@@ -15,6 +15,13 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     public static let sendKeys = ["button", "return", "keypad_enter", "command_return"]
     public static let newlineKeys = ["shift_return", "option_return"]
     public static let destinations = ["desk", "studio", "active", "schedule"]
+    private static let guestSecurity: [String: Any] = [
+        "bot_bound": true,
+        "host_bound": true,
+        "opaque_grant": true,
+        "loopback_url_exported": false,
+        "bearer_exported": false,
+    ]
 
     public enum Status: String, Sendable {
         case accepted, completed, failed, unknown, partial
@@ -36,6 +43,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         public static let missingRequest = Error(code: -32097, message: "Mutation requires a non-empty client_request_id.")
         public static let crossTarget = Error(code: -32084, message: "Attachment grant does not match this Bot or conversation.")
         public static let handleConflict = Error(code: -32085, message: "Bot handle is already used or retired.")
+        public static let guestConflict = Error(code: -32092, message: "Bot Guest authority is stale or does not match this host, Bot, task, runtime, grant, or frame.")
     }
 
     private let lock = NSLock()
@@ -49,10 +57,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     public var onHasLiveRun: ((BotID) -> Bool)?
     public var onStopRun: ((BotID, Bool, String) -> Void)?
-    public var onStartGuest: ((BotID, String, String) -> Void)?
-    public var onStopGuest: ((BotID, String) -> Void)?
-    public var onRebuildGuest: ((BotID, String) -> Void)?
-    public var onGuestInput: ((BotID, [String: Any], String) throws -> Void)?
+    public var onStartGuest: ((BotID, String, String, [String: Any]) -> Void)?
+    public var onStopGuest: ((BotID, String, [String: Any]) -> Void)?
+    public var onRebuildGuest: ((BotID, String, [String: Any]) -> Void)?
+    public var onGuestInput: ((BotID, [String: Any], String, [String: Any]) throws -> Void)?
     public var onDockerClear: ((BotID) throws -> Void)?
     public var onSend: ((BotID, String, BotConversationID?, [String: Any]) throws -> [String: Any])?
     public var onOpenFile: ((BotID, String, Bool, String) throws -> Void)?
@@ -91,6 +99,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         self.attentionBindings = BotAttentionPushBindingStore(db: db)
         self.attentionNotificationMetadata = BotAttentionNotificationMetadataStore(db: db)
         loadSidecar()
+        invalidateRestoredGuestGrants()
         migrateSidecarQueueIfNeeded()
     }
 
@@ -103,9 +112,17 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               (existing["status"] as? String) == Status.accepted.rawValue else { return }
         existing["status"] = status.rawValue
         if let readback {
-            existing["readback"] = readback
-            if let botID = existing["bot_id"] as? String, readback["viewer"] != nil {
-                guest[botID] = readback
+            if let botID = existing["bot_id"] as? String,
+               var current = guest[botID],
+               readback["viewer_path"] != nil || readback["viewer"] != nil {
+                for (key, value) in readback { current[key] = value }
+                current["viewer"] = "/vnc.html"
+                current["viewer_path"] = "/vnc.html"
+                current["security"] = Self.guestSecurity
+                guest[botID] = current
+                existing["readback"] = current
+            } else {
+                existing["readback"] = readback
             }
         }
         receipts[requestID] = existing
@@ -140,7 +157,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         case "browser.state":
             return try browserState(params: params)
         case "guest.state":
-            return guestState(params: params)
+            return try guestState(params: params)
         case "receipt.status":
             return receiptStatus(params: params)
         case "peer.receipt.status":
@@ -259,13 +276,18 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return try authoritativeBrowserState(bot: bot, hostID: string(params, "host_id"))
     }
 
-    private func guestState(params: [String: Any]) -> [String: Any] {
-        let botID = string(params, "bot_id") ?? ""
-        return guest[botID] ?? [
-            "bot_id": botID,
-            "status": "stopped",
-            "viewer": "/vnc.html",
-        ]
+    private func guestState(params: [String: Any]) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        let botID = id(bot)
+        let hostID = try requireGuestHost(params)
+        if let existing = guest[botID] {
+            guard existing["host_id"] as? String == hostID else { throw Error.guestConflict }
+            return existing
+        }
+        let state = makeStoppedGuestState(botID: botID, hostID: hostID)
+        guest[botID] = state
+        persistSidecar()
+        return state
     }
 
     private func receiptStatus(params: [String: Any]) -> [String: Any] {
@@ -357,7 +379,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try browserAction(params: params, requestID: requestID)
         case "link.open":
             return try linkOpen(params: params, requestID: requestID)
-        case "guest.input", "guest.start", "guest.stop", "guest.rebuild":
+        case "guest.input", "guest.start", "guest.stop", "guest.rebuild", "guest.revoke":
             return try guestCommand(name: name, params: params, requestID: requestID)
         case "docker.clear":
             return try dockerClear(params: params, requestID: requestID)
@@ -1261,43 +1283,287 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func guestCommand(name: String, params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
         let botID = id(bot)
+        let hostID = try requireGuestHost(params)
         _ = try BotGuestHome.ensure(appSupport: appSupport, botID: bot.id)
-        let recipe = string(params, "recipe") ?? "pointer"
+        var state = guest[botID] ?? makeStoppedGuestState(botID: botID, hostID: hostID)
+        guard state["host_id"] as? String == hostID,
+              let taskID = string(params, "task_id"),
+              let task = guestTask(id: taskID, state: state),
+              task["operation"] as? String == "bot.\(name)" else {
+            throw Error.guestConflict
+        }
         let status: String
         let receiptStatus: Status
         switch name {
         case "guest.start":
-            onStartGuest?(bot.id, recipe, requestID)
+            guard let recipeID = string(params, "recipe_id"),
+                  recipeID == task["recipe_id"] as? String else { throw Error.guestConflict }
+            let runtime = makeGuestRuntime(
+                botID: botID,
+                hostID: hostID,
+                recipeID: recipeID,
+                previousState: state
+            )
+            state["runtime"] = runtime
+            state["frame"] = nil
+            state["error_message"] = nil
+            state["recovery"] = nil
+            state["grant_invalidated"] = false
+            state["recipe"] = task["recipe"]
+            onStartGuest?(bot.id, recipeID, requestID, state)
             status = "starting"
             receiptStatus = .accepted
         case "guest.rebuild":
-            onRebuildGuest?(bot.id, requestID)
+            try requireGuestRuntime(params: params, state: state)
+            let recipeID = ((state["runtime"] as? [String: Any])?["recipe_id"] as? String)
+                ?? (task["recipe_id"] as? String)
+                ?? ""
+            state["runtime"] = makeGuestRuntime(
+                botID: botID,
+                hostID: hostID,
+                recipeID: recipeID,
+                previousState: state
+            )
+            state["frame"] = nil
+            state["error_message"] = nil
+            state["recovery"] = nil
+            state["grant_invalidated"] = false
+            onRebuildGuest?(bot.id, requestID, state)
             status = "starting"
             receiptStatus = .accepted
         case "guest.stop":
-            onStopGuest?(bot.id, requestID)
+            try requireGuestRuntime(params: params, state: state)
+            invalidateGuestGrant(state: &state, status: "stopping")
+            onStopGuest?(bot.id, requestID, state)
             status = "stopping"
             receiptStatus = .accepted
+        case "guest.revoke":
+            try requireGuestRuntime(params: params, state: state)
+            invalidateGuestGrant(state: &state, status: "revoked")
+            status = "revoked"
+            receiptStatus = .completed
         case "guest.input":
             guard let onGuestInput else {
                 throw Error(code: -32091, message: "Bot guest input is unavailable.")
             }
-            try onGuestInput(bot.id, params, requestID)
+            try validateGuestInput(params: params, task: task, state: state)
+            state["input"] = [
+                "task_id": taskID,
+                "axis": task["axis"] as Any,
+                "before_frame_id": string(params, "before_frame_id") as Any,
+                "atomic": (task["axis"] as? String) == "drag",
+            ]
+            try onGuestInput(bot.id, params, requestID, state)
             status = "running"
             receiptStatus = .accepted
         default:
             throw Error.invalidParams
         }
-        let state: [String: Any] = [
-            "bot_id": botID,
-            "status": status,
-            "viewer": "/vnc.html",
-            "grant_id": requestID,
-            "recipe": recipe,
-            "embed_html_is_not_runtime": true,
-        ]
+        state["status"] = status
+        state["viewer"] = "/vnc.html"
+        state["viewer_path"] = "/vnc.html"
+        state["last_request_id"] = requestID
+        state["security"] = Self.guestSecurity
+        state["embed_html_is_not_runtime"] = true
         guest[botID] = state
         return receipt(requestID: requestID, status: receiptStatus, botID: botID, readback: state)
+    }
+
+    private func requireGuestHost(_ params: [String: Any]) throws -> String {
+        let hostID = string(params, "host_id")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !hostID.isEmpty, hostID.count <= 256 else { throw Error.guestConflict }
+        return hostID
+    }
+
+    private func makeStoppedGuestState(botID: String, hostID: String) -> [String: Any] {
+        [
+            "host_id": hostID,
+            "bot_id": botID,
+            "status": "stopped",
+            "viewer": "/vnc.html",
+            "viewer_path": "/vnc.html",
+            "grant_generation": 0,
+            "grant_invalidated": true,
+            "task_catalog": makeGuestTaskCatalog(botID: botID),
+            "security": Self.guestSecurity,
+            "embed_html_is_not_runtime": true,
+        ]
+    }
+
+    private func makeGuestTaskCatalog(botID: String) -> [String: Any] {
+        let recipeID = UUID().uuidString.lowercased()
+        let recipe: [String: Any] = [
+            "id": recipeID,
+            "immutable": true,
+            "image_reference": BotComputerGuestSpec.imageTag,
+            "container_id": BotComputerGuestSpec.containerName(botID: BotID(UUID(uuidString: botID)!)),
+            "viewer_path": "/vnc.html",
+        ]
+        func task(
+            _ title: String,
+            axis: String,
+            operation: String,
+            mode: String,
+            includesRecipe: Bool = false
+        ) -> [String: Any] {
+            var result: [String: Any] = [
+                "id": UUID().uuidString.lowercased(),
+                "title": title,
+                "axis": axis,
+                "operation": operation,
+                "interaction_mode": mode,
+            ]
+            if includesRecipe {
+                result["recipe_id"] = recipeID
+                result["recipe"] = recipe
+            }
+            return result
+        }
+        return [
+            "id": UUID().uuidString.lowercased(),
+            "generation": 1,
+            "tasks": [
+                task("Pointer", axis: "pointer", operation: "bot.guest.input", mode: "HOSTED_GUEST"),
+                task("Key", axis: "key", operation: "bot.guest.input", mode: "HOSTED_GUEST"),
+                task("Text", axis: "text", operation: "bot.guest.input", mode: "HOSTED_GUEST"),
+                task("Drag", axis: "drag", operation: "bot.guest.input", mode: "HOSTED_GUEST"),
+                task("Start", axis: "start", operation: "bot.guest.start", mode: "HOST_RUNTIME_RPC", includesRecipe: true),
+                task("Try again", axis: "tryAgain", operation: "bot.guest.start", mode: "HOST_RUNTIME_RPC", includesRecipe: true),
+                task("Rebuild", axis: "rebuild", operation: "bot.guest.rebuild", mode: "HOST_RUNTIME_RPC"),
+                task("Stop", axis: "stop", operation: "bot.guest.stop", mode: "HOST_RUNTIME_RPC"),
+                task("Fullscreen", axis: "fullscreen", operation: "bot.guest.state", mode: "HOST_RUNTIME_RPC"),
+                task("Error", axis: "error", operation: "bot.guest.state", mode: "HOST_RUNTIME_RPC"),
+                task("Refresh frame", axis: "frameObserve", operation: "bot.guest.state", mode: "HOST_RUNTIME_RPC"),
+                task("Revoke access", axis: "grantRevoke", operation: "bot.guest.revoke", mode: "HOST_RUNTIME_RPC"),
+                task("Reconnect", axis: "reconnect", operation: "bot.guest.state", mode: "HOST_RUNTIME_RPC"),
+                task("Recover", axis: "recovery", operation: "bot.guest.start", mode: "HOST_RUNTIME_RPC", includesRecipe: true),
+            ],
+        ]
+    }
+
+    private func guestTask(id taskID: String, state: [String: Any]) -> [String: Any]? {
+        guard let catalog = state["task_catalog"] as? [String: Any],
+              let tasks = catalog["tasks"] as? [[String: Any]] else { return nil }
+        return tasks.first { $0["id"] as? String == taskID }
+    }
+
+    private func makeGuestRuntime(
+        botID: String,
+        hostID: String,
+        recipeID: String,
+        previousState: [String: Any]
+    ) -> [String: Any] {
+        let previousRuntime = previousState["runtime"] as? [String: Any]
+        let currentGeneration = previousRuntime?["grant_generation"] as? Int
+            ?? previousState["grant_generation"] as? Int
+            ?? 0
+        return [
+            "host_id": hostID,
+            "bot_id": botID,
+            "container_id": BotComputerGuestSpec.containerName(botID: BotID(UUID(uuidString: botID)!)),
+            "app_run_id": UUID().uuidString.lowercased(),
+            "viewer_id": UUID().uuidString.lowercased(),
+            "viewer_path": "/vnc.html",
+            "session_id": UUID().uuidString.lowercased(),
+            "grant_id": UUID().uuidString.lowercased(),
+            "grant_generation": currentGeneration + 1,
+            "recipe_id": recipeID,
+            "image_reference": BotComputerGuestSpec.imageTag,
+        ]
+    }
+
+    private func requireGuestRuntime(params: [String: Any], state: [String: Any]) throws {
+        guard state["status"] as? String == "running",
+              state["grant_invalidated"] as? Bool == false,
+              let expected = state["runtime"] as? [String: Any],
+              let supplied = params["runtime"] as? [String: Any] else {
+            throw Error.guestConflict
+        }
+        for key in [
+            "host_id", "bot_id", "container_id", "app_run_id", "viewer_id",
+            "viewer_path", "session_id", "grant_id", "grant_generation",
+            "recipe_id", "image_reference",
+        ] where !Self.guestValuesEqual(expected[key], supplied[key]) {
+            throw Error.guestConflict
+        }
+    }
+
+    private func validateGuestInput(
+        params: [String: Any],
+        task: [String: Any],
+        state: [String: Any]
+    ) throws {
+        try requireGuestRuntime(params: params, state: state)
+        guard let frame = state["frame"] as? [String: Any],
+              let frameID = frame["frame_id"] as? String,
+              frameID == string(params, "before_frame_id"),
+              let width = frame["pixel_width"] as? Int,
+              let height = frame["pixel_height"] as? Int,
+              let input = params["input"] as? [String: Any],
+              let kind = input["kind"] as? String,
+              kind == task["axis"] as? String else { throw Error.guestConflict }
+        func point(_ xKey: String, _ yKey: String) -> Bool {
+            guard let x = input[xKey] as? Int, let y = input[yKey] as? Int else { return false }
+            return (0..<width).contains(x) && (0..<height).contains(y)
+        }
+        switch kind {
+        case "pointer":
+            guard point("x", "y") else { throw Error.invalidParams }
+        case "drag":
+            guard point("from_x", "from_y"), point("to_x", "to_y"),
+                  input["from_x"] as? Int != input["to_x"] as? Int
+                    || input["from_y"] as? Int != input["to_y"] as? Int else {
+                throw Error.invalidParams
+            }
+        case "text":
+            let text = (input["text"] as? String) ?? ""
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  text.count <= 2_000 else { throw Error.invalidParams }
+        case "key":
+            let allowed = Set(["Return", "Escape", "Tab", "Shift+Tab", "BackSpace", "Up", "Down", "Left", "Right"])
+            guard let key = input["key"] as? String, allowed.contains(key) else { throw Error.invalidParams }
+        default:
+            throw Error.invalidParams
+        }
+    }
+
+    private func invalidateGuestGrant(state: inout [String: Any], status: String) {
+        let previousGeneration = (state["runtime"] as? [String: Any])?["grant_generation"] as? Int
+            ?? state["grant_generation"] as? Int
+            ?? 0
+        state["status"] = status
+        state["grant_generation"] = previousGeneration + 1
+        state["grant_invalidated"] = true
+        state["runtime"] = nil
+        state["frame"] = nil
+        state["input"] = nil
+    }
+
+    private func invalidateRestoredGuestGrants() {
+        guard !guest.isEmpty else { return }
+        for botID in Array(guest.keys) {
+            guard var state = guest[botID] else { continue }
+            let hadRuntime = state["runtime"] != nil
+            if hadRuntime {
+                invalidateGuestGrant(state: &state, status: "reconnect_required")
+                state["recovery"] = [
+                    "method": "bot.guest.state",
+                    "requires_new_start_grant": true,
+                ]
+            }
+            state["security"] = Self.guestSecurity
+            guest[botID] = state
+        }
+        persistSidecar()
+    }
+
+    private static func guestValuesEqual(_ lhs: Any?, _ rhs: Any?) -> Bool {
+        switch (lhs, rhs) {
+        case let (left as String, right as String): return left == right
+        case let (left as Int, right as Int): return left == right
+        case let (left as NSNumber, right as NSNumber): return left == right
+        default: return false
+        }
     }
 
     private func dockerClear(params: [String: Any], requestID: String) throws -> [String: Any] {
@@ -1328,7 +1594,11 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let dockerGeneration = fileGeneration(botID: botID, root: "docker_home") + 1
         fileGenerations[fileGenerationKey(botID: botID, root: "docker_home")] = dockerGeneration
         let dockerCAS = rotateFileCAS(botID: botID, root: "docker_home")
-        guest[botID] = ["bot_id": botID, "status": "stopped", "viewer": "/vnc.html"]
+        if var guestState = guest[botID] {
+            invalidateGuestGrant(state: &guestState, status: "stopped")
+            guestState["security"] = Self.guestSecurity
+            guest[botID] = guestState
+        }
         return receipt(
             requestID: requestID,
             status: partial ? .partial : .completed,
@@ -2118,6 +2388,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
             browser = decoded
         }
+        if let data = loadData("bot.remote.guest_state"),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
+            guest = decoded
+        }
         if let data = loadData("bot.remote.routing"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
             routingPref = decoded
@@ -2173,19 +2447,58 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func persistSidecar() {
         saveJSON("bot.remote.unpublished", Array(unpublished).sorted())
-        saveJSON("bot.remote.receipts", receipts)
+        saveJSON("bot.remote.receipts", persistentReceiptSnapshot())
         saveJSON("bot.remote.files_location", filesLocation)
         saveJSON("bot.remote.file_grants", files)
         saveJSON("bot.remote.file_generations", fileGenerations)
         saveJSON("bot.remote.file_cas", fileCAS)
         saveJSON("bot.remote.file_hosts", fileHosts)
         saveJSON("bot.remote.browser_state", browser)
+        saveJSON("bot.remote.guest_state", guest.mapValues { state in
+            var projected = state
+            projected["frame"] = nil
+            projected["input"] = nil
+            return projected
+        })
         saveJSON("bot.remote.routing", routingPref)
         saveJSON("bot.remote.routing_consumed", Array(consumedRoutingReceipts).sorted())
         saveJSON("bot.remote.selected_conversations", selectedConversation)
         saveJSON("bot.remote.attention", attention)
         saveJSON("bot.remote.scheduler_runs", schedulerRuns)
         saveJSON("bot.remote.routine_runtime", routineRuntime)
+    }
+
+    /// Frame bytes stay available to the live receipt/state read path, but are
+    /// never accumulated in SQLite. A receipt replay after process loss keeps
+    /// its at-most-once identity while requiring a fresh host-issued grant.
+    private func persistentReceiptSnapshot() -> [String: [String: Any]] {
+        receipts.mapValues { receipt in
+            guard var readback = receipt["readback"] as? [String: Any],
+                  readback["task_catalog"] != nil,
+                  readback["viewer_path"] as? String == "/vnc.html" else { return receipt }
+            var projectedReceipt = receipt
+            readback["frame"] = nil
+            readback["input"] = nil
+            if let runtime = readback["runtime"] as? [String: Any] {
+                let generation = runtime["grant_generation"] as? Int
+                    ?? readback["grant_generation"] as? Int
+                    ?? 0
+                readback["runtime"] = nil
+                readback["status"] = "reconnect_required"
+                readback["grant_generation"] = generation + 1
+                readback["grant_invalidated"] = true
+                readback["recovery"] = [
+                    "method": "bot.guest.state",
+                    "requires_new_start_grant": true,
+                ]
+                if receipt["status"] as? String == Status.accepted.rawValue {
+                    projectedReceipt["status"] = Status.unknown.rawValue
+                }
+            }
+            readback["security"] = Self.guestSecurity
+            projectedReceipt["readback"] = readback
+            return projectedReceipt
+        }
     }
 
     private func loadData(_ key: String) -> Data? {

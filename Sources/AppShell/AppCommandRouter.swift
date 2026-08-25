@@ -2980,49 +2980,39 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 )
             }
         }
-        created.onStartGuest = { [weak self] id, _, requestID in
+        created.onStartGuest = { [weak self] id, _, requestID, context in
             self?.botsViewModel?.presentGuestDesktop(botID: id) { ok in
-                self?.settlePairedBot(
+                self?.settlePairedGuest(
+                    botID: id,
                     requestID: requestID,
-                    ok: ok,
-                    readback: [
-                        "bot_id": id.value.uuidString.lowercased(),
-                        "status": ok ? "running" : "failed",
-                        "viewer": "/vnc.html",
-                        "embed_html_is_not_runtime": true,
-                    ]
+                    context: context,
+                    runtimeSucceeded: ok
                 )
             }
         }
-        created.onStopGuest = { [weak self] id, requestID in
+        created.onStopGuest = { [weak self] id, requestID, context in
             self?.botsViewModel?.stopDockerGuest(botID: id) { ok in
+                var readback = context
+                readback["status"] = ok ? "stopped" : "failed"
+                readback["error_message"] = ok ? nil : "Could not stop the Linux desktop."
                 self?.settlePairedBot(
                     requestID: requestID,
                     ok: ok,
-                    readback: [
-                        "bot_id": id.value.uuidString.lowercased(),
-                        "status": ok ? "stopped" : "failed",
-                        "viewer": "/vnc.html",
-                        "embed_html_is_not_runtime": true,
-                    ]
+                    readback: readback
                 )
             }
         }
-        created.onRebuildGuest = { [weak self] id, requestID in
+        created.onRebuildGuest = { [weak self] id, requestID, context in
             self?.botsViewModel?.rebuildDockerGuest(botID: id) { ok in
-                self?.settlePairedBot(
+                self?.settlePairedGuest(
+                    botID: id,
                     requestID: requestID,
-                    ok: ok,
-                    readback: [
-                        "bot_id": id.value.uuidString.lowercased(),
-                        "status": ok ? "running" : "failed",
-                        "viewer": "/vnc.html",
-                        "embed_html_is_not_runtime": true,
-                    ]
+                    context: context,
+                    runtimeSucceeded: ok
                 )
             }
         }
-        created.onGuestInput = { [weak self] id, params, requestID in
+        created.onGuestInput = { [weak self] id, params, requestID, context in
             guard let service = self?.botsViewModel?.computerGuestService else {
                 throw BotRemoteControlAuthority.Error(
                     code: -32091,
@@ -3030,35 +3020,23 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 )
             }
             let steps = try Self.guestInputSteps(params)
-            Task.detached { [weak self] in
+            Task { @MainActor [weak self, service] in
                 do {
-                    try service.act(botID: id, steps: steps)
-                    await MainActor.run {
-                        self?.settlePairedBot(
-                            requestID: requestID,
-                            ok: true,
-                            readback: [
-                                "bot_id": id.value.uuidString.lowercased(),
-                                "status": "running",
-                                "viewer": "/vnc.html",
-                                "embed_html_is_not_runtime": true,
-                            ]
-                        )
-                    }
+                    let evidence = try await Task.detached { [service] in
+                        try service.act(botID: id, steps: steps)
+                        return try service.remoteFrame(botID: id)
+                    }.value
+                    self?.settlePairedBot(
+                        requestID: requestID,
+                        ok: true,
+                        readback: Self.guestFrameReadback(context: context, evidence: evidence)
+                    )
                 } catch {
-                    await MainActor.run {
-                        self?.settlePairedBot(
-                            requestID: requestID,
-                            ok: false,
-                            readback: [
-                                "bot_id": id.value.uuidString.lowercased(),
-                                "status": "failed",
-                                "error": String(describing: error),
-                                "viewer": "/vnc.html",
-                                "embed_html_is_not_runtime": true,
-                            ]
-                        )
-                    }
+                    self?.settlePairedBot(
+                        requestID: requestID,
+                        ok: false,
+                        readback: Self.guestFailureReadback(context: context, error: error)
+                    )
                 }
             }
         }
@@ -3116,7 +3094,137 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
+    private func settlePairedGuest(
+        botID: BotID,
+        requestID: String,
+        context: [String: Any],
+        runtimeSucceeded: Bool
+    ) {
+        guard runtimeSucceeded,
+              let service = botsViewModel?.computerGuestService else {
+            settlePairedBot(
+                requestID: requestID,
+                ok: false,
+                readback: Self.guestFailureReadback(
+                    context: context,
+                    message: "Could not start the Linux desktop."
+                )
+            )
+            return
+        }
+        Task { @MainActor [weak self, service] in
+            do {
+                let evidence = try await Task.detached { [service] in
+                    try service.remoteFrame(botID: botID)
+                }.value
+                self?.settlePairedBot(
+                    requestID: requestID,
+                    ok: true,
+                    readback: Self.guestFrameReadback(context: context, evidence: evidence)
+                )
+            } catch {
+                self?.settlePairedBot(
+                    requestID: requestID,
+                    ok: false,
+                    readback: Self.guestFailureReadback(context: context, error: error)
+                )
+            }
+        }
+    }
+
+    static func guestFrameReadback(
+        context: [String: Any],
+        evidence: BotComputerGuestFrameEvidence
+    ) -> [String: Any] {
+        var readback = context
+        var runtime = context["runtime"] as? [String: Any] ?? [:]
+        runtime["container_id"] = evidence.containerID
+        runtime["image_reference"] = evidence.imageReference
+        runtime["viewer_path"] = evidence.viewerPath
+        let previousFrame = context["frame"] as? [String: Any]
+        let sequence = (previousFrame?["sequence"] as? Int ?? -1) + 1
+        let frameID = UUID().uuidString.lowercased()
+        readback["runtime"] = runtime
+        readback["frame"] = [
+            "runtime": runtime,
+            "frame_id": frameID,
+            "sequence": sequence,
+            "pixel_width": evidence.pixelWidth,
+            "pixel_height": evidence.pixelHeight,
+            "png_base64": evidence.png.base64EncodedString(),
+            "png_hash": evidence.pngHash,
+        ]
+        readback["status"] = "running"
+        readback["viewer"] = evidence.viewerPath
+        readback["viewer_path"] = evidence.viewerPath
+        readback["grant_generation"] = runtime["grant_generation"]
+        readback["grant_invalidated"] = false
+        readback["before_frame_id"] = previousFrame?["frame_id"]
+        readback["after_frame_id"] = frameID
+        readback["error_message"] = nil
+        return readback
+    }
+
+    static func guestFailureReadback(
+        context: [String: Any],
+        error: Swift.Error
+    ) -> [String: Any] {
+        guestFailureReadback(context: context, message: String(describing: error))
+    }
+
+    static func guestFailureReadback(
+        context: [String: Any],
+        message: String
+    ) -> [String: Any] {
+        var readback = context
+        let previousGeneration = (context["runtime"] as? [String: Any])?["grant_generation"] as? Int
+            ?? context["grant_generation"] as? Int
+            ?? 0
+        readback["status"] = "failed"
+        readback["error_message"] = message
+        readback["runtime"] = nil
+        readback["frame"] = nil
+        readback["input"] = nil
+        readback["grant_generation"] = previousGeneration + 1
+        readback["grant_invalidated"] = true
+        readback["recovery"] = [
+            "method": "bot.guest.state",
+            "requires_new_start_grant": true,
+        ]
+        return readback
+    }
+
     private static func guestInputSteps(_ params: [String: Any]) throws -> [BotComputerActStep] {
+        if let input = params["input"] as? [String: Any],
+           let kind = input["kind"] as? String {
+            switch kind {
+            case "pointer":
+                guard let x = input["x"] as? Int, let y = input["y"] as? Int else {
+                    throw BotRemoteControlAuthority.Error.invalidParams
+                }
+                return [BotComputerActStep(action: "click", x: x, y: y)]
+            case "drag":
+                guard let fromX = input["from_x"] as? Int,
+                      let fromY = input["from_y"] as? Int,
+                      let toX = input["to_x"] as? Int,
+                      let toY = input["to_y"] as? Int else {
+                    throw BotRemoteControlAuthority.Error.invalidParams
+                }
+                return [BotComputerActStep(action: "drag", x: fromX, y: fromY, toX: toX, toY: toY)]
+            case "text":
+                guard let text = input["text"] as? String else {
+                    throw BotRemoteControlAuthority.Error.invalidParams
+                }
+                return [BotComputerActStep(action: "type", text: text)]
+            case "key":
+                guard let key = input["key"] as? String else {
+                    throw BotRemoteControlAuthority.Error.invalidParams
+                }
+                return [BotComputerActStep(action: "key", key: key)]
+            default:
+                throw BotRemoteControlAuthority.Error.invalidParams
+            }
+        }
         if let raw = params["steps"] as? [[String: Any]] {
             let steps = raw.map { dict in
                 BotComputerActStep(

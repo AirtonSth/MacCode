@@ -3,6 +3,7 @@ import CoreModel
 @testable import Persistence
 
 final class BotRemoteControlAuthorityTests: XCTestCase {
+    private let guestHostID = "test-host"
     private var db: SQLiteDB!
     private var store: BotStore!
     private var settings: SettingsStore!
@@ -34,6 +35,56 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             try? FileManager.default.removeItem(at: supportDir)
         }
         supportDir = nil
+    }
+
+    private func guestState(botID: String) throws -> [String: Any] {
+        try authority.dispatch(method: "bot.guest.state", params: [
+            "bot_id": botID,
+            "host_id": guestHostID,
+        ])
+    }
+
+    private func guestTask(botID: String, axis: String) throws -> [String: Any] {
+        let state = try guestState(botID: botID)
+        let catalog = try XCTUnwrap(state["task_catalog"] as? [String: Any])
+        let tasks = try XCTUnwrap(catalog["tasks"] as? [[String: Any]])
+        return try XCTUnwrap(tasks.first { $0["axis"] as? String == axis })
+    }
+
+    private func guestStartParams(botID: String, requestID: String) throws -> [String: Any] {
+        let task = try guestTask(botID: botID, axis: "start")
+        return [
+            "client_request_id": requestID,
+            "bot_id": botID,
+            "host_id": guestHostID,
+            "task_id": try XCTUnwrap(task["id"] as? String),
+            "recipe_id": try XCTUnwrap(task["recipe_id"] as? String),
+        ]
+    }
+
+    private func runningGuest(botID: String) throws -> [String: Any] {
+        let started = try authority.dispatch(
+            method: "bot.guest.start",
+            params: guestStartParams(botID: botID, requestID: "prepare-\(UUID().uuidString)")
+        )
+        var state = try XCTUnwrap(started["readback"] as? [String: Any])
+        let runtime = try XCTUnwrap(state["runtime"] as? [String: Any])
+        state["status"] = "running"
+        state["frame"] = [
+            "runtime": runtime,
+            "frame_id": UUID().uuidString.lowercased(),
+            "sequence": 0,
+            "pixel_width": 1_600,
+            "pixel_height": 1_200,
+            "png_base64": "",
+            "png_hash": "test",
+        ]
+        authority.settle(
+            requestID: try XCTUnwrap(started["request_id"] as? String),
+            status: .completed,
+            readback: state
+        )
+        return try guestState(botID: botID)
     }
 
     func test_settingsSet_failsWithoutRequestId_becauseSilentLocalSuccessIsForbidden() {
@@ -791,11 +842,10 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "name": "Piper",
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
-        let started = try authority.dispatch(method: "bot.guest.start", params: [
-            "client_request_id": "g1",
-            "bot_id": botID,
-            "recipe": "pointer",
-        ])
+        let started = try authority.dispatch(
+            method: "bot.guest.start",
+            params: guestStartParams(botID: botID, requestID: "g1")
+        )
         let readback = started["readback"] as? [String: Any]
         XCTAssertEqual(readback?["viewer"] as? String, "/vnc.html")
         XCTAssertEqual(readback?["embed_html_is_not_runtime"] as? Bool, true)
@@ -994,11 +1044,10 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "name": "Piper",
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
-        let started = try authority.dispatch(method: "bot.guest.start", params: [
-            "client_request_id": "g-start",
-            "bot_id": botID,
-            "recipe": "pointer",
-        ])
+        let started = try authority.dispatch(
+            method: "bot.guest.start",
+            params: guestStartParams(botID: botID, requestID: "g-start")
+        )
         let uuid = try XCTUnwrap(UUID(uuidString: botID))
         XCTAssertTrue(
             FileManager.default.fileExists(
@@ -1008,6 +1057,242 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual((started["readback"] as? [String: Any])?["viewer"] as? String, "/vnc.html")
         XCTAssertEqual(started["status"] as? String, "accepted")
         XCTAssertEqual((started["readback"] as? [String: Any])?["status"] as? String, "starting")
+    }
+
+    func test_guestCatalogIsHostIssuedAndStartReturnsSecretFreeExactRuntime() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "guest-catalog",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let state = try guestState(botID: botID)
+        let catalog = try XCTUnwrap(state["task_catalog"] as? [String: Any])
+        let tasks = try XCTUnwrap(catalog["tasks"] as? [[String: Any]])
+        XCTAssertEqual(Set(tasks.compactMap { $0["id"] as? String }).count, tasks.count)
+        XCTAssertTrue(Set([
+            "pointer", "key", "text", "drag", "start", "tryAgain",
+            "rebuild", "stop", "fullscreen", "error",
+        ]).isSubset(of: Set(tasks.compactMap { $0["axis"] as? String })))
+
+        var bad = try guestStartParams(botID: botID, requestID: "guest-bad-recipe")
+        bad["recipe_id"] = UUID().uuidString.lowercased()
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.guest.start", params: bad))
+
+        let started = try authority.dispatch(
+            method: "bot.guest.start",
+            params: guestStartParams(botID: botID, requestID: "guest-exact-start")
+        )
+        let readback = try XCTUnwrap(started["readback"] as? [String: Any])
+        let runtime = try XCTUnwrap(readback["runtime"] as? [String: Any])
+        XCTAssertEqual(runtime["host_id"] as? String, guestHostID)
+        XCTAssertEqual(runtime["bot_id"] as? String, botID)
+        XCTAssertEqual(runtime["viewer_path"] as? String, "/vnc.html")
+        XCTAssertNotNil(runtime["container_id"] as? String)
+        XCTAssertNotNil(runtime["app_run_id"] as? String)
+        XCTAssertNotNil(runtime["viewer_id"] as? String)
+        XCTAssertNotNil(runtime["session_id"] as? String)
+        XCTAssertNotNil(runtime["grant_id"] as? String)
+        XCTAssertEqual(runtime["grant_generation"] as? Int, 1)
+        let json = try JSONSerialization.data(withJSONObject: readback)
+        let wire = try XCTUnwrap(String(data: json, encoding: .utf8))
+        XCTAssertFalse(wire.contains("127.0.0.1"))
+        XCTAssertFalse(wire.contains("screen_url"))
+        XCTAssertFalse(wire.contains("bearer_token"))
+    }
+
+    func test_guestDragRequiresExactRuntimeAndFrameAndIsMarkedAtomic() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "guest-drag",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let state = try runningGuest(botID: botID)
+        let runtime = try XCTUnwrap(state["runtime"] as? [String: Any])
+        let frame = try XCTUnwrap(state["frame"] as? [String: Any])
+        let task = try guestTask(botID: botID, axis: "drag")
+        var hookedContext: [String: Any] = [:]
+        authority.onGuestInput = { _, _, _, context in hookedContext = context }
+        let base: [String: Any] = [
+            "bot_id": botID,
+            "host_id": guestHostID,
+            "task_id": try XCTUnwrap(task["id"] as? String),
+            "runtime": runtime,
+            "before_frame_id": try XCTUnwrap(frame["frame_id"] as? String),
+            "input": [
+                "kind": "drag",
+                "from_x": 10,
+                "from_y": 20,
+                "to_x": 30,
+                "to_y": 40,
+            ],
+        ]
+        let accepted = try authority.dispatch(
+            method: "bot.guest.input",
+            params: base.merging(["client_request_id": "guest-drag-ok"]) { _, new in new }
+        )
+        XCTAssertEqual(accepted["status"] as? String, "accepted")
+        XCTAssertEqual((hookedContext["input"] as? [String: Any])?["atomic"] as? Bool, true)
+
+        var stale = base
+        stale["client_request_id"] = "guest-drag-stale"
+        stale["before_frame_id"] = UUID().uuidString.lowercased()
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.guest.input", params: stale))
+
+        var crossRuntime = runtime
+        crossRuntime["grant_id"] = UUID().uuidString.lowercased()
+        var crossed = base
+        crossed["client_request_id"] = "guest-drag-cross"
+        crossed["runtime"] = crossRuntime
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.guest.input", params: crossed))
+
+        var substitutedImage = runtime
+        substitutedImage["image_reference"] = "untrusted/image:latest"
+        var substituted = base
+        substituted["client_request_id"] = "guest-drag-image-substitution"
+        substituted["runtime"] = substitutedImage
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.guest.input", params: substituted))
+    }
+
+    func test_guestPointerKeyAndTextUseHostTasksAndCurrentFrame() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "guest-input-axes",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let state = try runningGuest(botID: botID)
+        let runtime = try XCTUnwrap(state["runtime"] as? [String: Any])
+        let frame = try XCTUnwrap(state["frame"] as? [String: Any])
+        let beforeFrameID = try XCTUnwrap(frame["frame_id"] as? String)
+        authority.onGuestInput = { _, _, _, _ in }
+        let inputs: [(axis: String, input: [String: Any])] = [
+            ("pointer", ["kind": "pointer", "x": 10, "y": 20]),
+            ("key", ["kind": "key", "key": "Return"]),
+            ("text", ["kind": "text", "text": "hello"]),
+        ]
+
+        for (index, item) in inputs.enumerated() {
+            let task = try guestTask(botID: botID, axis: item.axis)
+            let accepted = try authority.dispatch(method: "bot.guest.input", params: [
+                "client_request_id": "guest-input-axis-\(index)",
+                "bot_id": botID,
+                "host_id": guestHostID,
+                "task_id": try XCTUnwrap(task["id"] as? String),
+                "runtime": runtime,
+                "before_frame_id": beforeFrameID,
+                "input": item.input,
+            ])
+            XCTAssertEqual(accepted["status"] as? String, "accepted")
+        }
+    }
+
+    func test_guestRebuildRotatesRuntimeAndStopInvalidatesReplacementGrant() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "guest-lifecycle",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let running = try runningGuest(botID: botID)
+        let originalRuntime = try XCTUnwrap(running["runtime"] as? [String: Any])
+        let rebuildTask = try guestTask(botID: botID, axis: "rebuild")
+        let rebuilt = try authority.dispatch(method: "bot.guest.rebuild", params: [
+            "client_request_id": "guest-rebuild",
+            "bot_id": botID,
+            "host_id": guestHostID,
+            "task_id": try XCTUnwrap(rebuildTask["id"] as? String),
+            "runtime": originalRuntime,
+        ])
+        var rebuiltState = try XCTUnwrap(rebuilt["readback"] as? [String: Any])
+        let replacementRuntime = try XCTUnwrap(rebuiltState["runtime"] as? [String: Any])
+        XCTAssertNotEqual(replacementRuntime["app_run_id"] as? String, originalRuntime["app_run_id"] as? String)
+        XCTAssertNotEqual(replacementRuntime["session_id"] as? String, originalRuntime["session_id"] as? String)
+        XCTAssertNotEqual(replacementRuntime["grant_id"] as? String, originalRuntime["grant_id"] as? String)
+        XCTAssertGreaterThan(
+            try XCTUnwrap(replacementRuntime["grant_generation"] as? Int),
+            try XCTUnwrap(originalRuntime["grant_generation"] as? Int)
+        )
+        rebuiltState["status"] = "running"
+        rebuiltState["frame"] = [
+            "runtime": replacementRuntime,
+            "frame_id": "replacement-frame",
+            "sequence": 0,
+            "pixel_width": 1_600,
+            "pixel_height": 1_200,
+            "png_base64": "",
+            "png_hash": "test",
+        ]
+        authority.settle(requestID: "guest-rebuild", status: .completed, readback: rebuiltState)
+
+        let stopTask = try guestTask(botID: botID, axis: "stop")
+        let stopped = try authority.dispatch(method: "bot.guest.stop", params: [
+            "client_request_id": "guest-stop",
+            "bot_id": botID,
+            "host_id": guestHostID,
+            "task_id": try XCTUnwrap(stopTask["id"] as? String),
+            "runtime": replacementRuntime,
+        ])
+        let stoppedState = try XCTUnwrap(stopped["readback"] as? [String: Any])
+        XCTAssertEqual(stoppedState["status"] as? String, "stopping")
+        XCTAssertEqual(stoppedState["grant_invalidated"] as? Bool, true)
+        XCTAssertNil(stoppedState["runtime"])
+        XCTAssertNil(stoppedState["frame"])
+    }
+
+    func test_guestRevokeAndRelaunchInvalidateOldGrantAndRequireRecovery() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "guest-revoke",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let running = try runningGuest(botID: botID)
+        let runtime = try XCTUnwrap(running["runtime"] as? [String: Any])
+        let revoke = try guestTask(botID: botID, axis: "grantRevoke")
+        let revoked = try authority.dispatch(method: "bot.guest.revoke", params: [
+            "client_request_id": "guest-revoke-now",
+            "bot_id": botID,
+            "host_id": guestHostID,
+            "task_id": try XCTUnwrap(revoke["id"] as? String),
+            "runtime": runtime,
+        ])
+        let revokedState = try XCTUnwrap(revoked["readback"] as? [String: Any])
+        XCTAssertEqual(revoked["status"] as? String, "completed")
+        XCTAssertEqual(revokedState["status"] as? String, "revoked")
+        XCTAssertEqual(revokedState["grant_invalidated"] as? Bool, true)
+        XCTAssertNil(revokedState["runtime"])
+
+        let beforeRelaunch = try runningGuest(botID: botID)
+        let completedRequestID = try XCTUnwrap(beforeRelaunch["last_request_id"] as? String)
+        let persistedGuestJSON = try db.performSync { database -> String? in
+            let statement = try database.prepare(
+                "SELECT value FROM settings WHERE key = 'bot.remote.guest_state' LIMIT 1;"
+            )
+            defer { statement.reset() }
+            guard try statement.step() else { return nil }
+            return statement.columnText(0)
+        }
+        XCTAssertFalse(try XCTUnwrap(persistedGuestJSON).contains("png_base64"))
+        let relaunched = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: settings,
+            appSupportDirectory: supportDir
+        )
+        authority = relaunched
+        let recovered = try guestState(botID: botID)
+        XCTAssertEqual(recovered["status"] as? String, "reconnect_required")
+        XCTAssertEqual(recovered["grant_invalidated"] as? Bool, true)
+        XCTAssertNil(recovered["runtime"])
+        XCTAssertEqual(
+            (recovered["recovery"] as? [String: Any])?["requires_new_start_grant"] as? Bool,
+            true
+        )
+        let replayed = try authority.dispatch(method: "bot.receipt.status", params: [
+            "client_request_id": completedRequestID,
+        ])
+        XCTAssertEqual(replayed["status"] as? String, "completed")
+        let replayedReadback = try XCTUnwrap(replayed["readback"] as? [String: Any])
+        XCTAssertEqual(replayedReadback["status"] as? String, "reconnect_required")
+        XCTAssertNil(replayedReadback["runtime"])
+        XCTAssertNil(replayedReadback["frame"])
     }
 
     func test_filesOpenTabAndSplit_requireDiskAndCallLiveSurfaceHook() throws {
@@ -1149,24 +1434,34 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "name": "Piper",
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let state = try runningGuest(botID: botID)
+        let task = try guestTask(botID: botID, axis: "text")
+        let runtime = try XCTUnwrap(state["runtime"] as? [String: Any])
+        let frame = try XCTUnwrap(state["frame"] as? [String: Any])
+        let inputParams: [String: Any] = [
+            "bot_id": botID,
+            "host_id": guestHostID,
+            "task_id": try XCTUnwrap(task["id"] as? String),
+            "runtime": runtime,
+            "before_frame_id": try XCTUnwrap(frame["frame_id"] as? String),
+            "input": ["kind": "text", "text": "hello"],
+        ]
         XCTAssertThrowsError(
-            try authority.dispatch(method: "bot.guest.input", params: [
-                "client_request_id": "gin-miss",
-                "bot_id": botID,
-                "text": "hello",
-            ])
+            try authority.dispatch(
+                method: "bot.guest.input",
+                params: inputParams.merging(["client_request_id": "gin-miss"]) { _, new in new }
+            )
         )
         var received = ""
         var hookedRequest = ""
-        authority.onGuestInput = { _, params, requestID in
-            received = params["text"] as? String ?? ""
+        authority.onGuestInput = { _, params, requestID, _ in
+            received = (params["input"] as? [String: Any])?["text"] as? String ?? ""
             hookedRequest = requestID
         }
-        let sent = try authority.dispatch(method: "bot.guest.input", params: [
-            "client_request_id": "gin-ok",
-            "bot_id": botID,
-            "text": "hello",
-        ])
+        let sent = try authority.dispatch(
+            method: "bot.guest.input",
+            params: inputParams.merging(["client_request_id": "gin-ok"]) { _, new in new }
+        )
         XCTAssertEqual(received, "hello")
         XCTAssertEqual(hookedRequest, "gin-ok")
         XCTAssertEqual(sent["status"] as? String, "accepted")
@@ -1194,12 +1489,11 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
         var requestID = ""
-        authority.onStartGuest = { _, _, id in requestID = id }
-        let started = try authority.dispatch(method: "bot.guest.start", params: [
-            "client_request_id": "g-set-1",
-            "bot_id": botID,
-            "recipe": "pointer",
-        ])
+        authority.onStartGuest = { _, _, id, _ in requestID = id }
+        let started = try authority.dispatch(
+            method: "bot.guest.start",
+            params: guestStartParams(botID: botID, requestID: "g-set-1")
+        )
         XCTAssertEqual(started["status"] as? String, "accepted")
         XCTAssertEqual(requestID, "g-set-1")
         authority.settle(
@@ -1216,7 +1510,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "client_request_id": "g-set-1",
         ])
         XCTAssertEqual(status["status"] as? String, "completed")
-        let guest = try authority.dispatch(method: "bot.guest.state", params: ["bot_id": botID])
+        let guest = try guestState(botID: botID)
         XCTAssertEqual(guest["status"] as? String, "running")
     }
 

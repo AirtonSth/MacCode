@@ -820,6 +820,11 @@ public final class JSONRPCDispatcher {
         "bot.files.open_tab",
         "bot.files.split",
         "bot.files.location.set",
+        "bot.guest.input",
+        "bot.guest.start",
+        "bot.guest.stop",
+        "bot.guest.rebuild",
+        "bot.guest.revoke",
         "bot.docker.clear",
         "bot.notify.set",
         "bot.desktop.set",
@@ -1170,6 +1175,32 @@ public final class JSONRPCDispatcher {
             }
             return ("bot.run.started", .object(payload))
         }
+        func project(_ value: JSONValue?, keys: [String]) -> JSONValue? {
+            guard let object = value?.objectValue else { return nil }
+            return .object(Dictionary(uniqueKeysWithValues: keys.compactMap { key in
+                object[key].map { (key, $0) }
+            }))
+        }
+        func guestTaskCatalog(_ value: JSONValue?) -> JSONValue? {
+            guard let catalog = value?.objectValue,
+                  let tasks = catalog["tasks"]?.arrayValue else { return nil }
+            let projectedTasks = tasks.compactMap { task -> JSONValue? in
+                guard var projected = project(
+                    task,
+                    keys: ["id", "title", "axis", "operation", "interaction_mode", "recipe_id"]
+                )?.objectValue else { return nil }
+                projected["recipe"] = project(
+                    task.objectValue?["recipe"],
+                    keys: ["id", "immutable", "image_reference", "container_id", "viewer_path"]
+                )
+                return .object(projected)
+            }
+            var projected = Dictionary(uniqueKeysWithValues: ["id", "generation"].compactMap { key in
+                catalog[key].map { (key, $0) }
+            })
+            projected["tasks"] = .array(projectedTasks)
+            return .object(projected)
+        }
         var payload: [String: JSONValue] = [:]
         var botNotifications: [JSONValue] = []
         var botLifecycleEvents: [(kind: String, payload: JSONValue)] = []
@@ -1254,8 +1285,10 @@ public final class JSONRPCDispatcher {
             payload["ok"] = result.objectValue?["ok"]
             payload["status"] = result.objectValue?["status"]
         case let botMethod where botMethod.hasPrefix("bot."):
-            guard let object = result.objectValue,
-                  object["status"]?.stringValue == "completed" else {
+            guard let object = result.objectValue else { return }
+            let resultStatus = object["status"]?.stringValue
+            guard resultStatus == "completed"
+                    || (botMethod.hasPrefix("bot.guest.") && resultStatus == "accepted") else {
                 return
             }
             switch botMethod {
@@ -1275,6 +1308,8 @@ public final class JSONRPCDispatcher {
             case "bot.files.open_tab", "bot.files.split": kind = "bot.files.opened"
             case "bot.files.location.set": kind = "bot.files.updated"
             case "bot.browser.action", "bot.link.open": kind = "bot.browser.updated"
+            case "bot.guest.input", "bot.guest.start", "bot.guest.stop", "bot.guest.rebuild", "bot.guest.revoke":
+                kind = "bot.guest.updated"
             case "bot.docker.clear": kind = "bot.docker.cleared"
             case "bot.attention.ack": kind = "bot.attention.updated"
             case "bot.scheduler.tick": kind = "bot.scheduler.updated"
@@ -1301,26 +1336,60 @@ public final class JSONRPCDispatcher {
                 if let notifications = readback["notifications"]?.arrayValue {
                     botNotifications.append(contentsOf: notifications.compactMap(canonicalBotNotification))
                 }
-                payload["conversation_id"] = readback["conversation_id"]
-                    ?? readback["selected_id"]
-                    ?? string("conversation_id")
-                payload["routine_id"] = readback["routine_id"]
-                    ?? string("routine_id")
-                payload["run_id"] = readback["run_id"]
-                payload["routing_receipt_id"] = readback["routing_receipt_id"]
-                payload["key"] = readback["key"] ?? string("key")
-                for key in [
-                    "host_id", "client_request_id", "root", "root_handle", "handle", "generation", "previous_generation",
-                    "root_cas", "previous_cas", "expected_cas", "current_cas",
-                    "entry_generation", "entry_cas", "path", "op",
-                    "profile_id", "attention_item_id", "notification_id", "source", "enqueued", "id",
-                    "surface_id", "snapshot_generation", "url", "title", "loading", "action",
-                    "session_before_digest", "session_after_digest", "cleared", "removed_count", "partial",
-                ] {
-                    payload[key] = readback[key]
+                if botMethod.hasPrefix("bot.guest.") {
+                    for key in [
+                        "host_id", "viewer_path", "grant_generation", "grant_invalidated",
+                        "before_frame_id", "after_frame_id", "status", "error_message",
+                    ] {
+                        payload[key] = readback[key]
+                    }
+                    payload["security"] = project(
+                        readback["security"],
+                        keys: [
+                            "bot_bound", "host_bound", "opaque_grant",
+                            "loopback_url_exported", "bearer_exported",
+                        ]
+                    )
+                    payload["task_catalog"] = guestTaskCatalog(readback["task_catalog"])
+                    payload["runtime"] = project(
+                        readback["runtime"],
+                        keys: [
+                            "host_id", "bot_id", "container_id", "app_run_id", "viewer_id",
+                            "viewer_path", "session_id", "grant_id", "grant_generation",
+                            "recipe_id", "image_reference",
+                        ]
+                    )
+                } else {
+                    payload["conversation_id"] = readback["conversation_id"]
+                        ?? readback["selected_id"]
+                        ?? string("conversation_id")
+                    payload["routine_id"] = readback["routine_id"]
+                        ?? string("routine_id")
+                    payload["run_id"] = readback["run_id"]
+                    payload["routing_receipt_id"] = readback["routing_receipt_id"]
+                    payload["key"] = readback["key"] ?? string("key")
+                    for key in [
+                        "host_id", "client_request_id", "root", "root_handle", "handle", "generation", "previous_generation",
+                        "root_cas", "previous_cas", "expected_cas", "current_cas",
+                        "entry_generation", "entry_cas", "path", "op",
+                        "profile_id", "attention_item_id", "notification_id", "source", "enqueued", "id",
+                        "surface_id", "snapshot_generation", "url", "title", "loading", "action",
+                        "session_before_digest", "session_after_digest", "cleared", "removed_count", "partial",
+                    ] {
+                        payload[key] = readback[key]
+                    }
+                    payload["security"] = readback["security"]
+                    payload["session"] = readback["session"]
                 }
-                payload["security"] = readback["security"]
-                payload["session"] = readback["session"]
+                if botMethod.hasPrefix("bot.guest."), let frame = readback["frame"]?.objectValue {
+                    payload["frame"] = .object([
+                        "frame_id": frame["frame_id"] ?? .null,
+                        "sequence": frame["sequence"] ?? .null,
+                        "pixel_width": frame["pixel_width"] ?? .null,
+                        "pixel_height": frame["pixel_height"] ?? .null,
+                        "png_hash": frame["png_hash"] ?? .null,
+                    ])
+                }
             }
         default:
             return

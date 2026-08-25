@@ -98,6 +98,93 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
 
 @MainActor
 final class BotComputerGuestServiceTests: XCTestCase {
+    func test_guestFrameReadbackAdvancesExactFrameAndFailureInvalidatesGrant() throws {
+        let runtime: [String: Any] = [
+            "host_id": "host",
+            "bot_id": UUID().uuidString.lowercased(),
+            "container_id": "container",
+            "app_run_id": "app-run",
+            "viewer_id": "viewer",
+            "viewer_path": "/vnc.html",
+            "session_id": "session",
+            "grant_id": "grant",
+            "grant_generation": 7,
+            "recipe_id": "recipe",
+            "image_reference": "recipe-image",
+        ]
+        let context: [String: Any] = [
+            "runtime": runtime,
+            "frame": [
+                "frame_id": "before-frame",
+                "sequence": 11,
+            ],
+        ]
+        let png = Data([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x06, 0x40, 0x00, 0x00, 0x04, 0xb0,
+        ])
+        let evidence = BotComputerGuestFrameEvidence(
+            containerID: "container",
+            imageReference: "sha256:runtime-image",
+            viewerPath: "/vnc.html",
+            pixelWidth: 1_600,
+            pixelHeight: 1_200,
+            png: png,
+            pngHash: "png-hash"
+        )
+
+        let readback = AppCommandRouter.guestFrameReadback(context: context, evidence: evidence)
+
+        let frame = try XCTUnwrap(readback["frame"] as? [String: Any])
+        let afterFrameID = try XCTUnwrap(frame["frame_id"] as? String)
+        XCTAssertNotEqual(afterFrameID, "before-frame")
+        XCTAssertEqual(frame["sequence"] as? Int, 12)
+        XCTAssertEqual(frame["png_base64"] as? String, png.base64EncodedString())
+        XCTAssertEqual(frame["png_hash"] as? String, "png-hash")
+        XCTAssertEqual(readback["before_frame_id"] as? String, "before-frame")
+        XCTAssertEqual(readback["after_frame_id"] as? String, afterFrameID)
+        XCTAssertEqual((readback["runtime"] as? [String: Any])?["image_reference"] as? String, "sha256:runtime-image")
+
+        let failed = AppCommandRouter.guestFailureReadback(context: readback, message: "capture failed")
+        XCTAssertNil(failed["runtime"])
+        XCTAssertNil(failed["frame"])
+        XCTAssertEqual(failed["grant_generation"] as? Int, 8)
+        XCTAssertEqual(failed["grant_invalidated"] as? Bool, true)
+        XCTAssertEqual(
+            (failed["recovery"] as? [String: Any])?["requires_new_start_grant"] as? Bool,
+            true
+        )
+    }
+
+    func test_remoteFrameExportsBoundedPNGIdentityWithoutViewerSecret() throws {
+        let support = makeSupport("rc-guest-remote-frame")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.png = Data([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x06, 0x40, 0x00, 0x00, 0x04, 0xb0,
+        ])
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let botID = BotID()
+
+        let frame = try service.remoteFrame(botID: botID)
+
+        XCTAssertEqual(frame.containerID, BotComputerGuestSpec.containerName(botID: botID))
+        XCTAssertEqual(frame.imageReference, "img")
+        XCTAssertEqual(frame.viewerPath, "/vnc.html")
+        XCTAssertEqual(frame.pixelWidth, 1_600)
+        XCTAssertEqual(frame.pixelHeight, 1_200)
+        XCTAssertEqual(frame.png, fake.png)
+        XCTAssertEqual(frame.pngHash.count, 64)
+    }
+
     func test_proveReadyRequiresPNGAndLoopback() throws {
         // WHY: Studio must not enable Docker desktop on a JPEG or a LAN bind.
         let support = makeSupport("rc-guest-svc")

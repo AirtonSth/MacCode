@@ -141,6 +141,7 @@ public enum HostMutationContract {
     bot.guest.start
     bot.guest.stop
     bot.guest.rebuild
+    bot.guest.revoke
     bot.docker.clear
     bot.notify.set
     bot.desktop.set
@@ -326,6 +327,22 @@ public enum HostMutationContract {
                     .string("profile_id", nonempty: true),
                     .string("host_id", nonempty: true),
                     .anyString(["attention_item_id", "notification_id", "item_id"], nonempty: true),
+                ]
+            case "bot.guest.start":
+                return [
+                    .uuid("bot_id"),
+                    .string("task_id", nonempty: true), .string("recipe_id", nonempty: true),
+                ]
+            case "bot.guest.input":
+                return [
+                    .uuid("bot_id"),
+                    .string("task_id", nonempty: true), .object("runtime"),
+                    .string("before_frame_id", nonempty: true), .object("input"),
+                ]
+            case "bot.guest.stop", "bot.guest.rebuild", "bot.guest.revoke":
+                return [
+                    .uuid("bot_id"),
+                    .string("task_id", nonempty: true), .object("runtime"),
                 ]
             default:
                 return [.uuid("bot_id")]

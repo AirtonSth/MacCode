@@ -13,4 +13,24 @@ final class BotComputerGuestObserveTests: XCTestCase {
         XCTAssertNoThrow(try BotComputerGuestObserve.assertActStepCount(3))
         XCTAssertThrowsError(try BotComputerGuestObserve.assertGuestRelativePath("../etc/passwd"))
     }
+
+    func test_dragIsOneAtomicGuestCommand_becauseRemoteDragCannotBeThreeReplayableMutations() throws {
+        let command = try BotComputerActStep(
+            action: "drag",
+            x: 10,
+            y: 20,
+            toX: 300,
+            toY: 400
+        ).execCommand()
+        XCTAssertEqual(command, [
+            "env", "DISPLAY=:1", "xdotool",
+            "mousemove", "10", "20",
+            "mousedown", "1",
+            "mousemove", "--sync", "300", "400",
+            "mouseup", "1",
+        ])
+        XCTAssertThrowsError(
+            try BotComputerActStep(action: "drag", x: 10, y: 20, toX: 10, toY: 20).execCommand()
+        )
+    }
 }

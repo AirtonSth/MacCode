@@ -1181,7 +1181,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
     func test_canonicalManifestExactlyMatchesDispatcherMutationCatalog() throws {
         let canonical = try canonicalMutationMethods()
 
-        XCTAssertEqual(canonical.count, 141)
+        XCTAssertEqual(canonical.count, 142)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }
@@ -3135,6 +3135,72 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         XCTAssertEqual(router.pairedBotRemoteCallCount, 1)
         XCTAssertEqual(router.finalizationCallCount, 1)
         XCTAssertEqual(router.finalizedEventKinds["bot.create:bot-domain-rejection"], [])
+    }
+
+    /// WHY: Guest execution is intentionally accepted before Docker/frame
+    /// settlement, but that accepted authority transition still needs one
+    /// durable canonical event so paired clients never depend on local UI.
+    func test_pairedGuestAcceptedReceiptFinalizesCanonicalIdentityEvent() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        let botID = UUID().uuidString.lowercased()
+        let taskID = UUID().uuidString.lowercased()
+        let requestID = "guest-accepted"
+        router.pairedBotRemoteResult = .object([
+            "status": .string("accepted"),
+            "request_id": .string(requestID),
+            "receipt_id": .string(UUID().uuidString.lowercased()),
+            "bot_id": .string(botID),
+            "readback": .object([
+                "host_id": .string("phase4-host"),
+                "bot_id": .string(botID),
+                "status": .string("starting"),
+                "viewer_path": .string("/vnc.html"),
+                "url": .string("http://127.0.0.1:6080/vnc.html?token=unsafe"),
+                "bearer_token": .string("unsafe-bearer"),
+                "grant_generation": .number(1),
+                "grant_invalidated": .bool(false),
+                "runtime": .object([
+                    "container_id": .string("container"),
+                    "session_id": .string("session"),
+                    "grant_id": .string("grant"),
+                    "loopback_url": .string("http://127.0.0.1:6080"),
+                ]),
+                "security": .object([
+                    "loopback_url_exported": .bool(false),
+                    "bearer_exported": .bool(false),
+                    "bearer_token": .string("unsafe-bearer"),
+                ]),
+            ]),
+        ])
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_501)
+        defer { live.stop() }
+        var params = live.mutationParams(
+            requestId: requestID,
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        params.removeValue(forKey: "thread_id")
+        params.removeValue(forKey: "text")
+        params["bot_id"] = botID
+        params["host_id"] = "phase4-host"
+        params["task_id"] = taskID
+        params["recipe_id"] = UUID().uuidString.lowercased()
+
+        let response = try await live.rpc(method: "bot.guest.start", params: params)
+
+        XCTAssertEqual((response["result"] as? [String: Any])?["status"] as? String, "accepted")
+        XCTAssertEqual(
+            router.finalizedEventKinds["bot.guest.start:\(requestID)"],
+            ["bot.guest.updated"]
+        )
+        let event = try XCTUnwrap(router.finalizedEvents["bot.guest.start:\(requestID)"]?.first)
+        XCTAssertEqual(event.payload.objectValue?["host_id"]?.stringValue, "phase4-host")
+        XCTAssertEqual(event.payload.objectValue?["viewer_path"]?.stringValue, "/vnc.html")
+        XCTAssertEqual(event.payload.objectValue?["security"]?.objectValue?["bearer_exported"]?.boolValue, false)
+        let eventData = try JSONEncoder().encode(event.payload)
+        let eventWire = try XCTUnwrap(String(data: eventData, encoding: .utf8))
+        XCTAssertFalse(eventWire.contains("127.0.0.1"))
+        XCTAssertFalse(eventWire.contains("unsafe-bearer"))
     }
 
     private func canonicalMutationMethods() throws -> Set<String> {
