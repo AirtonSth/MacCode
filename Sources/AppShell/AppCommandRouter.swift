@@ -7441,6 +7441,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func notificationList(workspaceId: WorkspaceID?, unreadOnly: Bool) throws -> [[String: JSONValue]] {
         guard let ctx = context else { return [] }
         let repo = NotificationRepository(db: ctx.db)
+        let botMetadata = BotAttentionNotificationMetadataStore(db: ctx.db)
+        let botMetadataByID = botMetadata.all()
         let list = try repo.list(workspaceId: workspaceId, unreadOnly: unreadOnly)
         return list.map { n in
             var d: [String: JSONValue] = [
@@ -7453,6 +7455,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             if let w = n.workspaceId { d["workspace_id"] = .string(w.value.uuidString) }
             if let s = n.surfaceId { d["surface_id"] = .string(s.value.uuidString) }
             if let r = n.readAt { d["read_at"] = .string(iso8601Formatter.string(from: r)) }
+            if let metadata = botMetadataByID[n.id] {
+                for (key, value) in metadata.fields { d[key] = .string(value) }
+            }
             d["push_policy"] = .string("background_only")
             return d
         }

@@ -37,13 +37,17 @@ public final class NotificationRepository {
     /// Idempotent event projection. Unlike `insert`, replaying the same stable
     /// event ID must not clear an existing read/dismissed timestamp and resurrect
     /// an item the user already acknowledged.
-    public func insertIfAbsent(_ n: AppNotification) throws {
+    @discardableResult
+    public func insertIfAbsent(_ n: AppNotification) throws -> Bool {
         let st = try db.prepare("""
             INSERT OR IGNORE INTO notifications(id, workspace_id, surface_id, title, body, category, created_at, read_at, dismissed_at)
             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?);
         """)
         try bind(n, to: st)
         _ = try st.step()
+        let changed = try db.prepare("SELECT changes();")
+        defer { changed.reset() }
+        return try changed.step() && changed.columnInt64(0) == 1
     }
 
     /// Reopens one stable stateful notification for a new live occurrence.

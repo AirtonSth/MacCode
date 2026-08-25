@@ -45,12 +45,12 @@ public final class BotAttentionPushBindingStore: @unchecked Sendable {
         return loadUnlocked().contains { $0.profileID == profileID && $0.hostID == hostID }
     }
 
-    public func latest(hostID: String? = nil) -> BotAttentionPushBinding? {
+    public func unique(hostID: String) -> BotAttentionPushBinding? {
         Self.lock.lock()
         defer { Self.lock.unlock() }
-        return loadUnlocked()
-            .filter { hostID == nil || $0.hostID == hostID }
-            .max { $0.updatedAt < $1.updatedAt }
+        let matches = loadUnlocked().filter { $0.hostID == hostID }
+        guard matches.count == 1 else { return nil }
+        return matches[0]
     }
 
     private func loadUnlocked() -> [BotAttentionPushBinding] {

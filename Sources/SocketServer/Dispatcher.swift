@@ -1099,7 +1099,38 @@ public final class JSONRPCDispatcher {
         func string(_ keys: String...) -> JSONValue? {
             keys.lazy.compactMap { params[$0]?.stringValue }.first.map(JSONValue.string)
         }
+        func canonicalBotNotification(_ value: JSONValue) -> JSONValue? {
+            guard let object = value.objectValue,
+                  let id = object["id"]?.stringValue,
+                  let profileID = object["profile_id"]?.stringValue,
+                  let hostID = object["host_id"]?.stringValue,
+                  let attentionItemID = object["attention_item_id"]?.stringValue,
+                  let notificationID = object["notification_id"]?.stringValue,
+                  let botID = object["bot_id"]?.stringValue,
+                  let source = object["source"]?.stringValue,
+                  let title = object["title"]?.stringValue,
+                  let category = object["category"]?.stringValue,
+                  !id.isEmpty, notificationID == id, attentionItemID == id,
+                  !profileID.isEmpty, !hostID.isEmpty, !botID.isEmpty,
+                  source == "bot" || source == "routine" else {
+                return nil
+            }
+            var payload: [String: JSONValue] = [
+                "id": .string(id),
+                "title": .string(title),
+                "category": .string(category),
+                "profile_id": .string(profileID),
+                "host_id": .string(hostID),
+                "attention_item_id": .string(attentionItemID),
+                "notification_id": .string(notificationID),
+                "bot_id": .string(botID),
+                "source": .string(source),
+            ]
+            if let body = object["body"]?.stringValue { payload["body"] = .string(body) }
+            return .object(payload)
+        }
         var payload: [String: JSONValue] = [:]
+        var botNotifications: [JSONValue] = []
         let kind: String
         switch method {
         case "agent.message.send":
@@ -1215,6 +1246,12 @@ public final class JSONRPCDispatcher {
                 ?? object["readback"]?.objectValue?["bot_id"]
                 ?? string("bot_id")
             if let readback = object["readback"]?.objectValue {
+                if let notification = readback["notification"].flatMap(canonicalBotNotification) {
+                    botNotifications.append(notification)
+                }
+                if let notifications = readback["notifications"]?.arrayValue {
+                    botNotifications.append(contentsOf: notifications.compactMap(canonicalBotNotification))
+                }
                 payload["conversation_id"] = readback["conversation_id"]
                     ?? readback["selected_id"]
                     ?? string("conversation_id")
@@ -1240,6 +1277,9 @@ public final class JSONRPCDispatcher {
             return
         }
         EventBus.shared.publish(kind: kind, payload: .object(payload.compactMapValues { $0 }))
+        for notification in botNotifications {
+            EventBus.shared.publish(kind: "notification.created", payload: notification)
+        }
     }
 
     /// Translate symbolic key names (cmux v2 contract) into raw bytes

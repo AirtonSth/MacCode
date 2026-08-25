@@ -195,6 +195,6 @@
     {"method": "bot.routing.set", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.receipt.status"]},
     {"method": "bot.attention.ack", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.attention.updated"], "readbackMethods": ["bot.attention.list"]},
     {"method": "bot.self_config", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.receipt.status"]},
-    {"method": "bot.scheduler.tick", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.scheduler.updated"], "readbackMethods": ["bot.routine.list"]}
+    {"method": "bot.scheduler.tick", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.scheduler.updated", "notification.created"], "readbackMethods": ["bot.routine.list", "notification.list"]}
   ]
 }

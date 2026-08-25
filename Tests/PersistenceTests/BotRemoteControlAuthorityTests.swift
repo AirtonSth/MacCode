@@ -364,6 +364,13 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
     /// execution/result and attention identity after the Mac authority relaunches.
     func test_dueRoutinePersistsExecutionResultNextRunAndAttentionIdentity() throws {
         let base = Date(timeIntervalSince1970: 1_800_000_000)
+        let profileID = "ios-schedule-profile"
+        let hostID = "host-schedule"
+        try BotAttentionPushBindingStore(db: db).bind(
+            profileID: profileID,
+            hostID: hostID,
+            deviceID: "ios-schedule-device"
+        )
         let created = try authority.dispatch(method: "bot.create", params: [
             "client_request_id": "schedule-bot", "name": "Scheduler",
         ], now: base)
@@ -406,19 +413,56 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
 
         let early = try authority.dispatch(method: "bot.scheduler.tick", params: [
             "client_request_id": "schedule-early",
+            "host_id": hostID,
         ], now: base.addingTimeInterval(30))
         XCTAssertTrue((((early["readback"] as? [String: Any])?["runs"] as? [[String: Any]]) ?? []).isEmpty,
                       "scheduler must not fabricate an early execution")
+        XCTAssertTrue((((early["readback"] as? [String: Any])?["notifications"] as? [[String: Any]]) ?? []).isEmpty)
         let fired = try authority.dispatch(method: "bot.scheduler.tick", params: [
             "client_request_id": "schedule-due",
+            "host_id": hostID,
         ], now: Date(timeIntervalSince1970: due))
-        let run = try XCTUnwrap(
-            ((fired["readback"] as? [String: Any])?["runs"] as? [[String: Any]])?.first
-        )
+        let firedReadback = try XCTUnwrap(fired["readback"] as? [String: Any])
+        let run = try XCTUnwrap((firedReadback["runs"] as? [[String: Any]])?.first)
         let runID = try XCTUnwrap(run["run_id"] as? String)
         XCTAssertEqual(run["routine_id"] as? String, routineID)
         XCTAssertEqual(run["result"] as? String, "completed")
         XCTAssertEqual(run["schedule_spec_json"] as? String, spec.encodedJSON())
+        let notification = try XCTUnwrap(
+            (firedReadback["notifications"] as? [[String: Any]])?.first
+        )
+        let notificationID = try XCTUnwrap(notification["id"] as? String)
+        XCTAssertEqual(notification["profile_id"] as? String, profileID)
+        XCTAssertEqual(notification["host_id"] as? String, hostID)
+        XCTAssertEqual(notification["attention_item_id"] as? String, notificationID)
+        XCTAssertEqual(notification["notification_id"] as? String, notificationID)
+        XCTAssertEqual(notification["bot_id"] as? String, botID)
+        XCTAssertEqual(notification["source"] as? String, "routine")
+        XCTAssertEqual(notification["category"] as? String, "RemoteCodeThreadUpdate")
+        XCTAssertNil(notification["conversation_id"], "P003 must not claim a conversation")
+        let persistedNotification = try XCTUnwrap(
+            NotificationRepository(db: db).list().first { $0.id == notificationID }
+        )
+        XCTAssertEqual(persistedNotification.title, notification["title"] as? String)
+        XCTAssertEqual(persistedNotification.body, notification["body"] as? String)
+        XCTAssertEqual(persistedNotification.category, notification["category"] as? String)
+        let persistedMetadata = try XCTUnwrap(
+            BotAttentionNotificationMetadataStore(db: db).metadata(notificationID: notificationID)
+        )
+        XCTAssertEqual(persistedMetadata.profileID, profileID)
+        XCTAssertEqual(persistedMetadata.hostID, hostID)
+        XCTAssertEqual(persistedMetadata.attentionItemID, notificationID)
+        XCTAssertEqual(persistedMetadata.botID, botID)
+        XCTAssertEqual(persistedMetadata.source, "routine")
+        let replay = try authority.dispatch(method: "bot.scheduler.tick", params: [
+            "client_request_id": "schedule-due",
+            "host_id": hostID,
+        ], now: Date(timeIntervalSince1970: due))
+        XCTAssertEqual(
+            (replay["readback"] as? NSDictionary),
+            (fired["readback"] as? NSDictionary)
+        )
+        XCTAssertEqual(try NotificationRepository(db: db).list().filter { $0.id == notificationID }.count, 1)
 
         let relaunched = BotRemoteControlAuthority(
             db: db,
@@ -446,6 +490,49 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertNotNil(item["title"] as? String)
         XCTAssertNotNil(item["detail"] as? String)
         XCTAssertEqual(item["source"] as? String, "routine")
+        XCTAssertEqual(item["profile_id"] as? String, profileID)
+        XCTAssertEqual(item["host_id"] as? String, hostID)
+    }
+
+    /// WHY: a host can have multiple registered iOS devices. Without an exact
+    /// target in the Bot mutation, selecting the latest registration would send
+    /// another profile's notification, so ambiguous hosts must remain eventless.
+    func test_finishedAttentionFailsClosedWithTwoRegisteredDevices() throws {
+        let hostID = "host-two-devices"
+        try BotAttentionPushBindingStore(db: db).bind(
+            profileID: "profile-device-a",
+            hostID: hostID,
+            deviceID: "device-a"
+        )
+        try BotAttentionPushBindingStore(db: db).bind(
+            profileID: "profile-device-b",
+            hostID: hostID,
+            deviceID: "device-b"
+        )
+        XCTAssertNil(BotAttentionPushBindingStore(db: db).unique(hostID: hostID))
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "ambiguous-bot",
+            "name": "Ambiguous",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "ambiguous-send",
+            "host_id": hostID,
+            "bot_id": botID,
+            "text": "Finish safely",
+        ])
+        let stopped = try authority.dispatch(method: "bot.force_stop", params: [
+            "client_request_id": "ambiguous-stop",
+            "host_id": hostID,
+            "bot_id": botID,
+        ])
+        XCTAssertEqual(stopped["status"] as? String, "completed")
+        XCTAssertNil((stopped["readback"] as? [String: Any])?["notification"])
+        XCTAssertTrue(try NotificationRepository(db: db).list().isEmpty)
+        let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let item = try XCTUnwrap((listed["items"] as? [[String: Any]])?.first)
+        XCTAssertEqual(item["host_id"] as? String, hostID)
+        XCTAssertNil(item["profile_id"])
     }
 
     func test_reservedCapability_neverGetsPositiveParity() {

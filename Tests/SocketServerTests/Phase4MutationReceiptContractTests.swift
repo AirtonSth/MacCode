@@ -2135,6 +2135,95 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         XCTAssertTrue(failedRouter.finalizedEvents["bot.attention.ack:attention-ack-failed"]?.isEmpty ?? true)
     }
 
+    /// WHY: iOS schedules Bot OS notifications only from notification.created.
+    /// A completed host mutation must atomically publish one scheduler-ready
+    /// payload, replay it zero times, and never publish it for accepted/failed.
+    func test_finishedBotAttentionPublishesOneCanonicalNotificationForIOSScheduler() async throws {
+        let botID = UUID().uuidString.lowercased()
+        let itemID = UUID().uuidString.lowercased()
+        let profileID = UUID().uuidString.lowercased()
+        let notification: JSONValue = .object([
+            "id": .string(itemID),
+            "title": .string("Scheduled Bot finished"),
+            "body": .string("The result is ready."),
+            "category": .string("RemoteCodeThreadUpdate"),
+            "profile_id": .string(profileID),
+            "host_id": .string(Phase4LiveServer.hostId),
+            "attention_item_id": .string(itemID),
+            "notification_id": .string(itemID),
+            "bot_id": .string(botID),
+            "source": .string("routine"),
+        ])
+        let router = Phase4ReceiptFakeRouter()
+        router.pairedBotRemoteResult = .object([
+            "status": .string("completed"),
+            "request_id": .string("bot-notification-completed"),
+            "receipt_id": .string("bot-notification-receipt"),
+            "readback": .object([
+                "runs": .array([]),
+                "notifications": .array([notification]),
+            ]),
+        ])
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_736)
+        defer { live.stop() }
+        var params = live.mutationParams(
+            requestId: "bot-notification-completed",
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        params.removeValue(forKey: "thread_id")
+        params.removeValue(forKey: "text")
+        let first = try await live.rpc(method: "bot.scheduler.tick", params: params)
+        let replay = try await live.rpc(method: "bot.scheduler.tick", params: params)
+        XCTAssertEqual(first["result"] as? NSDictionary, replay["result"] as? NSDictionary)
+        XCTAssertEqual(router.pairedBotRemoteCallCount, 1)
+        XCTAssertEqual(router.finalizationCallCount, 1)
+        let events = try XCTUnwrap(
+            router.finalizedEvents["bot.scheduler.tick:bot-notification-completed"]
+        )
+        XCTAssertEqual(events.map(\.kind), ["bot.scheduler.updated", "notification.created"])
+        let payload = try XCTUnwrap(events.last?.payload.objectValue)
+        XCTAssertEqual(payload["id"]?.stringValue, itemID)
+        XCTAssertEqual(payload["title"]?.stringValue, "Scheduled Bot finished")
+        XCTAssertEqual(payload["body"]?.stringValue, "The result is ready.")
+        XCTAssertEqual(payload["category"]?.stringValue, "RemoteCodeThreadUpdate")
+        XCTAssertEqual(payload["profile_id"]?.stringValue, profileID)
+        XCTAssertEqual(payload["host_id"]?.stringValue, Phase4LiveServer.hostId)
+        XCTAssertEqual(payload["attention_item_id"]?.stringValue, itemID)
+        XCTAssertEqual(payload["notification_id"]?.stringValue, itemID)
+        XCTAssertEqual(payload["bot_id"]?.stringValue, botID)
+        XCTAssertEqual(payload["source"]?.stringValue, "routine")
+        XCTAssertNil(payload["conversation_id"])
+
+        for status in ["accepted", "failed"] {
+            let terminalRouter = Phase4ReceiptFakeRouter()
+            let requestID = "bot-notification-\(status)"
+            terminalRouter.pairedBotRemoteResult = .object([
+                "status": .string(status),
+                "request_id": .string(requestID),
+                "receipt_id": .string("receipt-\(status)"),
+                "readback": .object(["notifications": .array([notification])]),
+            ])
+            let terminalLive = try await Phase4LiveServer.start(
+                router: terminalRouter,
+                bootEpoch: status == "accepted" ? 1_737 : 1_738
+            )
+            var terminalParams = terminalLive.mutationParams(
+                requestId: requestID,
+                threadId: AgentThreadID(),
+                text: "unused"
+            )
+            terminalParams.removeValue(forKey: "thread_id")
+            terminalParams.removeValue(forKey: "text")
+            _ = try await terminalLive.rpc(method: "bot.scheduler.tick", params: terminalParams)
+            XCTAssertTrue(
+                terminalRouter.finalizedEvents["bot.scheduler.tick:\(requestID)"]?.isEmpty ?? true,
+                status
+            )
+            terminalLive.stop()
+        }
+    }
+
     func test_gitSSHAndProjectLaunchBatchIsDurableAndNoReplay() async throws {
         let workspaceUUID = UUID()
         let workspaceID = workspaceUUID.uuidString

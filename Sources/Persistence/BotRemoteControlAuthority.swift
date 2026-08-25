@@ -45,6 +45,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private let appSupport: URL
     private let browserStore: BotBrowserStore
     private let attentionBindings: BotAttentionPushBindingStore
+    private let attentionNotificationMetadata: BotAttentionNotificationMetadataStore
 
     public var onHasLiveRun: ((BotID) -> Bool)?
     public var onStopRun: ((BotID, Bool, String) -> Void)?
@@ -88,6 +89,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         self.appSupport = appSupportDirectory
         self.browserStore = BotBrowserStore(appSupportDirectory: appSupportDirectory)
         self.attentionBindings = BotAttentionPushBindingStore(db: db)
+        self.attentionNotificationMetadata = BotAttentionNotificationMetadataStore(db: db)
         loadSidecar()
         migrateSidecarQueueIfNeeded()
     }
@@ -326,7 +328,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         case "queue.remove":
             return try queueRemove(params: params, requestID: requestID)
         case "stop", "force_stop":
-            return try stop(params: params, requestID: requestID, force: name == "force_stop")
+            return try stop(params: params, requestID: requestID, force: name == "force_stop", now: now)
         case "conversation.create":
             return try conversationCreate(params: params, requestID: requestID)
         case "conversation.select":
@@ -646,7 +648,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         ])
     }
 
-    private func stop(params: [String: Any], requestID: String, force: Bool) throws -> [String: Any] {
+    private func stop(
+        params: [String: Any],
+        requestID: String,
+        force: Bool,
+        now: Date
+    ) throws -> [String: Any] {
         let bot = try requireBot(params)
         let botID = id(bot)
         let hadLive = onHasLiveRun?(bot.id) ?? (liveRuns[botID] != nil)
@@ -664,14 +671,14 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             ]
             drained = encodeQueue([next]).first
         }
-        attention[botID] = canonicalAttentionItem([
+        let item = canonicalAttentionItem([
             "id": attention[botID]?["id"] ?? UUID().uuidString.lowercased(),
             "bot_id": botID,
             "conversation_id": run?["conversation_id"] ?? NSNull(),
             "run_id": run?["run_id"] ?? NSNull(),
             "state": drained == nil ? "finished" : "working",
             "finished_at": drained == nil
-                ? Date().timeIntervalSince1970 as Any
+                ? now.timeIntervalSince1970 as Any
                 : NSNull(),
             "ownership": "primary",
             "primary": true,
@@ -680,18 +687,25 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "detail": drained == nil ? "Finished" : "Running queued follow-up",
             "source": "bot",
         ], hostID: string(params, "host_id"))
+        attention[botID] = item
+        let terminal = hadLive || run != nil
+        let notification = drained == nil && !liveStop && terminal
+            ? try persistAttentionNotification(item, now: now)
+            : nil
+        var readback: [String: Any] = [
+            "accepted": true,
+            "force": force,
+            "terminal": terminal,
+            "run": run as Any,
+            "drained": drained as Any,
+            "queue": encodeQueue(try store.listQueuedFollowUps(botID: bot.id)),
+        ]
+        if let notification { readback["notification"] = notification }
         return receipt(
             requestID: requestID,
             status: liveStop ? .accepted : .completed,
             botID: botID,
-            readback: [
-                "accepted": true,
-                "force": force,
-                "terminal": hadLive || run != nil,
-                "run": run as Any,
-                "drained": drained as Any,
-                "queue": encodeQueue(try store.listQueuedFollowUps(botID: bot.id)),
-            ]
+            readback: readback
         )
     }
 
@@ -831,6 +845,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func schedulerTick(params: [String: Any], now: Date, requestID: String) throws -> [String: Any] {
         var fired: [[String: Any]] = []
+        var notifications: [[String: Any]] = []
         for bot in try store.list() {
             for routine in try store.listRoutines(botID: bot.id) where routine.activation.isEnabled {
                 let routineKey = routine.definition.id.value.uuidString.lowercased()
@@ -869,7 +884,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                     )
                 ))
                 routineRuntime[routineKey] = runtime
-                attention[id(bot)] = canonicalAttentionItem([
+                let item = canonicalAttentionItem([
                     "id": UUID().uuidString.lowercased(),
                     "bot_id": id(bot),
                     "conversation_id": selectedConversation[id(bot)] ?? NSNull(),
@@ -883,10 +898,17 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                     "detail": "Scheduled routine completed",
                     "source": "routine",
                 ], hostID: string(params, "host_id"))
+                attention[id(bot)] = item
+                if let notification = try persistAttentionNotification(item, now: now) {
+                    notifications.append(notification)
+                }
                 fired.append(run)
             }
         }
-        return receipt(requestID: requestID, status: .completed, botID: nil, readback: ["runs": fired])
+        return receipt(requestID: requestID, status: .completed, botID: nil, readback: [
+            "runs": fired,
+            "notifications": notifications,
+        ])
     }
 
     private func attachmentStage(params: [String: Any], requestID: String) throws -> [String: Any] {
@@ -1408,12 +1430,66 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let requestedHost = hostID?.trimmingCharacters(in: .whitespacesAndNewlines)
         let storedHost = item["host_id"] as? String
         let selectedHost = storedHost?.isEmpty == false ? storedHost : requestedHost
-        if let selectedHost, !selectedHost.isEmpty,
-           let binding = attentionBindings.latest(hostID: selectedHost) {
-            item["profile_id"] = binding.profileID
-            item["host_id"] = binding.hostID
+        if let selectedHost, !selectedHost.isEmpty {
+            item["host_id"] = selectedHost
+            if let binding = attentionBindings.unique(hostID: selectedHost) {
+                item["profile_id"] = binding.profileID
+            }
         }
         return item
+    }
+
+    private func persistAttentionNotification(
+        _ item: [String: Any],
+        now: Date
+    ) throws -> [String: Any]? {
+        let state = item["state"] as? String ?? ""
+        guard state == "finished" || state == "needs" || state == "needs_attention",
+              let notificationID = item["notification_id"] as? String,
+              let attentionItemID = item["attention_item_id"] as? String,
+              let profileID = item["profile_id"] as? String,
+              let hostID = item["host_id"] as? String,
+              let botID = item["bot_id"] as? String,
+              let source = item["source"] as? String,
+              !notificationID.isEmpty, !attentionItemID.isEmpty,
+              !profileID.isEmpty, !hostID.isEmpty, !botID.isEmpty else {
+            return nil
+        }
+        let title = item["title"] as? String ?? "Bot needs attention"
+        let body = item["detail"] as? String
+        let category = "RemoteCodeThreadUpdate"
+        let metadata = BotAttentionNotificationMetadata(
+            notificationID: notificationID,
+            profileID: profileID,
+            hostID: hostID,
+            attentionItemID: attentionItemID,
+            botID: botID,
+            source: source
+        )
+        let inserted = try db.transaction {
+            let inserted = try NotificationRepository(db: db).insertIfAbsent(AppNotification(
+                id: notificationID,
+                title: title,
+                body: body,
+                category: category,
+                createdAt: now
+            ))
+            if inserted { try attentionNotificationMetadata.record(metadata) }
+            return inserted
+        }
+        guard inserted else { return nil }
+        return [
+            "id": notificationID,
+            "title": title,
+            "body": body as Any,
+            "category": category,
+            "profile_id": profileID,
+            "host_id": hostID,
+            "attention_item_id": attentionItemID,
+            "notification_id": notificationID,
+            "bot_id": botID,
+            "source": source,
+        ]
     }
 
     private func peerAsk(params: [String: Any], requestID: String) throws -> [String: Any] {
