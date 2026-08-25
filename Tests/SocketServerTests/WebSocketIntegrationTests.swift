@@ -717,6 +717,30 @@ final class WebSocketIntegrationTests: XCTestCase {
         XCTAssertEqual(event["connectionId"] as? String, connectionId)
     }
 
+    func test_CONN009_clientControlPingDoesNotSuppressTypedHeartbeat() async throws {
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        let task = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+        let welcome = try object(from: await receiveWithTimeout(task))
+        XCTAssertEqual((welcome["heartbeatIntervalMs"] as? NSNumber)?.int64Value, 10_000)
+
+        // Reproduce Foundation's ordering near the first heartbeat. Before the
+        // fix, the server counted this control ping as useful application
+        // traffic and postponed the typed heartbeat until the iOS deadline.
+        try await Task.sleep(nanoseconds: 8_000_000_000)
+        let pong = expectation(description: "client RFC ping receives pong")
+        task.sendPing { error in
+            XCTAssertNil(error)
+            pong.fulfill()
+        }
+        await fulfillment(of: [pong], timeout: 3)
+
+        let heartbeat = try object(from: await receiveWithTimeout(task, seconds: 4))
+        XCTAssertEqual(heartbeat["type"] as? String, "heartbeat")
+        XCTAssertEqual(heartbeat["connectionId"] as? String, welcome["connectionId"] as? String)
+    }
+
     func testWebSocketCloseUnsubscribesEventBus() async throws {
         let baselineSubscribers = EventBus.shared.subscriberCountForTests
         let (server, port) = try startServer()

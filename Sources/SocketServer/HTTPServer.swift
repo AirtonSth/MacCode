@@ -814,6 +814,10 @@ private final class SocketReadyOnceFlag: @unchecked Sendable {
 final class WebSocketLivenessState: @unchecked Sendable {
     enum Action: Equatable {
         case none
+        /// Send the application heartbeat without an RFC control ping. Recent
+        /// inbound traffic proves the peer can still write, but it does not
+        /// prove the peer's application-frame receive pipeline is advancing.
+        case heartbeat(Data)
         case ping(Data)
         case timedOut
     }
@@ -823,7 +827,7 @@ final class WebSocketLivenessState: @unchecked Sendable {
     private let timeout: TimeInterval
     private let nonce: @Sendable () -> Data
     private var lastProofAt: TimeInterval
-    private var lastPingAt: TimeInterval
+    private var lastHeartbeatAt: TimeInterval
     private var outstandingPing: Data?
 
     init(
@@ -836,21 +840,26 @@ final class WebSocketLivenessState: @unchecked Sendable {
         self.timeout = timeout
         self.nonce = nonce
         self.lastProofAt = now
-        self.lastPingAt = now
+        self.lastHeartbeatAt = now
     }
 
     func nextAction(now: TimeInterval) -> Action {
         lock.lock(); defer { lock.unlock() }
         if now - lastProofAt >= timeout { return .timedOut }
         // Real inbound traffic (or a recent pong) is liveness: do not emit a
-        // spurious RFC ping while the peer is already proving the path.
+        // spurious RFC ping while the peer is already proving the path. Keep
+        // the application heartbeat cadence independent, though: an RFC ping
+        // from the peer must not suppress the useful frame its receive loop
+        // relies on for the negotiated heartbeat deadline.
         guard outstandingPing == nil,
-              now - lastProofAt >= interval,
-              now - lastPingAt >= interval else { return .none }
+              now - lastHeartbeatAt >= interval else { return .none }
         let payload = nonce().prefix(125)
         let ping = Data(payload)
+        lastHeartbeatAt = now
+        guard now - lastProofAt >= interval else {
+            return .heartbeat(ping)
+        }
         outstandingPing = ping
-        lastPingAt = now
         return .ping(ping)
     }
 
@@ -862,8 +871,8 @@ final class WebSocketLivenessState: @unchecked Sendable {
         if outstandingPing != nil {
             return max(0, timeoutAt - now)
         }
-        let nextPingAt = max(lastProofAt + interval, lastPingAt + interval)
-        return max(0, min(nextPingAt, timeoutAt) - now)
+        let nextHeartbeatAt = lastHeartbeatAt + interval
+        return max(0, min(nextHeartbeatAt, timeoutAt) - now)
     }
 
     @discardableResult
@@ -873,7 +882,7 @@ final class WebSocketLivenessState: @unchecked Sendable {
               payload == outstandingPing else { return false }
         outstandingPing = nil
         lastProofAt = now
-        lastPingAt = now
+        lastHeartbeatAt = now
         return true
     }
 
@@ -883,7 +892,6 @@ final class WebSocketLivenessState: @unchecked Sendable {
     func noteInboundTraffic(now: TimeInterval) {
         lock.lock(); defer { lock.unlock() }
         lastProofAt = now
-        lastPingAt = now
         outstandingPing = nil
     }
 }
@@ -2779,6 +2787,17 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 switch liveness.nextAction(now: Date().timeIntervalSinceReferenceDate) {
                 case .none:
                     scheduleHeartbeatWake()
+                case .heartbeat(let payload):
+                    defer { scheduleHeartbeatWake() }
+                    guard let nonce = String(data: payload, encoding: .utf8),
+                          let heartbeatData = self.connectionHeartbeatData(
+                              connectionId: connectionId,
+                              nonce: nonce,
+                              lastReceivedSequence: sequenceWatermark.value
+                          ) else {
+                        return
+                    }
+                    _ = outbound.enqueueControl(opcode: 0x1, data: heartbeatData)
                 case .ping(let payload):
                     defer { scheduleHeartbeatWake() }
                     guard let nonce = String(data: payload, encoding: .utf8),
