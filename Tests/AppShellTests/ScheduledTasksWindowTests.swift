@@ -123,6 +123,24 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertTrue(source.contains("ensureActiveRunPolling"))
     }
 
+    func test_searchAndSelectionUseScopedDeferredPasses_becauseOverviewHydrationMustNotRepeat() throws {
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("scheduleTasksRefreshPass()"))
+        XCTAssertTrue(source.contains("scheduleRunsRefreshPass()"))
+        XCTAssertTrue(source.contains("tasksRefreshGeneration &+= 1"))
+        XCTAssertTrue(source.contains("runsRefreshGeneration &+= 1"))
+        XCTAssertTrue(source.contains("finishTasksRefreshTask(ownedBy: generation)"))
+        XCTAssertTrue(source.contains("finishRunsRefreshTask(ownedBy: generation)"))
+        XCTAssertFalse(
+            source.contains("if deferHydration { scheduleFreshnessPass() } else { reloadTasks() }"),
+            "typing in the overview must not re-run unrelated workspace/provider hydration"
+        )
+        XCTAssertFalse(
+            source.contains("if deferHydration { scheduleFreshnessPass() } else { reloadRuns() }"),
+            "selecting a task must not re-run unrelated overview hydration"
+        )
+    }
+
     func test_scheduledExecutionUsesHeadlessSendPath_becauseSchedulesMustNotStealFocus() throws {
         let runtime = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTaskRuntime.swift"), encoding: .utf8)
         let main = try String(contentsOf: sourceURL("Sources/AppShell/AppDelegate.swift"), encoding: .utf8)
@@ -146,6 +164,22 @@ final class ScheduledTasksWindowTests: XCTestCase {
             runtime.contains("context.coordinator.startRun("),
             "scheduled execute must start via sendAgentMessage, not a raw coordinator call"
         )
+    }
+
+    func test_scheduledStoreFanoutCoalescesByWorkspace_becauseManyAgentTabsShareOneRailRead() throws {
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/AppDelegate.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "private func reloadAgentSurfacesFromScheduledStoreChange()"))
+        let tail = source[start.upperBound...]
+        let end = tail.range(of: "\n    public func checkForUpdatesAfterOpeningApp")?.lowerBound ?? tail.endIndex
+        let body = String(tail[..<end])
+        XCTAssertTrue(body.contains("var workspaceIDs = Set<WorkspaceID>()"))
+        XCTAssertTrue(body.contains("requestCoalescedReload(workspaceID: workspaceID)"))
+        XCTAssertFalse(
+            body.contains("agent.viewModel.reloadThreads()"),
+            "scheduled-run bursts must not enqueue one rail refresh per open Agent tab"
+        )
+        XCTAssertTrue(body.contains("selectThread(selection.threadID, markRead: false)"))
+        XCTAssertTrue(body.contains("refreshSurfaceRuntimeState()"))
     }
 
     func test_rootViewUsesDesignSystemSurfaces_becauseScheduledTasksMustMatchLatestRemoteCodeChrome() throws {

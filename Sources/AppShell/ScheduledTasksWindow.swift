@@ -188,8 +188,12 @@ public final class ScheduledTasksViewModel: ObservableObject {
     private var providerLoadCount = 0
     private var activeRunPollTask: Task<Void, Never>?
     private var freshnessTask: Task<Void, Never>?
+    private var tasksRefreshTask: Task<Void, Never>?
+    private var runsRefreshTask: Task<Void, Never>?
     private var navigationTask: Task<Void, Never>?
     private var freshnessGeneration: UInt64 = 0
+    private var tasksRefreshGeneration: UInt64 = 0
+    private var runsRefreshGeneration: UInt64 = 0
     private var navigationGeneration: UInt64 = 0
     private var suppressSelectedTaskReload = false
     private let deferHydration: Bool
@@ -208,6 +212,8 @@ public final class ScheduledTasksViewModel: ObservableObject {
 
     deinit {
         freshnessTask?.cancel()
+        tasksRefreshTask?.cancel()
+        runsRefreshTask?.cancel()
         activeRunPollTask?.cancel()
         navigationTask?.cancel()
     }
@@ -235,21 +241,70 @@ public final class ScheduledTasksViewModel: ObservableObject {
     }
 
     func waitForFreshnessForTesting() async {
-        while let task = freshnessTask {
-            let generation = freshnessGeneration
-            await task.value
-            if freshnessGeneration == generation, freshnessTask == nil {
-                return
+        while true {
+            let pending = [freshnessTask, tasksRefreshTask, runsRefreshTask].compactMap { $0 }
+            guard !pending.isEmpty else { return }
+            await withTaskGroup(of: Void.self) { group in
+                for task in pending {
+                    group.addTask { await task.value }
+                }
             }
+            await Task.yield()
         }
     }
 
     private func reloadTasksOrDefer() {
-        if deferHydration { scheduleFreshnessPass() } else { reloadTasks() }
+        if deferHydration { scheduleTasksRefreshPass() } else { reloadTasks() }
     }
 
     private func reloadRunsOrDefer() {
-        if deferHydration { scheduleFreshnessPass() } else { reloadRuns() }
+        if deferHydration { scheduleRunsRefreshPass() } else { reloadRuns() }
+    }
+
+    /// Search/filter changes only need the task projection. Re-running the
+    /// complete hydration pass here used to re-read workspaces, users, run
+    /// history, scheduler state, and provider catalogs for every keystroke.
+    private func scheduleTasksRefreshPass() {
+        guard deferHydration else { return }
+        tasksRefreshTask?.cancel()
+        tasksRefreshGeneration &+= 1
+        let generation = tasksRefreshGeneration
+        tasksRefreshTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            defer { self.finishTasksRefreshTask(ownedBy: generation) }
+            guard !Task.isCancelled,
+                  self.tasksRefreshGeneration == generation else { return }
+            self.reloadTasks()
+        }
+    }
+
+    /// Selecting a task publishes the selection immediately and only then
+    /// refreshes its history. Keep that pass independent from the overview
+    /// task list so detail navigation does not repeat unrelated hydration.
+    private func scheduleRunsRefreshPass() {
+        guard deferHydration else { return }
+        runsRefreshTask?.cancel()
+        runsRefreshGeneration &+= 1
+        let generation = runsRefreshGeneration
+        runsRefreshTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            defer { self.finishRunsRefreshTask(ownedBy: generation) }
+            guard !Task.isCancelled,
+                  self.runsRefreshGeneration == generation else { return }
+            self.reloadRuns()
+        }
+    }
+
+    private func finishTasksRefreshTask(ownedBy generation: UInt64) {
+        guard tasksRefreshGeneration == generation else { return }
+        tasksRefreshTask = nil
+    }
+
+    private func finishRunsRefreshTask(ownedBy generation: UInt64) {
+        guard runsRefreshGeneration == generation else { return }
+        runsRefreshTask = nil
     }
 
     public var selectedTask: ScheduledTask? { tasks.first { $0.id == selectedTaskID } }
