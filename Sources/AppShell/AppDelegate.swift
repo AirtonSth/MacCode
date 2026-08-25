@@ -524,13 +524,27 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private func reloadAgentSurfacesFromScheduledStoreChange() {
+        var workspaceIDs = Set<WorkspaceID>()
+        var selectedThreads: [(viewModel: AgentAppViewModel, threadID: AgentThreadID)] = []
         for surface in SurfaceRegistry.shared.all() {
             guard let agent = surface as? AgentAppSurface else { continue }
-            let selected = agent.viewModel.selectedThreadId
-            agent.viewModel.reloadThreads()
-            if let selected {
-                agent.viewModel.selectThread(selected, markRead: false)
+            workspaceIDs.insert(agent.viewModel.workspaceID)
+            if let selected = agent.viewModel.selectedThreadId {
+                selectedThreads.append((agent.viewModel, selected))
             }
+        }
+        // One request per workspace is enough: the coordinator owns the
+        // shared off-main rail snapshot for every registered surface. The old
+        // per-surface reloadThreads() loop repeatedly cancelled/replaced the
+        // same workspace task during scheduled-run bursts.
+        for workspaceID in workspaceIDs {
+            AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: workspaceID)
+        }
+        // Keep the exact selected-thread chrome/read semantics. This soft
+        // reselect does not wipe the painted transcript or fetch a provider
+        // snapshot; it only reconciles the durable scheduled-run state.
+        for selection in selectedThreads {
+            selection.viewModel.selectThread(selection.threadID, markRead: false)
         }
         windowController?.refreshSurfaceRuntimeState()
     }

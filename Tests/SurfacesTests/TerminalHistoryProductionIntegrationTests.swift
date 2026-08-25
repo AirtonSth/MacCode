@@ -6,6 +6,137 @@ import XCTest
 
 @MainActor
 final class TerminalHistoryProductionIntegrationTests: XCTestCase {
+  func testSubThresholdEnqueuesCoalesceOneTimerFlush() async throws {
+    // WHY: repeated PTY callbacks inside the 250 ms batching window must use
+    // one delayed flush, otherwise many active terminals compete for main-actor
+    // work and can persist the same pending tail in separate UI wakeups.
+    let database = try SQLiteDB(path: ":memory:")
+    try Schema.migrate(database)
+    let repository = TerminalOutputRepository(db: database)
+    let surfaceID = SurfaceID().value.uuidString
+    let workspaceID = WorkspaceID().value.uuidString
+    let coordinator = TerminalHistoryCoordinator(
+      repository: repository,
+      surfaceID: surfaceID,
+      workspaceID: workspaceID
+    )
+    defer {
+      coordinator.beforePersistForTesting = nil
+      coordinator.discardAndDeletePersistedHistory()
+      _ = TerminalHistoryCoordinator.pendingFinalDeleteBarrier()?.wait(
+        until: .now() + 2
+      )
+    }
+
+    coordinator.prepare(restored: false)
+    try await waitForPreparationAsync(coordinator, expected: .ready(nextChunkIndex: 1))
+    let persistStarted = DispatchSemaphore(value: 0)
+    let persistCount = LockedCounter()
+    coordinator.beforePersistForTesting = {
+      if persistCount.increment() == 1 {
+        persistStarted.signal()
+      }
+    }
+
+    coordinator.enqueue(Data("RC2_TIMER_FIRST\n".utf8))
+    try await Task.sleep(nanoseconds: 50_000_000)
+    coordinator.enqueue(Data("RC2_TIMER_SECOND\n".utf8))
+
+    let deadline = Date().addingTimeInterval(2)
+    while persistCount.value == 0, Date() < deadline {
+      try await Task.sleep(nanoseconds: 5_000_000)
+    }
+    XCTAssertEqual(
+      persistStarted.wait(timeout: .now()),
+      .success,
+      "the delayed timer must eventually hand the coalesced tail to the writer"
+    )
+    let barrier = coordinator.flushBarrier()
+    let drained = await barrier.waitAsync(until: .now() + 2)
+    XCTAssertTrue(drained)
+    XCTAssertEqual(persistCount.value, 1)
+    XCTAssertEqual(
+      try repository.readWindow(surfaceID: surfaceID).text,
+      "RC2_TIMER_FIRST\nRC2_TIMER_SECOND\n"
+    )
+  }
+
+  func testClearBeforeFlushTimerDropsPreClearTailAndKeepsPostClearTail() async throws {
+    // WHY: clear_history cancels a pending delayed flush. Its eventual timer
+    // callback must not resurrect bytes that were intentionally discarded, while
+    // output received after the clear remains durable exactly once.
+    let database = try SQLiteDB(path: ":memory:")
+    try Schema.migrate(database)
+    let repository = TerminalOutputRepository(db: database)
+    let surfaceID = SurfaceID().value.uuidString
+    let coordinator = TerminalHistoryCoordinator(
+      repository: repository,
+      surfaceID: surfaceID,
+      workspaceID: WorkspaceID().value.uuidString
+    )
+    defer {
+      coordinator.discardAndDeletePersistedHistory()
+      _ = TerminalHistoryCoordinator.pendingFinalDeleteBarrier()?.wait(
+        until: .now() + 2
+      )
+    }
+
+    coordinator.prepare(restored: false)
+    try await waitForPreparationAsync(coordinator, expected: .ready(nextChunkIndex: 1))
+    coordinator.enqueue(Data("RC2_CLEAR_BEFORE_TIMER\n".utf8))
+    coordinator.clearPersistedHistory()
+    coordinator.enqueue(Data("RC2_CLEAR_AFTER_TIMER\n".utf8))
+
+    let barrier = coordinator.flushBarrier()
+    let cleared = await barrier.waitAsync(until: .now() + 2)
+    XCTAssertTrue(cleared)
+    try await Task.sleep(nanoseconds: 350_000_000)
+    XCTAssertEqual(
+      try repository.readWindow(surfaceID: surfaceID).text,
+      "RC2_CLEAR_AFTER_TIMER\n"
+    )
+  }
+
+  func testFinalizeBeforeFlushTimerDoesNotResurrectOrDuplicateTail() async throws {
+    // WHY: finalization drains a sub-threshold tail immediately, then rejects
+    // later output. The old delayed callback must become a no-op after that
+    // drain rather than replaying or duplicating the tail.
+    let database = try SQLiteDB(path: ":memory:")
+    try Schema.migrate(database)
+    let repository = TerminalOutputRepository(db: database)
+    let surfaceID = SurfaceID().value.uuidString
+    let coordinator = TerminalHistoryCoordinator(
+      repository: repository,
+      surfaceID: surfaceID,
+      workspaceID: WorkspaceID().value.uuidString
+    )
+    defer {
+      coordinator.discardAndDeletePersistedHistory()
+      _ = TerminalHistoryCoordinator.pendingFinalDeleteBarrier()?.wait(
+        until: .now() + 2
+      )
+    }
+
+    coordinator.prepare(restored: false)
+    try await waitForPreparationAsync(coordinator, expected: .ready(nextChunkIndex: 1))
+    let persistCount = LockedCounter()
+    coordinator.beforePersistForTesting = {
+      _ = persistCount.increment()
+    }
+    coordinator.enqueue(Data("RC2_FINALIZE_BEFORE_TIMER\n".utf8))
+    let barrier = coordinator.flushBarrier(finalizing: true)
+    let finalized = await barrier.waitAsync(until: .now() + 2)
+    XCTAssertTrue(finalized)
+
+    coordinator.enqueue(Data("RC2_LATE_AFTER_FINALIZE\n".utf8))
+    try await Task.sleep(nanoseconds: 350_000_000)
+    XCTAssertEqual(persistCount.value, 1)
+    XCTAssertEqual(
+      try repository.readWindow(surfaceID: surfaceID).text,
+      "RC2_FINALIZE_BEFORE_TIMER\n"
+    )
+  }
+
   func testPrepareRetriesOnlyTransientLocksAndPreservesPreflightUntilAuthoritativeIndex() throws {
     // WHY: falling back to chunk 1 after a temporary lock can collide with
     // durable history and silently discard new terminal bytes.

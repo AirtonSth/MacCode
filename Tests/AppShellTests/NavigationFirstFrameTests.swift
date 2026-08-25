@@ -176,6 +176,25 @@ extension ActiveThreadsWindowTests {
         XCTAssertTrue(source.contains("navigationTask"))
     }
 
+    func test_activeThreadsTabSwitchUsesScopedDeferredRefresh_becauseOnlyVisibleProjectionNeedsHydration() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/AppShell/ActiveThreadsWindow.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("public func scheduleTabRefresh(_ tab: Tab)"))
+        XCTAssertTrue(source.contains("tabRefreshGeneration &+= 1"))
+        XCTAssertTrue(source.contains("self.selectedTab == tab"))
+        XCTAssertTrue(source.contains("vm.scheduleTabRefresh(tab)"))
+        XCTAssertFalse(
+            source.contains("if vm.deferHydration { vm.scheduleFreshnessPass() }"),
+            "switching tabs must not rebuild both active and finished projections"
+        )
+    }
+
     func test_activeThreadOpenDefersExactRoute() throws {
         let source = try String(
             contentsOf: URL(fileURLWithPath: #filePath)
@@ -208,16 +227,19 @@ extension ScheduledTasksWindowTests {
         )
         try ScheduledTaskStore(db: context.db).save(task)
         let viewModel = ScheduledTasksViewModel(context: context, router: router, loadImmediately: false)
+        let beforeFilter = viewModel.fullHydrationCountForTesting
         viewModel.scheduleFreshnessPass()
         await viewModel.waitForFreshnessForTesting()
         viewModel.selectedTaskID = task.id
         await viewModel.waitForFreshnessForTesting()
-        let beforeFilter = viewModel.fullHydrationCountForTesting
+        let beforeScopedSearch = viewModel.fullHydrationCountForTesting
 
         viewModel.searchText = "does-not-match"
         await viewModel.waitForFreshnessForTesting()
 
         XCTAssertNil(viewModel.selectedTaskID)
+        XCTAssertEqual(viewModel.fullHydrationCountForTesting, beforeScopedSearch,
+                       "search changes use the scoped task projection and must not re-run full overview hydration")
         XCTAssertEqual(viewModel.fullHydrationCountForTesting, beforeFilter + 1)
     }
 
@@ -264,7 +286,20 @@ extension ScheduledTasksWindowTests {
             encoding: .utf8
         )
         XCTAssertTrue(source.contains("private func reloadTasksOrDefer()"))
-        XCTAssertTrue(source.contains("if deferHydration { scheduleFreshnessPass() }"))
+        XCTAssertTrue(source.contains("if deferHydration { scheduleTasksRefreshPass() }"))
+    }
+
+    func test_scheduledTaskFilterUsesScopedProjectionWithoutOverviewHydration() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/AppShell/ScheduledTasksWindow.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("if deferHydration { scheduleTasksRefreshPass() }"))
+        XCTAssertFalse(source.contains("if deferHydration { scheduleFreshnessPass() } else { reloadTasks() }"))
     }
 
     func test_scheduledHistoryOpenDefersExactRoute() throws {

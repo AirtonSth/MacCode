@@ -74,6 +74,51 @@ final class ActiveThreadsWindowTests: XCTestCase {
                       "opening a row must route into the agent thread")
     }
 
+    @MainActor
+    func test_tabRefreshAcknowledgesSelectionAndKeepsLatestProjectionAndFailure() async throws {
+        let directory = NSTemporaryDirectory() + "rc-active-refresh-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(workspaceId: workspaceID, title: "Finished target", provider: .codex, model: "gpt-5")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id, provider: .codex, providerInstanceId: "codex", model: "gpt-5",
+            status: .completed, startedAt: Date(timeIntervalSince1970: 10), finishedAt: Date(timeIntervalSince1970: 20)
+        )
+        try context.runRepo.upsert(run)
+
+        let viewModel = ActiveThreadsViewModel(context: context, router: router, loadImmediately: false)
+        viewModel.selectedTab = .lastFinished
+        XCTAssertEqual(viewModel.selectedTab, .lastFinished,
+                       "tab selection must be acknowledged before the deferred read")
+        viewModel.scheduleTabRefresh(.lastFinished)
+        viewModel.selectedTab = .active
+        viewModel.scheduleTabRefresh(.active)
+        viewModel.selectedTab = .lastFinished
+        viewModel.scheduleTabRefresh(.lastFinished)
+        for _ in 0..<1_000 {
+            if viewModel.finishedItems.count == 1 { break }
+            await Task.yield()
+        }
+        XCTAssertEqual(viewModel.selectedTab, .lastFinished)
+        XCTAssertEqual(viewModel.finishedItems.map(\.runID), [run.id],
+                       "the latest selected tab must publish the exact finished projection")
+        XCTAssertEqual(viewModel.finishedItems.first?.title, "Finished target")
+
+        try context.db.execute("DROP TABLE agent_runs")
+        viewModel.selectedTab = .lastFinished
+        viewModel.scheduleTabRefresh(.lastFinished)
+        for _ in 0..<1_000 {
+            if viewModel.errorMessage != nil { break }
+            await Task.yield()
+        }
+        XCTAssertNotNil(viewModel.errorMessage,
+                        "a failed finished-run repository read must remain visible")
+    }
+
     func test_appContextPublishesSidebarRefreshOnActiveCountChange_becauseBadgeMustStayLive() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/AppContext.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("lastPublishedActiveThreadCount"),

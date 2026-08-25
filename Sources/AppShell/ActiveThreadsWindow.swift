@@ -32,8 +32,10 @@ public final class ActiveThreadsViewModel: ObservableObject {
     private let router: AppCommandRouter
     private var startedAtByThread: [AgentThreadID: Date] = [:]
     private var freshnessTask: Task<Void, Never>?
+    private var tabRefreshTask: Task<Void, Never>?
     private var navigationTask: Task<Void, Never>?
     private var freshnessGeneration: UInt64 = 0
+    private var tabRefreshGeneration: UInt64 = 0
     private var navigationGeneration: UInt64 = 0
     fileprivate let deferHydration: Bool
 
@@ -48,6 +50,7 @@ public final class ActiveThreadsViewModel: ObservableObject {
 
     deinit {
         freshnessTask?.cancel()
+        tabRefreshTask?.cancel()
         navigationTask?.cancel()
     }
 
@@ -153,6 +156,38 @@ public final class ActiveThreadsViewModel: ObservableObject {
             }
         } catch {
             errorMessage = String(describing: error)
+        }
+    }
+
+    /// Tab changes only need the selected projection. Re-running `reload()`
+    /// here also rebuilt the active projection and durable start-time map,
+    /// which made a rapid Active ↔ Last Finished switch do twice the SQLite
+    /// work and republish both lists.
+    public func scheduleTabRefresh(_ tab: Tab) {
+        guard deferHydration else { return }
+        // The initial full pass already owns all projections. Let it finish
+        // rather than enqueueing a second read for a click in the same turn.
+        guard freshnessTask == nil else { return }
+        tabRefreshTask?.cancel()
+        tabRefreshGeneration &+= 1
+        let generation = tabRefreshGeneration
+        tabRefreshTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            defer {
+                if self.tabRefreshGeneration == generation {
+                    self.tabRefreshTask = nil
+                }
+            }
+            guard !Task.isCancelled,
+                  self.tabRefreshGeneration == generation,
+                  self.selectedTab == tab else { return }
+            switch tab {
+            case .active:
+                self.reloadActive()
+            case .lastFinished:
+                self.reloadFinished()
+            }
         }
     }
 
@@ -302,11 +337,9 @@ public struct ActiveThreadsRootView: View {
         }
         .onAppear { vm.scheduleFreshnessPass() }
         .onChange(of: vm.selectedTab) { tab in
-            if tab == .lastFinished {
-                if vm.deferHydration { vm.scheduleFreshnessPass() } else { vm.reloadFinished() }
-            } else {
-                if vm.deferHydration { vm.scheduleFreshnessPass() } else { vm.reloadActive() }
-            }
+            if vm.deferHydration { vm.scheduleTabRefresh(tab) }
+            else if tab == .lastFinished { vm.reloadFinished() }
+            else { vm.reloadActive() }
         }
     }
 

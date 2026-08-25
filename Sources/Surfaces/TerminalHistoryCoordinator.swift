@@ -2780,11 +2780,17 @@ final class TerminalHistoryCoordinator {
     private func scheduleFlush() {
         guard !flushScheduled else { return }
         flushScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            guard let self else { return }
-            self.flushScheduled = false
-            if case .ready = self.preparationState {
-                self.flushReadyPending()
+        // The coordinator is main-actor isolated, but the timer itself does
+        // not need the main queue. With many active terminals, one timer per
+        // surface otherwise competes with chat/layout work while the app is
+        // already trying to paint. Wake the actor only when the batch is due.
+        queue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.flushScheduled = false
+                if case .ready = self.preparationState {
+                    self.flushReadyPending()
+                }
             }
         }
     }
