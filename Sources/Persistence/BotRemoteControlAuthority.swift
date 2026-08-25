@@ -69,6 +69,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private var routineRuntime: [String: [String: Any]] = [:]
     private var filesLocation: [String: String] = [:]
     private var fileGenerations: [String: Int] = [:]
+    private var fileCAS: [String: String] = [:]
     private var fileHosts: [String: String] = [:]
     private var routingPref: [String: [String: Any]] = [:]
     private var consumedRoutingReceipts: Set<String> = []
@@ -242,6 +243,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "host_id": hostID,
             "root": root,
             "generation": currentGeneration,
+            "root_cas": fileCASValue(botID: botID, root: root),
             "root_handle": rootEntry["handle"] as Any,
             "entries": entries,
             "security": fileSecurity(),
@@ -911,27 +913,46 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let bot = try requireBot(params)
         let botID = id(bot)
         let hostID = try requireFileHost(params: params, botID: botID)
-        let handle = string(params, "handle") ?? ""
-        guard !handle.isEmpty else { throw Error.invalidParams }
-        let entry = try resolveFileEntry(bot: bot, handle: handle)
+        let rootHandle = string(params, "root_handle") ?? ""
+        guard !rootHandle.isEmpty else { throw Error.invalidParams }
+        let rootEntry = try resolveFileEntry(bot: bot, handle: rootHandle)
+        let handle = string(params, "handle")
+        let entry = try handle.map { try resolveFileEntry(bot: bot, handle: $0) } ?? rootEntry
         guard entry["host_id"] as? String == hostID else { throw Error.crossTarget }
         let root = entry["root"] as? String ?? ""
         let selectedRoot = filesLocation[botID] ?? "bot_home"
         let currentGeneration = fileGeneration(botID: botID, root: root)
+        let currentCAS = fileCASValue(botID: botID, root: root)
         let grantedGeneration = entry["generation"] as? Int ?? 0
-        let expectedGeneration = int(params, "expected_generation") ?? grantedGeneration
-        guard root == selectedRoot, grantedGeneration == currentGeneration,
-              expectedGeneration == currentGeneration else {
+        let grantedCAS = entry["cas"] as? String ?? ""
+        guard let expectedGeneration = int(params, "expected_generation") ?? int(params, "generation"),
+              let expectedCAS = string(params, "expected_cas") ?? string(params, "cas"),
+              !expectedCAS.isEmpty else { throw Error.invalidParams }
+        guard root == selectedRoot,
+              rootEntry["host_id"] as? String == hostID,
+              rootEntry["root"] as? String == selectedRoot,
+              rootEntry["kind"] as? String == "root",
+              rootEntry["generation"] as? Int == currentGeneration,
+              rootEntry["cas"] as? String == currentCAS,
+              grantedGeneration == currentGeneration,
+              grantedCAS == currentCAS,
+              expectedGeneration == currentGeneration,
+              expectedCAS == currentCAS else {
             return fileConflictReceipt(
                 requestID: requestID,
+                hostID: hostID,
                 botID: botID,
                 root: selectedRoot,
-                expectedGeneration: expectedGeneration
+                expectedGeneration: expectedGeneration,
+                expectedCAS: expectedCAS
             )
         }
         let kind = entry["kind"] as? String ?? "file"
+        guard (handle == nil && kind == "root") || (handle != nil && kind == "file") else {
+            throw Error.invalidParams
+        }
         let path = kind == "root"
-            ? (string(params, "relative_path") ?? string(params, "path") ?? "")
+            ? (string(params, "relative_path") ?? "")
             : (entry["path"] as? String ?? "")
         guard !path.isEmpty else { throw Error.invalidParams }
         let op = string(params, "op") ?? "write"
@@ -940,6 +961,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         try applyDiskMutation(bot: bot, root: root, path: path, op: op, contents: contents)
         let nextGeneration = currentGeneration + 1
         fileGenerations[fileGenerationKey(botID: botID, root: root)] = nextGeneration
+        let nextCAS = rotateFileCAS(botID: botID, root: root)
         let nextEntry = op == "delete"
             ? nil
             : mintFileGrant(hostID: hostID, botID: botID, root: root, path: path, kind: "file")
@@ -949,32 +971,54 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "root": root,
             "path": path,
             "previous_generation": currentGeneration,
+            "previous_cas": currentCAS,
             "generation": nextGeneration,
+            "root_cas": nextCAS,
+            "root_handle": mintFileGrant(hostID: hostID, botID: botID, root: root, path: "", kind: "root")["handle"] as Any,
             "op": op,
             "security": fileSecurity(),
         ]
-        if let nextEntry { readback["handle"] = nextEntry["handle"] }
+        if let nextEntry {
+            readback["handle"] = nextEntry["handle"]
+            readback["entry_generation"] = nextEntry["generation"]
+            readback["entry_cas"] = nextEntry["cas"]
+        }
         return receipt(requestID: requestID, status: .completed, botID: botID, readback: readback)
     }
 
     private func filesOpen(params: [String: Any], requestID: String, split: Bool) throws -> [String: Any] {
         let bot = try requireBot(params)
         let hostID = try requireFileHost(params: params, botID: id(bot))
+        let rootHandle = string(params, "root_handle") ?? ""
         let handle = string(params, "handle") ?? ""
+        guard !rootHandle.isEmpty, !handle.isEmpty else { throw Error.invalidParams }
+        let rootEntry = try resolveFileEntry(bot: bot, handle: rootHandle)
         let entry = try resolveFileEntry(bot: bot, handle: handle)
         guard entry["host_id"] as? String == hostID else { throw Error.crossTarget }
         let root = (entry["root"] as? String) ?? (filesLocation[id(bot)] ?? "bot_home")
         let currentGeneration = fileGeneration(botID: id(bot), root: root)
-        let expectedGeneration = int(params, "expected_generation") ?? (entry["generation"] as? Int ?? 0)
+        let currentCAS = fileCASValue(botID: id(bot), root: root)
+        guard let expectedGeneration = int(params, "expected_generation") ?? int(params, "generation"),
+              let expectedCAS = string(params, "expected_cas") ?? string(params, "cas"),
+              !expectedCAS.isEmpty else { throw Error.invalidParams }
         guard root == (filesLocation[id(bot)] ?? "bot_home"),
+              rootEntry["host_id"] as? String == hostID,
+              rootEntry["root"] as? String == root,
+              rootEntry["kind"] as? String == "root",
+              rootEntry["generation"] as? Int == currentGeneration,
+              rootEntry["cas"] as? String == currentCAS,
               entry["kind"] as? String == "file",
               entry["generation"] as? Int == currentGeneration,
-              expectedGeneration == currentGeneration else {
+              entry["cas"] as? String == currentCAS,
+              expectedGeneration == currentGeneration,
+              expectedCAS == currentCAS else {
             return fileConflictReceipt(
                 requestID: requestID,
+                hostID: hostID,
                 botID: id(bot),
                 root: filesLocation[id(bot)] ?? "bot_home",
-                expectedGeneration: expectedGeneration
+                expectedGeneration: expectedGeneration,
+                expectedCAS: expectedCAS
             )
         }
         let path = entry["path"] as? String ?? ""
@@ -985,6 +1029,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             try onOpenFile(bot.id, path, split, root)
         }
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
+            "bot_id": id(bot),
             "mounted": true,
             "host_id": hostID,
             "split": split,
@@ -992,6 +1037,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "path": path,
             "root": root,
             "generation": currentGeneration,
+            "root_cas": currentCAS,
+            "root_handle": rootHandle,
+            "entry_generation": entry["generation"] as Any,
+            "entry_cas": entry["cas"] as Any,
             "security": fileSecurity(),
         ])
     }
@@ -1004,17 +1053,31 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard root == "bot_home" || root == "docker_home" else { throw Error.invalidParams }
         let previousRoot = filesLocation[botID] ?? "bot_home"
         let currentGeneration = fileGeneration(botID: botID, root: previousRoot)
-        if let expectedGeneration = int(params, "expected_generation"), expectedGeneration != currentGeneration {
+        let currentCAS = fileCASValue(botID: botID, root: previousRoot)
+        let expectedHandle = string(params, "previous_root_handle") ?? string(params, "expected_handle") ?? ""
+        guard let expectedGeneration = int(params, "expected_generation"),
+              let expectedCAS = string(params, "expected_cas"),
+              !expectedHandle.isEmpty, !expectedCAS.isEmpty else { throw Error.invalidParams }
+        let previousGrant = try resolveFileEntry(bot: bot, handle: expectedHandle)
+        if previousGrant["kind"] as? String != "root"
+            || previousGrant["root"] as? String != previousRoot
+            || previousGrant["generation"] as? Int != currentGeneration
+            || previousGrant["cas"] as? String != currentCAS
+            || expectedGeneration != currentGeneration
+            || expectedCAS != currentCAS {
             return fileConflictReceipt(
                 requestID: requestID,
+                hostID: hostID,
                 botID: botID,
                 root: previousRoot,
-                expectedGeneration: expectedGeneration
+                expectedGeneration: expectedGeneration,
+                expectedCAS: expectedCAS
             )
         }
         if root == "docker_home" { _ = try BotGuestHome.ensure(appSupport: appSupport, botID: bot.id) }
         if root != previousRoot {
             fileGenerations[fileGenerationKey(botID: botID, root: previousRoot)] = currentGeneration + 1
+            _ = rotateFileCAS(botID: botID, root: previousRoot)
             files = files.filter { $0.value["bot_id"] as? String != botID }
         }
         filesLocation[botID] = root
@@ -1024,7 +1087,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "host_id": hostID,
             "root": root,
             "previous_root": previousRoot,
+            "previous_generation": currentGeneration,
+            "previous_cas": currentCAS,
             "generation": fileGeneration(botID: botID, root: root),
+            "root_cas": fileCASValue(botID: botID, root: root),
             "root_handle": rootEntry["handle"] as Any,
             "security": fileSecurity(),
         ])
@@ -1185,6 +1251,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         for key in removed { files[key] = nil }
         let dockerGeneration = fileGeneration(botID: botID, root: "docker_home") + 1
         fileGenerations[fileGenerationKey(botID: botID, root: "docker_home")] = dockerGeneration
+        let dockerCAS = rotateFileCAS(botID: botID, root: "docker_home")
         guest[botID] = ["bot_id": botID, "status": "stopped", "viewer": "/vnc.html"]
         return receipt(
             requestID: requestID,
@@ -1196,6 +1263,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 "removed_count": max(removed.count, removedPaths.count),
                 "partial": partial,
                 "generation": dockerGeneration,
+                "root_cas": dockerCAS,
             ]
         )
     }
@@ -1558,12 +1626,28 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         fileGenerations[fileGenerationKey(botID: botID, root: root)] ?? 1
     }
 
+    private func fileCASValue(botID: String, root: String) -> String {
+        let key = fileGenerationKey(botID: botID, root: root)
+        if let value = fileCAS[key], !value.isEmpty { return value }
+        let value = UUID().uuidString.lowercased()
+        fileCAS[key] = value
+        return value
+    }
+
+    @discardableResult
+    private func rotateFileCAS(botID: String, root: String) -> String {
+        let value = UUID().uuidString.lowercased()
+        fileCAS[fileGenerationKey(botID: botID, root: root)] = value
+        return value
+    }
+
     private func fileSecurity() -> [String: Any] {
         [
             "opaque_handle": true,
             "bot_bound": true,
             "root_bound": true,
             "generation_bound": true,
+            "cas_bound": true,
             "symlink_safe": true,
         ]
     }
@@ -1578,6 +1662,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func mintFileGrant(hostID: String, botID: String, root: String, path: String, kind: String) -> [String: Any] {
         let currentGeneration = fileGeneration(botID: botID, root: root)
+        let currentCAS = fileCASValue(botID: botID, root: root)
         if let existing = files.values.first(where: {
             $0["bot_id"] as? String == botID
                 && $0["host_id"] as? String == hostID
@@ -1585,6 +1670,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 && $0["path"] as? String == path
                 && $0["kind"] as? String == kind
                 && $0["generation"] as? Int == currentGeneration
+                && $0["cas"] as? String == currentCAS
         }) {
             return existing
         }
@@ -1597,6 +1683,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "path": path,
             "kind": kind,
             "generation": currentGeneration,
+            "cas": currentCAS,
             "security": fileSecurity(),
         ]
         files[handle] = entry
@@ -1605,22 +1692,38 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func fileConflictReceipt(
         requestID: String,
+        hostID: String,
         botID: String,
         root: String,
-        expectedGeneration: Int
+        expectedGeneration: Int,
+        expectedCAS: String
     ) -> [String: Any] {
         let current = fileGeneration(botID: botID, root: root)
+        let currentCAS = fileCASValue(botID: botID, root: root)
         return receipt(requestID: requestID, status: .failed, botID: botID, readback: [
             "bot_id": botID,
+            "host_id": hostID,
             "conflict": true,
             "root": root,
+            "root_handle": mintFileGrant(
+                hostID: hostID,
+                botID: botID,
+                root: root,
+                path: "",
+                kind: "root"
+            )["handle"] as Any,
+            "generation": current,
+            "root_cas": currentCAS,
             "expected_generation": expectedGeneration,
+            "expected_cas": expectedCAS,
             "current_generation": current,
+            "current_cas": currentCAS,
             "recovery": [
                 "method": "bot.files.list",
                 "bot_id": botID,
                 "root": root,
                 "current_generation": current,
+                "current_cas": currentCAS,
             ],
         ])
     }
@@ -1801,6 +1904,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Int] {
             fileGenerations = decoded
         }
+        if let data = loadData("bot.remote.file_cas"),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+            fileCAS = decoded
+        }
         if let data = loadData("bot.remote.file_hosts"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
             fileHosts = decoded
@@ -1868,6 +1975,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         saveJSON("bot.remote.files_location", filesLocation)
         saveJSON("bot.remote.file_grants", files)
         saveJSON("bot.remote.file_generations", fileGenerations)
+        saveJSON("bot.remote.file_cas", fileCAS)
         saveJSON("bot.remote.file_hosts", fileHosts)
         saveJSON("bot.remote.browser_state", browser)
         saveJSON("bot.remote.routing", routingPref)

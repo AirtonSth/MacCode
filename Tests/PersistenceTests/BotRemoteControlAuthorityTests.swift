@@ -529,12 +529,14 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             ])
         )
         let grant = try fileRootGrant(botID: botID)
+        XCTAssertFalse(grant.cas.isEmpty)
         XCTAssertThrowsError(
             try authority.dispatch(method: "bot.files.mutate", params: [
                 "client_request_id": "esc",
                 "bot_id": botID,
-                "handle": grant.handle,
+                "root_handle": grant.handle,
                 "expected_generation": grant.generation,
+                "expected_cas": grant.cas,
                 "relative_path": "../etc/passwd",
                 "op": "write",
             ])
@@ -542,8 +544,9 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let wrote = try authority.dispatch(method: "bot.files.mutate", params: [
             "client_request_id": "ok",
             "bot_id": botID,
-            "handle": grant.handle,
+            "root_handle": grant.handle,
             "expected_generation": grant.generation,
+            "expected_cas": grant.cas,
             "relative_path": "MEMORY.md",
             "op": "write",
         ])
@@ -551,6 +554,11 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertFalse(handle?.contains(botID) == true, "opaque grants must not encode Bot identity")
         XCTAssertFalse(handle?.contains("/Users") == true)
         XCTAssertEqual((wrote["readback"] as? [String: Any])?["generation"] as? Int, grant.generation + 1)
+        XCTAssertNotEqual((wrote["readback"] as? [String: Any])?["root_cas"] as? String, grant.cas)
+        XCTAssertEqual(
+            (wrote["readback"] as? [String: Any])?["entry_cas"] as? String,
+            (wrote["readback"] as? [String: Any])?["root_cas"] as? String
+        )
     }
 
     func test_forceStop_returnsTerminalReadbackDistinctFromMissingRun() throws {
@@ -691,15 +699,17 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
         let grant = try fileRootGrant(botID: botID)
-        _ = try authority.dispatch(method: "bot.files.mutate", params: [
+        let wrote = try authority.dispatch(method: "bot.files.mutate", params: [
             "client_request_id": "disk-w",
             "bot_id": botID,
-            "handle": grant.handle,
+            "root_handle": grant.handle,
             "expected_generation": grant.generation,
+            "expected_cas": grant.cas,
             "relative_path": "notes.txt",
             "op": "write",
             "contents": "from remote",
         ])
+        let postCAS = try XCTUnwrap((wrote["readback"] as? [String: Any])?["root_cas"] as? String)
         let uuid = try XCTUnwrap(UUID(uuidString: botID))
         let bot = try XCTUnwrap(store.get(id: BotID(uuid)))
         let home = BotHome(appSupportDirectory: supportDir, bot: bot)
@@ -713,11 +723,13 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             appSupportDirectory: supportDir
         )
         let listed = try relaunched.dispatch(method: "bot.files.list", params: ["bot_id": botID])
+        XCTAssertEqual(listed["root_cas"] as? String, postCAS, "CAS authority must survive host relaunch")
         let entries = try XCTUnwrap(listed["entries"] as? [[String: Any]])
         XCTAssertTrue(
             entries.contains { ($0["path"] as? String) == "notes.txt" },
             "files.list must read the Bot Home disk after relaunch, got \(entries.map { $0["path"] as? String })"
         )
+        XCTAssertEqual(entries.first { ($0["path"] as? String) == "notes.txt" }?["cas"] as? String, postCAS)
     }
 
     func test_browserAction_persistsBotBrowserStoreTarget() throws {
@@ -767,17 +779,22 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "name": "Piper",
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let initialGrant = try fileRootGrant(botID: botID)
         _ = try authority.dispatch(method: "bot.files.location.set", params: [
             "client_request_id": "dock-loc",
             "bot_id": botID,
             "root": "docker_home",
+            "previous_root_handle": initialGrant.handle,
+            "expected_generation": initialGrant.generation,
+            "expected_cas": initialGrant.cas,
         ])
         let grant = try fileRootGrant(botID: botID)
         _ = try authority.dispatch(method: "bot.files.mutate", params: [
             "client_request_id": "dock-w",
             "bot_id": botID,
-            "handle": grant.handle,
+            "root_handle": grant.handle,
             "expected_generation": grant.generation,
+            "expected_cas": grant.cas,
             "relative_path": "scratch.txt",
             "op": "write",
             "contents": "guest bytes",
@@ -825,13 +842,17 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let wrote = try authority.dispatch(method: "bot.files.mutate", params: [
             "client_request_id": "open-w",
             "bot_id": botID,
-            "handle": grant.handle,
+            "root_handle": grant.handle,
             "expected_generation": grant.generation,
+            "expected_cas": grant.cas,
             "relative_path": "notes.txt",
             "op": "write",
             "contents": "surface",
         ])
         let handle = try XCTUnwrap((wrote["readback"] as? [String: Any])?["handle"] as? String)
+        let rootHandle = try XCTUnwrap((wrote["readback"] as? [String: Any])?["root_handle"] as? String)
+        let generation = try XCTUnwrap((wrote["readback"] as? [String: Any])?["generation"] as? Int)
+        let cas = try XCTUnwrap((wrote["readback"] as? [String: Any])?["root_cas"] as? String)
         var opened: [(String, Bool, String)] = []
         authority.onOpenFile = { _, path, split, root in
             opened.append((path, split, root))
@@ -839,14 +860,20 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let tab = try authority.dispatch(method: "bot.files.open_tab", params: [
             "client_request_id": "open-tab",
             "bot_id": botID,
+            "root_handle": rootHandle,
             "handle": handle,
+            "expected_generation": generation,
+            "expected_cas": cas,
         ])
         XCTAssertEqual((tab["readback"] as? [String: Any])?["mounted"] as? Bool, true)
         XCTAssertEqual((tab["readback"] as? [String: Any])?["split"] as? Bool, false)
         let split = try authority.dispatch(method: "bot.files.split", params: [
             "client_request_id": "open-split",
             "bot_id": botID,
+            "root_handle": rootHandle,
             "handle": handle,
+            "expected_generation": generation,
+            "expected_cas": cas,
         ])
         XCTAssertEqual((split["readback"] as? [String: Any])?["split"] as? Bool, true)
         XCTAssertEqual(opened.map(\.0), ["notes.txt", "notes.txt"])
@@ -1109,21 +1136,24 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
         let grant = try fileRootGrant(botID: botID)
-        _ = try authority.dispatch(method: "bot.files.mutate", params: [
+        let first = try authority.dispatch(method: "bot.files.mutate", params: [
             "client_request_id": "files-cas-first",
             "bot_id": botID,
-            "handle": grant.handle,
+            "root_handle": grant.handle,
             "expected_generation": grant.generation,
+            "expected_cas": grant.cas,
             "relative_path": "cas.txt",
             "op": "write",
             "contents": "authoritative",
         ])
+        let firstReadback = try XCTUnwrap(first["readback"] as? [String: Any])
         let conflictParams: [String: Any] = [
             "client_request_id": "files-cas-stale",
             "bot_id": botID,
-            "handle": grant.handle,
-            "expected_generation": grant.generation,
-            "relative_path": "cas.txt",
+            "root_handle": firstReadback["root_handle"] as Any,
+            "handle": firstReadback["handle"] as Any,
+            "expected_generation": firstReadback["generation"] as Any,
+            "expected_cas": grant.cas,
             "op": "write",
             "contents": "stale",
         ]
@@ -1133,6 +1163,9 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(conflict as NSDictionary, replay as NSDictionary)
         let readback = try XCTUnwrap(conflict["readback"] as? [String: Any])
         XCTAssertEqual(readback["conflict"] as? Bool, true)
+        XCTAssertEqual(readback["expected_generation"] as? Int, firstReadback["generation"] as? Int,
+                       "CAS must conflict even when generation is current")
+        XCTAssertNotEqual(readback["expected_cas"] as? String, readback["current_cas"] as? String)
         XCTAssertEqual((readback["recovery"] as? [String: Any])?["method"] as? String, "bot.files.list")
         let bot = try XCTUnwrap(store.get(id: BotID(try XCTUnwrap(UUID(uuidString: botID)))))
         XCTAssertEqual(try String(contentsOf: BotHome(appSupportDirectory: supportDir, bot: bot).root
@@ -1156,8 +1189,9 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "client_request_id": "files-cross-bot",
             "host_id": "host-a",
             "bot_id": thiefID,
-            "handle": grant.handle,
+            "root_handle": grant.handle,
             "expected_generation": grant.generation,
+            "expected_cas": grant.cas,
             "relative_path": "stolen.txt",
             "op": "write",
         ])) { error in
@@ -1173,8 +1207,9 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertThrowsError(try authority.dispatch(method: "bot.files.mutate", params: [
             "client_request_id": "files-symlink",
             "bot_id": ownerID,
-            "handle": grant.handle,
+            "root_handle": grant.handle,
             "expected_generation": grant.generation,
+            "expected_cas": grant.cas,
             "relative_path": "escape/payload.txt",
             "op": "write",
         ]))
@@ -1191,13 +1226,19 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "host_id": "host-a",
             "bot_id": ownerID,
             "root": "docker_home",
+            "previous_root_handle": grant.handle,
             "expected_generation": grant.generation,
+            "expected_cas": grant.cas,
         ])
+        let dockerGrant = try fileRootGrant(botID: ownerID, hostID: "host-a")
         _ = try authority.dispatch(method: "bot.files.location.set", params: [
             "client_request_id": "files-switch-back",
             "host_id": "host-a",
             "bot_id": ownerID,
             "root": "bot_home",
+            "previous_root_handle": dockerGrant.handle,
+            "expected_generation": dockerGrant.generation,
+            "expected_cas": dockerGrant.cas,
         ])
         XCTAssertThrowsError(try authority.dispatch(method: "bot.files.mutate", params: [
             "client_request_id": "files-revoked-switch",
@@ -1304,13 +1345,17 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(notifications, 1, "login verification must not reopen the page")
     }
 
-    private func fileRootGrant(botID: String, hostID: String = "") throws -> (handle: String, generation: Int) {
+    private func fileRootGrant(
+        botID: String,
+        hostID: String = ""
+    ) throws -> (handle: String, generation: Int, cas: String) {
         var params: [String: Any] = ["bot_id": botID]
         if !hostID.isEmpty { params["host_id"] = hostID }
         let listed = try authority.dispatch(method: "bot.files.list", params: params)
         return (
             try XCTUnwrap(listed["root_handle"] as? String),
-            try XCTUnwrap(listed["generation"] as? Int)
+            try XCTUnwrap(listed["generation"] as? Int),
+            try XCTUnwrap(listed["root_cas"] as? String)
         )
     }
 }

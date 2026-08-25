@@ -1221,7 +1221,9 @@ public final class JSONRPCDispatcher {
                 payload["routing_receipt_id"] = readback["routing_receipt_id"]
                 payload["key"] = readback["key"] ?? string("key")
                 for key in [
-                    "host_id", "root", "root_handle", "handle", "generation", "previous_generation", "path", "op",
+                    "host_id", "root", "root_handle", "handle", "generation", "previous_generation",
+                    "root_cas", "previous_cas", "expected_cas", "current_cas",
+                    "entry_generation", "entry_cas", "path", "op",
                     "surface_id", "snapshot_generation", "url", "title", "loading", "action",
                     "session_before_digest", "session_after_digest", "cleared", "removed_count", "partial",
                 ] {
