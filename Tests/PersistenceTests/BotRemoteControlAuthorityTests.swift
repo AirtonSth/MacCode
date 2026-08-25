@@ -309,7 +309,8 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         authority.onSend = { callbackBotID, callbackText, callbackConversationID, callbackRouting in
             XCTAssertEqual(callbackBotID.value.uuidString.lowercased(), botID)
             XCTAssertEqual(callbackText, "Use this exact route")
-            XCTAssertEqual(callbackConversationID?.value.uuidString.lowercased(), conversationID)
+            XCTAssertNil(callbackConversationID,
+                         "the first send must let the host create and return the authoritative conversation")
             XCTAssertEqual(callbackRouting["routing_receipt_id"] as? String, routingReceiptID)
             XCTAssertEqual(callbackRouting["run_as_user"] as? NSDictionary, runAs as NSDictionary)
             return [
@@ -324,7 +325,6 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let sendParams: [String: Any] = [
             "client_request_id": "route-send",
             "bot_id": botID,
-            "conversation_id": conversationID,
             "text": "Use this exact route",
             "host_id": "host-exact",
             "routing_receipt_id": routingReceiptID,

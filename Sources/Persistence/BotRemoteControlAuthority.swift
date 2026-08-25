@@ -557,8 +557,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
         let routing = try effectiveRouting(
             botID: botID,
-            params: params,
-            requireConversationID: requestedConversationID
+            params: params
         )
         let attachmentIDs = stringArray(params, "attachment_ids")
         var bound: [[String: Any]] = []
@@ -1954,8 +1953,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func effectiveRouting(
         botID: String,
-        params: [String: Any],
-        requireConversationID: String?
+        params: [String: Any]
     ) throws -> [String: Any] {
         let requestedReceipt = string(params, "routing_receipt_id")
         var routing = routingPref[botID] ?? [
@@ -1975,7 +1973,6 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               !consumedRoutingReceipts.contains(requestedReceipt),
               routing["routing_receipt_id"] as? String == requestedReceipt,
               routing["host_id"] as? String == string(params, "host_id"),
-              requireConversationID?.isEmpty == false,
               params["run_as_user"] != nil else {
             throw Error.crossTarget
         }
