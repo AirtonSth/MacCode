@@ -496,7 +496,9 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         )
     }
 
-    func test_browserAction_isHostFirstWithGeneration() throws {
+    /// WHY: bot.link.open is a distinct admitted intent. Its authoritative
+    /// readback must not silently identify the operation as navigation.
+    func test_linkOpen_isHostFirstAndReportsOpenAction() throws {
         let created = try authority.dispatch(method: "bot.create", params: [
             "client_request_id": "br",
             "name": "Piper",
@@ -509,6 +511,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         ])
         let readback = result["readback"] as? [String: Any]
         XCTAssertEqual(readback?["host_first"] as? Bool, true)
+        XCTAssertEqual(readback?["action"] as? String, "open")
         XCTAssertEqual(readback?["url"] as? String, "http://127.0.0.1:3000")
         XCTAssertGreaterThan(readback?["generation"] as? Int ?? 0, 0)
         XCTAssertNotNil(result["receipt_id"] as? String)

@@ -1181,7 +1181,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func linkOpen(params: [String: Any], requestID: String) throws -> [String: Any] {
         let url = string(params, "url") ?? ""
         guard !url.isEmpty else { throw Error.invalidParams }
-        return try browserAction(params: params.merging(["url": url]) { _, new in new }, requestID: requestID)
+        return try browserAction(
+            params: params.merging(["action": "open", "url": url]) { _, new in new },
+            requestID: requestID
+        )
     }
 
     private func guestCommand(name: String, params: [String: Any], requestID: String) throws -> [String: Any] {
