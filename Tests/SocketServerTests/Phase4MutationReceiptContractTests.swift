@@ -1297,7 +1297,11 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
                 method: method,
                 params: HostMutationContract.validPreflightProbe(method: method)
             ), method)
-            let probes = HostMutationContract.invalidPreflightProbes(method: method)
+            let probes = HostMutationContract.invalidPreflightProbes(method: method).filter { probe in
+                // Bot host identity is supplied by the authenticated transport,
+                // so client-declared host variants cannot exercise preflight.
+                !(method.hasPrefix("bot.") && probe.label.hasPrefix("host_id."))
+            }
             XCTAssertEqual(probes.isEmpty, parameterless.contains(method), method)
             covered.insert(method)
             for (index, probe) in probes.enumerated() {
@@ -1307,6 +1311,14 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
                 params["connection_id"] = .string("phase4-connection")
                 params["expected_host_id"] = .string("phase4-host")
                 params["expected_boot_epoch"] = .number(1)
+                if method == "private.push_token.update",
+                   params["server_id"]?.stringValue == "server" {
+                    // Typed push probes use a neutral valid sentinel. At the
+                    // authenticated HTTP boundary it must name this host so the
+                    // individual syntax defect, rather than host confirmation,
+                    // is the rejection being exercised.
+                    params["server_id"] = .string(context.hostId)
+                }
                 let response = await dispatcher.dispatch(JSONRPCRequest(
                     jsonrpc: "2.0",
                     id: .string("\(method):\(probe.label)"),
@@ -1314,7 +1326,9 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
                     params: params
                 ), mutationContext: context)
 
-                XCTAssertEqual(response.error?.code, -32602, "\(method):\(probe.label)")
+                let expectedCode = method == "private.push_token.update"
+                    && probe.label == "server_id.empty" ? -32098 : -32602
+                XCTAssertEqual(response.error?.code, expectedCode, "\(method):\(probe.label)")
                 XCTAssertNil(response.result, "\(method):\(probe.label)")
             }
         }
