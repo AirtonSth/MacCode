@@ -185,6 +185,10 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     /// effects. Nil until the first `submit()`.
     private(set) var lastExecutedCommandID: String?
 
+    /// Test-only counter proving a palette open performs one filter pass after
+    /// rebuilding its catalog rather than two equivalent table reloads.
+    private(set) var filterPassCountForTesting = 0
+
     public init(router: AppCommandRouter) {
         self.router = router
         let panel = PalettePanel(
@@ -490,7 +494,6 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
             currentQuery = ""
             rebuildCommands()
             searchField.stringValue = ""
-            applyFilter("")
             window.center()
             window.makeKeyAndOrderFront(nil)
             window.makeFirstResponder(searchField)
@@ -532,6 +535,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     }
 
     private func applyFilter(_ q: String) {
+        filterPassCountForTesting += 1
         let lower = q.trimmingCharacters(in: .whitespacesAndNewlines)
         currentQuery = lower
         // PERF-L93: remove only the IDs this method owns (section headers +

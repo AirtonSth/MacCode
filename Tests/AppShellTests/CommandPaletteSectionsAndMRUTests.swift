@@ -248,6 +248,26 @@ final class CommandPaletteSectionsAndMRUTests: XCTestCase {
                        "if stale state leaks between builds, commands accumulate or change unexpectedly")
     }
 
+    // MARK: - Initial open reload coalescing
+
+    /// WHY: rebuildCommands already applies the current query. Re-applying the
+    /// empty query in toggle() used to reload the same NSTableView twice before
+    /// the palette became interactive, which is visible when many surfaces have
+    /// populated the command catalog.
+    func test_openPerformsOneFilterPassAfterRebuild() throws {
+        let (_, _, palette) = try make()
+        let before = palette.filterPassCountForTesting
+
+        palette.toggle()
+
+        XCTAssertEqual(
+            palette.filterPassCountForTesting - before,
+            1,
+            "opening the palette must rebuild and filter once, not perform a duplicate table reload"
+        )
+        palette.toggle()
+    }
+
     // MARK: - T033: allCommandIDsForTesting and commandIDsForTesting are consistent
 
     /// WHY: commandIDsForTesting (filtered) with an empty query must be a

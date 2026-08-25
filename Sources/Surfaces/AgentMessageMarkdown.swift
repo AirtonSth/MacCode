@@ -590,8 +590,16 @@ public struct AgentMessageMarkdownView: View {
     @State private var copiedCode: Int? = nil
 
     public var body: some View {
+        let groups = AgentMessageMarkdown.selectionGroups(
+            from: AgentMessageMarkdown.blocks(from: text, cache: cacheResults)
+        )
         VStack(alignment: .leading, spacing: compact ? DS.Space.sm : DS.Space.md) {
-            ForEach(Array(AgentMessageMarkdown.selectionGroups(from: AgentMessageMarkdown.blocks(from: text, cache: cacheResults)).enumerated()), id: \.offset) { index, group in
+            // Iterate the existing collection's indices instead of allocating an
+            // enumerated Array on every SwiftUI body pass. Streaming/hover state
+            // can invalidate this view frequently, and the groups already have
+            // stable positional identity for the code-copy state below.
+            ForEach(groups.indices, id: \.self) { index in
+                let group = groups[index]
                 if group.count == 1, let block = group.first, isIsolatedBlock(block) {
                     blockView(block, index: index)
                 } else {
@@ -668,7 +676,8 @@ public struct AgentMessageMarkdownView: View {
             VStack(alignment: .leading, spacing: 0) {
                 // Header row
                 HStack(spacing: 0) {
-                    ForEach(Array(headers.enumerated()), id: \.offset) { _, header in
+                    ForEach(headers.indices, id: \.self) { headerIndex in
+                        let header = headers[headerIndex]
                         linkedInline(header, weight: .semibold, lineSpacing: 2)
                             .padding(.horizontal, DS.Space.sm)
                             .padding(.vertical, DS.Space.xs)
@@ -678,9 +687,11 @@ public struct AgentMessageMarkdownView: View {
                 .background(DS.Palette.surface)
                 Divider()
                 // Data rows
-                ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
+                ForEach(rows.indices, id: \.self) { rowIndex in
+                    let row = rows[rowIndex]
                     HStack(spacing: 0) {
-                        ForEach(Array(row.enumerated()), id: \.offset) { colIndex, cell in
+                        ForEach(row.indices, id: \.self) { colIndex in
+                            let cell = row[colIndex]
                             linkedInline(cell, lineSpacing: 2)
                                 .padding(.horizontal, DS.Space.sm)
                                 .padding(.vertical, DS.Space.xs)
