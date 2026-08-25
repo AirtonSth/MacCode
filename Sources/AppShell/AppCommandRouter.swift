@@ -2905,7 +2905,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private var pairedBotRemote: BotRemoteControlAuthority?
-    private let botRuntimeEvidenceProjector = BotRuntimeEvidenceProjector()
+    private lazy var botRuntimeEvidenceProjector = BotRuntimeEvidenceProjector { [weak self] terminal in
+        _ = self?.pairedBotRemote?.settleRuntime(
+            botID: terminal.botID,
+            runID: terminal.runID,
+            failed: terminal.failed
+        )
+    }
 
     public func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
         let authority = try pairedBotAuthority()

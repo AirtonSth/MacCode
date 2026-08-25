@@ -5,6 +5,12 @@ import SocketServer
 /// Projects Agent runtime events only after a completed Bot send receipt binds
 /// one authenticated host/Bot/conversation/request/run/thread tuple.
 final class BotRuntimeEvidenceProjector: @unchecked Sendable {
+    struct TerminalEvidence: Equatable {
+        let botID: String
+        let runID: String
+        let failed: Bool
+    }
+
     private struct Binding: Equatable {
         let hostID: String
         let botID: String
@@ -15,12 +21,17 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
     }
 
     private let eventBus: EventBus
+    private let onTerminal: (TerminalEvidence) -> Void
     private let lock = NSLock()
     private var bindingsByRunID: [String: Binding] = [:]
     private var subscriptionID: UUID?
 
-    init(eventBus: EventBus = .shared) {
+    init(
+        eventBus: EventBus = .shared,
+        onTerminal: @escaping (TerminalEvidence) -> Void = { _ in }
+    ) {
         self.eventBus = eventBus
+        self.onTerminal = onTerminal
         subscriptionID = eventBus.subscribe(since: eventBus.currentSeq) { [weak self] event in
             self?.receive(event)
         }
@@ -105,6 +116,13 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
             "client_request_id": .string(binding.requestID),
             "run_id": .string(binding.runID),
         ]))
+        if projectedKind == "bot.run.completed" || projectedKind == "bot.run.failed" {
+            onTerminal(TerminalEvidence(
+                botID: binding.botID,
+                runID: binding.runID,
+                failed: projectedKind == "bot.run.failed"
+            ))
+        }
     }
 
     private func nonempty(_ value: String?) -> String? {

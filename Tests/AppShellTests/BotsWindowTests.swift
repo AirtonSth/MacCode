@@ -6867,6 +6867,10 @@ final class BotsWindowTests: XCTestCase {
             slice.contains("reasoningEffort: revision.reasoningEffort"),
             "Desk send must use the composer reasoning chip"
         )
+        XCTAssertTrue(
+            source.contains("recordNeedsAttention(bot: bot, conversation: prepared.conversation"),
+            "a failed provider start must preserve the Agent thread linked during preparation"
+        )
     }
 
     func test_codexDeskSendSharesWorkspaceLessStartContract() throws {

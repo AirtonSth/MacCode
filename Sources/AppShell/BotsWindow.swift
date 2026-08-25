@@ -8621,7 +8621,7 @@ public final class BotsViewModel: ObservableObject {
                 _ = await self.followLinkedRun(bot: bot, started: started)
             } else {
                 self.deskSendInFlightStartedAt = nil
-                self.recordNeedsAttention(bot: bot, conversation: conversation, userText: userText)
+                self.recordNeedsAttention(bot: bot, conversation: prepared.conversation, userText: userText)
             }
         }
         rememberDeskSend(work, botID: bot.id)

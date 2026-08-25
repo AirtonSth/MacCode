@@ -8,7 +8,8 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
     /// exact completed send receipt first bound their full runtime identity.
     func test_projectsStrictlyOrderedExactStreamAndTerminalEvidence() throws {
         let bus = EventBus(recentLimit: 32)
-        let projector = BotRuntimeEvidenceProjector(eventBus: bus)
+        var terminals: [BotRuntimeEvidenceProjector.TerminalEvidence] = []
+        let projector = BotRuntimeEvidenceProjector(eventBus: bus) { terminals.append($0) }
         let receipt = sendReceipt()
         XCTAssertTrue(projector.registerCompletedSend(receipt))
 
@@ -25,6 +26,7 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
         bus.publish(kind: "agent.item.delta", payload: agentPayload())
 
         XCTAssertEqual(projected.map(\.kind), ["bot.run.stream", "bot.run.completed"])
+        XCTAssertEqual(terminals, [.init(botID: "bot-a", runID: "run-a", failed: false)])
         XCTAssertTrue(zip(projected, projected.dropFirst()).allSatisfy { $0.seq < $1.seq })
         for event in projected {
             let payload = try XCTUnwrap(event.payload.objectValue)

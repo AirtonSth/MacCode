@@ -171,6 +171,31 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
     }
 
+    /// Settles only the exact live run previously admitted by `bot.send`.
+    /// Generic Agent terminal events cannot move a different Bot or newer run.
+    @discardableResult
+    public func settleRuntime(
+        botID: String,
+        runID: String,
+        failed: Bool,
+        now: Date = Date()
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let run = liveRuns[botID],
+              run["run_id"] as? String == runID,
+              var item = attention[botID],
+              item["run_id"] as? String == runID else { return false }
+        liveRuns.removeValue(forKey: botID)
+        item["state"] = "finished"
+        item["finished_at"] = now.timeIntervalSince1970
+        item["detail"] = failed ? "Run failed" : "Run completed"
+        item["outcome"] = failed ? "failed" : "completed"
+        attention[botID] = canonicalAttentionItem(item)
+        persistSidecar()
+        return true
+    }
+
     public func effectiveSettings() -> (raw: [String: Bool], effective: [String: Bool]) {
         let flags = settings.load().botControlPlaneFlags
         let raw: [String: Bool] = [
@@ -644,6 +669,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let conversationID = authoritativeSend["conversation_id"] as? String
             ?? requestedConversationID
             ?? selectedConversation[botID]
+        if let conversationID {
+            selectedConversation[botID] = conversationID
+        }
         if authoritativeSend["queued_follow_up"] as? Bool == true {
             return runtimeReceipt(
                 requestID: requestID,

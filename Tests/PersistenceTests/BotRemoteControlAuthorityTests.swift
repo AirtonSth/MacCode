@@ -256,6 +256,19 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
                 && $0["bot_id"] as? String == botID
                 && $0["conversation_id"] as? String == conversationID
         })
+        let conversations = try authority.dispatch(method: "bot.conversation.list", params: ["bot_id": botID])
+        XCTAssertEqual(conversations["selected_id"] as? String, conversationID,
+                       "the first host-admitted conversation becomes authoritative selection")
+
+        XCTAssertFalse(authority.settleRuntime(botID: botID, runID: "wrong-run", failed: true))
+        XCTAssertTrue(authority.settleRuntime(botID: botID, runID: runID, failed: true))
+        let attention = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let item = try XCTUnwrap((attention["items"] as? [[String: Any]])?.first {
+            $0["bot_id"] as? String == botID
+        })
+        XCTAssertEqual(item["run_id"] as? String, runID)
+        XCTAssertEqual(item["state"] as? String, "finished")
+        XCTAssertEqual(item["outcome"] as? String, "failed")
     }
 
     /// WHY: a routing choice is an admitted host capability, not an iOS hint.
