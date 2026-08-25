@@ -325,6 +325,15 @@ public enum AgentHostEnvironmentMerge {
             || key.hasPrefix("RC_DISTILL_")
             // Claude PostToolUse sidecar path is host-owned Token Saver state (not a secret).
             || key == "REMOTE_CODE_DISTILL_STATE_PATH"
+            // Managed Bot and Agent App MCPs receive these exact host-authoritative
+            // identity, run, socket, and capability values for the active request.
+            || key == BotSelfConfigCatalog.callerEnvironmentKey
+            || key == "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"
+            || key == BotPeerDelegation.threadEnvironmentKey
+            || key == BotPeerDelegation.runEnvironmentKey
+            || key == BotPeerDelegation.socketEnvironmentKey
+            || key == BotPeerDelegation.capabilityEnvironmentKey
+            || key == BotPeerDelegation.turnContextEnvironmentKey
     }
 }
 
