@@ -181,7 +181,7 @@
     {"method": "bot.files.split", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.files.opened"], "readbackMethods": ["bot.files.list"]},
     {"method": "bot.files.location.set", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.files.updated"], "readbackMethods": ["bot.files.list"]},
     {"method": "bot.browser.action", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.browser.updated"], "readbackMethods": ["bot.browser.state"]},
-    {"method": "bot.link.open", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.browser.updated"], "readbackMethods": ["bot.browser.state"]},
+    {"method": "bot.link.open", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.browser.updated", "bot.files.opened"], "readbackMethods": ["bot.browser.state", "bot.files.list"]},
     {"method": "bot.guest.input", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.guest.updated"], "readbackMethods": ["bot.receipt.status", "bot.guest.state"]},
     {"method": "bot.guest.start", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.guest.updated"], "readbackMethods": ["bot.receipt.status", "bot.guest.state"]},
     {"method": "bot.guest.stop", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.guest.updated"], "readbackMethods": ["bot.receipt.status", "bot.guest.state"]},

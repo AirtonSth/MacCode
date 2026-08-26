@@ -82,6 +82,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private var fileGenerations: [String: Int] = [:]
     private var fileCAS: [String: String] = [:]
     private var fileHosts: [String: String] = [:]
+    /// File-link capabilities must be reissued by a current-process
+    /// `bot.files.list`; persisted handles alone are never executable after relaunch.
+    private var processIssuedFileHandles: Set<String> = []
     private var routingPref: [String: [String: Any]] = [:]
     private var consumedRoutingReceipts: Set<String> = []
     private var selectedConversation: [String: String] = [:]
@@ -1533,12 +1536,115 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     }
 
     private func linkOpen(params: [String: Any], requestID: String) throws -> [String: Any] {
-        let url = string(params, "url") ?? ""
-        guard !url.isEmpty else { throw Error.invalidParams }
-        return try browserAction(
-            params: params.merging(["action": "open", "url": url]) { _, new in new },
+        let bot = try requireBot(params)
+        let botID = id(bot)
+        let conversationID = string(params, "conversation_id") ?? ""
+        guard !conversationID.isEmpty,
+              selectedConversation[botID] == conversationID,
+              params["host_first"] as? Bool == true else { throw Error.crossTarget }
+
+        if string(params, "link_kind") == "file" {
+            return try fileLinkOpen(
+                bot: bot,
+                conversationID: conversationID,
+                params: params,
+                requestID: requestID
+            )
+        }
+
+        guard string(params, "link_kind") == "web",
+              let urlString = string(params, "url"),
+              let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.user == nil,
+              let hostID = string(params, "host_id"), !hostID.isEmpty,
+              let surfaceID = string(params, "surface_id"), !surfaceID.isEmpty,
+              let expectedGeneration = int(params, "expected_generation"),
+              let snapshotGeneration = int(params, "snapshot_generation") else {
+            throw Error.invalidParams
+        }
+        let before = try authoritativeBrowserState(bot: bot, hostID: hostID)
+        guard before["host_id"] as? String == hostID,
+              before["surface_id"] as? String == surfaceID,
+              before["generation"] as? Int == expectedGeneration,
+              before["snapshot_generation"] as? Int == snapshotGeneration else {
+            throw Error.crossTarget
+        }
+        var result = try browserAction(
+            params: params.merging(["action": "open", "url": urlString]) { _, new in new },
             requestID: requestID
         )
+        if var readback = result["readback"] as? [String: Any] {
+            readback["conversation_id"] = conversationID
+            readback["link_kind"] = "web"
+            result["readback"] = readback
+        }
+        return result
+    }
+
+    private func fileLinkOpen(
+        bot: BotDefinition,
+        conversationID: String,
+        params: [String: Any],
+        requestID: String
+    ) throws -> [String: Any] {
+        let botID = id(bot)
+        guard params["url"] == nil, params["path"] == nil, params["relative_path"] == nil,
+              let hostID = string(params, "host_id"), !hostID.isEmpty,
+              let root = string(params, "root"),
+              root == (filesLocation[botID] ?? "bot_home"),
+              let rootHandle = string(params, "root_handle"),
+              let handle = string(params, "handle"),
+              processIssuedFileHandles.contains(rootHandle),
+              processIssuedFileHandles.contains(handle),
+              let expectedGeneration = int(params, "expected_generation"),
+              let expectedCAS = string(params, "expected_cas"), !expectedCAS.isEmpty,
+              let entryGeneration = int(params, "entry_generation"),
+              let entryCAS = string(params, "entry_cas"), !entryCAS.isEmpty else {
+            throw Error.invalidParams
+        }
+        let admittedHostID = try requireFileHost(params: params, botID: botID)
+        let rootEntry = try resolveFileEntry(bot: bot, handle: rootHandle)
+        let entry = try resolveFileEntry(bot: bot, handle: handle)
+        let currentGeneration = fileGeneration(botID: botID, root: root)
+        let currentCAS = fileCASValue(botID: botID, root: root)
+        guard admittedHostID == hostID,
+              rootEntry["host_id"] as? String == hostID,
+              entry["host_id"] as? String == hostID,
+              rootEntry["root"] as? String == root,
+              entry["root"] as? String == root,
+              rootEntry["kind"] as? String == "root",
+              entry["kind"] as? String == "file",
+              rootEntry["generation"] as? Int == currentGeneration,
+              entry["generation"] as? Int == currentGeneration,
+              rootEntry["cas"] as? String == currentCAS,
+              entry["cas"] as? String == currentCAS,
+              expectedGeneration == currentGeneration,
+              entryGeneration == currentGeneration,
+              expectedCAS == currentCAS,
+              entryCAS == currentCAS,
+              let path = entry["path"] as? String,
+              try diskFileExists(bot: bot, root: root, path: path) else {
+            throw Error.crossTarget
+        }
+        try onOpenFile?(bot.id, path, false, root)
+        return receipt(requestID: requestID, status: .completed, botID: botID, readback: [
+            "bot_id": botID,
+            "host_id": hostID,
+            "conversation_id": conversationID,
+            "link_kind": "file",
+            "mounted": true,
+            "split": false,
+            "root": root,
+            "root_handle": rootHandle,
+            "handle": handle,
+            "generation": currentGeneration,
+            "root_cas": currentCAS,
+            "entry_generation": currentGeneration,
+            "entry_cas": currentCAS,
+            "security": fileSecurity(),
+        ])
     }
 
     private func guestCommand(name: String, params: [String: Any], requestID: String) throws -> [String: Any] {
@@ -2422,6 +2528,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 && $0["generation"] as? Int == currentGeneration
                 && $0["cas"] as? String == currentCAS
         }) {
+            if let handle = existing["handle"] as? String {
+                processIssuedFileHandles.insert(handle)
+            }
             return existing
         }
         let handle = UUID().uuidString.lowercased()
@@ -2437,6 +2546,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "security": fileSecurity(),
         ]
         files[handle] = entry
+        processIssuedFileHandles.insert(handle)
         return entry
     }
 

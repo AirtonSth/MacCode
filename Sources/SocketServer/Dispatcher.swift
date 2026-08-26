@@ -1357,7 +1357,11 @@ public final class JSONRPCDispatcher {
             case "bot.files.mutate": kind = "bot.files.changed"
             case "bot.files.open_tab", "bot.files.split": kind = "bot.files.opened"
             case "bot.files.location.set": kind = "bot.files.updated"
-            case "bot.browser.action", "bot.link.open": kind = "bot.browser.updated"
+            case "bot.browser.action": kind = "bot.browser.updated"
+            case "bot.link.open":
+                kind = object["readback"]?.objectValue?["link_kind"]?.stringValue == "file"
+                    ? "bot.files.opened"
+                    : "bot.browser.updated"
             case "bot.guest.input", "bot.guest.start", "bot.guest.stop", "bot.guest.rebuild", "bot.guest.revoke":
                 kind = "bot.guest.updated"
             case "bot.docker.clear": kind = "bot.docker.cleared"
@@ -1424,7 +1428,8 @@ public final class JSONRPCDispatcher {
                         "entry_generation", "entry_cas", "path", "op",
                         "current_revision_id", "revision", "soul", "description",
                         "profile_id", "attention_item_id", "notification_id", "source", "enqueued", "id",
-                        "surface_id", "snapshot_generation", "url", "title", "loading", "action",
+                        "surface_id", "snapshot_generation", "url", "title", "loading", "action", "link_kind",
+                        "mounted", "split",
                         "session_before_digest", "session_after_digest", "cleared", "removed_count", "partial",
                     ] {
                         payload[key] = readback[key]

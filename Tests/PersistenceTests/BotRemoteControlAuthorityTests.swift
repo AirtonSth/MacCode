@@ -1310,25 +1310,152 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         )
     }
 
-    /// WHY: bot.link.open is a distinct admitted intent. Its authoritative
-    /// readback must not silently identify the operation as navigation.
-    func test_linkOpen_isHostFirstAndReportsOpenAction() throws {
+    /// WHY: a transcript URL is untrusted prose until it is bound to the exact
+    /// selected conversation and current host-owned Browser surface.
+    func test_linkOpen_requiresExactConversationSurfaceAndGeneration() throws {
         let created = try authority.dispatch(method: "bot.create", params: [
             "client_request_id": "br",
             "name": "Piper",
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
-        let result = try authority.dispatch(method: "bot.link.open", params: [
-            "client_request_id": "link-1",
-            "bot_id": botID,
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.link.open", params: [
+            "client_request_id": "link-unbound", "bot_id": botID,
             "url": "http://127.0.0.1:3000",
-        ])
+        ]), "unbound transcript prose must never enqueue a Browser open")
+
+        let params = try webLinkParams(
+            botID: botID,
+            requestID: "link-1",
+            url: "http://127.0.0.1:3000"
+        )
+        let result = try authority.dispatch(method: "bot.link.open", params: params)
         let readback = result["readback"] as? [String: Any]
         XCTAssertEqual(readback?["host_first"] as? Bool, true)
         XCTAssertEqual(readback?["action"] as? String, "open")
+        XCTAssertEqual(readback?["conversation_id"] as? String, params["conversation_id"] as? String)
+        XCTAssertEqual(readback?["surface_id"] as? String, params["surface_id"] as? String)
         XCTAssertEqual(readback?["url"] as? String, "http://127.0.0.1:3000")
         XCTAssertGreaterThan(readback?["generation"] as? Int ?? 0, 0)
         XCTAssertNotNil(result["receipt_id"] as? String)
+
+        for (index, key) in ["host_id", "conversation_id", "surface_id"].enumerated() {
+            var crossed = try webLinkParams(
+                botID: botID,
+                requestID: "link-cross-\(index)",
+                url: "https://example.test/\(index)"
+            )
+            crossed[key] = "wrong-\(key)"
+            XCTAssertThrowsError(try authority.dispatch(method: "bot.link.open", params: crossed))
+        }
+        var stale = try webLinkParams(botID: botID, requestID: "link-stale", url: "https://example.test/stale")
+        stale["expected_generation"] = -1
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.link.open", params: stale))
+    }
+
+    /// WHY: a transcript file mention is not authority. Only a live opaque
+    /// host grant can open it, and no raw path may cross the paired RPC.
+    func test_linkOpen_fileGrantRejectsCrossBotStaleRevokedAndRelaunchUse() throws {
+        let owner = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "file-link-owner", "name": "Owner",
+        ])
+        let ownerID = try XCTUnwrap(owner["bot_id"] as? String)
+        let conversation = try authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "file-link-conversation", "bot_id": ownerID, "title": "Files",
+        ])
+        let conversationID = try XCTUnwrap(
+            (conversation["readback"] as? [String: Any])?["conversation_id"] as? String
+        )
+        let root = try fileRootGrant(botID: ownerID, hostID: "host-a")
+        let created = try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "file-link-create",
+            "host_id": "host-a",
+            "bot_id": ownerID,
+            "root_handle": root.handle,
+            "expected_generation": root.generation,
+            "expected_cas": root.cas,
+            "relative_path": "report.md",
+            "op": "write",
+            "contents": "report",
+        ])
+        let fileState = try XCTUnwrap(created["readback"] as? [String: Any])
+        var openedPath: String?
+        authority.onOpenFile = { _, path, _, _ in openedPath = path }
+        let exact: [String: Any] = [
+            "client_request_id": "file-link-open",
+            "host_id": "host-a",
+            "bot_id": ownerID,
+            "conversation_id": conversationID,
+            "host_first": true,
+            "link_kind": "file",
+            "root": "bot_home",
+            "root_handle": try XCTUnwrap(fileState["root_handle"] as? String),
+            "handle": try XCTUnwrap(fileState["handle"] as? String),
+            "expected_generation": try XCTUnwrap(fileState["generation"] as? Int),
+            "expected_cas": try XCTUnwrap(fileState["root_cas"] as? String),
+            "entry_generation": try XCTUnwrap(fileState["entry_generation"] as? Int),
+            "entry_cas": try XCTUnwrap(fileState["entry_cas"] as? String),
+        ]
+        let opened = try authority.dispatch(method: "bot.link.open", params: exact)
+        let readback = try XCTUnwrap(opened["readback"] as? [String: Any])
+        XCTAssertEqual(openedPath, "report.md")
+        XCTAssertEqual(readback["link_kind"] as? String, "file")
+        XCTAssertEqual(readback["handle"] as? String, exact["handle"] as? String)
+        XCTAssertNil(exact["path"])
+        XCTAssertNil(exact["url"], "raw file paths and file URLs must never cross bot.link.open")
+        XCTAssertNil(readback["path"], "the paired readback must retain only opaque file authority")
+
+        let other = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "file-link-other", "name": "Other",
+        ])
+        let otherID = try XCTUnwrap(other["bot_id"] as? String)
+        let otherConversation = try authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "file-link-other-conversation", "bot_id": otherID, "title": "Other",
+        ])
+        var crossed = exact
+        crossed["client_request_id"] = "file-link-crossed"
+        crossed["bot_id"] = otherID
+        crossed["conversation_id"] = (otherConversation["readback"] as? [String: Any])?["conversation_id"]
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.link.open", params: crossed))
+
+        let relaunched = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: settings,
+            appSupportDirectory: supportDir
+        )
+        var afterRelaunch = exact
+        afterRelaunch["client_request_id"] = "file-link-relaunch"
+        XCTAssertThrowsError(try relaunched.dispatch(method: "bot.link.open", params: afterRelaunch),
+                             "persisted grants must be reissued by a current-process files.list")
+
+        let rotated = try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "file-link-rotate",
+            "host_id": "host-a",
+            "bot_id": ownerID,
+            "root_handle": fileState["root_handle"] as Any,
+            "expected_generation": fileState["generation"] as Any,
+            "expected_cas": fileState["root_cas"] as Any,
+            "relative_path": "new.md",
+            "op": "write",
+            "contents": "new",
+        ])
+        var stale = exact
+        stale["client_request_id"] = "file-link-stale"
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.link.open", params: stale))
+
+        let rotatedState = try XCTUnwrap(rotated["readback"] as? [String: Any])
+        _ = try authority.dispatch(method: "bot.files.location.set", params: [
+            "client_request_id": "file-link-revoke",
+            "host_id": "host-a",
+            "bot_id": ownerID,
+            "root": "docker_home",
+            "previous_root_handle": rotatedState["root_handle"] as Any,
+            "expected_generation": rotatedState["generation"] as Any,
+            "expected_cas": rotatedState["root_cas"] as Any,
+        ])
+        var revoked = exact
+        revoked["client_request_id"] = "file-link-revoked"
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.link.open", params: revoked))
     }
 
     func test_filesMutate_requiresOpaqueGenerationBoundGrantAndRejectsPathEscape() throws {
@@ -1914,12 +2041,9 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "name": "Piper",
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
-        _ = try authority.dispatch(method: "bot.link.open", params: [
-            "client_request_id": "br-open",
-            "bot_id": botID,
-            "url": "http://127.0.0.1:3000",
-            "title": "Dev",
-        ])
+        var params = try webLinkParams(botID: botID, requestID: "br-open", url: "http://127.0.0.1:3000")
+        params["title"] = "Dev"
+        _ = try authority.dispatch(method: "bot.link.open", params: params)
         let uuid = try XCTUnwrap(UUID(uuidString: botID))
         let persisted = try XCTUnwrap(
             BotBrowserStore(appSupportDirectory: supportDir).loadTarget(botID: BotID(uuid))
@@ -1938,11 +2062,10 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let botID = try XCTUnwrap(created["bot_id"] as? String)
         var posted: [Notification.Name] = []
         authority.notifyBrowserPendingOpen = { posted.append($0) }
-        _ = try authority.dispatch(method: "bot.link.open", params: [
-            "client_request_id": "br-note-open",
-            "bot_id": botID,
-            "url": "http://127.0.0.1:4000",
-        ])
+        _ = try authority.dispatch(
+            method: "bot.link.open",
+            params: webLinkParams(botID: botID, requestID: "br-note-open", url: "http://127.0.0.1:4000")
+        )
         XCTAssertEqual(posted, [BotBrowserHost.pendingOpenNotification])
         let state = try authority.dispatch(method: "bot.browser.state", params: ["bot_id": botID])
         XCTAssertEqual(state["url"] as? String, "http://127.0.0.1:4000")
@@ -2472,11 +2595,10 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             throw BotRemoteControlAuthority.Error(code: -32087, message: "Bot browser persist failed.")
         }
         XCTAssertThrowsError(
-            try authority.dispatch(method: "bot.link.open", params: [
-                "client_request_id": "br-fail-1",
-                "bot_id": botID,
-                "url": "http://127.0.0.1:5000",
-            ])
+            try authority.dispatch(
+                method: "bot.link.open",
+                params: webLinkParams(botID: botID, requestID: "br-fail-1", url: "http://127.0.0.1:5000")
+            )
         )
         XCTAssertEqual(
             try BotBrowserStore(appSupportDirectory: supportDir).loadPendingOpens().map(\.url),
@@ -2689,13 +2811,13 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "client_request_id": "browser-restore", "name": "Browser",
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
-        let opened = try authority.dispatch(method: "bot.link.open", params: [
-            "client_request_id": "browser-open",
-            "host_id": "host-a",
-            "bot_id": botID,
-            "url": "https://example.test/login",
-            "title": "Sign in",
-        ])
+        var openParams = try webLinkParams(
+            botID: botID,
+            requestID: "browser-open",
+            url: "https://example.test/login"
+        )
+        openParams["title"] = "Sign in"
+        let opened = try authority.dispatch(method: "bot.link.open", params: openParams)
         let openedState = try XCTUnwrap(opened["readback"] as? [String: Any])
         let surfaceID = try XCTUnwrap(openedState["surface_id"] as? String)
         let session = try XCTUnwrap(openedState["session"] as? [String: Any])
@@ -2728,12 +2850,14 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let botID = try XCTUnwrap(created["bot_id"] as? String)
         var notifications = 0
         authority.notifyBrowserPendingOpen = { _ in notifications += 1 }
-        let opened = try authority.dispatch(method: "bot.link.open", params: [
-            "client_request_id": "browser-login-open",
-            "host_id": "host-a",
-            "bot_id": botID,
-            "url": "https://example.test/login",
-        ])
+        let opened = try authority.dispatch(
+            method: "bot.link.open",
+            params: webLinkParams(
+                botID: botID,
+                requestID: "browser-login-open",
+                url: "https://example.test/login"
+            )
+        )
         let before = try XCTUnwrap(opened["readback"] as? [String: Any])
         let stale = try authority.dispatch(method: "bot.browser.action", params: [
             "client_request_id": "browser-stale",
@@ -2891,5 +3015,37 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             try XCTUnwrap(listed["generation"] as? Int),
             try XCTUnwrap(listed["root_cas"] as? String)
         )
+    }
+
+    private func webLinkParams(
+        botID: String,
+        requestID: String,
+        url: String,
+        hostID: String = "host-a"
+    ) throws -> [String: Any] {
+        let conversation = try authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "\(requestID)-conversation",
+            "bot_id": botID,
+            "title": "Link conversation",
+        ])
+        let conversationID = try XCTUnwrap(
+            (conversation["readback"] as? [String: Any])?["conversation_id"] as? String
+        )
+        let state = try authority.dispatch(method: "bot.browser.state", params: [
+            "host_id": hostID,
+            "bot_id": botID,
+        ])
+        return [
+            "client_request_id": requestID,
+            "host_id": hostID,
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "surface_id": try XCTUnwrap(state["surface_id"] as? String),
+            "expected_generation": try XCTUnwrap(state["generation"] as? Int),
+            "snapshot_generation": try XCTUnwrap(state["snapshot_generation"] as? Int),
+            "host_first": true,
+            "link_kind": "web",
+            "url": url,
+        ]
     }
 }

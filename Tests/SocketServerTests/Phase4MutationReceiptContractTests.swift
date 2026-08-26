@@ -3162,6 +3162,26 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
                     "session": .object(["authenticated": .bool(true), "cookie_exported": .bool(false)]),
                 ]
             ),
+            (
+                "bot.link.open",
+                "bot.files.opened",
+                [
+                    "bot_id": .string(botID),
+                    "host_id": .string(Phase4LiveServer.hostId),
+                    "conversation_id": .string("conversation-file-link"),
+                    "link_kind": .string("file"),
+                    "root": .string("bot_home"),
+                    "root_handle": .string("opaque-root-grant"),
+                    "root_cas": .string("root-cas-9"),
+                    "handle": .string("opaque-file-grant"),
+                    "entry_generation": .number(9),
+                    "entry_cas": .string("root-cas-9"),
+                    "generation": .number(9),
+                    "mounted": .bool(true),
+                    "split": .bool(false),
+                    "security": .object(["opaque_handle": .bool(true), "symlink_safe": .bool(true)]),
+                ]
+            ),
         ]
 
         for (index, testCase) in completedCases.enumerated() {
