@@ -54,6 +54,9 @@ public final class BotStore: @unchecked Sendable {
     private let db: SQLiteDB
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
+#if DEBUG
+    var onBeforePublishCommitForTesting: (() throws -> Void)?
+#endif
     private let dates = LockedISO8601Formatter({
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
@@ -326,21 +329,35 @@ public final class BotStore: @unchecked Sendable {
         draft: BotRevisionDraft,
         avatarSymbol: String? = nil,
         notificationsEnabled: Bool? = nil,
-        now: Date = Date()
+        now: Date = Date(),
+        beforeCommit: ((BotRevision) throws -> Void)? = nil,
+        onRollback: (() throws -> Void)? = nil
     ) throws -> BotRevision {
-        try db.transaction {
-            guard let bot = try loadBot(id: botID, database: db), bot.deletedAt == nil else {
-                throw BotStoreError.notFound
+        var externalMutationApplied = false
+        do {
+            return try db.transaction {
+                guard let bot = try loadBot(id: botID, database: db), bot.deletedAt == nil else {
+                    throw BotStoreError.notFound
+                }
+                let revision = try publishLocked(
+                    bot: bot,
+                    expectedCurrentRevisionID: expectedCurrentRevisionID,
+                    draft: draft,
+                    avatarSymbol: avatarSymbol ?? bot.avatarSymbol,
+                    notificationsEnabled: notificationsEnabled ?? bot.notificationsEnabled,
+                    now: now,
+                    database: db
+                )
+                try beforeCommit?(revision)
+                externalMutationApplied = beforeCommit != nil
+#if DEBUG
+                try onBeforePublishCommitForTesting?()
+#endif
+                return revision
             }
-            return try publishLocked(
-                bot: bot,
-                expectedCurrentRevisionID: expectedCurrentRevisionID,
-                draft: draft,
-                avatarSymbol: avatarSymbol ?? bot.avatarSymbol,
-                notificationsEnabled: notificationsEnabled ?? bot.notificationsEnabled,
-                now: now,
-                database: db
-            )
+        } catch {
+            if externalMutationApplied { try onRollback?() }
+            throw error
         }
     }
 

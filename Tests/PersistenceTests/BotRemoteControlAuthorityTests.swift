@@ -1723,6 +1723,191 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(entries.first { ($0["path"] as? String) == "notes.txt" }?["cas"] as? String, postCAS)
     }
 
+    /// WHY: SOUL.md and DESCRIPTION.md are authored Bot profile fields, not
+    /// independent files. Their opaque CAS mutation must publish the same exact
+    /// revision while leaving ordinary files and every other Bot untouched.
+    func test_filesMutateProfileFilesPublishExactRevisionAndSurviveRelaunchWithoutCrossBotEffects() throws {
+        let first = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "profile-files-a", "name": "Alpha",
+            "description": "Original description", "soul": "Original soul",
+        ])
+        let second = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "profile-files-b", "name": "Beta",
+            "description": "Beta description", "soul": "Beta soul",
+        ])
+        let firstID = try XCTUnwrap(first["bot_id"] as? String)
+        let secondID = try XCTUnwrap(second["bot_id"] as? String)
+        let firstBotID = BotID(try XCTUnwrap(UUID(uuidString: firstID)))
+        let secondBotID = BotID(try XCTUnwrap(UUID(uuidString: secondID)))
+        let firstOriginalRevision = try XCTUnwrap(try store.get(id: firstBotID)?.currentRevisionID)
+        let secondOriginalRevision = try XCTUnwrap(try store.get(id: secondBotID)?.currentRevisionID)
+
+        var grant = try fileRootGrant(botID: firstID, hostID: "profile-host")
+        _ = try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "profile-files-ordinary",
+            "host_id": "profile-host", "bot_id": firstID,
+            "root_handle": grant.handle, "expected_generation": grant.generation,
+            "expected_cas": grant.cas, "relative_path": "notes.txt",
+            "op": "write", "contents": "keep me",
+        ])
+        XCTAssertEqual(try store.get(id: firstBotID)?.currentRevisionID, firstOriginalRevision)
+
+        grant = try fileRootGrant(botID: firstID, hostID: "profile-host")
+        let soulMutation = try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "profile-files-soul",
+            "host_id": "profile-host", "bot_id": firstID,
+            "root_handle": grant.handle, "expected_generation": grant.generation,
+            "expected_cas": grant.cas, "relative_path": BotHome.soulName,
+            "op": "write", "contents": "Own the support inbox.",
+        ])
+        let soulReadback = try XCTUnwrap(soulMutation["readback"] as? [String: Any])
+        XCTAssertEqual(soulReadback["soul"] as? String, "Own the support inbox.")
+        XCTAssertEqual(soulReadback["description"] as? String, "Original description")
+        XCTAssertEqual(soulReadback["revision"] as? Int, 2)
+        XCTAssertNotEqual(soulReadback["current_revision_id"] as? String, firstOriginalRevision.value.uuidString.lowercased())
+
+        grant = try fileRootGrant(botID: firstID, hostID: "profile-host")
+        let descriptionMutation = try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "profile-files-description",
+            "host_id": "profile-host", "bot_id": firstID,
+            "root_handle": grant.handle, "expected_generation": grant.generation,
+            "expected_cas": grant.cas, "relative_path": BotHome.descriptionName,
+            "op": "write", "contents": "  Updated profile  ",
+        ])
+        let descriptionReadback = try XCTUnwrap(descriptionMutation["readback"] as? [String: Any])
+        XCTAssertEqual(descriptionReadback["soul"] as? String, "Own the support inbox.")
+        XCTAssertEqual(descriptionReadback["description"] as? String, "Updated profile")
+        XCTAssertEqual(descriptionReadback["revision"] as? Int, 3)
+
+        grant = try fileRootGrant(botID: firstID, hostID: "profile-host")
+        let removedSoul = try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "profile-files-soul-remove",
+            "host_id": "profile-host", "bot_id": firstID,
+            "root_handle": grant.handle, "expected_generation": grant.generation,
+            "expected_cas": grant.cas, "relative_path": BotHome.soulName,
+            "op": "delete",
+        ])
+        let removedReadback = try XCTUnwrap(removedSoul["readback"] as? [String: Any])
+        XCTAssertEqual(removedReadback["soul"] as? String, "")
+        XCTAssertEqual(removedReadback["description"] as? String, "Updated profile")
+        XCTAssertEqual(removedReadback["revision"] as? Int, 4)
+
+        authority = BotRemoteControlAuthority(
+            db: db, store: BotStore(db: db), settings: SettingsStore(db: db),
+            appSupportDirectory: supportDir
+        )
+        let relaunched = try authority.dispatch(method: "bot.get", params: ["bot_id": firstID])
+        XCTAssertEqual(relaunched["soul"] as? String, "")
+        XCTAssertEqual(relaunched["description"] as? String, "Updated profile")
+        XCTAssertEqual(relaunched["current_revision_id"] as? String, removedReadback["current_revision_id"] as? String)
+        let firstBot = try XCTUnwrap(try store.get(id: firstBotID))
+        XCTAssertEqual(
+            try String(contentsOf: BotHome(appSupportDirectory: supportDir, bot: firstBot).root
+                .appendingPathComponent("notes.txt"), encoding: .utf8),
+            "keep me"
+        )
+        let secondBot = try XCTUnwrap(try store.get(id: secondBotID))
+        let secondRevision = try XCTUnwrap(try store.getRevision(id: secondOriginalRevision))
+        XCTAssertEqual(secondBot.currentRevisionID, secondOriginalRevision)
+        XCTAssertEqual(secondBot.description, "Beta description")
+        XCTAssertEqual(secondRevision.soul, "Beta soul")
+    }
+
+    /// WHY: disk authority must succeed before a profile revision can commit;
+    /// otherwise an error receipt/event could hide a revision that did publish.
+    func test_filesMutateProfileWriteAndRemoveFailuresPublishNoRevisionOrCompletedReceipt() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "profile-failure-create", "name": "Failure",
+            "description": "Original description", "soul": "Original soul",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let typedID = BotID(try XCTUnwrap(UUID(uuidString: botID)))
+        let bot = try XCTUnwrap(try store.get(id: typedID))
+        let originalRevision = try XCTUnwrap(bot.currentRevisionID)
+        let home = BotHome(appSupportDirectory: supportDir, bot: bot)
+        try home.ensure(
+            name: bot.name, handle: bot.handle, title: bot.title,
+            description: bot.description, soul: "Original soul"
+        )
+        try FileManager.default.removeItem(at: home.soulURL)
+        try FileManager.default.createDirectory(at: home.soulURL, withIntermediateDirectories: false)
+        let grant = try fileRootGrant(botID: botID, hostID: "failure-host")
+
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "profile-write-failure",
+            "host_id": "failure-host", "bot_id": botID,
+            "root_handle": grant.handle, "expected_generation": grant.generation,
+            "expected_cas": grant.cas, "relative_path": BotHome.soulName,
+            "op": "write", "contents": "must not publish",
+        ]))
+        XCTAssertEqual(try store.get(id: typedID)?.currentRevisionID, originalRevision)
+        XCTAssertNotEqual(
+            try authority.dispatch(method: "bot.receipt.status", params: [
+                "client_request_id": "profile-write-failure",
+            ])["status"] as? String,
+            "completed"
+        )
+
+        try FileManager.default.removeItem(at: home.soulURL)
+        let outside = supportDir.appendingPathComponent("outside-profile.txt")
+        try "outside".write(to: outside, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(at: home.soulURL, withDestinationURL: outside)
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "profile-remove-failure",
+            "host_id": "failure-host", "bot_id": botID,
+            "root_handle": grant.handle, "expected_generation": grant.generation,
+            "expected_cas": grant.cas, "relative_path": BotHome.soulName,
+            "op": "delete",
+        ]))
+        XCTAssertEqual(try store.get(id: typedID)?.currentRevisionID, originalRevision)
+        XCTAssertEqual(try String(contentsOf: outside, encoding: .utf8), "outside")
+        XCTAssertNotEqual(
+            try authority.dispatch(method: "bot.receipt.status", params: [
+                "client_request_id": "profile-remove-failure",
+            ])["status"] as? String,
+            "completed"
+        )
+    }
+
+    /// WHY: a SQLite failure after the atomic file replacement must restore the
+    /// prior bytes as well as roll back the revision, never exposing split truth.
+    func test_filesMutateProfileCommitFailureCompensatesDiskAndPublishesNoCompletedReceipt() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "profile-commit-create", "name": "Commit Failure",
+            "description": "Original description", "soul": "Original soul",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let typedID = BotID(try XCTUnwrap(UUID(uuidString: botID)))
+        let bot = try XCTUnwrap(try store.get(id: typedID))
+        let originalRevision = try XCTUnwrap(bot.currentRevisionID)
+        let home = BotHome(appSupportDirectory: supportDir, bot: bot)
+        try home.ensure(
+            name: bot.name, handle: bot.handle, title: bot.title,
+            description: bot.description, soul: "Original soul"
+        )
+        let grant = try fileRootGrant(botID: botID, hostID: "commit-failure-host")
+        struct InjectedCommitFailure: Error {}
+        store.onBeforePublishCommitForTesting = { throw InjectedCommitFailure() }
+
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "profile-commit-failure",
+            "host_id": "commit-failure-host", "bot_id": botID,
+            "root_handle": grant.handle, "expected_generation": grant.generation,
+            "expected_cas": grant.cas, "relative_path": BotHome.soulName,
+            "op": "write", "contents": "must be compensated",
+        ]))
+        store.onBeforePublishCommitForTesting = nil
+
+        XCTAssertEqual(try store.get(id: typedID)?.currentRevisionID, originalRevision)
+        XCTAssertEqual(try String(contentsOf: home.soulURL, encoding: .utf8), "Original soul")
+        XCTAssertNotEqual(
+            try authority.dispatch(method: "bot.receipt.status", params: [
+                "client_request_id": "profile-commit-failure",
+            ])["status"] as? String,
+            "completed"
+        )
+    }
+
     func test_browserAction_persistsBotBrowserStoreTarget() throws {
         let created = try authority.dispatch(method: "bot.create", params: [
             "client_request_id": "br-store",

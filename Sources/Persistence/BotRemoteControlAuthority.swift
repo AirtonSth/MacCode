@@ -1263,7 +1263,52 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let op = string(params, "op") ?? "write"
         guard op == "write" || op == "delete" else { throw Error.invalidParams }
         let contents = string(params, "contents") ?? string(params, "body") ?? ""
-        try applyDiskMutation(bot: bot, root: root, path: path, op: op, contents: contents)
+        var profileRevision: BotRevision?
+        if root == "bot_home", path == BotHome.soulName || path == BotHome.descriptionName {
+            guard let revisionID = bot.currentRevisionID,
+                  let current = try store.getRevision(id: revisionID),
+                  current.botID == bot.id else {
+                throw Error.notFound
+            }
+            let draft = BotRevisionDraft(
+                name: current.name,
+                title: current.title,
+                description: path == BotHome.descriptionName ? (op == "delete" ? "" : contents) : current.description,
+                soul: path == BotHome.soulName ? (op == "delete" ? "" : contents) : current.soul,
+                permissionMode: current.permissionMode,
+                desktopKind: current.desktopKind
+            )
+            let home = botHome(bot)
+            try home.ensure(
+                name: current.name,
+                handle: bot.handle,
+                title: current.title,
+                description: current.description,
+                soul: current.soul
+            )
+            let profileURL = try secureContainedURL(root: home.root, path: path)
+            let previousContents = try Data(contentsOf: profileURL)
+            profileRevision = try store.publish(
+                botID: bot.id,
+                expectedCurrentRevisionID: revisionID,
+                draft: draft,
+                beforeCommit: { [self] revision in
+                    let publishedContents = path == BotHome.soulName ? revision.soul : revision.description
+                    try applyDiskMutation(
+                        bot: bot,
+                        root: root,
+                        path: path,
+                        op: op,
+                        contents: publishedContents
+                    )
+                },
+                onRollback: {
+                    try previousContents.write(to: profileURL, options: .atomic)
+                }
+            )
+        } else {
+            try applyDiskMutation(bot: bot, root: root, path: path, op: op, contents: contents)
+        }
         let nextGeneration = currentGeneration + 1
         fileGenerations[fileGenerationKey(botID: botID, root: root)] = nextGeneration
         let nextCAS = rotateFileCAS(botID: botID, root: root)
@@ -1287,6 +1332,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             readback["handle"] = nextEntry["handle"]
             readback["entry_generation"] = nextEntry["generation"]
             readback["entry_cas"] = nextEntry["cas"]
+        }
+        if let profileRevision {
+            readback["current_revision_id"] = profileRevision.id.value.uuidString.lowercased()
+            readback["revision"] = profileRevision.revisionNumber
+            readback["soul"] = profileRevision.soul
+            readback["description"] = profileRevision.description
         }
         return receipt(requestID: requestID, status: .completed, botID: botID, readback: readback)
     }

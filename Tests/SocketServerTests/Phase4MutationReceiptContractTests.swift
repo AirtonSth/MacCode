@@ -3134,9 +3134,13 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
                     "handle": .string("opaque-file-grant"),
                     "entry_generation": .number(7),
                     "entry_cas": .string("root-cas-7"),
-                    "path": .string("MEMORY.md"),
+                    "path": .string("SOUL.md"),
                     "op": .string("write"),
                     "generation": .number(7),
+                    "current_revision_id": .string("profile-revision-7"),
+                    "revision": .number(7),
+                    "soul": .string("Exact instructions"),
+                    "description": .string("Exact description"),
                     "security": .object(["opaque_handle": .bool(true), "symlink_safe": .bool(true)]),
                 ]
             ),
@@ -3204,8 +3208,8 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             params.removeValue(forKey: "text")
             params["bot_id"] = botID
 
-            _ = try await live.rpc(method: "bot.browser.action", params: params)
-            XCTAssertEqual(router.finalizedEventKinds["bot.browser.action:\(requestID)"], [])
+            _ = try await live.rpc(method: "bot.files.mutate", params: params)
+            XCTAssertEqual(router.finalizedEventKinds["bot.files.mutate:\(requestID)"], [])
         }
     }
 

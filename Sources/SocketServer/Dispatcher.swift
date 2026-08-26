@@ -1422,6 +1422,7 @@ public final class JSONRPCDispatcher {
                         "host_id", "client_request_id", "root", "root_handle", "handle", "generation", "previous_generation",
                         "root_cas", "previous_cas", "expected_cas", "current_cas",
                         "entry_generation", "entry_cas", "path", "op",
+                        "current_revision_id", "revision", "soul", "description",
                         "profile_id", "attention_item_id", "notification_id", "source", "enqueued", "id",
                         "surface_id", "snapshot_generation", "url", "title", "loading", "action",
                         "session_before_digest", "session_after_digest", "cleared", "removed_count", "partial",
