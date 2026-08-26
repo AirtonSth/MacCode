@@ -52,4 +52,25 @@ final class OwnedChildReaperTests: XCTestCase {
         // pid 0 / negative treated as already gone
         XCTAssertEqual(OwnedChildReaper.poll(pid: -1), 0)
     }
+
+    func test_waitForZombieFalse_returnsWithoutBlockingWaitpid() throws {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+        proc.arguments = ["-c", "while true; do sleep 0.05; done"]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        try proc.run()
+        let pid = proc.processIdentifier
+        let started = Date()
+        _ = OwnedChildReaper.terminateAndReap(
+            pid: pid,
+            termGrace: 0.05,
+            killGrace: 0.05,
+            waitForZombie: false
+        )
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1.5,
+                          "usage-refresher PTY teardown must not block on waitpid(0)")
+        proc.terminate()
+        proc.waitUntilExit()
+    }
 }

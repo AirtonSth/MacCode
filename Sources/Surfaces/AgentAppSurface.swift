@@ -610,6 +610,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public let customModelStore: AgentCustomModelStore?
     public let planNotesStore: PlanNotesStore?
     private let orchestrationRuntime: AgentOrchestrationRuntime
+    private var subagentRefreshGeneration: UInt64 = 0
+    private var subagentRefreshTask: Task<Void, Never>?
+    private var publishedSubagentActivityThreadId: AgentThreadID?
+    #if DEBUG
+    /// Counts sync receipt JSON/SQLite work that still ran on the MainActor.
+    /// Production refresh must stay at zero; the freeze-class hang was this path.
+    public private(set) var mainActorSubagentReceiptDecodeCountForTesting = 0
+    #endif
     private var promptHistory: [String] = []
     private var promptHistoryCursor: Int?
     private var terminalRunIds = Set<AgentRunID>()
@@ -1085,6 +1093,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         tokenSaverFooterReloadTask?.cancel()
         tokenSaverFooterReloadTask = nil
+        subagentRefreshTask?.cancel()
+        subagentRefreshTask = nil
+        subagentRefreshGeneration &+= 1
         tokenSaverSavingsRepo = nil
         tokenSaverFooterEligibleCheck = nil
         tokenSaverGraphifyActiveCheck = nil
@@ -1346,20 +1357,50 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// + JSON decode never sit on the main thread (hang_breach under multi-thread).
     public func refreshSubagentActivity() {
         guard !isDisposed else { return }
-        guard selectedThreadId != nil else {
+        guard let threadId = selectedThreadId else {
+            publishedSubagentActivityThreadId = nil
             applySubagentActivity(.empty)
             return
         }
-        // Synchronous path kept for event-driven reselect; poll uses the off-main loader.
-        let snapshot = loadSubagentActivitySnapshotSync(persistLifecycleReconciliation: true)
-        applySubagentActivity(snapshot)
+        // Switching threads must drop the previous thread's badge immediately.
+        // The receipt load stays off-main (freeze-class hang_breach).
+        if publishedSubagentActivityThreadId != threadId {
+            applySubagentActivity(.empty)
+            publishedSubagentActivityThreadId = threadId
+        }
+        // Off-main JSON/SQLite. The previous MainActor `loadSubagentActivitySnapshotSync`
+        // path is the freeze-class hang_breach (CPU diag: applyRailSnapshot → receipts).
+        let generation = subagentRefreshGeneration &+ 1
+        subagentRefreshGeneration = generation
+        subagentRefreshTask?.cancel()
+        subagentRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.subagentRefreshGeneration == generation else { return }
+            let snapshot = await self.loadSubagentActivitySnapshotsOffMainActor(
+                for: [threadId],
+                persistLifecycleReconciliation: true
+            )[threadId] ?? .empty
+            guard !Task.isCancelled else { return }
+            guard self.subagentRefreshGeneration == generation else { return }
+            self.applySubagentActivity(snapshot, loadedFor: threadId)
+            if self.subagentRefreshGeneration == generation {
+                self.subagentRefreshTask = nil
+            }
+        }
     }
+
+    #if DEBUG
+    public func awaitSubagentActivityRefreshForTesting() async {
+        await subagentRefreshTask?.value
+    }
+    #endif
 
     /// Apply a precomputed snapshot on the main actor (poll completion path).
     public func applySubagentActivity(_ next: SubagentActivitySnapshot) {
         guard !isDisposed else { return }
         guard Self.shouldPublishSubagentActivity(current: subagentActivity, next: next) else { return }
         subagentActivity = next
+        publishedSubagentActivityThreadId = selectedThreadId
     }
 
     /// Apply a poll result only while the thread that produced it is still selected.
@@ -1415,28 +1456,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 )
             })
         }.value
-    }
-
-    private func loadSubagentActivitySnapshotSync(
-        persistLifecycleReconciliation: Bool
-    ) -> SubagentActivitySnapshot {
-        guard let selectedThreadId else { return .empty }
-        let receipts = (try? orchestrationRuntime.activityReceipts(
-            threadIds: [selectedThreadId],
-            limit: SubagentActivityProjection.defaultReceiptFetchLimit,
-            persistLifecycleReconciliation: persistLifecycleReconciliation
-        )) ?? []
-        let activeRunIds = Set(
-            coordinator.activeThreadIdsSnapshot().compactMap { threadId in
-                coordinator.activeRunId(threadId: threadId)
-            }
-        )
-        return SubagentActivityProjection.project(
-            receipts: receipts,
-            threadIds: [selectedThreadId],
-            activeRunIds: activeRunIds,
-            now: clock()
-        )
     }
 
     /// Skip equal subagent snapshot reloads (soft reselect / idle poll multipass).
@@ -10095,9 +10114,11 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
 
 }
 
-public struct AgentImageViewPresentation: Equatable, Sendable {
+public struct AgentImageViewPresentation: Equatable, Sendable, Identifiable {
     public let displayName: String
     public let resourceURL: URL
+
+    public var id: String { resourceURL.path }
 
     public static func make(for item: AssistantItem) -> AgentImageViewPresentation? {
         guard item.type == .imageView else { return nil }
@@ -10239,7 +10260,7 @@ private struct AgentTranscriptImageThumbStrip: View {
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(alignment: .top, spacing: DS.Space.sm) {
-                ForEach(Array(presentations.enumerated()), id: \.offset) { index, presentation in
+                ForEach(Array(presentations.enumerated()), id: \.element.id) { index, presentation in
                     AgentTranscriptImageThumb(
                         url: presentation.resourceURL,
                         displayName: presentation.displayName,
@@ -13772,9 +13793,8 @@ public struct AgentAppView: View {
                         Text(question.prompt)
                             .font(DS.Font.bodyDense.weight(.semibold))
                             .foregroundColor(DS.Palette.text)
-                        // Index-keyed so duplicate option labels can't share SwiftUI identity.
-                        ForEach(Array(question.options.enumerated()), id: \.offset) { _, option in
-                            askUserQuestionOptionButton(option, question: question, request: request)
+                        ForEach(question.identifiedOptions) { row in
+                            askUserQuestionOptionButton(row.option, question: question, request: request)
                         }
                         AskUserQuestionOtherField(vm: vm, question: question, request: request)
                     }

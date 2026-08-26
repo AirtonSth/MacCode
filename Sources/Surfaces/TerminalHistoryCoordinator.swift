@@ -453,15 +453,42 @@ private final class TerminalHistoryReadOperation: @unchecked Sendable {
     }
 }
 
+/// Caps concurrent SQLite history writes per surface. The freeze-class disk
+/// diag was unbounded `flushReadyPending` WAL frames (8.6 GB dirty).
+enum TerminalHistoryFlushBackpressure: Sendable {
+    static let maxInFlightSQLiteWrites = 1
+
+    static func shouldEnqueueWrite(inFlightCount: Int) -> Bool {
+        inFlightCount < maxInFlightSQLiteWrites
+    }
+}
+
 private final class TerminalHistoryQueueState: @unchecked Sendable {
     private let condition = NSCondition()
     private var failureGeneration: UInt64 = 0
+    private var inFlightFlushCount = 0
     private var durablePartial = false
     private var retentionMaintenanceScheduled = false
     private var globalRetentionMaintenanceScheduled = false
     private var retentionCheckRequired = false
     private var retryDeadline = Date.distantFuture
     private var retriesCancelled = false
+
+    func beginFlushIfPermitted() -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        guard TerminalHistoryFlushBackpressure.shouldEnqueueWrite(
+            inFlightCount: inFlightFlushCount
+        ) else { return false }
+        inFlightFlushCount += 1
+        return true
+    }
+
+    func endFlush() {
+        condition.lock()
+        inFlightFlushCount = max(0, inFlightFlushCount - 1)
+        condition.unlock()
+    }
 
     func recordFailure() {
         condition.lock()
@@ -1442,6 +1469,7 @@ final class TerminalHistoryCoordinator {
               let chunkIndex = nextChunkIndex,
               let writerGeneration,
               !pendingData.isEmpty else { return }
+        guard queueState.beginFlushIfPermitted() else { return }
 
         let data = pendingData
         pendingData = Data()
@@ -1463,6 +1491,12 @@ final class TerminalHistoryCoordinator {
         let beforePersistForTesting = beforePersistForTesting
 
         queue.async { [weak self] in
+            defer {
+                queueState.endFlush()
+                DispatchQueue.main.async { [weak self] in
+                    self?.flushReadyPending()
+                }
+            }
             let reportFailure: @Sendable (Error) -> Void = { [weak self] error in
                 queueState.recordFailure()
                 let staleWriter = error as? TerminalHistoryRepositoryError

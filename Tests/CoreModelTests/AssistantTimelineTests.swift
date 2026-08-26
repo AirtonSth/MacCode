@@ -406,6 +406,19 @@ final class AssistantTimelineTests: XCTestCase {
         XCTAssertEqual(decoded.questions.first?.options.first?.detail, "Declarative")
         XCTAssertEqual(decoded.questions.last?.allowsMultipleSelection, true)
         XCTAssertTrue(decoded.isStructured)
+        let duplicate = AssistantUserInputQuestion(
+            id: "dup",
+            prompt: "Choose",
+            options: [
+                AssistantUserInputOption(label: "Yes"),
+                AssistantUserInputOption(label: "Yes"),
+            ]
+        )
+        XCTAssertEqual(
+            duplicate.identifiedOptions.map(\.id),
+            ["dup#0#Yes", "dup#1#Yes"],
+            "duplicate option labels must still get unique SwiftUI identities"
+        )
 
         // Legacy / version-skew payload with no `questions` key decodes to a plain
         // free-text request, not a decode failure.

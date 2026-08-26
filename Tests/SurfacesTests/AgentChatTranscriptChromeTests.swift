@@ -4,6 +4,35 @@ import CoreModel
 
 final class AgentChatTranscriptChromeTests: XCTestCase {
 
+    func test_agentAppChat_usesStableForEachIdentity() throws {
+        // WHY: AvdLee list-patterns — ForEach identity must outlive the row.
+        // `id: \.offset` remounts every image/option when the collection shifts
+        // and was the freeze-class SwiftUI invalidation finding on Agent App chat.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        XCTAssertFalse(
+            source.contains("id: \\.offset"),
+            "Agent App chat/rail ForEach must not use positional identity"
+        )
+        XCTAssertTrue(
+            source.contains("identifiedOptions"),
+            "AskUserQuestion options must use a precomputed stable row id"
+        )
+        XCTAssertTrue(
+            AgentImageViewPresentation(
+                displayName: "shot.png",
+                resourceURL: URL(fileURLWithPath: "/tmp/shot.png")
+            ).id.hasSuffix("shot.png"),
+            "image strip identity must follow the resource URL, not the index"
+        )
+    }
+
     func test_statusCardIsFullWidthOnItsOwnLine_becauseRunHeadersAreNotBubbles() throws {
         // WHY: Supervised-run / work-log panels hugged content next to a
         // timestamp gutter. System cards must span the transcript column.

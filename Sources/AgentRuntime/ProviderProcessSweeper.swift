@@ -132,12 +132,54 @@ public enum ProviderProcessSweeper {
         return !isRemoteCodeDistillMCPCommand(command)
     }
 
-    /// True when argv mode is `mcp` (managed distill CLI helper).
+    /// Per-run stdio MCP argv modes spawned by Claude/Codex/Grok. The long-running
+    /// Token Saver HTTP server is NOT in this set (`--auth-token` / `--host`).
+    public static let distillMCPArgvModes: Set<String> = [
+        "mcp",
+        "bot-self-config",
+        "bot-web",
+        "bot-browser",
+        "bot-computer",
+    ]
+
+    /// True when argv mode is a Distill MCP sidecar (`mcp` or bot catalog).
     public static func isRemoteCodeDistillMCPCommand(_ command: String) -> Bool {
-        guard isRemoteCodeDistillService(command) else { return false }
+        distillMCPMode(from: command) != nil
+    }
+
+    public static func distillMCPMode(from command: String) -> String? {
+        guard isRemoteCodeDistillService(command) else { return nil }
         let parts = command.split(whereSeparator: \.isWhitespace).map(String.init)
-        // executable [mode] …
-        return parts.count >= 2 && parts[1] == "mcp"
+        guard parts.count >= 2, distillMCPArgvModes.contains(parts[1]) else { return nil }
+        return parts[1]
+    }
+
+    /// Distill MCP PIDs whose parent is gone (reparented to launchd / pid 1, or
+    /// a ppid not present in this table). Live provider-owned children stay.
+    /// The HTTP/MLX server is never returned.
+    public static func orphanDistillMCPPIDs(
+        in processes: [ProviderRuntimeProcess]
+    ) -> [Int32] {
+        let live = Set(processes.map(\.pid))
+        return processes.compactMap { row in
+            guard isRemoteCodeDistillMCPCommand(row.command) else { return nil }
+            let parentAlive = row.ppid > 1 && live.contains(row.ppid)
+            return parentAlive ? nil : row.pid
+        }
+    }
+
+    /// Reap Distill MCP sidecars left behind after the owning provider run
+    /// exited. Returns the PIDs that were signalled.
+    @discardableResult
+    public static func reapOrphanDistillMCPSidecars(
+        processes: [ProviderRuntimeProcess],
+        terminate: (pid_t) -> Bool
+    ) -> [Int32] {
+        var terminated: [Int32] = []
+        for pid in orphanDistillMCPPIDs(in: processes) {
+            if terminate(pid) { terminated.append(pid) }
+        }
+        return terminated
     }
 
     static func descendants(

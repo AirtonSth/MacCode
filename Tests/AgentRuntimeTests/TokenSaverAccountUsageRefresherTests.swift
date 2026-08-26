@@ -47,6 +47,27 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
         return sorted[sorted.count / 2]
     }
 
+    func test_ptyTerminateDoesNotBlockOnZombieWait() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/AgentRuntime/TokenSaverAccountUsageRefresher.swift"
+            ),
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            source.contains("waitForZombie: false"),
+            "Claude /usage PTY teardown must not pin overlapping refreshes on waitpid(0)"
+        )
+        XCTAssertTrue(
+            source.contains("inFlightRefresh"),
+            "concurrent refreshAccountUsage must coalesce onto one in-flight task"
+        )
+    }
+
     func test_codexParserPrefersWeeklyCodexLimitBucket() {
         let usage = AssistantAccountUsageParser.codex(from: [
             "rateLimits": [

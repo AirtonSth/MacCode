@@ -192,6 +192,100 @@ final class AgentWorkspaceRailReloadCoordinatorTests: XCTestCase {
         }
     }
 
+    func test_applyRailSnapshot_doesNotDecodeReceiptsOnMainActor() throws {
+        // WHY: the freeze-class CPU diag was applyRailSnapshot →
+        // refreshSubagentActivity → JSONDecoder of admission receipts on
+        // MainActor against a multi-GB sqlite file.
+        let root = NSTemporaryDirectory() + "rc-rail-offmain-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [:]
+        )
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(workspaceId: workspaceID, title: "Live", provider: .codex, model: "gpt-5")
+        try threadRepo.upsert(thread)
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: root,
+            coordinator: runCoordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        vm.selectThread(thread.id, markRead: false)
+        let before = vm.mainActorSubagentReceiptDecodeCountForTesting
+        vm.applyRailSnapshot(
+            AgentWorkspaceRailReloadCoordinator.RailSnapshot(
+                workspaceID: workspaceID,
+                threads: [thread],
+                prunedThreadIDs: []
+            )
+        )
+        XCTAssertEqual(
+            vm.mainActorSubagentReceiptDecodeCountForTesting,
+            before,
+            "rail apply must not decode orchestration receipts on the MainActor"
+        )
+        vm.dispose()
+    }
+
+    func test_subagentRefresh_rejectsStaleThreadResult() async throws {
+        // WHY: rapid A→B must not let the slower A's receipt snapshot overwrite B.
+        let root = NSTemporaryDirectory() + "rc-rail-ab-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [:]
+        )
+        let workspaceID = WorkspaceID()
+        let threadA = AgentThread(workspaceId: workspaceID, title: "A", provider: .codex, model: "gpt-5")
+        let threadB = AgentThread(workspaceId: workspaceID, title: "B", provider: .codex, model: "gpt-5")
+        try threadRepo.upsert(threadA)
+        try threadRepo.upsert(threadB)
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: root,
+            coordinator: runCoordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        defer { vm.dispose() }
+        vm.selectThread(threadA.id, markRead: false)
+        let staleA = SubagentActivitySnapshot(
+            active: [],
+            done: [],
+            unknown: [],
+            completedBound: SubagentActivityProjection.defaultCompletedBound + 7
+        )
+        vm.selectThread(threadB.id, markRead: false)
+        vm.applySubagentActivity(staleA, loadedFor: threadA.id)
+        XCTAssertNotEqual(
+            vm.subagentActivity.completedBound,
+            staleA.completedBound,
+            "a snapshot loaded for thread A must not publish after the user moved to B"
+        )
+        let liveB = SubagentActivitySnapshot(
+            active: [],
+            done: [],
+            unknown: [],
+            completedBound: SubagentActivityProjection.defaultCompletedBound + 3
+        )
+        vm.applySubagentActivity(liveB, loadedFor: threadB.id)
+        XCTAssertEqual(vm.subagentActivity.completedBound, liveB.completedBound)
+    }
+
     func test_reRegisterRestartsWithinOnePollCadence() async {
         let fixture = PollFixture()
         let coordinator = AgentWorkspaceRailReloadCoordinator(

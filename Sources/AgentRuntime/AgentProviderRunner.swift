@@ -727,6 +727,17 @@ enum ProcessTerminator {
         childPIDProvider.directChildren(of: root).flatMap(processTreePIDs(root:)) + [root]
     }
 
+    /// After the root has been signalled, multiprocessing helpers (Graphify's
+    /// Python resource_tracker) can remain. Recapture the tree and keep only
+    /// still-alive non-root PIDs so a timeout cannot leak them.
+    static func unreapedDescendants(
+        root: Int32,
+        tree: [Int32],
+        isAlive: (Int32) -> Bool = { ProcessTerminator.isAlive($0) }
+    ) -> [Int32] {
+        tree.filter { pid in pid != root && pid > 0 && isAlive(pid) }
+    }
+
     /// Tracks a provider tree across repeated teardown polls. `knownPIDs`
     /// retains children after reparenting; an isolated process group catches a
     /// child that forks during the root's TERM trap before the next tree scan.
