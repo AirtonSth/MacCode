@@ -87,6 +87,40 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         return try guestState(botID: botID)
     }
 
+    private func sidecarObject(_ key: String) throws -> [String: Any] {
+        let statement = try db.prepare("SELECT value FROM settings WHERE key = ? LIMIT 1;")
+        defer { statement.reset() }
+        try statement.bind(1, key)
+        guard try statement.step(),
+              let text = statement.columnText(0),
+              let data = text.data(using: .utf8),
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
+        }
+        return object
+    }
+
+    private func createLiveBot(
+        prefix: String,
+        name: String
+    ) throws -> (botID: String, conversationID: String, runID: String) {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "\(prefix)-create", "name": name,
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let conversation = try authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "\(prefix)-conversation", "bot_id": botID, "title": "\(name) thread",
+        ])
+        let conversationID = try XCTUnwrap(
+            (conversation["readback"] as? [String: Any])?["conversation_id"] as? String
+        )
+        let sent = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "\(prefix)-send", "bot_id": botID, "text": "\(name) work",
+        ])
+        let runID = try XCTUnwrap((sent["readback"] as? [String: Any])?["run_id"] as? String)
+        return (botID, conversationID, runID)
+    }
+
     func test_settingsSet_failsWithoutRequestId_becauseSilentLocalSuccessIsForbidden() {
         XCTAssertThrowsError(
             try authority.dispatch(method: "bot.settings.set", params: [
@@ -890,6 +924,72 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "client_request_id": "del-yes", "bot_id": botID, "confirm": "delete",
         ])
         XCTAssertEqual(try store.list(includeHidden: true).count, 0)
+    }
+
+    func test_deleteClearsOnlyThatBotsLiveAttentionAndSelectionAcrossRelaunch() throws {
+        // WHY: deleting one teammate must close its transient work without
+        // erasing another teammate's active run, attention, or selection.
+        let deleted = try createLiveBot(prefix: "delete-a", name: "Delete A")
+        let survivor = try createLiveBot(prefix: "delete-b", name: "Keep B")
+
+        _ = try authority.dispatch(method: "bot.delete", params: [
+            "client_request_id": "delete-a", "bot_id": deleted.botID, "confirm": "delete",
+        ], now: Date(timeIntervalSince1970: 1_700_000_600))
+
+        let remaining = try authority.dispatch(method: "bot.attention.list", params: [:])
+        XCTAssertEqual(Set((remaining["items"] as? [[String: Any]] ?? []).compactMap { $0["bot_id"] as? String }), [survivor.botID])
+        XCTAssertFalse(authority.settleRuntime(botID: deleted.botID, runID: deleted.runID, failed: false))
+        XCTAssertTrue(authority.settleRuntime(botID: survivor.botID, runID: survivor.runID, failed: false))
+        let selections = try sidecarObject("bot.remote.selected_conversations")
+        XCTAssertNil(selections[deleted.botID])
+        XCTAssertEqual(selections[survivor.botID] as? String, survivor.conversationID)
+        XCTAssertNotEqual(deleted.conversationID, survivor.conversationID)
+
+        let relaunched = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: settings,
+            appSupportDirectory: supportDir
+        )
+        let restored = try relaunched.dispatch(method: "bot.attention.list", params: [:])
+        XCTAssertEqual(Set((restored["items"] as? [[String: Any]] ?? []).compactMap { $0["bot_id"] as? String }), [survivor.botID])
+    }
+
+    func test_discardNewClearsOnlyThatBotsTransientState() throws {
+        // WHY: canceling an unpublished Bot uses the same destructive boundary
+        // as delete and must not leave its run/attention beside another Bot.
+        let discarded = try createLiveBot(prefix: "discard-a", name: "Discard A")
+        let survivor = try createLiveBot(prefix: "discard-b", name: "Keep B")
+
+        _ = try authority.dispatch(method: "bot.discard_new", params: [
+            "client_request_id": "discard-a", "bot_id": discarded.botID,
+        ], now: Date(timeIntervalSince1970: 1_700_000_700))
+
+        let remaining = try authority.dispatch(method: "bot.attention.list", params: [:])
+        XCTAssertEqual(Set((remaining["items"] as? [[String: Any]] ?? []).compactMap { $0["bot_id"] as? String }), [survivor.botID])
+        XCTAssertFalse(authority.settleRuntime(botID: discarded.botID, runID: discarded.runID, failed: false))
+        XCTAssertTrue(authority.settleRuntime(botID: survivor.botID, runID: survivor.runID, failed: false))
+        let selections = try sidecarObject("bot.remote.selected_conversations")
+        XCTAssertNil(selections[discarded.botID])
+        XCTAssertEqual(selections[survivor.botID] as? String, survivor.conversationID)
+    }
+
+    func test_relaunchFiltersLegacyAttentionForDeletedBots() throws {
+        // WHY: older sidecars may retain attention written before Bot deletion;
+        // relaunch must heal that stale projection without touching live Bots.
+        let deleted = try createLiveBot(prefix: "legacy-a", name: "Legacy A")
+        let survivor = try createLiveBot(prefix: "legacy-b", name: "Keep B")
+        try store.delete(id: BotID(try XCTUnwrap(UUID(uuidString: deleted.botID))))
+
+        let relaunched = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: settings,
+            appSupportDirectory: supportDir
+        )
+
+        let restored = try relaunched.dispatch(method: "bot.attention.list", params: [:])
+        XCTAssertEqual(Set((restored["items"] as? [[String: Any]] ?? []).compactMap { $0["bot_id"] as? String }), [survivor.botID])
     }
 
     func test_newSaveAndExistingSave_areDistinctPres() throws {

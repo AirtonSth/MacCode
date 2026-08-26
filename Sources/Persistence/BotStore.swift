@@ -473,6 +473,16 @@ public final class BotStore: @unchecked Sendable {
             try tombstone.bind(3, string(now))
             _ = try tombstone.step()
 
+            let acknowledgeAttention = try db.prepare("""
+                UPDATE bot_attention_items
+                SET acknowledged_at = COALESCE(acknowledged_at, ?)
+                WHERE bot_id = ?;
+                """)
+            defer { acknowledgeAttention.reset() }
+            try acknowledgeAttention.bind(1, string(now))
+            try acknowledgeAttention.bind(2, id.value.uuidString.lowercased())
+            _ = try acknowledgeAttention.step()
+
             try executeBound("DELETE FROM bot_conversations WHERE bot_id = ?;", id: id)
             try executeBound("DELETE FROM bot_skill_bindings WHERE bot_id = ?;", id: id)
             try executeBound("DELETE FROM bot_routine_activations WHERE bot_id = ?;", id: id)

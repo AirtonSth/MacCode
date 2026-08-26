@@ -365,7 +365,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         case "create":
             return try create(params: params, requestID: requestID, now: now)
         case "discard_new":
-            return try discardNew(params: params, requestID: requestID)
+            return try discardNew(params: params, requestID: requestID, now: now)
         case "save":
             return try save(params: params, requestID: requestID, now: now)
         case "delete":
@@ -458,12 +458,13 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: encodeBot(bot, extra: ["unpublished": true, "pre": "UNPUBLISHED_NEW"]))
     }
 
-    private func discardNew(params: [String: Any], requestID: String) throws -> [String: Any] {
+    private func discardNew(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
         let bot = try requireBot(params)
         let botID = id(bot)
         guard unpublished.contains(botID) else { throw Error.invalidParams }
-        try store.delete(id: bot.id)
+        try store.delete(id: bot.id, now: now)
         unpublished.remove(botID)
+        clearTransientState(botID: botID)
         try? store.deleteQueuedFollowUps(botID: bot.id)
         return receipt(requestID: requestID, status: .completed, botID: botID, readback: ["deleted": true, "unpublished": false])
     }
@@ -492,9 +493,17 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return receipt(requestID: requestID, status: .accepted, botID: string(params, "bot_id"), readback: ["confirm_required": true])
         }
         let bot = try requireBot(params)
+        let botID = id(bot)
         try store.delete(id: bot.id, now: now)
-        unpublished.remove(id(bot))
-        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: ["deleted": true])
+        unpublished.remove(botID)
+        clearTransientState(botID: botID)
+        return receipt(requestID: requestID, status: .completed, botID: botID, readback: ["deleted": true])
+    }
+
+    private func clearTransientState(botID: String) {
+        attention.removeValue(forKey: botID)
+        liveRuns.removeValue(forKey: botID)
+        selectedConversation.removeValue(forKey: botID)
     }
 
     private func setPinned(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
@@ -2439,7 +2448,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
         if let data = loadData("bot.remote.attention"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
-            attention = decoded
+            let liveBotIDs = Set(((try? store.list(includeHidden: true)) ?? []).map(id))
+            attention = decoded.filter { liveBotIDs.contains($0.key) }
         }
         if let data = loadData("bot.remote.scheduler_runs"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
