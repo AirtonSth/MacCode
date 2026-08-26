@@ -613,11 +613,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var subagentRefreshGeneration: UInt64 = 0
     private var subagentRefreshTask: Task<Void, Never>?
     private var publishedSubagentActivityThreadId: AgentThreadID?
-    #if DEBUG
-    /// Counts sync receipt JSON/SQLite work that still ran on the MainActor.
-    /// Production refresh must stay at zero; the freeze-class hang was this path.
-    public private(set) var mainActorSubagentReceiptDecodeCountForTesting = 0
-    #endif
     private var promptHistory: [String] = []
     private var promptHistoryCursor: Int?
     private var terminalRunIds = Set<AgentRunID>()

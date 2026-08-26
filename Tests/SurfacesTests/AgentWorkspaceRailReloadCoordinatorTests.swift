@@ -1,6 +1,6 @@
 import XCTest
 import CoreModel
-import AgentRuntime
+@testable import AgentRuntime
 @testable import Persistence
 @testable import Surfaces
 
@@ -192,10 +192,11 @@ final class AgentWorkspaceRailReloadCoordinatorTests: XCTestCase {
         }
     }
 
-    func test_applyRailSnapshot_doesNotDecodeReceiptsOnMainActor() throws {
+    func test_applyRailSnapshot_doesNotDecodeReceiptsOnMainActor() async throws {
         // WHY: the freeze-class CPU diag was applyRailSnapshot →
         // refreshSubagentActivity → JSONDecoder of admission receipts on
-        // MainActor against a multi-GB sqlite file.
+        // MainActor. The spy is the real `activityReceipts` entry, not a
+        // counter that never increments.
         let root = NSTemporaryDirectory() + "rc-rail-offmain-\(UUID().uuidString)"
         defer { try? FileManager.default.removeItem(atPath: root) }
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root).run()
@@ -206,20 +207,69 @@ final class AgentWorkspaceRailReloadCoordinatorTests: XCTestCase {
             runRepo: runRepo,
             messageRepo: messageRepo,
             threadRepo: threadRepo,
-            providers: [:]
+            providers: [
+                .codex: FakeProviderRunner(provider: .codex),
+                .claude: FakeProviderRunner(provider: .claude),
+                .grok: FakeProviderRunner(provider: .grok)
+            ]
+        )
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false },
+            processIsAlive: { _ in false }
         )
         let workspaceID = WorkspaceID()
-        let thread = AgentThread(workspaceId: workspaceID, title: "Live", provider: .codex, model: "gpt-5")
-        try threadRepo.upsert(thread)
         let vm = AgentAppViewModel(
             workspaceID: workspaceID,
             cwd: root,
             coordinator: runCoordinator,
             threadRepo: threadRepo,
-            messageRepo: messageRepo
+            messageRepo: messageRepo,
+            orchestrationRuntime: runtime
         )
-        vm.selectThread(thread.id, markRead: false)
-        let before = vm.mainActorSubagentReceiptDecodeCountForTesting
+        defer { vm.dispose() }
+        vm.createThread(title: "Live")
+        let threadID = try XCTUnwrap(vm.selectedThreadId)
+        let seedRuntime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false },
+            processIsAlive: { _ in true }
+        )
+        let parentRunID = AgentRunID()
+        let parentCapability = AgentDelegationCapability.issue()
+        _ = try seedRuntime.recordExternalRoot(
+            runId: parentRunID,
+            threadId: threadID,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            permissionMode: .supervised,
+            delegationCapabilitySHA256: AgentDelegationCapability.sha256Hex(parentCapability),
+            ownerProcessID: 998
+        )
+        _ = try seedRuntime.recordAuthorizedExternalChild(
+            runId: AgentRunID(),
+            threadId: threadID,
+            provider: .grok,
+            providerInstanceId: "grok-cli",
+            model: "grok",
+            nodeId: "nested.grok.dead",
+            parentRunId: parentRunID,
+            parentThreadId: threadID,
+            parentCapability: parentCapability,
+            childCapability: AgentDelegationCapability.issue(),
+            requestedPermissionMode: .supervised,
+            ownerProcessID: 999
+        )
+        await vm.awaitSubagentActivityRefreshForTesting()
+        runtime.activityReceiptsThreadProbeForTesting.reset()
+
+        let thread = try XCTUnwrap(try threadRepo.get(id: threadID))
         vm.applyRailSnapshot(
             AgentWorkspaceRailReloadCoordinator.RailSnapshot(
                 workspaceID: workspaceID,
@@ -228,11 +278,24 @@ final class AgentWorkspaceRailReloadCoordinatorTests: XCTestCase {
             )
         )
         XCTAssertEqual(
-            vm.mainActorSubagentReceiptDecodeCountForTesting,
-            before,
+            runtime.activityReceiptsThreadProbeForTesting.mainThreadCallCount,
+            0,
             "rail apply must not decode orchestration receipts on the MainActor"
         )
-        vm.dispose()
+        await vm.awaitSubagentActivityRefreshForTesting()
+        XCTAssertEqual(
+            runtime.activityReceiptsThreadProbeForTesting.mainThreadCallCount,
+            0,
+            "the winning off-main load must still not decode on the MainActor"
+        )
+        XCTAssertGreaterThan(
+            runtime.activityReceiptsThreadProbeForTesting.backgroundCallCount,
+            0,
+            "the winning load must actually decode receipts off-main"
+        )
+        XCTAssertEqual(vm.subagentActivity.activeCount, 0)
+        XCTAssertEqual(vm.subagentActivity.unknownCount, 1,
+                       "eventual badge must match the durable dead-child receipt")
     }
 
     func test_subagentRefresh_rejectsStaleThreadResult() async throws {
