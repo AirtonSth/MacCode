@@ -211,6 +211,38 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(row["current_revision_id"] as? String, publishedRevisionID)
     }
 
+    func test_desktopSetPublishesDurableKindAndExactRevisionReadback() throws {
+        // WHY: Studio Save must not report a desktop kind that bot.get/list
+        // will immediately replace after the next refresh or host relaunch.
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "desktop-create", "name": "Desktop Bot",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let changed = try authority.dispatch(method: "bot.desktop.set", params: [
+            "client_request_id": "desktop-set", "bot_id": botID,
+            "kind": BotDesktopKind.dockerDesktop.rawValue,
+        ])
+        let readback = try XCTUnwrap(changed["readback"] as? [String: Any])
+        let revisionID = try XCTUnwrap(readback["current_revision_id"] as? String)
+        XCTAssertEqual(readback["kind"] as? String, BotDesktopKind.dockerDesktop.rawValue)
+        XCTAssertEqual(readback["desktop_kind"] as? String, BotDesktopKind.dockerDesktop.rawValue)
+
+        let get = try authority.dispatch(method: "bot.get", params: ["bot_id": botID])
+        let listed = try authority.dispatch(method: "bot.list", params: [:])
+        let row = try XCTUnwrap((listed["bots"] as? [[String: Any]])?.first { $0["id"] as? String == botID })
+        XCTAssertEqual(get["desktop_kind"] as? String, BotDesktopKind.dockerDesktop.rawValue)
+        XCTAssertEqual(row["desktop_kind"] as? String, BotDesktopKind.dockerDesktop.rawValue)
+        XCTAssertEqual(get["current_revision_id"] as? String, revisionID)
+        XCTAssertEqual(row["current_revision_id"] as? String, revisionID)
+
+        let relaunched = BotRemoteControlAuthority(
+            db: db, store: store, settings: settings, appSupportDirectory: supportDir
+        )
+        let restored = try relaunched.dispatch(method: "bot.get", params: ["bot_id": botID])
+        XCTAssertEqual(restored["desktop_kind"] as? String, BotDesktopKind.dockerDesktop.rawValue)
+        XCTAssertEqual(restored["current_revision_id"] as? String, revisionID)
+    }
+
     /// WHY: process-local receipt state may disappear at relaunch, but the
     /// authored soul and its revision must remain recoverable from BotStore.
     func test_soulReadbackSurvivesAuthorityRelaunch() throws {

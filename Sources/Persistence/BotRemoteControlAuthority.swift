@@ -1994,9 +1994,33 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func desktopSet(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
-        let kind = string(params, "kind") ?? BotDesktopKind.logicalExecutionSpace.rawValue
-        guard BotDesktopKind.advertisedKinds.map(\.rawValue).contains(kind) else { throw Error.invalidParams }
-        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: ["kind": kind])
+        let rawKind = string(params, "kind") ?? BotDesktopKind.logicalExecutionSpace.rawValue
+        guard let kind = BotDesktopKind(rawValue: rawKind),
+              BotDesktopKind.advertisedKinds.contains(kind),
+              let revisionID = bot.currentRevisionID,
+              let current = try store.getRevision(id: revisionID),
+              current.botID == bot.id else {
+            throw Error.invalidParams
+        }
+        let draft = BotRevisionDraft(
+            name: bot.name,
+            title: current.title,
+            description: current.description,
+            soul: current.soul,
+            permissionMode: current.permissionMode,
+            desktopKind: kind
+        )
+        let published = try store.publish(botID: bot.id, expectedCurrentRevisionID: revisionID, draft: draft)
+        return receipt(
+            requestID: requestID,
+            status: .completed,
+            botID: id(bot),
+            readback: [
+                "kind": published.desktopKind.advertisedOrLogical.rawValue,
+                "desktop_kind": published.desktopKind.advertisedOrLogical.rawValue,
+                "current_revision_id": published.id.value.uuidString.lowercased(),
+            ]
+        )
     }
 
     private func avatarSet(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
@@ -2247,6 +2271,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "hidden": bot.hidden,
             "notifications_enabled": bot.notificationsEnabled,
             "soul": revision.soul,
+            "desktop_kind": revision.desktopKind.advertisedOrLogical.rawValue,
             "current_revision_id": revision.id.value.uuidString.lowercased(),
             "workspace_id": NSNull(),
         ]
