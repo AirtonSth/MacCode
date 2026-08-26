@@ -30,7 +30,7 @@ The user's running RemoteCode (`io.remotecode.desktop`) is off-limits. A git wor
 
 - Create/enter a linked worktree, then edit, build, and test only there: `cd "$(scripts/isolated-sandbox.sh ensure)"`
 - Prove with `scripts/isolated-sandbox.sh test` (optional `--filter …`). Launch a second GUI only via `scripts/isolated-sandbox.sh run`.
-- Never `pkill -x RemoteCode`. Never `osascript` quit `io.remotecode.desktop`. Never `script/build_and_run.sh` or `scripts/run-app.sh` (they package the stable bundle id and quit the host).
+- Never `pkill -x RemoteCode`. Never `osascript` quit `io.remotecode.desktop`. Never `scripts/run-app.sh` (it packages the stable bundle id and quits the host). `script/build_and_run.sh` launches the debug sandbox app via `scripts/isolated-sandbox.sh`.
 - Do not install or overwrite `~/.local/bin/distill` from the sandbox. Leave Token Saver off on the debug instance.
 - Identity, ports, and App Support live in `scripts/isolated-sandbox.sh`. Ritual: `.grok/skills/isolated-sandbox/SKILL.md`.
 

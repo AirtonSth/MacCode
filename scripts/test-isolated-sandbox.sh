@@ -26,13 +26,13 @@ fi
 
 cd "$REPO_ROOT"
 IDENTITY="$("$SANDBOX" identity)"
-printf '%s\n' "$IDENTITY" | grep -qx 'bundle_id=io.remotecode.desktop.debug' \
+grep -Fqx 'bundle_id=io.remotecode.desktop.debug' <<<"$IDENTITY" \
   || fail "default bundle_id must be debug, got: $IDENTITY"
-printf '%s\n' "$IDENTITY" | grep -qx 'channel=debug' \
+grep -Fqx 'channel=debug' <<<"$IDENTITY" \
   || fail "default channel must be debug"
-printf '%s\n' "$IDENTITY" | grep -qx 'http_port=18218' \
+grep -Fqx 'http_port=18218' <<<"$IDENTITY" \
   || fail "default http_port must be 18218"
-printf '%s\n' "$IDENTITY" | grep -qx 'stable_bundle_id=io.remotecode.desktop' \
+grep -Fqx 'stable_bundle_id=io.remotecode.desktop' <<<"$IDENTITY" \
   || fail "identity must name the forbidden stable bundle"
 SANDBOX_HOME="$(printf '%s\n' "$IDENTITY" | sed -n 's/^sandbox_home=//p')"
 [ "$SANDBOX_HOME" = "$REPO_ROOT/.sandbox-state/home" ] \

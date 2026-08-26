@@ -221,7 +221,7 @@ when defaults are unset. iOS client docs: `ios-app/docs/RUNBOOKS.md` (RB-8),
 
 ## Build And Test
 
-Agents must not launch `script/build_and_run.sh` against the user's running host app. Use `scripts/isolated-sandbox.sh` (see `AGENTS.md`).
+`script/build_and_run.sh` launches `dist/RemoteCodeDebug.app` via `scripts/isolated-sandbox.sh` and does not quit the host app. Do not run `scripts/run-app.sh` against the user's running host app (see `AGENTS.md`).
 
 ```bash
 swift build --product RemoteCode

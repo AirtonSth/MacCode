@@ -301,9 +301,9 @@ codesign --verify --deep --strict --verbose=2 "$STAGING_APP"
 # Surface identity summary so a packaging log proves TCC durability class.
 if command -v codesign >/dev/null 2>&1; then
   SIGN_META="$(codesign -dv --verbose=4 "$STAGING_APP" 2>&1 || true)"
-  SIGN_TEAM="$(printf '%s\n' "$SIGN_META" | awk -F= '/^TeamIdentifier=/{print $2; exit}')"
-  SIGN_FLAGS="$(printf '%s\n' "$SIGN_META" | awk -F'[()]' '/flags=/{print $2; exit}')"
-  if printf '%s\n' "$SIGN_FLAGS" | grep -q adhoc || [ "${SIGN_TEAM:-not set}" = "not set" ]; then
+  SIGN_TEAM="$(awk -F= '/^TeamIdentifier=/{print $2; exit}' <<<"$SIGN_META")"
+  SIGN_FLAGS="$(awk -F'[()]' '/flags=/{print $2; exit}' <<<"$SIGN_META")"
+  if grep -q adhoc <<<"${SIGN_FLAGS:-}" || [ "${SIGN_TEAM:-not set}" = "not set" ]; then
     echo "[package] codesign team=none class=adhoc (TCC grants will not survive rebuilds)" >&2
   else
     echo "[package] codesign team=${SIGN_TEAM} class=durable flags=${SIGN_FLAGS:-none}" >&2
