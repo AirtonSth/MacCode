@@ -231,13 +231,13 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func list(params: [String: Any]) throws -> [String: Any] {
         let includeHidden = (params["include_hidden"] as? Bool) ?? false
-        let bots = try store.list(includeHidden: includeHidden).map { encodeBot($0) }
+        let bots = try store.list(includeHidden: includeHidden).map { try encodeBot($0) }
         return ["bots": bots, "unpublished_ids": Array(unpublished).sorted()]
     }
 
     private func get(params: [String: Any]) throws -> [String: Any] {
         let bot = try requireBot(params)
-        var encoded = encodeBot(bot)
+        var encoded = try encodeBot(bot)
         encoded["unpublished"] = unpublished.contains(bot.id.value.uuidString.lowercased())
         return encoded
     }
@@ -459,7 +459,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             now: now
         )
         unpublished.insert(id(bot))
-        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: encodeBot(bot, extra: ["unpublished": true, "pre": "UNPUBLISHED_NEW"]))
+        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: try encodeBot(bot, extra: ["unpublished": true, "pre": "UNPUBLISHED_NEW"]))
     }
 
     private func discardNew(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
@@ -489,7 +489,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
         unpublished.remove(botID)
         let fresh = try store.get(id: bot.id) ?? bot
-        return receipt(requestID: requestID, status: .completed, botID: botID, readback: encodeBot(fresh, extra: ["unpublished": false, "pre": pre]))
+        return receipt(requestID: requestID, status: .completed, botID: botID, readback: try encodeBot(fresh, extra: ["unpublished": false, "pre": pre]))
     }
 
     private func deleteBot(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
@@ -542,7 +542,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         } else {
             copiedRouting = nil
         }
-        var duplicateReadback = encodeBot(copy, extra: [
+        var duplicateReadback = try encodeBot(copy, extra: [
             "source_bot_id": id(bot),
             "schedule_spec_jsons": specs,
         ])
@@ -1708,7 +1708,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let bot = try requireBot(params)
         let soul = string(params, "soul") ?? ""
         guard let revisionID = bot.currentRevisionID,
-              let current = try store.getRevision(id: revisionID) else {
+              let current = try store.getRevision(id: revisionID),
+              current.botID == bot.id else {
             throw Error.notFound
         }
         let draft = BotRevisionDraft(
@@ -1719,8 +1720,16 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             permissionMode: current.permissionMode,
             desktopKind: current.desktopKind
         )
-        _ = try store.publish(botID: bot.id, expectedCurrentRevisionID: revisionID, draft: draft)
-        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: ["soul": soul])
+        let published = try store.publish(botID: bot.id, expectedCurrentRevisionID: revisionID, draft: draft)
+        return receipt(
+            requestID: requestID,
+            status: .completed,
+            botID: id(bot),
+            readback: [
+                "soul": published.soul,
+                "current_revision_id": published.id.value.uuidString.lowercased(),
+            ]
+        )
     }
 
     private func routingSet(params: [String: Any], requestID: String) throws -> [String: Any] {
@@ -1898,7 +1907,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         bot.id.value.uuidString.lowercased()
     }
 
-    private func encodeBot(_ bot: BotDefinition, extra: [String: Any] = [:]) -> [String: Any] {
+    private func encodeBot(_ bot: BotDefinition, extra: [String: Any] = [:]) throws -> [String: Any] {
+        guard let revisionID = bot.currentRevisionID,
+              let revision = try store.getRevision(id: revisionID),
+              revision.botID == bot.id else {
+            throw Error.notFound
+        }
         var body: [String: Any] = [
             "id": id(bot),
             "handle": bot.handle,
@@ -1909,6 +1923,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "pinned": bot.pinned,
             "hidden": bot.hidden,
             "notifications_enabled": bot.notificationsEnabled,
+            "soul": revision.soul,
+            "current_revision_id": revision.id.value.uuidString.lowercased(),
             "workspace_id": NSNull(),
         ]
         if let routing = routingPref[id(bot)] {

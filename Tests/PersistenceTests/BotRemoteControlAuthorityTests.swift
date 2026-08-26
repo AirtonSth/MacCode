@@ -161,6 +161,109 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(effective?["effects"], false)
     }
 
+    /// WHY: Studio's authored Instructions are revision-owned. A successful
+    /// soul mutation is not authoritative to iOS unless both exact read paths
+    /// expose the newly published revision for the same Bot.
+    func test_soulSetExposesExactPublishedRevisionThroughGetAndList() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "soul-create",
+            "name": "Soul Owner",
+            "soul": "Original instructions",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let originalRevisionID = try XCTUnwrap(
+            try store.get(id: BotID(try XCTUnwrap(UUID(uuidString: botID))))?.currentRevisionID
+        )
+
+        let changed = try authority.dispatch(method: "bot.soul.set", params: [
+            "client_request_id": "soul-change",
+            "bot_id": botID,
+            "soul": "Own the exact support inbox.",
+        ])
+        let readback = try XCTUnwrap(changed["readback"] as? [String: Any])
+        let publishedRevisionID = try XCTUnwrap(readback["current_revision_id"] as? String)
+        XCTAssertEqual(readback["soul"] as? String, "Own the exact support inbox.")
+        XCTAssertNotEqual(publishedRevisionID, originalRevisionID.value.uuidString.lowercased())
+
+        let got = try authority.dispatch(method: "bot.get", params: ["bot_id": botID])
+        XCTAssertEqual(got["id"] as? String, botID)
+        XCTAssertEqual(got["soul"] as? String, "Own the exact support inbox.")
+        XCTAssertEqual(got["current_revision_id"] as? String, publishedRevisionID)
+
+        let listed = try authority.dispatch(method: "bot.list", params: [:])
+        let row = try XCTUnwrap((listed["bots"] as? [[String: Any]])?.first {
+            $0["id"] as? String == botID
+        })
+        XCTAssertEqual(row["soul"] as? String, "Own the exact support inbox.")
+        XCTAssertEqual(row["current_revision_id"] as? String, publishedRevisionID)
+    }
+
+    /// WHY: process-local receipt state may disappear at relaunch, but the
+    /// authored soul and its revision must remain recoverable from BotStore.
+    func test_soulReadbackSurvivesAuthorityRelaunch() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "soul-relaunch-create",
+            "name": "Durable Soul",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let changed = try authority.dispatch(method: "bot.soul.set", params: [
+            "client_request_id": "soul-relaunch-change",
+            "bot_id": botID,
+            "soul": "Persist across authority reconstruction.",
+        ])
+        let revisionID = try XCTUnwrap(
+            (changed["readback"] as? [String: Any])?["current_revision_id"] as? String
+        )
+
+        authority = BotRemoteControlAuthority(
+            db: db,
+            store: BotStore(db: db),
+            settings: SettingsStore(db: db),
+            appSupportDirectory: supportDir
+        )
+
+        let got = try authority.dispatch(method: "bot.get", params: ["bot_id": botID])
+        XCTAssertEqual(got["id"] as? String, botID)
+        XCTAssertEqual(got["soul"] as? String, "Persist across authority reconstruction.")
+        XCTAssertEqual(got["current_revision_id"] as? String, revisionID)
+    }
+
+    /// WHY: a corrupt cross-Bot revision pointer must never disclose another
+    /// Bot's Instructions through get or through a partially successful list.
+    func test_soulReadbackFailsClosedForCrossBotRevisionIdentity() throws {
+        let first = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "soul-first",
+            "name": "First Soul",
+            "soul": "First private instructions",
+        ])
+        let second = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "soul-second",
+            "name": "Second Soul",
+            "soul": "Second private instructions",
+        ])
+        let firstID = try XCTUnwrap(first["bot_id"] as? String)
+        let secondID = try XCTUnwrap(second["bot_id"] as? String)
+        let secondRevisionID = try XCTUnwrap(
+            try store.get(id: BotID(try XCTUnwrap(UUID(uuidString: secondID))))?.currentRevisionID
+        )
+        let statement = try db.prepare("UPDATE bots SET current_revision_id = ? WHERE id = ?;")
+        defer { statement.reset() }
+        try statement.bind(1, secondRevisionID.value.uuidString.lowercased())
+        try statement.bind(2, firstID)
+        _ = try statement.step()
+
+        XCTAssertThrowsError(
+            try authority.dispatch(method: "bot.get", params: ["bot_id": firstID])
+        ) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .notFound)
+        }
+        XCTAssertThrowsError(
+            try authority.dispatch(method: "bot.list", params: [:])
+        ) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .notFound)
+        }
+    }
+
     func test_sendWithoutRequestId_doesNotEnqueue() throws {
         let created = try authority.dispatch(method: "bot.create", params: [
             "client_request_id": "c1",
