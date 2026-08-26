@@ -76,21 +76,6 @@ case "$url" in
       printf '%s' "$code"
     fi
     ;;
-  */jobs/789/artifacts/release-validation-receipt.json)
-    if [ "${RC2_FAKE_RECEIPT_MODE:-ok}" = "missing" ]; then
-      exit 22
-    fi
-    receipt="${RC2_FAKE_VALIDATION_RECEIPT:?}"
-    case "${RC2_FAKE_RECEIPT_MODE:-ok}" in
-      no-run-all) jq '.run_all_macos_ci = "0"' "$receipt" ;;
-      failed-prior-stages) jq '.prior_stages_status = "failed"' "$receipt" ;;
-      missing-job) jq 'del(.required_jobs[-1])' "$receipt" ;;
-      wrong-pipeline) jq '.pipeline_id = 999' "$receipt" ;;
-      wrong-sha) jq '.commit_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$receipt" ;;
-      ok) cat "$receipt" ;;
-      *) echo "unknown receipt mode" >&2; exit 2 ;;
-    esac
-    ;;
   *)
     echo "unexpected fake curl URL: $url" >&2
     exit 22
@@ -151,43 +136,7 @@ EOF
 
 chmod +x "$fake_bin/git" "$fake_bin/curl" "$fake_bin/aws"
 
-manifest="$fixture_root/acceptance.json"
-cat > "$manifest" <<'EOF'
-{
-  "schema_version": 1,
-  "commit_sha": "__SHA__",
-  "validation_pipeline_id": 123,
-  "validation_job_id": 789,
-  "gates": [
-    {"id":"focused-tests","status":"PASS"},
-    {"id":"full-swift-suite","status":"PASS"},
-    {"id":"package-signing","status":"PASS"},
-    {"id":"real-app-e2e","status":"PASS"},
-    {"id":"e2e-inventory","status":"PASS"},
-    {"id":"release-guard","status":"PASS"}
-  ]
-}
-EOF
-
 CI_COMMIT_SHA="0123456789abcdef0123456789abcdef01234567"
-sed -i '' "s/__SHA__/$CI_COMMIT_SHA/" "$manifest"
-validation_receipt="$fixture_root/release-validation-receipt.json"
-jq -n -S \
-  --arg sha "$CI_COMMIT_SHA" \
-  '{
-    schema_version: 1,
-    commit_sha: $sha,
-    ref: "production",
-    pipeline_id: 123,
-    validation_job_id: 789,
-    run_all_macos_ci: "1",
-    prior_stages_status: "success",
-    required_jobs: [
-      {id: "lint_scripts", status: "PASS"},
-      {id: "pr_unit_tests", status: "PASS"},
-      {id: "package_bundle_check", status: "PASS"}
-    ]
-  }' > "$validation_receipt"
 export CI_COMMIT_SHA
 export RELEASE_TAG="v9.8.7"
 export CI_COMMIT_TAG="$RELEASE_TAG"
@@ -195,13 +144,7 @@ export CI_PIPELINE_ID="456"
 export CI_API_V4_URL="https://gitlab.example/api/v4"
 export CI_PROJECT_ID="1"
 export CI_JOB_TOKEN="job-token"
-export RC2_VALIDATED_PIPELINE_ID="123"
-export RC2_VALIDATED_JOB_ID="789"
-RC2_ACCEPTANCE_MANIFEST_BASE64="$(base64 < "$manifest" | tr -d '\n')"
-RC2_ACCEPTANCE_MANIFEST_SHA256="$(shasum -a 256 "$manifest" | awk '{print $1}')"
-export RC2_ACCEPTANCE_MANIFEST_BASE64 RC2_ACCEPTANCE_MANIFEST_SHA256
 export RC2_FAKE_CURL_LOG="$fixture_root/curl.log"
-export RC2_FAKE_VALIDATION_RECEIPT="$validation_receipt"
 export PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 "$preflight" >/dev/null
@@ -219,66 +162,58 @@ export RC2_FAKE_TAG_SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 expect_preflight_failure "wrong tag SHA" "$preflight"
 unset RC2_FAKE_TAG_SHA
 
-saved_digest="$RC2_ACCEPTANCE_MANIFEST_SHA256"
-export RC2_ACCEPTANCE_MANIFEST_SHA256="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-expect_preflight_failure "wrong manifest digest" "$preflight"
-export RC2_ACCEPTANCE_MANIFEST_SHA256="$saved_digest"
+saved_tag="$CI_COMMIT_TAG"
+export CI_COMMIT_TAG="v9.8.8"
+expect_preflight_failure "mismatched RELEASE_TAG" "$preflight"
+export CI_COMMIT_TAG="$saved_tag"
 
-export RC2_FAKE_RECEIPT_MODE="no-run-all"
-expect_preflight_failure "missing RUN_ALL_MACOS_CI" "$preflight"
-unset RC2_FAKE_RECEIPT_MODE
+saved_release_tag="$RELEASE_TAG"
+export RELEASE_TAG="v9.8.7-beta"
+export CI_COMMIT_TAG="$RELEASE_TAG"
+expect_preflight_failure "non-semver tag" "$preflight"
+export RELEASE_TAG="$saved_release_tag"
+export CI_COMMIT_TAG="$saved_release_tag"
 
-export RC2_FAKE_RECEIPT_MODE="missing"
-expect_preflight_failure "missing validation pipeline" "$preflight"
-unset RC2_FAKE_RECEIPT_MODE
+saved_commit_tag="$CI_COMMIT_TAG"
+unset CI_COMMIT_TAG
+expect_preflight_failure "missing CI_COMMIT_TAG" "$preflight"
+export CI_COMMIT_TAG="$saved_commit_tag"
 
-export RC2_FAKE_RECEIPT_MODE="failed-prior-stages"
-expect_preflight_failure "failed validation pipeline" "$preflight"
-unset RC2_FAKE_RECEIPT_MODE
-
-export RC2_FAKE_RECEIPT_MODE="wrong-pipeline"
-expect_preflight_failure "mismatched validation pipeline" "$preflight"
-unset RC2_FAKE_RECEIPT_MODE
-
-export RC2_FAKE_RECEIPT_MODE="wrong-sha"
-expect_preflight_failure "validation receipt for another SHA" "$preflight"
-unset RC2_FAKE_RECEIPT_MODE
-
-export RC2_FAKE_RECEIPT_MODE="missing-job"
-expect_preflight_failure "missing required job" "$preflight"
-unset RC2_FAKE_RECEIPT_MODE
-
-saved_manifest_base64="$RC2_ACCEPTANCE_MANIFEST_BASE64"
-saved_manifest_digest="$RC2_ACCEPTANCE_MANIFEST_SHA256"
-failed_manifest="$fixture_root/acceptance-failed.json"
-jq '(.gates[0].status) = "FAIL"' "$manifest" > "$failed_manifest"
-RC2_ACCEPTANCE_MANIFEST_BASE64="$(base64 < "$failed_manifest" | tr -d '\n')"
-RC2_ACCEPTANCE_MANIFEST_SHA256="$(shasum -a 256 "$failed_manifest" | awk '{print $1}')"
-export RC2_ACCEPTANCE_MANIFEST_BASE64 RC2_ACCEPTANCE_MANIFEST_SHA256
-expect_preflight_failure "non-PASS acceptance gate" "$preflight"
-export RC2_ACCEPTANCE_MANIFEST_BASE64="$saved_manifest_base64"
-export RC2_ACCEPTANCE_MANIFEST_SHA256="$saved_manifest_digest"
-
+ci_yaml="$repo_root/.gitlab-ci.yml"
 stable_rules="$(awk '
   /^stable_macos_arm64_dmg:/ { in_job=1 }
   in_job && /^[^[:space:]][^:]*:/ && $0 !~ /^stable_macos_arm64_dmg:/ { exit }
   in_job { print }
-' "$repo_root/.gitlab-ci.yml")"
-receipt_job="$(awk '
-  /^release_validation_receipt:/ { in_job=1 }
-  in_job && /^[^[:space:]][^:]*:/ && $0 !~ /^release_validation_receipt:/ { exit }
-  in_job { print }
-' "$repo_root/.gitlab-ci.yml")"
-# shellcheck disable=SC2016
-if ! printf '%s\n' "$receipt_job" | grep -F 'stage: attest' >/dev/null \
-  || ! printf '%s\n' "$receipt_job" | grep -F 'RUN_ALL_MACOS_CI == "1" && $CI_COMMIT_BRANCH == "production"' >/dev/null \
-  || ! printf '%s\n' "$receipt_job" | grep -F 'when: on_success' >/dev/null
-then
-  echo "FAIL: validation receipt is not a final successful production RUN_ALL artifact" >&2
+' "$ci_yaml")"
+other_jobs="$(awk '
+  /^[a-zA-Z][A-Za-z0-9_]*:/ {
+    name=$1
+    sub(/:.*/, "", name)
+    if (name != "stages" && name != "workflow" && name != "variables" && name != "stable_macos_arm64_dmg") {
+      print name
+    }
+  }
+' "$ci_yaml")"
+if [ -n "$other_jobs" ]; then
+  echo "FAIL: CI still defines jobs besides stable_macos_arm64_dmg:" >&2
+  printf '%s\n' "$other_jobs" >&2
   exit 1
 fi
-if printf '%s\n' "$stable_rules" | grep -F "if: '\$CI_COMMIT_TAG =~" >/dev/null; then
-  echo "FAIL: a bare semver tag still admits stable publication" >&2
+if grep -E 'release_validation_receipt:|lint_scripts:|pr_unit_tests:|package_bundle_check:|RUN_ALL_MACOS_CI|merge_request_event|RC2_VALIDATED_PIPELINE_ID|RC2_ACCEPTANCE_MANIFEST' "$ci_yaml" >/dev/null; then
+  echo "FAIL: CI still contains non-release pipeline jobs or controller gates" >&2
+  exit 1
+fi
+# shellcheck disable=SC2016
+if ! printf '%s\n' "$stable_rules" | grep -F "if: '\$CI_COMMIT_TAG =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+$/'" >/dev/null; then
+  echo "FAIL: stable publication is not admitted by a bare glab semver tag" >&2
+  exit 1
+fi
+# shellcheck disable=SC2016
+if ! grep -F "if: '\$CI_COMMIT_TAG =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+$/'" "$ci_yaml" >/dev/null \
+  || grep -F 'merge_request_event' "$ci_yaml" >/dev/null \
+  || grep -F 'CI_PIPELINE_SOURCE == "push"' "$ci_yaml" >/dev/null
+then
+  echo "FAIL: workflow still admits non-tag pipelines" >&2
   exit 1
 fi
 # shellcheck disable=SC2016
