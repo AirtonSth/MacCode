@@ -8,6 +8,9 @@ public struct BotComputerGuestReady: Equatable, Sendable {
     public var pngHash: String
     public var pngMagic: String
     public var resumed: Bool
+    public var containerID: String
+    public var imageReference: String
+    public var capturedPNG: Data
 }
 
 /// Secret-free projection used by paired clients. The noVNC loopback URL and
@@ -111,7 +114,10 @@ public final class BotComputerGuestService: @unchecked Sendable {
                 screenURL: url,
                 pngHash: hash,
                 pngMagic: Self.pngMagic(png),
-                resumed: false
+                resumed: false,
+                containerID: name,
+                imageReference: inspect.imageID,
+                capturedPNG: png
             )
             lastReason = ""
             return true
@@ -326,7 +332,10 @@ public final class BotComputerGuestService: @unchecked Sendable {
             screenURL: url,
             pngHash: hash,
             pngMagic: Self.pngMagic(png),
-            resumed: resumed
+            resumed: resumed,
+            containerID: name,
+            imageReference: inspect.imageID,
+            capturedPNG: png
         )
         lastReady = ready
         lastReason = ""
@@ -458,11 +467,25 @@ public final class BotComputerGuestService: @unchecked Sendable {
         return (png, hash, Self.pngMagic(png))
     }
 
-    public func remoteFrame(botID: BotID) throws -> BotComputerGuestFrameEvidence {
+    public func remoteFrame(
+        botID: BotID,
+        ready: BotComputerGuestReady? = nil
+    ) throws -> BotComputerGuestFrameEvidence {
         let name = BotComputerGuestSpec.containerName(botID: botID)
         let inspect = try docker.inspect(name: name)
         guard inspect.running else { throw BotComputerGuestError.notReady }
-        let png = try waitForPNG(name: name)
+        let png: Data
+        if let ready {
+            guard ready.containerID == name,
+                  ready.imageReference == inspect.imageID,
+                  ready.pngHash == (try BotComputerGuestObserve.validatePNG(ready.capturedPNG)),
+                  ready.pngMagic == Self.pngMagic(ready.capturedPNG) else {
+                throw BotComputerGuestError.notReady
+            }
+            png = ready.capturedPNG
+        } else {
+            png = try waitForPNG(name: name)
+        }
         let hash = try BotComputerGuestObserve.validatePNG(png)
         let dimensions = try Self.pngDimensions(png)
         return BotComputerGuestFrameEvidence(

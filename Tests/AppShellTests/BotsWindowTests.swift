@@ -9922,7 +9922,7 @@ final class BotsWindowTests: XCTestCase {
             0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
             0x00, 0x00, 0x06, 0x40, 0x00, 0x00, 0x04, 0xb0,
         ])
-        docker.failExecAfterCall = 2
+        docker.failExecAfterCall = 1
         vm.computerGuestService = BotComputerGuestService(
             appSupport: context.appSupportDirectory,
             docker: docker,
@@ -9989,8 +9989,8 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(receiptFrame["png_hash"]?.stringValue?.count, 64)
         XCTAssertEqual(
             docker.execCallCount,
-            2,
-            "start readiness and terminal frame should each capture once; a third capture can lose a valid VNC frame"
+            1,
+            "the exact frame proven during start readiness must settle the receipt without another capture"
         )
     }
 

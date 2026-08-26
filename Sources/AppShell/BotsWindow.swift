@@ -9169,9 +9169,9 @@ public final class BotsViewModel: ObservableObject {
         objectWillChange.send()
     }
 
-    func presentGuestDesktop(botID: BotID, onSettled: ((Bool) -> Void)? = nil) {
+    func presentGuestDesktop(botID: BotID, onSettled: ((BotComputerGuestReady?) -> Void)? = nil) {
         guard guestLaunchState(for: botID) != .starting else {
-            DispatchQueue.main.async { onSettled?(false) }
+            DispatchQueue.main.async { onSettled?(nil) }
             return
         }
         guard dockerGuestReadyOverrideForTesting == nil,
@@ -9179,7 +9179,7 @@ public final class BotsViewModel: ObservableObject {
             guestLaunchStateByBot[botID.value] = .failed(
                 BotComputerDockerError.cliMissing.description
             )
-            DispatchQueue.main.async { onSettled?(false) }
+            DispatchQueue.main.async { onSettled?(nil) }
             return
         }
         guestLaunchStateByBot[botID.value] = .starting
@@ -9189,7 +9189,7 @@ public final class BotsViewModel: ObservableObject {
                 let url = try BotComputerGuestSpec.viewerURL(ready.screenURL)
                 await MainActor.run {
                     self.rememberGuestScreen(url: url, botID: botID, running: true)
-                    onSettled?(true)
+                    onSettled?(ready)
                 }
             } catch {
                 await MainActor.run {
@@ -9200,7 +9200,7 @@ public final class BotsViewModel: ObservableObject {
                             ?? BotComputerDockerError.provisioningFailed.description
                     )
                     self.objectWillChange.send()
-                    onSettled?(false)
+                    onSettled?(nil)
                 }
             }
         }
@@ -9229,14 +9229,14 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
-    func rebuildDockerGuest(botID: BotID, onSettled: ((Bool) -> Void)? = nil) {
+    func rebuildDockerGuest(botID: BotID, onSettled: ((BotComputerGuestReady?) -> Void)? = nil) {
         guard !isGuestRebuilding(botID) else {
-            DispatchQueue.main.async { onSettled?(false) }
+            DispatchQueue.main.async { onSettled?(nil) }
             return
         }
         guard let service = computerGuestService else {
             errorMessage = "Docker desktop is not ready."
-            DispatchQueue.main.async { onSettled?(false) }
+            DispatchQueue.main.async { onSettled?(nil) }
             return
         }
         let wasRunning = isGuestRunning(botID)
@@ -9248,7 +9248,7 @@ public final class BotsViewModel: ObservableObject {
                 await MainActor.run {
                     self.guestRebuildingByBot[botID.value] = false
                     self.rememberGuestScreen(url: url, botID: botID, running: true)
-                    onSettled?(true)
+                    onSettled?(ready)
                 }
             } catch {
                 await MainActor.run {
@@ -9256,7 +9256,7 @@ public final class BotsViewModel: ObservableObject {
                     self.errorMessage = wasRunning
                         ? "Could not rebuild the Linux desktop. The current desktop is still running."
                         : "Could not rebuild the Linux desktop."
-                    onSettled?(false)
+                    onSettled?(nil)
                 }
             }
         }

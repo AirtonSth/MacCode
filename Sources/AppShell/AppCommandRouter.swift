@@ -3010,12 +3010,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
         }
         created.onStartGuest = { [weak self] id, _, requestID, context in
-            self?.botsViewModel?.presentGuestDesktop(botID: id) { ok in
+            self?.botsViewModel?.presentGuestDesktop(botID: id) { ready in
                 self?.settlePairedGuest(
                     botID: id,
                     requestID: requestID,
                     context: context,
-                    runtimeSucceeded: ok
+                    ready: ready
                 )
             }
         }
@@ -3032,12 +3032,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
         }
         created.onRebuildGuest = { [weak self] id, requestID, context in
-            self?.botsViewModel?.rebuildDockerGuest(botID: id) { ok in
+            self?.botsViewModel?.rebuildDockerGuest(botID: id) { ready in
                 self?.settlePairedGuest(
                     botID: id,
                     requestID: requestID,
                     context: context,
-                    runtimeSucceeded: ok
+                    ready: ready
                 )
             }
         }
@@ -3139,9 +3139,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         botID: BotID,
         requestID: String,
         context: [String: Any],
-        runtimeSucceeded: Bool
+        ready: BotComputerGuestReady?
     ) {
-        guard runtimeSucceeded,
+        guard let ready,
               let service = botsViewModel?.computerGuestService else {
             settlePairedBot(
                 requestID: requestID,
@@ -3156,7 +3156,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         Task { @MainActor [weak self, service] in
             do {
                 let evidence = try await Task.detached { [service] in
-                    try service.remoteFrame(botID: botID)
+                    try service.remoteFrame(botID: botID, ready: ready)
                 }.value
                 self?.settlePairedBot(
                     requestID: requestID,

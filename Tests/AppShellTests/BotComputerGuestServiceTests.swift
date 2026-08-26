@@ -174,8 +174,8 @@ final class BotComputerGuestServiceTests: XCTestCase {
         )
         let botID = BotID()
 
-        _ = try service.provision(botID: botID)
-        let frame = try service.remoteFrame(botID: botID)
+        let ready = try service.provision(botID: botID)
+        let frame = try service.remoteFrame(botID: botID, ready: ready)
 
         XCTAssertEqual(frame.containerID, BotComputerGuestSpec.containerName(botID: botID))
         XCTAssertEqual(frame.imageReference, "img")
@@ -184,7 +184,7 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertEqual(frame.pixelHeight, 1_200)
         XCTAssertEqual(frame.png, fake.png)
         XCTAssertEqual(frame.pngHash.count, 64)
-        XCTAssertEqual(fake.execCalls, 2, "provision readiness and the exported frame must each capture once")
+        XCTAssertEqual(fake.execCalls, 1, "the frame proven during readiness must be exported without recapture")
     }
 
     func test_remoteFrameFailsClosedWithoutProvisioningAnAbsentGuest() throws {
@@ -203,6 +203,27 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertThrowsError(try service.remoteFrame(botID: BotID()))
         XCTAssertTrue(fake.created.isEmpty)
         XCTAssertEqual(fake.execCalls, 0)
+    }
+
+    func test_remoteFrameRejectsReadinessEvidenceFromAnotherBotWithoutRecapture() throws {
+        // WHY: readiness evidence is authoritative only for its exact Bot and
+        // canonical container, even when another Guest is concurrently ready.
+        let support = makeSupport("rc-guest-remote-frame-cross-bot")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let firstBot = BotID()
+        let secondBot = BotID()
+        let firstReady = try service.provision(botID: firstBot)
+        _ = try service.provision(botID: secondBot)
+
+        XCTAssertThrowsError(try service.remoteFrame(botID: secondBot, ready: firstReady))
+        XCTAssertEqual(fake.execCalls, 2, "rejecting cross-Bot evidence must not capture or replay")
     }
 
     func test_proveReadyRequiresPNGAndLoopback() throws {
