@@ -8182,6 +8182,32 @@ final class BotsWindowTests: XCTestCase {
             "the active projection must be backed by the exact pre-bound provider run"
         )
 
+        router.botsViewModel = vm
+        let activeRemote = try await router.dispatchPairedBotRemote(
+            method: "bot.attention.list",
+            params: [:]
+        )
+        let activeItems = try XCTUnwrap(activeRemote.objectValue?["items"]?.arrayValue)
+        let delegated = try XCTUnwrap(activeItems.compactMap(\.objectValue).first {
+            $0["bot_id"]?.stringValue == quinn.id.value.uuidString.lowercased()
+        })
+        XCTAssertEqual(delegated["id"]?.stringValue, handoff.activityID.uuidString.lowercased())
+        XCTAssertEqual(delegated["conversation_id"]?.stringValue, handoff.peerConversationID.value.uuidString.lowercased())
+        XCTAssertEqual(delegated["thread_id"]?.stringValue, handoff.peerThreadID?.value.uuidString.lowercased())
+        XCTAssertEqual(delegated["run_id"]?.stringValue, handoff.peerRunID?.value.uuidString.lowercased())
+        XCTAssertEqual(delegated["owner_bot_id"]?.stringValue, piper.id.value.uuidString.lowercased())
+        XCTAssertEqual(delegated["owner_conversation_id"]?.stringValue, origin.id.value.uuidString.lowercased())
+        XCTAssertEqual(delegated["ownership"]?.stringValue, "delegated")
+        XCTAssertEqual(delegated["primary"]?.boolValue, false)
+        XCTAssertEqual(delegated["delegated"]?.boolValue, true)
+        XCTAssertEqual(
+            activeItems.compactMap(\.objectValue).filter {
+                $0["bot_id"]?.stringValue == quinn.id.value.uuidString.lowercased()
+            }.count,
+            1,
+            "one delegated handoff must produce one attention owner"
+        )
+
         XCTAssertTrue(peerRunner.finish(promptContaining: "DUAL_ACTIVE", reply: "released"))
         let handoffCompleted = await waitUntil(timeout: 5) {
             vm.peerHandoffSnapshotsForTesting(
@@ -8190,6 +8216,17 @@ final class BotsWindowTests: XCTestCase {
             ).contains { $0.phase == .completed }
         }
         XCTAssertTrue(handoffCompleted)
+        let finishedRemote = try await router.dispatchPairedBotRemote(
+            method: "bot.attention.list",
+            params: [:]
+        )
+        let finishedItems = try XCTUnwrap(finishedRemote.objectValue?["items"]?.arrayValue)
+        let finishedPeer = try XCTUnwrap(finishedItems.compactMap(\.objectValue).first {
+            $0["bot_id"]?.stringValue == quinn.id.value.uuidString.lowercased()
+        })
+        XCTAssertEqual(finishedPeer["id"]?.stringValue, handoff.activityID.uuidString.lowercased())
+        XCTAssertEqual(finishedPeer["state"]?.stringValue, "finished")
+        XCTAssertEqual(finishedPeer["ownership"]?.stringValue, "delegated")
         await milestone.value
     }
 

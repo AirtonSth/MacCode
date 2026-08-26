@@ -63,6 +63,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     public var onGuestInput: ((BotID, [String: Any], String, [String: Any]) throws -> Void)?
     public var onDockerClear: ((BotID) throws -> Void)?
     public var onSend: ((BotID, String, BotConversationID?, [String: Any]) throws -> [String: Any])?
+    public var onDelegatedAttentionSnapshot: (() throws -> [[String: Any]])?
     public var onOpenFile: ((BotID, String, Bool, String) throws -> Void)?
     public var notifyBrowserPendingOpen: ((Notification.Name) throws -> Void)?
 
@@ -168,6 +169,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return peerReceiptStatus(params: params)
         case "attention.list":
             try synchronizeDurableNeedsAttention()
+            try synchronizeDelegatedAttention()
             return ["items": attention.values.map { canonicalAttentionItem($0) }]
         case "reserved.probe":
             throw Error.reserved
@@ -240,6 +242,75 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             }
         }
         if changed { persistSidecar() }
+    }
+
+    private func synchronizeDelegatedAttention() throws {
+        guard let onDelegatedAttentionSnapshot else { return }
+        let snapshot = try onDelegatedAttentionSnapshot()
+        var delegatedByBot: [String: [String: Any]] = [:]
+        for raw in snapshot {
+            let item = try validatedDelegatedAttention(raw)
+            guard let botID = item["bot_id"] as? String else { throw Error.crossTarget }
+            if let existing = delegatedByBot[botID],
+               !NSDictionary(dictionary: existing).isEqual(to: item) {
+                throw Error.crossTarget
+            }
+            delegatedByBot[botID] = item
+        }
+
+        var next = attention.filter { _, item in
+            item["source"] as? String != "bot_peer_handoff"
+        }
+        for (botID, item) in delegatedByBot { next[botID] = item }
+        guard !NSDictionary(dictionary: attention).isEqual(to: next) else { return }
+        attention = next
+        persistSidecar()
+    }
+
+    private func validatedDelegatedAttention(_ raw: [String: Any]) throws -> [String: Any] {
+        guard raw["ownership"] as? String == "delegated",
+              raw["primary"] as? Bool == false,
+              raw["delegated"] as? Bool == true,
+              raw["source"] as? String == "bot_peer_handoff",
+              let itemID = stringUUID(raw, "id"),
+              stringUUID(raw, "lifecycle_receipt_id") == itemID,
+              let botID = stringUUID(raw, "bot_id"),
+              let conversationID = stringUUID(raw, "conversation_id"),
+              let threadID = stringUUID(raw, "thread_id"),
+              stringUUID(raw, "run_id") != nil,
+              let ownerBotID = stringUUID(raw, "owner_bot_id"),
+              let ownerConversationID = stringUUID(raw, "owner_conversation_id"),
+              let state = raw["state"] as? String,
+              ["working", "finished", "needs_attention"].contains(state),
+              let bot = try store.get(id: BotID(botID)), bot.deletedAt == nil,
+              let conversation = try store.conversation(id: BotConversationID(conversationID)),
+              conversation.botID == bot.id,
+              conversation.linkedAgentThreadID == AgentThreadID(threadID),
+              let ownerBot = try store.get(id: BotID(ownerBotID)), ownerBot.deletedAt == nil,
+              let ownerConversation = try store.conversation(id: BotConversationID(ownerConversationID)),
+              ownerConversation.botID == ownerBot.id else {
+            throw Error.crossTarget
+        }
+        if state == "finished" {
+            guard raw["finished_at"] is Double else { throw Error.crossTarget }
+        } else {
+            guard raw["finished_at"] is NSNull else { throw Error.crossTarget }
+        }
+        if raw["owner_thread_id"] != nil && !(raw["owner_thread_id"] is NSNull) {
+            guard let ownerThreadID = stringUUID(raw, "owner_thread_id"),
+                  ownerConversation.linkedAgentThreadID == AgentThreadID(ownerThreadID) else {
+                throw Error.crossTarget
+            }
+        }
+        if raw["owner_run_id"] != nil && !(raw["owner_run_id"] is NSNull) {
+            guard stringUUID(raw, "owner_run_id") != nil else { throw Error.crossTarget }
+        }
+        return canonicalAttentionItem(raw)
+    }
+
+    private func stringUUID(_ values: [String: Any], _ key: String) -> UUID? {
+        guard let raw = values[key] as? String else { return nil }
+        return UUID(uuidString: raw)
     }
 
     private func durableNeedsAttention(

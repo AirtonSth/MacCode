@@ -770,6 +770,70 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         return handoffs
     }
 
+    func remoteAttentionOwnershipSnapshots() -> [[String: Any]] {
+        refreshStorageProjection()
+        var latestByPeer: [BotID: PersistedBotPeerHandoff] = [:]
+        for handoff in handoffs.values where handoff.originBotID != nil {
+            guard let existing = latestByPeer[handoff.peerBotID] else {
+                latestByPeer[handoff.peerBotID] = handoff
+                continue
+            }
+            if existing.createdAt < handoff.createdAt
+                || (existing.createdAt == handoff.createdAt
+                    && existing.activityID.uuidString < handoff.activityID.uuidString) {
+                latestByPeer[handoff.peerBotID] = handoff
+            }
+        }
+        return latestByPeer.values.compactMap(Self.remoteAttentionOwnershipSnapshot)
+    }
+
+    private static func remoteAttentionOwnershipSnapshot(
+        _ handoff: PersistedBotPeerHandoff
+    ) -> [String: Any]? {
+        guard let peerThreadID = handoff.peerThreadID,
+              let peerRunID = handoff.peerRunID,
+              let originBotID = handoff.originBotID,
+              let originConversationID = handoff.originConversationID else { return nil }
+        let state: String
+        let finishedAt: Any
+        switch handoff.phase {
+        case .peerPrepared, .peerRunning:
+            state = "working"
+            finishedAt = NSNull()
+        case .needsAttention:
+            state = "needs_attention"
+            finishedAt = NSNull()
+        case .peerCompleted, .hostPrepared, .hostRunning, .completed:
+            guard let replyCreatedAt = handoff.replyCreatedAt else { return nil }
+            state = "finished"
+            finishedAt = replyCreatedAt.timeIntervalSince1970
+        }
+        var item: [String: Any] = [
+            "id": handoff.activityID.uuidString.lowercased(),
+            "lifecycle_receipt_id": handoff.activityID.uuidString.lowercased(),
+            "bot_id": handoff.peerBotID.value.uuidString.lowercased(),
+            "conversation_id": handoff.peerConversationID.value.uuidString.lowercased(),
+            "thread_id": peerThreadID.value.uuidString.lowercased(),
+            "run_id": peerRunID.value.uuidString.lowercased(),
+            "owner_bot_id": originBotID.value.uuidString.lowercased(),
+            "owner_conversation_id": originConversationID.value.uuidString.lowercased(),
+            "state": state,
+            "finished_at": finishedAt,
+            "ownership": "delegated",
+            "primary": false,
+            "delegated": true,
+            "source": "bot_peer_handoff",
+            "peer_phase": handoff.phase.rawValue,
+        ]
+        if let ownerThreadID = handoff.hostThreadID {
+            item["owner_thread_id"] = ownerThreadID.value.uuidString.lowercased()
+        }
+        if let ownerRunID = handoff.hostRunID {
+            item["owner_run_id"] = ownerRunID.value.uuidString.lowercased()
+        }
+        return item
+    }
+
     func claimContinuation(
         consultationID: UUID,
         callerThread: AgentThreadID,

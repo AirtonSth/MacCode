@@ -584,6 +584,146 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertTrue(try store.listAttention(includeAcknowledged: true).isEmpty)
     }
 
+    /// WHY: peer descendants are real Bot work, but they must never inflate
+    /// the primary count or lose their exact activity/conversation/run owner
+    /// after the paired authority is reconstructed.
+    func test_delegatedAttentionIsExactDeduplicatedAndSurvivesRelaunch() throws {
+        let primary = try createLiveBot(prefix: "ownership-primary", name: "Primary B")
+        XCTAssertTrue(authority.settleRuntime(
+            botID: primary.botID,
+            runID: primary.runID,
+            failed: false
+        ))
+        let delegated = try createLiveBot(prefix: "ownership-peer", name: "Delegated A")
+        let delegatedBot = BotID(try XCTUnwrap(UUID(uuidString: delegated.botID)))
+        let delegatedConversationID = BotConversationID(
+            try XCTUnwrap(UUID(uuidString: delegated.conversationID))
+        )
+        let delegatedThreadID = AgentThreadID()
+        var delegatedConversation = try XCTUnwrap(
+            try store.conversation(id: delegatedConversationID)
+        )
+        delegatedConversation.linkedAgentThreadID = delegatedThreadID
+        try store.upsertConversation(delegatedConversation)
+
+        let ownerThreadID = AgentThreadID()
+        let primaryConversationID = BotConversationID(
+            try XCTUnwrap(UUID(uuidString: primary.conversationID))
+        )
+        var primaryConversation = try XCTUnwrap(try store.conversation(id: primaryConversationID))
+        primaryConversation.linkedAgentThreadID = ownerThreadID
+        try store.upsertConversation(primaryConversation)
+        let activityID = UUID()
+        let ownerRunID = AgentRunID()
+        let row: [String: Any] = [
+            "id": activityID.uuidString.lowercased(),
+            "lifecycle_receipt_id": activityID.uuidString.lowercased(),
+            "bot_id": delegatedBot.value.uuidString.lowercased(),
+            "conversation_id": delegatedConversationID.value.uuidString.lowercased(),
+            "thread_id": delegatedThreadID.value.uuidString.lowercased(),
+            "run_id": delegated.runID,
+            "owner_bot_id": primary.botID,
+            "owner_conversation_id": primary.conversationID,
+            "owner_thread_id": ownerThreadID.value.uuidString.lowercased(),
+            "owner_run_id": ownerRunID.value.uuidString.lowercased(),
+            "state": "working",
+            "finished_at": NSNull(),
+            "ownership": "delegated",
+            "primary": false,
+            "delegated": true,
+            "source": "bot_peer_handoff",
+            "peer_phase": "peer_running",
+        ]
+        authority.onDelegatedAttentionSnapshot = { [row, row] }
+
+        let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let items = try XCTUnwrap(listed["items"] as? [[String: Any]])
+        XCTAssertEqual(items.count, 2, "the peer projection replaces its primary placeholder instead of double counting")
+        let peer = try XCTUnwrap(items.first { $0["bot_id"] as? String == delegated.botID })
+        XCTAssertEqual(peer["id"] as? String, activityID.uuidString.lowercased())
+        XCTAssertEqual(peer["lifecycle_receipt_id"] as? String, activityID.uuidString.lowercased())
+        XCTAssertEqual(peer["conversation_id"] as? String, delegated.conversationID)
+        XCTAssertEqual(peer["thread_id"] as? String, delegatedThreadID.value.uuidString.lowercased())
+        XCTAssertEqual(peer["run_id"] as? String, delegated.runID)
+        XCTAssertEqual(peer["owner_bot_id"] as? String, primary.botID)
+        XCTAssertEqual(peer["owner_conversation_id"] as? String, primary.conversationID)
+        XCTAssertEqual(peer["owner_thread_id"] as? String, ownerThreadID.value.uuidString.lowercased())
+        XCTAssertEqual(peer["owner_run_id"] as? String, ownerRunID.value.uuidString.lowercased())
+        XCTAssertEqual(peer["ownership"] as? String, "delegated")
+        XCTAssertEqual(peer["primary"] as? Bool, false)
+        XCTAssertEqual(peer["delegated"] as? Bool, true)
+
+        let primaryBefore = try XCTUnwrap(items.first { $0["bot_id"] as? String == primary.botID })
+        XCTAssertEqual(primaryBefore["ownership"] as? String, "primary")
+        XCTAssertEqual(primaryBefore["primary"] as? Bool, true)
+        XCTAssertEqual(primaryBefore["delegated"] as? Bool, false)
+
+        authority = BotRemoteControlAuthority(
+            db: db,
+            store: BotStore(db: db),
+            settings: SettingsStore(db: db),
+            appSupportDirectory: supportDir
+        )
+        let restored = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let restoredItems = try XCTUnwrap(restored["items"] as? [[String: Any]])
+        XCTAssertEqual(restoredItems.count, 2)
+        let restoredPeer = try XCTUnwrap(restoredItems.first {
+            $0["bot_id"] as? String == delegated.botID
+        })
+        XCTAssertEqual(restoredPeer["id"] as? String, activityID.uuidString.lowercased())
+        XCTAssertEqual(restoredPeer["ownership"] as? String, "delegated")
+        XCTAssertEqual(restoredPeer["run_id"] as? String, delegated.runID)
+        XCTAssertEqual(restoredPeer["owner_run_id"] as? String, ownerRunID.value.uuidString.lowercased())
+    }
+
+    /// WHY: ownership comes from the host, not from labels supplied by iOS.
+    /// Missing or future ownership values must fail closed before any row is
+    /// adopted or persisted.
+    func test_delegatedAttentionRejectsMissingAndUnknownOwnership() throws {
+        let delegated = try createLiveBot(prefix: "ownership-invalid", name: "Invalid Peer")
+        let threadID = AgentThreadID()
+        let conversationID = BotConversationID(
+            try XCTUnwrap(UUID(uuidString: delegated.conversationID))
+        )
+        var conversation = try XCTUnwrap(try store.conversation(id: conversationID))
+        conversation.linkedAgentThreadID = threadID
+        try store.upsertConversation(conversation)
+        let activityID = UUID().uuidString.lowercased()
+        let base: [String: Any] = [
+            "id": activityID,
+            "lifecycle_receipt_id": activityID,
+            "bot_id": delegated.botID,
+            "conversation_id": delegated.conversationID,
+            "thread_id": threadID.value.uuidString.lowercased(),
+            "run_id": delegated.runID,
+            "owner_bot_id": delegated.botID,
+            "owner_conversation_id": delegated.conversationID,
+            "state": "working",
+            "finished_at": NSNull(),
+            "primary": false,
+            "delegated": true,
+            "source": "bot_peer_handoff",
+        ]
+
+        authority.onDelegatedAttentionSnapshot = { [base] }
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.attention.list", params: [:])) {
+            XCTAssertEqual($0 as? BotRemoteControlAuthority.Error, .crossTarget)
+        }
+
+        var unknown = base
+        unknown["ownership"] = "descendant"
+        authority.onDelegatedAttentionSnapshot = { [unknown] }
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.attention.list", params: [:])) {
+            XCTAssertEqual($0 as? BotRemoteControlAuthority.Error, .crossTarget)
+        }
+
+        authority.onDelegatedAttentionSnapshot = nil
+        let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let item = try XCTUnwrap((listed["items"] as? [[String: Any]])?.first)
+        XCTAssertEqual(item["ownership"] as? String, "primary")
+        XCTAssertNotEqual(item["id"] as? String, base["id"] as? String)
+    }
+
     /// WHY: a routing choice is an admitted host capability, not an iOS hint.
     /// The exact outer receipt and run-as tuple must bind one conversation/run
     /// and must not be reusable after response loss or relaunch.

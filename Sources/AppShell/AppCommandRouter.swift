@@ -3090,6 +3090,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             )
             return Self.foundationObject(result.objectValue ?? [:])
         }
+        created.onDelegatedAttentionSnapshot = { [weak self] in
+            self?.context?.botPeerHandoffAuthority.remoteAttentionOwnershipSnapshots() ?? []
+        }
         created.onOpenFile = { [weak self] botID, path, split, root in
             guard let vm = self?.botsViewModel else {
                 throw BotRemoteControlAuthority.Error(
