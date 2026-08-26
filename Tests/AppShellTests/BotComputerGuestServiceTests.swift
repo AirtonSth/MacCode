@@ -12,6 +12,7 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     var created: [String] = []
     var createdOptions: [BotComputerContainerCreateOptions] = []
     var removed: [String] = []
+    var removeError: Error?
     var started: [String] = []
     var stopped: [String] = []
     var builds: [URL] = []
@@ -87,6 +88,7 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     }
     func remove(name: String) throws {
         removed.append(name)
+        if let removeError { throw removeError }
         containers[name] = nil
     }
     func removeMatching(namePrefix: String) throws {
@@ -698,6 +700,83 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertTrue(second.resumed)
         service.teardown(botID: botID)
         XCTAssertThrowsError(try fake.inspect(name: BotComputerGuestSpec.containerName(botID: botID)))
+    }
+
+    func test_removeGuestRuntimeVerifiesAbsenceAfterAnIdempotentRemoveError() throws {
+        // WHY: deleting an already-absent runtime may make `docker rm` fail;
+        // that must not leave a false container_runtime residual or block the
+        // independent Bot Home cleanup axis.
+        let support = makeSupport("rc-guest-remove-absent")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.removeError = BotComputerGuestError.notReady
+        let service = BotComputerGuestService(appSupport: support, docker: fake)
+
+        XCTAssertNoThrow(try service.removeGuestRuntime(botID: BotID()))
+    }
+
+    func test_removeGuestRuntimeKeepsFailureWhenCanonicalContainerStillExists() throws {
+        // WHY: an idempotent verifier may clear a false-positive error only
+        // after it proves the exact container is absent.
+        let support = makeSupport("rc-guest-remove-present")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let botID = BotID()
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        fake.containers[name] = BotComputerContainerInspect(running: true, imageID: "img", hostPort: 49_152)
+        fake.removeError = BotComputerGuestError.notReady
+        let service = BotComputerGuestService(appSupport: support, docker: fake)
+
+        XCTAssertThrowsError(try service.removeGuestRuntime(botID: botID))
+        XCTAssertNotNil(fake.containers[name])
+    }
+
+    func test_absentRuntimeVerificationProducesACompletedDeleteReceiptAndWipesHome() throws {
+        // WHY: an idempotent Docker error with no remaining runtime must not
+        // turn an otherwise complete authoritative deletion into partial.
+        let support = makeSupport("rc-guest-delete-absent")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let store = BotStore(db: db)
+        let authority = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: SettingsStore(db: db),
+            appSupportDirectory: support
+        )
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "absent-create", "name": "Absent runtime",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let botUUID = try XCTUnwrap(UUID(uuidString: botID))
+        _ = try authority.dispatch(method: "bot.guest.state", params: [
+            "host_id": "host", "bot_id": botID,
+        ])
+        _ = try BotGuestHome.ensure(appSupport: support, botID: BotID(botUUID))
+        let fake = FakeDocker()
+        fake.removeError = BotComputerGuestError.notReady
+        let service = BotComputerGuestService(appSupport: support, docker: fake)
+        var teardownCount = 0
+        authority.onDockerClear = { id in
+            teardownCount += 1
+            try service.removeGuestRuntime(botID: id)
+        }
+        let params: [String: Any] = [
+            "client_request_id": "absent-delete", "bot_id": botID, "confirm": "delete",
+        ]
+
+        let deleted = try authority.dispatch(method: "bot.delete", params: params)
+        let replay = try authority.dispatch(method: "bot.delete", params: params)
+
+        XCTAssertEqual(deleted["status"] as? String, "completed")
+        XCTAssertEqual(replay["receipt_id"] as? String, deleted["receipt_id"] as? String)
+        XCTAssertEqual(teardownCount, 1, "terminal receipt replay must not redispatch cleanup")
+        let readback = try XCTUnwrap(deleted["readback"] as? [String: Any])
+        XCTAssertEqual(readback["cleanup_complete"] as? Bool, true)
+        XCTAssertEqual(readback["cleanup_residuals"] as? [String], [])
+        XCTAssertNotNil(try store.get(id: BotID(botUUID))?.deletedAt)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: BotGuestHome.url(appSupport: support, botID: BotID(botUUID)).path))
     }
 
     func test_liveProveReady_emitsPNGMagicAndLoopback() throws {

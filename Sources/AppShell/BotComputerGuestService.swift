@@ -519,18 +519,28 @@ public final class BotComputerGuestService: @unchecked Sendable {
     }
 
     public func removeGuestRuntime(botID: BotID) throws {
-        var firstError: Error?
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        var removalError: Error?
         do {
-            try docker.remove(name: BotComputerGuestSpec.containerName(botID: botID))
+            try docker.remove(name: name)
         } catch {
-            firstError = error
+            removalError = error
         }
         do {
             try docker.removeNetwork(name: BotComputerGuestSpec.networkName(botID: botID))
         } catch {
-            if firstError == nil { firstError = error }
+            // Network cleanup is independent from executable container state.
+            // Verify the canonical runtime below before deciding the receipt.
         }
-        if let firstError { throw firstError }
+        let runtimeExists: Bool
+        do {
+            runtimeExists = try docker.containerExists(name: name)
+        } catch {
+            throw removalError ?? error
+        }
+        guard runtimeExists == false else {
+            throw removalError ?? BotComputerDockerError.provisioningFailed
+        }
     }
 
     private static func pngDimensions(_ data: Data) throws -> (width: Int, height: Int) {

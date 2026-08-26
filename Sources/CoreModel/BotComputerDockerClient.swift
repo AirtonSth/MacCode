@@ -77,6 +77,7 @@ public protocol BotComputerDockerClienting: Sendable {
     func start(name: String) throws
     func stop(name: String) throws
     func inspect(name: String) throws -> BotComputerContainerInspect
+    func containerExists(name: String) throws -> Bool
     func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data
     func rename(from: String, to: String) throws
     func ensureNetwork(name: String) throws
@@ -87,6 +88,15 @@ public protocol BotComputerDockerClienting: Sendable {
 
 public extension BotComputerDockerClienting {
     func removeNetwork(name: String) throws {}
+
+    func containerExists(name: String) throws -> Bool {
+        do {
+            _ = try inspect(name: name)
+            return true
+        } catch BotComputerGuestError.notReady {
+            return false
+        }
+    }
 }
 
 public struct BotComputerContainerInspect: Equatable, Sendable {
@@ -268,6 +278,13 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             hostPort: port,
             networkNames: networks
         )
+    }
+
+    public func containerExists(name: String) throws -> Bool {
+        let data = try run(["ps", "-aq", "--filter", "name=^/\(name)$"])
+        return String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false
     }
 
     public func exec(name: String, command: [String], user: String? = nil, detach: Bool = false) throws -> Data {

@@ -1796,7 +1796,10 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "client_request_id": "partial-create", "name": "Partial A",
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let botUUID = try XCTUnwrap(UUID(uuidString: botID))
+        let grant = try fileRootGrant(botID: botID)
         _ = try guestState(botID: botID)
+        _ = try BotGuestHome.ensure(appSupport: supportDir, botID: BotID(botUUID))
         var teardownCount = 0
         authority.onDockerClear = { _ in
             teardownCount += 1
@@ -1814,7 +1817,16 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let readback = try XCTUnwrap(first["readback"] as? [String: Any])
         XCTAssertEqual(readback["cleanup_complete"] as? Bool, false)
         XCTAssertEqual(readback["cleanup_residuals"] as? [String], ["container_runtime"])
+        XCTAssertNotNil(
+            try store.get(id: BotID(botUUID))?.deletedAt,
+            "the durable Bot tombstone must survive partial teardown"
+        )
+        XCTAssertFalse(authority.isFileHandleExecutableForTesting(grant.handle))
         XCTAssertNil(try sidecarObject("bot.remote.guest_state")[botID])
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: BotGuestHome.url(appSupport: supportDir, botID: BotID(botUUID)).path),
+            "container teardown failure must not skip the independent Bot Home wipe"
+        )
     }
 
     func test_deleteSidecarFailureIsPartialAndRelaunchPrunesLegacyAuthority() throws {
