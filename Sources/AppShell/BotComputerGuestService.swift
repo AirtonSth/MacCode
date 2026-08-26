@@ -459,18 +459,20 @@ public final class BotComputerGuestService: @unchecked Sendable {
     }
 
     public func remoteFrame(botID: BotID) throws -> BotComputerGuestFrameEvidence {
-        let observed = try observe(botID: botID)
         let name = BotComputerGuestSpec.containerName(botID: botID)
         let inspect = try docker.inspect(name: name)
-        let dimensions = try Self.pngDimensions(observed.png)
+        guard inspect.running else { throw BotComputerGuestError.notReady }
+        let png = try waitForPNG(name: name)
+        let hash = try BotComputerGuestObserve.validatePNG(png)
+        let dimensions = try Self.pngDimensions(png)
         return BotComputerGuestFrameEvidence(
             containerID: name,
             imageReference: inspect.imageID,
             viewerPath: "/vnc.html",
             pixelWidth: dimensions.width,
             pixelHeight: dimensions.height,
-            png: observed.png,
-            pngHash: observed.hash
+            png: png,
+            pngHash: hash
         )
     }
 

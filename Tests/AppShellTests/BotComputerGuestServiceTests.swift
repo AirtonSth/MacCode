@@ -174,6 +174,7 @@ final class BotComputerGuestServiceTests: XCTestCase {
         )
         let botID = BotID()
 
+        _ = try service.provision(botID: botID)
         let frame = try service.remoteFrame(botID: botID)
 
         XCTAssertEqual(frame.containerID, BotComputerGuestSpec.containerName(botID: botID))
@@ -183,6 +184,25 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertEqual(frame.pixelHeight, 1_200)
         XCTAssertEqual(frame.png, fake.png)
         XCTAssertEqual(frame.pngHash.count, 64)
+        XCTAssertEqual(fake.execCalls, 2, "provision readiness and the exported frame must each capture once")
+    }
+
+    func test_remoteFrameFailsClosedWithoutProvisioningAnAbsentGuest() throws {
+        // WHY: a remote frame belongs to the exact accepted Guest runtime;
+        // silently provisioning here could replace its container or session.
+        let support = makeSupport("rc-guest-remote-frame-absent")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+
+        XCTAssertThrowsError(try service.remoteFrame(botID: BotID()))
+        XCTAssertTrue(fake.created.isEmpty)
+        XCTAssertEqual(fake.execCalls, 0)
     }
 
     func test_proveReadyRequiresPNGAndLoopback() throws {

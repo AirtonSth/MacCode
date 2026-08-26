@@ -9739,6 +9739,8 @@ final class BotsWindowTests: XCTestCase {
         var created: [String] = []
         var builds: [URL] = []
         var png = BotComputerGuestObserve.pngSignature + Data(repeating: 1, count: 16)
+        var execCallCount = 0
+        var failExecAfterCall: Int?
         var containers: [String: BotComputerContainerInspect] = [:]
         var startError: Error?
         var startCallCount = 0
@@ -9792,7 +9794,13 @@ final class BotsWindowTests: XCTestCase {
             guard let value = containers[name] else { throw BotComputerGuestError.notReady }
             return value
         }
-        func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data { png }
+        func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data {
+            execCallCount += 1
+            if let failExecAfterCall, execCallCount > failExecAfterCall {
+                throw BotComputerGuestError.observeFailed
+            }
+            return png
+        }
         func rename(from: String, to: String) throws {
             containers[to] = containers[from]
             containers[from] = nil
@@ -9896,6 +9904,94 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(fake.created.contains(BotComputerGuestSpec.containerName(botID: piper.id)))
         XCTAssertEqual(vm.guestScreenURL(for: piper.id)?.host, "127.0.0.1")
         XCTAssertTrue(vm.isGuestRunning(piper.id))
+    }
+
+    func test_pairedGuestStartSettlesOnlyWithExactRemoteFrameInReceiptAndState() async throws {
+        // WHY: a terminal start receipt without a frame leaves iOS showing a
+        // running guest it cannot observe or control. This must cross the real
+        // router -> VM provision -> remoteFrame -> receipt/state boundary.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let docker = RecordingDocker()
+        docker.png = Data([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x06, 0x40, 0x00, 0x00, 0x04, 0xb0,
+        ])
+        docker.failExecAfterCall = 2
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: docker,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.dockerGuestReadyOverrideForTesting = nil
+        let botID = bot.id.value.uuidString.lowercased()
+        let hostID = "paired-guest-host"
+        let initial = try await router.dispatchPairedBotRemote(method: "bot.guest.state", params: [
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+        ])
+        let initialState = try XCTUnwrap(initial.objectValue)
+        let tasks = try XCTUnwrap(initialState["task_catalog"]?.objectValue?["tasks"]?.arrayValue)
+        let startTask = try XCTUnwrap(tasks.compactMap(\.objectValue).first {
+            $0["operation"]?.stringValue == "bot.guest.start"
+        })
+        let requestID = "paired-guest-frame"
+        let accepted = try await router.dispatchPairedBotRemote(method: "bot.guest.start", params: [
+            "client_request_id": .string(requestID),
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+            "task_id": try XCTUnwrap(startTask["id"]),
+            "recipe_id": try XCTUnwrap(startTask["recipe_id"]),
+        ])
+        let acceptedRuntime = try XCTUnwrap(
+            accepted.objectValue?["readback"]?.objectValue?["runtime"]?.objectValue
+        )
+        var receipt = accepted
+        for _ in 0..<200 {
+            receipt = try await router.dispatchPairedBotRemote(method: "bot.receipt.status", params: [
+                "client_request_id": .string(requestID),
+            ])
+            if receipt.objectValue?["status"]?.stringValue != "accepted" { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let terminal = try XCTUnwrap(receipt.objectValue)
+        XCTAssertEqual(terminal["status"]?.stringValue, "completed")
+        let receiptReadback = try XCTUnwrap(terminal["readback"]?.objectValue)
+        let receiptFrame = try XCTUnwrap(receiptReadback["frame"]?.objectValue)
+        let receiptRuntime = try XCTUnwrap(receiptReadback["runtime"]?.objectValue)
+
+        let state = try await router.dispatchPairedBotRemote(method: "bot.guest.state", params: [
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+        ])
+        let stateObject = try XCTUnwrap(state.objectValue)
+        let stateFrame = try XCTUnwrap(stateObject["frame"]?.objectValue)
+        let stateRuntime = try XCTUnwrap(stateObject["runtime"]?.objectValue)
+        XCTAssertEqual(stateObject["status"]?.stringValue, "running")
+        XCTAssertEqual(receiptFrame, stateFrame)
+        XCTAssertEqual(receiptRuntime, stateRuntime)
+        for key in ["host_id", "bot_id", "app_run_id", "session_id", "grant_id", "grant_generation"] {
+            XCTAssertEqual(receiptRuntime[key], acceptedRuntime[key], key)
+        }
+        XCTAssertEqual(receiptRuntime["host_id"]?.stringValue, hostID)
+        XCTAssertEqual(receiptRuntime["bot_id"]?.stringValue, botID)
+        XCTAssertEqual(receiptRuntime["container_id"]?.stringValue, BotComputerGuestSpec.containerName(botID: bot.id))
+        XCTAssertEqual(receiptRuntime["image_reference"]?.stringValue, "img")
+        XCTAssertEqual(receiptFrame["pixel_width"]?.intValue, 1_600)
+        XCTAssertEqual(receiptFrame["pixel_height"]?.intValue, 1_200)
+        XCTAssertEqual(receiptFrame["png_base64"]?.stringValue, docker.png.base64EncodedString())
+        XCTAssertEqual(receiptFrame["png_hash"]?.stringValue?.count, 64)
+        XCTAssertEqual(
+            docker.execCallCount,
+            2,
+            "start readiness and terminal frame should each capture once; a third capture can lose a valid VNC frame"
+        )
     }
 
     func test_presentGuestDesktopPublishesLaunchProgressAndSupportsRetry() async throws {
