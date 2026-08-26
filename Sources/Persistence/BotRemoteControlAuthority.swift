@@ -1349,9 +1349,13 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let botID = id(bot)
         let hostID = try requireFileHost(params: params, botID: botID)
         let rootHandle = string(params, "root_handle") ?? ""
-        guard !rootHandle.isEmpty else { throw Error.invalidParams }
-        let rootEntry = try resolveFileEntry(bot: bot, handle: rootHandle)
         let handle = string(params, "handle")
+        guard !rootHandle.isEmpty,
+              processIssuedFileHandles.contains(rootHandle),
+              handle.map(processIssuedFileHandles.contains) ?? true else {
+            throw Error.invalidParams
+        }
+        let rootEntry = try resolveFileEntry(bot: bot, handle: rootHandle)
         let entry = try handle.map { try resolveFileEntry(bot: bot, handle: $0) } ?? rootEntry
         guard entry["host_id"] as? String == hostID else { throw Error.crossTarget }
         let root = entry["root"] as? String ?? ""
@@ -1439,6 +1443,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         } else {
             try applyDiskMutation(bot: bot, root: root, path: path, op: op, contents: contents)
         }
+        revokeFileGrants(botID: botID, root: root)
         let nextGeneration = currentGeneration + 1
         fileGenerations[fileGenerationKey(botID: botID, root: root)] = nextGeneration
         let nextCAS = rotateFileCAS(botID: botID, root: root)
@@ -1543,7 +1548,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let expectedHandle = string(params, "previous_root_handle") ?? string(params, "expected_handle") ?? ""
         guard let expectedGeneration = int(params, "expected_generation"),
               let expectedCAS = string(params, "expected_cas"),
-              !expectedHandle.isEmpty, !expectedCAS.isEmpty else { throw Error.invalidParams }
+              !expectedHandle.isEmpty, !expectedCAS.isEmpty,
+              processIssuedFileHandles.contains(expectedHandle) else { throw Error.invalidParams }
         let previousGrant = try resolveFileEntry(bot: bot, handle: expectedHandle)
         if previousGrant["kind"] as? String != "root"
             || previousGrant["root"] as? String != previousRoot
@@ -1564,7 +1570,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         if root != previousRoot {
             fileGenerations[fileGenerationKey(botID: botID, root: previousRoot)] = currentGeneration + 1
             _ = rotateFileCAS(botID: botID, root: previousRoot)
-            files = files.filter { $0.value["bot_id"] as? String != botID }
+            revokeFileGrants(botID: botID)
         }
         filesLocation[botID] = root
         let rootEntry = mintFileGrant(hostID: hostID, botID: botID, root: root, path: "", kind: "root")
@@ -2086,6 +2092,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             (files[key]?["bot_id"] as? String) == botID && (files[key]?["root"] as? String) == "docker_home"
         }
         for key in removed { files[key] = nil }
+        processIssuedFileHandles.subtract(removed)
         let dockerGeneration = fileGeneration(botID: botID, root: "docker_home") + 1
         fileGenerations[fileGenerationKey(botID: botID, root: "docker_home")] = dockerGeneration
         let dockerCAS = rotateFileCAS(botID: botID, root: "docker_home")
@@ -2648,6 +2655,15 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let value = UUID().uuidString.lowercased()
         fileCAS[fileGenerationKey(botID: botID, root: root)] = value
         return value
+    }
+
+    private func revokeFileGrants(botID: String, root: String? = nil) {
+        let revoked = files.keys.filter { handle in
+            guard files[handle]?["bot_id"] as? String == botID else { return false }
+            return root == nil || files[handle]?["root"] as? String == root
+        }
+        for handle in revoked { files[handle] = nil }
+        processIssuedFileHandles.subtract(revoked)
     }
 
     private func fileSecurity() -> [String: Any] {

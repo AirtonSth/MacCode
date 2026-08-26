@@ -2316,7 +2316,12 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "client_request_id": "dock",
             "name": "Piper",
         ])
+        let peer = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "dock-peer",
+            "name": "Scout",
+        ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let peerID = try XCTUnwrap(peer["bot_id"] as? String)
         let initialGrant = try fileRootGrant(botID: botID)
         _ = try authority.dispatch(method: "bot.files.location.set", params: [
             "client_request_id": "dock-loc",
@@ -2339,13 +2344,27 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         ])
         let uuid = try XCTUnwrap(UUID(uuidString: botID))
         let guest = BotGuestHome.url(appSupport: supportDir, botID: BotID(uuid))
+        let peerUUID = try XCTUnwrap(UUID(uuidString: peerID))
+        let peerGuest = try BotGuestHome.ensure(appSupport: supportDir, botID: BotID(peerUUID))
+        try Data("peer bytes".utf8).write(to: peerGuest.appendingPathComponent("keep.txt"))
         XCTAssertTrue(FileManager.default.fileExists(atPath: guest.appendingPathComponent("scratch.txt").path))
-        _ = try authority.dispatch(method: "bot.docker.clear", params: [
+        var clearedBots: [BotID] = []
+        authority.onDockerClear = { clearedBots.append($0) }
+        let params: [String: Any] = [
             "client_request_id": "dock-c",
             "bot_id": botID,
             "confirm": "clear",
-        ])
+        ]
+        let cleared = try authority.dispatch(method: "bot.docker.clear", params: params)
+        let replay = try authority.dispatch(method: "bot.docker.clear", params: params)
+        let readback = try XCTUnwrap(cleared["readback"] as? [String: Any])
+        XCTAssertEqual(cleared["status"] as? String, "completed")
+        XCTAssertEqual(cleared as NSDictionary, replay as NSDictionary)
+        XCTAssertEqual(readback["partial"] as? Bool, false)
+        XCTAssertGreaterThanOrEqual(readback["removed_count"] as? Int ?? 0, 1)
+        XCTAssertEqual(clearedBots, [BotID(uuid)], "response loss must not clear the exact Bot twice")
         XCTAssertFalse(FileManager.default.fileExists(atPath: guest.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: peerGuest.appendingPathComponent("keep.txt").path))
     }
 
     func test_guestStart_createsGuestHomeAndKeepsVncViewer() throws {
@@ -2960,9 +2979,79 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             .appendingPathComponent("cas.txt")), "authoritative")
     }
 
-    /// WHY: a grant is authority, not a parseable path token. It remains usable
-    /// after host relaunch only for its exact Bot, root, and generation.
-    func test_fileGrantIsOpaqueDurableAndRejectsCrossBotAndSymlinkEscape() throws {
+    func test_filesMutationAcceptsOnlyFreshProcessIssuedExactTuple() throws {
+        // WHY: U057 file authority is a current-process capability. The exact
+        // tuple returned by list/write must work, while rotated, cross-Bot, and
+        // pre-relaunch handles must never regain authority from the sidecar.
+        let owner = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "fresh-files-owner", "name": "Owner",
+        ])
+        let peer = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "fresh-files-peer", "name": "Peer",
+        ])
+        let ownerID = try XCTUnwrap(owner["bot_id"] as? String)
+        let peerID = try XCTUnwrap(peer["bot_id"] as? String)
+        let initial = try fileRootGrant(botID: ownerID, hostID: "host-a")
+        let created = try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "fresh-files-create", "host_id": "host-a", "bot_id": ownerID,
+            "root_handle": initial.handle, "expected_generation": initial.generation,
+            "expected_cas": initial.cas, "relative_path": "current.txt", "op": "write",
+            "contents": "first",
+        ])
+        let current = try XCTUnwrap(created["readback"] as? [String: Any])
+
+        let updated = try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "fresh-files-update", "host_id": "host-a", "bot_id": ownerID,
+            "root_handle": current["root_handle"] as Any, "handle": current["handle"] as Any,
+            "expected_generation": current["generation"] as Any,
+            "expected_cas": current["root_cas"] as Any, "op": "write", "contents": "second",
+        ])
+        XCTAssertEqual(updated["status"] as? String, "completed",
+                       "the exact tuple just issued by the host must remain usable")
+        let latest = try XCTUnwrap(updated["readback"] as? [String: Any])
+
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "fresh-files-rotated", "host_id": "host-a", "bot_id": ownerID,
+            "root_handle": initial.handle, "expected_generation": initial.generation,
+            "expected_cas": initial.cas, "relative_path": "stale.txt", "op": "write",
+        ]), "rotation must revoke the original root handle")
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "fresh-files-cross", "host_id": "host-a", "bot_id": peerID,
+            "root_handle": latest["root_handle"] as Any, "handle": latest["handle"] as Any,
+            "expected_generation": latest["generation"] as Any,
+            "expected_cas": latest["root_cas"] as Any, "op": "write", "contents": "cross",
+        ])) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .crossTarget)
+        }
+
+        let relaunched = BotRemoteControlAuthority(
+            db: db, store: store, settings: settings, appSupportDirectory: supportDir
+        )
+        XCTAssertThrowsError(try relaunched.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "fresh-files-relaunch-stale", "host_id": "host-a", "bot_id": ownerID,
+            "root_handle": latest["root_handle"] as Any, "handle": latest["handle"] as Any,
+            "expected_generation": latest["generation"] as Any,
+            "expected_cas": latest["root_cas"] as Any, "op": "write", "contents": "stale",
+        ]), "a persisted handle is data, not a process capability")
+
+        let relisted = try relaunched.dispatch(method: "bot.files.list", params: [
+            "host_id": "host-a", "bot_id": ownerID,
+        ])
+        let entry = try XCTUnwrap((relisted["entries"] as? [[String: Any]])?.first {
+            $0["path"] as? String == "current.txt"
+        })
+        let afterRelaunch = try relaunched.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "fresh-files-relaunch-current", "host_id": "host-a", "bot_id": ownerID,
+            "root_handle": relisted["root_handle"] as Any, "handle": entry["handle"] as Any,
+            "expected_generation": relisted["generation"] as Any,
+            "expected_cas": relisted["root_cas"] as Any, "op": "write", "contents": "third",
+        ])
+        XCTAssertEqual(afterRelaunch["status"] as? String, "completed")
+    }
+
+    /// WHY: a grant is authority, not a parseable path token. Its exact Bot,
+    /// root, and containment fences remain mandatory while it is current.
+    func test_fileGrantIsOpaqueAndRejectsCrossBotAndSymlinkEscape() throws {
         let first = try authority.dispatch(method: "bot.create", params: [
             "client_request_id": "files-owner", "name": "Owner",
         ])
