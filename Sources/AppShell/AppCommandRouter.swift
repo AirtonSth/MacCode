@@ -2626,7 +2626,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         return .object([
             "activity_id": .string(result.activityID.uuidString.lowercased()),
+            "lifecycle_receipt_id": .string(result.activityID.uuidString.lowercased()),
             BotPeerDelegation.consultationIDParameterKey: .string(result.consultationID.uuidString.lowercased()),
+            "conversation_id": .string(result.peerConversationID.value.uuidString.lowercased()),
+            "thread_id": .string(result.peerThreadID.value.uuidString.lowercased()),
+            "run_id": .string(result.peerRunID.value.uuidString.lowercased()),
             "bot": .object([
                 "id": .string(current.id.value.uuidString.lowercased()),
                 "handle": .string(current.handle),

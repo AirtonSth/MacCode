@@ -37,6 +37,28 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         }
     }
 
+    func askBotPeer(
+        callerThread: AgentThreadID,
+        callerRun: AgentRunID,
+        handle: String,
+        prompt: String,
+        replyMode: BotPeerDelegation.ReplyMode,
+        consultationID: UUID?,
+        delegationCapability: String?
+    ) async throws -> JSONValue {
+        throw JSONRPCError.notSupported("Bot delegation")
+    }
+
+    func invokeDelegatedBotSelfConfig(
+        callerThread: AgentThreadID,
+        callerRun: AgentRunID,
+        toolName: String,
+        arguments: [String: JSONValue],
+        delegationCapability: String?
+    ) throws -> JSONValue {
+        throw JSONRPCError.notSupported("delegated Bot settings")
+    }
+
     func createHostBot(
         name: String,
         title: String,

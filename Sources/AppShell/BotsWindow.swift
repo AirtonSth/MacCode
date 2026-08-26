@@ -1160,7 +1160,14 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         hostRunID: AgentRunID,
         providerSnapshots: [AgentProviderSnapshot],
         consultationID: UUID? = nil
-    ) async -> (activityID: UUID, reply: String, consultationID: UUID)? {
+    ) async -> (
+        activityID: UUID,
+        reply: String,
+        consultationID: UUID,
+        peerConversationID: BotConversationID,
+        peerThreadID: AgentThreadID,
+        peerRunID: AgentRunID
+    )? {
         refreshStorageProjection()
         let originConversation = try? botStore.conversationLinked(to: originThread.id)
         let originBot = originConversation.flatMap { try? botStore.get(id: $0.botID) }
@@ -1205,8 +1212,18 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         ) else { return nil }
         await milestone.value
         guard let reply = replyText(forActivityID: activityID.value),
-              let consultationID = handoffs[activityID.value]?.consultationID else { return nil }
-        return (activityID.value, reply, consultationID)
+              let handoff = handoffs[activityID.value],
+              let consultationID = handoff.consultationID,
+              let peerThreadID = handoff.peerThreadID,
+              let peerRunID = handoff.peerRunID else { return nil }
+        return (
+            activityID.value,
+            reply,
+            consultationID,
+            handoff.peerConversationID,
+            peerThreadID,
+            peerRunID
+        )
     }
 
     private func awaitAgentAppDispatch(activityID: UUID) async {

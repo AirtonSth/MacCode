@@ -146,7 +146,7 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
         let dispatcher = JSONRPCDispatcher(router: router)
         let threadID = UUID().uuidString.lowercased()
         let runID = UUID().uuidString.lowercased()
-        let capability = String(repeating: "ab", count: 32)
+        let capability = router.activeCapability
         func params(_ extra: [String: JSONValue] = [:]) -> [String: JSONValue] {
             var result: [String: JSONValue] = [
                 "thread_id": .string(threadID),
@@ -165,6 +165,7 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
             id: .number(2),
             method: "bot.peer.ask",
             params: params([
+                "client_request_id": .string("peer-ask-auth"),
                 "handle": .string("qa"),
                 "prompt": .string("Review this."),
                 "reply_mode": .string("consult"),
@@ -175,12 +176,173 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
             id: .number(3),
             method: "bot.peer.self_config",
             params: params([
+                "client_request_id": .string("peer-self-config-auth"),
                 "tool_name": .string("bot_get_settings"),
                 "arguments": .object([:]),
             ])
         ))
 
         XCTAssertEqual(router.authorizationMutations, [false, false, false])
+    }
+
+    func test_peerMutationsUsePrivateDurableReceiptsWithoutRedispatch() async throws {
+        // WHY: bot.peer.* is a supervised Unix capability, not a public HTTP
+        // mutation. A lost response must be recoverable from the exact durable
+        // terminal receipt without asking the Bot or applying self-config twice.
+        let router = HostCatalogReceiptRouter()
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let threadID = UUID().uuidString.lowercased()
+        let runID = UUID().uuidString.lowercased()
+        let capability = router.activeCapability
+        func params(_ requestID: String, extra: [String: JSONValue]) -> [String: JSONValue] {
+            var values: [String: JSONValue] = [
+                "thread_id": .string(threadID),
+                "run_id": .string(runID),
+                BotPeerDelegation.capabilityRPCParameterKey: .string(capability),
+                "client_request_id": .string(requestID),
+            ]
+            for (key, value) in extra { values[key] = value }
+            return values
+        }
+        let askParams = params("peer-ask-1", extra: [
+            "handle": .string("qa"),
+            "prompt": .string("Review this."),
+            "reply_mode": .string("consult"),
+        ])
+
+        let firstAsk = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
+            jsonrpc: "2.0", id: .number(1), method: "bot.peer.ask", params: askParams
+        ))
+        XCTAssertNil(firstAsk.error)
+        XCTAssertEqual(router.peerAskCount, 1)
+        let askReceipt = try XCTUnwrap(firstAsk.result?.objectValue?["command_receipt"]?.objectValue)
+        XCTAssertEqual(askReceipt["client_request_id"]?.stringValue, "peer-ask-1")
+        XCTAssertEqual(askReceipt["host_id"]?.stringValue, router.activeHostID)
+        XCTAssertEqual(askReceipt["caller_thread_id"]?.stringValue, threadID)
+        XCTAssertEqual(askReceipt["caller_run_id"]?.stringValue, runID)
+        XCTAssertNotEqual(askReceipt["delegation_fingerprint"]?.stringValue, capability)
+        XCTAssertEqual(firstAsk.result?.objectValue?["bot"]?.objectValue?["id"]?.stringValue,
+                       "55555555-5555-5555-5555-555555555555")
+        XCTAssertEqual(firstAsk.result?.objectValue?["conversation_id"]?.stringValue,
+                       "22222222-2222-2222-2222-222222222222")
+        XCTAssertEqual(firstAsk.result?.objectValue?["thread_id"]?.stringValue,
+                       "33333333-3333-3333-3333-333333333333")
+        XCTAssertEqual(firstAsk.result?.objectValue?["run_id"]?.stringValue,
+                       "44444444-4444-4444-4444-444444444444")
+
+        let askStatus = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(2),
+            method: "bot.peer.receipt.status",
+            params: params("peer-ask-1", extra: ["method": .string("bot.peer.ask")])
+        ))
+        XCTAssertNil(askStatus.error)
+        XCTAssertEqual(askStatus.result?.objectValue?["status"]?.stringValue, "committed")
+        XCTAssertEqual(
+            askStatus.result?.objectValue?["result"]?.objectValue?["reply"]?.stringValue,
+            "Reviewed once."
+        )
+        XCTAssertEqual(router.peerAskCount, 1, "status readback must not redispatch the consultation")
+
+        let reloaded = JSONRPCDispatcher(router: router)
+        let replayAsk = await reloaded.dispatchUnixSocket(JSONRPCRequest(
+            jsonrpc: "2.0", id: .number(3), method: "bot.peer.ask", params: askParams
+        ))
+        XCTAssertEqual(replayAsk.result, firstAsk.result)
+        XCTAssertEqual(router.peerAskCount, 1, "same logical id must replay the durable result after dispatcher recreation")
+
+        let selfConfigParams = params("peer-config-1", extra: [
+            "tool_name": .string("bot_set_settings"),
+            "arguments": .object(["name": .string("Nova")]),
+        ])
+        let firstConfig = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
+            jsonrpc: "2.0", id: .number(4), method: "bot.peer.self_config", params: selfConfigParams
+        ))
+        XCTAssertNil(firstConfig.error)
+        XCTAssertEqual(router.peerSelfConfigCount, 1)
+        let configStatus = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(5),
+            method: "bot.receipt.status",
+            params: params("peer-config-1", extra: ["method": .string("bot.peer.self_config")])
+        ))
+        XCTAssertEqual(configStatus.result?.objectValue?["status"]?.stringValue, "committed")
+        XCTAssertEqual(
+            configStatus.result?.objectValue?["result"]?.objectValue?["name"]?.stringValue,
+            "Nova"
+        )
+        XCTAssertEqual(router.peerSelfConfigCount, 1)
+        XCTAssertEqual(firstConfig.result?.objectValue?["id"]?.stringValue,
+                       "55555555-5555-5555-5555-555555555555")
+
+        var crossThreadStatusParams = params(
+            "peer-ask-1",
+            extra: ["method": .string("bot.peer.ask")]
+        )
+        crossThreadStatusParams["thread_id"] = .string(UUID().uuidString.lowercased())
+        let crossThreadStatus = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(6),
+            method: "bot.peer.receipt.status",
+            params: crossThreadStatusParams
+        ))
+        XCTAssertEqual(crossThreadStatus.error?.code, -32094)
+        XCTAssertEqual(router.peerAskCount, 1, "a cross-thread status probe must not expose or replay a result")
+
+        let persistedReceiptText = try JSONEncoder().encode(firstAsk.result)
+        XCTAssertFalse(
+            String(decoding: persistedReceiptText, as: UTF8.self).contains(capability),
+            "the raw bearer must never enter a persisted receipt result"
+        )
+    }
+
+    func test_peerReceiptStatusNeverReplaysUnknownOrInProgressOperation() async {
+        // WHY: a status poll is evidence, never permission to repeat an unknown
+        // side effect. Only a committed receipt may return its cached result.
+        let router = HostCatalogReceiptRouter()
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let threadID = UUID().uuidString.lowercased()
+        let runID = UUID().uuidString.lowercased()
+        func params(_ requestID: String) -> [String: JSONValue] {
+            [
+                "thread_id": .string(threadID),
+                "run_id": .string(runID),
+                BotPeerDelegation.capabilityRPCParameterKey: .string(router.activeCapability),
+                "client_request_id": .string(requestID),
+                "method": .string("bot.peer.ask"),
+            ]
+        }
+
+        router.seedReceipt(method: "bot.peer.ask", requestID: "in-progress", ownerParams: params("in-progress"), state: "claimed")
+        router.seedReceipt(method: "bot.peer.ask", requestID: "unknown", ownerParams: params("unknown"), state: "unknown")
+
+        let inProgress = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
+            jsonrpc: "2.0", id: .number(1), method: "bot.peer.receipt.status", params: params("in-progress")
+        ))
+        let unknown = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
+            jsonrpc: "2.0", id: .number(2), method: "bot.peer.receipt.status", params: params("unknown")
+        ))
+        XCTAssertEqual(inProgress.result?.objectValue?["status"]?.stringValue, "inProgress")
+        XCTAssertNil(inProgress.result?.objectValue?["result"])
+        XCTAssertEqual(unknown.result?.objectValue?["status"]?.stringValue, "unknown")
+        XCTAssertNil(unknown.result?.objectValue?["result"])
+        XCTAssertEqual(router.peerAskCount, 0)
+    }
+
+    func test_privatePeerReceiptCatalogStaysOutsidePublicMutationManifest() {
+        // WHY: durable receipts must not accidentally expose supervised peer
+        // tools over the public HTTP mutation catalog.
+        XCTAssertEqual(
+            HostMutationContract.managedProviderMutationMethods,
+            RemoteCodeHostCatalog.rpcMutationMethods.union(["bot.peer.ask", "bot.peer.self_config"])
+        )
+        XCTAssertTrue(
+            HostMutationContract.methods.isDisjoint(with: ["bot.peer.ask", "bot.peer.self_config"])
+        )
+        XCTAssertEqual(
+            JSONRPCDispatcher.managedPeerReceiptMethods,
+            ["bot.peer.ask", "bot.peer.self_config"]
+        )
     }
 
     func test_peerContinuationRejectsMalformedOrWronglyTypedConsultationIDsBeforeDispatch() async {
@@ -200,6 +362,7 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
 
         for malformed in [JSONValue.string("not-a-uuid"), .bool(true), .number(1)] {
             var params = common
+            params["client_request_id"] = .string("malformed-\(malformed)")
             params[BotPeerDelegation.consultationIDParameterKey] = malformed
             let response = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
                 jsonrpc: "2.0",
@@ -339,6 +502,10 @@ private final class HostCatalogReceiptRouter: FakeRouter, CommandReceiptStateRou
     var authorizationMutations: [Bool] = []
     var lastCallerThread: AgentThreadID?
     var lastCallerRun: AgentRunID?
+    let activeCapability = String(repeating: "ab", count: 32)
+    let activeHostID = "host-peer-receipt-test"
+    var peerAskCount = 0
+    var peerSelfConfigCount = 0
     private var receipts: [String: Receipt] = [:]
     private var bots: [String: String] = [:]
     private var skills: [String: String] = [:]
@@ -360,6 +527,80 @@ private final class HostCatalogReceiptRouter: FakeRouter, CommandReceiptStateRou
         _ = method
         _ = threadID
         _ = runID
+    }
+
+    override func activeAgentDelegation(
+        thread: AgentThreadID,
+        run: AgentRunID
+    ) throws -> AgentActiveDelegationSnapshot? {
+        AgentActiveDelegationSnapshot(
+            threadId: thread,
+            runId: run,
+            hostId: activeHostID,
+            capability: activeCapability,
+            expiresAt: Date().addingTimeInterval(60)
+        )
+    }
+
+    override func askBotPeer(
+        callerThread: AgentThreadID,
+        callerRun: AgentRunID,
+        handle: String,
+        prompt: String,
+        replyMode: BotPeerDelegation.ReplyMode,
+        consultationID: UUID?,
+        delegationCapability: String?
+    ) async throws -> JSONValue {
+        peerAskCount += 1
+        return .object([
+            "lifecycle_receipt_id": .string("11111111-1111-1111-1111-111111111111"),
+            "conversation_id": .string("22222222-2222-2222-2222-222222222222"),
+            "thread_id": .string("33333333-3333-3333-3333-333333333333"),
+            "run_id": .string("44444444-4444-4444-4444-444444444444"),
+            "bot": .object([
+                "id": .string("55555555-5555-5555-5555-555555555555"),
+                "handle": .string(handle),
+            ]),
+            "reply": .string("Reviewed once."),
+            "reply_mode": .string(replyMode.rawValue),
+        ])
+    }
+
+    override func invokeDelegatedBotSelfConfig(
+        callerThread: AgentThreadID,
+        callerRun: AgentRunID,
+        toolName: String,
+        arguments: [String: JSONValue],
+        delegationCapability: String?
+    ) throws -> JSONValue {
+        peerSelfConfigCount += 1
+        return .object([
+            "id": .string("55555555-5555-5555-5555-555555555555"),
+            "name": arguments["name"] ?? .string("Nova"),
+        ])
+    }
+
+    func seedReceipt(
+        method: String,
+        requestID: String,
+        ownerParams: [String: JSONValue],
+        state: String
+    ) {
+        let threadID = ownerParams["thread_id"]?.stringValue ?? ""
+        let runID = ownerParams["run_id"]?.stringValue ?? ""
+        let capability = ownerParams[BotPeerDelegation.capabilityRPCParameterKey]?.stringValue ?? ""
+        let owner = JSONRPCDispatcher.managedPeerOwnerFingerprint(
+            hostID: activeHostID,
+            threadID: threadID,
+            runID: runID,
+            capability: capability
+        )
+        receipts["\(method):\(requestID)"] = Receipt(
+            owner: owner,
+            hash: "unused",
+            state: state,
+            result: nil
+        )
     }
 
     override func createHostBot(
@@ -524,10 +765,15 @@ private final class HostCatalogReceiptRouter: FakeRouter, CommandReceiptStateRou
     ) throws -> CommandReceiptStatusResult {
         let key = "\(method):\(clientRequestId)"
         guard let receipt = receipts[key] else { return .absent }
+        guard receipt.owner == ownerFingerprint else { return .ownerMismatch }
         switch receipt.state {
         case "claimed": return .inProgress
         case "committed": return .committed
         default: return .unknown
         }
+    }
+
+    override func commandReceipt(method: String, clientRequestId: String) -> JSONValue? {
+        receipts["\(method):\(clientRequestId)"]?.result
     }
 }

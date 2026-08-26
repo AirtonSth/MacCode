@@ -24,6 +24,64 @@ final class BotPeerRPCClientTests: XCTestCase {
         XCTAssertEqual((object["bots"] as? [Any])?.count, 0)
     }
 
+    func test_peerMutationResponseLossReturnsCommittedReceiptWithoutRedispatch() throws {
+        // WHY: a missing socket response is ambiguous. The client must inspect
+        // the exact durable receipt first and return its terminal result without
+        // issuing the peer operation a second time.
+        for testCase in [
+            (method: "bot.peer.ask", status: "bot.peer.receipt.status"),
+            (method: "bot.peer.self_config", status: "bot.receipt.status"),
+        ] {
+            let server = try UnixEchoServer(requestCount: 2) { index, request in
+                let params = try XCTUnwrap(request["params"] as? [String: Any])
+                let requestID = try XCTUnwrap(params["client_request_id"] as? String)
+                XCTAssertFalse(requestID.isEmpty)
+                XCTAssertEqual(params["thread_id"] as? String, Self.threadID)
+                XCTAssertEqual(params["run_id"] as? String, Self.runID)
+                XCTAssertEqual(params[BotPeerDelegation.capabilityRPCParameterKey] as? String, Self.capability)
+                if index == 0 {
+                    XCTAssertEqual(request["method"] as? String, testCase.method)
+                    return nil
+                }
+                XCTAssertEqual(request["method"] as? String, testCase.status)
+                XCTAssertEqual(params["method"] as? String, testCase.method)
+                return #"{"jsonrpc":"2.0","id":1,"result":{"status":"committed","method":"\#(testCase.method)","clientRequestId":"\#(requestID)","caller_thread_id":"\#(Self.threadID)","caller_run_id":"\#(Self.runID)","result":{"ok":"terminal"}}}"#
+            }
+            defer { server.stop() }
+
+            let result = try BotPeerRPCClient(
+                environment: Self.environment(socket: server.path),
+                timeoutOverride: 0.5
+            ).call(method: testCase.method, arguments: [:])
+            XCTAssertEqual((result as? [String: Any])?["ok"] as? String, "terminal")
+            XCTAssertEqual(
+                server.methods,
+                [testCase.method, testCase.status],
+                "committed response loss must perform one operation and one status read only"
+            )
+        }
+    }
+
+    func test_peerMutationNonTerminalStatusNeverRedispatches() throws {
+        // WHY: absent, unknown, and in-progress are not durable proof that the effect was not applied.
+        // Status-before-retry must stop rather than fabricate a safe retry.
+        for status in ["absent", "unknown", "inProgress"] {
+            let server = try UnixEchoServer(requestCount: 2) { index, request in
+                let params = try XCTUnwrap(request["params"] as? [String: Any])
+                let requestID = try XCTUnwrap(params["client_request_id"] as? String)
+                if index == 0 { return nil }
+                return #"{"jsonrpc":"2.0","id":1,"result":{"status":"\#(status)","method":"bot.peer.ask","clientRequestId":"\#(requestID)","caller_thread_id":"\#(Self.threadID)","caller_run_id":"\#(Self.runID)}}"#
+            }
+            defer { server.stop() }
+
+            XCTAssertThrowsError(try BotPeerRPCClient(
+                environment: Self.environment(socket: server.path),
+                timeoutOverride: 0.5
+            ).call(method: "bot.peer.ask", arguments: [:]))
+            XCTAssertEqual(server.methods, ["bot.peer.ask", "bot.peer.receipt.status"])
+        }
+    }
+
     func test_connectFailureOnMissingSocket() {
         var closed: [Int32] = []
         var syscalls = Self.fakeConnectedSyscalls(closed: &closed)
@@ -250,11 +308,34 @@ private final class UnixEchoServer {
     let path: String
     private let listenFD: Int32
     private var thread: Thread?
+    private let lock = NSLock()
+    private var recordedMethods: [String] = []
 
-    init(
+    var methods: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedMethods
+    }
+
+    convenience init(
         keepaliveAfter: TimeInterval? = nil,
         replyDelay: TimeInterval? = nil,
         _ handler: @escaping ([String: Any]) throws -> String?
+    ) throws {
+        try self.init(
+            requestCount: 1,
+            keepaliveAfter: keepaliveAfter,
+            replyDelay: replyDelay
+        ) { _, request in
+            try handler(request)
+        }
+    }
+
+    init(
+        requestCount: Int,
+        keepaliveAfter: TimeInterval? = nil,
+        replyDelay: TimeInterval? = nil,
+        _ handler: @escaping (Int, [String: Any]) throws -> String?
     ) throws {
         path = NSTemporaryDirectory() + "rc-peer-rpc-\(UUID().uuidString).sock"
         unlink(path)
@@ -277,42 +358,56 @@ private final class UnixEchoServer {
             throw BotPeerRPCError.socket("bind/listen")
         }
         let fd = listenFD
-        thread = Thread {
-            var client = sockaddr_un()
-            var length = socklen_t(MemoryLayout<sockaddr_un>.size)
-            let accepted = withUnsafeMutablePointer(to: &client) { pointer in
-                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.accept(fd, $0, &length)
+        thread = Thread { [weak self] in
+            for index in 0..<requestCount {
+                var client = sockaddr_un()
+                var length = socklen_t(MemoryLayout<sockaddr_un>.size)
+                let accepted = withUnsafeMutablePointer(to: &client) { pointer in
+                    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        Darwin.accept(fd, $0, &length)
+                    }
                 }
-            }
-            guard accepted >= 0 else { return }
-            defer { Darwin.close(accepted) }
-            var data = Data()
-            var buffer = [UInt8](repeating: 0, count: 4096)
-            while data.last != 0x0A {
-                let count = Darwin.read(accepted, &buffer, buffer.count)
-                if count <= 0 { return }
-                data.append(buffer, count: count)
-            }
-            guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-            if let keepaliveAfter {
-                Thread.sleep(forTimeInterval: keepaliveAfter)
-                let ping = Data([BotPeerDelegation.peerConsultationKeepaliveByte])
-                _ = ping.withUnsafeBytes { raw in
-                    Darwin.write(accepted, raw.baseAddress!, ping.count)
+                guard accepted >= 0 else { return }
+                var data = Data()
+                var buffer = [UInt8](repeating: 0, count: 4096)
+                while data.last != 0x0A {
+                    let count = Darwin.read(accepted, &buffer, buffer.count)
+                    if count <= 0 {
+                        Darwin.close(accepted)
+                        return
+                    }
+                    data.append(buffer, count: count)
                 }
-            }
-            guard let reply = try? handler(object) else {
-                Thread.sleep(forTimeInterval: 0.2)
-                return
-            }
-            if let replyDelay {
-                Thread.sleep(forTimeInterval: replyDelay)
-            }
-            var payload = Data(reply.utf8)
-            if payload.last != 0x0A { payload.append(0x0A) }
-            _ = payload.withUnsafeBytes { raw in
-                Darwin.write(accepted, raw.baseAddress!, payload.count)
+                guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    Darwin.close(accepted)
+                    return
+                }
+                if let method = object["method"] as? String {
+                    self?.lock.lock()
+                    self?.recordedMethods.append(method)
+                    self?.lock.unlock()
+                }
+                if let keepaliveAfter {
+                    Thread.sleep(forTimeInterval: keepaliveAfter)
+                    let ping = Data([BotPeerDelegation.peerConsultationKeepaliveByte])
+                    _ = ping.withUnsafeBytes { raw in
+                        Darwin.write(accepted, raw.baseAddress!, ping.count)
+                    }
+                }
+                guard let reply = try? handler(index, object) else {
+                    Thread.sleep(forTimeInterval: 0.2)
+                    Darwin.close(accepted)
+                    continue
+                }
+                if let replyDelay {
+                    Thread.sleep(forTimeInterval: replyDelay)
+                }
+                var payload = Data(reply.utf8)
+                if payload.last != 0x0A { payload.append(0x0A) }
+                _ = payload.withUnsafeBytes { raw in
+                    Darwin.write(accepted, raw.baseAddress!, payload.count)
+                }
+                Darwin.close(accepted)
             }
         }
         thread?.start()

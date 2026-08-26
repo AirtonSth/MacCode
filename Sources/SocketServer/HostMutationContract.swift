@@ -182,8 +182,10 @@ public enum HostMutationContract {
     /// Private managed-provider mutations reuse the same syntactic and durable
     /// receipt machinery, but they are not part of the public HTTP Phase 4
     /// catalog. Only the authenticated Unix entry point may route them here.
-    private static let managedProviderMutationMethods =
-        RemoteCodeHostCatalog.rpcMutationMethods
+    static let managedProviderMutationMethods =
+        RemoteCodeHostCatalog.rpcMutationMethods.union([
+            "bot.peer.ask", "bot.peer.self_config",
+        ])
 
     public static func preflight(method: String, params: [String: JSONValue]) throws {
         guard methods.contains(method) || managedProviderMutationMethods.contains(method) else {
@@ -321,6 +323,16 @@ public enum HostMutationContract {
                 return []
             case "bot.settings.set":
                 return [.string("key")]
+            case "bot.peer.ask":
+                return [
+                    .uuid("thread_id"), .uuid("run_id"), .string("handle"), .string("prompt"),
+                    .stringEnum("reply_mode", ["consult", "reply_only"]),
+                    .optionalUUID(BotPeerDelegation.consultationIDParameterKey),
+                ]
+            case "bot.peer.self_config":
+                return [
+                    .uuid("thread_id"), .uuid("run_id"), .string("tool_name"), .object("arguments"),
+                ]
             case "bot.attention.ack":
                 return [
                     .uuid("bot_id"),
@@ -387,8 +399,6 @@ public enum HostMutationContract {
         case "agent.checkpoint.revert": return [.uuid("thread_id"), .firstPresentInt(["turn_count", "checkpoint_turn_count"])]
         case "agent.attachment.upload": return [.uuid("workspace_id"), .string("filename"), .anyString(["data_base64", "dataBase64"])]
         case "agent.attachment.import": return [.uuid("workspace_id"), .string("relative_path", nonempty: true)]
-        case "bot.peer.ask": return [.uuid("thread_id"), .uuid("run_id"), .string("handle"), .string("prompt"), .stringEnum("reply_mode", ["consult", "reply_only"]), .optionalUUID(BotPeerDelegation.consultationIDParameterKey)]
-        case "bot.peer.self_config": return [.uuid("thread_id"), .uuid("run_id"), .string("tool_name"), .object("arguments")]
         case "host.bot.create": return [.string("name", nonempty: true)]
         case "host.bot.open": return [.uuid("bot_id")]
         case "host.bot.send": return [.uuid("bot_id"), .string("text", nonempty: true)]

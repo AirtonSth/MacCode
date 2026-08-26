@@ -722,7 +722,11 @@ public final class JSONRPCDispatcher {
     private nonisolated static let managedProviderSocketMethods =
         RemoteCodeHostCatalog.rpcMethods.union([
             "bot.peer.list", "bot.peer.ask", "bot.peer.self_config",
+            "bot.peer.receipt.status",
         ])
+    nonisolated static let managedPeerReceiptMethods: Set<String> = [
+        "bot.peer.ask", "bot.peer.self_config",
+    ]
     /// Bounded unknown-outcome fence (same cap as committed receipts). Does not
     /// store request payloads or secrets — only owner fingerprint + params hash.
     private var volatileUnknownReceipts = BoundedUnknownReceiptCache()
@@ -1499,14 +1503,19 @@ public final class JSONRPCDispatcher {
     }
 
     private func dispatchManagedHostUnix(_ req: JSONRPCRequest) async -> JSONRPCResponse {
+        let params = req.params ?? [:]
+        let peerReceiptMethod = params["method"]?.stringValue
+        let isPeerReceiptStatus = req.method == "bot.peer.receipt.status"
+            || (req.method == "bot.receipt.status"
+                && peerReceiptMethod.map(Self.managedPeerReceiptMethods.contains) == true)
         let isPeer = req.method == "bot.peer.list"
             || req.method == "bot.peer.ask"
             || req.method == "bot.peer.self_config"
+            || isPeerReceiptStatus
         let isHost = RemoteCodeHostCatalog.rpcMethods.contains(req.method)
         guard isPeer || isHost else {
             return await dispatchLocalIPC(req)
         }
-        let params = req.params ?? [:]
         // Peer consultation/self-configuration is already constrained by the
         // exact bearer and Bot grant. It remains available to supervised runs;
         // only host catalog mutations require full-access admission.
@@ -1519,6 +1528,39 @@ public final class JSONRPCDispatcher {
             return .init(id: req.id, error: Self.mapDomainError(error, method: req.method))
         }
         return await Self.$managedProviderSocketAuthenticated.withValue(true) {
+            if Self.managedPeerReceiptMethods.contains(req.method) || isPeerReceiptStatus {
+                let context: MutationRequestContext
+                do {
+                    context = try managedPeerMutationContext(params)
+                } catch let error as JSONRPCError {
+                    return .init(id: req.id, error: error)
+                } catch {
+                    return .init(id: req.id, error: Self.mapDomainError(error, method: req.method))
+                }
+                if isPeerReceiptStatus {
+                    return commandReceiptStatus(
+                        req,
+                        context: context,
+                        allowedMethods: Self.managedPeerReceiptMethods,
+                        includeCommittedResult: true,
+                        peerIdentity: params
+                    )
+                }
+                guard let clientRequestId = params["client_request_id"]?.stringValue?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                      !clientRequestId.isEmpty else {
+                    return .init(id: req.id, error: JSONRPCError(
+                        code: -32097,
+                        message: "Mutation requires a non-empty client_request_id."
+                    ))
+                }
+                RemoteCodeHostCatalogDiagnostics.receipt(
+                    decision: "claim",
+                    method: req.method,
+                    operationID: clientRequestId
+                )
+                return await dispatchRemoteMutation(req, context: context)
+            }
             if isHost, RemoteCodeHostCatalog.rpcMutationMethods.contains(req.method) {
                 guard let clientRequestId = params["client_request_id"]?.stringValue?
                     .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1550,6 +1592,51 @@ public final class JSONRPCDispatcher {
             }
             return await dispatchLocalIPC(req)
         }
+    }
+
+    private func managedPeerMutationContext(
+        _ params: [String: JSONValue]
+    ) throws -> MutationRequestContext {
+        guard let threadUUID = params["thread_id"]?.stringValue.flatMap(UUID.init),
+              let runUUID = params["run_id"]?.stringValue.flatMap(UUID.init),
+              let capability = params[BotPeerDelegation.capabilityRPCParameterKey]?.stringValue,
+              !capability.isEmpty else {
+            throw JSONRPCError(code: -32047, message: "Host catalog requires an authenticated active run.")
+        }
+        let threadID = AgentThreadID(threadUUID)
+        let runID = AgentRunID(runUUID)
+        guard let active = try router.activeAgentDelegation(thread: threadID, run: runID),
+              active.threadId == threadID,
+              active.runId == runID,
+              active.capability == capability,
+              active.expiresAt > Date() else {
+            throw JSONRPCError(code: -32047, message: "Host catalog requires an authenticated active run.")
+        }
+        return MutationRequestContext(
+            ownerFingerprint: Self.managedPeerOwnerFingerprint(
+                hostID: active.hostId,
+                threadID: threadUUID.uuidString.lowercased(),
+                runID: runUUID.uuidString.lowercased(),
+                capability: capability
+            ),
+            hostId: active.hostId,
+            bootEpoch: 0
+        )
+    }
+
+    nonisolated static func managedPeerOwnerFingerprint(
+        hostID: String,
+        threadID: String,
+        runID: String,
+        capability: String
+    ) -> String {
+        AgentMessageTransport.bodySHA256Hex(
+            "peer-receipt-v1\u{0}\(hostID)\u{0}\(threadID.lowercased())\u{0}\(runID.lowercased())\u{0}\(capability)"
+        )
+    }
+
+    private nonisolated static func managedPeerDelegationFingerprint(_ capability: String) -> String {
+        AgentMessageTransport.bodySHA256Hex("peer-delegation-v1\u{0}\(capability)")
     }
 
     private func authenticateManagedHostParams(
@@ -1605,7 +1692,11 @@ public final class JSONRPCDispatcher {
         }
         guard let mutationContext else { return await dispatchCore(req) }
         if req.method == "command.receipt.status" {
-            return commandReceiptStatus(req, context: mutationContext)
+            return commandReceiptStatus(
+                req,
+                context: mutationContext,
+                allowedMethods: Self.hostMutationMethods
+            )
         }
         guard Self.hostMutationMethods.contains(req.method) else {
             return await dispatchCore(req)
@@ -1815,11 +1906,19 @@ public final class JSONRPCDispatcher {
             )
         }
 
+        var executionParams = businessParams
+        if Self.managedPeerReceiptMethods.contains(req.method),
+           let capability = params[BotPeerDelegation.capabilityRPCParameterKey] {
+            // The domain authority verifies the same live bearer again. It is
+            // execution-only: paramsHash and durable receipt storage use the
+            // stripped business params plus digest-only owner identity.
+            executionParams[BotPeerDelegation.capabilityRPCParameterKey] = capability
+        }
         let businessRequest = JSONRPCRequest(
             jsonrpc: req.jsonrpc,
             id: req.id,
             method: req.method,
-            params: businessParams
+            params: executionParams
         )
         let eventSink: EventBus.MutationEventSink? = Self.durableSynchronousMutationMethods.contains(req.method)
             ? EventBus.MutationEventSink()
@@ -1869,6 +1968,14 @@ public final class JSONRPCDispatcher {
                 requiresSnapshot: true
             )
         }
+        let committedResult = peerReceiptResult(
+            result,
+            method: req.method,
+            clientRequestId: clientRequestId,
+            context: context,
+            params: params
+        )
+        let successfulResponse = JSONRPCResponse(id: req.id, result: committedResult)
         let finalizationStarted = DispatchTime.now().uptimeNanoseconds
         do {
             if let eventSink {
@@ -1879,7 +1986,7 @@ public final class JSONRPCDispatcher {
                         clientRequestId: clientRequestId,
                         ownerFingerprint: context.ownerFingerprint,
                         paramsHash: paramsHash,
-                        result: result,
+                        result: committedResult,
                         events: events,
                         minimumEventSequence: minimumEventSequence
                     )
@@ -1890,14 +1997,14 @@ public final class JSONRPCDispatcher {
                     clientRequestId: clientRequestId,
                     ownerFingerprint: context.ownerFingerprint,
                     paramsHash: paramsHash,
-                    result: result
+                    result: committedResult
                 )
             }
             commandReceiptMetrics.recordFinalization(
                 success: true,
                 latencyMilliseconds: Self.elapsedMilliseconds(since: finalizationStarted)
             )
-            return response
+            return successfulResponse
         } catch {
             commandReceiptMetrics.recordFinalization(
                 success: false,
@@ -1973,14 +2080,41 @@ public final class JSONRPCDispatcher {
         return nil
     }
 
+    private func peerReceiptResult(
+        _ result: JSONValue,
+        method: String,
+        clientRequestId: String,
+        context: MutationRequestContext,
+        params: [String: JSONValue]
+    ) -> JSONValue {
+        guard Self.managedPeerReceiptMethods.contains(method),
+              var object = result.objectValue,
+              let threadID = params["thread_id"]?.stringValue,
+              let runID = params["run_id"]?.stringValue,
+              let capability = params[BotPeerDelegation.capabilityRPCParameterKey]?.stringValue else {
+            return result
+        }
+        object["command_receipt"] = .object([
+            "client_request_id": .string(clientRequestId),
+            "host_id": .string(context.hostId),
+            "caller_thread_id": .string(threadID.lowercased()),
+            "caller_run_id": .string(runID.lowercased()),
+            "delegation_fingerprint": .string(Self.managedPeerDelegationFingerprint(capability)),
+        ])
+        return .object(object)
+    }
+
     private func commandReceiptStatus(
         _ req: JSONRPCRequest,
-        context: MutationRequestContext
+        context: MutationRequestContext,
+        allowedMethods: Set<String>,
+        includeCommittedResult: Bool = false,
+        peerIdentity: [String: JSONValue]? = nil
     ) -> JSONRPCResponse {
         let params = req.params ?? [:]
         guard let clientRequestId = mutationIdentity(params: params, context: context),
               let method = params["method"]?.stringValue,
-              Self.hostMutationMethods.contains(method),
+              allowedMethods.contains(method),
               let receiptRouter = router as? CommandReceiptStateRouting else {
             return .init(id: req.id, error: .invalidParams)
         }
@@ -2022,13 +2156,39 @@ public final class JSONRPCDispatcher {
         case .legacyUnverifiable: values = ("legacyUnverifiable", false, true)
         case .ownerMismatch: fatalError("handled above")
         }
-        return .init(id: req.id, result: .object([
+        var result: [String: JSONValue] = [
             "status": .string(values.0),
             "method": .string(method),
             "clientRequestId": .string(clientRequestId),
             "retryable": .bool(values.1),
             "requiresSnapshot": .bool(values.2),
-        ]))
+        ]
+        if let peerIdentity {
+            if let threadID = peerIdentity["thread_id"]?.stringValue {
+                result["caller_thread_id"] = .string(threadID.lowercased())
+            }
+            if let runID = peerIdentity["run_id"]?.stringValue {
+                result["caller_run_id"] = .string(runID.lowercased())
+            }
+        }
+        if includeCommittedResult, status == .committed {
+            guard let committed = router.commandReceipt(
+                method: method,
+                clientRequestId: clientRequestId
+            ) else {
+                return receiptFailure(
+                    id: req.id,
+                    code: -32092,
+                    reason: "legacyReceiptUnverifiable",
+                    method: method,
+                    clientRequestId: clientRequestId,
+                    retryable: false,
+                    requiresSnapshot: true
+                )
+            }
+            result["result"] = committed
+        }
+        return .init(id: req.id, result: .object(result))
     }
 
     /// HTTP-authoritative mutation identity.
