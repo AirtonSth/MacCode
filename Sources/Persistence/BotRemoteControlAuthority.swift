@@ -1557,6 +1557,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               let url = URL(string: urlString),
               let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
+              let linkHost = url.host, !linkHost.isEmpty,
               url.user == nil,
               let hostID = string(params, "host_id"), !hostID.isEmpty,
               let surfaceID = string(params, "surface_id"), !surfaceID.isEmpty,

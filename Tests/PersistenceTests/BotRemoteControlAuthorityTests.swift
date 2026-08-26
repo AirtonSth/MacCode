@@ -1350,6 +1350,10 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         var stale = try webLinkParams(botID: botID, requestID: "link-stale", url: "https://example.test/stale")
         stale["expected_generation"] = -1
         XCTAssertThrowsError(try authority.dispatch(method: "bot.link.open", params: stale))
+        XCTAssertThrowsError(try authority.dispatch(
+            method: "bot.link.open",
+            params: webLinkParams(botID: botID, requestID: "link-missing-host", url: "https:///path")
+        ))
     }
 
     /// WHY: a transcript file mention is not authority. Only a live opaque
