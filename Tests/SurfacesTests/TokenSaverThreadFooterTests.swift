@@ -1,8 +1,12 @@
 import XCTest
+import Combine
+import CoreModel
 @testable import Surfaces
 @testable import AgentRuntime
+@testable import Persistence
 
 /// Pure-seam coverage for the Token Saver per-thread savings footer under final replies.
+@MainActor
 final class TokenSaverThreadFooterTests: XCTestCase {
     func test_footerText_disabled_returnsNil() {
         // WHY: Token Saver is paid — never teaser a savings claim while off.
@@ -206,6 +210,218 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         XCTAssertGreaterThan(withAuto, without)
     }
 
+    func test_loadMeasured_distinguishesMissingZeroFromFailedRead() async throws {
+        // WHY: a real zero must clear a stale footer, while a failed ledger read
+        // must preserve it. The optional result is the only public signal that
+        // lets callers make that distinction without inventing a test VM.
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let repo = TokenSaverSavingsRepository(db: db)
+        let missing = await TokenSaverThreadFooterReload.loadMeasured(
+            eligible: true,
+            threadId: AgentThreadID(),
+            repo: repo
+        )
+        XCTAssertEqual(missing, 0, "an eligible thread with no ledger row is a genuine zero")
+
+        let unreadableDB = try SQLiteDB(path: ":memory:")
+        let unreadableRepo = TokenSaverSavingsRepository(db: unreadableDB)
+        let failed = await TokenSaverThreadFooterReload.loadMeasured(
+            eligible: true,
+            threadId: AgentThreadID(),
+            repo: unreadableRepo
+        )
+        XCTAssertNil(failed, "a ledger read failure must remain distinct from zero")
+    }
+
+    func test_sharedReloadSnapshot_includesGraphifyObservationInBothSurfaces() {
+        // WHY: Graphify is part of the shared observation contract; dropping its
+        // count would make Agent App and Bot Desk under-report the same thread.
+        let base = TokenSaverThreadFooterReload.Observation(
+            assistantChars: 0,
+            turnCount: 1,
+            cacheReadInputTokens: 0,
+            providerRawTokens: 10_000,
+            providerBilledTokenUnits: 10_000,
+            autoRoutingActive: false,
+            graphifySignalCount: 0
+        )
+        let graphified = TokenSaverThreadFooterReload.Observation(
+            assistantChars: base.assistantChars,
+            turnCount: base.turnCount,
+            cacheReadInputTokens: base.cacheReadInputTokens,
+            providerRawTokens: base.providerRawTokens,
+            providerBilledTokenUnits: base.providerBilledTokenUnits,
+            autoRoutingActive: base.autoRoutingActive,
+            graphifySignalCount: 4
+        )
+        let withoutGraphify = TokenSaverThreadFooterReload.snapshot(
+            measuredDelivered: 1_000,
+            eligible: true,
+            graphifyActive: true,
+            observation: base
+        )
+        let withGraphify = TokenSaverThreadFooterReload.snapshot(
+            measuredDelivered: 1_000,
+            eligible: true,
+            graphifyActive: true,
+            observation: graphified
+        )
+        XCTAssertGreaterThan(
+            withGraphify.displayTokens,
+            withoutGraphify.displayTokens,
+            "shared snapshot must carry Graphify signals into the displayed total"
+        )
+    }
+
+    func test_agentAppFooter_dropsStaleReadAfterThreadSelectionChanges() async throws {
+        // WHY: a slow read for A may finish after the user selects B; it must
+        // never publish A's ledger value into B's footer, while B still gets
+        // its own value once its read completes.
+        let tmp = NSTemporaryDirectory() + "rc2-token-saver-race-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [
+                .codex: FakeProviderRunner(provider: .codex),
+                .claude: FakeProviderRunner(provider: .claude)
+            ]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(),
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        vm.createThread(title: "A")
+        let threadA = try XCTUnwrap(vm.selectedThreadId)
+        vm.createThread(title: "B")
+        let threadB = try XCTUnwrap(vm.selectedThreadId)
+        let reader = BlockingFooterReader(values: [
+            threadA.value.uuidString: 111,
+            threadB.value.uuidString: 222
+        ])
+        let publishedValues = Task { @MainActor in
+            var values: [Int] = []
+            for await value in vm.$tokenSaverThreadMeasuredTokens.values {
+                values.append(value)
+                if value == 222 { return values }
+            }
+            return values
+        }
+        defer { publishedValues.cancel() }
+
+        vm.bindTokenSaverThreadFooter(
+            savingsRepo: TokenSaverSavingsRepository(db: db),
+            isEligible: { true },
+            measuredLoader: { _, threadId, _ in
+                guard let threadId else { return nil }
+                return await reader.read(threadId.value.uuidString)
+            }
+        )
+        vm.selectThread(threadA, markRead: false)
+        await reader.waitUntilStarted(threadA.value.uuidString)
+        vm.selectThread(threadB, markRead: false)
+        await reader.waitUntilStarted(threadB.value.uuidString)
+
+        await reader.release(threadA.value.uuidString)
+        await reader.waitUntilReturned(threadA.value.uuidString)
+        await reader.release(threadB.value.uuidString)
+        let observedValues = await publishedValues.value
+
+        XCTAssertEqual(vm.selectedThreadId, threadB)
+        XCTAssertFalse(observedValues.contains(111),
+                       "A's late read must never publish into selected B")
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 222)
+    }
+
+    func test_agentAppFooter_preservesPositiveSnapshotWhenNextLedgerReadFails() async throws {
+        // WHY: a transient ledger read failure must not erase a savings total
+        // that the Agent App already published for the selected thread.
+        let tmp = NSTemporaryDirectory() + "rc2-token-saver-ledger-failure-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [
+                .codex: FakeProviderRunner(provider: .codex),
+                .claude: FakeProviderRunner(provider: .claude)
+            ]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(),
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        vm.createThread(title: "Ledger failure")
+        let loader = SequencedFooterLoader(results: [321, nil])
+        let positiveSnapshotPublished = expectation(description: "positive footer snapshot published")
+        let positiveSnapshotCancellable = vm.$tokenSaverThreadMeasuredTokens
+            .combineLatest(vm.$tokenSaverThreadSavedTokens)
+            .sink { measured, displayed in
+                if measured == 321 && displayed >= 321 {
+                    positiveSnapshotPublished.fulfill()
+                }
+            }
+        defer { positiveSnapshotCancellable.cancel() }
+
+        vm.bindTokenSaverThreadFooter(
+            savingsRepo: TokenSaverSavingsRepository(db: db),
+            isEligible: { true },
+            graphifySignalCount: { 0 },
+            measuredLoader: { _, _, _ in await loader.read() }
+        )
+        let positiveCall = await loader.waitForCall()
+        XCTAssertEqual(positiveCall.result, 321)
+        await loader.release(positiveCall)
+        await loader.waitUntilReturned(positiveCall)
+        await fulfillment(of: [positiveSnapshotPublished], timeout: 5)
+        let positiveDisplayTokens = vm.tokenSaverThreadSavedTokens
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 321)
+        XCTAssertGreaterThanOrEqual(positiveDisplayTokens, 321)
+        let expectedPositiveFooter =
+            "Token Saver: \(AgentAppView.formatTokenCountForFooter(positiveDisplayTokens)) tokens saved (tool output, shorter answers, multi-turn cache)"
+        XCTAssertEqual(
+            AgentAppView.tokenSaverThreadFooterText(
+                displayTokens: positiveDisplayTokens,
+                measuredTokens: vm.tokenSaverThreadMeasuredTokens,
+                enabled: vm.tokenSaverFooterEnabled
+            ),
+            expectedPositiveFooter
+        )
+
+        vm.reloadTokenSaverThreadSavings()
+        let failedCall = await loader.waitForCall()
+        XCTAssertNil(failedCall.result)
+        await loader.release(failedCall)
+        await loader.waitUntilReturned(failedCall)
+
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 321)
+        XCTAssertEqual(vm.tokenSaverThreadSavedTokens, positiveDisplayTokens)
+        XCTAssertEqual(
+            AgentAppView.tokenSaverThreadFooterText(
+                displayTokens: vm.tokenSaverThreadSavedTokens,
+                measuredTokens: vm.tokenSaverThreadMeasuredTokens,
+                enabled: vm.tokenSaverFooterEnabled
+            ),
+            expectedPositiveFooter
+        )
+    }
+
     func test_formatTokenCount_millions() {
         XCTAssertEqual(AgentAppView.formatTokenCountForFooter(1_500_000), "1.5M")
         XCTAssertEqual(AgentAppView.formatTokenCountForFooter(12_000_000), "12M")
@@ -279,5 +495,136 @@ final class TokenSaverThreadFooterTests: XCTestCase {
                 autoRoutingActive: true
             )
         )
+    }
+}
+
+private actor BlockingFooterReader {
+    private let values: [String: Int]
+    private var started = Set<String>()
+    private var released = Set<String>()
+    private var returned = Set<String>()
+    private var startWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var returnWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var waiters: [String: [CheckedContinuation<Int?, Never>]] = [:]
+
+    init(values: [String: Int]) {
+        self.values = values
+    }
+
+    func read(_ id: String) async -> Int? {
+        started.insert(id)
+        let starts = startWaiters.removeValue(forKey: id) ?? []
+        for continuation in starts {
+            continuation.resume()
+        }
+
+        let value: Int?
+        if released.contains(id) {
+            value = values[id]
+        } else {
+            value = await withCheckedContinuation { continuation in
+                waiters[id, default: []].append(continuation)
+            }
+        }
+
+        returned.insert(id)
+        let returns = returnWaiters.removeValue(forKey: id) ?? []
+        for continuation in returns {
+            continuation.resume()
+        }
+        return value
+    }
+
+    func waitUntilStarted(_ id: String) async {
+        if started.contains(id) { return }
+        await withCheckedContinuation { continuation in
+            startWaiters[id, default: []].append(continuation)
+        }
+    }
+
+    func waitUntilReturned(_ id: String) async {
+        if returned.contains(id) { return }
+        await withCheckedContinuation { continuation in
+            returnWaiters[id, default: []].append(continuation)
+        }
+    }
+
+    func release(_ id: String) {
+        released.insert(id)
+        let continuations = waiters.removeValue(forKey: id) ?? []
+        for continuation in continuations {
+            continuation.resume(returning: values[id])
+        }
+    }
+}
+
+private actor SequencedFooterLoader {
+    struct Call: Sendable {
+        let ordinal: Int
+        let result: Int?
+    }
+
+    private let results: [Int?]
+    private var nextOrdinal = 0
+    private var pendingCalls: [Call] = []
+    private var callWaiters: [CheckedContinuation<Call, Never>] = []
+    private var released = Set<Int>()
+    private var returned = Set<Int>()
+    private var returnWaiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
+    private var resultWaiters: [Int: [CheckedContinuation<Int?, Never>]] = [:]
+
+    init(results: [Int?]) {
+        self.results = results
+    }
+
+    func read() async -> Int? {
+        let call = Call(ordinal: nextOrdinal, result: results[nextOrdinal])
+        nextOrdinal += 1
+        if let continuation = callWaiters.first {
+            callWaiters.removeFirst()
+            continuation.resume(returning: call)
+        } else {
+            pendingCalls.append(call)
+        }
+
+        let result: Int?
+        if released.contains(call.ordinal) {
+            result = call.result
+        } else {
+            result = await withCheckedContinuation { continuation in
+                resultWaiters[call.ordinal, default: []].append(continuation)
+            }
+        }
+
+        returned.insert(call.ordinal)
+        let returns = returnWaiters.removeValue(forKey: call.ordinal) ?? []
+        for continuation in returns {
+            continuation.resume()
+        }
+        return result
+    }
+
+    func waitForCall() async -> Call {
+        if !pendingCalls.isEmpty {
+            return pendingCalls.removeFirst()
+        }
+        return await withCheckedContinuation { continuation in
+            callWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilReturned(_ call: Call) async {
+        if returned.contains(call.ordinal) { return }
+        await withCheckedContinuation { continuation in
+            returnWaiters[call.ordinal, default: []].append(continuation)
+        }
+    }
+
+    func release(_ call: Call) {
+        released.insert(call.ordinal)
+        let continuations = resultWaiters.removeValue(forKey: call.ordinal) ?? []
+        for continuation in continuations {
+            continuation.resume(returning: call.result)
+        }
     }
 }

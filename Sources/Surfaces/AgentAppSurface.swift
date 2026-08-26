@@ -378,6 +378,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private weak var tokenSaverSavingsRepo: TokenSaverSavingsRepository?
     private var tokenSaverFooterEligibleCheck: (@Sendable () -> Bool)?
     private var tokenSaverGraphifyActiveCheck: (@Sendable () -> Bool)?
+    private var tokenSaverGraphifySignalCountCheck: (@Sendable () -> Int)?
+    private var tokenSaverMeasuredLoader: (@Sendable (Bool, AgentThreadID?, TokenSaverSavingsRepository?) async -> Int?)?
     private var tokenSaverFooterObserver: NSObjectProtocol?
     private var tokenSaverFooterAccountObserver: NSObjectProtocol?
     private var tokenSaverFooterStatusObserver: NSObjectProtocol?
@@ -1814,11 +1816,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func bindTokenSaverThreadFooter(
         savingsRepo: TokenSaverSavingsRepository,
         isEligible: @escaping @Sendable () -> Bool,
-        isGraphifyActive: @escaping @Sendable () -> Bool = { false }
+        isGraphifyActive: @escaping @Sendable () -> Bool = { false },
+        graphifySignalCount: @escaping @Sendable () -> Int = { 0 },
+        measuredLoader: @escaping @Sendable (Bool, AgentThreadID?, TokenSaverSavingsRepository?) async -> Int? = {
+            eligible, threadId, repo in
+            await TokenSaverThreadFooterReload.loadMeasured(
+                eligible: eligible,
+                threadId: threadId,
+                repo: repo
+            )
+        }
     ) {
         tokenSaverSavingsRepo = savingsRepo
         tokenSaverFooterEligibleCheck = isEligible
         tokenSaverGraphifyActiveCheck = isGraphifyActive
+        tokenSaverGraphifySignalCountCheck = graphifySignalCount
+        tokenSaverMeasuredLoader = measuredLoader
         if tokenSaverFooterObserver == nil {
             let handler: (Notification) -> Void = { [weak self] _ in
                 self?.reloadTokenSaverThreadSavings()
@@ -1854,6 +1867,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         tokenSaverFooterReloadTask?.cancel()
         let eligibleCheck = tokenSaverFooterEligibleCheck
         let graphifyCheck = tokenSaverGraphifyActiveCheck
+        let graphifySignalCountCheck = tokenSaverGraphifySignalCountCheck
+        let measuredLoader = tokenSaverMeasuredLoader
         let threadId = selectedThreadId
         let repo = tokenSaverSavingsRepo
         // Capture assistant size + turn/usage on MainActor (UI/timeline state).
@@ -1866,47 +1881,53 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let providerRaw = usage.map { max(0, $0.inputTokens) + max(0, $0.outputTokens) } ?? 0
         let providerBilled = usage.map { $0.billedTotalTokenUnits } ?? 0
         let autoRouting = routingMode == .auto
+        let observation = TokenSaverThreadFooterReload.Observation(
+            assistantChars: assistantChars,
+            turnCount: turnCount,
+            cacheReadInputTokens: cacheRead,
+            providerRawTokens: providerRaw,
+            providerBilledTokenUnits: providerBilled > 0 ? providerBilled : nil,
+            autoRoutingActive: autoRouting
+        )
         tokenSaverFooterReloadTask = Task { [weak self] in
             // Eligibility/settings reads off-main so a savings burst does not
             // stack cold SettingsStore performSync on the MainActor.
             let eligible = eligibleCheck?() == true
             let graphifyActive = graphifyCheck?() == true
-            let measured: Int
-            if eligible, let threadId, let repo {
-                let id = threadId.value.uuidString
-                measured = await Task.detached(priority: .utility) {
-                    (try? repo.savedTokens(forThreadID: id)) ?? 0
-                }.value
-            } else {
-                measured = 0
-            }
+            let graphifyCount = graphifySignalCountCheck?() ?? 0
+            let measured = await measuredLoader?(eligible, threadId, repo)
+            guard let measured else { return }
             guard !Task.isCancelled else { return }
-            let display = AgentAppView.tokenSaverThreadFooterDisplayTokens(
+            let next = TokenSaverThreadFooterReload.snapshot(
                 measuredDelivered: measured,
-                assistantChars: assistantChars,
-                tokenSaverEnabled: eligible,
+                eligible: eligible,
                 graphifyActive: graphifyActive,
-                turnCount: turnCount,
-                cacheReadInputTokens: cacheRead,
-                providerRawTokens: providerRaw,
-                providerBilledTokenUnits: providerBilled > 0 ? providerBilled : nil,
-                autoRoutingActive: autoRouting
+                observation: TokenSaverThreadFooterReload.Observation(
+                    assistantChars: observation.assistantChars,
+                    turnCount: observation.turnCount,
+                    cacheReadInputTokens: observation.cacheReadInputTokens,
+                    providerRawTokens: observation.providerRawTokens,
+                    providerBilledTokenUnits: observation.providerBilledTokenUnits,
+                    autoRoutingActive: observation.autoRoutingActive,
+                    graphifySignalCount: graphifyCount
+                )
             )
             await MainActor.run { [weak self] in
                 guard let self, !self.isDisposed, !Task.isCancelled else { return }
+                guard self.selectedThreadId == threadId else { return }
                 // Soft reselect / stream ticks re-enter constantly. Skip identical
                 // footer assigns so @Published chrome does not multipass-repaint.
                 guard Self.shouldPublishTokenSaverFooter(
                     currentEnabled: self.tokenSaverFooterEnabled,
-                    nextEnabled: eligible,
+                    nextEnabled: next.enabled,
                     currentMeasured: self.tokenSaverThreadMeasuredTokens,
-                    nextMeasured: measured,
+                    nextMeasured: next.measuredTokens,
                     currentDisplay: self.tokenSaverThreadSavedTokens,
-                    nextDisplay: display
+                    nextDisplay: next.displayTokens
                 ) else { return }
-                self.tokenSaverFooterEnabled = eligible
-                self.tokenSaverThreadMeasuredTokens = measured
-                self.tokenSaverThreadSavedTokens = display
+                self.tokenSaverFooterEnabled = next.enabled
+                self.tokenSaverThreadMeasuredTokens = next.measuredTokens
+                self.tokenSaverThreadSavedTokens = next.displayTokens
             }
         }
     }

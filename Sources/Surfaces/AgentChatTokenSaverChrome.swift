@@ -347,11 +347,22 @@ public enum TokenSaverThreadFooterReload {
         eligible: Bool,
         threadId: AgentThreadID?,
         repo: TokenSaverSavingsRepository?
-    ) async -> Int {
+    ) async -> Int? {
         guard eligible, let threadId, let repo else { return 0 }
         let id = threadId.value.uuidString
         return await Task.detached(priority: .utility) {
-            (try? repo.savedTokens(forThreadID: id)) ?? 0
+            try? repo.savedTokens(forThreadID: id)
         }.value
+    }
+
+    public static func currentDayGraphifySignalCount(
+        repo: GraphifyUsageRepository,
+        now: Date = Date()
+    ) -> Int {
+        let calendar = Calendar.current
+        let start = calendar.startOfDay(for: now)
+        let fromMs = Int64(start.timeIntervalSince1970 * 1_000)
+        let toMs = Int64(calendar.date(byAdding: .day, value: 1, to: start)!.timeIntervalSince1970 * 1_000)
+        return (try? repo.signalCount(fromMs: fromMs, toMsExclusive: toMs)) ?? 0
     }
 }

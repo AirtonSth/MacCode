@@ -3295,6 +3295,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             },
             isGraphifyActive: {
                 SettingsStore(db: db).load().isGraphifyRuntimeActive
+            },
+            graphifySignalCount: {
+                TokenSaverThreadFooterReload.currentDayGraphifySignalCount(
+                    repo: context.graphifyUsageRepo
+                )
             }
         )
     }
