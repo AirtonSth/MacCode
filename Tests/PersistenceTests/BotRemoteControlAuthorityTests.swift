@@ -1099,6 +1099,115 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(item["host_id"] as? String, hostID)
     }
 
+    /// WHY: Notify Off is a delivery preference, not permission to erase Bot
+    /// attention. Muted work must remain authoritative across relaunch, while
+    /// OS/private-push projection stays empty and a later enabled delivery
+    /// resumes with the exact host/profile/item/Bot/source tuple.
+    func test_notificationsPreferenceSuppressesDeliveryWithoutCorruptingAttentionOrReplay() throws {
+        let profileID = "ios-muted-profile"
+        let hostID = "host-muted"
+        try BotAttentionPushBindingStore(db: db).bind(
+            profileID: profileID,
+            hostID: hostID,
+            deviceID: "ios-muted-device"
+        )
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "muted-create",
+            "name": "Quiet Bot",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let conversation = try authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "muted-conversation",
+            "bot_id": botID,
+            "title": "Quiet work",
+        ])
+        let conversationID = try XCTUnwrap(
+            (conversation["readback"] as? [String: Any])?["conversation_id"] as? String
+        )
+        _ = try authority.dispatch(method: "bot.notify.set", params: [
+            "client_request_id": "muted-off",
+            "bot_id": botID,
+            "enabled": false,
+        ])
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "muted-send",
+            "host_id": hostID,
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "text": "Complete without delivery",
+        ])
+        let mutedStop = try authority.dispatch(method: "bot.force_stop", params: [
+            "client_request_id": "muted-stop",
+            "host_id": hostID,
+            "bot_id": botID,
+        ])
+        XCTAssertNil((mutedStop["readback"] as? [String: Any])?["notification"])
+        XCTAssertTrue(try NotificationRepository(db: db).list().isEmpty)
+
+        let mutedList = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let mutedItem = try XCTUnwrap((mutedList["items"] as? [[String: Any]])?.first)
+        let mutedItemID = try XCTUnwrap(mutedItem["id"] as? String)
+        XCTAssertEqual(mutedItem["profile_id"] as? String, profileID)
+        XCTAssertEqual(mutedItem["host_id"] as? String, hostID)
+        XCTAssertEqual(mutedItem["attention_item_id"] as? String, mutedItemID)
+        XCTAssertEqual(mutedItem["bot_id"] as? String, botID)
+        XCTAssertEqual(mutedItem["source"] as? String, "bot")
+        XCTAssertEqual(mutedItem["state"] as? String, "finished")
+
+        authority = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: settings,
+            appSupportDirectory: supportDir
+        )
+        let restored = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let restoredItem = try XCTUnwrap((restored["items"] as? [[String: Any]])?.first)
+        XCTAssertEqual(restoredItem as NSDictionary, mutedItem as NSDictionary)
+
+        _ = try authority.dispatch(method: "bot.notify.set", params: [
+            "client_request_id": "muted-on",
+            "bot_id": botID,
+            "enabled": true,
+        ])
+        let mutedReplay = try authority.dispatch(method: "bot.force_stop", params: [
+            "client_request_id": "muted-stop",
+            "host_id": hostID,
+            "bot_id": botID,
+        ])
+        XCTAssertEqual(
+            mutedReplay["readback"] as? NSDictionary,
+            mutedStop["readback"] as? NSDictionary
+        )
+        XCTAssertTrue(
+            try NotificationRepository(db: db).list().isEmpty,
+            "re-enabling must not replay an already suppressed terminal effect"
+        )
+
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "resumed-send",
+            "host_id": hostID,
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "text": "Complete with delivery",
+        ])
+        let resumedStop = try authority.dispatch(method: "bot.force_stop", params: [
+            "client_request_id": "resumed-stop",
+            "host_id": hostID,
+            "bot_id": botID,
+        ])
+        let notification = try XCTUnwrap(
+            (resumedStop["readback"] as? [String: Any])?["notification"] as? [String: Any]
+        )
+        let notificationID = try XCTUnwrap(notification["id"] as? String)
+        XCTAssertEqual(notification["profile_id"] as? String, profileID)
+        XCTAssertEqual(notification["host_id"] as? String, hostID)
+        XCTAssertEqual(notification["attention_item_id"] as? String, notificationID)
+        XCTAssertEqual(notification["notification_id"] as? String, notificationID)
+        XCTAssertEqual(notification["bot_id"] as? String, botID)
+        XCTAssertEqual(notification["source"] as? String, "bot")
+        XCTAssertEqual(try NotificationRepository(db: db).list().map(\.id), [notificationID])
+    }
+
     /// WHY: a host can have multiple registered iOS devices. Without an exact
     /// target in the Bot mutation, selecting the latest registration would send
     /// another profile's notification, so ambiguous hosts must remain eventless.

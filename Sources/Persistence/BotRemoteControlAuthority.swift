@@ -1984,6 +1984,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               let profileID = item["profile_id"] as? String,
               let hostID = item["host_id"] as? String,
               let botID = item["bot_id"] as? String,
+              let botUUID = UUID(uuidString: botID),
+              let bot = try store.get(id: BotID(botUUID)),
+              bot.notificationsEnabled,
               let source = item["source"] as? String,
               !notificationID.isEmpty, !attentionItemID.isEmpty,
               !profileID.isEmpty, !hostID.isEmpty, !botID.isEmpty else {
