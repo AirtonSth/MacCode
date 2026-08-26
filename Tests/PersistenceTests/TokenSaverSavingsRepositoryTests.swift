@@ -215,10 +215,10 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
                        "Week/report-window savings must include both calendar-day buckets")
     }
 
-    /// WHY: day-card amort used permanent thread totals, so one long thread's
-    /// lifetime 8M × 50 turns painted Today ~400M and Week ~999M. Inputs must
-    /// only sum savings delivered inside the requested window.
-    func test_threadCacheAmortizationInputs_areDayScopedNotPermanent() throws {
+    /// WHY: the day/week card is eligible only when a thread delivered savings
+    /// inside the window, but its amortization input must remain the permanent
+    /// thread total so the card and completed-thread footer use the same stack.
+    func test_threadCacheAmortizationInputs_usePermanentTotalForActiveThread() throws {
         let db = try makeDB()
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
@@ -232,7 +232,7 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
             year: 2026, month: 8, day: 4, hour: 12
         ).date)
         let thread = "THREAD-AMORT-1"
-        // Lifetime pile-up on the same thread (must NOT enter today's amort base).
+        // Lifetime pile-up remains part of the permanent amortization base.
         _ = try repo.record(
             provider: "codex", mode: "x", inputTokens: 8_000_000, outputTokens: 0,
             attributability: "prompt_bound", delivered: true, threadID: thread, at: yesterday
@@ -254,9 +254,9 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
         XCTAssertEqual(inputs.count, 1)
         let row = try XCTUnwrap(inputs.first)
         XCTAssertEqual(row.threadID, thread)
-        XCTAssertEqual(row.savedTokens, 150_000,
-                       "must sum only today's delivered savings, not permanent 8.15M")
-        XCTAssertEqual(row.runs, 2, "run count is today's compress events only")
+        XCTAssertEqual(row.savedTokens, 8_150_000,
+                       "an active thread uses its permanent delivered total")
+        XCTAssertEqual(row.runs, 3, "an active thread uses its permanent delivered run count")
         XCTAssertEqual(row.provider, "codex")
     }
 
