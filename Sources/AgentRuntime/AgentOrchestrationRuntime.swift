@@ -3227,6 +3227,8 @@ public final class ActivityReceiptsThreadProbe: @unchecked Sendable {
     private var mainThreadCalls = 0
     private var backgroundCalls = 0
 
+    public init() {}
+
     public func recordCurrentThread() {
         let isMain = Thread.isMainThread
         lock.lock()

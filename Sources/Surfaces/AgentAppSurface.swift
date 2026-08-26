@@ -612,7 +612,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private let orchestrationRuntime: AgentOrchestrationRuntime
     private var subagentRefreshGeneration: UInt64 = 0
     private var subagentRefreshTask: Task<Void, Never>?
+    private var titleRepairGeneration: UInt64 = 0
+    private var titleRepairTask: Task<Void, Never>?
+    private var pruneGeneration: UInt64 = 0
+    private var pruneTask: Task<Void, Never>?
     private var publishedSubagentActivityThreadId: AgentThreadID?
+    #if DEBUG
+    let titleRepairStoreIOProbeForTesting = ActivityReceiptsThreadProbe()
+    #endif
     private var promptHistory: [String] = []
     private var promptHistoryCursor: Int?
     private var terminalRunIds = Set<AgentRunID>()
@@ -1091,6 +1098,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         subagentRefreshTask?.cancel()
         subagentRefreshTask = nil
         subagentRefreshGeneration &+= 1
+        titleRepairTask?.cancel()
+        titleRepairTask = nil
+        titleRepairGeneration &+= 1
+        pruneTask?.cancel()
+        pruneTask = nil
+        pruneGeneration &+= 1
         tokenSaverSavingsRepo = nil
         tokenSaverFooterEligibleCheck = nil
         tokenSaverGraphifyActiveCheck = nil
@@ -1388,6 +1401,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func awaitSubagentActivityRefreshForTesting() async {
         await subagentRefreshTask?.value
     }
+
+    public func awaitTitleRepairForTesting() async {
+        await titleRepairTask?.value
+    }
+
+    public func awaitPruneStaleRunProjectionsForTesting() async {
+        await pruneTask?.value
+    }
+
+    func seedRunThreadProjectionForTesting(runId: AgentRunID, threadId: AgentThreadID) {
+        runThreads[runId] = threadId
+    }
+
+    func trackedRunIdForTesting(_ threadId: AgentThreadID) -> AgentRunID? {
+        trackedRunId(for: threadId)
+    }
     #endif
 
     /// Apply a precomputed snapshot on the main actor (poll completion path).
@@ -1471,34 +1500,55 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private func pruneStaleRunThreadProjections() {
         let snapshot = runThreads
         guard !snapshot.isEmpty else { return }
-        var clearedSelected = false
+        var stillMaybeLive: [(AgentRunID, AgentThreadID)] = []
         for (runId, threadId) in snapshot {
             if coordinator.activeRunId(threadId: threadId) == runId {
                 continue
             }
-            if let durable = try? coordinator.durableActiveRun(threadId: threadId),
-               durable.id == runId {
-                continue
-            }
-            if isScheduledThreadRunning?(threadId) == true,
-               let durable = try? coordinator.durableActiveRun(threadId: threadId),
-               durable.id == runId {
-                continue
-            }
-            runThreads[runId] = nil
-            if currentRunId == runId {
-                currentRunId = nil
-                if selectedThreadId == threadId {
-                    clearedSelected = true
+            stillMaybeLive.append((runId, threadId))
+        }
+        guard !stillMaybeLive.isEmpty else { return }
+        let generation = pruneGeneration &+ 1
+        pruneGeneration = generation
+        pruneTask?.cancel()
+        let coordinator = coordinator
+        pruneTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.pruneGeneration == generation else { return }
+            let keep: Set<AgentRunID> = await Task.detached(priority: .utility) {
+                var keep = Set<AgentRunID>()
+                for (runId, threadId) in stillMaybeLive {
+                    if let durable = try? coordinator.durableActiveRun(threadId: threadId),
+                       durable.id == runId {
+                        keep.insert(runId)
+                    }
+                }
+                return keep
+            }.value
+            guard !Task.isCancelled else { return }
+            guard self.pruneGeneration == generation else { return }
+            var clearedSelected = false
+            for (runId, threadId) in stillMaybeLive {
+                guard !keep.contains(runId) else { continue }
+                guard self.runThreads[runId] == threadId else { continue }
+                self.runThreads[runId] = nil
+                if self.currentRunId == runId {
+                    self.currentRunId = nil
+                    if self.selectedThreadId == threadId {
+                        clearedSelected = true
+                    }
                 }
             }
-        }
-        if clearedSelected, let sel = selectedThreadId, !isThreadStartingOrRunning(sel) {
-            runStartedAt = nil
-            if let durableStatus = threads.first(where: { $0.id == sel })?.status {
-                status = durableStatus
+            if clearedSelected, let sel = self.selectedThreadId, !self.isThreadStartingOrRunning(sel) {
+                self.runStartedAt = nil
+                if let durableStatus = self.threads.first(where: { $0.id == sel })?.status {
+                    self.status = durableStatus
+                }
+                self.isStopping = false
             }
-            isStopping = false
+            if self.pruneGeneration == generation {
+                self.pruneTask = nil
+            }
         }
     }
 
@@ -1518,41 +1568,84 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private func repairPlaceholderThreadTitles() {
         let toRepair = Self.indicesNeedingRepair(in: threads, alreadyRepaired: repairedThreadIds)
-        for index in toRepair {
-            // Mark as visited regardless of whether a user message exists — a thread
-            // with no user messages won't get a better title on the next call either.
-            // F13: fetch only the earliest user message (LIMIT 1) instead of loading
-            // the whole thread history + content blobs on the main actor per thread.
-            let firstUserMessage: AgentMessage
-            do {
-                guard let message = try messageRepo.firstUserMessage(threadId: threads[index].id) else {
-                    repairedThreadIds.insert(threads[index].id)
+        guard !toRepair.isEmpty else { return }
+        let generation = titleRepairGeneration &+ 1
+        titleRepairGeneration = generation
+        titleRepairTask?.cancel()
+        let capturedThreads = threads
+        let alreadyRepaired = repairedThreadIds
+        let messageRepo = messageRepo
+        let threadRepo = threadRepo
+        #if DEBUG
+        let probe = titleRepairStoreIOProbeForTesting
+        #endif
+        titleRepairTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.titleRepairGeneration == generation else { return }
+            struct Repair: Sendable {
+                let threadId: AgentThreadID
+                let thread: AgentThread?
+                let errorDescription: String?
+            }
+            let repairs: [Repair] = await Task.detached(priority: .utility) {
+                let indices = AgentAppViewModel.indicesNeedingRepair(
+                    in: capturedThreads,
+                    alreadyRepaired: alreadyRepaired
+                )
+                var out: [Repair] = []
+                out.reserveCapacity(indices.count)
+                for index in indices {
+                    let threadId = capturedThreads[index].id
+                    #if DEBUG
+                    probe.recordCurrentThread()
+                    #endif
+                    let firstUserMessage: AgentMessage
+                    do {
+                        guard let message = try messageRepo.firstUserMessage(threadId: threadId) else {
+                            out.append(Repair(threadId: threadId, thread: nil, errorDescription: nil))
+                            continue
+                        }
+                        firstUserMessage = message
+                    } catch {
+                        out.append(Repair(
+                            threadId: threadId,
+                            thread: nil,
+                            errorDescription: String(describing: error)
+                        ))
+                        continue
+                    }
+                    var thread = capturedThreads[index]
+                    thread.title = AgentThreadTitle.titleFromFirstMessage(firstUserMessage.content)
+                    do {
+                        try threadRepo.upsert(thread)
+                        out.append(Repair(threadId: threadId, thread: thread, errorDescription: nil))
+                    } catch {
+                        out.append(Repair(
+                            threadId: threadId,
+                            thread: nil,
+                            errorDescription: String(describing: error)
+                        ))
+                    }
+                }
+                return out
+            }.value
+            guard !Task.isCancelled else { return }
+            guard self.titleRepairGeneration == generation else { return }
+            for repair in repairs {
+                if let errorDescription = repair.errorDescription {
+                    self.statusMessage = "Could not repair thread title: \(errorDescription)"
                     continue
                 }
-                firstUserMessage = message
-            } catch {
-                statusMessage = "Could not repair thread title: \(error)"
-                continue
+                self.repairedThreadIds.insert(repair.threadId)
+                if let thread = repair.thread,
+                   let index = self.threads.firstIndex(where: { $0.id == thread.id }) {
+                    self.threads[index] = thread
+                    self.onThreadLifecycle?(.updated(thread))
+                }
             }
-            var thread = threads[index]
-            thread.title = AgentThreadTitle.titleFromFirstMessage(firstUserMessage.content)
-            // PERSISTENCE-DATA-002: a cosmetic title repair must NOT bump
-            // updatedAt — doing so reorders the rail (updated_at is the visible
-            // tiebreak) and made repaired threads jump to the top. Preserve the
-            // thread's real activity time so only genuine activity reorders it.
-            do {
-                try threadRepo.upsert(thread)
-            } catch {
-                statusMessage = "Could not repair thread title: \(error)"
-                continue
+            if self.titleRepairGeneration == generation {
+                self.titleRepairTask = nil
             }
-            repairedThreadIds.insert(thread.id)
-            threads[index] = thread
-            // Mirror the repaired title so remote thread lists don't keep
-            // showing the placeholder. Loop-safe: repairedThreadIds plus the
-            // now-non-placeholder title prevent re-entry on the reloadThreads
-            // the host's event subscription triggers.
-            onThreadLifecycle?(.updated(thread))
         }
     }
 
@@ -9884,14 +9977,43 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         }
     }
 
+    /// Live tool rows re-enter `body` (and TimelineView ticks) on the same JSON.
+    /// Parse once per body string; SwiftUI must not JSON-decode on every pass.
+    private final class ToolInputJSONBox {
+        let object: [String: Any]?
+        init(_ object: [String: Any]?) { self.object = object }
+    }
+
+    private static let toolInputCache: NSCache<NSString, ToolInputJSONBox> = {
+        let cache = NSCache<NSString, ToolInputJSONBox>()
+        cache.countLimit = 256
+        cache.totalCostLimit = 128 * 1_024
+        return cache
+    }()
+
+    #if DEBUG
+    nonisolated(unsafe) static var toolInputObjectComputeCountForTesting = 0
+    #endif
+
     static func toolInputObject(for item: AssistantItem) -> [String: Any]? {
         let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty,
-              let data = body.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
+        guard !body.isEmpty else { return nil }
+        let key = body as NSString
+        if let cached = toolInputCache.object(forKey: key) {
+            return cached.object
         }
-        return obj
+        #if DEBUG
+        toolInputObjectComputeCountForTesting &+= 1
+        #endif
+        let parsed: [String: Any]?
+        if let data = body.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            parsed = obj
+        } else {
+            parsed = nil
+        }
+        toolInputCache.setObject(ToolInputJSONBox(parsed), forKey: key, cost: max(1, body.utf8.count))
+        return parsed
     }
 
     static func intMillis(from value: Any?) -> Int? {
@@ -13733,12 +13855,12 @@ public struct AgentAppView: View {
             } else if request.allowsMultipleSelection {
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     HStack(spacing: DS.Space.sm) {
-                        ForEach(request.options, id: \.self) { option in
-                            let selected = vm.userInputSelections[vm.userInputStateKey(request)]?.contains(option) == true
+                        ForEach(request.identifiedOptions) { row in
+                            let selected = vm.userInputSelections[vm.userInputStateKey(request)]?.contains(row.option) == true
                             Button {
-                                vm.toggleUserInputOption(option, for: request)
+                                vm.toggleUserInputOption(row.option, for: request)
                             } label: {
-                                Label(option, systemImage: selected ? "checkmark.square.fill" : "square")
+                                Label(row.option, systemImage: selected ? "checkmark.square.fill" : "square")
                             }
                         }
                     }
@@ -13753,8 +13875,8 @@ public struct AgentAppView: View {
                 }
             } else {
                 HStack(spacing: DS.Space.sm) {
-                    ForEach(request.options, id: \.self) { option in
-                        Button(option) { vm.answerPendingUserInput(request, answer: option) }
+                    ForEach(request.identifiedOptions) { row in
+                        Button(row.option) { vm.answerPendingUserInput(request, answer: row.option) }
                     }
                 }
                 .buttonStyle(.bordered)

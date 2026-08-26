@@ -1633,9 +1633,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         try runRepo.get(id: runId)?.startedAt
     }
 
+    #if DEBUG
+    public let durableActiveRunThreadProbeForTesting = ActivityReceiptsThreadProbe()
+    #endif
+
     /// Durable active run row for a thread, including LaunchAgent-owned sessions
     /// this process does not track in `activeThreads`.
     public func durableActiveRun(threadId: AgentThreadID) throws -> AgentRun? {
+        #if DEBUG
+        durableActiveRunThreadProbeForTesting.recordCurrentThread()
+        #endif
         lock.lock()
         let runId = activeThreads[threadId]
         lock.unlock()

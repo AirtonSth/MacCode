@@ -287,6 +287,18 @@ public struct AssistantUserInputRequest: Codable, Sendable, Equatable, Identifia
         self.resolvedAtMs = resolvedAtMs
     }
 
+    /// Stable legacy option rows. Duplicate labels stay unique without `id: \.self`.
+    public struct IdentifiedOption: Identifiable, Equatable, Sendable {
+        public let id: String
+        public let option: String
+    }
+
+    public var identifiedOptions: [IdentifiedOption] {
+        options.enumerated().map { index, option in
+            IdentifiedOption(id: "\(id)#\(index)#\(option)", option: option)
+        }
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id, turnId, prompt, options, allowsMultipleSelection, isSecret, questions, answer, state, createdAtMs, resolvedAtMs
     }

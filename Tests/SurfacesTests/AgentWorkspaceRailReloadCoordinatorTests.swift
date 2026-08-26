@@ -298,6 +298,130 @@ final class AgentWorkspaceRailReloadCoordinatorTests: XCTestCase {
                        "eventual badge must match the durable dead-child receipt")
     }
 
+    func test_applyRailSnapshot_doesNotReadFirstUserMessageOnMainActor() async throws {
+        // WHY: applyRailSnapshot used to run placeholder title repair (SQLite
+        // LIMIT 1 + upsert) on MainActor. That is the same hang_breach class as
+        // receipt JSON decode — rail apply must stay a UI mutation.
+        let root = NSTemporaryDirectory() + "rc-rail-title-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [:]
+        )
+        let workspaceID = WorkspaceID()
+        let old = Date(timeIntervalSince1970: 1_000_000)
+        var thread = AgentThread(
+            workspaceId: workspaceID,
+            title: AgentThreadTitle.defaultTitle,
+            provider: .codex,
+            model: "gpt-5"
+        )
+        thread.updatedAt = old
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: root,
+            coordinator: runCoordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        defer { vm.dispose() }
+        try threadRepo.upsert(thread)
+        try messageRepo.append(AgentMessage(threadId: thread.id, role: .user, content: "Implement the parser"))
+        vm.titleRepairStoreIOProbeForTesting.reset()
+        vm.applyRailSnapshot(
+            AgentWorkspaceRailReloadCoordinator.RailSnapshot(
+                workspaceID: workspaceID,
+                threads: [thread],
+                prunedThreadIDs: []
+            )
+        )
+        XCTAssertEqual(
+            vm.titleRepairStoreIOProbeForTesting.mainThreadCallCount,
+            0,
+            "rail apply must not read firstUserMessage on the MainActor"
+        )
+        await vm.awaitTitleRepairForTesting()
+        XCTAssertEqual(
+            vm.titleRepairStoreIOProbeForTesting.mainThreadCallCount,
+            0,
+            "the winning title repair must still not read SQLite on the MainActor"
+        )
+        XCTAssertGreaterThan(
+            vm.titleRepairStoreIOProbeForTesting.backgroundCallCount,
+            0,
+            "title repair must actually hit firstUserMessage off-main"
+        )
+        let repaired = try XCTUnwrap(vm.threads.first)
+        XCTAssertFalse(AgentThreadTitle.isPlaceholder(repaired.title))
+        XCTAssertEqual(repaired.updatedAt.timeIntervalSince1970, old.timeIntervalSince1970, accuracy: 0.001)
+    }
+
+    func test_applyRailSnapshot_doesNotCallDurableActiveRunOnMainActor() async throws {
+        // WHY: pruneStaleRunThreadProjections used durableActiveRun (SQLite)
+        // on MainActor during every rail apply.
+        let root = NSTemporaryDirectory() + "rc-rail-prune-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [:]
+        )
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "Live",
+            provider: .codex,
+            model: "gpt-5"
+        )
+        try threadRepo.upsert(thread)
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: root,
+            coordinator: runCoordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        defer { vm.dispose() }
+        let staleRun = AgentRunID()
+        vm.seedRunThreadProjectionForTesting(runId: staleRun, threadId: thread.id)
+        runCoordinator.durableActiveRunThreadProbeForTesting.reset()
+        vm.applyRailSnapshot(
+            AgentWorkspaceRailReloadCoordinator.RailSnapshot(
+                workspaceID: workspaceID,
+                threads: [thread],
+                prunedThreadIDs: []
+            )
+        )
+        XCTAssertEqual(
+            runCoordinator.durableActiveRunThreadProbeForTesting.mainThreadCallCount,
+            0,
+            "rail apply must not query durableActiveRun on the MainActor"
+        )
+        await vm.awaitPruneStaleRunProjectionsForTesting()
+        XCTAssertEqual(
+            runCoordinator.durableActiveRunThreadProbeForTesting.mainThreadCallCount,
+            0,
+            "the winning prune must still not query durableActiveRun on the MainActor"
+        )
+        XCTAssertGreaterThan(
+            runCoordinator.durableActiveRunThreadProbeForTesting.backgroundCallCount,
+            0,
+            "prune must actually consult durableActiveRun off-main"
+        )
+        XCTAssertNil(vm.trackedRunIdForTesting(thread.id))
+    }
+
     func test_subagentRefresh_rejectsStaleThreadResult() async throws {
         // WHY: rapid A→B must not let the slower A's receipt snapshot overwrite B.
         let root = NSTemporaryDirectory() + "rc-rail-ab-\(UUID().uuidString)"

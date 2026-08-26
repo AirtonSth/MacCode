@@ -24,6 +24,18 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
             source.contains("identifiedOptions"),
             "AskUserQuestion options must use a precomputed stable row id"
         )
+        XCTAssertFalse(
+            source.contains("ForEach(request.options, id: \\.self)"),
+            "legacy user-input options must not use id:\\.self (duplicate labels collide)"
+        )
+        let markdown = try String(
+            contentsOf: root.appendingPathComponent("Sources/Surfaces/AgentMessageMarkdown.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            markdown.contains("Unary ForEach child"),
+            "markdown groups must wrap the isolated/prose branch so ForEach stays unary"
+        )
         XCTAssertTrue(
             AgentImageViewPresentation(
                 displayName: "shot.png",

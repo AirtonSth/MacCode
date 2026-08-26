@@ -600,16 +600,21 @@ public struct AgentMessageMarkdownView: View {
             // stable positional identity for the code-copy state below.
             ForEach(groups.indices, id: \.self) { index in
                 let group = groups[index]
-                if group.count == 1, let block = group.first, isIsolatedBlock(block) {
-                    blockView(block, index: index)
-                } else {
-                    AgentLinkedAttributedText(
-                        attributed: AgentMessageMarkdown.selectableProse(from: group, compact: compact, cache: cacheResults),
-                        font: .systemFont(ofSize: 13),
-                        textColor: DS.NS.text,
-                        lineFragmentPadding: 0,
-                        lineSpacing: compact ? 3 : 5
-                    )
+                // Unary ForEach child (AvdLee list-patterns). Positional ids stay
+                // because hover/copy is index-keyed; content-hash ids remount the
+                // live streaming group on every token.
+                Group {
+                    if group.count == 1, let block = group.first, isIsolatedBlock(block) {
+                        blockView(block, index: index)
+                    } else {
+                        AgentLinkedAttributedText(
+                            attributed: AgentMessageMarkdown.selectableProse(from: group, compact: compact, cache: cacheResults),
+                            font: .systemFont(ofSize: 13),
+                            textColor: DS.NS.text,
+                            lineFragmentPadding: 0,
+                            lineSpacing: compact ? 3 : 5
+                        )
+                    }
                 }
             }
         }
