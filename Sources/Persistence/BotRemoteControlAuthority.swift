@@ -121,6 +121,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 current["security"] = Self.guestSecurity
                 guest[botID] = current
                 existing["readback"] = current
+            } else if readback["force"] is Bool,
+                      var current = existing["readback"] as? [String: Any] {
+                for (key, value) in readback { current[key] = value }
+                existing["readback"] = current
             } else {
                 existing["readback"] = readback
             }

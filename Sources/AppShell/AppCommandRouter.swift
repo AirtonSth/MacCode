@@ -2905,6 +2905,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private var pairedBotRemote: BotRemoteControlAuthority?
+    private var pairedBotSettlementWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
     private lazy var botRuntimeEvidenceProjector = BotRuntimeEvidenceProjector { [weak self] terminal in
         _ = self?.pairedBotRemote?.settleRuntime(
             botID: terminal.botID,
@@ -2918,6 +2919,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let foundation = Self.foundationObject(params)
         do {
             var result = try authority.dispatch(method: method, params: foundation)
+            if method == "bot.stop" || method == "bot.force_stop",
+               result["status"] as? String == BotRemoteControlAuthority.Status.accepted.rawValue,
+               let requestID = foundation["client_request_id"] as? String {
+                await waitForPairedBotSettlement(requestID: requestID)
+                result = try authority.dispatch(
+                    method: "bot.receipt.status",
+                    params: ["client_request_id": requestID]
+                )
+            }
             botsViewModel?.reloadQueuedFollowUpsFromStore()
             if method == "bot.get" || method == "bot.send" {
                 result = enrichPairedBotAssistant(params: foundation, result: result)
@@ -2974,7 +2984,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             self?.botsViewModel?.hasLiveRun(botID: id) ?? false
         }
         created.onStopRun = { [weak self] id, force, requestID in
-            self?.botsViewModel?.stopLiveRuns(for: id, force: force) { ok in
+            guard let self else { return }
+            guard let botsViewModel = self.botsViewModel else {
+                self.settlePairedBot(
+                    requestID: requestID,
+                    ok: false,
+                    readback: ["accepted": true, "force": force, "terminal": false]
+                )
+                return
+            }
+            botsViewModel.stopLiveRuns(for: id, force: force) { [weak self] ok in
                 self?.settlePairedBot(
                     requestID: requestID,
                     ok: ok,
@@ -3092,11 +3111,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// and `NSLock` is not recursive.
     private func settlePairedBot(requestID: String, ok: Bool, readback: [String: Any]) {
         DispatchQueue.main.async { [weak self] in
-            self?.pairedBotRemote?.settle(
+            guard let self else { return }
+            self.pairedBotRemote?.settle(
                 requestID: requestID,
                 status: ok ? .completed : .failed,
                 readback: readback
             )
+            let waiters = self.pairedBotSettlementWaiters.removeValue(forKey: requestID) ?? []
+            waiters.forEach { $0.resume() }
+        }
+    }
+
+    private func waitForPairedBotSettlement(requestID: String) async {
+        await withCheckedContinuation { continuation in
+            pairedBotSettlementWaiters[requestID, default: []].append(continuation)
         }
     }
 

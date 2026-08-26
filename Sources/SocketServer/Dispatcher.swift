@@ -802,6 +802,8 @@ public final class JSONRPCDispatcher {
         "bot.set_hidden",
         "bot.duplicate",
         "bot.send",
+        "bot.stop",
+        "bot.force_stop",
         "bot.settings.set",
         "bot.queue.remove",
         "bot.conversation.create",
@@ -1175,6 +1177,38 @@ public final class JSONRPCDispatcher {
             }
             return ("bot.run.started", .object(payload))
         }
+        func canonicalBotStop(
+            receipt: [String: JSONValue],
+            readback: [String: JSONValue],
+            force: Bool
+        ) -> [String: JSONValue]? {
+            guard readback["accepted"]?.boolValue == true,
+                  readback["force"]?.boolValue == force,
+                  readback["terminal"]?.boolValue == true,
+                  let hostID = params["host_id"]?.stringValue,
+                  let botID = receipt["bot_id"]?.stringValue,
+                  let requestID = receipt["request_id"]?.stringValue,
+                  let run = readback["run"]?.objectValue,
+                  run["host_id"]?.stringValue == hostID,
+                  run["bot_id"]?.stringValue == botID,
+                  let runRequestID = run["request_id"]?.stringValue,
+                  run["client_request_id"]?.stringValue == runRequestID,
+                  let runID = run["run_id"]?.stringValue,
+                  let conversationID = run["conversation_id"],
+                  !hostID.isEmpty, !botID.isEmpty, !requestID.isEmpty,
+                  !runRequestID.isEmpty, !runID.isEmpty else { return nil }
+            return [
+                "host_id": .string(hostID),
+                "bot_id": .string(botID),
+                "conversation_id": conversationID,
+                "request_id": .string(runRequestID),
+                "client_request_id": .string(runRequestID),
+                "stop_request_id": .string(requestID),
+                "run_id": .string(runID),
+                "terminal": .bool(true),
+                "force": .bool(force),
+            ]
+        }
         func project(_ value: JSONValue?, keys: [String]) -> JSONValue? {
             guard let object = value?.objectValue else { return nil }
             return .object(Dictionary(uniqueKeysWithValues: keys.compactMap { key in
@@ -1204,6 +1238,7 @@ public final class JSONRPCDispatcher {
         var payload: [String: JSONValue] = [:]
         var botNotifications: [JSONValue] = []
         var botLifecycleEvents: [(kind: String, payload: JSONValue)] = []
+        var botTerminalPayload: [String: JSONValue]?
         let kind: String
         switch method {
         case "agent.message.send":
@@ -1296,6 +1331,17 @@ public final class JSONRPCDispatcher {
             case "bot.discard_new", "bot.delete": kind = "bot.deleted"
             case "bot.settings.set": kind = "bot.settings.updated"
             case "bot.send": kind = "bot.message.accepted"
+            case "bot.stop", "bot.force_stop":
+                guard let readback = object["readback"]?.objectValue,
+                      let terminal = canonicalBotStop(
+                        receipt: object,
+                        readback: readback,
+                        force: method == "bot.force_stop"
+                      ) else {
+                    return
+                }
+                kind = "bot.run.stop_requested"
+                botTerminalPayload = terminal
             case "bot.queue.remove": kind = "bot.queue.updated"
             case "bot.conversation.select": kind = "bot.conversation.selected"
             case "bot.conversation.create", "bot.conversation.clear_all":
@@ -1389,6 +1435,9 @@ public final class JSONRPCDispatcher {
                         "pixel_height": frame["pixel_height"] ?? .null,
                         "png_hash": frame["png_hash"] ?? .null,
                     ])
+                }
+                if let botTerminalPayload {
+                    for (key, value) in botTerminalPayload { payload[key] = value }
                 }
             }
         default:

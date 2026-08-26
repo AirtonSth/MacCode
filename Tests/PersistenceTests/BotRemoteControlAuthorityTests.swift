@@ -1681,6 +1681,13 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "client_request_id": "stop-set-1",
         ])
         XCTAssertEqual(status["status"] as? String, "completed")
+        let readback = try XCTUnwrap(status["readback"] as? [String: Any])
+        let run = try XCTUnwrap(readback["run"] as? [String: Any])
+        XCTAssertEqual(run["request_id"] as? String, "stop-set-run",
+                       "async settlement must retain the original run identity")
+        XCTAssertEqual(run["client_request_id"] as? String, "stop-set-run")
+        XCTAssertEqual(readback["force"] as? Bool, true)
+        XCTAssertEqual(readback["terminal"] as? Bool, true)
     }
 
     func test_conversationList_exposesLinkedAgentThreadID_soRemoteClientsCanReadTranscripts() throws {

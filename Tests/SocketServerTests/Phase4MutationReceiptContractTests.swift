@@ -2894,6 +2894,128 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         }
     }
 
+    /// WHY: a completed stop receipt without a durable event range can
+    /// leave iOS showing a live Stop control after the exact host run ended.
+    /// Only a terminal receipt carrying the matching host/Bot/run tuple may
+    /// publish, and replay must never stop or emit twice.
+    func test_botStopVariantsFinalizeOneExactRunEventWithoutFabricationOrReplay() async throws {
+        let botID = UUID().uuidString.lowercased()
+        let conversationID = UUID().uuidString.lowercased()
+        let runID = UUID().uuidString.lowercased()
+        let runRequestID = "original-send"
+        func stopReceipt(requestID: String, force: Bool) -> JSONValue {
+            .object([
+                "status": .string("completed"),
+                "request_id": .string(requestID),
+                "receipt_id": .string("\(requestID)-receipt"),
+                "bot_id": .string(botID),
+                "readback": .object([
+                    "accepted": .bool(true),
+                    "force": .bool(force),
+                    "terminal": .bool(true),
+                    "run": .object([
+                        "host_id": .string(Phase4LiveServer.hostId),
+                        "bot_id": .string(botID),
+                        "conversation_id": .string(conversationID),
+                        "request_id": .string(runRequestID),
+                        "client_request_id": .string(runRequestID),
+                        "run_id": .string(runID),
+                    ]),
+                ]),
+            ])
+        }
+        for (index, method) in ["bot.stop", "bot.force_stop"].enumerated() {
+            let force = method == "bot.force_stop"
+            let requestID = "bot-stop-\(index)"
+            let router = Phase4ReceiptFakeRouter()
+            router.pairedBotRemoteResult = stopReceipt(requestID: requestID, force: force)
+            let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_535 + UInt64(index))
+            var params = live.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "unused")
+            params.removeValue(forKey: "thread_id")
+            params.removeValue(forKey: "text")
+            params["bot_id"] = botID
+
+            let first = try await live.rpc(method: method, params: params)
+            let replay = try await live.rpc(method: method, params: params)
+
+            XCTAssertEqual(first["result"] as? NSDictionary, replay["result"] as? NSDictionary, method)
+            XCTAssertEqual(router.pairedBotRemoteCallCount, 1, method)
+            XCTAssertEqual(router.finalizationCallCount, 1, method)
+            let events = try XCTUnwrap(router.finalizedEvents["\(method):\(requestID)"], method)
+            XCTAssertEqual(events.count, 1, method)
+            let event = try XCTUnwrap(events.first)
+            XCTAssertEqual(event.kind, "bot.run.stop_requested", method)
+            let payload = try XCTUnwrap(event.payload.objectValue)
+            XCTAssertEqual(payload["host_id"]?.stringValue, Phase4LiveServer.hostId, method)
+            XCTAssertEqual(payload["bot_id"]?.stringValue, botID, method)
+            XCTAssertEqual(payload["conversation_id"]?.stringValue, conversationID, method)
+            XCTAssertEqual(payload["run_id"]?.stringValue, runID, method)
+            XCTAssertEqual(payload["request_id"]?.stringValue, runRequestID, method)
+            XCTAssertEqual(payload["client_request_id"]?.stringValue, runRequestID, method)
+            XCTAssertEqual(payload["stop_request_id"]?.stringValue, requestID, method)
+            XCTAssertEqual(payload["terminal"]?.boolValue, true, method)
+            XCTAssertEqual(payload["force"]?.boolValue, force, method)
+            live.stop()
+        }
+
+        let unmatchedRouter = Phase4ReceiptFakeRouter()
+        unmatchedRouter.pairedBotRemoteResult = .object([
+            "status": .string("completed"),
+            "request_id": .string("bot-force-stop-missing-run"),
+            "receipt_id": .string("force-stop-missing-run-receipt"),
+            "bot_id": .string(botID),
+            "readback": .object([
+                "accepted": .bool(true),
+                "force": .bool(true),
+                "terminal": .bool(true),
+                "run": .object([
+                    "host_id": .string(Phase4LiveServer.hostId),
+                    "bot_id": .string(botID),
+                    "conversation_id": .string(conversationID),
+                    "request_id": .string(runRequestID),
+                    "client_request_id": .string("other-send"),
+                    "run_id": .string(runID),
+                ]),
+            ]),
+        ])
+        let unmatchedLive = try await Phase4LiveServer.start(router: unmatchedRouter, bootEpoch: 1_536)
+        var unmatchedParams = unmatchedLive.mutationParams(
+            requestId: "bot-force-stop-missing-run",
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        unmatchedParams.removeValue(forKey: "thread_id")
+        unmatchedParams.removeValue(forKey: "text")
+        unmatchedParams["bot_id"] = botID
+
+        _ = try await unmatchedLive.rpc(method: "bot.force_stop", params: unmatchedParams)
+
+        XCTAssertEqual(unmatchedRouter.pairedBotRemoteCallCount, 1)
+        XCTAssertEqual(unmatchedRouter.finalizationCallCount, 1)
+        XCTAssertEqual(unmatchedRouter.finalizedEventKinds["bot.force_stop:bot-force-stop-missing-run"], [])
+        unmatchedLive.stop()
+
+        let lostRouter = Phase4ReceiptFakeRouter()
+        lostRouter.finalizationPersistenceUnavailable = true
+        let requestID = "bot-force-stop"
+        lostRouter.pairedBotRemoteResult = stopReceipt(requestID: requestID, force: true)
+        let lostLive = try await Phase4LiveServer.start(router: lostRouter, bootEpoch: 1_537)
+        defer { lostLive.stop() }
+        var lostParams = lostLive.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "unused")
+        lostParams.removeValue(forKey: "thread_id")
+        lostParams.removeValue(forKey: "text")
+        lostParams["bot_id"] = botID
+
+        let lost = try await lostLive.rpc(method: "bot.force_stop", params: lostParams)
+        let lostReplay = try await lostLive.rpc(method: "bot.force_stop", params: lostParams)
+
+        XCTAssertEqual(errorCode(lost), commandOutcomeUnknown)
+        XCTAssertEqual(errorCode(lostReplay), commandOutcomeUnknown)
+        XCTAssertEqual(lostRouter.pairedBotRemoteCallCount, 1)
+        XCTAssertEqual(lostRouter.finalizationCallCount, 0)
+        XCTAssertNil(lostRouter.finalizedEvents["bot.force_stop:\(requestID)"])
+    }
+
     /// WHY: a Bot send is not usable on iOS without one exact receipt plus a
     /// lifecycle event that survives response replay without a second effect.
     func test_botSendPublishesExactStartedOrQueuedLifecycleOnce() async throws {

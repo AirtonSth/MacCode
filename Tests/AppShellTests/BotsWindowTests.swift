@@ -5565,6 +5565,39 @@ final class BotsWindowTests: XCTestCase {
         vm.beforeBotRunDispatchForTesting = nil
     }
 
+    func test_pairedStopVariantsReturnOnlyAfterAsyncReceiptSettlement() async throws {
+        // WHY: Phase4 finalizes the value returned by this router. Returning
+        // the initial accepted receipt would permanently omit the terminal
+        // event range even though bot.receipt.status is promoted moments later.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        for (index, method) in ["bot.stop", "bot.force_stop"].enumerated() {
+            let bot = try vm.create(name: "Piper \(index)", title: "Scout", provider: .claude)
+            let requestID = "paired-stop-settlement-\(index)"
+            let stopped = try await router.dispatchPairedBotRemote(method: method, params: [
+                "client_request_id": .string(requestID),
+                "host_id": .string("paired-test-host"),
+                "bot_id": .string(bot.id.value.uuidString.lowercased()),
+            ])
+            let receipt = try XCTUnwrap(stopped.objectValue)
+            XCTAssertEqual(receipt["status"]?.stringValue, "completed", method)
+            XCTAssertEqual(receipt["request_id"]?.stringValue, requestID, method)
+            XCTAssertEqual(
+                receipt["readback"]?.objectValue?["force"]?.boolValue,
+                method == "bot.force_stop",
+                method
+            )
+
+            let status = try await router.dispatchPairedBotRemote(method: "bot.receipt.status", params: [
+                "client_request_id": .string(requestID),
+            ])
+            XCTAssertEqual(status.objectValue?["status"]?.stringValue, "completed", method)
+        }
+    }
+
     func test_stopDuringPreflightDoesNotStartProvider() async throws {
         // WHY: bot.stop in the sendAgentMessage preflight window must cancel
         // before startRun, not complete and then let the send continue.
