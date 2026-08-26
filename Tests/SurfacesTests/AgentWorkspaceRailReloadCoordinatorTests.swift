@@ -422,6 +422,196 @@ final class AgentWorkspaceRailReloadCoordinatorTests: XCTestCase {
         XCTAssertNil(vm.trackedRunIdForTesting(thread.id))
     }
 
+    func test_titleRepair_doesNotClobberPersistThreadConfigFields() async throws {
+        // WHY: off-main repair used to upsert the captured AgentThread snapshot
+        // (status/unread/routing/updatedAt) before the generation check. A
+        // persistThreadConfig that landed during firstUserMessage was clobbered.
+        let root = NSTemporaryDirectory() + "rc-rail-title-race-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [:]
+        )
+        let workspaceID = WorkspaceID()
+        let old = Date(timeIntervalSince1970: 1_000_000)
+        var thread = AgentThread(
+            workspaceId: workspaceID,
+            title: AgentThreadTitle.defaultTitle,
+            provider: .codex,
+            model: "gpt-5"
+        )
+        thread.updatedAt = old
+        thread.hasUnread = true
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: root,
+            coordinator: runCoordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        defer { vm.dispose() }
+        try threadRepo.upsert(thread)
+        try messageRepo.append(AgentMessage(threadId: thread.id, role: .user, content: "Implement the parser"))
+        let gate = AsyncResumeGate()
+        vm.titleRepairBeforeFetchForTesting = { await gate.wait() }
+        vm.applyRailSnapshot(
+            AgentWorkspaceRailReloadCoordinator.RailSnapshot(
+                workspaceID: workspaceID,
+                threads: [thread],
+                prunedThreadIDs: []
+            )
+        )
+        vm.selectThread(thread.id, markRead: false)
+        vm.model = "o4-mini"
+        vm.permissionMode = .fullAccess
+        XCTAssertTrue(vm.persistThreadConfig())
+        let afterConfig = try XCTUnwrap(try threadRepo.get(id: thread.id))
+        XCTAssertEqual(afterConfig.model, "o4-mini")
+        XCTAssertEqual(afterConfig.permissionMode, .fullAccess)
+        XCTAssertNotEqual(
+            afterConfig.updatedAt.timeIntervalSince1970,
+            old.timeIntervalSince1970,
+            accuracy: 0.001
+        )
+        gate.open()
+        await vm.awaitTitleRepairForTesting()
+        let ui = try XCTUnwrap(vm.threads.first)
+        XCTAssertFalse(AgentThreadTitle.isPlaceholder(ui.title))
+        XCTAssertEqual(ui.model, afterConfig.model)
+        XCTAssertEqual(ui.permissionMode, afterConfig.permissionMode)
+        XCTAssertEqual(ui.hasUnread, afterConfig.hasUnread)
+        XCTAssertEqual(ui.status, afterConfig.status)
+        XCTAssertEqual(
+            ui.updatedAt.timeIntervalSince1970,
+            afterConfig.updatedAt.timeIntervalSince1970,
+            accuracy: 1,
+            "SQLite stores updated_at at second precision; repair must not revert persistThreadConfig's clock"
+        )
+        let durable = try XCTUnwrap(try threadRepo.get(id: thread.id))
+        XCTAssertEqual(durable.title, ui.title)
+        XCTAssertEqual(durable.model, afterConfig.model)
+        XCTAssertEqual(durable.permissionMode, afterConfig.permissionMode)
+        XCTAssertEqual(durable.hasUnread, afterConfig.hasUnread)
+        XCTAssertEqual(durable.status, afterConfig.status)
+        XCTAssertEqual(durable.updatedAt.timeIntervalSince1970, afterConfig.updatedAt.timeIntervalSince1970, accuracy: 0.001)
+    }
+
+    func test_prune_keepsRunStartedDuringDurableLookup() async throws {
+        // WHY: prune scheduled against a stale projection must not clear
+        // runThreads if startRun bound that runId before durableActiveRun returned.
+        let root = NSTemporaryDirectory() + "rc-rail-prune-race-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [:]
+        )
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "Live",
+            provider: .codex,
+            model: "gpt-5"
+        )
+        try threadRepo.upsert(thread)
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: root,
+            coordinator: runCoordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        defer { vm.dispose() }
+        let liveRun = AgentRunID()
+        vm.seedRunThreadProjectionForTesting(runId: liveRun, threadId: thread.id)
+        let gate = AsyncResumeGate()
+        vm.pruneBeforeDurableLookupForTesting = { await gate.wait() }
+        vm.applyRailSnapshot(
+            AgentWorkspaceRailReloadCoordinator.RailSnapshot(
+                workspaceID: workspaceID,
+                threads: [thread],
+                prunedThreadIDs: []
+            )
+        )
+        runCoordinator.bindActiveThreadForTesting(threadId: thread.id, runId: liveRun)
+        gate.open()
+        await vm.awaitPruneStaleRunProjectionsForTesting()
+        XCTAssertEqual(vm.trackedRunIdForTesting(thread.id), liveRun)
+        XCTAssertEqual(runCoordinator.activeRunId(threadId: thread.id), liveRun)
+    }
+
+    func test_prune_emptyStillMaybeLiveCancelsInFlightClear() async throws {
+        // WHY: an apply whose projections all match in-memory activeRunId used
+        // to return without bumping pruneGeneration, so an older prune still
+        // applied and wiped the live spinner.
+        let root = NSTemporaryDirectory() + "rc-rail-prune-cancel-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [:]
+        )
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "Live",
+            provider: .codex,
+            model: "gpt-5"
+        )
+        try threadRepo.upsert(thread)
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: root,
+            coordinator: runCoordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        defer { vm.dispose() }
+        let staleRun = AgentRunID()
+        vm.seedRunThreadProjectionForTesting(runId: staleRun, threadId: thread.id)
+        let gate = AsyncResumeGate()
+        vm.pruneBeforeDurableLookupForTesting = { await gate.wait() }
+        vm.applyRailSnapshot(
+            AgentWorkspaceRailReloadCoordinator.RailSnapshot(
+                workspaceID: workspaceID,
+                threads: [thread],
+                prunedThreadIDs: []
+            )
+        )
+        let liveRun = AgentRunID()
+        vm.clearRunThreadProjectionsForTesting()
+        vm.seedRunThreadProjectionForTesting(runId: liveRun, threadId: thread.id)
+        runCoordinator.bindActiveThreadForTesting(threadId: thread.id, runId: liveRun)
+        vm.pruneBeforeDurableLookupForTesting = nil
+        vm.applyRailSnapshot(
+            AgentWorkspaceRailReloadCoordinator.RailSnapshot(
+                workspaceID: workspaceID,
+                threads: [thread],
+                prunedThreadIDs: []
+            )
+        )
+        gate.open()
+        await vm.awaitPruneStaleRunProjectionsForTesting()
+        XCTAssertEqual(vm.trackedRunIdForTesting(thread.id), liveRun)
+        XCTAssertEqual(runCoordinator.activeRunId(threadId: thread.id), liveRun)
+    }
+
     func test_subagentRefresh_rejectsStaleThreadResult() async throws {
         // WHY: rapid A→B must not let the slower A's receipt snapshot overwrite B.
         let root = NSTemporaryDirectory() + "rc-rail-ab-\(UUID().uuidString)"
@@ -520,6 +710,34 @@ private final class PollFixture {
     let clock = ManualPollClock()
     var hasMembers = true
     var roundCount = 0
+}
+
+private final class AsyncResumeGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var opened = false
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if opened {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
+
+    func open() {
+        lock.lock()
+        opened = true
+        let pending = waiters
+        waiters.removeAll()
+        lock.unlock()
+        pending.forEach { $0.resume() }
+    }
 }
 
 @MainActor

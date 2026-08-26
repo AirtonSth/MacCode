@@ -1661,6 +1661,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return activeThreads[threadId]
     }
 
+    #if DEBUG
+    /// Test-only: the in-memory bind `startRun` writes before the provider
+    /// process is up. Lets a rail-prune race inject a live mapping without
+    /// waiting on FakeProviderRunner finish.
+    public func bindActiveThreadForTesting(threadId: AgentThreadID, runId: AgentRunID) {
+        lock.lock()
+        activeThreads[threadId] = runId
+        lock.unlock()
+    }
+    #endif
+
     /// Records the semantic mode selected by the primary AI's Bot tool call.
     /// This is run-scoped presentation deduplication, not prompt parsing.
     public func suppressPrimaryAssistantReply(runId: AgentRunID) {

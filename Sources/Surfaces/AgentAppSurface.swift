@@ -1417,6 +1417,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     func trackedRunIdForTesting(_ threadId: AgentThreadID) -> AgentRunID? {
         trackedRunId(for: threadId)
     }
+
+    /// Resume-gated hook so tests can mutate the thread after apply schedules
+    /// repair but before firstUserMessage / persist.
+    var titleRepairBeforeFetchForTesting: (@Sendable () async -> Void)?
+
+    /// Resume-gated hook so tests can start a live run after prune is scheduled
+    /// but before durableActiveRun returns.
+    var pruneBeforeDurableLookupForTesting: (@Sendable () async -> Void)?
+
+    func clearRunThreadProjectionsForTesting() {
+        runThreads.removeAll()
+    }
     #endif
 
     /// Apply a precomputed snapshot on the main actor (poll completion path).
@@ -1498,8 +1510,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// can survive a missed workspace-filtered didFinish and leave "Threads · N
     /// active" after the work is done.
     private func pruneStaleRunThreadProjections() {
+        let generation = pruneGeneration &+ 1
+        pruneGeneration = generation
+        pruneTask?.cancel()
+        pruneTask = nil
         let snapshot = runThreads
-        guard !snapshot.isEmpty else { return }
         var stillMaybeLive: [(AgentRunID, AgentThreadID)] = []
         for (runId, threadId) in snapshot {
             if coordinator.activeRunId(threadId: threadId) == runId {
@@ -1508,12 +1523,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             stillMaybeLive.append((runId, threadId))
         }
         guard !stillMaybeLive.isEmpty else { return }
-        let generation = pruneGeneration &+ 1
-        pruneGeneration = generation
-        pruneTask?.cancel()
         let coordinator = coordinator
+        #if DEBUG
+        let hold = pruneBeforeDurableLookupForTesting
+        #endif
         pruneTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            guard self.pruneGeneration == generation else { return }
+            #if DEBUG
+            await hold?()
+            #endif
             guard self.pruneGeneration == generation else { return }
             let keep: Set<AgentRunID> = await Task.detached(priority: .utility) {
                 var keep = Set<AgentRunID>()
@@ -1531,6 +1550,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             for (runId, threadId) in stillMaybeLive {
                 guard !keep.contains(runId) else { continue }
                 guard self.runThreads[runId] == threadId else { continue }
+                if self.coordinator.activeRunId(threadId: threadId) == runId {
+                    continue
+                }
                 self.runThreads[runId] = nil
                 if self.currentRunId == runId {
                     self.currentRunId = nil
@@ -1572,57 +1594,46 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let generation = titleRepairGeneration &+ 1
         titleRepairGeneration = generation
         titleRepairTask?.cancel()
-        let capturedThreads = threads
-        let alreadyRepaired = repairedThreadIds
+        let threadIds = toRepair.map { threads[$0].id }
         let messageRepo = messageRepo
         let threadRepo = threadRepo
         #if DEBUG
         let probe = titleRepairStoreIOProbeForTesting
+        let hold = titleRepairBeforeFetchForTesting
         #endif
         titleRepairTask = Task { @MainActor [weak self] in
             guard let self else { return }
             guard self.titleRepairGeneration == generation else { return }
-            struct Repair: Sendable {
+            #if DEBUG
+            await hold?()
+            #endif
+            guard self.titleRepairGeneration == generation else { return }
+            struct Fetch: Sendable {
                 let threadId: AgentThreadID
-                let thread: AgentThread?
+                let title: String?
                 let errorDescription: String?
             }
-            let repairs: [Repair] = await Task.detached(priority: .utility) {
-                let indices = AgentAppViewModel.indicesNeedingRepair(
-                    in: capturedThreads,
-                    alreadyRepaired: alreadyRepaired
-                )
-                var out: [Repair] = []
-                out.reserveCapacity(indices.count)
-                for index in indices {
-                    let threadId = capturedThreads[index].id
+            let fetched: [Fetch] = await Task.detached(priority: .utility) {
+                var out: [Fetch] = []
+                out.reserveCapacity(threadIds.count)
+                for threadId in threadIds {
                     #if DEBUG
                     probe.recordCurrentThread()
                     #endif
-                    let firstUserMessage: AgentMessage
                     do {
                         guard let message = try messageRepo.firstUserMessage(threadId: threadId) else {
-                            out.append(Repair(threadId: threadId, thread: nil, errorDescription: nil))
+                            out.append(Fetch(threadId: threadId, title: nil, errorDescription: nil))
                             continue
                         }
-                        firstUserMessage = message
-                    } catch {
-                        out.append(Repair(
+                        out.append(Fetch(
                             threadId: threadId,
-                            thread: nil,
-                            errorDescription: String(describing: error)
+                            title: AgentThreadTitle.titleFromFirstMessage(message.content),
+                            errorDescription: nil
                         ))
-                        continue
-                    }
-                    var thread = capturedThreads[index]
-                    thread.title = AgentThreadTitle.titleFromFirstMessage(firstUserMessage.content)
-                    do {
-                        try threadRepo.upsert(thread)
-                        out.append(Repair(threadId: threadId, thread: thread, errorDescription: nil))
                     } catch {
-                        out.append(Repair(
+                        out.append(Fetch(
                             threadId: threadId,
-                            thread: nil,
+                            title: nil,
                             errorDescription: String(describing: error)
                         ))
                     }
@@ -1631,17 +1642,28 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }.value
             guard !Task.isCancelled else { return }
             guard self.titleRepairGeneration == generation else { return }
-            for repair in repairs {
-                if let errorDescription = repair.errorDescription {
+            var titlesToPersist: [(AgentThreadID, String)] = []
+            for item in fetched {
+                if let errorDescription = item.errorDescription {
                     self.statusMessage = "Could not repair thread title: \(errorDescription)"
                     continue
                 }
-                self.repairedThreadIds.insert(repair.threadId)
-                if let thread = repair.thread,
-                   let index = self.threads.firstIndex(where: { $0.id == thread.id }) {
-                    self.threads[index] = thread
-                    self.onThreadLifecycle?(.updated(thread))
+                self.repairedThreadIds.insert(item.threadId)
+                guard let title = item.title else { continue }
+                guard let index = self.threads.firstIndex(where: { $0.id == item.threadId }) else {
+                    continue
                 }
+                guard AgentThreadTitle.isPlaceholder(self.threads[index].title) else { continue }
+                self.threads[index].title = title
+                titlesToPersist.append((item.threadId, title))
+                self.onThreadLifecycle?(.updated(self.threads[index]))
+            }
+            if !titlesToPersist.isEmpty {
+                await Task.detached(priority: .utility) {
+                    for (threadId, title) in titlesToPersist {
+                        try? threadRepo.updateTitlePreservingActivity(threadId, title: title)
+                    }
+                }.value
             }
             if self.titleRepairGeneration == generation {
                 self.titleRepairTask = nil

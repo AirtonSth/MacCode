@@ -447,6 +447,16 @@ public final class AgentThreadRepository {
         }
     }
 
+    /// Cosmetic title repair must not rewrite status, unread, routing, or
+    /// `updated_at` (PERSISTENCE-DATA-002). A full `upsert` of a captured row
+    /// clobbers concurrent `persistThreadConfig` / run-start writes.
+    public func updateTitlePreservingActivity(_ threadId: AgentThreadID, title: String) throws {
+        let st = try db.prepare("UPDATE agent_threads SET title = ? WHERE id = ?;")
+        try st.bind(1, title)
+        try st.bind(2, threadId.value.uuidString)
+        _ = try st.step()
+    }
+
     /// Hard workspace cap: reclaim oldest *terminal* threads (including those with
     /// history) when over the limit. Protected and never auto-deleted:
     /// running/pending, pinned, durable drafts, worktrees, recoverable fork
