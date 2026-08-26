@@ -312,7 +312,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var composerCursorOffset: Int? = nil
     @Published public var provider: AgentProvider = .codex
     @Published public var providerInstanceId: String = AgentProvider.codex.rawValue
-    /// macOS account that will execute the next provider process (`sudo -u`).
+    /// macOS account that will execute the next provider process through the shared helper.
     /// Nil / current-account means no privileged trampoline.
     @Published public var runAsUser: AgentRunAsUser? = AgentRunAsUser.current()
     @Published public var availableRunAsUsers: [AgentRunAsUser] = MacOSLocalUserCatalog.listEligibleUsers()
@@ -5153,7 +5153,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    /// Select the macOS account that will execute provider processes (sudo -u).
+    /// Select the macOS account that will execute provider processes through the shared helper.
     /// Locked after the first real conversation message, same as provider source.
     public func setRunAsUser(_ user: AgentRunAsUser) {
         guard !providerLocked else { return }
@@ -16064,7 +16064,7 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.execution.menu")
     }
 
-    /// macOS user capsule (sudo -u). Left of provider source + model.
+    /// macOS user capsule (shared helper). Left of provider source + model.
     private var runAsUserMenu: some View {
         let users = vm.availableRunAsUsers.isEmpty ? MacOSLocalUserCatalog.listEligibleUsers() : vm.availableRunAsUsers
         let selected = vm.runAsUser ?? AgentRunAsUser.current()

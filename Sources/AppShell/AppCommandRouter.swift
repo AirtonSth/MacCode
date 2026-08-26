@@ -5776,7 +5776,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     /// Resolves a provider CLI for the user who will execute it — same rules as
     /// ClaudeStreamingCLIAdapter / ProcessLocator.resolveForRunAsUser so Auto
-    /// admission and sudo -u spawn agree.
+    /// admission and helper-backed spawn agree.
     static func resolveProviderBinaryPath(
         binary: String,
         runAsUser: AgentRunAsUser?
@@ -5784,8 +5784,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ProcessLocator.resolveForRunAsUser(binary, runAsUser: runAsUser) ?? ""
     }
 
-    /// Environment for probing. Foreign run-as-user auth is executed via
-    /// `sudo -n -u` (ProviderCLIProbe); HOME overrides remain for discovery
+    /// Environment for probing. Foreign run-as-user auth is executed via the
+    /// installed helper (ProviderCLIProbe); HOME overrides remain for discovery
     /// that does not elevate (model list REST, skills paths).
     static func probeEnvironment(
         base: [String: String],
@@ -5833,7 +5833,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     /// Snapshot probe for Auto admission / Source UI. Pass `runAsUser` so binary
-    /// + auth match the account Claude will actually `sudo -u` as.
+    /// + auth match the account Claude will actually run as through the helper.
     public func listAgentProviderSnapshots(runAsUser: AgentRunAsUser?) async -> [AgentProviderSnapshot] {
         listAgentProviderSnapshotsCallCountForTesting += 1
         var snapshots: [AgentProviderSnapshot] = []
@@ -6175,9 +6175,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
            now.timeIntervalSince(cached.capturedAt) < providerProbeCacheTTL {
             return cached
         }
-        // Foreign identity: probe via sudo -n -u (same as spawn, non-interactive).
+        // Foreign identity: probe via the installed helper (same as spawn).
         // Avoids HOME-only false "not authenticated" that blocked Auto while
-        // Manual + sudo -A would still run.
+        // Manual spawn performs the one-time helper installation if needed.
         let skillsRoot = Self.providerSkillsRoot(
             provider: provider,
             environment: environment,

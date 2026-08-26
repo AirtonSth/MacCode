@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import IOKit.pwr_mgt
 import CoreGraphics
+import AgentRuntime
 
 public struct InsomniaPowerOptions: Equatable, Sendable {
     public static let defaultSession = InsomniaPowerOptions(
@@ -42,8 +43,13 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
     private var options: InsomniaPowerOptions = .defaultSession
     private var screenSaverTimer: Timer?
     private lazy var privilegedPMSet = PrivilegedPMSetSleepDisabler(
-        runPrivilegedShellCommand: { [weak self] command in
-            self?.runPrivilegedShellCommand(command) ?? false
+        runPrivilegedPMSet: { disabled, watchProcessID, stopFile, sessionDirectory in
+            RunAsUserProcessBootstrap.runPrivilegedPMSet(
+                disabled: disabled,
+                watchProcessID: watchProcessID,
+                stopFile: stopFile,
+                sessionDirectory: sessionDirectory
+            )
         },
         rootDomainSleepDisabled: { [weak self] in
             self?.rootDomainSleepDisabled() ?? false
@@ -207,8 +213,8 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
     }
 
     // PERF: async variant of ensureClamshellSleepDisabled — the privileged
-    // pmset path (NSAppleScript admin dialog) is dispatched to a detached
-    // background task so the main actor is never blocked.
+    // pmset helper is dispatched to a detached background task so the main
+    // actor is never blocked.
     private func ensureClamshellSleepDisabledAsync() async -> Bool {
         if rootDomainSleepDisabled() {
             clamshellSleepDisabled = true
@@ -231,15 +237,15 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
     }
 
     // PERF: async variant of the privileged-pmset disable path used in deactivate.
-    // Both the cached-helper wait and the one-shot NSAppleScript call are kept
-    // off the main actor.
+    // Both the cached-helper wait and the one-shot helper call are kept off the
+    // main actor.
     private func runPrivilegedDeactivateAsync() async {
         if privilegedPMSet.disableUsingCachedPermission() {
             if !(await waitForRootDomainSleepDisabledAsync(false)) {
                 NSLog("RemoteCode Insomnia cached pmset disable did not clear before timeout.")
             }
         } else {
-            // One-shot privileged disable — NSAppleScript blocks; run detached.
+            // One-shot privileged disable — the helper blocks; run detached.
             let pmSet = privilegedPMSet
             let succeeded = await Task.detached(priority: .userInitiated) {
                 pmSet.setDisabled(false)
@@ -249,21 +255,6 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
             }
         }
         clamshellSleepDisabled = rootDomainSleepDisabled()
-    }
-
-    private func runPrivilegedShellCommand(_ command: String) -> Bool {
-        let escapedCommand = command
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let source = "do shell script \"\(escapedCommand)\" with administrator privileges"
-        var error: NSDictionary?
-        guard NSAppleScript(source: source)?.executeAndReturnError(&error) != nil else {
-            if let error {
-                NSLog("RemoteCode Insomnia privileged command failed: %@", error)
-            }
-            return false
-        }
-        return true
     }
 
     private func createDisplaySleepAssertion() -> Bool {
@@ -372,7 +363,7 @@ final class PrivilegedPMSetSleepDisabler: @unchecked Sendable {
     private let fileManager: FileManager
     private let processIdentifier: Int32
     private let makeSessionDirectory: () -> URL
-    private let runPrivilegedShellCommand: (String) -> Bool
+    private let runPrivilegedPMSet: (Bool, Int32?, URL?, URL?) -> Bool
     private let rootDomainSleepDisabled: () -> Bool
     private var session: Session?
 
@@ -383,13 +374,13 @@ final class PrivilegedPMSetSleepDisabler: @unchecked Sendable {
             FileManager.default.temporaryDirectory
                 .appendingPathComponent("RemoteCodeInsomnia-\(UUID().uuidString)", isDirectory: true)
         },
-        runPrivilegedShellCommand: @escaping (String) -> Bool,
+        runPrivilegedPMSet: @escaping (Bool, Int32?, URL?, URL?) -> Bool,
         rootDomainSleepDisabled: @escaping () -> Bool
     ) {
         self.fileManager = fileManager
         self.processIdentifier = processIdentifier
         self.makeSessionDirectory = makeSessionDirectory
-        self.runPrivilegedShellCommand = runPrivilegedShellCommand
+        self.runPrivilegedPMSet = runPrivilegedPMSet
         self.rootDomainSleepDisabled = rootDomainSleepDisabled
     }
 
@@ -421,20 +412,17 @@ final class PrivilegedPMSetSleepDisabler: @unchecked Sendable {
     private func enableWithReusablePermission() -> Bool {
         let session = makeSession()
         do {
-            try fileManager.createDirectory(at: session.directory, withIntermediateDirectories: true)
+            try fileManager.createDirectory(
+                at: session.directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
         } catch {
             NSLog("RemoteCode Insomnia failed to create pmset helper state: %@", error.localizedDescription)
             return false
         }
 
-        let command = [
-            "/usr/bin/pmset -a disablesleep 1",
-            "status=$?",
-            "if [ $status -ne 0 ]; then exit $status; fi",
-            watcherCommand(for: session)
-        ].joined(separator: "; ")
-
-        guard runPrivilegedShellCommand(command) else {
+        guard runPrivilegedPMSet(true, processIdentifier, session.stopFile, session.directory) else {
             removeSessionDirectory(session)
             return false
         }
@@ -447,8 +435,7 @@ final class PrivilegedPMSetSleepDisabler: @unchecked Sendable {
     }
 
     private func runOneShotPMSet(disabled: Bool) -> Bool {
-        let value = disabled ? "1" : "0"
-        return runPrivilegedShellCommand("/usr/bin/pmset -a disablesleep \(value)")
+        runPrivilegedPMSet(disabled, nil, nil, nil)
     }
 
     private func makeSession() -> Session {
@@ -457,12 +444,6 @@ final class PrivilegedPMSetSleepDisabler: @unchecked Sendable {
             directory: directory,
             stopFile: directory.appendingPathComponent("disable", isDirectory: false)
         )
-    }
-
-    private func watcherCommand(for session: Session) -> String {
-        let stopFile = shellQuote(session.stopFile.path)
-        let directory = shellQuote(session.directory.path)
-        return "( while [ ! -e \(stopFile) ] && /bin/kill -0 \(processIdentifier) 2>/dev/null; do /bin/sleep 0.5; done; /usr/bin/pmset -a disablesleep 0; /bin/rm -rf \(directory) ) >/dev/null 2>&1 &"
     }
 
     private func signal(_ session: Session) -> Bool {
@@ -478,7 +459,4 @@ final class PrivilegedPMSetSleepDisabler: @unchecked Sendable {
         try? fileManager.removeItem(at: session.directory)
     }
 
-    private func shellQuote(_ value: String) -> String {
-        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
-    }
 }

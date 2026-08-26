@@ -63,7 +63,7 @@ public enum ProcessLocator {
         return p
     }
 
-    /// Binary resolution for Auto admission + sudo -u execution (same rules).
+    /// Binary resolution for Auto admission + shared-helper execution (same rules).
     /// 1) Absolute Settings path when executable (e.g. /Users/airtonjunior/.local/bin/claude)
     /// 2) Target run-as-user home search
     /// 3) Current user home / PATH search

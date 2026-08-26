@@ -191,7 +191,7 @@ public enum ProviderProcessSweeper {
 
             // Owner-anchored run-as-user rows (`foreignUserLaunch`) legitimately
             // have no child start identity: a non-root parent cannot read a root
-            // `sudo` child's kernel metadata (EPERM). They must never poison scan
+            // helper-launched child's kernel metadata (EPERM). They must never poison scan
             // completeness — one run-as-user turn otherwise blocks EVERY later
             // provider admission with processAccountingUnavailable until the row
             // ages out. Account them fail-safe instead: a live root PID and its

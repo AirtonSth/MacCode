@@ -1383,7 +1383,7 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
     public var routingConfiguration: AgentRoutingConfiguration?
     /// Optional only for backward-compatible decoding of pre-v34 wire snapshots.
     public var interactionMode: AgentInteractionMode?
-    /// macOS account that executes provider processes for this thread (`sudo -u`).
+    /// macOS account that executes provider processes for this thread through the shared helper.
     /// Nil means the current login user. Distinct from `providerInstanceId`.
     public var runAsUser: AgentRunAsUser?
 

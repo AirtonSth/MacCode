@@ -374,7 +374,7 @@ public enum AgentRunAsUserPresentation {
         if !interactive {
             return "Provider processes run as macOS user \(selected.shortName)"
         }
-        return "Choose which macOS user executes Codex/Claude/Grok (like sudo -u)"
+        return "Choose which macOS user executes Codex/Claude/Grok (through the shared helper)"
     }
 }
 

@@ -49,9 +49,9 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let stdoutPipe: Pipe
         let stderrPipe: Pipe
         var model: String
-        /// Set when the provider was launched via `sudo -u` as another macOS
-        /// user; its child processes carry this uid and can only be reaped by
-        /// re-entering that uid via sudo during teardown.
+        /// Set when the provider was launched through the shared helper as
+        /// another macOS user; its child processes carry this uid and can only
+        /// be reaped by re-entering that uid through the helper during teardown.
         let foreignUserUID: uid_t?
         let parser = ClaudeParser()
         let lineBuffer = LineBuffer()
@@ -600,7 +600,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
-        // Route through `sudo -u` when a different macOS user is selected so the
+        // Route through the shared helper when a different macOS user is selected so the
         // provider reads that user's ~/.claude (their logged-in account + MCP).
         let thinkingEnvironment = ClaudeRunner.thinkingEnvironment(request.environment)
         let baseEnv = CodexRunner.processEnvironment(overrides: thinkingEnvironment, purpose: .agentTurn(.claude))
@@ -664,7 +664,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
 
         do {
             try process.run()
-            // A run-as-user launch spawns a root `sudo` child whose kernel
+            // A run-as-user launch spawns a helper child whose kernel
             // metadata this non-root app cannot read; tag it owner-anchored so
             // the spawn is not rejected by an unreadable child identity.
             try ProcessSpawnTagger.tagProcess(process, provider: .claude, foreignUserLaunch: foreignUserUID != nil)

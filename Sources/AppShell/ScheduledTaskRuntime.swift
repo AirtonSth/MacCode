@@ -13,6 +13,7 @@ private let scheduledTaskLog = Logger(subsystem: "io.remotecode.appshell", categ
 public struct ScheduledSystemUser: Sendable, Equatable, Identifiable {
     public let name: String
     public let uid: uid_t
+    public let gid: gid_t
     public let homeDirectory: String
     public var id: String { name }
 }
@@ -32,7 +33,7 @@ public enum ScheduledSystemUserCatalog {
             let home = String(cString: homePointer)
             let shell = String(cString: shellPointer)
             guard !name.hasPrefix("_"), shell != "/usr/bin/false", shell != "/bin/false", shell != "/usr/bin/nologin" else { continue }
-            users.append(ScheduledSystemUser(name: name, uid: uid, homeDirectory: home))
+            users.append(ScheduledSystemUser(name: name, uid: uid, gid: entry.pw_gid, homeDirectory: home))
         }
         return users.sorted { lhs, rhs in
             if lhs.name == NSUserName() { return true }
@@ -52,6 +53,7 @@ public enum ScheduledSystemUserCatalog {
         return ScheduledSystemUser(
             name: String(cString: namePointer),
             uid: entry.pw_uid,
+            gid: entry.pw_gid,
             homeDirectory: String(cString: homePointer)
         )
     }
@@ -62,7 +64,7 @@ public enum ScheduledTaskPreflightError: Error, CustomStringConvertible, Localiz
     case missingWorkspace
     case inaccessibleWorkspace(String)
     case ineligibleUser(String)
-    case sudoUnavailable(String)
+    case helperUnavailable(String)
     case providerUnavailable(String)
     case unsupportedModel(String)
     case unsupportedReasoning(String)
@@ -73,7 +75,7 @@ public enum ScheduledTaskPreflightError: Error, CustomStringConvertible, Localiz
         case .missingWorkspace: return "The selected workspace no longer exists."
         case .inaccessibleWorkspace(let path): return "The workspace is not readable and writable: \(path)"
         case .ineligibleUser(let user): return "The system user is not eligible: \(user)"
-        case .sudoUnavailable(let user): return "Passwordless sudo is not available for user \(user). Configure sudoers, then retry."
+        case .helperUnavailable(let user): return "RemoteCode's privileged helper is unavailable for user \(user). Authorize its one-time installation, then retry."
         case .providerUnavailable(let reason): return reason
         case .unsupportedModel(let model): return "The selected provider does not expose model \(model)."
         case .unsupportedReasoning(let effort): return "The selected model does not support \(effort) reasoning."
@@ -272,7 +274,7 @@ public final class ScheduledTaskExecutor {
             generatedUID: "",
             shortName: user.name,
             uid: user.uid,
-            gid: getgid(),
+            gid: user.gid,
             homePath: user.homeDirectory
         )
     }
@@ -307,10 +309,17 @@ public final class ScheduledTaskExecutor {
         guard user.uid == task.runAsUID else {
             throw ScheduledTaskPreflightError.ineligibleUser("\(task.runAsUser) changed identity since this task was saved")
         }
-        if user.name != NSUserName() { try verifyPasswordlessSudo(user: user) }
+        if user.name != NSUserName() {
+            do {
+                try RunAsUserProcessBootstrap.ensureHelperInstalled()
+            } catch {
+                throw ScheduledTaskPreflightError.helperUnavailable(user.name)
+            }
+        }
 
         // Discover install/auth/binary as the account that will actually run the
-        // provider (sudo -u target). App-owner snapshots reject valid foreign-user CLIs.
+        // provider through the shared helper. App-owner snapshots reject valid
+        // foreign-user CLIs.
         let runAsForProbe = Self.resolveRunAsUser(task: task)
         let snapshots = await router.listAgentProviderSnapshots(runAsUser: runAsForProbe)
         if task.effectiveRoutingMode == .auto {
@@ -352,19 +361,16 @@ public final class ScheduledTaskExecutor {
         }
         let binary = snapshot.binaryPath?.trimmingCharacters(in: .whitespacesAndNewlines)
         let baseBinary = binary?.isEmpty == false ? binary! : task.provider.rawValue
-        if user.name != NSUserName() {
-            try verifyProviderBinary(baseBinary, user: user)
-        }
-        let probeBinary = try executionBinary(task: task, baseBinary: baseBinary)
         let probeEnvironment = user.name == NSUserName()
             ? router.providerEnvironment(provider: task.provider, instanceId: task.providerInstanceID)
             : [:]
         let authenticated = await Task.detached {
-            ProviderCLIProbe.authenticated(
+            ProviderCLIProbe.authStatus(
                 provider: task.provider,
-                binaryPath: probeBinary,
-                environment: probeEnvironment
-            )
+                binaryPath: baseBinary,
+                environment: probeEnvironment,
+                runAsUser: runAsForProbe
+            ).authenticated
         }.value
         guard authenticated == true else {
             throw ScheduledTaskPreflightError.providerUnavailable(
@@ -374,7 +380,7 @@ public final class ScheduledTaskExecutor {
         return PreparedExecution(
             workspace: workspace,
             manualLaunch: AgentOrchestrationLaunchConfiguration(
-                binary: probeBinary,
+                binary: baseBinary,
                 environment: probeEnvironment
             ),
             routingSnapshot: nil,
@@ -408,6 +414,7 @@ public final class ScheduledTaskExecutor {
     ) async throws -> AgentOrchestrationRoutingSnapshot {
         var verifiedSnapshots: [AgentProviderSnapshot] = []
         var launches: [String: AgentOrchestrationLaunchConfiguration] = [:]
+        let runAsForProbe = Self.resolveRunAsUser(task: task)
 
         // Scheduled Auto is host-bound: only the user-chosen provider may run.
         // Never admit other providers or substitute another host when the saved
@@ -432,38 +439,19 @@ public final class ScheduledTaskExecutor {
         for snapshot in candidateSnapshots {
             let binary = snapshot.binaryPath?.trimmingCharacters(in: .whitespacesAndNewlines)
             let baseBinary = binary?.isEmpty == false ? binary! : snapshot.provider.rawValue
-            if user.name != NSUserName() {
-                do { try verifyProviderBinary(baseBinary, user: user) }
-                catch {
-                    throw ScheduledTaskPreflightError.providerUnavailable(
-                        "The selected provider is not executable as \(user.name): \(error)"
-                    )
-                }
-            }
-            // Probe may use a foreign-user `.sh` wrapper for passwordless sudo auth.
-            // Coordinator launch configs must use the allowlisted provider binary so
-            // RunAsUserProcessBootstrap performs the single sudo transition.
-            let probeBinary: String
-            do {
-                probeBinary = try executionBinary(
-                    task: task,
-                    baseBinary: baseBinary,
-                    providerInstanceID: snapshot.id
-                )
-            } catch {
-                throw ScheduledTaskPreflightError.providerUnavailable(
-                    "Could not resolve the selected provider binary: \(error)"
-                )
-            }
+            // Probe and the eventual launch both use the shared helper for a
+            // foreign account; the launch configuration remains the real,
+            // allowlisted provider binary rather than a shell wrapper.
             let environment = user.name == NSUserName()
                 ? router.providerEnvironment(provider: snapshot.provider, instanceId: snapshot.id)
                 : [:]
             let authenticated = await Task.detached {
-                ProviderCLIProbe.authenticated(
+                ProviderCLIProbe.authStatus(
                     provider: snapshot.provider,
-                    binaryPath: probeBinary,
-                    environment: environment
-                )
+                    binaryPath: baseBinary,
+                    environment: environment,
+                    runAsUser: runAsForProbe
+                ).authenticated
             }.value
             guard authenticated == true else {
                 throw ScheduledTaskPreflightError.providerUnavailable(
@@ -553,72 +541,6 @@ public final class ScheduledTaskExecutor {
         )
     }
 
-    private func verifyPasswordlessSudo(user: ScheduledSystemUser) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        process.arguments = ["-n", "-u", "#\(user.uid)", "-H", "--", "/usr/bin/true"]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { throw ScheduledTaskPreflightError.sudoUnavailable(user.name) }
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else { throw ScheduledTaskPreflightError.sudoUnavailable(user.name) }
-    }
-
-    private func executionBinary(
-        task: ScheduledTask,
-        baseBinary: String,
-        providerInstanceID: String? = nil
-    ) throws -> String {
-        guard let user = ScheduledSystemUserCatalog.user(named: task.runAsUser) else {
-            throw ScheduledTaskPreflightError.ineligibleUser(task.runAsUser)
-        }
-        guard user.name != NSUserName() else { return baseBinary }
-        let directory = context.appSupportDirectory.appendingPathComponent("scheduled-task-runners", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes([.posixPermissions: 0o711], ofItemAtPath: directory.path)
-        let wrapper = directory.appendingPathComponent(Self.runnerFilename(
-            taskID: task.id,
-            providerInstanceID: providerInstanceID ?? task.providerInstanceID
-        ))
-        let script = "#!/bin/sh\nexec /usr/bin/sudo -n -u '#\(user.uid)' -H -- \(Self.shellQuote(baseBinary)) \"$@\"\n"
-        try Data(script.utf8).write(to: wrapper, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrapper.path)
-        return wrapper.path
-    }
-
-    // PERF: runnerFilename recompiled `[^A-Za-z0-9._-]` via
-    // replacingOccurrences(options: .regularExpression) on every cross-user
-    // sudo wrapper install. ASCII CharacterSet membership matches that class
-    // without a per-call regex compile.
-    private static let runnerFilenameAllowedScalars = CharacterSet(
-        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
-    )
-
-    nonisolated static func runnerFilename(taskID: UUID, providerInstanceID: String) -> String {
-        let suffix = String(providerInstanceID.unicodeScalars.map {
-            runnerFilenameAllowedScalars.contains($0) ? Character($0) : Character("-")
-        })
-        return "\(taskID.uuidString.lowercased())-\(suffix).sh"
-    }
-
-    private static func shellQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
-
-    private func verifyProviderBinary(_ binary: String, user: ScheduledSystemUser) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        process.arguments = ["-n", "-u", "#\(user.uid)", "-H", "--", "/usr/bin/test", "-x", binary]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch {
-            throw ScheduledTaskPreflightError.providerUnavailable("The selected provider binary is unavailable to \(user.name).")
-        }
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            throw ScheduledTaskPreflightError.providerUnavailable("The selected provider binary is unavailable to \(user.name).")
-        }
-    }
 }
 
 @MainActor

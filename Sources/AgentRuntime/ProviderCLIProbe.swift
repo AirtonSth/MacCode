@@ -171,8 +171,8 @@ public enum ProviderCLIProbe {
     }
 
     /// Auth probe aligned with provider spawn. When `runAsUser` is a foreign
-    /// macOS account, run the same `sudo -n -u <user> -H -- <binary> …` path
-    /// execution uses (non-interactive). A HOME-only probe as the app owner
+    /// macOS account, run through the same installed helper path execution
+    /// uses (non-interactive). A HOME-only probe as the app owner
     /// false-negatives Claude OAuth for the selected user and blocks Auto.
     public static func authStatus(
         provider: AgentProvider,
@@ -199,8 +199,8 @@ public enum ProviderCLIProbe {
             runAsUser: runAsUser,
             timeoutSeconds: timeoutSeconds
         ) else {
-            // Foreign sudo -n may fail without a cached credential — unknown,
-            // not "logged out". Auto may still admit; spawn uses sudo -A.
+            // A missing helper may fail closed — unknown, not "logged out".
+            // Auto may still admit; the real spawn performs one-time install.
             return AuthStatus(authenticated: nil, accountLabel: nil, accountAuthMethod: nil)
         }
 
@@ -281,15 +281,14 @@ public enum ProviderCLIProbe {
         let baseEnv = CodexRunner.processEnvironment(overrides: environment, purpose: .supportProcess)
         let launchPlan: RunAsUserProcessBootstrap.LaunchPlan
         do {
-            // Match ClaudeStreamingCLIAdapter: foreign user → sudo -n -u -H
-            // (no askpass during probe — password UI only at real spawn).
+            // Probes stay non-interactive: the installed helper must already
+            // exist, otherwise capability detection fails closed.
             launchPlan = try RunAsUserProcessBootstrap.plan(
                 executablePath: trimmed,
                 arguments: arguments,
                 environment: baseEnv,
                 currentDirectory: FileManager.default.currentDirectoryPath,
-                runAsUser: runAsUser,
-                askpassPath: nil
+                runAsUser: runAsUser
             )
         } catch {
             return nil

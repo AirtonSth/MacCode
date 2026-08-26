@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 
-/// macOS account identity used to execute a provider process (`sudo -u`-style).
+/// macOS account identity used to execute a provider process through the shared helper.
 /// Distinct from provider-instance selection (CODEX_HOME / personal-vs-work CLI configs).
 public struct AgentRunAsUser: Codable, Sendable, Equatable, Hashable, Identifiable {
     /// OpenDirectory GeneratedUID (stable across UID renumbering when possible).

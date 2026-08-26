@@ -1,14 +1,16 @@
 import Foundation
 import Darwin
 
-/// Privileged trampoline: setuid to a target macOS user, then exec the provider.
-/// Stdio is inherited so RemoteCode's Foundation Process pipes keep working.
+/// Privileged trampoline installed once at
+/// `/Library/PrivilegedHelperTools/io.remotecode.RunAsUserHelper`.
 ///
-/// Security model (MVP):
-/// - Must start with euid 0 (setuid-root install or LaunchDaemon).
-/// - Only absolute allowlisted provider basenames.
-/// - Never invokes a shell.
-/// - Rebuilds a minimal environment after setuid.
+/// The helper has three deliberately narrow operations:
+/// - `exec` drops to a validated interactive user before running an allowlisted
+///   provider binary.
+/// - `pmset` stays root for the single clamshell-sleep setting used by Insomnia.
+/// - `signal` signals only already-owned target-user provider PIDs.
+///
+/// It never accepts a shell command and never stores the invoking password.
 @main
 struct RemoteCodeRunAsUserHelperMain {
     static func main() {
@@ -23,13 +25,19 @@ struct RemoteCodeRunAsUserHelperMain {
 
     static func run(args: [String]) throws {
         guard let first = args.first else {
-            throw HelperError.usage("missing command (expected: exec)")
+            throw HelperError.usage("missing command (expected: exec, pmset, signal, or version)")
         }
         switch first {
         case "exec":
             try execCommand(Array(args.dropFirst()))
+        case "pmset":
+            try pmSetCommand(Array(args.dropFirst()))
+        case "watch":
+            try watchCommand(Array(args.dropFirst()))
+        case "signal":
+            try signalCommand(Array(args.dropFirst()))
         case "version":
-            fputs("RemoteCodeRunAsUserHelper 1\n", stdout)
+            fputs("RemoteCodeRunAsUserHelper 4\n", stdout)
             exit(0)
         default:
             throw HelperError.usage("unknown command \(first)")
@@ -85,18 +93,10 @@ struct RemoteCodeRunAsUserHelperMain {
 
         try validateTarget(uid: uid, gid: gid, user: user, home: home)
         try validateBinary(binary)
-
-        // Privilege check: must be root (setuid bit or launched by launchd as root).
-        if geteuid() != 0 {
-            throw HelperError.notRoot("effective uid is \(geteuid()); install helper setuid-root or as LaunchDaemon")
-        }
+        try requireRoot()
 
         // Change directory before dropping privileges when possible.
-        if chdir(cwd) != 0 {
-            // Retry after setuid if cwd is only accessible as target user.
-        }
-
-        // Darwin headers type the group argument as Int32 on Apple platforms.
+        _ = chdir(cwd)
         if initgroups(user, Int32(bitPattern: gid)) != 0 {
             throw HelperError.posix("initgroups failed errno=\(errno)")
         }
@@ -109,50 +109,277 @@ struct RemoteCodeRunAsUserHelperMain {
         if getuid() != uid || geteuid() != uid {
             throw HelperError.posix("uid not fully dropped (uid=\(getuid()) euid=\(geteuid()))")
         }
-
-        if chdir(cwd) != 0 {
+        guard chdir(cwd) == 0 else {
             throw HelperError.posix("chdir(\(cwd)) failed errno=\(errno)")
         }
 
-        var env: [String] = [
-            "HOME=\(home)",
-            "USER=\(user)",
-            "LOGNAME=\(user)",
-            "PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-            "TERM=xterm-256color",
-            "LANG=en_US.UTF-8",
-            "LC_ALL=en_US.UTF-8",
-            "TMPDIR=\(home)/Library/Caches/TemporaryItems",
-            "RC_RUN_AS_USER=\(user)"
+        var env: [String: String] = [
+            "HOME": home,
+            "USER": user,
+            "LOGNAME": user,
+            "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "TERM": "xterm-256color",
+            "LANG": "en_US.UTF-8",
+            "LC_ALL": "en_US.UTF-8",
+            "TMPDIR": "\(home)/Library/Caches/TemporaryItems",
+            "RC_RUN_AS_USER": user
         ]
-        // Preserve a small allowlist from the parent when present (no secrets).
-        for key in ["SSH_AUTH_SOCK", "COLORTERM", "TERM_PROGRAM"] {
-            if let value = ProcessInfo.processInfo.environment[key], !value.isEmpty {
-                env.append("\(key)=\(value)")
+
+        // Keep the provider receipt and explicit controls, but never forward
+        // arbitrary login-shell values, loader controls, or askpass paths.
+        let parentEnvironment = ProcessInfo.processInfo.environment
+        for (key, value) in parentEnvironment where shouldPreserve(key: key) && !value.isEmpty {
+            env[key] = value
+        }
+
+        exec(binary: binary, arguments: binaryArgs, environment: env.map { "\($0.key)=\($0.value)" })
+    }
+
+    static func pmSetCommand(_ args: [String]) throws {
+        try requireRoot()
+
+        var disabled: Bool?
+        var watchPID: pid_t?
+        var stopFile: String?
+        var sessionDirectory: String?
+        var i = 0
+        while i < args.count {
+            let key = args[i]
+            i += 1
+            guard i < args.count else { throw HelperError.usage("missing value for \(key)") }
+            let value = args[i]
+            i += 1
+            switch key {
+            case "--disablesleep":
+                guard value == "0" || value == "1" else {
+                    throw HelperError.usage("--disablesleep must be 0 or 1")
+                }
+                disabled = value == "1"
+            case "--watch-pid":
+                guard let pid = Int32(value), pid > 0 else {
+                    throw HelperError.usage("--watch-pid must be positive")
+                }
+                watchPID = pid
+            case "--stop-file":
+                stopFile = value
+            case "--session-directory":
+                sessionDirectory = value
+            default:
+                throw HelperError.usage("unknown pmset flag \(key)")
             }
         }
 
+        guard let disabled else { throw HelperError.usage("pmset requires --disablesleep 0|1") }
+        let watcherRequested = watchPID != nil || stopFile != nil || sessionDirectory != nil
+        if disabled {
+            guard watcherRequested, let watchPID, let stopFile, let sessionDirectory else {
+                throw HelperError.usage("enabling pmset requires a watcher")
+            }
+            try validateWatcher(pid: watchPID, stopFile: stopFile, sessionDirectory: sessionDirectory)
+        } else if watcherRequested {
+            throw HelperError.usage("disabling pmset cannot include a watcher")
+        }
+
+        let status = runPMSet(disabled: disabled)
+        guard status == 0 else { throw HelperError.posix("pmset exited with status \(status)") }
+        if disabled, let watchPID, let stopFile, let sessionDirectory {
+            try spawnWatcher(pid: watchPID, stopFile: stopFile, sessionDirectory: sessionDirectory)
+        }
+    }
+
+    static func signalCommand(_ args: [String]) throws {
+        try requireRoot()
+
+        var uid: uid_t?
+        var signalNumber: Int32?
+        var pids: [pid_t] = []
+        var i = 0
+        while i < args.count {
+            let key = args[i]
+            i += 1
+            guard i < args.count else { throw HelperError.usage("missing value for \(key)") }
+            let value = args[i]
+            i += 1
+            switch key {
+            case "--uid":
+                guard uid == nil, let value = UInt32(value) else {
+                    throw HelperError.usage("--uid must be specified once")
+                }
+                uid = value
+            case "--signal":
+                guard signalNumber == nil, let value = Int32(value) else {
+                    throw HelperError.usage("--signal must be specified once")
+                }
+                signalNumber = value
+            case "--pid":
+                guard let value = Int32(value), value > 0 else {
+                    throw HelperError.usage("--pid must be positive")
+                }
+                pids.append(value)
+            default:
+                throw HelperError.usage("unknown signal flag \(key)")
+            }
+        }
+
+        guard let uid, let signalNumber, !pids.isEmpty else {
+            throw HelperError.usage("signal requires --uid --signal and at least one --pid")
+        }
+        guard signalNumber == SIGTERM || signalNumber == SIGKILL else {
+            throw HelperError.usage("signal is limited to SIGTERM or SIGKILL")
+        }
+        guard uid >= 501, uid != 0, let pw = getpwuid(uid) else {
+            throw HelperError.invalidTarget("uid \(uid) is not an interactive user")
+        }
+        let user = String(cString: pw.pointee.pw_name)
+        guard user != "root", !user.hasPrefix("_") else {
+            throw HelperError.invalidTarget("uid \(uid) is not an interactive user")
+        }
+
+        // Validate every PID before signalling any of them. The root helper
+        // must not become an arbitrary cross-user kill primitive.
+        for pid in pids {
+            var info = proc_bsdinfo()
+            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else {
+                if errno == ESRCH { continue }
+                throw HelperError.invalidTarget("could not inspect pid \(pid)")
+            }
+            guard info.pbi_uid == uid else {
+                throw HelperError.invalidTarget("pid \(pid) is not owned by \(user)")
+            }
+        }
+
+        for pid in pids {
+            guard kill(pid, signalNumber) == 0 || errno == ESRCH else {
+                throw HelperError.posix("kill(\(pid), \(signalNumber)) failed errno=\(errno)")
+            }
+        }
+    }
+
+    static func watchCommand(_ args: [String]) throws {
+        try requireRoot()
+        var watchPID: pid_t?
+        var stopFile: String?
+        var sessionDirectory: String?
+        var i = 0
+        while i < args.count {
+            let key = args[i]
+            i += 1
+            guard i < args.count else { throw HelperError.usage("missing value for \(key)") }
+            let value = args[i]
+            i += 1
+            switch key {
+            case "--watch-pid":
+                guard let pid = Int32(value), pid > 0 else {
+                    throw HelperError.usage("--watch-pid must be positive")
+                }
+                watchPID = pid
+            case "--stop-file":
+                stopFile = value
+            case "--session-directory":
+                sessionDirectory = value
+            default:
+                throw HelperError.usage("unknown watch flag \(key)")
+            }
+        }
+        guard let watchPID, let stopFile, let sessionDirectory else {
+            throw HelperError.usage("watch requires --watch-pid --stop-file --session-directory")
+        }
+        try validateWatcher(pid: watchPID, stopFile: stopFile, sessionDirectory: sessionDirectory)
+
+        let interval = timespec(tv_sec: 0, tv_nsec: 500_000_000)
+        while access(stopFile, F_OK) != 0 && (kill(watchPID, 0) == 0 || errno == EPERM) {
+            var remaining = interval
+            _ = nanosleep(&remaining, nil)
+        }
+        let status = runPMSet(disabled: false)
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: sessionDirectory))
+        exit(status == 0 ? 0 : 1)
+    }
+
+    static func requireRoot() throws {
+        guard geteuid() == 0 else {
+            throw HelperError.notRoot("effective uid is \(geteuid()); install the helper setuid-root")
+        }
+    }
+
+    static func runPMSet(disabled: Bool) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        process.arguments = ["-a", "disablesleep", disabled ? "1" : "0"]
+        process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        } catch {
+            return -1
+        }
+    }
+
+    static func validateWatcher(pid: pid_t, stopFile: String, sessionDirectory: String) throws {
+        guard stopFile.hasPrefix("/"), sessionDirectory.hasPrefix("/"),
+              !stopFile.contains(".."), !sessionDirectory.contains(".."),
+              URL(fileURLWithPath: stopFile).deletingLastPathComponent().path ==
+                URL(fileURLWithPath: sessionDirectory).standardizedFileURL.path,
+              URL(fileURLWithPath: stopFile).lastPathComponent == "disable",
+              URL(fileURLWithPath: sessionDirectory).lastPathComponent.hasPrefix("RemoteCodeInsomnia-") else {
+            throw HelperError.invalidSession("watcher paths are not a RemoteCode Insomnia session")
+        }
+        var info = stat()
+        guard lstat(sessionDirectory, &info) == 0,
+              (info.st_mode & mode_t(0o170000)) == mode_t(0o040000),
+              info.st_uid == getuid(),
+              (info.st_mode & mode_t(0o077)) == 0 else {
+            throw HelperError.invalidSession("session directory must be a private directory owned by the caller")
+        }
+        guard kill(pid, 0) == 0 || errno == EPERM else {
+            throw HelperError.invalidSession("watch process is not alive")
+        }
+    }
+
+    static func spawnWatcher(pid: pid_t, stopFile: String, sessionDirectory: String) throws {
+        guard let helperPath = CommandLine.arguments.first, helperPath.hasPrefix("/") else {
+            throw HelperError.posix("helper executable path is unavailable")
+        }
+        let watcher = Process()
+        watcher.executableURL = URL(fileURLWithPath: helperPath)
+        watcher.arguments = [
+            "watch",
+            "--watch-pid", "\(pid)",
+            "--stop-file", stopFile,
+            "--session-directory", sessionDirectory
+        ]
+        watcher.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+        watcher.standardInput = FileHandle.nullDevice
+        watcher.standardOutput = FileHandle.nullDevice
+        watcher.standardError = FileHandle.nullDevice
+        try watcher.run()
+    }
+
+    static func shouldPreserve(key: String) -> Bool {
+        key == "PATH"
+            || key == "REMOTE_CODE_AGENT_PROVIDER"
+            || key == "CLAUDE_CODE_DISABLE_THINKING"
+            || key == "MAX_THINKING_TOKENS"
+            || key == "SSH_AUTH_SOCK"
+            || key == "COLORTERM"
+            || key == "TERM_PROGRAM"
+            || key.hasPrefix("RC_TOKEN_SAVER_")
+    }
+
+    static func exec(binary: String, arguments: [String], environment: [String]) -> Never {
         let cBinary = strdup(binary)
-        defer { free(cBinary) }
         var cArgs: [UnsafeMutablePointer<CChar>?] = [cBinary]
-        for arg in binaryArgs {
-            cArgs.append(strdup(arg))
-        }
+        cArgs.append(contentsOf: arguments.map { strdup($0) })
         cArgs.append(nil)
-        defer {
-            for ptr in cArgs.dropFirst().dropLast() {
-                free(ptr)
-            }
-        }
-
-        var cEnv: [UnsafeMutablePointer<CChar>?] = env.map { strdup($0) }
+        var cEnv: [UnsafeMutablePointer<CChar>?] = environment.map { strdup($0) }
         cEnv.append(nil)
-        defer {
-            for ptr in cEnv.dropLast() { free(ptr) }
-        }
-
         execve(binary, &cArgs, &cEnv)
-        throw HelperError.posix("execve(\(binary)) failed errno=\(errno)")
+        _exit(127)
     }
 
     static func validateTarget(uid: uid_t, gid: gid_t, user: String, home: String) throws {
@@ -172,19 +399,19 @@ struct RemoteCodeRunAsUserHelperMain {
         guard name == user else {
             throw HelperError.invalidTarget("uid \(uid) is \(name), not \(user)")
         }
-        if pw.pointee.pw_gid != gid {
-            // Primary gid mismatch — still allow if supplementary groups cover it,
-            // but require the account's real primary for setgid consistency.
+        let actualHome = String(cString: pw.pointee.pw_dir)
+        guard URL(fileURLWithPath: home).standardizedFileURL.path ==
+                URL(fileURLWithPath: actualHome).standardizedFileURL.path else {
+            throw HelperError.invalidTarget("home does not belong to \(user)")
+        }
+        guard pw.pointee.pw_gid == gid else {
             throw HelperError.invalidTarget("gid mismatch for \(user)")
         }
     }
 
     static func validateBinary(_ path: String) throws {
-        guard path.hasPrefix("/") else {
-            throw HelperError.invalidBinary("path must be absolute")
-        }
-        if path.contains("..") {
-            throw HelperError.invalidBinary("path must not contain ..")
+        guard path.hasPrefix("/"), !path.contains("..") else {
+            throw HelperError.invalidBinary("path must be absolute and must not contain ..")
         }
         let base = URL(fileURLWithPath: path).lastPathComponent
         let allow: Set<String> = ["codex", "claude", "grok", "node", "npm"]
@@ -206,11 +433,13 @@ enum HelperError: Error, CustomStringConvertible {
     case notRoot(String)
     case invalidTarget(String)
     case invalidBinary(String)
+    case invalidSession(String)
     case posix(String)
 
     var description: String {
         switch self {
-        case .usage(let s), .notRoot(let s), .invalidTarget(let s), .invalidBinary(let s), .posix(let s):
+        case .usage(let s), .notRoot(let s), .invalidTarget(let s), .invalidBinary(let s),
+             .invalidSession(let s), .posix(let s):
             return s
         }
     }

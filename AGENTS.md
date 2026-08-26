@@ -6,6 +6,12 @@
 - Do not add browser behavior that only works on one side without updating the other side in the same change.
 - User workflow state must survive closing and reopening RemoteCode. Persist the user's active workspace, panes, selected tabs, browser URLs/titles, surface metadata, agent thread state, and other explicit user choices unless the user intentionally closes/deletes them.
 
+## Privilege escalation (mandatory)
+
+- Use the single installed root-owned helper at `/Library/PrivilegedHelperTools/io.remotecode.RunAsUserHelper`. Its first install may show one administrator dialog; it remains available after RemoteCode closes and reopens.
+- The password is never persisted or stored. Provider run-as-user, Insomnia `pmset`, scheduled tasks, and provider teardown are the four consumers; all privilege escalation for them must call `RunAsUserProcessBootstrap`.
+- Do not use direct `sudo`, AppleScript administrator authorization, sudoers edits, or password files. The bootstrap installer is the only in-app `sudo` exception, and it must verify the helper owner, mode, and version before reuse.
+
 ## Loading and perceived performance (mandatory)
 
 Apply these rules to every user-visible load on macOS: navigation, tabs, rows, lists, details, search, reconnect, hydration, refresh, restore, and provider-backed content.

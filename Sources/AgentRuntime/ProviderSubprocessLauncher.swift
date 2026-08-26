@@ -14,12 +14,25 @@ public enum ProviderSubprocessLauncher {
         currentDirectory: String,
         environment overrides: [String: String],
         runAsUser: AgentRunAsUser? = nil,
-        askpassPath: String? = nil
+        askpassPath: String? = nil,
+        helperPathOverride: String? = nil
     ) throws -> Process {
         let environment = CodexRunner.processEnvironment(
             overrides: overrides,
             purpose: .agentTurn(provider)
         )
+        let helperPath: String?
+        if let runAsUser, runAsUser.uid != getuid() {
+            if let helperPathOverride {
+                helperPath = helperPathOverride
+            } else {
+                helperPath = try RunAsUserProcessBootstrap.ensureHelperInstalled(
+                    askpassPath: askpassPath
+                )
+            }
+        } else {
+            helperPath = nil
+        }
         let plan = try RunAsUserProcessBootstrap.plan(
             executablePath: executablePath,
             arguments: arguments,
@@ -27,7 +40,10 @@ public enum ProviderSubprocessLauncher {
             currentDirectory: currentDirectory,
             provider: provider,
             runAsUser: runAsUser,
-            askpassPath: askpassPath
+            helperLocator: { name in
+                guard name == RunAsUserProcessBootstrap.helperExecutableNames[0] else { return nil }
+                return helperPath
+            }
         )
         let process = Process()
         RunAsUserProcessBootstrap.apply(plan, to: process)

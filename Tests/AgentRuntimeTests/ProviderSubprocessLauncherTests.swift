@@ -61,7 +61,7 @@ final class ProviderSubprocessLauncherTests: XCTestCase {
         }
     }
 
-    func test_foreignUserLaunchPreservesProviderReceiptThroughSudoPlan() throws {
+    func test_foreignUserLaunchPreservesProviderReceiptThroughInstalledHelper() throws {
         // WHY: the run-as-user path is a second Process configuration route;
         // it must not lose provider identity or the authorized receipt when it
         // rewrites the child to sudo.
@@ -78,15 +78,17 @@ final class ProviderSubprocessLauncherTests: XCTestCase {
                 gid: getgid(),
                 homePath: "/Users/target-user"
             ),
-            askpassPath: "/tmp/remotecode-test-askpass"
+            askpassPath: "/tmp/remotecode-test-askpass",
+            helperPathOverride: "/tmp/remotecode-test-helper"
         )
 
-        XCTAssertEqual(process.executableURL?.path, RunAsUserProcessBootstrap.sudoPath)
+        XCTAssertEqual(process.executableURL?.path, "/tmp/remotecode-test-helper")
         XCTAssertTrue(process.arguments?.contains("/usr/local/bin/codex") == true)
         XCTAssertTrue(process.arguments?.contains("target-user") == true)
         XCTAssertEqual(process.environment?["REMOTE_CODE_AGENT_PROVIDER"], AgentProvider.codex.rawValue)
         XCTAssertNotNil(process.environment?[TokenSaverExecutionReceipt.envKey])
-        XCTAssertEqual(process.environment?["SUDO_ASKPASS"], "/tmp/remotecode-test-askpass")
+        XCTAssertNil(process.environment?["SUDO_ASKPASS"],
+                     "provider children must not inherit a password-prompt script after helper installation")
     }
 
     func test_foreignClaudeLaunchPreservesOnlyEnabledThinkingControls() throws {
@@ -105,16 +107,17 @@ final class ProviderSubprocessLauncherTests: XCTestCase {
                 uid: getuid() + 1,
                 gid: getgid(),
                 homePath: "/Users/target-user"
-            )
+            ),
+            helperPathOverride: "/tmp/remotecode-test-helper"
         )
 
-        XCTAssertTrue(process.arguments?.contains(
-            "--preserve-env=PATH,CLAUDE_CODE_DISABLE_THINKING,MAX_THINKING_TOKENS"
-        ) == true, "sudo env_reset must retain only the allowlisted Claude thinking controls")
+        XCTAssertTrue(process.arguments?.contains("CLAUDE_CODE_DISABLE_THINKING") == false,
+                      "thinking controls belong in the filtered helper environment, not command-line sudo flags")
         XCTAssertEqual(process.environment?["CLAUDE_CODE_DISABLE_THINKING"], "0")
         XCTAssertEqual(process.environment?["MAX_THINKING_TOKENS"], "32000")
         XCTAssertNil(process.environment?["CLAUDE_CODE_EFFORT_LEVEL"])
         XCTAssertNil(process.environment?["DISABLE_INTERLEAVED_THINKING"])
+        XCTAssertEqual(process.executableURL?.path, "/tmp/remotecode-test-helper")
     }
 
     func test_providerSourceLaunchSitesAreArchitecturallyBoundToTheLauncher() throws {
