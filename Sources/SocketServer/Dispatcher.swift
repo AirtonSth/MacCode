@@ -1326,8 +1326,13 @@ public final class JSONRPCDispatcher {
         case let botMethod where botMethod.hasPrefix("bot."):
             guard let object = result.objectValue else { return }
             let resultStatus = object["status"]?.stringValue
+            let readback = object["readback"]?.objectValue
+            let durablePartialDeletion = resultStatus == "partial"
+                && (botMethod == "bot.delete" || botMethod == "bot.discard_new")
+                && readback?["deleted"]?.boolValue == true
             guard resultStatus == "completed"
-                    || (botMethod.hasPrefix("bot.guest.") && resultStatus == "accepted") else {
+                    || (botMethod.hasPrefix("bot.guest.") && resultStatus == "accepted")
+                    || durablePartialDeletion else {
                 return
             }
             switch botMethod {
@@ -1431,6 +1436,7 @@ public final class JSONRPCDispatcher {
                         "surface_id", "snapshot_generation", "url", "title", "loading", "action", "link_kind",
                         "mounted", "split",
                         "session_before_digest", "session_after_digest", "cleared", "removed_count", "partial",
+                        "deleted", "cleanup_complete", "cleanup_residuals", "unpublished",
                     ] {
                         payload[key] = readback[key]
                     }

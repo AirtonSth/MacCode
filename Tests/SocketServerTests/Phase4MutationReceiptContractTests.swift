@@ -2894,6 +2894,85 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         }
     }
 
+    /// WHY: iOS removes published Bots through bot.delete and unpublished
+    /// drafts through bot.discard_new. Once either receipt proves durable Bot
+    /// absence, cleanup may still be partial, but replay must not redispatch or
+    /// lose the one canonical deletion event. A non-deletion never emits it.
+    func test_remoteBotRemovalPublishesOnlyDurableAbsenceWithCleanupReadback() async throws {
+        let botID = UUID().uuidString.lowercased()
+        for (index, method) in ["bot.delete", "bot.discard_new"].enumerated() {
+            let requestID = "remote-removal-partial-\(index)"
+            let router = Phase4ReceiptFakeRouter()
+            var readback: [String: JSONValue] = [
+                "bot_id": .string(botID),
+                "deleted": .bool(true),
+                "cleanup_complete": .bool(false),
+                "cleanup_residuals": .array([.string("docker_home")]),
+            ]
+            if method == "bot.discard_new" { readback["unpublished"] = .bool(false) }
+            router.pairedBotRemoteResult = .object([
+                "status": .string("partial"),
+                "request_id": .string(requestID),
+                "receipt_id": .string("\(requestID)-receipt"),
+                "bot_id": .string(botID),
+                "readback": .object(readback),
+            ])
+            let live = try await Phase4LiveServer.start(router: router, bootEpoch: UInt64(1_440 + index))
+            var params = live.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "unused")
+            params.removeValue(forKey: "thread_id")
+            params.removeValue(forKey: "text")
+            params["bot_id"] = botID
+            if method == "bot.delete" { params["confirm"] = "delete" }
+
+            let first = try await live.rpc(method: method, params: params)
+            let replay = try await live.rpc(method: method, params: params)
+
+            XCTAssertEqual(first["result"] as? NSDictionary, replay["result"] as? NSDictionary, method)
+            XCTAssertEqual(router.pairedBotRemoteCallCount, 1, method)
+            XCTAssertEqual(router.finalizationCallCount, 1, method)
+            let event = try XCTUnwrap(router.finalizedEvents["\(method):\(requestID)"]?.first, method)
+            XCTAssertEqual(event.kind, "bot.deleted", method)
+            let payload = try XCTUnwrap(event.payload.objectValue)
+            XCTAssertEqual(payload["bot_id"]?.stringValue, botID, method)
+            XCTAssertEqual(payload["deleted"]?.boolValue, true, method)
+            XCTAssertEqual(payload["cleanup_complete"]?.boolValue, false, method)
+            XCTAssertEqual(payload["cleanup_residuals"]?.arrayValue, [.string("docker_home")], method)
+            XCTAssertEqual(payload["unpublished"]?.boolValue, method == "bot.discard_new" ? false : nil, method)
+            live.stop()
+        }
+
+        for (index, status) in ["partial", "failed"].enumerated() {
+            let method = index == 0 ? "bot.delete" : "bot.discard_new"
+            let requestID = "remote-removal-not-deleted-\(status)"
+            let router = Phase4ReceiptFakeRouter()
+            router.pairedBotRemoteResult = .object([
+                "status": .string(status),
+                "request_id": .string(requestID),
+                "receipt_id": .string("\(requestID)-receipt"),
+                "bot_id": .string(botID),
+                "readback": .object([
+                    "bot_id": .string(botID),
+                    "deleted": .bool(false),
+                    "cleanup_complete": .bool(false),
+                    "cleanup_residuals": .array([.string("bot_store")]),
+                ]),
+            ])
+            let live = try await Phase4LiveServer.start(router: router, bootEpoch: UInt64(1_450 + index))
+            var params = live.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "unused")
+            params.removeValue(forKey: "thread_id")
+            params.removeValue(forKey: "text")
+            params["bot_id"] = botID
+            if method == "bot.delete" { params["confirm"] = "delete" }
+
+            _ = try await live.rpc(method: method, params: params)
+
+            XCTAssertEqual(router.pairedBotRemoteCallCount, 1, status)
+            XCTAssertEqual(router.finalizationCallCount, 1, status)
+            XCTAssertTrue(router.finalizedEvents["\(method):\(requestID)"]?.isEmpty ?? true, status)
+            live.stop()
+        }
+    }
+
     /// WHY: a completed stop receipt without a durable event range can
     /// leave iOS showing a live Stop control after the exact host run ended.
     /// Only a terminal receipt carrying the matching host/Bot/run tuple may
