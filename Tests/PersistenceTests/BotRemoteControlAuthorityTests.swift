@@ -409,6 +409,181 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(item["outcome"] as? String, "failed")
     }
 
+    /// WHY: `bot_ask_user` is a real MCP write, not a paired-RPC mutation.
+    /// Its durable question must replace only the exact active run's working
+    /// projection and remain the same needs-attention item after settlement
+    /// and authority reconstruction.
+    func test_botAskUserReachesExactPairedAttentionAndSurvivesRelaunch() throws {
+        let hostID = "ask-user-host"
+        let profileID = "ask-user-profile"
+        try BotAttentionPushBindingStore(db: db).bind(
+            profileID: profileID,
+            hostID: hostID,
+            deviceID: "ask-user-device"
+        )
+
+        let unrelated = try createLiveBot(prefix: "ask-user-b", name: "Unrelated B")
+        XCTAssertTrue(authority.settleRuntime(
+            botID: unrelated.botID,
+            runID: unrelated.runID,
+            failed: true
+        ))
+        let before = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let unrelatedBefore = try XCTUnwrap((before["items"] as? [[String: Any]])?.first {
+            $0["bot_id"] as? String == unrelated.botID
+        })
+        let unrelatedBotID = BotID(try XCTUnwrap(UUID(uuidString: unrelated.botID)))
+        let unrelatedAudit = BotAttentionItem(
+            botID: unrelatedBotID,
+            conversationID: BotConversationID(
+                try XCTUnwrap(UUID(uuidString: unrelated.conversationID))
+            ),
+            kind: .blocked,
+            title: "Historical B",
+            detail: "Keep this audit row.",
+            acknowledgedAt: Date()
+        )
+        try store.upsertAttention(unrelatedAudit)
+
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "ask-user-a-create",
+            "name": "Question A",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let bot = BotID(try XCTUnwrap(UUID(uuidString: botID)))
+        let conversation = try authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "ask-user-a-conversation",
+            "bot_id": botID,
+            "title": "Exact active conversation",
+        ])
+        let conversationID = try XCTUnwrap(
+            (conversation["readback"] as? [String: Any])?["conversation_id"] as? String
+        )
+        let threadID = UUID()
+        let runID = UUID()
+        authority.onSend = { callbackBotID, _, callbackConversationID, _ in
+            XCTAssertEqual(callbackBotID, bot)
+            XCTAssertEqual(callbackConversationID?.value.uuidString.lowercased(), conversationID)
+            return [
+                "bot_id": botID,
+                "conversation_id": conversationID,
+                "thread_id": threadID.uuidString.lowercased(),
+                "run_id": runID.uuidString.lowercased(),
+                "enqueued": true,
+                "queued_follow_up": false,
+            ]
+        }
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "ask-user-a-send",
+            "host_id": hostID,
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "text": "Ask the user only if blocked.",
+        ])
+        var linked = try XCTUnwrap(try store.conversation(
+            id: BotConversationID(try XCTUnwrap(UUID(uuidString: conversationID)))
+        ))
+        linked.linkedAgentThreadID = AgentThreadID(threadID)
+        try store.upsertConversation(linked)
+
+        // This sibling is deliberately newer. Ignoring the host-issued thread
+        // context would attach the question to this unrelated conversation.
+        try store.upsertConversation(BotConversation(
+            botID: bot,
+            title: "Newer sibling",
+            updatedAt: Date().addingTimeInterval(60)
+        ))
+        let service = try BotSelfConfigService.make(environment: [
+            BotSelfConfigCatalog.callerEnvironmentKey: botID,
+            BotPeerDelegation.threadEnvironmentKey: threadID.uuidString.lowercased(),
+            BotPeerDelegation.runEnvironmentKey: runID.uuidString.lowercased(),
+        ], store: store)
+        let asked = try service.invoke(
+            name: BotSelfConfigCatalog.askUser,
+            arguments: ["question": "Which repository should I use?"]
+        )
+        let itemID = try XCTUnwrap(asked["attention_id"] as? String)
+        XCTAssertEqual(asked["thread_id"] as? String, threadID.uuidString.lowercased())
+        XCTAssertEqual(asked["run_id"] as? String, runID.uuidString.lowercased())
+
+        let awaiting = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let awaitingItem = try XCTUnwrap((awaiting["items"] as? [[String: Any]])?.first {
+            $0["bot_id"] as? String == botID
+        })
+        XCTAssertEqual(awaitingItem["id"] as? String, itemID)
+        XCTAssertEqual(awaitingItem["run_id"] as? String, runID.uuidString.lowercased())
+        XCTAssertEqual(awaitingItem["state"] as? String, "needs_attention")
+
+        XCTAssertTrue(authority.settleRuntime(
+            botID: botID,
+            runID: runID.uuidString.uppercased(),
+            failed: false
+        ))
+        let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let item = try XCTUnwrap((listed["items"] as? [[String: Any]])?.first {
+            $0["bot_id"] as? String == botID
+        })
+        XCTAssertEqual(item["id"] as? String, itemID)
+        XCTAssertEqual(item["attention_item_id"] as? String, itemID)
+        XCTAssertEqual(item["bot_id"] as? String, botID)
+        XCTAssertEqual(item["conversation_id"] as? String, conversationID)
+        XCTAssertEqual(item["thread_id"] as? String, threadID.uuidString.lowercased())
+        XCTAssertEqual(item["run_id"] as? String, runID.uuidString.lowercased())
+        XCTAssertEqual(item["state"] as? String, "needs_attention")
+        XCTAssertEqual(item["source"] as? String, "bot_ask_user")
+        XCTAssertEqual(item["detail"] as? String, "Which repository should I use?")
+        XCTAssertEqual(item["profile_id"] as? String, profileID)
+        XCTAssertEqual(item["host_id"] as? String, hostID)
+        XCTAssertTrue(item["finished_at"] is NSNull)
+
+        let unrelatedAfter = try XCTUnwrap((listed["items"] as? [[String: Any]])?.first {
+            $0["bot_id"] as? String == unrelated.botID
+        })
+        XCTAssertEqual(unrelatedAfter as NSDictionary, unrelatedBefore as NSDictionary)
+        XCTAssertTrue(try store.listAttention(includeAcknowledged: true).contains {
+            $0.id == unrelatedAudit.id && $0.acknowledgedAt != nil
+        }, "unrelated audit history must not be rewritten while adopting A")
+
+        authority = BotRemoteControlAuthority(
+            db: db,
+            store: BotStore(db: db),
+            settings: SettingsStore(db: db),
+            appSupportDirectory: supportDir
+        )
+        let restored = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let restoredItem = try XCTUnwrap((restored["items"] as? [[String: Any]])?.first {
+            $0["bot_id"] as? String == botID
+        })
+        XCTAssertEqual(restoredItem["id"] as? String, itemID)
+        XCTAssertEqual(restoredItem["conversation_id"] as? String, conversationID)
+        XCTAssertEqual(restoredItem["thread_id"] as? String, threadID.uuidString.lowercased())
+        XCTAssertEqual(restoredItem["run_id"] as? String, runID.uuidString.lowercased())
+        XCTAssertEqual(restoredItem["state"] as? String, "needs_attention")
+    }
+
+    /// WHY: run context is an identity fence. A Bot must not attach its
+    /// question to a thread-owned conversation belonging to another Bot.
+    func test_botAskUserRejectsCrossBotThreadContext() throws {
+        let caller = try store.create(name: "Caller A", title: "", description: "")
+        let owner = try store.create(name: "Owner B", title: "", description: "")
+        let threadID = AgentThreadID()
+        try store.upsertConversation(BotConversation(
+            botID: owner.id,
+            title: "Owner thread",
+            linkedAgentThreadID: threadID
+        ))
+        let service = try BotSelfConfigService.make(environment: [
+            BotSelfConfigCatalog.callerEnvironmentKey: caller.id.value.uuidString.lowercased(),
+            BotPeerDelegation.threadEnvironmentKey: threadID.value.uuidString.lowercased(),
+            BotPeerDelegation.runEnvironmentKey: AgentRunID().value.uuidString.lowercased(),
+        ], store: store)
+
+        XCTAssertThrowsError(try service.askUser(question: "Leak this question")) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .crossBot)
+        }
+        XCTAssertTrue(try store.listAttention(includeAcknowledged: true).isEmpty)
+    }
+
     /// WHY: a routing choice is an admitted host capability, not an iOS hint.
     /// The exact outer receipt and run-as tuple must bind one conversation/run
     /// and must not be reusable after response loss or relaunch.

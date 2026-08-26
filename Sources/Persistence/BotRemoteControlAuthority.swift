@@ -167,6 +167,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         case "peer.receipt.status":
             return peerReceiptStatus(params: params)
         case "attention.list":
+            try synchronizeDurableNeedsAttention()
             return ["items": attention.values.map { canonicalAttentionItem($0) }]
         case "reserved.probe":
             throw Error.reserved
@@ -192,7 +193,22 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               var item = attention[botID],
               let attentionRunID = item["run_id"] as? String,
               runtimeIDsMatch(attentionRunID, runID) else { return false }
+        let durableQuestion: [String: Any]?
+        do {
+            durableQuestion = try durableNeedsAttention(
+                botID: botID,
+                run: run,
+                items: store.listAttention(includeAcknowledged: true)
+            )
+        } catch {
+            return false
+        }
         liveRuns.removeValue(forKey: botID)
+        if let durableQuestion {
+            attention[botID] = durableQuestion
+            persistSidecar()
+            return true
+        }
         item["state"] = "finished"
         item["finished_at"] = now.timeIntervalSince1970
         item["detail"] = failed ? "Run failed" : "Run completed"
@@ -206,6 +222,77 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let canonicalLeft = UUID(uuidString: lhs)?.uuidString.lowercased() ?? lhs
         let canonicalRight = UUID(uuidString: rhs)?.uuidString.lowercased() ?? rhs
         return canonicalLeft == canonicalRight
+    }
+
+    private func synchronizeDurableNeedsAttention() throws {
+        let items = try store.listAttention(includeAcknowledged: true)
+        var changed = false
+        for (botID, run) in liveRuns {
+            guard let item = try durableNeedsAttention(
+                botID: botID,
+                run: run,
+                items: items
+            ) else { continue }
+            if attention[botID]?["id"] as? String != item["id"] as? String
+                || attention[botID]?["state"] as? String != "needs_attention" {
+                attention[botID] = item
+                changed = true
+            }
+        }
+        if changed { persistSidecar() }
+    }
+
+    private func durableNeedsAttention(
+        botID: String,
+        run: [String: Any],
+        items: [BotAttentionItem]
+    ) throws -> [String: Any]? {
+        guard let botUUID = UUID(uuidString: botID),
+              let conversationRaw = run["conversation_id"] as? String,
+              let conversationUUID = UUID(uuidString: conversationRaw),
+              let threadRaw = run["thread_id"] as? String,
+              let threadUUID = UUID(uuidString: threadRaw),
+              let runRaw = run["run_id"] as? String,
+              let runUUID = UUID(uuidString: runRaw),
+              let startedAt = run["started_at"] as? Double else {
+            return nil
+        }
+        let exactBotID = BotID(botUUID)
+        let exactConversationID = BotConversationID(conversationUUID)
+        let exactThreadID = AgentThreadID(threadUUID)
+        guard let conversation = try store.conversation(id: exactConversationID),
+              conversation.botID == exactBotID,
+              conversation.linkedAgentThreadID == exactThreadID else {
+            return nil
+        }
+        let candidates = items.filter {
+            $0.acknowledgedAt == nil
+                && $0.botID == exactBotID
+                && $0.conversationID == exactConversationID
+                && $0.kind == .question
+                && $0.createdAt.timeIntervalSince1970 >= floor(startedAt)
+        }
+        guard candidates.count <= 1 else { throw Error.crossTarget }
+        guard let question = candidates.first else { return nil }
+        return canonicalAttentionItem([
+            "id": question.id.value.uuidString.lowercased(),
+            "bot_id": exactBotID.value.uuidString.lowercased(),
+            "host_id": run["host_id"] as? String ?? "",
+            "request_id": run["request_id"] as? String ?? "",
+            "conversation_id": exactConversationID.value.uuidString.lowercased(),
+            "thread_id": exactThreadID.value.uuidString.lowercased(),
+            "run_id": runUUID.uuidString.lowercased(),
+            "state": "needs_attention",
+            "finished_at": NSNull(),
+            "ownership": "primary",
+            "primary": true,
+            "delegated": false,
+            "kind": question.kind.rawValue,
+            "title": question.title,
+            "detail": question.detail,
+            "source": "bot_ask_user",
+            "created_at": question.createdAt.timeIntervalSince1970,
+        ], hostID: run["host_id"] as? String)
     }
 
     public func effectiveSettings() -> (raw: [String: Bool], effective: [String: Bool]) {
