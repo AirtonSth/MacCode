@@ -422,6 +422,108 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
     }
 
+    func test_agentAppFooter_refreshesFromDeliveredLedgerAfterUsageChanged() async throws {
+        // WHY: the production path is ledger record -> usage-changed signal ->
+        // selected-thread reload -> exact footer copy. Testing only the loader
+        // or only the notification leaves the regression that caused the chip
+        // to disappear unprotected.
+        let tmp = NSTemporaryDirectory() + "rc2-token-saver-composed-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [
+                .codex: FakeProviderRunner(provider: .codex),
+                .claude: FakeProviderRunner(provider: .claude)
+            ]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(),
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        vm.createThread(title: "Delivered ledger")
+        let threadId = try XCTUnwrap(vm.selectedThreadId)
+        let repo = TokenSaverSavingsRepository(db: db)
+        let loaderProbe = LedgerFooterLoadProbe()
+        vm.bindTokenSaverThreadFooter(
+            savingsRepo: repo,
+            isEligible: { true },
+            measuredLoader: { eligible, threadId, repo in
+                let ordinal = await loaderProbe.markStarted()
+                let result = await TokenSaverThreadFooterReload.loadMeasured(
+                    eligible: eligible,
+                    threadId: threadId,
+                    repo: repo
+                )
+                await loaderProbe.markFinished(ordinal)
+                return result
+            }
+        )
+
+        let initialLoad = await loaderProbe.waitForStart()
+        await loaderProbe.waitUntilFinished(initialLoad)
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0)
+
+        XCTAssertEqual(
+            try repo.record(
+                provider: "codex",
+                mode: "command-output",
+                inputTokens: 1_000,
+                outputTokens: 250,
+                delivered: true,
+                threadID: threadId.value.uuidString,
+                idempotencyKey: "composed-footer-1"
+            ),
+            750
+        )
+
+        let footerPublished = expectation(description: "selected thread footer published")
+        let cancellable = vm.$tokenSaverThreadMeasuredTokens
+            .combineLatest(vm.$tokenSaverThreadSavedTokens)
+            .sink { measured, displayed in
+                if measured == 750 && displayed >= 750 {
+                    footerPublished.fulfill()
+                }
+            }
+        defer { cancellable.cancel() }
+
+        NotificationCenter.default.post(
+            name: Notification.Name("rc2TokenSaverUsageChanged"),
+            object: nil
+        )
+        let refreshLoad = await loaderProbe.waitForStart()
+        await loaderProbe.waitUntilFinished(refreshLoad)
+        await fulfillment(of: [footerPublished], timeout: 5)
+
+        XCTAssertEqual(try repo.savedTokens(forThreadID: threadId.value.uuidString), 750)
+        XCTAssertEqual(vm.selectedThreadId, threadId)
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 750)
+        let footer = try XCTUnwrap(
+            AgentAppView.tokenSaverThreadFooterText(
+                displayTokens: vm.tokenSaverThreadSavedTokens,
+                measuredTokens: vm.tokenSaverThreadMeasuredTokens,
+                enabled: vm.tokenSaverFooterEnabled
+            )
+        )
+        XCTAssertEqual(
+            footer,
+            "Token Saver: \(AgentAppView.formatTokenCountForFooter(vm.tokenSaverThreadSavedTokens)) tokens saved (tool output, shorter answers, multi-turn cache)"
+        )
+        let chromeSource = try String(
+            contentsOfFile: "Sources/Surfaces/AgentChatTokenSaverChrome.swift",
+            encoding: .utf8
+        )
+        XCTAssertTrue(chromeSource.contains(".accessibilityIdentifier(\"agent.tokenSaver.threadFooter\")"))
+    }
+
     func test_formatTokenCount_millions() {
         XCTAssertEqual(AgentAppView.formatTokenCountForFooter(1_500_000), "1.5M")
         XCTAssertEqual(AgentAppView.formatTokenCountForFooter(12_000_000), "12M")
@@ -625,6 +727,50 @@ private actor SequencedFooterLoader {
         let continuations = resultWaiters.removeValue(forKey: call.ordinal) ?? []
         for continuation in continuations {
             continuation.resume(returning: call.result)
+        }
+    }
+}
+
+private actor LedgerFooterLoadProbe {
+    private var nextOrdinal = 0
+    private var pendingStarts: [Int] = []
+    private var startWaiters: [CheckedContinuation<Int, Never>] = []
+    private var finishedOrdinals = Set<Int>()
+    private var finishWaiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
+
+    func markStarted() -> Int {
+        let ordinal = nextOrdinal
+        nextOrdinal += 1
+        if let waiter = startWaiters.first {
+            startWaiters.removeFirst()
+            waiter.resume(returning: ordinal)
+        } else {
+            pendingStarts.append(ordinal)
+        }
+        return ordinal
+    }
+
+    func waitForStart() async -> Int {
+        if !pendingStarts.isEmpty {
+            return pendingStarts.removeFirst()
+        }
+        return await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func markFinished(_ ordinal: Int) {
+        finishedOrdinals.insert(ordinal)
+        let waiters = finishWaiters.removeValue(forKey: ordinal) ?? []
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    func waitUntilFinished(_ ordinal: Int) async {
+        if finishedOrdinals.contains(ordinal) { return }
+        await withCheckedContinuation { continuation in
+            finishWaiters[ordinal, default: []].append(continuation)
         }
     }
 }
