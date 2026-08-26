@@ -89,9 +89,31 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private var consumedRoutingReceipts: Set<String> = []
     private var selectedConversation: [String: String] = [:]
     private var generation: Int = 1
+
+    private struct QuarantinedBotState {
+        let wasUnpublished: Bool
+        let attachments: [String: [String: Any]]
+        let files: [String: [String: Any]]
+        let fileHandles: Set<String>
+        let filesLocation: String?
+        let fileGenerations: [String: Int]
+        let fileCAS: [String: String]
+        let fileHost: String?
+        let browser: [String: Any]?
+        let guest: [String: Any]?
+        let liveRun: [String: Any]?
+        let attention: [String: Any]?
+        let routing: [String: Any]?
+        let routingReceiptWasConsumed: Bool
+        let selectedConversation: String?
+    }
 #if DEBUG
     /// Exact per-write formatter path retained only for same-process A/B receipts.
     var useLegacySidecarDateFormatterForBenchmark = false
+
+    func isFileHandleExecutableForTesting(_ handle: String) -> Bool {
+        processIssuedFileHandles.contains(handle)
+    }
 #endif
 
     public init(db: SQLiteDB, store: BotStore, settings: SettingsStore, appSupportDirectory: URL) {
@@ -627,11 +649,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let bot = try requireBot(params)
         let botID = id(bot)
         guard unpublished.contains(botID) else { throw Error.invalidParams }
-        try store.delete(id: bot.id, now: now)
-        unpublished.remove(botID)
-        clearTransientState(botID: botID)
-        try? store.deleteQueuedFollowUps(botID: bot.id)
-        return receipt(requestID: requestID, status: .completed, botID: botID, readback: ["deleted": true, "unpublished": false])
+        return try deleteAndClean(
+            bot: bot,
+            requestID: requestID,
+            now: now,
+            extraReadback: ["unpublished": false]
+        )
     }
 
     private func save(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
@@ -658,21 +681,125 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return receipt(requestID: requestID, status: .accepted, botID: string(params, "bot_id"), readback: ["confirm_required": true])
         }
         let bot = try requireBot(params)
-        let botID = id(bot)
-        try store.delete(id: bot.id, now: now)
-        unpublished.remove(botID)
-        clearTransientState(botID: botID)
-        return receipt(requestID: requestID, status: .completed, botID: botID, readback: ["deleted": true])
+        return try deleteAndClean(bot: bot, requestID: requestID, now: now)
     }
 
-    private func clearTransientState(botID: String) {
-        attention.removeValue(forKey: botID)
-        liveRuns.removeValue(forKey: botID)
-        selectedConversation.removeValue(forKey: botID)
-        if let routing = routingPref.removeValue(forKey: botID),
-           let receiptID = routing["routing_receipt_id"] as? String {
-            consumedRoutingReceipts.remove(receiptID)
+    private func deleteAndClean(
+        bot: BotDefinition,
+        requestID: String,
+        now: Date,
+        extraReadback: [String: Any] = [:]
+    ) throws -> [String: Any] {
+        let botID = id(bot)
+        let quarantined = quarantineBotState(botID: botID)
+        do {
+            try store.delete(id: bot.id, now: now)
+        } catch {
+            restoreQuarantinedBotState(quarantined, botID: botID)
+            throw error
         }
+        try? store.deleteQueuedFollowUps(botID: bot.id)
+
+        var residuals: [String] = []
+        if quarantined.guest != nil {
+            if let onDockerClear {
+                do {
+                    try onDockerClear(bot.id)
+                } catch {
+                    residuals.append("container_runtime")
+                }
+            } else {
+                residuals.append("container_runtime")
+            }
+        }
+        do {
+            try BotGuestHome.wipe(appSupport: appSupport, botID: bot.id)
+        } catch {
+            residuals.append("guest_home")
+        }
+        residuals.append(contentsOf: persistSidecar().map { "sidecar:\($0)" })
+        residuals.sort()
+
+        var readback: [String: Any] = [
+            "deleted": true,
+            "cleanup_complete": residuals.isEmpty,
+            "cleanup_residuals": residuals,
+        ]
+        readback.merge(extraReadback) { _, new in new }
+        return receipt(
+            requestID: requestID,
+            status: residuals.isEmpty ? .completed : .partial,
+            botID: botID,
+            readback: readback
+        )
+    }
+
+    private func quarantineBotState(botID: String) -> QuarantinedBotState {
+        let botAttachments = attachments.filter { $0.value["bot_id"] as? String == botID }
+        let botFiles = files.filter { $0.value["bot_id"] as? String == botID }
+        let botFileHandles = Set(botFiles.keys)
+        let keyPrefix = "\(botID)|"
+        let botGenerations = fileGenerations.filter { $0.key.hasPrefix(keyPrefix) }
+        let botCAS = fileCAS.filter { $0.key.hasPrefix(keyPrefix) }
+        let routing = routingPref[botID]
+        let routingReceiptID = routing?["routing_receipt_id"] as? String
+        let quarantined = QuarantinedBotState(
+            wasUnpublished: unpublished.contains(botID),
+            attachments: botAttachments,
+            files: botFiles,
+            fileHandles: botFileHandles,
+            filesLocation: filesLocation[botID],
+            fileGenerations: botGenerations,
+            fileCAS: botCAS,
+            fileHost: fileHosts[botID],
+            browser: browser[botID],
+            guest: guest[botID],
+            liveRun: liveRuns[botID],
+            attention: attention[botID],
+            routing: routing,
+            routingReceiptWasConsumed: routingReceiptID.map(consumedRoutingReceipts.contains) ?? false,
+            selectedConversation: selectedConversation[botID]
+        )
+
+        unpublished.remove(botID)
+        for key in botAttachments.keys { attachments.removeValue(forKey: key) }
+        for key in botFiles.keys { files.removeValue(forKey: key) }
+        processIssuedFileHandles.subtract(botFileHandles)
+        filesLocation.removeValue(forKey: botID)
+        for key in botGenerations.keys { fileGenerations.removeValue(forKey: key) }
+        for key in botCAS.keys { fileCAS.removeValue(forKey: key) }
+        fileHosts.removeValue(forKey: botID)
+        browser.removeValue(forKey: botID)
+        guest.removeValue(forKey: botID)
+        liveRuns.removeValue(forKey: botID)
+        attention.removeValue(forKey: botID)
+        selectedConversation.removeValue(forKey: botID)
+        routingPref.removeValue(forKey: botID)
+        if let routingReceiptID { consumedRoutingReceipts.remove(routingReceiptID) }
+        return quarantined
+    }
+
+    private func restoreQuarantinedBotState(_ state: QuarantinedBotState, botID: String) {
+        if state.wasUnpublished { unpublished.insert(botID) }
+        attachments.merge(state.attachments) { _, restored in restored }
+        files.merge(state.files) { _, restored in restored }
+        processIssuedFileHandles.formUnion(state.fileHandles)
+        if let value = state.filesLocation { filesLocation[botID] = value }
+        fileGenerations.merge(state.fileGenerations) { _, restored in restored }
+        fileCAS.merge(state.fileCAS) { _, restored in restored }
+        if let value = state.fileHost { fileHosts[botID] = value }
+        if let value = state.browser { browser[botID] = value }
+        if let value = state.guest { guest[botID] = value }
+        if let value = state.liveRun { liveRuns[botID] = value }
+        if let value = state.attention { attention[botID] = value }
+        if let value = state.routing {
+            routingPref[botID] = value
+            if state.routingReceiptWasConsumed,
+               let receiptID = value["routing_receipt_id"] as? String {
+                consumedRoutingReceipts.insert(receiptID)
+            }
+        }
+        if let value = state.selectedConversation { selectedConversation[botID] = value }
     }
 
     private func setPinned(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
@@ -2806,31 +2933,13 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
             guest = decoded
         }
-        var staleRoutingReceiptIDs = Set<String>()
-        var routingWasPruned = false
         if let data = loadData("bot.remote.routing"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
-            if let liveBots = try? store.list(includeHidden: true) {
-                let liveBotIDs = Set(liveBots.map(id))
-                routingPref = decoded.filter { botID, routing in
-                    let live = liveBotIDs.contains(botID)
-                    if !live, let receiptID = routing["routing_receipt_id"] as? String {
-                        staleRoutingReceiptIDs.insert(receiptID)
-                    }
-                    return live
-                }
-                routingWasPruned = routingPref.count != decoded.count
-            } else {
-                routingPref = decoded
-            }
+            routingPref = decoded
         }
         if let data = loadData("bot.remote.routing_consumed"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String] {
-            consumedRoutingReceipts = Set(decoded).subtracting(staleRoutingReceiptIDs)
-        }
-        if routingWasPruned {
-            saveJSON("bot.remote.routing", routingPref)
-            saveJSON("bot.remote.routing_consumed", Array(consumedRoutingReceipts).sorted())
+            consumedRoutingReceipts = Set(decoded)
         }
         if let data = loadData("bot.remote.selected_conversations"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
@@ -2838,8 +2947,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
         if let data = loadData("bot.remote.attention"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
-            let liveBotIDs = Set(((try? store.list(includeHidden: true)) ?? []).map(id))
-            attention = decoded.filter { liveBotIDs.contains($0.key) }
+            attention = decoded
         }
         if let data = loadData("bot.remote.scheduler_runs"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
@@ -2849,6 +2957,54 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
             routineRuntime = decoded
         }
+        pruneRestoredSidecar()
+    }
+
+    private func pruneRestoredSidecar() {
+        guard let liveBots = try? store.list(includeHidden: true) else { return }
+        let liveBotIDs = Set(liveBots.map(id))
+        let staleGuestIDs = guest.keys.filter { !liveBotIDs.contains($0) }
+        let staleRoutingReceiptIDs = Set<String>(routingPref.compactMap { botID, routing in
+            guard !liveBotIDs.contains(botID) else { return nil }
+            return routing["routing_receipt_id"] as? String
+        })
+        var removed = 0
+        func retainLive<Value>(
+            _ values: inout [String: Value],
+            by botID: (String, Value) -> String?
+        ) {
+            let before = values.count
+            values = values.filter { key, value in
+                botID(key, value).map(liveBotIDs.contains) ?? false
+            }
+            removed += before - values.count
+        }
+
+        let unpublishedCount = unpublished.count
+        unpublished.formIntersection(liveBotIDs)
+        removed += unpublishedCount - unpublished.count
+
+        retainLive(&filesLocation) { key, _ in key }
+        retainLive(&files) { _, entry in entry["bot_id"] as? String }
+        retainLive(&fileGenerations) { key, _ in key.split(separator: "|", maxSplits: 1).first.map(String.init) }
+        retainLive(&fileCAS) { key, _ in key.split(separator: "|", maxSplits: 1).first.map(String.init) }
+        retainLive(&fileHosts) { key, _ in key }
+        retainLive(&browser) { key, _ in key }
+        retainLive(&guest) { key, _ in key }
+        retainLive(&routingPref) { key, _ in key }
+
+        let consumedCount = consumedRoutingReceipts.count
+        consumedRoutingReceipts.subtract(staleRoutingReceiptIDs)
+        removed += consumedCount - consumedRoutingReceipts.count
+
+        retainLive(&selectedConversation) { key, _ in key }
+        retainLive(&attention) { key, _ in key }
+
+        for botID in staleGuestIDs {
+            guard let uuid = UUID(uuidString: botID) else { continue }
+            try? BotGuestHome.wipe(appSupport: appSupport, botID: BotID(uuid))
+        }
+        if removed > 0 { persistSidecar() }
     }
 
     private func migrateSidecarQueueIfNeeded() {
@@ -2878,27 +3034,33 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         saveJSON("bot.remote.queue", [String: Any]())
     }
 
-    private func persistSidecar() {
-        saveJSON("bot.remote.unpublished", Array(unpublished).sorted())
-        saveJSON("bot.remote.receipts", persistentReceiptSnapshot())
-        saveJSON("bot.remote.files_location", filesLocation)
-        saveJSON("bot.remote.file_grants", files)
-        saveJSON("bot.remote.file_generations", fileGenerations)
-        saveJSON("bot.remote.file_cas", fileCAS)
-        saveJSON("bot.remote.file_hosts", fileHosts)
-        saveJSON("bot.remote.browser_state", browser)
-        saveJSON("bot.remote.guest_state", guest.mapValues { state in
+    @discardableResult
+    private func persistSidecar() -> [String] {
+        var failed: [String] = []
+        func save(_ key: String, _ value: Any) {
+            if !saveJSON(key, value) { failed.append(key) }
+        }
+        save("bot.remote.unpublished", Array(unpublished).sorted())
+        save("bot.remote.receipts", persistentReceiptSnapshot())
+        save("bot.remote.files_location", filesLocation)
+        save("bot.remote.file_grants", files)
+        save("bot.remote.file_generations", fileGenerations)
+        save("bot.remote.file_cas", fileCAS)
+        save("bot.remote.file_hosts", fileHosts)
+        save("bot.remote.browser_state", browser)
+        save("bot.remote.guest_state", guest.mapValues { state in
             var projected = state
             projected["frame"] = nil
             projected["input"] = nil
             return projected
         })
-        saveJSON("bot.remote.routing", routingPref)
-        saveJSON("bot.remote.routing_consumed", Array(consumedRoutingReceipts).sorted())
-        saveJSON("bot.remote.selected_conversations", selectedConversation)
-        saveJSON("bot.remote.attention", attention)
-        saveJSON("bot.remote.scheduler_runs", schedulerRuns)
-        saveJSON("bot.remote.routine_runtime", routineRuntime)
+        save("bot.remote.routing", routingPref)
+        save("bot.remote.routing_consumed", Array(consumedRoutingReceipts).sorted())
+        save("bot.remote.selected_conversations", selectedConversation)
+        save("bot.remote.attention", attention)
+        save("bot.remote.scheduler_runs", schedulerRuns)
+        save("bot.remote.routine_runtime", routineRuntime)
+        return failed
     }
 
     /// Frame bytes stay available to the live receipt/state read path, but are
@@ -2950,10 +3112,11 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return array
     }
 
-    private func saveJSON(_ key: String, _ value: Any) {
+    @discardableResult
+    private func saveJSON(_ key: String, _ value: Any) -> Bool {
         guard JSONSerialization.isValidJSONObject(value),
               let data = try? JSONSerialization.data(withJSONObject: value),
-              let text = String(data: data, encoding: .utf8) else { return }
+              let text = String(data: data, encoding: .utf8) else { return false }
 #if DEBUG
         let timestamp = useLegacySidecarDateFormatterForBenchmark
             ? ISO8601DateFormatter().string(from: Date())
@@ -2961,15 +3124,20 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 #else
         let timestamp = iso.string(from: Date())
 #endif
-        try? db.performSync { database in
-            let statement = try database.prepare(
-                "INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;"
-            )
-            defer { statement.reset() }
-            try statement.bind(1, key)
-            try statement.bind(2, text)
-            try statement.bind(3, timestamp)
-            _ = try statement.step()
+        do {
+            try db.performSync { database in
+                let statement = try database.prepare(
+                    "INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;"
+                )
+                defer { statement.reset() }
+                try statement.bind(1, key)
+                try statement.bind(2, text)
+                try statement.bind(3, timestamp)
+                _ = try statement.step()
+            }
+            return true
+        } catch {
+            return false
         }
     }
 }

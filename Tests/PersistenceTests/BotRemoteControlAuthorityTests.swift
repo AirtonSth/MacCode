@@ -1703,6 +1703,187 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         )
     }
 
+    func test_deleteQuarantinesOnlyExactBotFileAndGuestAuthority() throws {
+        // WHY: a terminal delete receipt must mean Bot A has no executable
+        // file/viewer authority while Bot B's independent grants remain live.
+        let a = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "cleanup-a-create", "name": "Delete A",
+        ])
+        let b = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "cleanup-b-create", "name": "Keep B",
+        ])
+        let aID = try XCTUnwrap(a["bot_id"] as? String)
+        let bID = try XCTUnwrap(b["bot_id"] as? String)
+        let aGrant = try fileRootGrant(botID: aID, hostID: "host-a")
+        let bGrant = try fileRootGrant(botID: bID, hostID: "host-b")
+        _ = try guestState(botID: aID)
+        _ = try guestState(botID: bID)
+        let aUUID = try XCTUnwrap(UUID(uuidString: aID))
+        let bUUID = try XCTUnwrap(UUID(uuidString: bID))
+        _ = try BotGuestHome.ensure(appSupport: supportDir, botID: BotID(aUUID))
+        _ = try BotGuestHome.ensure(appSupport: supportDir, botID: BotID(bUUID))
+        var teardownCount = 0
+        authority.onDockerClear = { id in
+            XCTAssertEqual(id, BotID(aUUID))
+            XCTAssertFalse(self.authority.isFileHandleExecutableForTesting(aGrant.handle),
+                           "A grants must be quarantined before external teardown")
+            teardownCount += 1
+        }
+
+        let deleted = try authority.dispatch(method: "bot.delete", params: [
+            "client_request_id": "cleanup-a-delete", "bot_id": aID, "confirm": "delete",
+        ])
+        let readback = try XCTUnwrap(deleted["readback"] as? [String: Any])
+        XCTAssertEqual(deleted["status"] as? String, "completed")
+        XCTAssertEqual(readback["cleanup_complete"] as? Bool, true)
+        XCTAssertEqual(teardownCount, 1)
+        XCTAssertFalse(authority.isFileHandleExecutableForTesting(aGrant.handle))
+        XCTAssertTrue(authority.isFileHandleExecutableForTesting(bGrant.handle))
+
+        let grants = try sidecarObject("bot.remote.file_grants")
+        XCTAssertFalse(grants.values.contains { ($0 as? [String: Any])?["bot_id"] as? String == aID })
+        XCTAssertTrue(grants.values.contains { ($0 as? [String: Any])?["bot_id"] as? String == bID })
+        XCTAssertFalse(try sidecarObject("bot.remote.file_generations").keys.contains { $0.hasPrefix("\(aID)|") })
+        XCTAssertFalse(try sidecarObject("bot.remote.file_cas").keys.contains { $0.hasPrefix("\(aID)|") })
+        XCTAssertNil(try sidecarObject("bot.remote.guest_state")[aID])
+        XCTAssertNotNil(try sidecarObject("bot.remote.guest_state")[bID])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: BotGuestHome.url(appSupport: supportDir, botID: BotID(aUUID)).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: BotGuestHome.url(appSupport: supportDir, botID: BotID(bUUID)).path))
+
+        _ = try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "cleanup-b-write", "host_id": "host-b", "bot_id": bID,
+            "root_handle": bGrant.handle, "expected_generation": bGrant.generation,
+            "expected_cas": bGrant.cas, "relative_path": "preserved.txt", "op": "write",
+            "contents": "B",
+        ])
+    }
+
+    func test_deleteRestoresQuarantineWhenBotStoreDeleteFails() throws {
+        // WHY: quarantine precedes BotStore deletion, but a failed durable
+        // tombstone must restore A because no terminal delete receipt exists.
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "rollback-create", "name": "Rollback A",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let grant = try fileRootGrant(botID: botID, hostID: "host-a")
+        _ = try guestState(botID: botID)
+        try db.execute("""
+            CREATE TRIGGER fail_bot_delete
+            BEFORE UPDATE OF deleted_at ON bots
+            WHEN OLD.id = '\(botID)'
+            BEGIN SELECT RAISE(ABORT, 'injected bot delete failure'); END;
+            """)
+        var teardownCount = 0
+        authority.onDockerClear = { _ in teardownCount += 1 }
+
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.delete", params: [
+            "client_request_id": "rollback-delete", "bot_id": botID, "confirm": "delete",
+        ]))
+        XCTAssertEqual(teardownCount, 0, "external teardown starts only after the durable tombstone")
+        XCTAssertNotNil(try store.get(id: BotID(try XCTUnwrap(UUID(uuidString: botID)))))
+        _ = try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "rollback-write", "host_id": "host-a", "bot_id": botID,
+            "root_handle": grant.handle, "expected_generation": grant.generation,
+            "expected_cas": grant.cas, "relative_path": "still-authorized.txt", "op": "write",
+            "contents": "restored",
+        ])
+    }
+
+    func test_deleteTeardownFailureIsPartialAndNeverReplays() throws {
+        // WHY: response loss or an external teardown error must not dispatch a
+        // destructive cleanup twice or masquerade as a fully completed delete.
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "partial-create", "name": "Partial A",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        _ = try guestState(botID: botID)
+        var teardownCount = 0
+        authority.onDockerClear = { _ in
+            teardownCount += 1
+            throw BotRemoteControlAuthority.Error(code: -32088, message: "injected teardown failure")
+        }
+        let params: [String: Any] = [
+            "client_request_id": "partial-delete", "bot_id": botID, "confirm": "delete",
+        ]
+
+        let first = try authority.dispatch(method: "bot.delete", params: params)
+        let replay = try authority.dispatch(method: "bot.delete", params: params)
+        XCTAssertEqual(first["status"] as? String, "partial")
+        XCTAssertEqual(replay["receipt_id"] as? String, first["receipt_id"] as? String)
+        XCTAssertEqual(teardownCount, 1)
+        let readback = try XCTUnwrap(first["readback"] as? [String: Any])
+        XCTAssertEqual(readback["cleanup_complete"] as? Bool, false)
+        XCTAssertEqual(readback["cleanup_residuals"] as? [String], ["container_runtime"])
+        XCTAssertNil(try sidecarObject("bot.remote.guest_state")[botID])
+    }
+
+    func test_deleteSidecarFailureIsPartialAndRelaunchPrunesLegacyAuthority() throws {
+        // WHY: a sidecar write can fail after BotStore commits. The receipt must
+        // expose that residual, and relaunch must heal stale A without touching B.
+        let a = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "sidecar-a-create", "name": "Delete A",
+        ])
+        let b = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "sidecar-b-create", "name": "Keep B",
+        ])
+        let aID = try XCTUnwrap(a["bot_id"] as? String)
+        let bID = try XCTUnwrap(b["bot_id"] as? String)
+        let aGrant = try fileRootGrant(botID: aID)
+        let bGrant = try fileRootGrant(botID: bID)
+        for (prefix, botID, grant) in [("a", aID, aGrant), ("b", bID, bGrant)] {
+            _ = try authority.dispatch(method: "bot.files.mutate", params: [
+                "client_request_id": "sidecar-\(prefix)-write", "bot_id": botID,
+                "root_handle": grant.handle, "expected_generation": grant.generation,
+                "expected_cas": grant.cas, "relative_path": "state.txt", "op": "write",
+                "contents": prefix,
+            ])
+        }
+        _ = try guestState(botID: aID)
+        _ = try guestState(botID: bID)
+        authority.onDockerClear = { _ in }
+        try db.execute("""
+            CREATE TRIGGER fail_cleanup_sidecars
+            BEFORE UPDATE ON settings
+            WHEN OLD.key IN (
+                'bot.remote.file_grants', 'bot.remote.file_generations',
+                'bot.remote.file_cas', 'bot.remote.guest_state'
+            )
+            BEGIN SELECT RAISE(ABORT, 'injected cleanup sidecar failure'); END;
+            """)
+
+        let deleted = try authority.dispatch(method: "bot.delete", params: [
+            "client_request_id": "sidecar-a-delete", "bot_id": aID, "confirm": "delete",
+        ])
+        XCTAssertEqual(deleted["status"] as? String, "partial")
+        let residuals = Set((deleted["readback"] as? [String: Any])?["cleanup_residuals"] as? [String] ?? [])
+        XCTAssertEqual(residuals, [
+            "sidecar:bot.remote.file_cas", "sidecar:bot.remote.file_generations",
+            "sidecar:bot.remote.file_grants", "sidecar:bot.remote.guest_state",
+        ])
+        XCTAssertTrue(try sidecarObject("bot.remote.file_grants").values.contains {
+            ($0 as? [String: Any])?["bot_id"] as? String == aID
+        })
+        XCTAssertNotNil(try sidecarObject("bot.remote.guest_state")[aID])
+
+        try db.execute("DROP TRIGGER fail_cleanup_sidecars;")
+        let relaunched = BotRemoteControlAuthority(
+            db: db, store: store, settings: settings, appSupportDirectory: supportDir
+        )
+        let healedGrants = try sidecarObject("bot.remote.file_grants")
+        XCTAssertFalse(healedGrants.values.contains { ($0 as? [String: Any])?["bot_id"] as? String == aID })
+        XCTAssertTrue(healedGrants.values.contains { ($0 as? [String: Any])?["bot_id"] as? String == bID })
+        XCTAssertFalse(try sidecarObject("bot.remote.file_generations").keys.contains { $0.hasPrefix("\(aID)|") })
+        XCTAssertTrue(try sidecarObject("bot.remote.file_generations").keys.contains { $0.hasPrefix("\(bID)|") })
+        XCTAssertFalse(try sidecarObject("bot.remote.file_cas").keys.contains { $0.hasPrefix("\(aID)|") })
+        XCTAssertTrue(try sidecarObject("bot.remote.file_cas").keys.contains { $0.hasPrefix("\(bID)|") })
+        XCTAssertNil(try sidecarObject("bot.remote.guest_state")[aID])
+        XCTAssertNotNil(try sidecarObject("bot.remote.guest_state")[bID])
+        let receipt = try relaunched.dispatch(method: "bot.receipt.status", params: [
+            "client_request_id": "sidecar-a-delete",
+        ])
+        XCTAssertEqual(receipt["status"] as? String, "partial", "receipt history remains audit-only")
+    }
+
     func test_discardNewClearsOnlyThatBotsTransientState() throws {
         // WHY: canceling an unpublished Bot uses the same destructive boundary
         // as delete and must not leave its run/attention beside another Bot.
@@ -1720,6 +1901,28 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let selections = try sidecarObject("bot.remote.selected_conversations")
         XCTAssertNil(selections[discarded.botID])
         XCTAssertEqual(selections[survivor.botID] as? String, survivor.conversationID)
+    }
+
+    func test_discardNewUsesTheSameExactGrantAndGuestCleanupBoundary() throws {
+        // WHY: cancelling an unpublished Bot must not leave a weaker cleanup
+        // boundary than confirmed delete.
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "discard-cleanup-create", "name": "Discard A",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        _ = try fileRootGrant(botID: botID)
+        _ = try guestState(botID: botID)
+        authority.onDockerClear = { _ in }
+
+        let discarded = try authority.dispatch(method: "bot.discard_new", params: [
+            "client_request_id": "discard-cleanup", "bot_id": botID,
+        ])
+        XCTAssertEqual(discarded["status"] as? String, "completed")
+        XCTAssertEqual((discarded["readback"] as? [String: Any])?["cleanup_complete"] as? Bool, true)
+        XCTAssertFalse(try sidecarObject("bot.remote.file_grants").values.contains {
+            ($0 as? [String: Any])?["bot_id"] as? String == botID
+        })
+        XCTAssertNil(try sidecarObject("bot.remote.guest_state")[botID])
     }
 
     func test_discardNewClearsOnlyExactRoutingAcrossRelaunch() throws {
