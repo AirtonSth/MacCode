@@ -2954,10 +2954,21 @@ public final class BotsViewModel: ObservableObject {
     @Published public var studioDraft = BotStudioDraft() {
         didSet { persistStudioDraftIfHydrated() }
     }
-    @Published public var composerText: String = "" {
-        didSet { persistComposerIfHydrated() }
+    /// Keep live composer edits and caret movement off the Desk view model that
+    /// owns the transcript and live timeline. The computed proxies preserve the
+    /// existing API while publishing both fields only to the composer subtree.
+    public let composerState = BotsComposerState()
+    public var composerText: String {
+        get { composerState.text }
+        set {
+            composerState.text = newValue
+            persistComposerIfHydrated()
+        }
     }
-    @Published public var composerCursorOffset: Int? = nil
+    public var composerCursorOffset: Int? {
+        get { composerState.cursorOffset }
+        set { composerState.cursorOffset = newValue }
+    }
     @Published public var attachments: [AgentAttachment] = [] {
         didSet { persistComposerIfHydrated() }
     }
@@ -9933,6 +9944,15 @@ struct BotsComposerTimelineSchedule: TimelineSchedule {
     }
 }
 
+/// Scopes composer observation so a keystroke does not invalidate the enclosing
+/// Desk body, which also owns the transcript and live replay projection.
+private struct BotsComposerReactiveScope<Content: View>: View {
+    @ObservedObject var composerState: BotsComposerState
+    @ViewBuilder var content: () -> Content
+
+    var body: some View { content() }
+}
+
 public struct BotsRootView: View {
     @ObservedObject private var vm: BotsViewModel
     /// Standalone Bots window keeps its own rail. The main shell hosts the
@@ -10652,7 +10672,9 @@ public struct BotsRootView: View {
                 if !vm.queuedFollowUps.isEmpty {
                     deskQueuedFollowUps
                 }
-                composerBar(bot)
+                BotsComposerReactiveScope(composerState: vm.composerState) {
+                    composerBar(bot)
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             if vm.isDeskSidePaneVisible {
