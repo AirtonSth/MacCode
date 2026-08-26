@@ -70,6 +70,7 @@ struct TimelineItemIndex: Sendable, Equatable {
 @MainActor
 public final class AgentComposerState: ObservableObject {
     @Published public var prompt: String = ""
+    @Published public var cursorOffset: Int? = nil
 }
 
 /// Stream/transcript paint state on its OWN ObservableObject so token/tool storms
@@ -309,7 +310,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // suggestions anchor at the actual insertion point, not text.endIndex.
     // nil means "not yet reported by the editor" -- suggestions fall back to
     // the endIndex anchor so programmatic prompt mutations (tests, /clear) work.
-    @Published public var composerCursorOffset: Int? = nil
+    // Keep the public proxy so existing vm.composerCursorOffset call sites stay
+    // unchanged while cursor updates publish only through composerState.
+    public var composerCursorOffset: Int? {
+        get { composerState.cursorOffset }
+        set { composerState.cursorOffset = newValue }
+    }
     @Published public var provider: AgentProvider = .codex
     @Published public var providerInstanceId: String = AgentProvider.codex.rawValue
     /// macOS account that will execute the next provider process through the shared helper.
@@ -1046,6 +1052,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// onto closed VMs until ARC collects the weak observer.
     public func dispose() {
         guard !isDisposed else { return }
+        if let selectedThreadId { persistComposerDraft(for: selectedThreadId) }
         isDisposed = true
         AgentWorkspaceRailReloadCoordinator.shared.unregister(self)
         stopScheduledLivePoll()
@@ -1538,21 +1545,80 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// IMP-MAC_AGENT-011: unsent composer state, keyed by thread and persisted
     /// so text, attachments, and interaction mode survive switching/relaunch.
     private var composerDraftsByThread: [AgentThreadID: [String: AgentThreadDraft]] = [:]
+    private static let composerDraftPersistenceDelayNanoseconds: UInt64 = 250_000_000
+    private var composerDraftPersistenceTask: Task<Void, Never>?
+    private var pendingComposerDraftPersistenceThreadID: AgentThreadID?
+    private var pendingComposerDraftPersistenceProviderInstanceID: String?
     private var providerThreadSnapshotConfirmedAtByThread: [AgentThreadID: Date] = [:]
 
-    private func persistComposerDraft(for threadId: AgentThreadID) {
-        let draft = AgentThreadDraft(
+    private func makeComposerDraft(for threadId: AgentThreadID) -> AgentThreadDraft {
+        AgentThreadDraft(
             threadId: threadId,
             providerInstanceId: providerInstanceId,
             text: prompt,
             attachments: attachments,
             interactionMode: interactionMode
         )
-        composerDraftsByThread[threadId, default: [:]][providerInstanceId] = draft
+    }
+
+    private func cacheComposerDraft(_ draft: AgentThreadDraft) {
+        composerDraftsByThread[draft.threadId, default: [:]][draft.providerInstanceId] = draft
+    }
+
+    private func persistComposerDraftToRepository(_ draft: AgentThreadDraft) {
         do {
             try draftRepo?.upsert(draft)
         } catch {
             statusMessage = "Draft save failed: \(error)"
+        }
+    }
+
+    private func cancelPendingComposerDraftPersistence() {
+        composerDraftPersistenceTask?.cancel()
+        composerDraftPersistenceTask = nil
+        pendingComposerDraftPersistenceThreadID = nil
+        pendingComposerDraftPersistenceProviderInstanceID = nil
+    }
+
+    private func cancelPendingComposerDraftPersistence(
+        for threadId: AgentThreadID,
+        providerInstanceId: String
+    ) {
+        guard pendingComposerDraftPersistenceThreadID == threadId,
+              pendingComposerDraftPersistenceProviderInstanceID == providerInstanceId else {
+            return
+        }
+        cancelPendingComposerDraftPersistence()
+    }
+
+    private func persistComposerDraft(for threadId: AgentThreadID) {
+        cancelPendingComposerDraftPersistence()
+        let draft = makeComposerDraft(for: threadId)
+        cacheComposerDraft(draft)
+        persistComposerDraftToRepository(draft)
+    }
+
+    private func scheduleComposerDraftPersistence(for threadId: AgentThreadID) {
+        let draft = makeComposerDraft(for: threadId)
+        cacheComposerDraft(draft)
+        cancelPendingComposerDraftPersistence()
+        pendingComposerDraftPersistenceThreadID = draft.threadId
+        pendingComposerDraftPersistenceProviderInstanceID = draft.providerInstanceId
+        composerDraftPersistenceTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: Self.composerDraftPersistenceDelayNanoseconds)
+            } catch {
+                return
+            }
+            guard let self, !self.isDisposed else { return }
+            guard self.pendingComposerDraftPersistenceThreadID == draft.threadId,
+                  self.pendingComposerDraftPersistenceProviderInstanceID == draft.providerInstanceId else {
+                return
+            }
+            self.composerDraftPersistenceTask = nil
+            self.pendingComposerDraftPersistenceThreadID = nil
+            self.pendingComposerDraftPersistenceProviderInstanceID = nil
+            self.persistComposerDraftToRepository(draft)
         }
     }
 
@@ -1578,11 +1644,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     private func clearComposerDraft(threadId: AgentThreadID, providerInstanceId: String) throws {
+        cancelPendingComposerDraftPersistence(
+            for: threadId,
+            providerInstanceId: providerInstanceId
+        )
         try draftRepo?.delete(threadId: threadId, providerInstanceId: providerInstanceId)
         clearComposerDraftMemory(threadId: threadId, providerInstanceId: providerInstanceId)
     }
 
     private func clearComposerDraftMemory(threadId: AgentThreadID, providerInstanceId: String) {
+        cancelPendingComposerDraftPersistence(
+            for: threadId,
+            providerInstanceId: providerInstanceId
+        )
         composerDraftsByThread[threadId]?.removeValue(forKey: providerInstanceId)
         if composerDraftsByThread[threadId]?.isEmpty == true {
             composerDraftsByThread.removeValue(forKey: threadId)
@@ -6270,7 +6344,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
     public func promptWasEdited() {
         promptHistoryCursor = nil
-        if let selectedThreadId { persistComposerDraft(for: selectedThreadId) }
+        if let selectedThreadId { scheduleComposerDraftPersistence(for: selectedThreadId) }
     }
     public func removeAttachment(_ attachment: AgentAttachment) {
         attachments.removeAll { $0 == attachment }
