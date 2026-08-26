@@ -666,6 +666,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         attention.removeValue(forKey: botID)
         liveRuns.removeValue(forKey: botID)
         selectedConversation.removeValue(forKey: botID)
+        if let routing = routingPref.removeValue(forKey: botID),
+           let receiptID = routing["routing_receipt_id"] as? String {
+            consumedRoutingReceipts.remove(receiptID)
+        }
     }
 
     private func setPinned(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
@@ -2615,13 +2619,31 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
             guest = decoded
         }
+        var staleRoutingReceiptIDs = Set<String>()
+        var routingWasPruned = false
         if let data = loadData("bot.remote.routing"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
-            routingPref = decoded
+            if let liveBots = try? store.list(includeHidden: true) {
+                let liveBotIDs = Set(liveBots.map(id))
+                routingPref = decoded.filter { botID, routing in
+                    let live = liveBotIDs.contains(botID)
+                    if !live, let receiptID = routing["routing_receipt_id"] as? String {
+                        staleRoutingReceiptIDs.insert(receiptID)
+                    }
+                    return live
+                }
+                routingWasPruned = routingPref.count != decoded.count
+            } else {
+                routingPref = decoded
+            }
         }
         if let data = loadData("bot.remote.routing_consumed"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String] {
-            consumedRoutingReceipts = Set(decoded)
+            consumedRoutingReceipts = Set(decoded).subtracting(staleRoutingReceiptIDs)
+        }
+        if routingWasPruned {
+            saveJSON("bot.remote.routing", routingPref)
+            saveJSON("bot.remote.routing_consumed", Array(consumedRoutingReceipts).sorted())
         }
         if let data = loadData("bot.remote.selected_conversations"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: String] {

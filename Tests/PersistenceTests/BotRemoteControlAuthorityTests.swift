@@ -100,6 +100,19 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         return object
     }
 
+    private func sidecarStringSet(_ key: String) throws -> Set<String> {
+        let statement = try db.prepare("SELECT value FROM settings WHERE key = ? LIMIT 1;")
+        defer { statement.reset() }
+        try statement.bind(1, key)
+        guard try statement.step(),
+              let text = statement.columnText(0),
+              let data = text.data(using: .utf8),
+              let values = try JSONSerialization.jsonObject(with: data) as? [String] else {
+            return []
+        }
+        return Set(values)
+    }
+
     private func createLiveBot(
         prefix: String,
         name: String
@@ -1482,6 +1495,51 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(Set((restored["items"] as? [[String: Any]] ?? []).compactMap { $0["bot_id"] as? String }), [survivor.botID])
     }
 
+    func test_deleteClearsOnlyExactRoutingAndConsumedReceiptAcrossRelaunch() throws {
+        // WHY: deleting Bot A must not leave executable routing authority for
+        // A or disturb Bot B's independent route, including after relaunch.
+        let a = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "route-delete-a-create", "name": "Delete A",
+        ])
+        let b = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "route-delete-b-create", "name": "Keep B",
+        ])
+        let aID = try XCTUnwrap(a["bot_id"] as? String)
+        let bID = try XCTUnwrap(b["bot_id"] as? String)
+        let routeA = try authority.dispatch(method: "bot.routing.set", params: [
+            "client_request_id": "route-delete-a", "bot_id": aID,
+            "provider": "grok", "provider_instance_id": "grok-a", "routing_mode": "auto",
+        ])
+        let routeB = try authority.dispatch(method: "bot.routing.set", params: [
+            "client_request_id": "route-delete-b", "bot_id": bID,
+            "provider": "codex", "provider_instance_id": "codex-b", "routing_mode": "auto",
+        ])
+        let aReceipt = try XCTUnwrap(routeA["receipt_id"] as? String)
+        let bReceipt = try XCTUnwrap(routeB["receipt_id"] as? String)
+        var send = try XCTUnwrap(routeA["readback"] as? [String: Any])
+        send["client_request_id"] = "route-delete-a-send"
+        send["text"] = "consume exact route"
+        _ = try authority.dispatch(method: "bot.send", params: send)
+        XCTAssertTrue(try sidecarStringSet("bot.remote.routing_consumed").contains(aReceipt))
+
+        _ = try authority.dispatch(method: "bot.delete", params: [
+            "client_request_id": "route-delete-a-confirm", "bot_id": aID, "confirm": "delete",
+        ])
+
+        let persisted = try sidecarObject("bot.remote.routing")
+        XCTAssertNil(persisted[aID])
+        XCTAssertEqual((persisted[bID] as? [String: Any])?["routing_receipt_id"] as? String, bReceipt)
+        XCTAssertFalse(try sidecarStringSet("bot.remote.routing_consumed").contains(aReceipt))
+
+        let relaunched = BotRemoteControlAuthority(
+            db: db, store: store, settings: settings, appSupportDirectory: supportDir
+        )
+        let surviving = try relaunched.dispatch(method: "bot.get", params: ["bot_id": bID])
+        XCTAssertEqual(
+            ((surviving["routing"] as? [String: Any])?["routing_receipt_id"] as? String), bReceipt
+        )
+    }
+
     func test_discardNewClearsOnlyThatBotsTransientState() throws {
         // WHY: canceling an unpublished Bot uses the same destructive boundary
         // as delete and must not leave its run/attention beside another Bot.
@@ -1499,6 +1557,70 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let selections = try sidecarObject("bot.remote.selected_conversations")
         XCTAssertNil(selections[discarded.botID])
         XCTAssertEqual(selections[survivor.botID] as? String, survivor.conversationID)
+    }
+
+    func test_discardNewClearsOnlyExactRoutingAcrossRelaunch() throws {
+        // WHY: canceling unpublished Bot A shares the delete boundary and must
+        // preserve unpublished Bot B's separate routing authority.
+        let a = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "route-discard-a-create", "name": "Discard A",
+        ])
+        let b = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "route-discard-b-create", "name": "Keep B",
+        ])
+        let aID = try XCTUnwrap(a["bot_id"] as? String)
+        let bID = try XCTUnwrap(b["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.routing.set", params: [
+            "client_request_id": "route-discard-a", "bot_id": aID, "provider_instance_id": "grok-a",
+        ])
+        let routeB = try authority.dispatch(method: "bot.routing.set", params: [
+            "client_request_id": "route-discard-b", "bot_id": bID, "provider_instance_id": "grok-b",
+        ])
+        let bReceipt = try XCTUnwrap(routeB["receipt_id"] as? String)
+
+        _ = try authority.dispatch(method: "bot.discard_new", params: [
+            "client_request_id": "route-discard-a-confirm", "bot_id": aID,
+        ])
+
+        let persisted = try sidecarObject("bot.remote.routing")
+        XCTAssertNil(persisted[aID])
+        XCTAssertEqual((persisted[bID] as? [String: Any])?["routing_receipt_id"] as? String, bReceipt)
+        let relaunched = BotRemoteControlAuthority(
+            db: db, store: store, settings: settings, appSupportDirectory: supportDir
+        )
+        let surviving = try relaunched.dispatch(method: "bot.get", params: ["bot_id": bID])
+        XCTAssertEqual(
+            ((surviving["routing"] as? [String: Any])?["routing_receipt_id"] as? String), bReceipt
+        )
+    }
+
+    func test_relaunchPrunesLegacyRoutingForDeletedBotWithoutTouchingLiveBot() throws {
+        // WHY: installs upgrading from the defective build already contain
+        // tombstones, so relaunch must heal them without rewriting live routes.
+        let a = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "legacy-route-a-create", "name": "Deleted A",
+        ])
+        let b = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "legacy-route-b-create", "name": "Keep B",
+        ])
+        let aID = try XCTUnwrap(a["bot_id"] as? String)
+        let bID = try XCTUnwrap(b["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.routing.set", params: [
+            "client_request_id": "legacy-route-a", "bot_id": aID, "provider_instance_id": "grok-a",
+        ])
+        let routeB = try authority.dispatch(method: "bot.routing.set", params: [
+            "client_request_id": "legacy-route-b", "bot_id": bID, "provider_instance_id": "grok-b",
+        ])
+        let bReceipt = try XCTUnwrap(routeB["receipt_id"] as? String)
+        try store.delete(id: BotID(try XCTUnwrap(UUID(uuidString: aID))))
+
+        _ = BotRemoteControlAuthority(
+            db: db, store: store, settings: settings, appSupportDirectory: supportDir
+        )
+
+        let persisted = try sidecarObject("bot.remote.routing")
+        XCTAssertNil(persisted[aID])
+        XCTAssertEqual((persisted[bID] as? [String: Any])?["routing_receipt_id"] as? String, bReceipt)
     }
 
     func test_relaunchFiltersLegacyAttentionForDeletedBots() throws {
