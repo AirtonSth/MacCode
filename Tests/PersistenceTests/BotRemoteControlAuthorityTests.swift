@@ -1720,6 +1720,12 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         _ = try guestState(botID: bID)
         let aUUID = try XCTUnwrap(UUID(uuidString: aID))
         let bUUID = try XCTUnwrap(UUID(uuidString: bID))
+        let aBot = try XCTUnwrap(store.get(id: BotID(aUUID)))
+        let bBot = try XCTUnwrap(store.get(id: BotID(bUUID)))
+        let aHome = BotHome(appSupportDirectory: supportDir, bot: aBot)
+        let bHome = BotHome(appSupportDirectory: supportDir, bot: bBot)
+        try aHome.ensure(name: aBot.name, handle: aBot.handle, title: aBot.title, description: "A", soul: "A")
+        try bHome.ensure(name: bBot.name, handle: bBot.handle, title: bBot.title, description: "B", soul: "B")
         _ = try BotGuestHome.ensure(appSupport: supportDir, botID: BotID(aUUID))
         _ = try BotGuestHome.ensure(appSupport: supportDir, botID: BotID(bUUID))
         var teardownCount = 0
@@ -1749,6 +1755,8 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertNotNil(try sidecarObject("bot.remote.guest_state")[bID])
         XCTAssertFalse(FileManager.default.fileExists(atPath: BotGuestHome.url(appSupport: supportDir, botID: BotID(aUUID)).path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: BotGuestHome.url(appSupport: supportDir, botID: BotID(bUUID)).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: aHome.root.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bHome.root.path))
 
         _ = try authority.dispatch(method: "bot.files.mutate", params: [
             "client_request_id": "cleanup-b-write", "host_id": "host-b", "bot_id": bID,
@@ -1922,6 +1930,10 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "client_request_id": "discard-cleanup-create", "name": "Discard A",
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let botUUID = try XCTUnwrap(UUID(uuidString: botID))
+        let bot = try XCTUnwrap(store.get(id: BotID(botUUID)))
+        let home = BotHome(appSupportDirectory: supportDir, bot: bot)
+        try home.ensure(name: bot.name, handle: bot.handle, title: bot.title, description: "discard", soul: "discard")
         _ = try fileRootGrant(botID: botID)
         _ = try guestState(botID: botID)
         authority.onDockerClear = { _ in }
@@ -1929,8 +1941,13 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let discarded = try authority.dispatch(method: "bot.discard_new", params: [
             "client_request_id": "discard-cleanup", "bot_id": botID,
         ])
+        let replay = try authority.dispatch(method: "bot.discard_new", params: [
+            "client_request_id": "discard-cleanup", "bot_id": botID,
+        ])
         XCTAssertEqual(discarded["status"] as? String, "completed")
+        XCTAssertEqual(replay["receipt_id"] as? String, discarded["receipt_id"] as? String)
         XCTAssertEqual((discarded["readback"] as? [String: Any])?["cleanup_complete"] as? Bool, true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.root.path))
         XCTAssertFalse(try sidecarObject("bot.remote.file_grants").values.contains {
             ($0 as? [String: Any])?["bot_id"] as? String == botID
         })
@@ -1983,6 +2000,12 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         ])
         let aID = try XCTUnwrap(a["bot_id"] as? String)
         let bID = try XCTUnwrap(b["bot_id"] as? String)
+        let aBot = try XCTUnwrap(store.get(id: BotID(try XCTUnwrap(UUID(uuidString: aID)))))
+        let bBot = try XCTUnwrap(store.get(id: BotID(try XCTUnwrap(UUID(uuidString: bID)))))
+        let aHome = BotHome(appSupportDirectory: supportDir, bot: aBot)
+        let bHome = BotHome(appSupportDirectory: supportDir, bot: bBot)
+        try aHome.ensure(name: aBot.name, handle: aBot.handle, title: aBot.title, description: "A", soul: "A")
+        try bHome.ensure(name: bBot.name, handle: bBot.handle, title: bBot.title, description: "B", soul: "B")
         _ = try authority.dispatch(method: "bot.routing.set", params: [
             "client_request_id": "legacy-route-a", "bot_id": aID, "provider_instance_id": "grok-a",
         ])
@@ -1999,6 +2022,8 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let persisted = try sidecarObject("bot.remote.routing")
         XCTAssertNil(persisted[aID])
         XCTAssertEqual((persisted[bID] as? [String: Any])?["routing_receipt_id"] as? String, bReceipt)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: aHome.root.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bHome.root.path))
     }
 
     func test_relaunchFiltersLegacyAttentionForDeletedBots() throws {

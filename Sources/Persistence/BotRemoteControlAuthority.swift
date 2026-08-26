@@ -713,6 +713,11 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             }
         }
         do {
+            try BotHome.wipe(appSupportDirectory: appSupport, botID: bot.id)
+        } catch {
+            residuals.append("bot_home")
+        }
+        do {
             try BotGuestHome.wipe(appSupport: appSupport, botID: bot.id)
         } catch {
             residuals.append("guest_home")
@@ -2979,6 +2984,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func pruneRestoredSidecar() {
         guard let liveBots = try? store.list(includeHidden: true) else { return }
         let liveBotIDs = Set(liveBots.map(id))
+        pruneDeletedBotHomes(liveBotIDs: liveBotIDs)
         let staleGuestIDs = guest.keys.filter { !liveBotIDs.contains($0) }
         let staleRoutingReceiptIDs = Set<String>(routingPref.compactMap { botID, routing in
             guard !liveBotIDs.contains(botID) else { return nil }
@@ -3021,6 +3027,20 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             try? BotGuestHome.wipe(appSupport: appSupport, botID: BotID(uuid))
         }
         if removed > 0 { persistSidecar() }
+    }
+
+    private func pruneDeletedBotHomes(liveBotIDs: Set<String>) {
+        let root = BotHome.botsRootURL(appSupportDirectory: appSupport)
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        for entry in entries {
+            let rawID = entry.lastPathComponent.lowercased()
+            guard !liveBotIDs.contains(rawID), let uuid = UUID(uuidString: rawID) else { continue }
+            try? BotHome.wipe(appSupportDirectory: appSupport, botID: BotID(uuid))
+        }
     }
 
     private func migrateSidecarQueueIfNeeded() {
