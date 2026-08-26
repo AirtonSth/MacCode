@@ -131,11 +131,16 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     /// Upgrade an `accepted` receipt after `dispatch` returns. In-hook settle is
     /// overwritten by `mutate`, and `NSLock` is not recursive.
-    public func settle(requestID: String, status: Status, readback: [String: Any]? = nil) {
+    @discardableResult
+    public func settle(
+        requestID: String,
+        status: Status,
+        readback: [String: Any]? = nil
+    ) -> [String: Any]? {
         lock.lock()
         defer { lock.unlock() }
         guard var existing = receipts[requestID],
-              (existing["status"] as? String) == Status.accepted.rawValue else { return }
+              (existing["status"] as? String) == Status.accepted.rawValue else { return nil }
         existing["status"] = status.rawValue
         if let readback {
             if let botID = existing["bot_id"] as? String,
@@ -157,6 +162,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
         receipts[requestID] = existing
         persistSidecar()
+        return existing
     }
 
     public func dispatch(method: String, params: [String: Any], now: Date = Date()) throws -> [String: Any] {

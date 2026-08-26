@@ -3119,14 +3119,61 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func settlePairedBot(requestID: String, ok: Bool, readback: [String: Any]) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.pairedBotRemote?.settle(
+            let settled = self.pairedBotRemote?.settle(
                 requestID: requestID,
                 status: ok ? .completed : .failed,
                 readback: readback
             )
+            if let settled,
+               let payload = Self.pairedGuestTerminalEventPayload(settled) {
+                EventBus.shared.publish(kind: "bot.guest.updated", payload: payload)
+            }
             let waiters = self.pairedBotSettlementWaiters.removeValue(forKey: requestID) ?? []
             waiters.forEach { $0.resume() }
         }
+    }
+
+    static func pairedGuestTerminalEventPayload(_ receipt: [String: Any]) -> JSONValue? {
+        guard let requestID = receipt["request_id"] as? String, !requestID.isEmpty,
+              let receiptID = receipt["receipt_id"] as? String, !receiptID.isEmpty,
+              let botID = receipt["bot_id"] as? String, !botID.isEmpty,
+              let receiptStatus = receipt["status"] as? String,
+              let readback = receipt["readback"] as? [String: Any],
+              readback["bot_id"] as? String == botID,
+              readback["last_request_id"] as? String == requestID,
+              readback["viewer_path"] as? String == "/vnc.html",
+              readback["task_catalog"] is [String: Any],
+              let hostID = readback["host_id"] as? String, !hostID.isEmpty,
+              let status = readback["status"] as? String,
+              let generation = readback["grant_generation"] as? Int,
+              generation >= 0 else { return nil }
+        switch (receiptStatus, status) {
+        case (BotRemoteControlAuthority.Status.completed.rawValue, "running"),
+             (BotRemoteControlAuthority.Status.completed.rawValue, "stopped"),
+             (BotRemoteControlAuthority.Status.failed.rawValue, "failed"):
+            break
+        default:
+            return nil
+        }
+        let afterFrameID = readback["after_frame_id"] as? String
+        if status == "running" {
+            guard let afterFrameID, !afterFrameID.isEmpty,
+                  let frame = readback["frame"] as? [String: Any],
+                  frame["frame_id"] as? String == afterFrameID else { return nil }
+        }
+        var payload: [String: Any] = [
+            "host_id": hostID,
+            "bot_id": botID,
+            "request_id": requestID,
+            "client_request_id": requestID,
+            "receipt_id": receiptID,
+            "status": status,
+            "grant_generation": generation,
+        ]
+        if let afterFrameID, !afterFrameID.isEmpty {
+            payload["after_frame_id"] = afterFrameID
+        }
+        return JSONValue.from(payload)
     }
 
     private func waitForPairedBotSettlement(requestID: String) async {
