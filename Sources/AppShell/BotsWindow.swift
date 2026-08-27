@@ -88,7 +88,20 @@ public struct BotDeskRouting: Equatable, Codable {
     /// user's thread route; delegated calls freeze the exact provider/model
     /// selected for the active caller run so Auto cannot choose a new one.
     public init(thread: AgentThread, activeRun: AgentRun? = nil) {
-        let run = activeRun?.threadId == thread.id ? activeRun : nil
+        let route: AgentRunRepository.RouteChrome? = {
+            guard let run = activeRun, run.threadId == thread.id else { return nil }
+            return AgentRunRepository.RouteChrome(
+                threadId: run.threadId,
+                provider: run.provider,
+                providerInstanceId: run.providerInstanceId ?? run.provider.rawValue,
+                model: run.model
+            )
+        }()
+        self.init(thread: thread, activeRunRoute: route)
+    }
+
+    public init(thread: AgentThread, activeRunRoute: AgentRunRepository.RouteChrome?) {
+        let run = activeRunRoute?.threadId == thread.id ? activeRunRoute : nil
         let provider = run?.provider ?? thread.provider
         self.init(
             provider: provider,
@@ -101,6 +114,22 @@ public struct BotDeskRouting: Equatable, Codable {
             reasoningEffort: thread.reasoningEffort,
             serviceTier: thread.serviceTier,
             runAsUser: thread.runAsUser
+        )
+    }
+
+    public init(
+        route: AgentRunRepository.RouteChrome,
+        policy: AgentThreadRepository.DeskPolicyChrome
+    ) {
+        self.init(
+            provider: route.provider,
+            providerInstanceID: route.providerInstanceId,
+            model: route.model,
+            routingMode: .manual,
+            permissionMode: policy.permissionMode,
+            reasoningEffort: policy.reasoningEffort,
+            serviceTier: policy.serviceTier,
+            runAsUser: policy.runAsUser
         )
     }
 
@@ -888,13 +917,13 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             return nil
         }
 
-        let activeCallerRun: AgentRun?
+        let activeCallerRoute: AgentRunRepository.RouteChrome?
         if let hostRunID,
-           let run = try? runRepo.get(id: hostRunID),
-           run.threadId == originThread.id {
-            activeCallerRun = run
+           let route = try? runRepo.route(of: hostRunID),
+           route.threadId == originThread.id {
+            activeCallerRoute = route
         } else {
-            activeCallerRun = nil
+            activeCallerRoute = nil
         }
         var conversation = BotConversation(
             botID: peer.id,
@@ -920,7 +949,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                     botID: peer.id,
                     title: Self.titleFromFirstMessage(peerDisplay)
                 )
-                routing = BotDeskRouting(thread: originThread, activeRun: activeCallerRun)
+                routing = BotDeskRouting(thread: originThread, activeRunRoute: activeCallerRoute)
                 var peerInheritanceContext = originThread
                 peerInheritanceContext.workspaceId = nil
                 try botStore.upsertConversation(conversation)
@@ -1911,20 +1940,22 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                   stored.threadId == threadID,
                   stored.role == .assistant,
                   stored.content == content else { return false }
-            if var thread = try threadRepo.get(id: threadID) {
-                var changed = false
-                if let terminalStatus, thread.status != terminalStatus {
-                    thread.status = terminalStatus
-                    changed = true
+            let markUnread = router?.agentAppThreadIsSelected(threadID) != true
+            if let terminalStatus {
+                if markUnread {
+                    try threadRepo.updateStatus(
+                        id: threadID,
+                        status: terminalStatus,
+                        hasUnread: true
+                    )
+                } else {
+                    try threadRepo.updateStatusPreservingUnread(
+                        id: threadID,
+                        status: terminalStatus
+                    )
                 }
-                if router?.agentAppThreadIsSelected(threadID) != true, !thread.hasUnread {
-                    thread.hasUnread = true
-                    changed = true
-                }
-                if changed {
-                    thread.updatedAt = Date()
-                    try threadRepo.upsert(thread)
-                }
+            } else if markUnread {
+                _ = try threadRepo.markUnreadUpdatingActivity(of: threadID)
             }
             router?.projectAgentAppPeerMessage(
                 threadID: threadID,
@@ -5301,7 +5332,7 @@ public final class BotsViewModel: ObservableObject {
                 ids.append(threadID)
                 continue
             }
-            if try context.coordinator.durableActiveRun(threadId: threadID) != nil {
+            if try context.coordinator.hasDurableActiveRun(threadId: threadID) {
                 ids.append(threadID)
             }
         }
@@ -8085,7 +8116,7 @@ public final class BotsViewModel: ObservableObject {
             text: humanText,
             attachments: attachments
         )
-        if try context.messageRepo.get(id: messageID) == nil {
+        if try context.messageRepo.exists(id: messageID) == false {
             try context.messageRepo.append(AgentMessage(
                 id: messageID,
                 threadId: threadID,
