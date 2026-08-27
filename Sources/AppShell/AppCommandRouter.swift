@@ -4603,9 +4603,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if let runtimeProfile = nestedRunContext?.runtimeProfile {
             guard runtimeProfile == .samGrokWorkerV1,
                   prov == .grok,
-                  m == "grok-4.5",
+                  GrokACPClient.admitsSamGrokWorker(model: m, effort: t.reasoningEffort),
                   t.permissionMode == .autoAcceptEdits,
-                  [.low, .medium, .high, .xhigh, .max].contains(t.reasoningEffort),
                   t.providerThreadId == nil else {
                 throw JSONRPCError.invalidParams
             }

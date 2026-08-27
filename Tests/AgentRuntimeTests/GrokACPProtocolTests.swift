@@ -108,6 +108,86 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertThrowsError(try GrokACPClient.launchArguments(for: request))
     }
 
+    func test_samGrokWorkerProfileAdmitsGrok46AndXhighEffort() throws {
+        // WHY: orchestration LIGHT/STANDARD/DEEP prefer grok-4.6, which
+        // advertises xhigh. Exact grok-4.5 + grok45-only effort guards fail
+        // closed before ACP starts (GROK-ACP-009).
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .grok,
+            model: "grok-4.6",
+            cwd: "/tmp",
+            prompt: "inspect",
+            permissionMode: .autoAcceptEdits,
+            reasoningEffort: .xhigh,
+            environment: [
+                AgentAppRuntimeProfile.environmentKey:
+                    AgentAppRuntimeProfile.samGrokWorkerV1.rawValue
+            ]
+        )
+        XCTAssertTrue(GrokACPClient.admitsSamGrokWorker(model: "grok-4.6", effort: .xhigh))
+        XCTAssertTrue(GrokACPClient.admitsSamGrokWorker(model: "grok-4.6-preview", effort: .xhigh))
+        XCTAssertTrue(GrokACPClient.admitsSamGrokWorker(model: "grok-4.5", effort: .high))
+        XCTAssertFalse(GrokACPClient.admitsSamGrokWorker(model: "grok-4.5", effort: .xhigh))
+        XCTAssertFalse(GrokACPClient.admitsSamGrokWorker(model: "grok-4.6", effort: .max))
+        XCTAssertEqual(
+            try GrokACPClient.launchArguments(for: request),
+            [
+                "--no-memory",
+                "--no-subagents",
+                "--disallowed-tools", "Agent",
+                "--no-auto-update",
+                "--sandbox", "workspace",
+                "agent",
+                "--model", "grok-4.6",
+                "--reasoning-effort", "xhigh",
+                "--always-approve",
+                "--no-leader",
+                "stdio"
+            ]
+        )
+    }
+
+    func test_samGrokWorkerProfileRejectsGrok45XhighAndGrok46Max() {
+        // WHY: router used to allow xhigh/max while the client only accepted
+        // grok-4.5 efforts. Both sites now share supportedEfforts.
+        let fourFiveXhigh = AgentRunRequest(
+            threadId: AgentThreadID(), provider: .grok, model: "grok-4.5",
+            cwd: "/tmp", prompt: "inspect", permissionMode: .autoAcceptEdits,
+            reasoningEffort: .xhigh,
+            environment: [AgentAppRuntimeProfile.environmentKey: AgentAppRuntimeProfile.samGrokWorkerV1.rawValue]
+        )
+        let fourSixMax = AgentRunRequest(
+            threadId: AgentThreadID(), provider: .grok, model: "grok-4.6",
+            cwd: "/tmp", prompt: "inspect", permissionMode: .autoAcceptEdits,
+            reasoningEffort: .max,
+            environment: [AgentAppRuntimeProfile.environmentKey: AgentAppRuntimeProfile.samGrokWorkerV1.rawValue]
+        )
+        XCTAssertThrowsError(try GrokACPClient.launchArguments(for: fourFiveXhigh))
+        XCTAssertThrowsError(try GrokACPClient.launchArguments(for: fourSixMax))
+    }
+
+    func test_samGrokWorkerRouterGuardUsesSharedAdmissionPredicate() throws {
+        // WHY: AppCommandRouter must not keep a second allow-list that admits
+        // xhigh on grok-4.5 while launchArguments rejects it.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let router = try String(
+            contentsOf: root.appendingPathComponent("Sources/AppShell/AppCommandRouter.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            router.contains("GrokACPClient.admitsSamGrokWorker(model: m, effort: t.reasoningEffort)"),
+            "Router must reuse the client admission predicate"
+        )
+        XCTAssertFalse(
+            router.contains("m == \"grok-4.5\""),
+            "Router must not pin sam-grok-worker to exact grok-4.5"
+        )
+    }
+
     func test_samGrokWorkerProfileFailsClosedForProviderSessionResume() {
         // WHY: the promoted raw contract is a fresh one-shot execution. It
         // cannot silently inherit a previous provider session's state.
@@ -1351,12 +1431,20 @@ final class GrokACPProtocolTests: XCTestCase {
     /// Recover without prompt must keep replay so readThread has history.
     func test_loadSessionParamsIncludeNoReplayMetaWhenRequested() throws {
         // Reconstruct the params shape GrokACPClient.loadSession must emit.
-        var withReplay: [String: Any] = ["sessionId": "sid", "cwd": "/tmp", "mcpServers": [Any]()]
+        let withReplay = GrokACPClient.sessionOpenParams(
+            cwd: "/tmp",
+            mcpServers: [Any](),
+            sessionId: "sid"
+        )
         // Default: no _meta.noReplay
         XCTAssertNil(withReplay["_meta"])
 
-        var noReplay: [String: Any] = ["sessionId": "sid", "cwd": "/tmp", "mcpServers": [Any]()]
-        noReplay["_meta"] = ["noReplay": true]
+        let noReplay = GrokACPClient.sessionOpenParams(
+            cwd: "/tmp",
+            mcpServers: [Any](),
+            sessionId: "sid",
+            noReplay: true
+        )
         XCTAssertEqual((noReplay["_meta"] as? [String: Any])?["noReplay"] as? Bool, true)
 
         let root = URL(fileURLWithPath: #file)
@@ -1374,7 +1462,9 @@ final class GrokACPProtocolTests: XCTestCase {
         )
         XCTAssertTrue(clientSource.contains("noReplay"), "loadSession must accept noReplay")
         XCTAssertTrue(
-            clientSource.contains("\"noReplay\": true") || clientSource.contains("[\"noReplay\": true]"),
+            clientSource.contains("\"noReplay\": true")
+                || clientSource.contains("[\"noReplay\": true]")
+                || clientSource.contains("meta[\"noReplay\"] = true"),
             "loadSession must send _meta.noReplay when requested"
         )
         let adapterSource = try String(
@@ -1384,6 +1474,69 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertTrue(
             adapterSource.contains("noReplay: shouldStartPrompt"),
             "Adapter must pass noReplay:true only on load+prompt path"
+        )
+        XCTAssertTrue(
+            adapterSource.contains("yoloMode: request.permissionMode == .fullAccess"),
+            "Adapter must stamp spawn-time yoloMode for fullAccess new/load"
+        )
+    }
+
+    func test_sessionOpenParamsEncodeYoloModeWithoutAutoMode() throws {
+        // WHY: grok-build session_setup reads _meta.yoloMode on new/load as
+        // structural always-approve. Post-open set_mode still covers the parent
+        // turn path; autoMode is not RemoteCode autoAcceptEdits (GROK-ACP-010).
+        let servers: [Any] = []
+        let omitted = GrokACPClient.sessionOpenParams(cwd: "/tmp", mcpServers: servers)
+        XCTAssertNil(omitted["_meta"], "supervised/autoAcceptEdits must omit yoloMode")
+        XCTAssertNil(omitted["sessionId"])
+        XCTAssertEqual(omitted["cwd"] as? String, "/tmp")
+
+        let yolo = GrokACPClient.sessionOpenParams(
+            cwd: "/tmp",
+            mcpServers: servers,
+            yoloMode: true
+        )
+        let yoloMeta = try XCTUnwrap(yolo["_meta"] as? [String: Any])
+        XCTAssertEqual(yoloMeta["yoloMode"] as? Bool, true)
+        XCTAssertNil(yoloMeta["autoMode"])
+        XCTAssertNil(yoloMeta["noReplay"])
+
+        let coldLoad = GrokACPClient.sessionOpenParams(
+            cwd: "/tmp",
+            mcpServers: servers,
+            sessionId: "sid",
+            yoloMode: true,
+            noReplay: true
+        )
+        XCTAssertEqual(coldLoad["sessionId"] as? String, "sid")
+        let loadMeta = try XCTUnwrap(coldLoad["_meta"] as? [String: Any])
+        XCTAssertEqual(loadMeta["yoloMode"] as? Bool, true)
+        XCTAssertEqual(loadMeta["noReplay"] as? Bool, true)
+        XCTAssertNil(loadMeta["autoMode"])
+
+        let encoded = try JSONSerialization.data(withJSONObject: yolo, options: [.sortedKeys])
+        let parsed = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual((parsed["_meta"] as? [String: Any])?["yoloMode"] as? Bool, true)
+
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let adapter = try String(
+            contentsOf: root.appendingPathComponent("Sources/AgentRuntime/GrokACPAdapter.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            adapter.contains("session.client.setMode(sessionId:"),
+            "Adapter must keep the set_mode path after spawn-time yoloMode"
+        )
+        let client = try String(
+            contentsOf: root.appendingPathComponent("Sources/AgentRuntime/GrokACPClient.swift"),
+            encoding: .utf8
+        )
+        XCTAssertFalse(
+            client.contains("\"autoMode\""),
+            "ACP open params must not emit autoMode"
         )
     }
 
