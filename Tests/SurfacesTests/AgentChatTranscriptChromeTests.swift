@@ -319,6 +319,10 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
             "Agent App must mount the shared Token Saver footer, not a private twin"
         )
         XCTAssertTrue(
+            source.contains("presentation: presentation"),
+            "Agent App must pass the shared on/off presentation so the red off-state is not a private twin"
+        )
+        XCTAssertTrue(
             source.contains("shouldShowTokenSaverThreadFooter("),
             "the chip must stay in the transcript after history/live rows and hide while the thread is live"
         )

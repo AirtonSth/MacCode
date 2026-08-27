@@ -3000,6 +3000,7 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var deskMessages: [BotDeskMessage] = []
     /// Same Token Saver footer figures Agent App shows, from the same calculator.
     @Published public private(set) var tokenSaverFooterEnabled = false
+    @Published public private(set) var tokenSaverFooterSnapshotReady = false
     @Published public private(set) var tokenSaverThreadMeasuredTokens = 0
     @Published public private(set) var tokenSaverThreadSavedTokens = 0
     @Published public private(set) var tokenSaverOriginalDisplayMessageIds: Set<AgentMessageID> = []
@@ -3889,11 +3890,13 @@ public final class BotsViewModel: ObservableObject {
     private func resetTokenSaverFooterSnapshot() {
         tokenSaverFooterReloadTask?.cancel()
         guard tokenSaverFooterEnabled
+            || tokenSaverFooterSnapshotReady
             || tokenSaverThreadMeasuredTokens != 0
             || tokenSaverThreadSavedTokens != 0 else { return }
         tokenSaverFooterEnabled = false
         tokenSaverThreadMeasuredTokens = 0
         tokenSaverThreadSavedTokens = 0
+        tokenSaverFooterSnapshotReady = false
     }
 
     func reloadTokenSaverThreadSavings() {
@@ -3960,12 +3963,12 @@ public final class BotsViewModel: ObservableObject {
                     measuredTokens: self.tokenSaverThreadMeasuredTokens,
                     displayTokens: self.tokenSaverThreadSavedTokens
                 )
-                guard TokenSaverThreadFooterReload.shouldPublish(current: current, next: next) else {
-                    return
+                if TokenSaverThreadFooterReload.shouldPublish(current: current, next: next) {
+                    self.tokenSaverFooterEnabled = next.enabled
+                    self.tokenSaverThreadMeasuredTokens = next.measuredTokens
+                    self.tokenSaverThreadSavedTokens = next.displayTokens
                 }
-                self.tokenSaverFooterEnabled = next.enabled
-                self.tokenSaverThreadMeasuredTokens = next.measuredTokens
-                self.tokenSaverThreadSavedTokens = next.displayTokens
+                self.tokenSaverFooterSnapshotReady = true
             }
         }
     }
@@ -4021,7 +4024,16 @@ public final class BotsViewModel: ObservableObject {
             displayTokens: tokenSaverThreadSavedTokens,
             measuredTokens: tokenSaverThreadMeasuredTokens,
             enabled: tokenSaverFooterEnabled,
-            autoRoutingActive: deskRouting.routingMode == .auto
+            autoRoutingActive: deskRouting.routingMode == .auto,
+            snapshotReady: tokenSaverFooterSnapshotReady
+        )
+    }
+
+    var deskTokenSaverFooterPresentation: AgentChatTokenSaverThreadFooterPresentation? {
+        AgentChatTokenSaverDisplayMode.footerPresentation(
+            enabled: tokenSaverFooterEnabled,
+            measuredTokens: tokenSaverThreadMeasuredTokens,
+            snapshotReady: tokenSaverFooterSnapshotReady
         )
     }
 
@@ -4031,6 +4043,7 @@ public final class BotsViewModel: ObservableObject {
         tokenSaverFooterEnabled = snapshot.enabled
         tokenSaverThreadMeasuredTokens = snapshot.measuredTokens
         tokenSaverThreadSavedTokens = snapshot.displayTokens
+        tokenSaverFooterSnapshotReady = true
     }
 
     func awaitTokenSaverFooterReloadForTesting() async {
@@ -11267,11 +11280,16 @@ public struct BotsRootView: View {
                         columnWidth: columnWidth
                     )
                 }
-                if !vm.deskRunIsLive && !vm.deskShowsLoading,
-                   let text = vm.deskTokenSaverFooterText {
+                if AgentAppView.shouldShowTokenSaverThreadFooter(
+                    runIsLive: vm.deskRunIsLive || vm.deskShowsLoading,
+                    footerText: vm.deskTokenSaverFooterText,
+                    hasFinishedTurn: vm.deskMessages.contains(where: { $0.role == .assistant })
+                ), let text = vm.deskTokenSaverFooterText,
+                   let presentation = vm.deskTokenSaverFooterPresentation {
                     AgentChatTokenSaverThreadFooter(
                         text: text,
-                        autoRouting: vm.deskRouting.routingMode == .auto
+                        autoRouting: vm.deskRouting.routingMode == .auto,
+                        presentation: presentation
                     )
                     .id("agent.tokenSaver.footer")
                 }

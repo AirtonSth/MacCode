@@ -8,32 +8,101 @@ import CoreModel
 /// Pure-seam coverage for the Token Saver per-thread savings footer under final replies.
 @MainActor
 final class TokenSaverThreadFooterTests: XCTestCase {
-    func test_footerText_disabled_returnsNil() {
-        // WHY: Token Saver is paid — never teaser a savings claim while off.
-        XCTAssertNil(AgentAppView.tokenSaverThreadFooterText(
+    func test_footerText_disabled_reportsZeroBecauseDeactivated() {
+        // WHY: Image #1 hid the chip while Token Saver was off. Off still
+        // reports 0 tokens saved, and says why — never a positive total.
+        let text = AgentAppView.tokenSaverThreadFooterText(
             displayTokens: 100_000,
             measuredTokens: 100_000,
             enabled: false
-        ))
+        )
+        XCTAssertEqual(
+            text,
+            "Token Saver: 0 tokens saved because Token Saver is deactivated"
+        )
+        XCTAssertEqual(
+            AgentAppView.tokenSaverThreadFooterPresentation(enabled: false),
+            .deactivated
+        )
+        XCTAssertFalse(text?.contains("177") == true)
+        XCTAssertFalse(text?.contains("100K") == true)
     }
 
-    func test_footerText_zeroSaved_returnsNil() {
-        // WHY: empty chip under every answer is noise; only show when total > 0.
-        XCTAssertNil(AgentAppView.tokenSaverThreadFooterText(
+    func test_footerText_zeroSaved_stillPresentNotDeactivated() {
+        // WHY: Token Saver on with a proven zero is a problem chip — yellow,
+        // still present, never the red deactivated copy.
+        let text = AgentAppView.tokenSaverThreadFooterText(
             displayTokens: 0,
             measuredTokens: 0,
             enabled: true
-        ))
+        )
+        XCTAssertEqual(
+            text,
+            "Token Saver: 0 tokens saved because something went wrong"
+        )
+        XCTAssertEqual(
+            AgentAppView.tokenSaverThreadFooterPresentation(
+                enabled: true,
+                measuredTokens: 0
+            ),
+            .problem
+        )
+        XCTAssertFalse(text?.localizedCaseInsensitiveContains("deactivated") == true)
     }
 
-    func test_footerText_zeroMeasured_evenWithDisplayEstimate_returnsNil() {
+    func test_footerText_zeroMeasured_doesNotInventEstimate() {
         // WHY: estimates may only raise a proven ledger figure — never invent a
-        // savings chip from assistant text alone (measured == 0).
-        XCTAssertNil(AgentAppView.tokenSaverThreadFooterText(
+        // savings total from assistant text alone (measured == 0).
+        let text = AgentAppView.tokenSaverThreadFooterText(
             displayTokens: 12_000,
             measuredTokens: 0,
             enabled: true
-        ))
+        )
+        XCTAssertEqual(
+            text,
+            "Token Saver: 0 tokens saved because something went wrong"
+        )
+        XCTAssertFalse(text?.contains("12K") == true)
+        XCTAssertEqual(
+            AgentAppView.tokenSaverThreadFooterPresentation(
+                enabled: true,
+                measuredTokens: 0
+            ),
+            .problem
+        )
+        XCTAssertNotEqual(
+            AgentAppView.tokenSaverThreadFooterPresentation(
+                enabled: true,
+                measuredTokens: 0
+            ),
+            .savings
+        )
+    }
+
+    func test_footerPresentation_pendingSnapshotIsNotDeactivated() {
+        // WHY: thread-switch publishes enabled=false + 0 until reload. That
+        // pending snapshot must not paint the red deactivated chip.
+        XCTAssertNil(
+            AgentAppView.tokenSaverThreadFooterPresentation(
+                enabled: false,
+                snapshotReady: false
+            )
+        )
+        XCTAssertNil(
+            AgentAppView.tokenSaverThreadFooterText(
+                displayTokens: 0,
+                measuredTokens: 0,
+                enabled: false,
+                snapshotReady: false
+            )
+        )
+        XCTAssertEqual(
+            AgentAppView.tokenSaverThreadFooterPresentation(
+                enabled: true,
+                snapshotReady: false
+            ),
+            nil
+        )
     }
 
     func test_footerText_includesFullStackCopyNotToolOutputOnly() {
@@ -368,6 +437,7 @@ final class TokenSaverThreadFooterTests: XCTestCase {
             messageRepo: messageRepo
         )
         vm.createThread(title: "Ledger failure")
+        await vm.waitForSelectThreadHydrationForTesting()
         let loader = SequencedFooterLoader(results: [321, nil])
         let positiveSnapshotPublished = expectation(description: "positive footer snapshot published")
         let positiveSnapshotCancellable = vm.$tokenSaverThreadMeasuredTokens
@@ -399,7 +469,8 @@ final class TokenSaverThreadFooterTests: XCTestCase {
             AgentAppView.tokenSaverThreadFooterText(
                 displayTokens: positiveDisplayTokens,
                 measuredTokens: vm.tokenSaverThreadMeasuredTokens,
-                enabled: vm.tokenSaverFooterEnabled
+                enabled: vm.tokenSaverFooterEnabled,
+                snapshotReady: vm.tokenSaverFooterSnapshotReady
             ),
             expectedPositiveFooter
         )
@@ -416,7 +487,8 @@ final class TokenSaverThreadFooterTests: XCTestCase {
             AgentAppView.tokenSaverThreadFooterText(
                 displayTokens: vm.tokenSaverThreadSavedTokens,
                 measuredTokens: vm.tokenSaverThreadMeasuredTokens,
-                enabled: vm.tokenSaverFooterEnabled
+                enabled: vm.tokenSaverFooterEnabled,
+                snapshotReady: vm.tokenSaverFooterSnapshotReady
             ),
             expectedPositiveFooter
         )
@@ -450,6 +522,7 @@ final class TokenSaverThreadFooterTests: XCTestCase {
             messageRepo: messageRepo
         )
         vm.createThread(title: "Delivered ledger")
+        await vm.waitForSelectThreadHydrationForTesting()
         let threadId = try XCTUnwrap(vm.selectedThreadId)
         let repo = TokenSaverSavingsRepository(db: db)
         let loaderProbe = LedgerFooterLoadProbe()
@@ -522,6 +595,17 @@ final class TokenSaverThreadFooterTests: XCTestCase {
             encoding: .utf8
         )
         XCTAssertTrue(chromeSource.contains(".accessibilityIdentifier(\"agent.tokenSaver.threadFooter\")"))
+        XCTAssertTrue(
+            chromeSource.contains("case deactivated"),
+            "red off-state must live on the shared footer control"
+        )
+        XCTAssertTrue(
+            chromeSource.contains("case problem"),
+            "yellow on-zero problem must live on the shared footer control"
+        )
+        XCTAssertTrue(chromeSource.contains("DS.Palette.danger"))
+        XCTAssertTrue(chromeSource.contains("DS.Palette.warning"))
+        XCTAssertTrue(chromeSource.contains("DS.Palette.success"))
     }
 
     func test_agentAppFooter_clearsPublishedSnapshotOnThreadSwitch() async throws {
@@ -594,14 +678,24 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         vm.selectThread(threadB, markRead: false)
         XCTAssertEqual(vm.selectedThreadId, threadB)
         XCTAssertFalse(vm.tokenSaverFooterEnabled)
+        XCTAssertFalse(vm.tokenSaverFooterSnapshotReady)
         XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0)
         XCTAssertEqual(vm.tokenSaverThreadSavedTokens, 0)
         XCTAssertNil(
             AgentAppView.tokenSaverThreadFooterText(
                 displayTokens: vm.tokenSaverThreadSavedTokens,
                 measuredTokens: vm.tokenSaverThreadMeasuredTokens,
-                enabled: vm.tokenSaverFooterEnabled
+                enabled: vm.tokenSaverFooterEnabled,
+                snapshotReady: vm.tokenSaverFooterSnapshotReady
             )
+        )
+        XCTAssertNotEqual(
+            AgentAppView.tokenSaverThreadFooterPresentation(
+                enabled: vm.tokenSaverFooterEnabled,
+                snapshotReady: vm.tokenSaverFooterSnapshotReady
+            ),
+            .deactivated,
+            "A→B reset must not claim Token Saver is deactivated while the new ledger is in flight"
         )
         XCTAssertFalse(
             AgentAppView.shouldShowTokenSaverThreadFooter(
@@ -609,7 +703,8 @@ final class TokenSaverThreadFooterTests: XCTestCase {
                 footerText: AgentAppView.tokenSaverThreadFooterText(
                     displayTokens: vm.tokenSaverThreadSavedTokens,
                     measuredTokens: vm.tokenSaverThreadMeasuredTokens,
-                    enabled: vm.tokenSaverFooterEnabled
+                    enabled: vm.tokenSaverFooterEnabled,
+                    snapshotReady: vm.tokenSaverFooterSnapshotReady
                 )
             )
         )
@@ -624,15 +719,25 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         await reader.release(threadB.value.uuidString)
         await fulfillment(of: [bPublished], timeout: 5)
         XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 750)
+        XCTAssertTrue(vm.tokenSaverFooterSnapshotReady)
         let expectedB =
             "Token Saver: \(AgentAppView.formatTokenCountForFooter(vm.tokenSaverThreadSavedTokens)) tokens saved (tool output, shorter answers, multi-turn cache)"
         XCTAssertEqual(
             AgentAppView.tokenSaverThreadFooterText(
                 displayTokens: vm.tokenSaverThreadSavedTokens,
                 measuredTokens: vm.tokenSaverThreadMeasuredTokens,
-                enabled: vm.tokenSaverFooterEnabled
+                enabled: vm.tokenSaverFooterEnabled,
+                snapshotReady: vm.tokenSaverFooterSnapshotReady
             ),
             expectedB
+        )
+        XCTAssertEqual(
+            AgentAppView.tokenSaverThreadFooterPresentation(
+                enabled: vm.tokenSaverFooterEnabled,
+                measuredTokens: vm.tokenSaverThreadMeasuredTokens,
+                snapshotReady: vm.tokenSaverFooterSnapshotReady
+            ),
+            .savings
         )
     }
 
@@ -654,18 +759,47 @@ final class TokenSaverThreadFooterTests: XCTestCase {
     func test_shouldShowFooter_hidesWhileRunIsLive() {
         // WHY: the working strip owns the live turn; the savings chip must not
         // appear until the selected thread is finished, even with a proven total.
-        let text = AgentAppView.tokenSaverThreadFooterText(
+        let onText = AgentAppView.tokenSaverThreadFooterText(
             displayTokens: 177_043,
             measuredTokens: 177_043,
             enabled: true
         )
+        let offText = AgentAppView.tokenSaverThreadFooterText(
+            displayTokens: 0,
+            measuredTokens: 0,
+            enabled: false
+        )
+        let problemText = AgentAppView.tokenSaverThreadFooterText(
+            displayTokens: 0,
+            measuredTokens: 0,
+            enabled: true
+        )
         XCTAssertEqual(
-            AgentAppView.shouldShowTokenSaverThreadFooter(runIsLive: true, footerText: text),
+            AgentAppView.shouldShowTokenSaverThreadFooter(runIsLive: true, footerText: onText),
             false
         )
         XCTAssertEqual(
-            AgentAppView.shouldShowTokenSaverThreadFooter(runIsLive: false, footerText: text),
+            AgentAppView.shouldShowTokenSaverThreadFooter(runIsLive: false, footerText: onText),
             true
+        )
+        XCTAssertEqual(
+            AgentAppView.shouldShowTokenSaverThreadFooter(runIsLive: false, footerText: offText),
+            true,
+            "a finished turn must still show the red 0/deactivated chip"
+        )
+        XCTAssertEqual(
+            AgentAppView.shouldShowTokenSaverThreadFooter(runIsLive: false, footerText: problemText),
+            true,
+            "a finished turn with Token Saver on and 0 measured must still show the yellow problem chip"
+        )
+        XCTAssertEqual(
+            AgentAppView.shouldShowTokenSaverThreadFooter(
+                runIsLive: false,
+                footerText: offText,
+                hasFinishedTurn: false
+            ),
+            false,
+            "an empty thread with no finished turn stays chip-less"
         )
         XCTAssertEqual(
             AgentAppView.shouldShowTokenSaverThreadFooter(runIsLive: false, footerText: nil),
@@ -738,13 +872,18 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertEqual(off.displayTokens, 12_500)
         XCTAssertFalse(off.enabled)
-        XCTAssertNil(
+        XCTAssertEqual(
+            AgentChatTokenSaverDisplayMode.footerPresentation(enabled: off.enabled),
+            .deactivated
+        )
+        XCTAssertEqual(
             AgentChatTokenSaverDisplayMode.footerText(
                 displayTokens: off.displayTokens,
                 measuredTokens: off.measuredTokens,
                 enabled: off.enabled,
                 autoRoutingActive: true
-            )
+            ),
+            "Token Saver: 0 tokens saved because Token Saver is deactivated"
         )
     }
 }
@@ -829,7 +968,8 @@ private actor SequencedFooterLoader {
     }
 
     func read() async -> Int? {
-        let call = Call(ordinal: nextOrdinal, result: results[nextOrdinal])
+        let planned = nextOrdinal < results.count ? results[nextOrdinal] : nil
+        let call = Call(ordinal: nextOrdinal, result: planned)
         nextOrdinal += 1
         if let continuation = callWaiters.first {
             callWaiters.removeFirst()

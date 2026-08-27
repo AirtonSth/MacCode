@@ -375,6 +375,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public private(set) var tokenSaverThreadMeasuredTokens: Int = 0
     /// True when Token Saver is enabled **and** the account is subscribed.
     @Published public private(set) var tokenSaverFooterEnabled: Bool = false
+    /// False after a thread switch until that thread's footer snapshot lands.
+    /// A reset publishes enabled=false + 0; that is pending, not "deactivated."
+    @Published public private(set) var tokenSaverFooterSnapshotReady: Bool = false
     private weak var tokenSaverSavingsRepo: TokenSaverSavingsRepository?
     private var tokenSaverFooterEligibleCheck: (@Sendable () -> Bool)?
     private var tokenSaverGraphifyActiveCheck: (@Sendable () -> Bool)?
@@ -1930,17 +1933,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 guard self.selectedThreadId == threadId else { return }
                 // Soft reselect / stream ticks re-enter constantly. Skip identical
                 // footer assigns so @Published chrome does not multipass-repaint.
-                guard Self.shouldPublishTokenSaverFooter(
+                if Self.shouldPublishTokenSaverFooter(
                     currentEnabled: self.tokenSaverFooterEnabled,
                     nextEnabled: next.enabled,
                     currentMeasured: self.tokenSaverThreadMeasuredTokens,
                     nextMeasured: next.measuredTokens,
                     currentDisplay: self.tokenSaverThreadSavedTokens,
                     nextDisplay: next.displayTokens
-                ) else { return }
-                self.tokenSaverFooterEnabled = next.enabled
-                self.tokenSaverThreadMeasuredTokens = next.measuredTokens
-                self.tokenSaverThreadSavedTokens = next.displayTokens
+                ) {
+                    self.tokenSaverFooterEnabled = next.enabled
+                    self.tokenSaverThreadMeasuredTokens = next.measuredTokens
+                    self.tokenSaverThreadSavedTokens = next.displayTokens
+                }
+                self.tokenSaverFooterSnapshotReady = true
             }
         }
     }
@@ -1954,6 +1959,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         tokenSaverFooterEnabled = false
         tokenSaverThreadMeasuredTokens = 0
         tokenSaverThreadSavedTokens = 0
+        tokenSaverFooterSnapshotReady = false
     }
 
     /// Skip equal token-saver footer publishes (soft reselect / idle multipass).
@@ -14282,26 +14288,52 @@ public struct AgentAppView: View {
         return max(measured, breakdown.totalCredible)
     }
 
+    /// Pure seam: green savings, yellow on-zero problem, red off. Nil while a
+    /// thread-switch snapshot has not landed — that pending 0 is not off or a
+    /// problem chip.
+    public nonisolated static func tokenSaverThreadFooterPresentation(
+        enabled: Bool,
+        measuredTokens: Int = 0,
+        snapshotReady: Bool = true
+    ) -> AgentChatTokenSaverThreadFooterPresentation? {
+        guard snapshotReady else { return nil }
+        if !enabled { return .deactivated }
+        if measuredTokens <= 0 { return .problem }
+        return .savings
+    }
+
     /// Pure seam: footer copy.
     ///
-    /// - Requires `measuredTokens > 0` so estimates only **raise** a proven ledger
-    ///   figure — never invent a chip from assistant text alone.
+    /// - Off (and ready): always 0 tokens saved because Token Saver is deactivated.
+    /// - On with `measuredTokens == 0`: still present, yellow problem copy, not red.
+    /// - On with measured > 0: estimates may only **raise** the proven ledger figure.
     /// - Product copy: full stack in plain language (tool output, shorter answers,
     ///   multi-turn cache). Optional Auto note for cheaper models.
     public nonisolated static func tokenSaverThreadFooterText(
         displayTokens: Int,
         measuredTokens: Int,
         enabled: Bool,
-        autoRoutingActive: Bool = false
+        autoRoutingActive: Bool = false,
+        snapshotReady: Bool = true
     ) -> String? {
-        guard enabled, measuredTokens > 0, displayTokens > 0 else { return nil }
-        let amount = formatTokenCountForFooter(displayTokens)
-        // Keep the chip scannable: one number + short list of what is inside it.
-        let base = "Token Saver: \(amount) tokens saved (tool output, shorter answers, multi-turn cache)"
-        if autoRoutingActive {
-            return base + " · Auto picked cheaper models at the same quality"
+        guard let presentation = tokenSaverThreadFooterPresentation(
+            enabled: enabled,
+            measuredTokens: measuredTokens,
+            snapshotReady: snapshotReady
+        ) else { return nil }
+        switch presentation {
+        case .deactivated:
+            return "Token Saver: 0 tokens saved because Token Saver is deactivated"
+        case .problem:
+            return "Token Saver: 0 tokens saved because something went wrong"
+        case .savings:
+            let amount = formatTokenCountForFooter(displayTokens)
+            let base = "Token Saver: \(amount) tokens saved (tool output, shorter answers, multi-turn cache)"
+            if autoRoutingActive {
+                return base + " · Auto picked cheaper models at the same quality"
+            }
+            return base
         }
-        return base
     }
 
     /// Backward-compatible alias used by older tests — measured-only copy path.
@@ -14337,14 +14369,16 @@ public struct AgentAppView: View {
 
     /// True only after the selected thread has finished a turn *and* the
     /// shipped footer copy is non-nil. Live runs keep the working strip instead.
+    /// Empty threads with no finished turn stay chip-less.
     public nonisolated static func shouldShowTokenSaverThreadFooter(
         runIsLive: Bool,
-        footerText: String?
+        footerText: String?,
+        hasFinishedTurn: Bool = true
     ) -> Bool {
-        !runIsLive && footerText != nil
+        !runIsLive && hasFinishedTurn && footerText != nil
     }
 
-    /// Soft success chip once under the newest finished answer (not every turn).
+    /// Shared Token Saver chip once under the newest finished answer (not every turn).
     @ViewBuilder
     private func tokenSaverThreadFooter() -> some View {
         // Auto routing is the product name for model-auto orchestration on a thread.
@@ -14353,13 +14387,25 @@ public struct AgentAppView: View {
             displayTokens: vm.tokenSaverThreadSavedTokens,
             measuredTokens: vm.tokenSaverThreadMeasuredTokens,
             enabled: vm.tokenSaverFooterEnabled,
-            autoRoutingActive: autoRouting
+            autoRoutingActive: autoRouting,
+            snapshotReady: vm.tokenSaverFooterSnapshotReady
         )
+        let presentation = Self.tokenSaverThreadFooterPresentation(
+            enabled: vm.tokenSaverFooterEnabled,
+            measuredTokens: vm.tokenSaverThreadMeasuredTokens,
+            snapshotReady: vm.tokenSaverFooterSnapshotReady
+        )
+        let hasFinishedTurn = vm.messages.contains(where: { $0.role == .assistant })
         if Self.shouldShowTokenSaverThreadFooter(
             runIsLive: vm.selectedThreadRunIsStartingOrRunning,
-            footerText: text
-        ), let text {
-            AgentChatTokenSaverThreadFooter(text: text, autoRouting: autoRouting)
+            footerText: text,
+            hasFinishedTurn: hasFinishedTurn
+        ), let text, let presentation {
+            AgentChatTokenSaverThreadFooter(
+                text: text,
+                autoRouting: autoRouting,
+                presentation: presentation
+            )
         }
     }
 

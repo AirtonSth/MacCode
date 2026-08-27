@@ -348,6 +348,19 @@ final class BotsWindowTests: XCTestCase {
             let vm = BotsViewModel(context: context)
             XCTAssertNil(vm.tokenSaverFooterTextForTesting())
             XCTAssertFalse(vm.tokenSaverFooterEnabled)
+            XCTAssertFalse(vm.tokenSaverFooterSnapshotReady)
+            vm.applyTokenSaverFooterSnapshotForTesting(
+                TokenSaverThreadFooterReload.Snapshot(
+                    enabled: false,
+                    measuredTokens: 0,
+                    displayTokens: 0
+                )
+            )
+            XCTAssertEqual(
+                vm.tokenSaverFooterTextForTesting(),
+                "Token Saver: 0 tokens saved because Token Saver is deactivated"
+            )
+            XCTAssertEqual(vm.deskTokenSaverFooterPresentation, .deactivated)
         }
     }
 
@@ -14180,6 +14193,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(
             bots.contains("AgentChatTokenSaverThreadFooter"),
             "Desk must mount the shared Token Saver footer, not a lookalike capsule"
+        )
+        XCTAssertTrue(
+            bots.contains("presentation: presentation"),
+            "Desk must pass the shared on/off presentation so off-state red is not Agent-App-only"
         )
         XCTAssertTrue(bots.contains("AgentChatTokenSaverDisplayControl"))
         XCTAssertTrue(bots.contains("deskUserDisplayText"))
