@@ -131,7 +131,9 @@ public final class TokenSaverScopedRecoveryStore: @unchecked Sendable {
         guard objectBytes <= TokenSaverRecoveryLimits.maxObjectBytes else {
             throw TokenSaverRecoveryStoreError.objectQuotaExceeded
         }
-        let diskFloor = max(TokenSaverRecoveryLimits.minimumFreeDiskBytes, disk.totalBytes / 10)
+        // Fixed 5 GiB — not a percent of volume size. 10% of a multi-TB disk
+        // forfeited every lossy Distill handle while tens of GiB were still free.
+        let diskFloor = TokenSaverRecoveryLimits.minimumFreeDiskBytes
         guard disk.freeBytes >= diskFloor,
               objectBytes <= disk.freeBytes - diskFloor else {
             throw TokenSaverRecoveryStoreError.diskFloorReached
