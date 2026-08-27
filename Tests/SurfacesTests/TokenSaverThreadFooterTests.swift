@@ -524,6 +524,155 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         XCTAssertTrue(chromeSource.contains(".accessibilityIdentifier(\"agent.tokenSaver.threadFooter\")"))
     }
 
+    func test_agentAppFooter_clearsPublishedSnapshotOnThreadSwitch() async throws {
+        // WHY: AC3 — the chip is the selected thread's ledger. Switching A→B
+        // must not keep A's 177K on B while B's read is in flight (Desk already
+        // resets; Agent App previously only cancelled the task).
+        let tmp = NSTemporaryDirectory() + "rc2-token-saver-switch-clear-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [
+                .codex: FakeProviderRunner(provider: .codex),
+                .claude: FakeProviderRunner(provider: .claude)
+            ]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(),
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        vm.createThread(title: "A")
+        let threadA = try XCTUnwrap(vm.selectedThreadId)
+        vm.createThread(title: "B")
+        let threadB = try XCTUnwrap(vm.selectedThreadId)
+        vm.selectThread(threadA, markRead: false)
+        let reader = BlockingFooterReader(values: [
+            threadA.value.uuidString: 177_043,
+            threadB.value.uuidString: 750
+        ])
+        vm.bindTokenSaverThreadFooter(
+            savingsRepo: TokenSaverSavingsRepository(db: db),
+            isEligible: { true },
+            measuredLoader: { _, threadId, _ in
+                guard let threadId else { return nil }
+                return await reader.read(threadId.value.uuidString)
+            }
+        )
+
+        let aPublished = expectation(description: "thread A footer published")
+        var aCancellable: AnyCancellable?
+        aCancellable = vm.$tokenSaverThreadMeasuredTokens.sink { value in
+            if value == 177_043 { aPublished.fulfill() }
+        }
+        defer { aCancellable?.cancel() }
+
+        await reader.waitUntilStarted(threadA.value.uuidString)
+        await reader.release(threadA.value.uuidString)
+        await fulfillment(of: [aPublished], timeout: 5)
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 177_043)
+        XCTAssertGreaterThanOrEqual(vm.tokenSaverThreadSavedTokens, 177_043)
+        let expectedA =
+            "Token Saver: \(AgentAppView.formatTokenCountForFooter(vm.tokenSaverThreadSavedTokens)) tokens saved (tool output, shorter answers, multi-turn cache)"
+        XCTAssertEqual(
+            AgentAppView.tokenSaverThreadFooterText(
+                displayTokens: vm.tokenSaverThreadSavedTokens,
+                measuredTokens: vm.tokenSaverThreadMeasuredTokens,
+                enabled: vm.tokenSaverFooterEnabled
+            ),
+            expectedA
+        )
+
+        vm.selectThread(threadB, markRead: false)
+        XCTAssertEqual(vm.selectedThreadId, threadB)
+        XCTAssertFalse(vm.tokenSaverFooterEnabled)
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0)
+        XCTAssertEqual(vm.tokenSaverThreadSavedTokens, 0)
+        XCTAssertNil(
+            AgentAppView.tokenSaverThreadFooterText(
+                displayTokens: vm.tokenSaverThreadSavedTokens,
+                measuredTokens: vm.tokenSaverThreadMeasuredTokens,
+                enabled: vm.tokenSaverFooterEnabled
+            )
+        )
+        XCTAssertFalse(
+            AgentAppView.shouldShowTokenSaverThreadFooter(
+                runIsLive: false,
+                footerText: AgentAppView.tokenSaverThreadFooterText(
+                    displayTokens: vm.tokenSaverThreadSavedTokens,
+                    measuredTokens: vm.tokenSaverThreadMeasuredTokens,
+                    enabled: vm.tokenSaverFooterEnabled
+                )
+            )
+        )
+
+        let bPublished = expectation(description: "thread B footer published")
+        var bCancellable: AnyCancellable?
+        bCancellable = vm.$tokenSaverThreadMeasuredTokens.sink { value in
+            if value == 750 { bPublished.fulfill() }
+        }
+        defer { bCancellable?.cancel() }
+        await reader.waitUntilStarted(threadB.value.uuidString)
+        await reader.release(threadB.value.uuidString)
+        await fulfillment(of: [bPublished], timeout: 5)
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 750)
+        let expectedB =
+            "Token Saver: \(AgentAppView.formatTokenCountForFooter(vm.tokenSaverThreadSavedTokens)) tokens saved (tool output, shorter answers, multi-turn cache)"
+        XCTAssertEqual(
+            AgentAppView.tokenSaverThreadFooterText(
+                displayTokens: vm.tokenSaverThreadSavedTokens,
+                measuredTokens: vm.tokenSaverThreadMeasuredTokens,
+                enabled: vm.tokenSaverFooterEnabled
+            ),
+            expectedB
+        )
+    }
+
+    func test_footerText_image1Copy_usesLiveFormattedAmount() {
+        // WHY: Image #1 is the green leaf chip under a finished Agent App answer.
+        // 177043 formats as 177.0K — exact thousands would drop the decimal.
+        let text = AgentAppView.tokenSaverThreadFooterText(
+            displayTokens: 177_043,
+            measuredTokens: 177_043,
+            enabled: true
+        )
+        XCTAssertEqual(
+            text,
+            "Token Saver: 177.0K tokens saved (tool output, shorter answers, multi-turn cache)"
+        )
+        XCTAssertEqual(AgentAppView.formatTokenCountForFooter(177_043), "177.0K")
+    }
+
+    func test_shouldShowFooter_hidesWhileRunIsLive() {
+        // WHY: the working strip owns the live turn; the savings chip must not
+        // appear until the selected thread is finished, even with a proven total.
+        let text = AgentAppView.tokenSaverThreadFooterText(
+            displayTokens: 177_043,
+            measuredTokens: 177_043,
+            enabled: true
+        )
+        XCTAssertEqual(
+            AgentAppView.shouldShowTokenSaverThreadFooter(runIsLive: true, footerText: text),
+            false
+        )
+        XCTAssertEqual(
+            AgentAppView.shouldShowTokenSaverThreadFooter(runIsLive: false, footerText: text),
+            true
+        )
+        XCTAssertEqual(
+            AgentAppView.shouldShowTokenSaverThreadFooter(runIsLive: false, footerText: nil),
+            false
+        )
+    }
+
     func test_formatTokenCount_millions() {
         XCTAssertEqual(AgentAppView.formatTokenCountForFooter(1_500_000), "1.5M")
         XCTAssertEqual(AgentAppView.formatTokenCountForFooter(12_000_000), "12M")

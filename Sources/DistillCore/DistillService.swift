@@ -47,6 +47,20 @@ public struct TokenSaverRecoveryRequestContext: Sendable, Equatable {
     public var hasCompleteMutationContext: Bool {
         hasCompleteScope && !invocationID.isEmpty && !operationID.isEmpty
     }
+
+    /// Forward any present identity fields. Store-before-loss still requires
+    /// `hasCompleteScope` on the server; savings attribution only needs thread id.
+    public func applyIdentityHeaders(to request: inout URLRequest) {
+        func set(_ value: String, header: String) {
+            guard !value.isEmpty else { return }
+            request.setValue(value, forHTTPHeaderField: header)
+        }
+        set(workspaceID, header: "X-RemoteCode-Workspace-ID")
+        set(projectID, header: "X-RemoteCode-Project-ID")
+        set(threadID, header: "X-RemoteCode-Thread-ID")
+        set(provider, header: "X-RemoteCode-Provider")
+        set(attemptID, header: "X-RemoteCode-Attempt-ID")
+    }
 }
 
 public enum TokenSaverScopedRecoveryState: String, Sendable, Equatable {

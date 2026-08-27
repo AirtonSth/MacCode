@@ -1932,6 +1932,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Drop published footer chrome for the leaving thread. Call after
+    /// `selectedThreadId` changes so an in-flight load for the previous thread
+    /// cannot republish (it checks selectedThreadId).
+    private func resetTokenSaverFooterSnapshot() {
+        tokenSaverFooterReloadTask?.cancel()
+        tokenSaverFooterReloadTask = nil
+        tokenSaverFooterEnabled = false
+        tokenSaverThreadMeasuredTokens = 0
+        tokenSaverThreadSavedTokens = 0
+    }
+
     /// Skip equal token-saver footer publishes (soft reselect / idle multipass).
     public nonisolated static func shouldPublishTokenSaverFooter(
         currentEnabled: Bool,
@@ -1997,6 +2008,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if let previous = selectedThreadId { persistComposerDraft(for: previous) }
         selectedThreadId = id
         publishInterestedThreadId(id)
+        // Per-thread chip: never keep the leaving thread's savings on the
+        // newly selected one while its ledger read is in flight (or if it fails).
+        resetTokenSaverFooterSnapshot()
         providerThreadSnapshotStatusMessage = nil
         providerThreadSnapshotLastConfirmedAt = providerThreadSnapshotConfirmedAtByThread[id]
         // F6: Token Saver translation maps are per-thread state. Reset them on a
@@ -5946,10 +5960,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         transcriptHistoryRevealCount = 0
         planNotes = ""
         subagentActivity = .empty
-        tokenSaverFooterReloadTask?.cancel()
-        tokenSaverFooterReloadTask = nil
-        tokenSaverThreadSavedTokens = 0
-        tokenSaverThreadMeasuredTokens = 0
+        resetTokenSaverFooterSnapshot()
         reloadQueuedMessages()
         reloadCheckpoints()
     }
@@ -13355,10 +13366,8 @@ public struct AgentAppView: View {
                             }
                             // B-1: one chip for the whole thread, after the newest
                             // finished answer — never N copies under every final.
-                            if !vm.selectedThreadRunIsStartingOrRunning {
-                                tokenSaverThreadFooter()
-                                    .id("agent.tokenSaver.footer")
-                            }
+                            tokenSaverThreadFooter()
+                                .id("agent.tokenSaver.footer")
                             if Self.shouldRenderActivePlan(
                                 plan: vm.activePlan,
                                 status: vm.status,
@@ -14202,17 +14211,30 @@ public struct AgentAppView: View {
         return "\(n)"
     }
 
+    /// True only after the selected thread has finished a turn *and* the
+    /// shipped footer copy is non-nil. Live runs keep the working strip instead.
+    public nonisolated static func shouldShowTokenSaverThreadFooter(
+        runIsLive: Bool,
+        footerText: String?
+    ) -> Bool {
+        !runIsLive && footerText != nil
+    }
+
     /// Soft success chip once under the newest finished answer (not every turn).
     @ViewBuilder
     private func tokenSaverThreadFooter() -> some View {
         // Auto routing is the product name for model-auto orchestration on a thread.
         let autoRouting = vm.routingMode == .auto
-        if let text = Self.tokenSaverThreadFooterText(
+        let text = Self.tokenSaverThreadFooterText(
             displayTokens: vm.tokenSaverThreadSavedTokens,
             measuredTokens: vm.tokenSaverThreadMeasuredTokens,
             enabled: vm.tokenSaverFooterEnabled,
             autoRoutingActive: autoRouting
-        ) {
+        )
+        if Self.shouldShowTokenSaverThreadFooter(
+            runIsLive: vm.selectedThreadRunIsStartingOrRunning,
+            footerText: text
+        ), let text {
             AgentChatTokenSaverThreadFooter(text: text, autoRouting: autoRouting)
         }
     }

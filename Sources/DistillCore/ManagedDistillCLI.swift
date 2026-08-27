@@ -120,7 +120,10 @@ public struct ManagedDistillCLI: Sendable {
         // on claude/codex/grok instead of "unknown" when only headers are set.
         let recoveryProvider = recoveryContext?.provider
         self.provider = Self.resolveProvider(explicit: provider, recoveryProvider: recoveryProvider)
-        self.recoveryContext = recoveryContext?.hasCompleteScope == true ? recoveryContext : nil
+        // Keep a partial context so X-RemoteCode-Thread-ID still reaches the
+        // sidecar when workspace/project/attempt are missing. Store-before-loss
+        // stays gated on hasCompleteScope server-side.
+        self.recoveryContext = (recoveryContext?.threadID.isEmpty == false) ? recoveryContext : nil
         self.invocationID = invocationID
         self.maxOutputCharacters = max(128, maxOutputCharacters)
         self.reversibleStoreMinBytes = reversibleStoreMinBytes
@@ -993,15 +996,13 @@ public struct ManagedDistillCLI: Sendable {
             attemptID: environment["RC_TOKEN_SAVER_ATTEMPT_ID"] ?? "",
             operationID: ""
         )
-        return context.hasCompleteScope ? context : nil
+        if context.hasCompleteScope || !context.threadID.isEmpty {
+            return context
+        }
+        return nil
     }
 
     private func applyRecoveryScope(to request: inout URLRequest) {
-        guard let recoveryContext else { return }
-        request.setValue(recoveryContext.workspaceID, forHTTPHeaderField: "X-RemoteCode-Workspace-ID")
-        request.setValue(recoveryContext.projectID, forHTTPHeaderField: "X-RemoteCode-Project-ID")
-        request.setValue(recoveryContext.threadID, forHTTPHeaderField: "X-RemoteCode-Thread-ID")
-        request.setValue(recoveryContext.provider, forHTTPHeaderField: "X-RemoteCode-Provider")
-        request.setValue(recoveryContext.attemptID, forHTTPHeaderField: "X-RemoteCode-Attempt-ID")
+        recoveryContext?.applyIdentityHeaders(to: &request)
     }
 }

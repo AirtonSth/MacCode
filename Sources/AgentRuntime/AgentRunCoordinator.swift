@@ -610,7 +610,14 @@ public enum TokenSaverExecutionReceiptSeam {
         if receipt.capabilities.recoveryScope == true {
             env["RC_TOKEN_SAVER_WORKSPACE_ID"] = receipt.workspaceId
             env["RC_TOKEN_SAVER_PROJECT_ID"] = receipt.projectId
-            env["RC_TOKEN_SAVER_THREAD_ID"] = receipt.threadId
+        }
+        // Per-thread Token Saver chip reads `token_saver_thread_totals`. That
+        // accumulator only moves when delivered rows carry a thread id, which
+        // PATH wrappers/hooks take from this env var. Recovery scope needs a
+        // workspace; savings attribution does not.
+        let threadId = receipt.threadId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !threadId.isEmpty {
+            env["RC_TOKEN_SAVER_THREAD_ID"] = threadId
         }
         if let rootRunId = receipt.rootRunId {
             env["RC_TOKEN_SAVER_ROOT_RUN_ID"] = rootRunId

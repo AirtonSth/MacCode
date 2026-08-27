@@ -133,18 +133,16 @@ public final class DistillServiceClient: @unchecked Sendable {
         do {
             let body = try encode(wireRequest)
             httpRequest.httpBody = body
-            if let recoveryContext, recoveryContext.hasCompleteScope {
-                let derivedOperationID = ManagedDistillCLI.recoveryOperationID(kind: "distill", canonicalPayload: body)
-                let operationID = recoveryContext.operationID.isEmpty
-                    ? derivedOperationID
-                    : recoveryContext.operationID + ":" + derivedOperationID
-                httpRequest.setValue(recoveryContext.workspaceID, forHTTPHeaderField: "X-RemoteCode-Workspace-ID")
-                httpRequest.setValue(recoveryContext.projectID, forHTTPHeaderField: "X-RemoteCode-Project-ID")
-                httpRequest.setValue(recoveryContext.threadID, forHTTPHeaderField: "X-RemoteCode-Thread-ID")
-                httpRequest.setValue(recoveryContext.provider, forHTTPHeaderField: "X-RemoteCode-Provider")
-                httpRequest.setValue(recoveryContext.attemptID, forHTTPHeaderField: "X-RemoteCode-Attempt-ID")
-                httpRequest.setValue(request.id.uuidString.lowercased(), forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
-                httpRequest.setValue(operationID, forHTTPHeaderField: "X-RemoteCode-Operation-ID")
+            if let recoveryContext {
+                recoveryContext.applyIdentityHeaders(to: &httpRequest)
+                if recoveryContext.hasCompleteScope {
+                    let derivedOperationID = ManagedDistillCLI.recoveryOperationID(kind: "distill", canonicalPayload: body)
+                    let operationID = recoveryContext.operationID.isEmpty
+                        ? derivedOperationID
+                        : recoveryContext.operationID + ":" + derivedOperationID
+                    httpRequest.setValue(request.id.uuidString.lowercased(), forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
+                    httpRequest.setValue(operationID, forHTTPHeaderField: "X-RemoteCode-Operation-ID")
+                }
             }
         } catch {
             throw DistillClientError.transport("encode request: \(error)")

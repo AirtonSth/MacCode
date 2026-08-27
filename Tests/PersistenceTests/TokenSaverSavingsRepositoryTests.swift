@@ -587,4 +587,28 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
         XCTAssertEqual(try repo.savedTokens(forThreadID: threadA), 1_350,
                        "thread total must survive event prune")
     }
+
+    func test_deliveredRecordWithoutThreadId_countsInSummaryButNotThreadFooter() throws {
+        // WHY: Today/Week popover totals can look healthy while the transcript
+        // chip stays hidden if the live record path forgot the thread id.
+        let db = try makeDB()
+        let repo = TokenSaverSavingsRepository(db: db)
+        let thread = "33333333-3333-3333-3333-333333333333"
+
+        XCTAssertEqual(try repo.record(
+            provider: "codex", mode: "command-output", inputTokens: 1_000,
+            outputTokens: 250, savedTokens: 750, delivered: true,
+            threadID: "", idempotencyKey: "unattributed-today"
+        ), 750)
+        XCTAssertEqual(try repo.record(
+            provider: "codex", mode: "command-output", inputTokens: 800,
+            outputTokens: 200, savedTokens: 600, delivered: true,
+            threadID: thread, idempotencyKey: "attributed-footer"
+        ), 600)
+
+        XCTAssertEqual(try repo.summary().totalSavedTokens, 1_350)
+        XCTAssertEqual(try repo.savedTokens(forThreadID: thread), 600,
+                       "the footer reads only the per-thread accumulator")
+        XCTAssertEqual(try repo.savedTokens(forThreadID: ""), 0)
+    }
 }
