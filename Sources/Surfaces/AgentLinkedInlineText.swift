@@ -78,17 +78,37 @@ struct AgentLinkedInlineText: View {
     }
 }
 
-struct AgentSelectablePlainText: View {
+public struct AgentSelectablePlainText: View {
     let text: String
     var fontSize: CGFloat = 13
+    var fontWeight: NSFont.Weight = .regular
+    var monospaced: Bool = false
     var textColor: NSColor = DS.NS.text
     var lineSpacing: CGFloat = 0
     var maximumNumberOfLines: Int? = nil
 
-    var body: some View {
+    public init(
+        text: String,
+        fontSize: CGFloat = 13,
+        fontWeight: NSFont.Weight = .regular,
+        monospaced: Bool = false,
+        textColor: NSColor = DS.NS.text,
+        lineSpacing: CGFloat = 0,
+        maximumNumberOfLines: Int? = nil
+    ) {
+        self.text = text
+        self.fontSize = fontSize
+        self.fontWeight = fontWeight
+        self.monospaced = monospaced
+        self.textColor = textColor
+        self.lineSpacing = lineSpacing
+        self.maximumNumberOfLines = maximumNumberOfLines
+    }
+
+    public var body: some View {
         AgentLinkedAttributedText(
             attributed: AttributedString(text),
-            font: .systemFont(ofSize: fontSize),
+            font: AgentLinkedInlineText.nsFont(size: fontSize, weight: fontWeight, monospaced: monospaced),
             textColor: textColor,
             lineFragmentPadding: 0,
             lineSpacing: lineSpacing,

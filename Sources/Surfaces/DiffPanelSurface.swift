@@ -1378,12 +1378,12 @@ public struct DiffPanelView: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundColor(DS.Palette.danger)
                     .font(.system(size: 11))
-                Text(msg)
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.danger)
-                    .lineLimit(4)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
+                AgentSelectablePlainText(
+                    text: msg,
+                    fontSize: 11,
+                    textColor: DS.NS.danger,
+                    maximumNumberOfLines: 4
+                )
                 Spacer(minLength: 0)
                 Button {
                     withAnimation(DS.Motion.micro) { vm.lastError = nil }
@@ -1896,12 +1896,16 @@ public struct DiffPanelView: View {
                             if vm.findActive && !vm.findQuery.isEmpty {
                                 diffLinesView
                             } else {
-                                Text(vm.styledDiff)
-                                    .font(DS.Font.mono)
-                                    .textSelection(.enabled)
-                                    .padding(DS.Space.lg)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .accessibilityIdentifier("diff.body")
+                                AgentLinkedAttributedText(
+                                    attributed: vm.styledDiff,
+                                    font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+                                    textColor: DS.NS.text,
+                                    lineFragmentPadding: 0,
+                                    lineSpacing: 0
+                                )
+                                .padding(DS.Space.lg)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .accessibilityIdentifier("diff.body")
                             }
                             if vm.diffTruncated {
                                 Text("Diff truncated -- Find searches only this rendered preview. Use Copy diff for the complete text.")
@@ -1963,16 +1967,20 @@ public struct DiffPanelView: View {
                     }
                     return a
                 }()
-                Text(lineText)
-                    .font(DS.Font.mono)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, DS.Space.lg)
-                    .padding(.vertical, 0)
-                    .background(isMatchLine
-                        ? DS.Palette.warning.opacity(0.25)
-                        : Color.clear)
-                    .id("diff.line.\(idx)")
+                AgentLinkedAttributedText(
+                    attributed: lineText,
+                    font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+                    textColor: DS.NS.text,
+                    lineFragmentPadding: 0,
+                    lineSpacing: 0
+                )
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, DS.Space.lg)
+                .padding(.vertical, 0)
+                .background(isMatchLine
+                    ? DS.Palette.warning.opacity(0.25)
+                    : Color.clear)
+                .id("diff.line.\(idx)")
             }
         }
         .padding(.vertical, DS.Space.lg)

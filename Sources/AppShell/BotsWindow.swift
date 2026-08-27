@@ -11048,11 +11048,13 @@ public struct BotsRootView: View {
             Text("Revision \(receipt.revisionNumber) · \(vm.providerChipTitle(receipt.provider)) · \(receipt.model.isEmpty ? "model unset" : receipt.model) · \(receipt.permissionMode.rawValue)")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textSecondary)
-            Text("payload \(receipt.payloadDigest)")
-                .font(.system(.caption, design: .monospaced))
-                .foregroundColor(DS.Palette.textTertiary)
-                .textSelection(.enabled)
-                .accessibilityIdentifier("bots.brain.digest")
+            AgentSelectablePlainText(
+                text: "payload \(receipt.payloadDigest)",
+                fontSize: 11,
+                monospaced: true,
+                textColor: DS.NS.textTertiary
+            )
+            .accessibilityIdentifier("bots.brain.digest")
             if !compact {
                 Text("compiler \(receipt.compilerVersion) · no opaque RemoteCode layer")
                     .font(DS.Font.caption)
@@ -11073,11 +11075,12 @@ public struct BotsRootView: View {
                             .foregroundColor(DS.Palette.text)
                     }
                     if !layer.text.isEmpty {
-                        Text(layer.text)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
+                        AgentSelectablePlainText(
+                            text: layer.text,
+                            fontSize: 11,
+                            textColor: DS.NS.textSecondary
+                        )
+                        .fixedSize(horizontal: false, vertical: true)
                     }
                     Text(layer.reason)
                         .font(DS.Font.caption)
@@ -11091,11 +11094,13 @@ public struct BotsRootView: View {
     }
 
     private func brainEffective(_ receipt: ContextAssemblyReceipt) -> some View {
-        Text(receipt.compiledPayload.isEmpty ? "(empty payload)" : receipt.compiledPayload)
-            .font(.system(.caption, design: .monospaced))
-            .foregroundColor(DS.Palette.text)
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        AgentSelectablePlainText(
+            text: receipt.compiledPayload.isEmpty ? "(empty payload)" : receipt.compiledPayload,
+            fontSize: 11,
+            monospaced: true,
+            textColor: DS.NS.text
+        )
+        .frame(maxWidth: .infinity, alignment: .leading)
             .padding(DS.Space.md)
             .background(DS.Palette.surfaceRaised)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
@@ -11114,10 +11119,11 @@ public struct BotsRootView: View {
             } else {
                 ForEach(receipt.memoryLayers) { layer in
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(layer.text.isEmpty ? "(empty fact)" : layer.text)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .textSelection(.enabled)
+                        AgentSelectablePlainText(
+                            text: layer.text.isEmpty ? "(empty fact)" : layer.text,
+                            fontSize: 11,
+                            textColor: DS.NS.textSecondary
+                        )
                         Text(layer.reason)
                             .font(DS.Font.caption)
                             .foregroundColor(DS.Palette.textTertiary)
@@ -11467,7 +11473,6 @@ public struct BotsRootView: View {
                     }
                     AgentMessageMarkdownView(text: message.text)
                         .foregroundColor(DS.Palette.text)
-                        .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 if let messageId, let original,

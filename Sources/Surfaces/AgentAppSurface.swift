@@ -13903,10 +13903,12 @@ public struct AgentAppView: View {
             switch request.kind {
             case .commandExecution, .exec:
                 HStack(alignment: .top, spacing: DS.Space.sm) {
-                    Text(detail)
-                        .font(DS.Font.mono)
-                        .foregroundColor(DS.Palette.text)
-                        .textSelection(.enabled)
+                    AgentSelectablePlainText(
+                        text: detail,
+                        fontSize: 12,
+                        monospaced: true,
+                        textColor: DS.NS.text
+                    )
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(DS.Space.sm)
                         .background(DS.Palette.surface)
@@ -13964,11 +13966,13 @@ public struct AgentAppView: View {
                     }
                 }
             default:
-                Text(detail)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(4)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: detail,
+                    fontSize: 11,
+                    monospaced: true,
+                    textColor: DS.NS.textTertiary,
+                    maximumNumberOfLines: 4
+                )
             }
         }
     }
@@ -14222,7 +14226,6 @@ public struct AgentAppView: View {
             cacheResults: cacheMarkdown
         )
             .foregroundColor(DS.Palette.text)
-            .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -14568,10 +14571,13 @@ public struct AgentAppView: View {
                     .font(.system(size: 11))
                     .foregroundColor(recoverable ? DS.Palette.warning : DS.Palette.danger)
                     .frame(width: 14, height: 14, alignment: .center)
-                Text(err)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(recoverable ? DS.Palette.warning : DS.Palette.danger)
-                    .lineSpacing(3).textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: err,
+                    fontSize: 11,
+                    monospaced: true,
+                    textColor: recoverable ? DS.NS.warning : DS.NS.danger,
+                    lineSpacing: 3
+                )
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Button { vm.dismissDisplayedError() } label: {
                     Image(systemName: "xmark")
@@ -14856,11 +14862,11 @@ public struct AgentAppView: View {
                 }
             }
         case .system:
-            Text(msg.content)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-                .italic()
-                .textSelection(.enabled)
+            AgentSelectablePlainText(
+                text: msg.content,
+                fontSize: 11,
+                textColor: DS.NS.textTertiary
+            )
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -15396,11 +15402,12 @@ public struct AgentAppView: View {
             .buttonStyle(.plain)
             .help(streaming ? "" : (text.isEmpty ? "" : (expanded ? "Hide reasoning" : "Show reasoning")))
             if expanded, !text.isEmpty {
-                Text(text)
-                    .font(DS.Font.bodyDense)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineSpacing(3)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: text,
+                    fontSize: 12,
+                    textColor: DS.NS.textTertiary,
+                    lineSpacing: 3
+                )
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -15621,11 +15628,13 @@ public struct AgentAppView: View {
             // UX-MAC_AGENT-OPEN-SPLIT: file/URL tools keep an open-in-split affordance.
             if let summary = commandSummary, !summary.isEmpty {
                 HStack(alignment: .top, spacing: DS.Space.xs) {
-                    Text(summary)
-                        .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
-                        .textSelection(.enabled)
-                        .lineLimit(expanded ? nil : 1)
-                        .truncationMode(.tail)
+                    AgentSelectablePlainText(
+                        text: summary,
+                        fontSize: 11,
+                        monospaced: true,
+                        textColor: DS.NS.textSecondary,
+                        maximumNumberOfLines: expanded ? nil : 1
+                    )
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .help(commandFull ?? summary)
                     if let full = commandFull, !full.isEmpty {
@@ -15693,10 +15702,12 @@ public struct AgentAppView: View {
 
             // Expanded: full command (when longer/different than the summary) + output.
             if expanded, let full = commandFull, fullDiffersFromSummary, !full.isEmpty {
-                Text(full)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: full,
+                    fontSize: 11,
+                    monospaced: true,
+                    textColor: DS.NS.textTertiary
+                )
                     .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface.opacity(0.7))
@@ -15708,9 +15719,12 @@ public struct AgentAppView: View {
             // the transcript. Skill tool output stays complete (source-aware exception).
             // Full text stays selectable.
             if expanded, let o = output, !o.isEmpty {
-                Text(AgentTimelineItemPresentation.cappedDetail(o, for: item))
-                    .font(DS.Font.mono).foregroundColor(DS.Palette.textSecondary)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: AgentTimelineItemPresentation.cappedDetail(o, for: item),
+                    fontSize: 12,
+                    monospaced: true,
+                    textColor: DS.NS.textSecondary
+                )
                     .padding(DS.Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface)
@@ -15966,10 +15980,11 @@ public struct AgentAppView: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(DS.Palette.danger)
                 .frame(width: 14, height: 14, alignment: .center)
-            Text(message)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.text)
-                .textSelection(.enabled)
+            AgentSelectablePlainText(
+                text: message,
+                fontSize: 11,
+                textColor: DS.NS.text
+            )
                 .frame(maxWidth: .infinity, alignment: .leading)
             if offersCopy {
                 Button("Copy") {
@@ -16015,10 +16030,11 @@ public struct AgentAppView: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(DS.Palette.textSecondary)
                 .frame(width: 14, height: 14, alignment: .center)
-            Text(message)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textSecondary)
-                .textSelection(.enabled)
+            AgentSelectablePlainText(
+                text: message,
+                fontSize: 11,
+                textColor: DS.NS.textSecondary
+            )
                 .frame(maxWidth: .infinity, alignment: .leading)
             Button(action: dismiss) {
                 Image(systemName: "xmark")
@@ -16334,10 +16350,11 @@ public struct AgentAppView: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(tone)
                 .frame(width: 14, height: 14, alignment: .center)
-            Text(item.message)
-                .font(DS.Font.caption)
-                .foregroundColor(item.severity == .info ? DS.Palette.textSecondary : DS.Palette.text)
-                .textSelection(.enabled)
+            AgentSelectablePlainText(
+                text: item.message,
+                fontSize: 11,
+                textColor: item.severity == .info ? DS.NS.textSecondary : DS.NS.text
+            )
                 .frame(maxWidth: .infinity, alignment: .leading)
             if item.offersCopy {
                 Button("Copy") {
@@ -17100,10 +17117,12 @@ public struct AgentAppView: View {
                         }
                     }
                     ScrollView {
-                        Text(plan)
-                            .font(DS.Font.monoSmall)
-                            .foregroundColor(DS.Palette.text)
-                            .textSelection(.enabled)
+                        AgentSelectablePlainText(
+                            text: plan,
+                            fontSize: 11,
+                            monospaced: true,
+                            textColor: DS.NS.text
+                        )
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(maxHeight: proposedPlanExpanded ? 420 : 220)
@@ -17201,10 +17220,12 @@ public struct AgentAppView: View {
                         }
                     }
                     ScrollView {
-                        Text(vm.checkpointDiffPreview)
-                            .font(DS.Font.monoSmall)
-                            .foregroundColor(DS.Palette.text)
-                            .textSelection(.enabled)
+                        AgentSelectablePlainText(
+                            text: vm.checkpointDiffPreview,
+                            fontSize: 11,
+                            monospaced: true,
+                            textColor: DS.NS.text
+                        )
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(maxHeight: 220)
@@ -17349,7 +17370,6 @@ public struct AgentAppView: View {
                 Spacer(minLength: 0)
             }
             AgentMessageMarkdownView(text: markdown)
-                .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: DS.Space.xs) {
                 if plan.showsImplementationActions {

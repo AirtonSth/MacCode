@@ -730,10 +730,12 @@ public struct AgentMessageMarkdownView: View {
             // IMP-010: wrap code block in ZStack so a copy button can be
             // overlaid in the top-right corner without altering layout.
             ZStack(alignment: .topTrailing) {
-                Text(block.text.isEmpty ? " " : block.text)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(DS.Palette.text)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: block.text.isEmpty ? " " : block.text,
+                    fontSize: 11,
+                    monospaced: true,
+                    textColor: DS.NS.text
+                )
                     .padding(DS.Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface)
@@ -795,9 +797,13 @@ struct DiffPreviewText: View {
     }
 
     var body: some View {
-        Text(attributed)
-            .font(DS.Font.monoSmall)
-            .textSelection(.enabled)
+        AgentLinkedAttributedText(
+            attributed: attributed,
+            font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+            textColor: DS.NS.text,
+            lineFragmentPadding: 0,
+            lineSpacing: 0
+        )
     }
 
     private static func render(_ diff: String, maxLines: Int) -> AttributedString {
@@ -864,12 +870,12 @@ struct AgentFileEditDiffCard: View {
                         .font(DS.Font.caption.weight(.semibold))
                         .foregroundColor(DS.Palette.textSecondary)
                     if let path = model.path, !path.isEmpty {
-                        Text(path)
-                            .font(DS.Font.monoSmall)
-                            .foregroundColor(DS.Palette.warning)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .textSelection(.enabled)
+                        AgentSelectablePlainText(
+                            text: path,
+                            fontSize: 11,
+                            textColor: DS.NS.warning,
+                            maximumNumberOfLines: 1
+                        )
                     }
                     Spacer(minLength: 0)
                     Image(systemName: expanded ? "chevron.down" : "chevron.right")
@@ -885,7 +891,6 @@ struct AgentFileEditDiffCard: View {
             .accessibilityIdentifier("agent.fileEdit.header")
 
             if expanded {
-                // Single selection container — not per-line — keeps recycling cheap.
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(visible.rows) { line in
                         diffLineRow(line)
@@ -910,7 +915,6 @@ struct AgentFileEditDiffCard: View {
                             .padding(.vertical, 4)
                     }
                 }
-                .textSelection(.enabled)
                 .background(DS.Palette.surface)
             }
         }
