@@ -420,7 +420,9 @@ extension BotsWindowTests {
             encoding: .utf8
         )
         XCTAssertTrue(source.contains("private func openDeskFromCache"))
-        XCTAssertTrue(source.contains("cachedConversation?.id == cachedConversationID"))
+        XCTAssertTrue(source.contains("cachedMessages(botID:"))
+        XCTAssertTrue(source.contains("applyStudioSupport(snapshot, prefetchRail: false)"))
+        XCTAssertTrue(source.contains("allowStoreLookup: false"))
         let guardStart = try XCTUnwrap(source.range(of: "private func navigationFreshnessIsCurrent("))
         let guardTail = source[guardStart.lowerBound...]
         let guardEnd = try XCTUnwrap(guardTail.range(of: "\n    private func performDeskFreshness"))
@@ -440,6 +442,8 @@ extension BotsWindowTests {
             encoding: .utf8
         )
         XCTAssertTrue(source.contains("deskWorkLog = []"))
+        XCTAssertTrue(source.contains("messagesByConversation"))
+        XCTAssertTrue(source.contains("allowStoreLookup: !navigationFirstFrameDeferral"))
         XCTAssertTrue(source.contains(".thread(botID: conversation.botID, conversationID: conversation.id)"))
         XCTAssertTrue(source.contains("selectedConversation?.id == conversationID"))
     }
