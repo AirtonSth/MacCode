@@ -3055,16 +3055,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         try service.act(botID: id, steps: steps)
                         return try service.remoteFrame(botID: id)
                     }.value
+                    var readback = Self.guestFrameReadback(context: context, evidence: evidence)
+                    readback["last_request_id"] = requestID
                     self?.settlePairedBot(
                         requestID: requestID,
                         ok: true,
-                        readback: Self.guestFrameReadback(context: context, evidence: evidence)
+                        readback: readback
                     )
                 } catch {
+                    var readback = Self.guestFailureReadback(context: context, error: error)
+                    readback["last_request_id"] = requestID
                     self?.settlePairedBot(
                         requestID: requestID,
                         ok: false,
-                        readback: Self.guestFailureReadback(context: context, error: error)
+                        readback: readback
                     )
                 }
             }

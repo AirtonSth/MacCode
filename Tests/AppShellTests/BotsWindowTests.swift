@@ -10069,6 +10069,139 @@ final class BotsWindowTests: XCTestCase {
         }
     }
 
+    func test_pairedGuestInputSettlementPublishesExactPointerRequestIDForSuccessAndFailure() async throws {
+        // WHY: guest input settles asynchronously after the authority has
+        // accepted it. Each terminal readback/event must retain that input's
+        // request identity, rather than the Start (or preceding input) ID.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let docker = RecordingDocker()
+        docker.png = Data([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x06, 0x40, 0x00, 0x00, 0x04, 0xb0,
+        ])
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: docker,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.dockerGuestReadyOverrideForTesting = nil
+        let botID = bot.id.value.uuidString.lowercased()
+        let hostID = "paired-guest-input-host"
+        let initial = try await router.dispatchPairedBotRemote(method: "bot.guest.state", params: [
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+        ])
+        let initialState = try XCTUnwrap(initial.objectValue)
+        let tasks = try XCTUnwrap(initialState["task_catalog"]?.objectValue?["tasks"]?.arrayValue)
+        let startTask = try XCTUnwrap(tasks.compactMap(\.objectValue).first {
+            $0["operation"]?.stringValue == "bot.guest.start"
+        })
+        let pointerTask = try XCTUnwrap(tasks.compactMap(\.objectValue).first {
+            $0["operation"]?.stringValue == "bot.guest.input"
+                && $0["axis"]?.stringValue == "pointer"
+        })
+        let startRequestID = "paired-guest-input-start"
+        let successRequestID = "paired-guest-input-success"
+        let failureRequestID = "paired-guest-input-failure"
+        let recorder = GuestEventRecorder()
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "bot.guest.updated",
+                  let requestID = event.payload.objectValue?["request_id"]?.stringValue,
+                  [successRequestID, failureRequestID].contains(requestID) else { return }
+            recorder.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(subscription) }
+
+        func terminalReceipt(requestID: String) async throws -> [String: JSONValue] {
+            var latest = JSONValue.null
+            for _ in 0..<200 {
+                latest = try await router.dispatchPairedBotRemote(method: "bot.receipt.status", params: [
+                    "client_request_id": .string(requestID),
+                ])
+                if let object = latest.objectValue,
+                   object["status"]?.stringValue != "accepted" {
+                    return object
+                }
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            throw NSError(domain: "BotsWindowTests", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "receipt remained accepted: \(requestID)",
+            ])
+        }
+
+        _ = try await router.dispatchPairedBotRemote(method: "bot.guest.start", params: [
+            "client_request_id": .string(startRequestID),
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+            "task_id": try XCTUnwrap(startTask["id"]),
+            "recipe_id": try XCTUnwrap(startTask["recipe_id"]),
+        ])
+        let startTerminal = try await terminalReceipt(requestID: startRequestID)
+        XCTAssertEqual(startTerminal["status"]?.stringValue, "completed")
+        let startReadback = try XCTUnwrap(startTerminal["readback"]?.objectValue)
+        let startRuntime = try XCTUnwrap(startReadback["runtime"]?.objectValue)
+        let startFrameID = try XCTUnwrap(startReadback["frame"]?.objectValue?["frame_id"]?.stringValue)
+
+        let pointerParams: [String: JSONValue] = [
+            "client_request_id": .string(successRequestID),
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+            "task_id": try XCTUnwrap(pointerTask["id"]),
+            "runtime": .object(startRuntime),
+            "before_frame_id": .string(startFrameID),
+            "input": .object([
+                "kind": .string("pointer"),
+                "x": .number(100.0),
+                "y": .number(100.0),
+            ]),
+        ]
+        let acceptedSuccess = try await router.dispatchPairedBotRemote(
+            method: "bot.guest.input",
+            params: pointerParams
+        )
+        XCTAssertEqual(acceptedSuccess.objectValue?["status"]?.stringValue, "accepted")
+        let successTerminal = try await terminalReceipt(requestID: successRequestID)
+        XCTAssertEqual(successTerminal["status"]?.stringValue, "completed")
+        let successReadback = try XCTUnwrap(successTerminal["readback"]?.objectValue)
+        XCTAssertEqual(successReadback["last_request_id"]?.stringValue, successRequestID)
+        XCTAssertNotEqual(successReadback["last_request_id"]?.stringValue, startRequestID)
+        let successFrameID = try XCTUnwrap(successReadback["frame"]?.objectValue?["frame_id"]?.stringValue)
+        let successEvent = try XCTUnwrap(recorder.events.first {
+            $0.payload.objectValue?["request_id"]?.stringValue == successRequestID
+        })
+        XCTAssertEqual(successEvent.payload.objectValue?["request_id"]?.stringValue, successRequestID)
+        XCTAssertEqual(successEvent.payload.objectValue?["after_frame_id"]?.stringValue, successFrameID)
+
+        docker.failExecAfterCall = docker.execCallCount
+        let failureParams = pointerParams.merging([
+            "client_request_id": .string(failureRequestID),
+            "runtime": .object(try XCTUnwrap(successReadback["runtime"]?.objectValue)),
+            "before_frame_id": .string(successFrameID),
+        ]) { _, new in new }
+        let acceptedFailure = try await router.dispatchPairedBotRemote(
+            method: "bot.guest.input",
+            params: failureParams
+        )
+        XCTAssertEqual(acceptedFailure.objectValue?["status"]?.stringValue, "accepted")
+        let failureTerminal = try await terminalReceipt(requestID: failureRequestID)
+        XCTAssertEqual(failureTerminal["status"]?.stringValue, "failed")
+        let failureReadback = try XCTUnwrap(failureTerminal["readback"]?.objectValue)
+        XCTAssertEqual(failureReadback["last_request_id"]?.stringValue, failureRequestID)
+        XCTAssertNotEqual(failureReadback["last_request_id"]?.stringValue, startRequestID)
+        XCTAssertNotEqual(failureReadback["last_request_id"]?.stringValue, successRequestID)
+        let failureEvent = try XCTUnwrap(recorder.events.first {
+            $0.payload.objectValue?["request_id"]?.stringValue == failureRequestID
+        })
+        XCTAssertEqual(failureEvent.payload.objectValue?["request_id"]?.stringValue, failureRequestID)
+    }
+
     func test_guestTerminalHintKeepsFailureAndStopSecretFreeAndRejectsMismatchedFrame() throws {
         // WHY: the terminal event is only a bounded reread hint. It must retain
         // exact request ownership for failure/stop without becoming a second
