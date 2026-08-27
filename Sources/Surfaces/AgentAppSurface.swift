@@ -1914,6 +1914,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             let measured = await measuredLoader?(eligible, threadId, repo)
             guard let measured else { return }
             guard !Task.isCancelled else { return }
+            let deliveredRuns = await TokenSaverThreadFooterReload.loadDeliveredTotal(
+                eligible: eligible,
+                threadId: threadId,
+                repo: repo
+            )?.runs ?? 0
             let next = TokenSaverThreadFooterReload.snapshot(
                 measuredDelivered: measured,
                 eligible: eligible,
@@ -1926,7 +1931,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     providerBilledTokenUnits: observation.providerBilledTokenUnits,
                     autoRoutingActive: observation.autoRoutingActive,
                     graphifySignalCount: graphifyCount
-                )
+                ),
+                deliveredRuns: deliveredRuns
             )
             await MainActor.run { [weak self] in
                 guard let self, !self.isDisposed, !Task.isCancelled else { return }

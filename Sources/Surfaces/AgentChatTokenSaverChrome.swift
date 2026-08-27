@@ -353,15 +353,20 @@ public enum TokenSaverThreadFooterReload {
         measuredDelivered: Int,
         eligible: Bool,
         graphifyActive: Bool,
-        observation: Observation
+        observation: Observation,
+        deliveredRuns: Int = 0
     ) -> Snapshot {
+        // Permanent `runs` is the same extra-turn floor the day/week card uses.
+        // Cache-first timeline paint can be 0–1 turns and would otherwise drop
+        // the chip from measured×(runs−1) down to bare measured.
+        let turnCount = max(observation.turnCount, max(0, deliveredRuns))
         let display = AgentAppView.tokenSaverThreadFooterDisplayTokens(
             measuredDelivered: measuredDelivered,
             assistantChars: observation.assistantChars,
             tokenSaverEnabled: eligible,
             graphifyActive: graphifyActive,
             graphifySignalCount: observation.graphifySignalCount,
-            turnCount: observation.turnCount,
+            turnCount: turnCount,
             cacheReadInputTokens: observation.cacheReadInputTokens,
             providerRawTokens: observation.providerRawTokens,
             providerBilledTokenUnits: observation.providerBilledTokenUnits,
@@ -388,16 +393,38 @@ public enum TokenSaverThreadFooterReload {
         )
     }
 
+    public struct DeliveredTotal: Equatable, Sendable {
+        public var savedTokens: Int
+        public var runs: Int
+
+        public init(savedTokens: Int, runs: Int) {
+            self.savedTokens = max(0, savedTokens)
+            self.runs = max(0, runs)
+        }
+    }
+
+    public static func loadDeliveredTotal(
+        eligible: Bool,
+        threadId: AgentThreadID?,
+        repo: TokenSaverSavingsRepository?
+    ) async -> DeliveredTotal? {
+        guard eligible, let threadId, let repo else {
+            return DeliveredTotal(savedTokens: 0, runs: 0)
+        }
+        let id = threadId.value.uuidString
+        return await Task.detached(priority: .utility) {
+            guard let total = try? repo.deliveredTotal(forThreadID: id) else { return nil }
+            return DeliveredTotal(savedTokens: total.savedTokens, runs: total.runs)
+        }.value
+    }
+
     public static func loadMeasured(
         eligible: Bool,
         threadId: AgentThreadID?,
         repo: TokenSaverSavingsRepository?
     ) async -> Int? {
-        guard eligible, let threadId, let repo else { return 0 }
-        let id = threadId.value.uuidString
-        return await Task.detached(priority: .utility) {
-            try? repo.savedTokens(forThreadID: id)
-        }.value
+        await loadDeliveredTotal(eligible: eligible, threadId: threadId, repo: repo)?
+            .savedTokens
     }
 
     public static func currentDayGraphifySignalCount(

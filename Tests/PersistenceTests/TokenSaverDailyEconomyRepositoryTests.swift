@@ -138,7 +138,7 @@ final class TokenSaverDailyEconomyRepositoryTests: XCTestCase {
         let db = try makeDB()
         let repo = TokenSaverDailyEconomyRepository(db: db)
         let dayMs = repo.dayStartMs()
-        XCTAssertEqual(TokenSaverDailyEconomyRepository.formulaVersion, "credible_v7")
+        XCTAssertEqual(TokenSaverDailyEconomyRepository.formulaVersion, "credible_v9")
         let record = TokenSaverDailyEconomyRecord(
             dayStartMs: dayMs,
             measuredTokens: 2,
@@ -160,7 +160,7 @@ final class TokenSaverDailyEconomyRepositoryTests: XCTestCase {
         XCTAssertEqual(loaded.graphifyRawTokens, 12_345)
         XCTAssertEqual(loaded.capBinding, "no_proof_allowance")
         XCTAssertEqual(loaded.windowUsageBilledUnits, 9_832_294.0, accuracy: 0.001)
-        XCTAssertEqual(loaded.formulaVersion, "credible_v7")
+        XCTAssertEqual(loaded.formulaVersion, "credible_v9")
         XCTAssertEqual(loaded.totalCredible, 10)
     }
 }

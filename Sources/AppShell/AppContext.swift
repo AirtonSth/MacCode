@@ -5415,15 +5415,13 @@ public final class AppContext {
             if cal.isDate(dayStart, inSameDayAs: cal.startOfDay(for: now)) {
                 try? graphifyUsageRepo.prune(nowMs: nowMs)
             }
-            // Multi-turn cache impact from **day-window** savings only (not permanent
-            // thread totals). Cap vs day measured so Week cannot invent ~999M fantasy.
+            // Permanent thread stack, never capped against day-measured pipes.
             let threadInputs = (try? tokenSaverSavingsRepo.threadCacheAmortizationInputs(
                 dayStartMs: dayStartMs,
                 dayEndMsExclusive: dayEndMs
             )) ?? []
             let threadCacheAmort = TokenSaverBareUserEstimator.sumThreadCacheAmortization(
-                inputs: threadInputs.map { (savedTokens: $0.savedTokens, runs: $0.runs) },
-                windowMeasuredTokens: measured
+                inputs: threadInputs.map { (savedTokens: $0.savedTokens, runs: $0.runs) }
             )
             let breakdown = TokenSaverBareUserEstimator.estimate(
                 measuredToolOutputSaved: measured,

@@ -234,6 +234,49 @@ final class TokenSaverThreadFooterTests: XCTestCase {
                              "large assistant output should raise credible total above pure ledger")
     }
 
+    func test_sharedReloadSnapshot_usesPermanentRunsWhenTimelineIsShort() {
+        // WHY: cache-first paint often has 0–1 timeline turns. The day/week
+        // card multiplies permanent saved × (runs − 1); the footer must use
+        // that same floor or the chip collapses to bare measured.
+        let observation = TokenSaverThreadFooterReload.Observation(
+            assistantChars: 0,
+            turnCount: 1,
+            cacheReadInputTokens: 0,
+            providerRawTokens: 4_534,
+            providerBilledTokenUnits: 4_534,
+            autoRoutingActive: false
+        )
+        let shortTimeline = TokenSaverThreadFooterReload.snapshot(
+            measuredDelivered: 4_534,
+            eligible: true,
+            graphifyActive: false,
+            observation: observation,
+            deliveredRuns: 0
+        )
+        let restored = TokenSaverThreadFooterReload.snapshot(
+            measuredDelivered: 4_534,
+            eligible: true,
+            graphifyActive: false,
+            observation: observation,
+            deliveredRuns: 51
+        )
+        XCTAssertGreaterThan(restored.displayTokens, shortTimeline.displayTokens)
+        XCTAssertGreaterThan(
+            restored.displayTokens,
+            4_534 * 10,
+            "permanent runs must restore the large cache-amortized chip"
+        )
+        XCTAssertEqual(restored.measuredTokens, 4_534)
+        let off = TokenSaverThreadFooterReload.snapshot(
+            measuredDelivered: 4_534,
+            eligible: false,
+            graphifyActive: false,
+            observation: observation,
+            deliveredRuns: 51
+        )
+        XCTAssertEqual(off.displayTokens, 4_534, "off must not invent amort")
+    }
+
     func test_displayTokens_multiTurnCacheAmortizationRaisesFigure() {
         // WHY: elephant-class long threads must credit multi-turn re-read impact
         // of tool-output savings — not show bare measured alone.

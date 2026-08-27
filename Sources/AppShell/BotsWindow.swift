@@ -3928,15 +3928,15 @@ public final class BotsViewModel: ObservableObject {
             let eligible = SettingsStore(db: db).load().tokenSaverEnabled
                 && PrivateAccountSessionStore(repo: settingsRepo).load()?.user.subscribed == true
             let graphifyActive = SettingsStore(db: db).load().isGraphifyRuntimeActive
-            let measured = await TokenSaverThreadFooterReload.loadMeasured(
+            let total = await TokenSaverThreadFooterReload.loadDeliveredTotal(
                 eligible: eligible,
                 threadId: threadId,
                 repo: savingsRepo
             )
-            guard let measured else { return }
+            guard let total else { return }
             guard !Task.isCancelled else { return }
             let next = TokenSaverThreadFooterReload.snapshot(
-                measuredDelivered: measured,
+                measuredDelivered: total.savedTokens,
                 eligible: eligible,
                 graphifyActive: graphifyActive,
                 observation: TokenSaverThreadFooterReload.Observation(
@@ -3949,7 +3949,8 @@ public final class BotsViewModel: ObservableObject {
                     graphifySignalCount: TokenSaverThreadFooterReload.currentDayGraphifySignalCount(
                         repo: graphifyRepo
                     )
-                )
+                ),
+                deliveredRuns: total.runs
             )
             await MainActor.run { [weak self] in
                 guard let self, !Task.isCancelled else { return }

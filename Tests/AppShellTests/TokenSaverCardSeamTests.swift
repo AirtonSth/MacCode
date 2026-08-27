@@ -769,6 +769,39 @@ final class TokenSaverCardSeamTests: XCTestCase {
         )
     }
 
+    func test_estimatedSavePath_neverCapsAmortAgainstDayMeasured() throws {
+        // WHY: todayMeasured × 200 painted Estimated save 2.6M instead of the
+        // permanent thread stack. Estimated save must never be capped down.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let appContext = try String(
+            contentsOf: root.appendingPathComponent("Sources/AppShell/AppContext.swift"),
+            encoding: .utf8
+        )
+        let sidebar = try String(
+            contentsOf: root.appendingPathComponent("Sources/AppShell/SidebarView.swift"),
+            encoding: .utf8
+        )
+        let agents = try String(
+            contentsOf: root.appendingPathComponent("Agents.md"),
+            encoding: .utf8
+        )
+        XCTAssertFalse(
+            appContext.contains("windowMeasuredTokens:"),
+            "daily economy must not cap thread amort against day-measured pipes"
+        )
+        XCTAssertFalse(
+            sidebar.contains("cacheAmortizationMaxMultipleOfMeasured"),
+            "sidebar provider amort must not scale down to a measured multiple"
+        )
+        XCTAssertTrue(
+            agents.contains("Estimated save must never go down"),
+            "Agents.md must keep the one-way Estimated save ratchet"
+        )
+    }
+
     func test_sinceInstallLine_usesAttributedOnly() {
         let line = SidebarRootView.tokenSaverSinceInstallLine(
             attributedSavedTokens: 96_041_366,

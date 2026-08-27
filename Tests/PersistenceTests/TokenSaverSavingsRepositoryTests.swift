@@ -578,14 +578,21 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
         )
 
         XCTAssertEqual(try repo.savedTokens(forThreadID: threadA), 1_350)
+        XCTAssertEqual(try repo.deliveredTotal(forThreadID: threadA).runs, 2,
+                       "permanent runs count delivered rows so the footer can amortize extra turns")
+        XCTAssertEqual(try repo.deliveredTotal(forThreadID: threadA).savedTokens, 1_350)
         XCTAssertEqual(try repo.savedTokens(forThreadID: threadB), 180)
+        XCTAssertEqual(try repo.deliveredTotal(forThreadID: threadB).runs, 1)
         XCTAssertEqual(try repo.savedTokens(forThreadID: ""), 0)
         XCTAssertEqual(try repo.savedTokens(forThreadID: "missing"), 0)
+        XCTAssertEqual(try repo.deliveredTotal(forThreadID: "missing").runs, 0)
 
         // Prune deletes old event rows but must keep the permanent thread total.
         try repo.prune(now: now)
         XCTAssertEqual(try repo.savedTokens(forThreadID: threadA), 1_350,
                        "thread total must survive event prune")
+        XCTAssertEqual(try repo.deliveredTotal(forThreadID: threadA).runs, 2,
+                       "permanent runs must survive event prune")
     }
 
     func test_deliveredRecordWithoutThreadId_countsInSummaryButNotThreadFooter() throws {

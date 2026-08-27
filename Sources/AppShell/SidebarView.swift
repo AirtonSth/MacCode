@@ -1088,34 +1088,15 @@ public final class SidebarViewModel: ObservableObject {
                 dayStartMs: todayMs,
                 dayEndMsExclusive: dayEndMs
             )) ?? []
-            // Cap provider amort map using today's measured so row totals stay
-            // reconcilable with the green headline (same multiple as estimator).
-            let todayMeasured = amortInputs.reduce(0) { $0 + max(0, $1.savedTokens) }
-            let rawCredits: [(String, Int)] = amortInputs.map { row in
-                (
-                    row.provider,
-                    TokenSaverBareUserEstimator.sumThreadCacheAmortization(
-                        savedTokens: row.savedTokens,
-                        runs: row.runs
-                    )
-                )
-            }
-            let rawTotal = rawCredits.reduce(0) {
-                TokenSaverBareUserEstimator.saturatingAdd($0, $1.1)
-            }
-            let cap = TokenSaverBareUserEstimator.saturatingMul(
-                todayMeasured,
-                TokenSaverBareUserEstimator.cacheAmortizationMaxMultipleOfMeasured
-            )
-            let scale: Double = (rawTotal > cap && rawTotal > 0)
-                ? Double(cap) / Double(rawTotal)
-                : 1.0
             var byProvider: [String: Int] = [:]
-            for (provider, credit) in rawCredits {
-                let scaled = Int((Double(credit) * scale).rounded(.down))
-                byProvider[provider, default: 0] = TokenSaverBareUserEstimator.saturatingAdd(
-                    byProvider[provider] ?? 0,
-                    scaled
+            for row in amortInputs {
+                let credit = TokenSaverBareUserEstimator.sumThreadCacheAmortization(
+                    savedTokens: row.savedTokens,
+                    runs: row.runs
+                )
+                byProvider[row.provider, default: 0] = TokenSaverBareUserEstimator.saturatingAdd(
+                    byProvider[row.provider] ?? 0,
+                    credit
                 )
             }
             return (snapshot, summary, economyToday, weekTotal, byProvider)
