@@ -1973,6 +1973,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Bumped on every full thread open so deferred provider-snapshot tasks for
     /// a prior open never wipe a newer selection (or the same thread re-selected soft).
     private var selectThreadOpenGeneration: UInt64 = 0
+    private var selectThreadHydrationTask: Task<Void, Never>?
+    private var paintedTimelineByThread: [AgentThreadID: AssistantTimelineState] = [:]
     /// True when the last `selectThread` used the in-memory rail instead of a full `get`.
     private(set) var lastThreadSelectionUsedRailForTesting = false
     /// Count of durable `threadRepo.get` lookups from `selectThread` (cache misses).
@@ -2001,31 +2003,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             workspaceID: workspaceID,
             rail: threads
         ) {
-            if selectedThreadId != id {
-                // Stale rail can outlive a deleted row when a rail reload fails.
-                // Probe existence without the full 26-column + routing `get`.
-                do {
-                    durableThreadExistenceProbeCountForTesting += 1
-                    guard let durableWorkspace = try threadRepo.workspaceId(of: id) else {
-                        if statusMessage.isEmpty {
-                            statusMessage = "Could not open thread: The thread is no longer available."
-                        }
-                        lastThreadSelectionUsedRailForTesting = false
-                        return
-                    }
-                    guard durableWorkspace == workspaceID else {
-                        if statusMessage.isEmpty {
-                            statusMessage = "Could not open thread: The thread belongs to another workspace."
-                        }
-                        lastThreadSelectionUsedRailForTesting = false
-                        return
-                    }
-                } catch {
-                    statusMessage = "Could not open thread: \(error)"
-                    lastThreadSelectionUsedRailForTesting = false
-                    return
-                }
-            }
+            // Rail hits publish first. Existence probe runs after the first
+            // frame so a click is not blocked on SQLite.
             selectedThread = cached
             lastThreadSelectionUsedRailForTesting = true
         } else {
@@ -2073,7 +2052,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         )
         // IMP-MAC_AGENT-011: stash the leaving thread's draft before swapping,
         // then restore the opened thread's draft.
-        if let previous = selectedThreadId { persistComposerDraft(for: previous) }
+        if let previous = selectedThreadId {
+            persistComposerDraft(for: previous)
+            paintedTimelineByThread[previous] = timeline
+        }
         selectedThreadId = id
         publishInterestedThreadId(id)
         // Per-thread chip: never keep the leaving thread's savings on the
@@ -2155,6 +2137,95 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             stopScheduledLivePoll()
         }
         normalizeInteractionModeForSelectedProvider()
+        if let cachedTimeline = paintedTimelineByThread[id] {
+            timeline = cachedTimeline
+            timelineItemIndex = TimelineItemIndex(turns: cachedTimeline.turns)
+        } else {
+            timeline = AssistantTimelineState()
+            timelineItemIndex = TimelineItemIndex(turns: [])
+        }
+        loadAllMessages(id)
+        focusTick &+= 1
+        scheduleSelectThreadHydration(
+            thread: selectedThread,
+            markRead: markRead,
+            openGeneration: openGeneration,
+            probeExistence: lastThreadSelectionUsedRailForTesting
+        )
+    }
+
+    func waitForSelectThreadHydrationForTesting() async {
+        while let task = selectThreadHydrationTask {
+            let generation = selectThreadOpenGeneration
+            await task.value
+            if selectThreadOpenGeneration == generation,
+               selectThreadHydrationTask == nil {
+                return
+            }
+        }
+    }
+
+    private static func waitForCommittedFrame() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async {
+                continuation.resume()
+            }
+        }
+    }
+
+    private func scheduleSelectThreadHydration(
+        thread: AgentThread,
+        markRead: Bool,
+        openGeneration: UInt64,
+        probeExistence: Bool
+    ) {
+        let id = thread.id
+        selectThreadHydrationTask?.cancel()
+        selectThreadHydrationTask = Task { @MainActor [weak self] in
+            await Self.waitForCommittedFrame()
+            guard let self else { return }
+            defer {
+                if self.selectThreadOpenGeneration == openGeneration {
+                    self.selectThreadHydrationTask = nil
+                }
+            }
+            guard !Task.isCancelled,
+                  self.selectThreadOpenGeneration == openGeneration,
+                  self.selectedThreadId == id else { return }
+            if probeExistence {
+                do {
+                    self.durableThreadExistenceProbeCountForTesting += 1
+                    guard let durableWorkspace = try self.threadRepo.workspaceId(of: id) else {
+                        if self.statusMessage.isEmpty {
+                            self.statusMessage = "Could not open thread: The thread is no longer available."
+                        }
+                        return
+                    }
+                    guard durableWorkspace == self.workspaceID else {
+                        if self.statusMessage.isEmpty {
+                            self.statusMessage = "Could not open thread: The thread belongs to another workspace."
+                        }
+                        return
+                    }
+                } catch {
+                    self.statusMessage = "Could not open thread: \(error)"
+                    return
+                }
+            }
+            self.hydrateOpenedThread(
+                thread,
+                markRead: markRead,
+                openGeneration: openGeneration
+            )
+        }
+    }
+
+    private func hydrateOpenedThread(
+        _ selectedThread: AgentThread,
+        markRead: Bool,
+        openGeneration: UInt64
+    ) {
+        let id = selectedThread.id
         // UX-MAC_AGENT-CONTINUE: check whether the newly selected thread was
         // interrupted by a relaunch and has a recoverable provider session.
         selectedThreadHasRecoverableContext = coordinator.hasRecoverableContext(threadId: id)
@@ -2173,7 +2244,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 reloadThreads()
             }
         }
-        loadAllMessages(id)
         streamApplyGeneration &+= 1
         streamApplyInFlight = false
         streamFlushNeeded = false
@@ -2294,14 +2364,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             setPlanNotesWithoutSaving("", threadId: id)
             statusMessage = "Could not load plan notes: \(error)"
         }
-        // UX-MAC_AGENT-001: route first-responder to the composer on every
-        // open/switch so the user can type without a manual click.
-        focusTick &+= 1
-        // Subagents is thread-scoped chrome: rebuild immediately so switching
-        // threads never briefly shows another thread's Active/Done counts.
+        // Subagents is thread-scoped chrome: rebuild after first paint so
+        // switching threads never keeps another thread's Active/Done counts.
         refreshSubagentActivity()
         // Token Saver footer is per-thread; re-read the permanent total on open.
         reloadTokenSaverThreadSavings()
+        paintedTimelineByThread[id] = timeline
     }
 
     /// Called by the plan sidebar whenever planNotes changes to persist the

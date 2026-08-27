@@ -2267,9 +2267,20 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
         XCTAssertEqual(
             vm.durableThreadExistenceProbeCountForTesting,
-            probesBefore + 1,
-            "switching onto a rail row still probes durable existence without loading chrome"
+            probesBefore,
+            "rail switch must publish before the existence probe"
         )
+        let deadline = Date().addingTimeInterval(1)
+        while vm.durableThreadExistenceProbeCountForTesting == probesBefore,
+              Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertEqual(
+            vm.durableThreadExistenceProbeCountForTesting,
+            probesBefore + 1,
+            "existence probe still runs after the first frame"
+        )
+        XCTAssertEqual(vm.selectedThreadId, first)
     }
 
     /// Same-thread reselect (rail re-click / host refresh) used to hit SQLite

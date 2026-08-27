@@ -2891,8 +2891,14 @@ public final class BotsViewModel: ObservableObject {
     public static let assistantPlaceholder = BotsDeskFollowThrough.noRouterPlaceholder
 
     @Published public private(set) var bots: [BotDefinition] = []
+    /// Stored roster snapshot so ForEach does not re-filter/sort `fleet` on
+    /// unrelated @Published writes (desk timeline, inspector, Token Saver).
+    @Published public private(set) var publishedRoster: [BotDefinition] = []
     @Published public var searchText: String = "" {
-        didSet { persistSearchText() }
+        didSet {
+            persistSearchText()
+            publishRosterIfNeeded()
+        }
     }
     @Published public var showHidden: Bool = false {
         didSet {
@@ -2902,6 +2908,7 @@ public final class BotsViewModel: ObservableObject {
             // conversations + recent messages) before the roster could
             // paint. Off filters locally; on lists hidden rows only.
             applyShowHiddenLocally()
+            publishRosterIfNeeded()
         }
     }
     @Published public var selectedBotID: BotID?
@@ -3361,6 +3368,12 @@ public final class BotsViewModel: ObservableObject {
             result.insert(selected, at: 0)
         }
         return result
+    }
+
+    private func publishRosterIfNeeded() {
+        let next = fleet
+        guard next != publishedRoster else { return }
+        publishedRoster = next
     }
 
     public var openAttentionCount: Int { attentionItems.count }
@@ -4300,7 +4313,7 @@ public final class BotsViewModel: ObservableObject {
         let generation = navigationFreshnessGeneration
         navigationFreshnessTask?.cancel()
         navigationFreshnessTask = Task { @MainActor [weak self] in
-            await Task.yield()
+            await Self.waitForCommittedFrame()
             guard let self else { return }
             defer {
                 // A cancelled task may resume after its replacement has been
@@ -4336,6 +4349,16 @@ public final class BotsViewModel: ObservableObject {
         navigationFreshnessGeneration &+= 1
         navigationFreshnessTask?.cancel()
         navigationFreshnessTask = nil
+    }
+
+    /// Next main-queue turn after the current CATransaction. `Task.yield()`
+    /// is only an executor hop and can still run before SwiftUI paints.
+    private static func waitForCommittedFrame() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async {
+                continuation.resume()
+            }
+        }
     }
 
     private func navigationFreshnessIsCurrent(
@@ -6077,6 +6100,7 @@ public final class BotsViewModel: ObservableObject {
             }
             lastPreviewByBot = previews
             lastUpdatedByBot = updated
+            publishRosterIfNeeded()
             rebuildAttentionStates()
             pruneQueuedFollowUpsToFleet()
             pruneComposerDraftsToFleet()
@@ -6884,6 +6908,7 @@ public final class BotsViewModel: ObservableObject {
         }
         flushPendingDraftPersistence()
         selectedBotID = id
+        publishRosterIfNeeded()
         applyComposerDraft(for: id)
         applyInspectorDraft(for: id)
     }
@@ -9630,7 +9655,6 @@ public struct BotsModeSwitcher: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .animation(DS.Motion.micro, value: selected)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityIdentifier(identifier)
     }
@@ -9730,14 +9754,14 @@ public struct BotsRosterList: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: DS.Space.lg) {
-                    if vm.fleet.isEmpty {
+                    if vm.publishedRoster.isEmpty {
                         Text(vm.searchText.isEmpty ? "No bots yet" : "No matches")
                             .font(DS.Font.body)
                             .foregroundColor(DS.Palette.textTertiary)
                             .padding(.horizontal, DS.Space.md)
                             .padding(.vertical, DS.Space.sm)
                     } else {
-                        ForEach(vm.fleet, id: \.id) { bot in
+                        ForEach(vm.publishedRoster, id: \.id) { bot in
                             rosterRow(bot)
                         }
                     }
