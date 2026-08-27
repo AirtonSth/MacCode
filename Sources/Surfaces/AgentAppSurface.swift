@@ -654,6 +654,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // coordinator's multi-workspace broadcast but are filtered out cheaply here.
     private var threadWorkspaceCache: [AgentThreadID: WorkspaceID] = [:]
 
+    /// Cache-first workspace membership for coordinator/event fan-out.
+    /// A miss probes `workspace_id` only — never the 26-column + routing `get`.
+    private func resolvedWorkspaceID(for threadId: AgentThreadID) -> WorkspaceID? {
+        if let cached = threadWorkspaceCache[threadId] {
+            return cached
+        }
+        let workspaceID = try? threadRepo.workspaceId(of: threadId)
+        if let workspaceID {
+            threadWorkspaceCache[threadId] = workspaceID
+        }
+        return workspaceID
+    }
+
     #if DEBUG
     /// Test seam for the partial-failure boundary after cap enforcement.
     private var reloadThreadListForTesting: (() throws -> [AgentThread])?
@@ -1949,30 +1962,85 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Bumped on every full thread open so deferred provider-snapshot tasks for
     /// a prior open never wipe a newer selection (or the same thread re-selected soft).
     private var selectThreadOpenGeneration: UInt64 = 0
+    /// True when the last `selectThread` used the in-memory rail instead of a full `get`.
+    private(set) var lastThreadSelectionUsedRailForTesting = false
+    /// Count of durable `threadRepo.get` lookups from `selectThread` (cache misses).
+    private(set) var durableThreadSelectionLookupCountForTesting = 0
+    /// Count of cheap workspace-id probes used to reject stale rail rows.
+    private(set) var durableThreadExistenceProbeCountForTesting = 0
+
+    /// Cache-first thread row for selection. A rail click must not wait on
+    /// `threadRepo.get` — that path compiles two statements off the DB queue
+    /// on MainActor (row + routing) and can hitch behind a FULLMUTEX writer.
+    nonisolated static func railThreadForSelection(
+        id: AgentThreadID,
+        workspaceID: WorkspaceID,
+        rail: [AgentThread]
+    ) -> AgentThread? {
+        guard let thread = rail.first(where: { $0.id == id }) else { return nil }
+        guard thread.workspaceId == workspaceID else { return nil }
+        return thread
+    }
 
     public func selectThread(_ id: AgentThreadID, markRead: Bool = true) {
         guard !isDisposed else { return }
         let selectedThread: AgentThread
-        do {
-            guard let persistedThread = try threadRepo.get(id: id) else {
+        if let cached = Self.railThreadForSelection(
+            id: id,
+            workspaceID: workspaceID,
+            rail: threads
+        ) {
+            if selectedThreadId != id {
+                // Stale rail can outlive a deleted row when a rail reload fails.
+                // Probe existence without the full 26-column + routing `get`.
+                do {
+                    durableThreadExistenceProbeCountForTesting += 1
+                    guard let durableWorkspace = try threadRepo.workspaceId(of: id) else {
+                        if statusMessage.isEmpty {
+                            statusMessage = "Could not open thread: The thread is no longer available."
+                        }
+                        lastThreadSelectionUsedRailForTesting = false
+                        return
+                    }
+                    guard durableWorkspace == workspaceID else {
+                        if statusMessage.isEmpty {
+                            statusMessage = "Could not open thread: The thread belongs to another workspace."
+                        }
+                        lastThreadSelectionUsedRailForTesting = false
+                        return
+                    }
+                } catch {
+                    statusMessage = "Could not open thread: \(error)"
+                    lastThreadSelectionUsedRailForTesting = false
+                    return
+                }
+            }
+            selectedThread = cached
+            lastThreadSelectionUsedRailForTesting = true
+        } else {
+            lastThreadSelectionUsedRailForTesting = false
+            durableThreadSelectionLookupCountForTesting += 1
+            do {
+                guard let persistedThread = try threadRepo.get(id: id) else {
+                    if statusMessage.isEmpty {
+                        statusMessage = "Could not open thread: The thread is no longer available."
+                    }
+                    return
+                }
+                selectedThread = persistedThread
+            } catch {
+                statusMessage = "Could not open thread: \(error)"
+                return
+            }
+            guard let selectedWorkspaceID = selectedThread.workspaceId,
+                  selectedWorkspaceID == workspaceID else {
                 if statusMessage.isEmpty {
-                    statusMessage = "Could not open thread: The thread is no longer available."
+                    statusMessage = "Could not open thread: The thread belongs to another workspace."
                 }
                 return
             }
-            selectedThread = persistedThread
-        } catch {
-            statusMessage = "Could not open thread: \(error)"
-            return
         }
-        guard let selectedWorkspaceID = selectedThread.workspaceId,
-              selectedWorkspaceID == workspaceID else {
-            if statusMessage.isEmpty {
-                statusMessage = "Could not open thread: The thread belongs to another workspace."
-            }
-            return
-        }
-        threadWorkspaceCache[id] = selectedWorkspaceID
+        threadWorkspaceCache[id] = selectedThread.workspaceId ?? workspaceID
         if statusMessage.contains(Self.deletedThreadDraftRecoveryMessage) {
             statusMessage = ""
         }
@@ -5343,10 +5411,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             routingMode = updatedConfiguration.mode
             rememberNewThreadDefaults()
+            if let index = threads.firstIndex(where: { $0.id == id }) {
+                threads[index] = persisted
+            }
             if !enabled {
                 restoreThreadConfiguration(from: persisted)
-            } else if let index = threads.firstIndex(where: { $0.id == id }) {
-                threads[index] = persisted
             }
             statusMessage = ""
             onThreadConfigPersisted?(persisted)
@@ -6538,19 +6607,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let threadId,
               let uuid = UUID(uuidString: threadId) else { return }
         let eventThreadId = AgentThreadID(uuid)
-        let eventWorkspaceID: WorkspaceID?
-        if let cachedWorkspaceID = threadWorkspaceCache[eventThreadId] {
-            eventWorkspaceID = cachedWorkspaceID
-        } else {
-            do {
-                eventWorkspaceID = try threadRepo.get(id: eventThreadId)?.workspaceId
-            } catch {
-                return
-            }
-            if eventWorkspaceID == workspaceID {
-                threadWorkspaceCache[eventThreadId] = eventWorkspaceID
-            }
-        }
+        let eventWorkspaceID = resolvedWorkspaceID(for: eventThreadId)
         guard eventWorkspaceID == workspaceID else { return }
         switch kind {
         case "agent.message.queue.failed":
@@ -6782,13 +6839,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     /// Applies one already-verified durable peer row without changing the
     /// selected thread, composer draft, or focus state.
+    /// Workspace membership uses the cache-first probe — never a 26-column get.
     public func applyPersistedBotPeerMessage(
         messageID: AgentMessageID,
         threadId: AgentThreadID,
         terminalStatus: AgentRunStatus? = nil
     ) {
-        guard let thread = try? threadRepo.get(id: threadId),
-              thread.workspaceId == workspaceID,
+        guard resolvedWorkspaceID(for: threadId) == workspaceID,
               let message = try? messageRepo.get(id: messageID),
               message.threadId == threadId,
               message.role == .assistant else { return }
@@ -6853,9 +6910,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             replacedWaitingRow = true
         }
         if replacedWaitingRow || awaitsTerminalThreadStatus,
-           let thread = try? threadRepo.get(id: threadID) {
-            let statusChanged = status != thread.status
-            status = thread.status
+           let durableStatus = try? threadRepo.status(of: threadID) {
+            let statusChanged = status != durableStatus
+            status = durableStatus
             if replacedWaitingRow || statusChanged {
                 scheduleReloadThreads(delayMilliseconds: 0)
             }
@@ -6984,6 +7041,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return runStatus == .running || runStatus == .pending
     }
 
+    /// Send/queue only need routing. The painted rail already JOINs it —
+    /// do not full-get a 26-column row that is already in `threads`.
+    private func routingConfigurationForSend(threadId: AgentThreadID) -> AgentRoutingConfiguration {
+        if let painted = threads.first(where: { $0.id == threadId }) {
+            return painted.effectiveRoutingConfiguration
+        }
+        // Routing row only. A leftover 26-column `get` hitchs send/queue when
+        // the painted rail does not already hold the thread.
+        return (try? threadRepo.routingConfiguration(of: threadId))
+            ?? .legacyManual(selection: currentModelSelection, providerInstanceId: providerInstanceId)
+    }
+
+    func routingConfigurationForSendForTesting(threadId: AgentThreadID) -> AgentRoutingConfiguration {
+        routingConfigurationForSend(threadId: threadId)
+    }
+
     private func enqueuePromptWhileRunning(
         text: String,
         attached: [AgentAttachment],
@@ -6992,8 +7065,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let selectedThreadId, let queuedMessageRepo else { return false }
         let mode = interactionMode ?? self.interactionMode
         do {
-            let routing = (try? threadRepo.get(id: selectedThreadId))?.effectiveRoutingConfiguration
-                ?? .legacyManual(selection: currentModelSelection, providerInstanceId: providerInstanceId)
+            let routing = routingConfigurationForSend(threadId: selectedThreadId)
             if routing.mode == .auto {
                 _ = try orchestrationRuntime.route(
                     configuration: routing,
@@ -7110,7 +7182,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     ) async -> AgentRunID? {
         let baseRouting = queuedRoutingSnapshot?.configuration
             ?? routingConfiguration
-            ?? selectedThreadId.flatMap { try? threadRepo.get(id: $0)?.effectiveRoutingConfiguration }
+            ?? selectedThreadId.map { routingConfigurationForSend(threadId: $0) }
             ?? .legacyManual(selection: currentModelSelection, providerInstanceId: providerInstanceId)
         let runProvider = provider
         let runProviderInstanceId = providerInstanceId
@@ -7894,7 +7966,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             currentRunId = nil
             runStartedAt = nil
             isStopping = false
-            if let durableStatus = (try? threadRepo.get(id: threadId))?.status {
+            if let durableStatus = try? threadRepo.status(of: threadId) {
                 status = durableStatus
             }
             clearActivePlanFollowUpSuppressionIfSafe()
@@ -8596,15 +8668,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             let finishedTid = threadId
             // Same workspace filter as didChangeStatus: multi-tab Agent Apps must
             // not pay MainActor work or promote unrelated workspaces on finish.
-            let threadWorkspace: WorkspaceID?
-            if let cached = self.threadWorkspaceCache[finishedTid] {
-                threadWorkspace = cached
-            } else {
-                threadWorkspace = try? self.threadRepo.get(id: finishedTid)?.workspaceId
-                if let wid = threadWorkspace {
-                    self.threadWorkspaceCache[finishedTid] = wid
-                }
-            }
+            let threadWorkspace = self.resolvedWorkspaceID(for: finishedTid)
             guard Self.shouldHandleRunFinishForWorkspace(
                 threadWorkspace: threadWorkspace,
                 surfaceWorkspace: self.workspaceID
@@ -8691,15 +8755,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             guard !self.isDisposed else { return }
             // PERF-MAC_AGENT-009: use the cache for the workspace filter; fall back to
             // DB only on a cache miss (first event for a thread not yet loaded here).
-            let threadWorkspace: WorkspaceID?
-            if let cached = self.threadWorkspaceCache[threadId] {
-                threadWorkspace = cached
-            } else {
-                threadWorkspace = try? self.threadRepo.get(id: threadId)?.workspaceId
-                if let wid = threadWorkspace {
-                    self.threadWorkspaceCache[threadId] = wid
-                }
-            }
+            let threadWorkspace = self.resolvedWorkspaceID(for: threadId)
             guard threadWorkspace == self.workspaceID else { return }
             // Coalesce N same-workspace Agent App tabs into one reload per surface.
             self.scheduleReloadThreads()

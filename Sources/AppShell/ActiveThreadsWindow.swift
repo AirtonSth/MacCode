@@ -109,30 +109,35 @@ public final class ActiveThreadsViewModel: ObservableObject {
         let activeSet = Set(threadIDs)
         startedAtByThread = startedAtByThread.filter { activeSet.contains($0.key) }
 
-        for threadID in threadIDs {
-            if startedAtByThread[threadID] == nil {
-                if let runId = context.coordinator.activeRunId(threadId: threadID),
-                   let run = try? context.runRepo.get(id: runId) {
-                    startedAtByThread[threadID] = run.startedAt
-                } else if let durable = try? context.coordinator.durableActiveRun(threadId: threadID) {
-                    startedAtByThread[threadID] = durable.startedAt
-                } else {
-                    startedAtByThread[threadID] = Date()
-                }
+        let missingStartedAt = threadIDs.filter { startedAtByThread[$0] == nil }
+        var runIdByThread: [AgentThreadID: AgentRunID] = [:]
+        var runIDs: [AgentRunID] = []
+        runIDs.reserveCapacity(missingStartedAt.count)
+        for threadID in missingStartedAt {
+            guard let runId = context.coordinator.activeRunId(threadId: threadID) else { continue }
+            runIdByThread[threadID] = runId
+            runIDs.append(runId)
+        }
+        let stamps = (try? context.runRepo.startedAt(ids: runIDs)) ?? [:]
+        for threadID in missingStartedAt {
+            if let runId = runIdByThread[threadID], let startedAt = stamps[runId] {
+                startedAtByThread[threadID] = startedAt
+            } else if let durable = try? context.coordinator.durableActiveRun(threadId: threadID) {
+                startedAtByThread[threadID] = durable.startedAt
+            } else {
+                startedAtByThread[threadID] = Date()
             }
         }
 
+        let chrome = (try? context.threadRepo.listChrome(ids: threadIDs)) ?? [:]
         activeItems = PetActiveThreadProjector.items(threadIDs: threadIDs) { [weak self] threadID in
-            guard let self,
-                  let thread = try? self.context.threadRepo.get(id: threadID) else {
-                return nil
-            }
-            let workspaceName = thread.workspaceId.flatMap { self.context.state.workspaces[$0]?.name }
+            guard let self, let meta = chrome[threadID] else { return nil }
+            let workspaceName = meta.workspaceId.flatMap { self.context.state.workspaces[$0]?.name }
             return (
-                workspaceID: thread.workspaceId,
+                workspaceID: meta.workspaceId,
                 workspaceName: workspaceName,
-                providerName: PetActiveThreadProjector.providerLabel(thread.provider),
-                threadTitle: thread.title,
+                providerName: PetActiveThreadProjector.providerLabel(meta.provider),
+                threadTitle: meta.title,
                 startedAt: self.startedAtByThread[threadID],
                 lastUpdatePreview: nil
             )
@@ -142,13 +147,14 @@ public final class ActiveThreadsViewModel: ObservableObject {
     public func reloadFinished() {
         do {
             let runs = try context.runRepo.listRecentFinished(limit: 50)
-            finishedItems = runs.compactMap { run in
-                let thread = try? context.threadRepo.get(id: run.threadId)
-                let workspaceID = thread?.workspaceId
+            let chrome = try context.threadRepo.listChrome(ids: runs.map(\.threadId))
+            finishedItems = runs.map { run in
+                let meta = chrome[run.threadId]
+                let workspaceID = meta?.workspaceId
                 let workspaceName = workspaceID.flatMap { context.state.workspaces[$0]?.name }
                 return FinishedThreadItem(
                     run: run,
-                    threadTitle: thread?.title,
+                    threadTitle: meta?.title,
                     workspaceID: workspaceID,
                     workspaceName: workspaceName,
                     providerName: PetActiveThreadProjector.providerLabel(run.provider)

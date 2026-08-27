@@ -262,6 +262,48 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         XCTAssertEqual(context.graphifyProviderLabel(for: threadId), "unknown")
     }
 
+    /// WHY: the first Graphify itemDelta used to full-get 26 columns + routing
+    /// JSON just to read provider. listChrome already returns that field.
+    func test_graphifyProviderLabel_usesListChromeWithoutDurableGet() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyProviderChrome-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        let thread = AgentThread(title: "graphify", provider: .grok, model: "grok-4")
+        try context.threadRepo.upsert(thread)
+        let getsBefore = context.threadRepo.durableGetCountForTesting
+        let chromeBefore = context.threadRepo.listChromeCallCountForTesting
+        context.graphifyProviderLookupCountForTesting = 0
+
+        XCTAssertEqual(context.graphifyProviderLabel(for: thread.id), "grok")
+        XCTAssertEqual(context.graphifyProviderLookupCountForTesting, 1)
+        XCTAssertEqual(
+            context.threadRepo.durableGetCountForTesting,
+            getsBefore,
+            "first Graphify provider lookup must not compile a full 26-column get"
+        )
+        XCTAssertEqual(
+            context.threadRepo.listChromeCallCountForTesting,
+            chromeBefore + 1
+        )
+        XCTAssertEqual(context.graphifyProviderLabel(for: thread.id), "grok")
+        XCTAssertEqual(context.graphifyProviderLookupCountForTesting, 1)
+        XCTAssertEqual(context.threadRepo.listChromeCallCountForTesting, chromeBefore + 1)
+
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/AppShell/AppContext.swift"),
+            encoding: .utf8
+        )
+        let range = try XCTUnwrap(source.range(of: "func graphifyProviderLabel(for threadId: AgentThreadID)"))
+        let body = String(source[range.lowerBound...].prefix(900))
+        XCTAssertTrue(body.contains("threadRepo.listChrome(ids: [threadId])"))
+        XCTAssertFalse(body.contains("threadRepo.get(id: threadId)"))
+    }
+
     /// WHY: after a Graphify invocation is recorded, later itemDelta chunks
     /// used to JSON-parse the growing tool body and re-detect on MainActor.
     func test_graphifyDetect_skipsAfterInvocationRecorded() throws {

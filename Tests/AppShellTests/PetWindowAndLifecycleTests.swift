@@ -630,6 +630,483 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         XCTAssertTrue(after.detail?.contains("1m") == true)
     }
 
+    func test_itemStartedProgressRepublish_usesCachedChromeWithoutDurableLookup() async throws {
+        // WHY: Live Activity item.started used to re-run N full threadRepo.get
+        // plus bot list/link queries on MainActor. Chrome is already painted.
+        let directory = NSTemporaryDirectory() + "RC2PetLAProgressCache-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspace = try router.createWorkspace(name: "elephant", cwd: NSTemporaryDirectory())
+        let thread = AgentThread(
+            workspaceId: workspace.id,
+            title: "cached chrome title",
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            hasUnread: false
+        )
+        try context.threadRepo.upsert(thread)
+        let runID = AgentRunID()
+        try context.runRepo.upsert(AgentRun(
+            id: runID,
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: Date().addingTimeInterval(-90)
+        ))
+        SettingsStore(db: context.db).save(AppSettings(petEnabled: true, petReadyCounterEnabled: false))
+
+        let controller = try PetController(context: context, router: router, openSettings: { _ in false })
+        controller.start()
+        defer { controller.stop() }
+
+        context.coordinator.onActiveRunProjectionChanged?(
+            ActiveRunProjection(runs: [.init(threadId: thread.id, runId: runID)]),
+            .started
+        )
+        try await Task.sleep(nanoseconds: 40_000_000)
+
+        let before = try XCTUnwrap(controller.modelForTests.activeThreads.first)
+        XCTAssertGreaterThan(
+            controller.activeThreadDurableLookupCountForTesting,
+            0,
+            "first host projection must still read durable chrome"
+        )
+        let lookupsAfterProjection = controller.activeThreadDurableLookupCountForTesting
+        let detailBefore = before.detail
+
+        try context.db.execute("DELETE FROM agent_threads;")
+
+        EventBus.shared.publish(kind: "agent.item.started", payload: .object([
+            "thread_id": .string(thread.id.value.uuidString),
+            "item": .object([
+                "id": .string("item-git"),
+                "type": .string("commandExecution"),
+                "summary": .string("git status"),
+                "body": .string("git status --short")
+            ])
+        ]))
+        try await Task.sleep(nanoseconds: 40_000_000)
+
+        XCTAssertTrue(
+            controller.progressRepublishUsedCachedChromeForTesting,
+            "progress must reuse projected chrome instead of SQLite"
+        )
+        XCTAssertEqual(
+            controller.activeThreadDurableLookupCountForTesting,
+            lookupsAfterProjection,
+            "item.started must not issue another durable thread get"
+        )
+        let after = try XCTUnwrap(controller.modelForTests.activeThreads.first)
+        XCTAssertEqual(after.lastUpdatePreview, "Running: git status")
+        XCTAssertEqual(after.detail, detailBefore)
+        XCTAssertEqual(after.workspaceName, "elephant")
+    }
+
+    func test_firstProjection_usesListChromeWithoutDurableGet() throws {
+        // WHY: the first ActiveRunProjection still walked N full threadRepo.get
+        // plus botStore.list and N conversationLinked on MainActor.
+        let directory = NSTemporaryDirectory() + "RC2PetFirstChrome-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspace = try router.createWorkspace(name: "Pet", cwd: NSTemporaryDirectory())
+        var threadIDs: [AgentThreadID] = []
+        for index in 0..<8 {
+            let thread = AgentThread(
+                workspaceId: workspace.id,
+                title: "proj-\(index)",
+                provider: .codex,
+                model: "gpt-5",
+                status: .running
+            )
+            try context.threadRepo.upsert(thread)
+            threadIDs.append(thread.id)
+        }
+        SettingsStore(db: context.db).save(AppSettings(petEnabled: true, petReadyCounterEnabled: false))
+        let controller = try PetController(context: context, router: router, openSettings: { _ in false })
+        controller.start()
+        defer { controller.stop() }
+
+        let getsBefore = context.threadRepo.durableGetCountForTesting
+        let chromeBefore = context.threadRepo.listChromeCallCountForTesting
+        controller.applyActiveThreadIDsForTests(threadIDs)
+        XCTAssertEqual(controller.modelForTests.activeThreads.count, 8)
+        XCTAssertEqual(
+            Set(controller.modelForTests.activeThreads.compactMap(\.detail)).count,
+            8
+        )
+        XCTAssertTrue(
+            controller.modelForTests.activeThreads.contains(where: { $0.detail?.contains("proj-0") == true })
+        )
+        XCTAssertEqual(
+            context.threadRepo.durableGetCountForTesting,
+            getsBefore,
+            "first projection must use listChrome, not N full gets"
+        )
+        XCTAssertEqual(context.threadRepo.listChromeCallCountForTesting, chromeBefore + 1)
+        XCTAssertEqual(controller.activeThreadDurableLookupCountForTesting, 8)
+    }
+
+    func test_firstProjection_listChrome_fasterThanDurableGets() throws {
+        let directory = NSTemporaryDirectory() + "RC2PetFirstChromeBench-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspace = try router.createWorkspace(name: "bench", cwd: NSTemporaryDirectory())
+        var threadIDs: [AgentThreadID] = []
+        threadIDs.reserveCapacity(20)
+        for index in 0..<20 {
+            let thread = AgentThread(
+                workspaceId: workspace.id,
+                title: "bench-\(index)",
+                provider: .codex,
+                model: "gpt-5",
+                status: .running
+            )
+            try context.threadRepo.upsert(thread)
+            threadIDs.append(thread.id)
+        }
+        SettingsStore(db: context.db).save(AppSettings(petEnabled: true, petReadyCounterEnabled: false))
+        let controller = try PetController(context: context, router: router, openSettings: { _ in false })
+        controller.start()
+        defer { controller.stop() }
+
+        let warmup = 3
+        let samples = 5
+        let iterations = 200
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        func timeMs(_ body: () throws -> Void) rethrows -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            try body()
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0
+        }
+        for _ in 0..<warmup {
+            controller.applyActiveThreadIDsForTests(threadIDs)
+            for id in threadIDs { _ = try context.threadRepo.get(id: id) }
+        }
+        var chromeSamples: [Double] = []
+        var getSamples: [Double] = []
+        chromeSamples.reserveCapacity(samples)
+        getSamples.reserveCapacity(samples)
+        for _ in 0..<samples {
+            chromeSamples.append(timeMs {
+                for _ in 0..<iterations {
+                    controller.applyActiveThreadIDsForTests(threadIDs)
+                }
+            })
+            getSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    for id in threadIDs { _ = try context.threadRepo.get(id: id) }
+                }
+            })
+        }
+        let chromeMed = median(chromeSamples)
+        let getMed = median(getSamples)
+        let improvement = (getMed - chromeMed) / getMed * 100.0
+        NSLog(
+            "[perf-proof] pet-first-projection listChrome_ms=%@ durable_get_ms=%@ improvement_pct=%.2f chrome=%@ get=%@",
+            String(chromeMed), String(getMed), improvement,
+            String(describing: chromeSamples), String(describing: getSamples)
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5.0,
+            "batched first projection must beat N durable gets by ≥5% (got \(improvement)%; chrome=\(chromeMed)ms get=\(getMed)ms)"
+        )
+        XCTAssertEqual(controller.modelForTests.activeThreads.count, 20)
+    }
+
+    func test_firstProjection_usesBatchedStartedAtWithoutDurableRunGet() throws {
+        // WHY: first ActiveRunProjection compiled N full runRepo.get just to
+        // read started_at for elapsed labels.
+        let directory = NSTemporaryDirectory() + "RC2PetStartedAt-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspace = try router.createWorkspace(name: "elephant", cwd: NSTemporaryDirectory())
+        let thread = AgentThread(
+            workspaceId: workspace.id,
+            title: "elapsed",
+            provider: .claude,
+            model: "opus",
+            status: .running
+        )
+        try context.threadRepo.upsert(thread)
+        let runID = AgentRunID()
+        let startedAt = Date().addingTimeInterval(-90)
+        try context.runRepo.upsert(AgentRun(
+            id: runID,
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: startedAt
+        ))
+        SettingsStore(db: context.db).save(AppSettings(petEnabled: true, petReadyCounterEnabled: false))
+        let controller = try PetController(context: context, router: router, openSettings: { _ in false })
+        controller.start()
+        defer { controller.stop() }
+
+        let getsBefore = context.runRepo.durableGetCountForTesting
+        let batchBefore = context.runRepo.startedAtCallCountForTesting
+        controller.applyActiveRunProjectionForTests(
+            ActiveRunProjection(runs: [.init(threadId: thread.id, runId: runID)])
+        )
+        let row = try XCTUnwrap(controller.modelForTests.activeThreads.first)
+        XCTAssertTrue(
+            row.detail?.contains("1m") == true,
+            "batched startedAt must still embed elapsed; got \(row.detail ?? "nil")"
+        )
+        XCTAssertEqual(
+            context.runRepo.durableGetCountForTesting,
+            getsBefore,
+            "first projection must not compile a full run get for elapsed"
+        )
+        XCTAssertEqual(context.runRepo.startedAtCallCountForTesting, batchBefore + 1)
+    }
+
+    func test_startedAtBatch_fasterThanNDurableRunGets() throws {
+        let directory = NSTemporaryDirectory() + "RC2PetStartedAtBench-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        _ = try router.createWorkspace(name: "bench", cwd: NSTemporaryDirectory())
+        var runIDs: [AgentRunID] = []
+        runIDs.reserveCapacity(20)
+        let startedAt = Date().addingTimeInterval(-90)
+        for index in 0..<20 {
+            let thread = AgentThread(title: "run-\(index)", provider: .codex, model: "gpt-5")
+            try context.threadRepo.upsert(thread)
+            let run = AgentRun(
+                threadId: thread.id,
+                provider: .codex,
+                model: "gpt-5",
+                status: .running,
+                startedAt: startedAt
+            )
+            try context.runRepo.upsert(run)
+            runIDs.append(run.id)
+        }
+        let warmup = 3
+        let samples = 5
+        let iterations = 200
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        func timeMs(_ body: () throws -> Void) rethrows -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            try body()
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0
+        }
+        for _ in 0..<warmup {
+            _ = try context.runRepo.startedAt(ids: runIDs)
+            for id in runIDs { _ = try context.runRepo.get(id: id) }
+        }
+        var batchSamples: [Double] = []
+        var getSamples: [Double] = []
+        batchSamples.reserveCapacity(samples)
+        getSamples.reserveCapacity(samples)
+        for _ in 0..<samples {
+            batchSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = try context.runRepo.startedAt(ids: runIDs)
+                }
+            })
+            getSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    for id in runIDs { _ = try context.runRepo.get(id: id) }
+                }
+            })
+        }
+        let batchMed = median(batchSamples)
+        let getMed = median(getSamples)
+        let improvement = (getMed - batchMed) / getMed * 100.0
+        NSLog(
+            "[perf-proof] run-started-at batch_ms=%@ durable_get_ms=%@ improvement_pct=%.2f batch=%@ get=%@",
+            String(batchMed), String(getMed), improvement,
+            String(describing: batchSamples), String(describing: getSamples)
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5.0,
+            "batched startedAt must beat N durable run gets by ≥5% (got \(improvement)%; batch=\(batchMed)ms get=\(getMed)ms)"
+        )
+    }
+
+    /// WHY: EventBus run start/finish used to full-get the 10-column run row
+    /// (including error_message) just to emit started_at_ms / duration_ms.
+    func test_runTimingProbe_fasterThanDurableGet() throws {
+        let directory = NSTemporaryDirectory() + "RC2RunTimingProbe-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let thread = AgentThread(title: "timing", provider: .codex, model: "gpt-5")
+        try context.threadRepo.upsert(thread)
+        let startedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let finishedAt = Date(timeIntervalSince1970: 1_700_000_012)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-5",
+            status: .completed,
+            startedAt: startedAt,
+            finishedAt: finishedAt,
+            errorMessage: String(repeating: "e", count: 32 * 1024)
+        )
+        try context.runRepo.upsert(run)
+
+        let getsBefore = context.runRepo.durableGetCountForTesting
+        let probesBefore = context.runRepo.timingProbeCountForTesting
+        let timing = try XCTUnwrap(context.runRepo.timing(of: run.id))
+        XCTAssertEqual(timing.startedAt.timeIntervalSince1970, startedAt.timeIntervalSince1970, accuracy: 0.001)
+        let probedFinished = try XCTUnwrap(timing.finishedAt)
+        XCTAssertEqual(probedFinished.timeIntervalSince1970, finishedAt.timeIntervalSince1970, accuracy: 0.001)
+        XCTAssertEqual(context.runRepo.durableGetCountForTesting, getsBefore)
+        XCTAssertEqual(context.runRepo.timingProbeCountForTesting, probesBefore + 1)
+
+        let warmup = 3
+        let samples = 5
+        let iterations = 200
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        func timeMs(_ body: () throws -> Void) rethrows -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            try body()
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0
+        }
+        for _ in 0..<warmup {
+            _ = try context.runRepo.timing(of: run.id)
+            _ = try context.runRepo.get(id: run.id)
+        }
+        var probeSamples: [Double] = []
+        var getSamples: [Double] = []
+        probeSamples.reserveCapacity(samples)
+        getSamples.reserveCapacity(samples)
+        for _ in 0..<samples {
+            probeSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = try context.runRepo.timing(of: run.id)
+                }
+            })
+            getSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = try context.runRepo.get(id: run.id)
+                }
+            })
+        }
+        let probeMed = median(probeSamples)
+        let getMed = median(getSamples)
+        let improvement = (getMed - probeMed) / getMed * 100.0
+        NSLog(
+            "[perf-proof] run-timing probe_ms=%@ durable_get_ms=%@ improvement_pct=%.2f probe=%@ get=%@",
+            String(probeMed), String(getMed), improvement,
+            String(describing: probeSamples), String(describing: getSamples)
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5.0,
+            "run timing probe must beat durable get by ≥5% (got \(improvement)%; probe=\(probeMed)ms get=\(getMed)ms)"
+        )
+    }
+
+    func test_progressRepublish_cachedChrome_fasterThanDurableApply() throws {
+        let directory = NSTemporaryDirectory() + "RC2PetLAProgressBench-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspace = try router.createWorkspace(name: "bench", cwd: NSTemporaryDirectory())
+        var threadIDs: [AgentThreadID] = []
+        threadIDs.reserveCapacity(20)
+        let startedAt = Date().addingTimeInterval(-90)
+        for index in 0..<20 {
+            let thread = AgentThread(
+                workspaceId: workspace.id,
+                title: "bench-\(index)",
+                provider: .codex,
+                model: "gpt-5",
+                status: .running
+            )
+            try context.threadRepo.upsert(thread)
+            try context.runRepo.upsert(AgentRun(
+                threadId: thread.id,
+                provider: .codex,
+                model: "gpt-5",
+                status: .running,
+                startedAt: startedAt
+            ))
+            threadIDs.append(thread.id)
+        }
+        SettingsStore(db: context.db).save(AppSettings(petEnabled: true, petReadyCounterEnabled: false))
+        let controller = try PetController(context: context, router: router, openSettings: { _ in false })
+        controller.start()
+        defer { controller.stop() }
+
+        controller.applyActiveThreadIDsForTests(threadIDs, startedByThread: Dictionary(
+            uniqueKeysWithValues: threadIDs.map { ($0, startedAt) }
+        ))
+        XCTAssertEqual(controller.modelForTests.activeThreads.count, 20)
+
+        let warmup = 3
+        let samples = 5
+        let iterations = 200
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        func timeMs(_ body: () -> Void) -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            body()
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup {
+            controller.republishActiveThreadsForLiveActivityForTests()
+            controller.applyActiveThreadIDsForTests(threadIDs, startedByThread: [:])
+        }
+
+        var cacheSamples: [Double] = []
+        var durableSamples: [Double] = []
+        cacheSamples.reserveCapacity(samples)
+        durableSamples.reserveCapacity(samples)
+        for _ in 0..<samples {
+            cacheSamples.append(timeMs {
+                for _ in 0..<iterations {
+                    controller.republishActiveThreadsForLiveActivityForTests()
+                }
+            })
+            durableSamples.append(timeMs {
+                for _ in 0..<iterations {
+                    controller.applyActiveThreadIDsForTests(threadIDs, startedByThread: [:])
+                }
+            })
+        }
+        let cacheMed = median(cacheSamples)
+        let durableMed = median(durableSamples)
+        let improvement = (durableMed - cacheMed) / durableMed * 100.0
+        NSLog(
+            "[perf-proof] pet-la-progress cache_ms=%@ durable_apply_ms=%@ improvement_pct=%.2f cache=%@ durable=%@",
+            String(cacheMed), String(durableMed), improvement,
+            String(describing: cacheSamples), String(describing: durableSamples)
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5.0,
+            "cached Live Activity progress must beat durable apply by ≥5% (got \(improvement)%; cache=\(cacheMed)ms durable=\(durableMed)ms)"
+        )
+        XCTAssertTrue(controller.progressRepublishUsedCachedChromeForTesting)
+    }
+
     func test_mergingStartedAtByThreadPreservesRetainedWhenIncomingEmpty() {
         let a = AgentThreadID(UUID(uuidString: "11111111-1111-1111-1111-111111111111")!)
         let b = AgentThreadID(UUID(uuidString: "22222222-2222-2222-2222-222222222222")!)

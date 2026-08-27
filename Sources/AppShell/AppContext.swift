@@ -1177,18 +1177,18 @@ public final class AppContext {
             var payload: [String: JSONValue] = ["thread_id": .string(threadId.value.uuidString)]
             if let runId {
                 payload["run_id"] = .string(runId.value.uuidString)
-                if let run = try? runRepo.get(id: runId) {
-                    let startedAtMs = Int64(run.startedAt.timeIntervalSince1970 * 1000)
+                if let timing = try? runRepo.timing(of: runId) {
+                    let startedAtMs = Int64(timing.startedAt.timeIntervalSince1970 * 1000)
                     payload["started_at_ms"] = .number(Double(startedAtMs))
                     payload["started_at"] = .number(Double(startedAtMs))
-                    if let finishedAt = run.finishedAt {
+                    if let finishedAt = timing.finishedAt {
                         let finishedAtMs = Int64(finishedAt.timeIntervalSince1970 * 1000)
                         payload["finished_at_ms"] = .number(Double(finishedAtMs))
                         payload["duration_ms"] = .number(Double(max(0, finishedAtMs - startedAtMs)))
                     }
                 }
             }
-            if let wid = try? threadRepo.get(id: threadId)?.workspaceId {
+            if let wid = try? threadRepo.workspaceId(of: threadId) {
                 payload["workspace_id"] = .string(wid.value.uuidString)
             }
             if let status {
@@ -1449,7 +1449,7 @@ public final class AppContext {
                 // Grok has no live `.accountUsage` stream (Claude/Codex do). Re-read
                 // the local billing snapshot after each Grok run so the Token Saver
                 // purple ring updates without waiting for the next periodic probe.
-                if let run = try? self.runRepo.get(id: rid), run.provider == .grok {
+                if (try? self.runRepo.provider(of: rid)) == .grok {
                     self.refreshGrokTokenSaverAccountUsage(reason: "run_finished")
                 }
                 // Drain the next queued message after ANY terminal status. stopRun
@@ -1461,10 +1461,11 @@ public final class AppContext {
                 self.ensureQueueDrainWaiterIfNeeded(threadId: tid)
                 // Main agent only: nested/subagent workers must not fire
                 // system or private push banners (parent owns user-facing UX).
+                let chrome = (try? self.threadRepo.listChrome(ids: [tid]))?[tid]
                 if let content = RemoteCodeNotificationContent.threadOutcome(
                     threadId: tid.value.uuidString,
-                    workspaceId: (try? self.threadRepo.get(id: tid)?.workspaceId)?.value.uuidString,
-                    title: try? self.threadRepo.get(id: tid)?.title,
+                    workspaceId: chrome?.workspaceId?.value.uuidString,
+                    title: chrome?.title,
                     phase: status,
                     isNestedWorker: self.isNestedAgentWorker(runId: rid, threadId: tid)
                 ) {
@@ -1661,13 +1662,16 @@ public final class AppContext {
         let newlyActiveThreadIDs = activeThreadIDs.subtracting(cachedThreadIDs).sorted {
             $0.value.uuidString < $1.value.uuidString
         }
-        for threadID in newlyActiveThreadIDs {
-            guard let thread = try? threadRepo.get(id: threadID),
-                  let workspaceID = thread.workspaceId else { continue }
-            activeAgentThreadContextByID[threadID] = ActiveAgentThreadContext(
-                workspaceID: workspaceID,
-                title: thread.title
-            )
+        if !newlyActiveThreadIDs.isEmpty {
+            let chromeByID = (try? threadRepo.listChrome(ids: newlyActiveThreadIDs)) ?? [:]
+            for threadID in newlyActiveThreadIDs {
+                guard let chrome = chromeByID[threadID],
+                      let workspaceID = chrome.workspaceId else { continue }
+                activeAgentThreadContextByID[threadID] = ActiveAgentThreadContext(
+                    workspaceID: workspaceID,
+                    title: chrome.title
+                )
+            }
         }
 
         var projected: [WorkspaceID: [String]] = [:]
@@ -1716,7 +1720,7 @@ public final class AppContext {
             guard self.queueDrainWaiters[threadId]?.token == token,
                   self.queueDrainAllowsWork(threadId: threadId),
                   self.coordinator.hasProviderSession(threadId: threadId) else { return }
-            switch (try? self.threadRepo.get(id: threadId))?.status {
+            switch try? self.threadRepo.status(of: threadId) {
             case .completed, .failed, .cancelled, .interrupted:
                 EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
                     "thread_id": .string(threadId.value.uuidString),
@@ -1939,7 +1943,8 @@ public final class AppContext {
         threadId: AgentThreadID,
         baseEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: String] {
-        let sameUser = tokenSaverIsSameUser(threadId: threadId)
+        let identity = try? threadRepo.identity(of: threadId)
+        let sameUser = tokenSaverIsSameUser(identity: identity)
         // task-08: cross-user runs get no Token Saver env/hint/PATH managed bin.
         guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
             isSameUser: sameUser,
@@ -1973,8 +1978,7 @@ public final class AppContext {
         // Bot Desk compress demand-starts Distill, and stampIdentity would
         // otherwise scrub the same turn.
         let live = TokenSaverWaveLiveRollout.liveWaves.map(\.rawValue).sorted().joined(separator: ",")
-        let thread = try? threadRepo.get(id: threadId)
-        let scope = tokenSaverPersistentScope(threadId: threadId)
+        let scope = tokenSaverPersistentScope(threadId: threadId, identity: identity)
         let workspaceID = scope?.workspaceID
         let projectID = scope?.projectID
         let receipt = TokenSaverExecutionReceiptSeam.admit(
@@ -1994,8 +1998,8 @@ public final class AppContext {
         // The begin/end worker bridge needs the same app database and neutral
         // provider identity; these are metadata only, never prompt content.
         env["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"] = appSupportDirectory.path
-        env["REMOTE_CODE_AGENT_MODEL"] = thread?.model ?? "unknown"
-        env["REMOTE_CODE_PROVIDER_INSTANCE_ID"] = thread?.providerInstanceId ?? provider.rawValue
+        env["REMOTE_CODE_AGENT_MODEL"] = identity?.model ?? "unknown"
+        env["REMOTE_CODE_PROVIDER_INSTANCE_ID"] = identity?.providerInstanceId ?? provider.rawValue
         // Managed PATH is host-local (not inside the compact receipt JSON).
         if receipt.capabilities.managedPath == true {
             let installer = makeAgentSkillInstaller()
@@ -2101,10 +2105,11 @@ public final class AppContext {
         actionTitle: String
     ) {
         let nested = isNestedAgentWorker(runId: runId, threadId: threadId)
+        let chrome = (try? threadRepo.listChrome(ids: [threadId]))?[threadId]
         guard let content = RemoteCodeNotificationContent.userActionNeeded(
             threadId: threadId.value.uuidString,
-            workspaceId: (try? threadRepo.get(id: threadId)?.workspaceId)?.value.uuidString,
-            threadTitle: try? threadRepo.get(id: threadId)?.title,
+            workspaceId: chrome?.workspaceId?.value.uuidString,
+            threadTitle: chrome?.title,
             actionTitle: actionTitle,
             requestId: requestId,
             isNestedWorker: nested
@@ -2124,7 +2129,7 @@ public final class AppContext {
         threadId: AgentThreadID,
         baseEnvironment: [String: String] = [:]
     ) -> [String: String] {
-        let thread = try? threadRepo.get(id: threadId)
+        let identity = try? threadRepo.identity(of: threadId)
         var environment = baseEnvironment
         environment.removeValue(forKey: AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey)
         environment.merge([
@@ -2133,8 +2138,8 @@ public final class AppContext {
             "RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE": "1",
             "RC_REMOTE_CODE_AGENT_APP_SOCKET_PATH": AppPaths.socketPath(for: channel),
             "REMOTE_CODE_AGENT_PROVIDER": provider.rawValue,
-            "REMOTE_CODE_AGENT_MODEL": thread?.model ?? "unknown",
-            "REMOTE_CODE_PROVIDER_INSTANCE_ID": thread?.providerInstanceId ?? provider.rawValue,
+            "REMOTE_CODE_AGENT_MODEL": identity?.model ?? "unknown",
+            "REMOTE_CODE_PROVIDER_INSTANCE_ID": identity?.providerInstanceId ?? provider.rawValue,
         ]) { _, new in new }
         if let conversation = try? botStore.conversationLinked(to: threadId) {
             environment[BotSelfConfigCatalog.callerEnvironmentKey] =
@@ -2248,7 +2253,7 @@ public final class AppContext {
             environment.removeValue(forKey: "RC_REMOTE_CODE_EFFECTIVE_ZDOTDIR")
             environment.removeValue(forKey: "RC_REMOTE_CODE_MANAGED_ZDOTDIR")
         }
-        if let workspaceID = thread?.workspaceId?.value.uuidString {
+        if let workspaceID = identity?.workspaceId?.value.uuidString {
             environment["RC_REMOTE_CODE_WORKSPACE_ID"] = workspaceID
         }
         if let telemetryExecutable = Self.subagentTelemetryExecutableURL()?.path {
@@ -3437,13 +3442,21 @@ public final class AppContext {
     private func tokenSaverPersistentScope(
         threadId: AgentThreadID
     ) -> (workspaceID: String, projectID: String)? {
-        guard let thread = try? threadRepo.get(id: threadId) else {
-            return nil
+        tokenSaverPersistentScope(
+            threadId: threadId,
+            identity: try? threadRepo.identity(of: threadId)
+        )
+    }
+
+    private func tokenSaverPersistentScope(
+        threadId: AgentThreadID,
+        identity: AgentThreadRepository.IdentityChrome?
+    ) -> (workspaceID: String, projectID: String)? {
+        guard let identity else { return nil }
+        if let workspaceID = identity.workspaceId?.value.uuidString {
+            return (workspaceID, identity.projectId?.value.uuidString ?? workspaceID)
         }
-        if let workspaceID = thread.workspaceId?.value.uuidString {
-            return (workspaceID, thread.projectId?.value.uuidString ?? workspaceID)
-        }
-        if let projectID = thread.projectId?.value.uuidString {
+        if let projectID = identity.projectId?.value.uuidString {
             return (projectID, projectID)
         }
         guard let conversation = try? botStore.conversationLinked(to: threadId) else {
@@ -3459,9 +3472,9 @@ public final class AppContext {
     ) -> TokenSaverAdmissionDecision {
         guard tokenSaverLifecycleDegradedReason == nil,
               isTokenSaverRuntimeActive(),
-              let thread = try? threadRepo.get(id: threadId),
-              let projectID = thread.projectId?.value.uuidString,
-              thread.workspaceId != nil,
+              let identity = try? threadRepo.identity(of: threadId),
+              let projectID = identity.projectId?.value.uuidString,
+              identity.workspaceId != nil,
               let lane = try? tokenSaverLaneStateRepo.get(projectID: projectID, lane: laneName),
               ["shadow_only", "promoted"].contains(lane.state),
               !lane.optedOut,
@@ -3472,10 +3485,10 @@ public final class AppContext {
     }
 
     private func tokenSaverProjectObservation(runId: AgentRunID, lane: String) -> TokenSaverAdmissionDecision {
-        guard let run = try? runRepo.get(id: runId) else {
+        guard let threadId = try? runRepo.threadId(of: runId) else {
             return .init(allowed: false, reason: "missing_run_scope")
         }
-        return tokenSaverProjectObservation(threadId: run.threadId, lane: lane)
+        return tokenSaverProjectObservation(threadId: threadId, lane: lane)
     }
 
     private func tokenSaverProjectAdmission(
@@ -3483,11 +3496,11 @@ public final class AppContext {
         lane: String,
         globallyEnabled: Bool? = nil
     ) -> TokenSaverAdmissionDecision {
-        guard let run = try? runRepo.get(id: runId) else {
+        guard let threadId = try? runRepo.threadId(of: runId) else {
             return .init(allowed: false, reason: "missing_run_scope")
         }
         return tokenSaverProjectAdmission(
-            threadId: run.threadId,
+            threadId: threadId,
             lane: lane,
             globallyEnabled: globallyEnabled
         )
@@ -3496,8 +3509,12 @@ public final class AppContext {
     /// task-08: cross-user Token Saver is raw-only for every compressor turn kind.
     /// Unknown identity fails closed (disables Token Saver callbacks) while keeping provider raw.
     private func tokenSaverIsSameUser(threadId: AgentThreadID) -> Bool {
-        guard let thread = try? threadRepo.get(id: threadId) else { return false }
-        guard let runAs = thread.runAsUser else { return true }
+        tokenSaverIsSameUser(identity: try? threadRepo.identity(of: threadId))
+    }
+
+    private func tokenSaverIsSameUser(identity: AgentThreadRepository.IdentityChrome?) -> Bool {
+        guard let identity else { return false }
+        guard let runAs = identity.runAsUser else { return true }
         return runAs.uid == getuid()
     }
 
@@ -4296,12 +4313,15 @@ public final class AppContext {
     /// uses the same scope and never mutates provider-global instruction files.
     func recordSessionLearnFromRun(runId: AgentRunID, status: AgentRunStatus) {
         let settings = SettingsStore(db: db).load()
+        // Thread id + identity only. A leftover 10-column `get` (including
+        // `error_message`) hitchs every SessionLearn-enabled finish before
+        // failed/expensive even decides whether the blob is needed.
         guard settings.sessionLearnEnabled,
-              tokenSaverProjectObservation(runId: runId, lane: "session_learn").allowed,
-              let run = try? runRepo.get(id: runId),
-              let thread = try? threadRepo.get(id: run.threadId),
-              let workspaceID = thread.workspaceId?.value.uuidString,
-              let projectID = thread.projectId?.value.uuidString,
+              let threadId = try? runRepo.threadId(of: runId),
+              tokenSaverProjectObservation(threadId: threadId, lane: "session_learn").allowed,
+              let identity = try? threadRepo.identity(of: threadId),
+              let workspaceID = identity.workspaceId?.value.uuidString,
+              let projectID = identity.projectId?.value.uuidString,
               let lane = try? tokenSaverLaneStateRepo.get(projectID: projectID, lane: "session_learn"),
               lane.retentionDays > 0 else {
             sessionLearnInputTokensByRun.removeValue(forKey: runId)
@@ -4309,7 +4329,8 @@ public final class AppContext {
         }
         let expensive = (sessionLearnInputTokensByRun.removeValue(forKey: runId) ?? 0) >= 64_000
         guard status == .failed || expensive else { return }
-        let source = run.errorMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let source = (try? runRepo.errorMessage(of: runId))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let text = Self.utf8SafePrefix(
             (source?.isEmpty == false ? source! : "High-input run required repeated context."),
             maxBytes: 512
@@ -4321,8 +4342,8 @@ public final class AppContext {
                 scope: .init(
                     workspaceID: workspaceID,
                     projectID: projectID,
-                    threadID: run.threadId.value.uuidString,
-                    provider: run.provider.rawValue
+                    threadID: threadId.value.uuidString,
+                    provider: (try? runRepo.provider(of: runId))?.rawValue ?? AgentProvider.codex.rawValue
                 ),
                 attemptID: runId.value.uuidString,
                 expiresAt: Date().addingTimeInterval(TimeInterval(lane.retentionDays) * 86_400)
@@ -4358,9 +4379,9 @@ public final class AppContext {
             )
             return prompt
         }
-        guard let thread = try? threadRepo.get(id: threadId),
-              let workspaceID = thread.workspaceId?.value.uuidString,
-              let projectID = thread.projectId?.value.uuidString else {
+        guard let identity = try? threadRepo.identity(of: threadId),
+              let workspaceID = identity.workspaceId?.value.uuidString,
+              let projectID = identity.projectId?.value.uuidString else {
             return prompt
         }
         let scope = TokenSaverSessionLearnScope(
@@ -4418,9 +4439,9 @@ public final class AppContext {
             lane: "rollover_capsule"
         )
         guard admission.allowed else { return admission }
-        guard let parent = try? threadRepo.get(id: parentThreadID),
-              let projectID = parent.projectId?.value.uuidString,
-              parent.workspaceId != nil,
+        guard let identity = try? threadRepo.identity(of: parentThreadID),
+              let projectID = identity.projectId?.value.uuidString,
+              identity.workspaceId != nil,
               let lane = try? tokenSaverLaneStateRepo.get(
                 projectID: projectID,
                 lane: "rollover_capsule"
@@ -4645,9 +4666,9 @@ public final class AppContext {
 
     private func recordTokenSaverPreparedObservation(request: AgentRunRequest, originalPrompt: String) {
         guard tokenSaverProjectObservation(threadId: request.threadId, lane: "measurement").allowed,
-              let thread = try? threadRepo.get(id: request.threadId),
-              let workspaceID = thread.workspaceId?.value.uuidString,
-              let projectID = thread.projectId?.value.uuidString else {
+              let identity = try? threadRepo.identity(of: request.threadId),
+              let workspaceID = identity.workspaceId?.value.uuidString,
+              let projectID = identity.projectId?.value.uuidString else {
             return
         }
         let attemptID = request.runId.value.uuidString
@@ -4801,10 +4822,7 @@ public final class AppContext {
     }
 
     private func recordTokenSaverUsage(_ usage: AssistantTokenUsage, runId: AgentRunID) {
-        guard usage.totalTokens > 0,
-              let run = try? runRepo.get(id: runId) else {
-            return
-        }
+        guard usage.totalTokens > 0 else { return }
         var pending: PendingUsage
         if let active = pendingUsageByRun[runId] {
             pending = active
@@ -4815,8 +4833,10 @@ public final class AppContext {
             // Once a terminal baseline ages out of the bounded tombstone cache,
             // fail closed for accounting. Reconstructing it from zero would
             // double-count a replayed provider receipt.
-            guard run.status == .pending || run.status == .running else { return }
-            pending = PendingUsage(provider: run.provider)
+            guard let status = try? runRepo.status(of: runId),
+                  status == .pending || status == .running,
+                  let provider = try? runRepo.provider(of: runId) else { return }
+            pending = PendingUsage(provider: provider)
         }
         // Incremental events have no provider event ID, so a replay after the
         // terminal callback cannot be distinguished from a new charge. Provider
@@ -4886,17 +4906,18 @@ public final class AppContext {
     private func beginTokenSaverAttempt(runId: AgentRunID) {
         let attemptID = runId.value.uuidString
         guard (try? tokenSaverAttemptLedger.attempt(id: attemptID)) == nil,
-              let run = try? runRepo.get(id: runId),
-              tokenSaverProjectObservation(runId: runId, lane: "measurement").allowed else {
+              tokenSaverProjectObservation(runId: runId, lane: "measurement").allowed,
+              let provider = try? runRepo.provider(of: runId),
+              let model = try? runRepo.model(of: runId) else {
             return
         }
         let record = TokenSaverAttemptRecord(
             id: attemptID,
             runID: attemptID,
-            provider: run.provider.rawValue,
+            provider: provider.rawValue,
             adapterVersion: "unavailable",
             providerVersion: "unavailable",
-            model: run.model,
+            model: model,
             cacheState: "unavailable",
             language: "unavailable",
             hardwareClass: "unavailable",
@@ -5081,8 +5102,8 @@ public final class AppContext {
             pending.finished = true
             pendingUsageByRun[runId] = pending
         } else if completedUsageByRun[runId] == nil,
-                  let run = try? runRepo.get(id: runId) {
-            var pending = PendingUsage(provider: run.provider)
+                  let provider = try? runRepo.provider(of: runId) {
+            var pending = PendingUsage(provider: provider)
             pending.finished = true
             archiveCompletedUsage(runId: runId, pending: pending)
         }
@@ -5474,10 +5495,12 @@ public final class AppContext {
 
     /// Provider label for Graphify usage rows. Thread identity is stable for a
     /// run; itemDelta must not SQLite-get the thread on every stream chunk.
+    /// First miss probes listChrome (provider only), never the 26-column get.
     func graphifyProviderLabel(for threadId: AgentThreadID) -> String {
         if let cached = graphifyProviderByThread[threadId] { return cached }
         graphifyProviderLookupCountForTesting += 1
-        let label = (try? threadRepo.get(id: threadId))?.provider.rawValue ?? "unknown"
+        let label = (try? threadRepo.listChrome(ids: [threadId]))?[threadId]?.provider.rawValue
+            ?? "unknown"
         if graphifyProviderByThread.count >= Self.graphifyProviderByThreadLimit {
             graphifyProviderByThread.removeAll(keepingCapacity: true)
         }

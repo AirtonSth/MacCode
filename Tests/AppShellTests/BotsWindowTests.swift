@@ -1528,6 +1528,79 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(chrome.contains("stop.circle"))
     }
 
+    /// WHY: opening Desk used to full-get every linked thread just to paint
+    /// provider · model on the rail. First paint must reuse batched listChrome
+    /// so N rows cannot stall MainActor.
+    func test_deskThreadRailRouting_usesListChromeWithoutDurableGet() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        var conversations: [BotConversation] = []
+        conversations.reserveCapacity(20)
+        for index in 0..<20 {
+            let thread = AgentThread(
+                title: "desk-\(index)",
+                provider: .claude,
+                model: "opus-\(index)"
+            )
+            try context.threadRepo.upsert(thread)
+            let conversation = BotConversation(
+                botID: bot.id,
+                title: "desk-\(index)",
+                linkedAgentThreadID: thread.id
+            )
+            try context.botStore.upsertConversation(conversation)
+            conversations.append(conversation)
+        }
+        let getsBeforeOpen = context.threadRepo.durableGetCountForTesting
+        let chromeBeforeOpen = context.threadRepo.listChromeCallCountForTesting
+        vm.openDesk(bot)
+        XCTAssertGreaterThanOrEqual(
+            context.threadRepo.listChromeCallCountForTesting,
+            chromeBeforeOpen + 1,
+            "openDesk must prefetch rail routing with listChrome"
+        )
+        XCTAssertLessThan(
+            context.threadRepo.durableGetCountForTesting - getsBeforeOpen,
+            20,
+            "openDesk must not full-get once per linked thread for rail chrome"
+        )
+
+        let getsBeforeRows = context.threadRepo.durableGetCountForTesting
+        let chromeBeforeRows = context.threadRepo.listChromeCallCountForTesting
+        let painted = vm.conversations.map { vm.deskThreadRailRouting(for: $0) }
+        XCTAssertEqual(painted.count, 20)
+        XCTAssertEqual(Set(painted.map(\.model)), Set((0..<20).map { "opus-\($0)" }))
+        XCTAssertTrue(painted.allSatisfy { $0.provider == .claude })
+        XCTAssertEqual(
+            context.threadRepo.durableGetCountForTesting,
+            getsBeforeRows,
+            "desk thread rows must read rail routing from the prefetch cache"
+        )
+        XCTAssertEqual(
+            context.threadRepo.listChromeCallCountForTesting,
+            chromeBeforeRows,
+            "row paint must not re-query listChrome after prefetch"
+        )
+
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/AppShell/BotsWindow.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("prefetchDeskThreadRailRouting(for: conversations)"))
+        XCTAssertTrue(source.contains("threadRepo.listChrome(ids: missing)"))
+        let routingRange = try XCTUnwrap(source.range(of: "public func deskThreadRailRouting(for conversation: BotConversation)"))
+        let routingBody = String(source[routingRange.lowerBound...].prefix(900))
+        XCTAssertFalse(
+            routingBody.contains("threadRepo.get(id:"),
+            "deskThreadRailRouting must not full-get a thread for provider · model"
+        )
+    }
+
     func test_deskThreadRailOrdersWorkingFirst_becauseActiveMustStayOnTop() throws {
         // WHY: + / a newer idle dest thread used to insert at index 0 and
         // bury the live spinner. Dest must use the shared active-first sort

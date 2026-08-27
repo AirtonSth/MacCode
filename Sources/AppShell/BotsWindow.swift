@@ -828,7 +828,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
               conversation.botID == peerBotID,
               let peerThreadID = handoff.peerThreadID,
               conversation.linkedAgentThreadID == peerThreadID,
-              (try? threadRepo.get(id: peerThreadID)) != nil else {
+              (try? threadRepo.status(of: peerThreadID)) != nil else {
             return nil
         }
         return handoff
@@ -1019,8 +1019,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 // child. Abort dispatch only on durable PROOF the host was
                 // stopped — cancelled/interrupted terminal row. Completed and
                 // unknown hosts still dispatch (late replies stay useful).
-                if let hostRun = try? runRepo.get(id: hostRunID),
-                   hostRun.status == .cancelled || hostRun.status == .interrupted {
+                if let status = try? runRepo.status(of: hostRunID),
+                   status == .cancelled || status == .interrupted {
                     coordinator.stopRun(threadId: thread.id)
                     finalizeDelegationTelemetry(runID: peerRunID, status: .cancelled)
                     markConversationNeedsAttention(conversation, detail: display)
@@ -2118,7 +2118,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 continue
             }
             if let threadID = handoff.originAgentThreadID,
-               (try? threadRepo.get(id: threadID)) == nil {
+               (try? threadRepo.status(of: threadID)) == nil {
                 removeRestoredHandoff(activityID: activityID, handoff: handoff)
                 continue
             }
@@ -2302,7 +2302,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
 
     private func settleCancelledQueuedHost(runID: AgentRunID, threadID: AgentThreadID) {
         let queuedID = AgentQueuedMessageID(runID.value)
-        guard (try? runRepo.get(id: runID)) == nil,
+        guard (try? runRepo.status(of: runID)) == nil,
               (try? queuedMessageRepo.get(id: queuedID)) == nil else { return }
         let activityIDs = handoffs.compactMap { activityID, handoff -> UUID? in
             guard handoff.hostRunID == runID,
@@ -2356,8 +2356,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                     dates.append(stamped)
                 }
                 if let threadID = handoff.peerThreadID,
-                   let thread = try? threadRepo.get(id: threadID) {
-                    dates.append(thread.updatedAt)
+                   let updatedAt = try? threadRepo.updatedAt(of: threadID) {
+                    dates.append(updatedAt)
                 }
             default:
                 break
@@ -4272,6 +4272,7 @@ public final class BotsViewModel: ObservableObject {
         selectedConversation = cachedConversation
         conversations = studioSupportByBot[cachedBot.id]?.conversations
             ?? conversations.filter { $0.botID == cachedBot.id }
+        prefetchDeskThreadRailRouting(for: conversations)
         let cachedConversationID = messagesConversationIDByBot[cachedBot.id]
         deskMessages = cachedConversation?.id == cachedConversationID
             ? (messagesByBot[cachedBot.id] ?? [])
@@ -6207,6 +6208,7 @@ public final class BotsViewModel: ObservableObject {
             conversationListCountForTesting += 1
             deskThreadRailRoutingCache.removeAll()
             conversations = try botStore.listConversations(botID: id)
+            prefetchDeskThreadRailRouting(for: conversations)
             if let remembered = selectedConversationByBot[id],
                let found = conversations.first(where: { $0.id == remembered }) {
                 selectedConversation = found
@@ -6239,6 +6241,7 @@ public final class BotsViewModel: ObservableObject {
 
     private func applyStudioSupport(_ snapshot: BotStudioSupportSnapshot) {
         conversations = snapshot.conversations
+        prefetchDeskThreadRailRouting(for: conversations)
         selectedConversation = snapshot.selectedConversation
         selectedRevision = snapshot.selectedRevision
         skillBindings = snapshot.skillBindings
@@ -6501,10 +6504,26 @@ public final class BotsViewModel: ObservableObject {
         UserDefaults.standard.set(Double(deskThreadRailWidth), forKey: Self.deskThreadRailWidthDefaultsKey)
     }
 
-    /// Memo for thread-rail provider · model chips: one repo point-get
-    /// per linked thread instead of one per row per render (the desk
+    /// Memo for thread-rail provider · model chips: one batched listChrome
+    /// per desk reload instead of one full get per row per render (the desk
     /// composer republishes this model on every keystroke).
     private var deskThreadRailRoutingCache: [AgentThreadID: BotDeskThreadRailRouting] = [:]
+
+    /// Prefetch provider · model for linked threads so first rail paint
+    /// does not compile N 26-column + routing `get`s.
+    private func prefetchDeskThreadRailRouting(for conversations: [BotConversation]) {
+        let missing = conversations.compactMap(\.linkedAgentThreadID).filter {
+            deskThreadRailRoutingCache[$0] == nil
+        }
+        guard !missing.isEmpty else { return }
+        let chrome = (try? context.threadRepo.listChrome(ids: missing)) ?? [:]
+        for (id, row) in chrome {
+            deskThreadRailRoutingCache[id] = BotDeskThreadRailRouting(
+                provider: row.provider,
+                model: row.model
+            )
+        }
+    }
 
     /// Provider · model for a desk thread row — the same chip data the
     /// Agent App rail shows. The linked run's thread wins; a never-run
@@ -6512,8 +6531,8 @@ public final class BotsViewModel: ObservableObject {
     public func deskThreadRailRouting(for conversation: BotConversation) -> BotDeskThreadRailRouting {
         if let threadID = conversation.linkedAgentThreadID {
             if let cached = deskThreadRailRoutingCache[threadID] { return cached }
-            if let thread = try? context.threadRepo.get(id: threadID) {
-                let routing = BotDeskThreadRailRouting(provider: thread.provider, model: thread.model)
+            if let row = (try? context.threadRepo.listChrome(ids: [threadID]))?[threadID] {
+                let routing = BotDeskThreadRailRouting(provider: row.provider, model: row.model)
                 deskThreadRailRoutingCache[threadID] = routing
                 return routing
             }
@@ -8176,7 +8195,7 @@ public final class BotsViewModel: ObservableObject {
         } else {
             run = linkedRun(for: threadID, botID: botID)
         }
-        let mode = (try? context.threadRepo.get(id: threadID))?.permissionMode
+        let mode = (try? context.threadRepo.permissionMode(of: threadID))
             ?? deskRouting.permissionMode
         let rows = BotsDeskFollowThrough.workLogRows(for: run, mode: mode)
         if selectedBotID == botID {

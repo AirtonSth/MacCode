@@ -182,4 +182,136 @@ final class ActiveThreadsWindowTests: XCTestCase {
         XCTAssertFalse(allFinished.contains(where: { $0.status == .running || $0.status == .pending }))
         XCTAssertEqual(allFinished.map(\.id), [finished.id, olderFinished.id])
     }
+
+    @MainActor
+    func test_reloadFinished_usesListChromeWithoutDurableGet() throws {
+        // WHY: Last Finished used to compile one full threadRepo.get per run
+        // (26 columns + routing JSON) on MainActor. Chrome is four columns.
+        let directory = NSTemporaryDirectory() + "rc-active-chrome-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspaceID = WorkspaceID()
+        var threads: [AgentThread] = []
+        for index in 0..<20 {
+            let thread = AgentThread(
+                workspaceId: workspaceID,
+                title: "Finished \(index)",
+                provider: .codex,
+                model: "gpt-5"
+            )
+            try context.threadRepo.upsert(thread)
+            try context.runRepo.upsert(AgentRun(
+                threadId: thread.id,
+                provider: .codex,
+                providerInstanceId: "codex",
+                model: "gpt-5",
+                status: .completed,
+                startedAt: Date(timeIntervalSince1970: Double(index)),
+                finishedAt: Date(timeIntervalSince1970: Double(100 + index))
+            ))
+            threads.append(thread)
+        }
+        let viewModel = ActiveThreadsViewModel(context: context, router: router, loadImmediately: false)
+        let getsBefore = context.threadRepo.durableGetCountForTesting
+        let chromeBefore = context.threadRepo.listChromeCallCountForTesting
+        viewModel.reloadFinished()
+        XCTAssertEqual(viewModel.finishedItems.count, 20)
+        XCTAssertEqual(
+            Set(viewModel.finishedItems.map(\.title)),
+            Set(threads.map(\.title)),
+            "finished rows must keep the durable thread title"
+        )
+        XCTAssertEqual(
+            context.threadRepo.durableGetCountForTesting,
+            getsBefore,
+            "reloadFinished must not compile N full gets"
+        )
+        XCTAssertEqual(
+            context.threadRepo.listChromeCallCountForTesting,
+            chromeBefore + 1
+        )
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/ActiveThreadsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("listChrome(ids:"))
+        XCTAssertFalse(
+            source.contains("threadRepo.get(id: threadID)"),
+            "reloadActive must not walk full gets for painted chrome"
+        )
+        XCTAssertFalse(source.contains("threadRepo.get(id: run.threadId)"))
+    }
+
+    func test_listChrome_skipsUnknownIds() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let threadRepo = AgentThreadRepository(db: db)
+        let kept = AgentThread(title: "kept", provider: .grok, model: "grok-4")
+        try threadRepo.upsert(kept)
+        let missing = AgentThreadID()
+        let chrome = try threadRepo.listChrome(ids: [kept.id, missing])
+        XCTAssertEqual(Set(chrome.keys), [kept.id])
+        XCTAssertEqual(chrome[kept.id]?.title, "kept")
+        XCTAssertEqual(chrome[kept.id]?.provider, .grok)
+        XCTAssertEqual(chrome[kept.id]?.model, "grok-4")
+        XCTAssertNil(chrome[missing])
+    }
+
+    func test_listChrome_fasterThanNDurableGets() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let threadRepo = AgentThreadRepository(db: db)
+        var ids: [AgentThreadID] = []
+        ids.reserveCapacity(20)
+        for index in 0..<20 {
+            let thread = AgentThread(title: "chrome-\(index)", provider: .claude, model: "opus")
+            try threadRepo.upsert(thread)
+            ids.append(thread.id)
+        }
+        let warmup = 3
+        let samples = 5
+        let iterations = 200
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        func timeMs(_ body: () throws -> Void) rethrows -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            try body()
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0
+        }
+        for _ in 0..<warmup {
+            _ = try threadRepo.listChrome(ids: ids)
+            for id in ids { _ = try threadRepo.get(id: id) }
+        }
+        var chromeSamples: [Double] = []
+        var getSamples: [Double] = []
+        chromeSamples.reserveCapacity(samples)
+        getSamples.reserveCapacity(samples)
+        for _ in 0..<samples {
+            chromeSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = try threadRepo.listChrome(ids: ids)
+                }
+            })
+            getSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    for id in ids { _ = try threadRepo.get(id: id) }
+                }
+            })
+        }
+        let chromeMed = median(chromeSamples)
+        let getMed = median(getSamples)
+        let improvement = (getMed - chromeMed) / getMed * 100.0
+        NSLog(
+            "[perf-proof] active-threads listChrome_ms=%@ durable_get_ms=%@ improvement_pct=%.2f chrome=%@ get=%@",
+            String(chromeMed), String(getMed), improvement,
+            String(describing: chromeSamples), String(describing: getSamples)
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5.0,
+            "batched listChrome must beat N durable gets by ≥5% (got \(improvement)%; chrome=\(chromeMed)ms get=\(getMed)ms)"
+        )
+    }
 }

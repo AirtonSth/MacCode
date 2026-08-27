@@ -546,8 +546,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             payload["durable_state"] = .string(durableState.rawValue)
             payload["durableState"] = .string(durableState.rawValue)
         }
-        if let thread = try? context?.threadRepo.get(id: message.threadId),
-           let workspaceId = thread.workspaceId {
+        // Queue EventBus only needs workspace membership for iOS/mirror
+        // routing. A full 26-column + routing `get` hitchs MainActor, and
+        // reorder republishes every queued row.
+        if let workspaceId = try? context?.threadRepo.workspaceId(of: message.threadId) {
             payload["workspace_id"] = .string(workspaceId.value.uuidString)
         }
         EventBus.shared.publish(kind: kind, payload: .object(payload))
@@ -593,10 +595,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let resolvedWorkspace: WorkspaceID?
         if let workspace {
             resolvedWorkspace = workspace
-        } else if let thread = try? context?.threadRepo.get(id: thread) {
-            resolvedWorkspace = thread.workspaceId
         } else {
-            resolvedWorkspace = nil
+            // Chrome lives on the painted rail. This hop only needs workspace
+            // membership; a full 26-column + routing `get` hitchs MainActor.
+            resolvedWorkspace = try? context?.threadRepo.workspaceId(of: thread)
         }
         var workspacesNeedingRailReload = Set<WorkspaceID>()
         for s in SurfaceRegistry.shared.all() {
@@ -2368,8 +2370,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     @discardableResult
     public func openAgentThread(thread threadID: AgentThreadID, markRead: Bool = false) throws -> SurfaceDescriptor {
         guard let ctx = context,
-              let thread = try ctx.threadRepo.get(id: threadID),
-              let workspaceID = thread.workspaceId,
+              let workspaceID = try ctx.threadRepo.workspaceId(of: threadID),
               ctx.state.workspaces[workspaceID] != nil else {
             throw LayoutError.workspaceNotFound
         }
@@ -2695,8 +2696,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         mutation: Bool,
         method: String
     ) throws -> AppContext {
+        // Presence only. A full 26-column + routing `get` hitchs MainActor on
+        // every bot.peer.list / self_config / ask admission.
         guard let ctx = context,
-              try ctx.threadRepo.get(id: threadID) != nil else {
+              try ctx.threadRepo.status(of: threadID) != nil else {
             throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.")
         }
         try authenticateManagedHostCall(
@@ -3362,16 +3365,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         requestedPermissionMode: AgentPermissionMode
     ) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        let parentRun = try ctx.runRepo.get(id: nestedRunContext.parentRunID)
+        let persistedRunIsActive: Bool
+        if let parentThreadId = try ctx.runRepo.threadId(of: nestedRunContext.parentRunID) {
+            let parentStatus = try ctx.runRepo.status(of: nestedRunContext.parentRunID)
+            persistedRunIsActive = parentThreadId == nestedRunContext.parentThreadID
+                && (parentStatus == .pending || parentStatus == .running)
+        } else {
+            persistedRunIsActive = true
+        }
         let parentReceipt = try ctx.orchestrationRuntime.activeReceipt(
             runId: nestedRunContext.parentRunID,
             threadId: nestedRunContext.parentThreadID,
             delegationCapability: nestedRunContext.parentCapability
         )
-        let persistedRunIsActive = parentRun.map {
-            $0.threadId == nestedRunContext.parentThreadID
-                && ($0.status == .pending || $0.status == .running)
-        } ?? true
         guard let parentReceipt,
               persistedRunIsActive,
               let parentThread = try ctx.threadRepo.get(id: nestedRunContext.parentThreadID),
@@ -3835,12 +3841,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         markReadOnSelection: Bool
     ) throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        guard let t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
-        if let wid = t.workspaceId {
-            AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: wid)
+        // Chrome lives on the painted rail. This hop only needs workspace
+        // membership; a full 26-column + routing `get` hitchs MainActor.
+        guard let workspaceID = try ctx.threadRepo.workspaceId(of: thread) else {
+            throw LayoutError.workspaceNotFound
         }
+        AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: workspaceID)
         for s in SurfaceRegistry.shared.all() {
-            guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
+            guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == workspaceID else { continue }
             if let surfaceID, agent.descriptor.id == surfaceID {
                 agent.viewModel.selectThread(thread, markRead: markReadOnSelection)
             }
@@ -4656,18 +4664,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         thread: AgentThreadID,
         recoverPreparedFromPriorProcess: Bool = false
     ) async throws {
+        // This gate only needs durable run-state. A full 26-column + routing
+        // `get` hitchs MainActor before the next queued follow-up can start.
         guard let ctx = context,
               ctx.queueDrainAllowsWork(threadId: thread),
               !Task.isCancelled,
-              let threadState = try ctx.threadRepo.get(id: thread),
-              threadState.status != .running,
-              threadState.status != .pending,
+              let status = try ctx.threadRepo.status(of: thread),
+              status != .running,
+              status != .pending,
               !ctx.coordinator.hasProviderSession(threadId: thread) else { return }
         if let head = try ctx.queuedMessageRepo.first(threadId: thread),
            let dispatch = try ctx.queuedMessageRepo.dispatch(id: head.id),
            dispatch.state == .prepared,
            let runId = dispatch.runId {
-            if let existingRun = try ctx.runRepo.get(id: runId) {
+            if let runStatus = try ctx.runRepo.status(of: runId) {
                 guard try preparedQueueRunHasProviderEvidence(threadId: thread, runId: runId) else {
                     throw unconfirmedQueuedMessageStartError()
                 }
@@ -4680,11 +4690,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     publishQueuedMessage(kind: "agent.message.queue.drained", recovered)
                     refreshAgentSurfaces(thread: thread)
                 }
-                if existingRun.status == .running || existingRun.status == .pending {
+                if runStatus == .running || runStatus == .pending {
                     return
                 }
-            }
-            if try ctx.runRepo.get(id: runId) == nil {
+            } else {
                 guard recoverPreparedFromPriorProcess else { return }
                 guard try ctx.queuedMessageRepo.recoverPreparedBeforeProviderStart(id: head.id, runId: runId) != nil else {
                     throw JSONRPCError(code: -32000, message: "Queued message recovery is already being reconciled.")
@@ -4936,7 +4945,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         runId: AgentRunID
     ) throws -> Bool {
         guard let ctx = context,
-              try ctx.runRepo.get(id: runId) != nil,
+              try ctx.runRepo.threadId(of: runId) != nil,
               let session = try ctx.providerSessionRuntimeRepo.get(threadId: threadId),
               session.lastRunId == runId,
               let lastEventKind = session.lastEventKind?
@@ -5632,8 +5641,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// the saved resume cursor without persisting a new user message.
     public func continueAgentRun(thread: AgentThreadID) async throws -> AgentRunID? {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        if let existing = try ctx.threadRepo.get(id: thread),
-           existing.status == .running
+        if (try ctx.threadRepo.status(of: thread)) == .running
             || ctx.coordinator.hasPendingProviderStart(threadId: thread)
             || ctx.coordinator.hasProviderSession(threadId: thread) {
             throw JSONRPCError(code: -32000, message: "Thread already has an active run.")
@@ -5718,7 +5726,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func reorderAgentThread(thread: AgentThreadID, position: Int) throws -> [AgentThread] {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         try ctx.threadRepo.reorder(id: thread, position: position)
-        guard let t = try ctx.threadRepo.get(id: thread), let wid = t.workspaceId else { throw LayoutError.workspaceNotFound }
+        // Chrome lives on the painted rail. This hop only needs workspace
+        // membership; a leftover 26-column + routing `get` hitchs MainActor.
+        guard let wid = try ctx.threadRepo.workspaceId(of: thread) else { throw LayoutError.workspaceNotFound }
         let list = try ctx.threadRepo.list(workspaceId: wid)
         AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: wid)
         windowController?.refreshFromState()
