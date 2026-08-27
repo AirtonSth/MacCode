@@ -763,4 +763,88 @@ final class ClaudeParserCLITests: XCTestCase {
             "empty success without origin is not classified ambient (may be a real empty answer)"
         )
     }
+
+    func test_systemInitMcpAndPluginErrorsEmitProviderRuntime() {
+        // WHY: stderr is a Pipe, so CLI skip warnings never print. Hosts must
+        // read mcp_server_errors / plugin_errors on system/init (CLAUDE-CLI-010).
+        let line = #"{"type":"system","subtype":"init","session_id":"sess-err","mcp_server_errors":[{"name":"bot-peer","type":"config","message":"skipped by validation"}],"plugin_errors":[{"plugin":"broken-plugin","type":"load","message":"failed to load"}]}"#
+        let evs = collect([line])
+        let runtime = evs.compactMap { event -> ProviderRuntimeEvent? in
+            if case .providerRuntime(let runtime) = event { return runtime }
+            return nil
+        }
+        XCTAssertEqual(runtime.filter { $0.method == "claude.init.mcp_server_error" }.count, 1,
+                       "each mcp_server_errors row must become a providerRuntime event")
+        XCTAssertEqual(runtime.filter { $0.method == "claude.init.plugin_error" }.count, 1,
+                       "each plugin_errors row must become a providerRuntime event")
+        XCTAssertTrue(runtime.contains {
+            $0.method == "claude.init.mcp_server_error" && $0.payloadJSON.contains("bot-peer")
+        })
+        XCTAssertTrue(runtime.contains {
+            $0.method == "claude.init.plugin_error" && $0.payloadJSON.contains("broken-plugin")
+        })
+        XCTAssertFalse(evs.contains {
+            if case .error(_, let recoverable) = $0 { return !recoverable }
+            return false
+        }, "init load skips must not fail the turn")
+    }
+
+    func test_systemInitWithoutLoadErrorArraysEmitsNoInitErrorRuntime() {
+        let evs = collect([#"{"type":"system","subtype":"init","session_id":"sess-ok"}"#])
+        XCTAssertFalse(evs.contains {
+            if case .providerRuntime(let runtime) = $0 {
+                return runtime.method == "claude.init.mcp_server_error"
+                    || runtime.method == "claude.init.plugin_error"
+            }
+            return false
+        }, "omitted mcp_server_errors/plugin_errors must stay silent")
+    }
+
+    func test_parentToolUseIdDoesNotJoinParentAssembledBody() {
+        // WHY: --forward-subagent-text emits nested assistant text with
+        // parent_tool_use_id. If that text joins assembledAssistantBody, an
+        // empty result falls back to nested prose as the parent answer.
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"sess-sub"}"#,
+            #"{"type":"assistant","parent_tool_use_id":"toolu_parent","message":{"id":"m-nested","role":"assistant","content":[{"type":"text","text":"nested-prose"}]}}"#,
+            #"{"type":"assistant","message":{"id":"m-parent","role":"assistant","content":[{"type":"text","text":"parent-answer"}]}}"#,
+            #"{"type":"result","subtype":"success","result":"","session_id":"sess-sub"}"#
+        ])
+        XCTAssertEqual(finalMessage(evs), "parent-answer",
+                       "nested forwarded text must not become the parent final message")
+        let nested = evs.compactMap { event -> AssistantItem? in
+            if case .itemStarted(let item) = event, item.body.isEmpty || item.id.contains("toolu_parent") {
+                return item
+            }
+            return nil
+        }.first { item in
+            item.summary?.contains("toolu_parent") == true
+        }
+        XCTAssertNotNil(nested, "nested text must surface parent_tool_use_id on the item")
+        XCTAssertTrue(nested?.id.contains("toolu_parent") == true)
+        XCTAssertTrue(evs.contains {
+            if case .itemDelta(_, let body, _, _) = $0 { return body == "nested-prose" }
+            return false
+        }, "nested prose must still render as an item delta")
+    }
+
+    func test_streamEventParentToolUseIdDoesNotJoinParentAssembledBody() {
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"sess-se"}"#,
+            #"{"type":"stream_event","parent_tool_use_id":"toolu_p","session_id":"sess-se","event":{"type":"message_start","message":{"id":"sm-nested"}}}"#,
+            #"{"type":"stream_event","parent_tool_use_id":"toolu_p","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","id":"txt-nested"}}}"#,
+            #"{"type":"stream_event","parent_tool_use_id":"toolu_p","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"nested-delta"}}}"#,
+            #"{"type":"stream_event","parent_tool_use_id":"toolu_p","event":{"type":"content_block_stop","index":0}}"#,
+            #"{"type":"assistant","message":{"id":"m-parent","role":"assistant","content":[{"type":"text","text":"parent-answer"}]}}"#,
+            #"{"type":"result","subtype":"success","result":"","session_id":"sess-se"}"#
+        ])
+        XCTAssertEqual(finalMessage(evs), "parent-answer",
+                       "stream_event nested deltas must not fill the parent assembled body")
+        XCTAssertTrue(evs.contains {
+            if case .itemStarted(let item) = $0 {
+                return item.summary?.contains("toolu_p") == true || item.id.contains("toolu_p")
+            }
+            return false
+        }, "stream_event unwrap must copy parent_tool_use_id onto nested blocks")
+    }
 }
