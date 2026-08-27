@@ -3022,6 +3022,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         created.onStopGuest = { [weak self] id, requestID, context in
             self?.botsViewModel?.stopDockerGuest(botID: id) { ok in
                 var readback = context
+                readback["last_request_id"] = requestID
                 readback["status"] = ok ? "stopped" : "failed"
                 readback["error_message"] = ok ? nil : "Could not stop the Linux desktop."
                 self?.settlePairedBot(
@@ -3194,13 +3195,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     ) {
         guard let ready,
               let service = botsViewModel?.computerGuestService else {
+            var readback = Self.guestFailureReadback(
+                context: context,
+                message: "Could not start the Linux desktop."
+            )
+            readback["last_request_id"] = requestID
             settlePairedBot(
                 requestID: requestID,
                 ok: false,
-                readback: Self.guestFailureReadback(
-                    context: context,
-                    message: "Could not start the Linux desktop."
-                )
+                readback: readback
             )
             return
         }
@@ -3209,16 +3212,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 let evidence = try await Task.detached { [service] in
                     try service.remoteFrame(botID: botID, ready: ready)
                 }.value
+                var readback = Self.guestFrameReadback(context: context, evidence: evidence)
+                readback["last_request_id"] = requestID
                 self?.settlePairedBot(
                     requestID: requestID,
                     ok: true,
-                    readback: Self.guestFrameReadback(context: context, evidence: evidence)
+                    readback: readback
                 )
             } catch {
+                var readback = Self.guestFailureReadback(context: context, error: error)
+                readback["last_request_id"] = requestID
                 self?.settlePairedBot(
                     requestID: requestID,
                     ok: false,
-                    readback: Self.guestFailureReadback(context: context, error: error)
+                    readback: readback
                 )
             }
         }
