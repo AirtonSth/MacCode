@@ -359,8 +359,23 @@ public final class AgentThreadRepository {
     public private(set) var permissionModeProbeCountForTesting = 0
     public private(set) var updatedAtProbeCountForTesting = 0
     public private(set) var providerThreadIdProbeCountForTesting = 0
+    public private(set) var providerProbeCountForTesting = 0
     public private(set) var routingConfigurationProbeCountForTesting = 0
+    public private(set) var adapterRecoveryProbeCountForTesting = 0
+    public private(set) var deskPolicyProbeCountForTesting = 0
+    public private(set) var sendAdmissionProbeCountForTesting = 0
+    public private(set) var markReadPreservingActivityCountForTesting = 0
+    public private(set) var markUnreadUpdatingActivityCountForTesting = 0
+    public private(set) var stampTerminalCountForTesting = 0
     public private(set) var listChromeCallCountForTesting = 0
+    public private(set) var threadWithoutRoutingProbeCountForTesting = 0
+    public private(set) var setPinnedCountForTesting = 0
+    public private(set) var setColorCountForTesting = 0
+    public private(set) var setExecutionConfigCountForTesting = 0
+    public private(set) var setWorktreePathCountForTesting = 0
+    public private(set) var setPermissionModeCountForTesting = 0
+    public private(set) var setRoutingConfigurationCountForTesting = 0
+    public private(set) var setPickerConfigCountForTesting = 0
     private static let chromeLookupBatchSize = 200
 
     /// Painted list chrome for Active Threads / desk rails / similar overviews.
@@ -383,6 +398,75 @@ public final class AgentThreadRepository {
         public let model: String
         public let providerInstanceId: String
         public let runAsUser: AgentRunAsUser?
+    }
+
+    /// Adapter-session recovery only needs status plus cwd/model/identity.
+    /// Avoids the full `get` (26 columns + routing JSON) on open/read/stop
+    /// when there is no live provider session, including completed threads
+    /// that return before any provider resume.
+    public struct AdapterRecoveryChrome: Equatable, Sendable {
+        public let status: AgentRunStatus
+        public let provider: AgentProvider
+        public let providerInstanceId: String
+        public let model: String
+        public let reasoningEffort: AgentReasoningEffort
+        public let worktreePath: String?
+        public let runAsUser: AgentRunAsUser?
+    }
+
+    /// Host-bot send only needs permission/effort/tier/run-as-user after the
+    /// caller run already froze provider/model. Avoids the full `get`
+    /// (26 columns + routing JSON).
+    public struct DeskPolicyChrome: Equatable, Sendable {
+        public let permissionMode: AgentPermissionMode
+        public let reasoningEffort: AgentReasoningEffort
+        public let serviceTier: AgentServiceTier
+        public let runAsUser: AgentRunAsUser?
+
+        public init(
+            permissionMode: AgentPermissionMode,
+            reasoningEffort: AgentReasoningEffort,
+            serviceTier: AgentServiceTier,
+            runAsUser: AgentRunAsUser?
+        ) {
+            self.permissionMode = permissionMode
+            self.reasoningEffort = reasoningEffort
+            self.serviceTier = serviceTier
+            self.runAsUser = runAsUser
+        }
+    }
+
+    /// Send/queue admission only needs status, permission, and provider
+    /// identity before configure/mutate. Avoids the full `get` (26 columns
+    /// + routing JSON).
+    public struct SendAdmissionChrome: Equatable, Sendable {
+        public let status: AgentRunStatus
+        public let permissionMode: AgentPermissionMode
+        public let provider: AgentProvider
+        public let providerInstanceId: String
+        public let model: String
+        public let reasoningEffort: AgentReasoningEffort
+        public let serviceTier: AgentServiceTier
+
+        public var legacyEffectiveRouting: AgentRoutingConfiguration {
+            .legacyManual(
+                selection: AgentModelSelection(
+                    provider: provider,
+                    modelId: model,
+                    reasoningEffort: reasoningEffort,
+                    serviceTier: serviceTier
+                ),
+                providerInstanceId: providerInstanceId
+            )
+        }
+    }
+
+    /// Open/select mark-read only needs workspace membership and unread.
+    /// Avoids the full `get` (26 columns + routing JSON).
+    public struct MarkReadChrome: Equatable, Sendable {
+        public let workspaceId: WorkspaceID?
+        public let cleared: Bool
+        public let updatedAt: Date
     }
     /// Each maintenance transaction processes at most this many historical
     /// terminal rows. This bounds work, not eligibility: recoverable rows are
@@ -939,6 +1023,58 @@ public final class AgentThreadRepository {
         _ = try statement.step()
     }
 
+    /// Status chrome only. Does not rewrite `has_unread` so a selected
+    /// bot-peer terminal stamp cannot clear unread.
+    public func updateStatusPreservingUnread(
+        id: AgentThreadID,
+        status: AgentRunStatus,
+        at date: Date = Date()
+    ) throws {
+        updateStatusCountForTesting += 1
+        let statement = try db.prepare("""
+            UPDATE agent_threads
+            SET status = ?,
+                updated_at = ?
+            WHERE id = ?;
+            """)
+        try statement.bind(1, status.rawValue)
+        try statement.bind(2, iso.string(from: date))
+        try statement.bind(3, id.value.uuidString)
+        _ = try statement.step()
+    }
+
+    /// Finish-path terminal chrome only. Avoids the 26-column get+upsert
+    /// (plus routing JSON rewrite) when only status, unread, optional
+    /// provider cursor, and `updated_at` change. Missing rows are a no-op
+    /// so persistTerminalGraph's existence probe can fail closed.
+    public func stampTerminal(
+        id: AgentThreadID,
+        status: AgentRunStatus,
+        hasUnread: Bool,
+        providerThreadId: String?,
+        at date: Date = Date()
+    ) throws {
+        stampTerminalCountForTesting += 1
+        if let providerThreadId {
+            let statement = try db.prepare("""
+                UPDATE agent_threads
+                SET status = ?,
+                    has_unread = ?,
+                    provider_thread_id = ?,
+                    updated_at = ?
+                WHERE id = ?;
+                """)
+            try statement.bind(1, status.rawValue)
+            try statement.bind(2, hasUnread)
+            try statement.bind(3, providerThreadId)
+            try statement.bind(4, iso.string(from: date))
+            try statement.bind(5, id.value.uuidString)
+            _ = try statement.step()
+        } else {
+            try updateStatus(id: id, status: status, hasUnread: hasUnread, at: date)
+        }
+    }
+
     /// Stop-path status chrome only. Avoids the full get+upsert (26 columns +
     /// routing JSON rewrite) when leftover running/pending shells must become
     /// cancelled. Completed/failed/interrupted/cancelled rows stay put.
@@ -964,10 +1100,11 @@ public final class AgentThreadRepository {
 
     /// `.threadStarted` cursor chrome only. Avoids the full get+upsert
     /// (26 columns + routing JSON rewrite) when only `provider_thread_id`
-    /// and `updated_at` change. Missing rows are a no-op.
+    /// and `updated_at` change. `nil` clears the cursor (picker/provider
+    /// switches). Missing rows are a no-op.
     public func updateProviderThreadId(
         id: AgentThreadID,
-        providerThreadId: String,
+        providerThreadId: String?,
         at date: Date = Date()
     ) throws {
         updateProviderThreadIdCountForTesting += 1
@@ -1005,6 +1142,18 @@ public final class AgentThreadRepository {
         return AgentRunStatus(rawValue: st.columnText(0) ?? "") ?? .pending
     }
 
+    /// Cheap provider probe for fork admission. Avoids the full `get`
+    /// (26 columns + routing JSON) when only existence and `provider`
+    /// decide whether the child may use the parent provider. Returns nil
+    /// when the durable row is gone.
+    public func provider(of id: AgentThreadID) throws -> AgentProvider? {
+        providerProbeCountForTesting += 1
+        let st = try db.prepare("SELECT provider FROM agent_threads WHERE id = ? LIMIT 1;")
+        try st.bind(1, id.value.uuidString)
+        guard try st.step() else { return nil }
+        return AgentProvider(rawValue: st.columnText(0) ?? "codex") ?? .codex
+    }
+
     /// Cheap permission-mode probe for Desk work-log restore. Avoids the full
     /// `get` (26 columns + routing JSON) when only `permission_mode` is needed.
     /// Returns nil when the durable row is gone.
@@ -1014,6 +1163,102 @@ public final class AgentThreadRepository {
         try st.bind(1, id.value.uuidString)
         guard try st.step() else { return nil }
         return AgentPermissionMode(rawValue: st.columnText(0) ?? "") ?? .supervised
+    }
+
+    /// Cheap host-bot policy probe. Avoids the full `get` (26 columns +
+    /// routing JSON) when the caller run route already froze provider/model
+    /// and `sendHostBot` only needs permission/effort/tier/run-as-user.
+    /// Returns nil when the durable row is gone.
+    public func deskPolicy(of id: AgentThreadID) throws -> DeskPolicyChrome? {
+        deskPolicyProbeCountForTesting += 1
+        let st = try db.prepare("""
+            SELECT permission_mode, reasoning_effort, service_tier, run_as_user_json
+            FROM agent_threads
+            WHERE id = ? LIMIT 1;
+            """)
+        try st.bind(1, id.value.uuidString)
+        guard try st.step() else { return nil }
+        return DeskPolicyChrome(
+            permissionMode: AgentPermissionMode(rawValue: st.columnText(0) ?? "") ?? .supervised,
+            reasoningEffort: AgentReasoningEffort(rawValue: st.columnText(1) ?? "") ?? .medium,
+            serviceTier: AgentServiceTier(rawValue: st.columnText(2) ?? "") ?? .auto,
+            runAsUser: decodeRunAsUser(st.columnText(3))
+        )
+    }
+
+    /// Cheap send/queue admission probe. Avoids the full `get` (26 columns +
+    /// routing JSON) when only status/permission/provider/instance/model
+    /// decide preflight and queue-while-running. Returns nil when the
+    /// durable row is gone.
+    public func sendAdmission(of id: AgentThreadID) throws -> SendAdmissionChrome? {
+        sendAdmissionProbeCountForTesting += 1
+        let st = try db.prepare("""
+            SELECT status, permission_mode, provider, provider_instance_id, model, reasoning_effort, service_tier
+            FROM agent_threads
+            WHERE id = ? LIMIT 1;
+            """)
+        try st.bind(1, id.value.uuidString)
+        guard try st.step() else { return nil }
+        let provider = AgentProvider(rawValue: st.columnText(2) ?? "codex") ?? .codex
+        return SendAdmissionChrome(
+            status: AgentRunStatus(rawValue: st.columnText(0) ?? "") ?? .pending,
+            permissionMode: AgentPermissionMode(rawValue: st.columnText(1) ?? "") ?? .supervised,
+            provider: provider,
+            providerInstanceId: st.columnText(3) ?? provider.rawValue,
+            model: st.columnText(4) ?? "",
+            reasoningEffort: AgentReasoningEffort(rawValue: st.columnText(5) ?? "") ?? .medium,
+            serviceTier: AgentServiceTier(rawValue: st.columnText(6) ?? "") ?? .auto
+        )
+    }
+
+    /// Open/select mark-read only. Avoids the full get+upsert (26 columns +
+    /// routing JSON rewrite) when only `has_unread` must flip to false.
+    /// Does not rewrite `updated_at`. Returns nil when the durable row is gone.
+    public func markReadPreservingActivity(of id: AgentThreadID) throws -> MarkReadChrome? {
+        markReadPreservingActivityCountForTesting += 1
+        let st = try db.prepare("""
+            SELECT workspace_id, has_unread, updated_at
+            FROM agent_threads
+            WHERE id = ? LIMIT 1;
+            """)
+        try st.bind(1, id.value.uuidString)
+        guard try st.step() else { return nil }
+        let workspaceId = (st.columnText(0)).flatMap { UUID(uuidString: $0) }.map { WorkspaceID($0) }
+        let hasUnread = st.columnInt64(1) != 0
+        let updatedAt = parseDate(st.columnText(2))
+        if hasUnread {
+            let upd = try db.prepare("UPDATE agent_threads SET has_unread = 0 WHERE id = ?;")
+            try upd.bind(1, id.value.uuidString)
+            _ = try upd.step()
+        }
+        return MarkReadChrome(workspaceId: workspaceId, cleared: hasUnread, updatedAt: updatedAt)
+    }
+
+    /// Bot-peer unread chrome only. Avoids the full get+upsert (26 columns +
+    /// routing JSON rewrite) when an unselected thread must float on the
+    /// activity rail. Missing rows return nil. Already-unread rows return false
+    /// without rewriting `updated_at`.
+    @discardableResult
+    public func markUnreadUpdatingActivity(of id: AgentThreadID, at date: Date = Date()) throws -> Bool? {
+        markUnreadUpdatingActivityCountForTesting += 1
+        let st = try db.prepare("""
+            SELECT has_unread
+            FROM agent_threads
+            WHERE id = ? LIMIT 1;
+            """)
+        try st.bind(1, id.value.uuidString)
+        guard try st.step() else { return nil }
+        if st.columnInt64(0) != 0 { return false }
+        let upd = try db.prepare("""
+            UPDATE agent_threads
+            SET has_unread = 1,
+                updated_at = ?
+            WHERE id = ?;
+            """)
+        try upd.bind(1, iso.string(from: date))
+        try upd.bind(2, id.value.uuidString)
+        _ = try upd.step()
+        return true
     }
 
     /// Cheap recency probe for bot-peer wait keepalives. Avoids the full `get`
@@ -1064,6 +1309,31 @@ public final class AgentThreadRepository {
         )
     }
 
+    /// Cheap adapter-recovery chrome for `recoverAdapterSessionIfNeeded`.
+    /// Avoids the full `get` (26 columns + routing JSON) when only status,
+    /// provider, cwd, model, reasoning, and run-as-user are needed.
+    /// Returns nil when the durable row is gone.
+    public func adapterRecovery(of id: AgentThreadID) throws -> AdapterRecoveryChrome? {
+        adapterRecoveryProbeCountForTesting += 1
+        let st = try db.prepare("""
+            SELECT status, provider, provider_instance_id, model, reasoning_effort, worktree_path, run_as_user_json
+            FROM agent_threads
+            WHERE id = ? LIMIT 1;
+            """)
+        try st.bind(1, id.value.uuidString)
+        guard try st.step() else { return nil }
+        let provider = AgentProvider(rawValue: st.columnText(1) ?? "codex") ?? .codex
+        return AdapterRecoveryChrome(
+            status: AgentRunStatus(rawValue: st.columnText(0) ?? "") ?? .pending,
+            provider: provider,
+            providerInstanceId: st.columnText(2) ?? provider.rawValue,
+            model: st.columnText(3) ?? "",
+            reasoningEffort: AgentReasoningEffort(rawValue: st.columnText(4) ?? "") ?? .medium,
+            worktreePath: st.columnText(5),
+            runAsUser: decodeRunAsUser(st.columnText(6))
+        )
+    }
+
     public func listChrome(ids: [AgentThreadID]) throws -> [AgentThreadID: ListChrome] {
         listChromeCallCountForTesting += 1
         guard !ids.isEmpty else { return [:] }
@@ -1100,6 +1370,19 @@ public final class AgentThreadRepository {
 
     public func get(id: AgentThreadID) throws -> AgentThread? {
         durableGetCountForTesting += 1
+        return try loadThread(id: id, includeRouting: true)
+    }
+
+    /// 26-column picker/identity row without `agent_thread_routing`.
+    /// Configure/send mutate those columns; routing JSON is attached only
+    /// when an upsert is required so a leftover full `get` cannot hitch
+    /// every send.
+    public func threadWithoutRouting(of id: AgentThreadID) throws -> AgentThread? {
+        threadWithoutRoutingProbeCountForTesting += 1
+        return try loadThread(id: id, includeRouting: false)
+    }
+
+    private func loadThread(id: AgentThreadID, includeRouting: Bool) throws -> AgentThread? {
         let st = try db.prepare("SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json FROM agent_threads WHERE id = ?;")
         try st.bind(1, id.value.uuidString)
         if try st.step() {
@@ -1137,7 +1420,7 @@ public final class AgentThreadRepository {
                 modelSelection: decodeModelSelection(st.columnText(23), provider: provider, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
                 interactionMode: AgentInteractionMode(rawValue: st.columnText(24) ?? "") ?? .default,
                 runAsUser: decodeRunAsUser(st.columnText(25)),
-                routingConfiguration: try loadRoutingConfiguration(threadId: idVal)
+                routingConfiguration: includeRouting ? try loadRoutingConfiguration(threadId: idVal) : nil
             )
         }
         return nil
@@ -1157,14 +1440,53 @@ public final class AgentThreadRepository {
         threadId: AgentThreadID,
         expectedRevision: Int
     ) throws {
-        guard var thread = try get(id: threadId) else { return }
-        let actualRevision = thread.routingConfiguration?.revision ?? 0
-        guard actualRevision == expectedRevision else {
-            throw AgentRoutingRevisionError.conflict(expected: expectedRevision, actual: actualRevision)
+        setRoutingConfigurationCountForTesting += 1
+        // Routing CAS only. A leftover 26-column + routing `get` then full-row
+        // `upsert` hitchs Auto toggle and rewrites every thread column.
+        try db.performSync { database in
+            try database.transaction {
+                let exists = try db.prepare(
+                    "SELECT 1 FROM agent_threads WHERE id = ? LIMIT 1;"
+                )
+                try exists.bind(1, threadId.value.uuidString)
+                guard try exists.step() else { return }
+
+                let revision = try db.prepare(
+                    "SELECT revision FROM agent_thread_routing WHERE thread_id = ? LIMIT 1;"
+                )
+                try revision.bind(1, threadId.value.uuidString)
+                let actualRevision = try revision.step() ? Int(revision.columnInt64(0)) : 0
+                guard actualRevision == expectedRevision else {
+                    throw AgentRoutingRevisionError.conflict(
+                        expected: expectedRevision,
+                        actual: actualRevision
+                    )
+                }
+
+                let routing = try db.prepare("""
+                    INSERT INTO agent_thread_routing(thread_id, mode, configuration_json, revision, updated_at)
+                    VALUES(?, ?, ?, ?, ?)
+                    ON CONFLICT(thread_id) DO UPDATE SET
+                        mode=excluded.mode,
+                        configuration_json=excluded.configuration_json,
+                        revision=excluded.revision,
+                        updated_at=excluded.updated_at;
+                    """)
+                try routing.bind(1, threadId.value.uuidString)
+                try routing.bind(2, configuration.mode.rawValue)
+                try routing.bind(3, try encodeRoutingConfiguration(configuration))
+                try routing.bind(4, configuration.revision)
+                try routing.bind(5, iso.string(from: configuration.updatedAt))
+                _ = try routing.step()
+
+                let stamp = try db.prepare(
+                    "UPDATE agent_threads SET updated_at = ? WHERE id = ?;"
+                )
+                try stamp.bind(1, iso.string(from: configuration.updatedAt))
+                try stamp.bind(2, threadId.value.uuidString)
+                _ = try stamp.step()
+            }
         }
-        thread.routingConfiguration = configuration
-        thread.updatedAt = configuration.updatedAt
-        try upsert(thread)
     }
 
     private func loadRoutingConfiguration(threadId: AgentThreadID) throws -> AgentRoutingConfiguration? {
@@ -1757,13 +2079,164 @@ public final class AgentThreadRepository {
         _ = try update.step()
     }
 
+    /// Picker/permission/run-as-user chrome only. Avoids the full get+upsert
+    /// (26 columns + routing JSON rewrite of title/status/unread/color/pin)
+    /// when persistThreadConfig must copy the painted picker. Missing rows
+    /// return false.
+    @discardableResult
+    public func setPickerConfig(
+        of id: AgentThreadID,
+        provider: AgentProvider,
+        providerInstanceId: String,
+        runAsUser: AgentRunAsUser?,
+        model: String,
+        permissionMode: AgentPermissionMode,
+        reasoningEffort: AgentReasoningEffort,
+        serviceTier: AgentServiceTier,
+        modelSelection: AgentModelSelection,
+        interactionMode: AgentInteractionMode,
+        at date: Date = Date()
+    ) throws -> Bool {
+        setPickerConfigCountForTesting += 1
+        let st = try db.prepare("""
+            UPDATE agent_threads
+            SET provider = ?,
+                provider_instance_id = ?,
+                model = ?,
+                permission_mode = ?,
+                reasoning_effort = ?,
+                service_tier = ?,
+                model_selection_json = ?,
+                interaction_mode = ?,
+                run_as_user_json = ?,
+                updated_at = ?
+            WHERE id = ?;
+            """)
+        try st.bind(1, provider.rawValue)
+        try st.bind(2, providerInstanceId)
+        try st.bind(3, model)
+        try st.bind(4, permissionMode.rawValue)
+        try st.bind(5, reasoningEffort.rawValue)
+        try st.bind(6, serviceTier.rawValue)
+        try st.bind(7, encodeModelSelection(modelSelection))
+        try st.bind(8, interactionMode.rawValue)
+        try st.bind(9, encodeRunAsUser(runAsUser))
+        try st.bind(10, iso.string(from: date))
+        try st.bind(11, id.value.uuidString)
+        _ = try st.step()
+        let changes = try db.prepare("SELECT changes();")
+        return try changes.step() && changes.columnInt64(0) == 1
+    }
+
+    /// Permission-mode chrome only. Avoids the full get+upsert (26 columns +
+    /// routing JSON rewrite) when an unselected session-grant must persist
+    /// `permission_mode`. Missing rows return false.
+    @discardableResult
+    public func setPermissionMode(
+        of id: AgentThreadID,
+        permissionMode: AgentPermissionMode,
+        at date: Date = Date()
+    ) throws -> Bool {
+        setPermissionModeCountForTesting += 1
+        let st = try db.prepare("""
+            UPDATE agent_threads
+            SET permission_mode = ?,
+                updated_at = ?
+            WHERE id = ?;
+            """)
+        try st.bind(1, permissionMode.rawValue)
+        try st.bind(2, iso.string(from: date))
+        try st.bind(3, id.value.uuidString)
+        _ = try st.step()
+        let changes = try db.prepare("SELECT changes();")
+        return try changes.step() && changes.columnInt64(0) == 1
+    }
+
+    /// Execution-mode chrome only. Avoids the full get+upsert (26 columns +
+    /// routing JSON rewrite) when only `execution_mode` / `base_branch` must
+    /// change. Local mode clears `worktree_path`; worktree keeps the stored
+    /// path. Missing rows return false.
+    @discardableResult
+    public func setExecutionConfig(
+        of id: AgentThreadID,
+        executionMode: AgentExecutionMode,
+        baseBranch: String?,
+        at date: Date = Date()
+    ) throws -> Bool {
+        setExecutionConfigCountForTesting += 1
+        let st = try db.prepare("""
+            UPDATE agent_threads
+            SET execution_mode = ?,
+                base_branch = ?,
+                worktree_path = CASE WHEN ? = 'local' THEN NULL ELSE worktree_path END,
+                updated_at = ?
+            WHERE id = ?;
+            """)
+        try st.bind(1, executionMode.rawValue)
+        try st.bind(2, baseBranch)
+        try st.bind(3, executionMode.rawValue)
+        try st.bind(4, iso.string(from: date))
+        try st.bind(5, id.value.uuidString)
+        _ = try st.step()
+        let changes = try db.prepare("SELECT changes();")
+        return try changes.step() && changes.columnInt64(0) == 1
+    }
+
+    /// Worktree checkout path only. Avoids the full get+upsert (26 columns +
+    /// routing JSON rewrite) when first send creates the agent worktree.
+    /// Missing rows return false.
+    @discardableResult
+    public func setWorktreePath(
+        of id: AgentThreadID,
+        path: String,
+        at date: Date = Date()
+    ) throws -> Bool {
+        setWorktreePathCountForTesting += 1
+        let st = try db.prepare("""
+            UPDATE agent_threads
+            SET worktree_path = ?,
+                updated_at = ?
+            WHERE id = ?;
+            """)
+        try st.bind(1, path)
+        try st.bind(2, iso.string(from: date))
+        try st.bind(3, id.value.uuidString)
+        _ = try st.step()
+        let changes = try db.prepare("SELECT changes();")
+        return try changes.step() && changes.columnInt64(0) == 1
+    }
+
+    public func setColor(id: AgentThreadID, color: String?) throws {
+        setColorCountForTesting += 1
+        let st = try db.prepare("""
+            UPDATE agent_threads
+            SET color = ?,
+                updated_at = ?
+            WHERE id = ?;
+            """)
+        try st.bind(1, color)
+        try st.bind(2, iso.string(from: Date()))
+        try st.bind(3, id.value.uuidString)
+        _ = try st.step()
+    }
+
     public func setPinned(id: AgentThreadID, pinned: Bool) throws {
+        setPinnedCountForTesting += 1
         try db.performSync { database in try database.transaction {
-                guard var t = try get(id: id) else { return }
-                t.pinned = pinned
-                t.updatedAt = Date()
-                try upsert(t)
-                if let wid = t.workspaceId { try normalizeOrder(workspaceId: wid) }
+                // Pin + recency only. A leftover 26-column + routing load then
+                // full-row write, plus rail-wide sort rewrites, hitchs pin.
+                // Rail order is last activity; pin is a visual/retention marker.
+                guard try workspaceId(of: id) != nil else { return }
+                let st = try db.prepare("""
+                    UPDATE agent_threads
+                    SET pinned = ?,
+                        updated_at = ?
+                    WHERE id = ?;
+                    """)
+                try st.bind(1, pinned)
+                try st.bind(2, iso.string(from: Date()))
+                try st.bind(3, id.value.uuidString)
+                _ = try st.step()
         } }
     }
 
@@ -1817,16 +2290,29 @@ public final class AgentThreadRepository {
     }
 
     private func normalizeOrder(workspaceId: WorkspaceID, ordered: [AgentThread]? = nil) throws {
-        let list: [AgentThread]
+        let ids: [AgentThreadID]
         if let ordered {
-            list = ordered
+            ids = ordered.map(\.id)
         } else {
-            list = try self.list(workspaceId: workspaceId)
+            let st = try db.prepare("""
+                SELECT id FROM agent_threads
+                WHERE workspace_id = ?
+                ORDER BY updated_at DESC, id DESC;
+                """)
+            try st.bind(1, workspaceId.value.uuidString)
+            var out: [AgentThreadID] = []
+            while try st.step() {
+                if let uuid = (st.columnText(0)).flatMap({ UUID(uuidString: $0) }) {
+                    out.append(AgentThreadID(uuid))
+                }
+            }
+            ids = out
         }
-        let sorted = list.filter(\.pinned) + list.filter { !$0.pinned }
-        for (idx, var t) in sorted.enumerated() {
-            t.sortOrder = idx
-            try upsert(t)
+        for (idx, id) in ids.enumerated() {
+            let st = try db.prepare("UPDATE agent_threads SET sort_order = ? WHERE id = ?;")
+            try st.bind(1, Int64(idx))
+            try st.bind(2, id.value.uuidString)
+            _ = try st.step()
         }
     }
 }
@@ -1985,6 +2471,10 @@ public final class AgentMessageRepository: @unchecked Sendable {
     private let decoder = JSONDecoder()
     public private(set) var fullListCountForTesting = 0
     public private(set) var assistantOutputProbeCountForTesting = 0
+    public private(set) var hasAnyProbeCountForTesting = 0
+    public private(set) var existsProbeCountForTesting = 0
+    public private(set) var listRecentCountForTesting = 0
+    public private(set) var durableGetCountForTesting = 0
     public init(db: SQLiteDB) { self.db = db }
 
     /// Durable transcript retention: keep only the newest N messages per thread
@@ -2656,6 +3146,25 @@ public final class AgentMessageRepository: @unchecked Sendable {
         return (try st.step()) ? Int(st.columnInt64(0)) : 0
     }
 
+    /// Existence only. Avoids compiling the latest `agent_messages` body plus
+    /// `attachments_json` when send/configure/first-title only need "has the
+    /// thread started?".
+    public func hasAny(threadId: AgentThreadID) throws -> Bool {
+        hasAnyProbeCountForTesting += 1
+        let st = try db.prepare("SELECT 1 FROM agent_messages WHERE thread_id = ? LIMIT 1;")
+        try st.bind(1, threadId.value.uuidString)
+        return try st.step()
+    }
+
+    /// Existence only. Avoids compiling `content` + `attachments_json` when
+    /// startRun / startProviderRun / desk user-row only need "is this id taken?".
+    public func exists(id: AgentMessageID) throws -> Bool {
+        existsProbeCountForTesting += 1
+        let st = try db.prepare("SELECT 1 FROM agent_messages WHERE id = ? LIMIT 1;")
+        try st.bind(1, id.value.uuidString)
+        return try st.step()
+    }
+
     /// Cheap launch-reconcile quality probe. Avoids hydrating the full
     /// `agent_messages` history (user/system rows, attachments JSON, and every
     /// assistant blob) just to learn whether any non-empty assistant output exists.
@@ -2690,6 +3199,7 @@ public final class AgentMessageRepository: @unchecked Sendable {
     /// The newest `limit` messages, returned oldest→newest for display.
     /// Backs the bounded message window (B4 pagination).
     public func listRecent(threadId: AgentThreadID, limit: Int) throws -> [AgentMessage] {
+        listRecentCountForTesting += 1
         let st = try db.prepare("SELECT id, thread_id, role, content, created_at, attachments_json FROM agent_messages WHERE thread_id = ? ORDER BY created_at DESC, id DESC LIMIT ?;")
         try st.bind(1, threadId.value.uuidString)
         try st.bind(2, max(0, limit))
@@ -2705,6 +3215,7 @@ public final class AgentMessageRepository: @unchecked Sendable {
     }
 
     public func get(id: AgentMessageID) throws -> AgentMessage? {
+        durableGetCountForTesting += 1
         let st = try db.prepare("SELECT id, thread_id, role, content, created_at, attachments_json FROM agent_messages WHERE id = ? LIMIT 1;")
         try st.bind(1, id.value.uuidString)
         return (try st.step()) ? message(from: st) : nil
@@ -4003,7 +4514,11 @@ public final class AgentRunRepository: @unchecked Sendable {
     public private(set) var providerProbeCountForTesting = 0
     public private(set) var modelProbeCountForTesting = 0
     public private(set) var errorMessageProbeCountForTesting = 0
+    public private(set) var hasActiveProbeCountForTesting = 0
+    public private(set) var activeChromeProbeCountForTesting = 0
+    public private(set) var routeProbeCountForTesting = 0
     public private(set) var promotePendingStartToRunningCountForTesting = 0
+    public private(set) var stampTerminalCountForTesting = 0
     private static let startedAtLookupBatchSize = 200
 
     /// EventBus run payloads only need clocks. Avoids pulling `error_message`
@@ -4017,6 +4532,34 @@ public final class AgentRunRepository: @unchecked Sendable {
     public struct RunTerminal: Equatable, Sendable {
         public let status: AgentRunStatus
         public let finishedAt: Date?
+    }
+
+    /// Working-for clocks / Stop targeting / live-poll only need id + started_at.
+    public struct ActiveRunChrome: Equatable, Sendable {
+        public let id: AgentRunID
+        public let startedAt: Date
+    }
+
+    /// Bot-desk routing only needs thread membership plus the frozen provider
+    /// route. Avoids the 10-column `get` (including `error_message`) on host
+    /// bot send and peer @mention dispatch.
+    public struct RouteChrome: Equatable, Sendable {
+        public let threadId: AgentThreadID
+        public let provider: AgentProvider
+        public let providerInstanceId: String
+        public let model: String
+
+        public init(
+            threadId: AgentThreadID,
+            provider: AgentProvider,
+            providerInstanceId: String,
+            model: String
+        ) {
+            self.threadId = threadId
+            self.provider = provider
+            self.providerInstanceId = providerInstanceId
+            self.model = model
+        }
     }
     let db: SQLiteDB
     private let globalRetentionStateLock = NSLock()
@@ -4217,6 +4760,36 @@ public final class AgentRunRepository: @unchecked Sendable {
         _ = try st.step()
     }
 
+    /// Finish-path run chrome only. Avoids compiling the 10-column `get`
+    /// (including `error_message`) then upserting just to stamp terminal
+    /// columns. Returns false when the durable row is gone.
+    @discardableResult
+    public func stampTerminal(
+        id: AgentRunID,
+        status: AgentRunStatus,
+        finishedAt: Date,
+        errorMessage: String?,
+        terminalReason: String?
+    ) throws -> Bool {
+        stampTerminalCountForTesting += 1
+        let statement = try db.prepare("""
+            UPDATE agent_runs
+            SET status = ?,
+                finished_at = ?,
+                error_message = ?,
+                terminal_reason = ?
+            WHERE id = ?;
+            """)
+        try statement.bind(1, status.rawValue)
+        try statement.bind(2, iso.string(from: finishedAt))
+        try statement.bind(3, errorMessage)
+        try statement.bind(4, terminalReason)
+        try statement.bind(5, id.value.uuidString)
+        _ = try statement.step()
+        let changes = try db.prepare("SELECT changes();")
+        return try changes.step() && changes.columnInt64(0) == 1
+    }
+
     public func get(id: AgentRunID) throws -> AgentRun? {
         durableGetCountForTesting += 1
         let st = try db.prepare("""
@@ -4335,6 +4908,29 @@ public final class AgentRunRepository: @unchecked Sendable {
         return st.columnText(0)
     }
 
+    /// Cheap bot-desk route for host send / peer @mention. Avoids the
+    /// 10-column `get` (including `error_message`) when only thread
+    /// membership and provider/instance/model freeze `BotDeskRouting`.
+    /// Returns nil when the durable row is gone.
+    public func route(of id: AgentRunID) throws -> RouteChrome? {
+        routeProbeCountForTesting += 1
+        let st = try db.prepare(
+            "SELECT thread_id, provider, provider_instance_id, model FROM agent_runs WHERE id = ? LIMIT 1;"
+        )
+        try st.bind(1, id.value.uuidString)
+        guard try st.step() else { return nil }
+        guard let rawThread = st.columnText(0), let threadUUID = UUID(uuidString: rawThread) else {
+            return nil
+        }
+        let provider = AgentProvider(rawValue: st.columnText(1) ?? "") ?? .codex
+        return RouteChrome(
+            threadId: AgentThreadID(threadUUID),
+            provider: provider,
+            providerInstanceId: st.columnText(2) ?? provider.rawValue,
+            model: st.columnText(3) ?? ""
+        )
+    }
+
     /// Cheap thread-membership probe for start-gate pending terminals.
     /// Avoids the full 10-column `get` (including `error_message`) when only
     /// `thread_id` decides whether a retained terminal belongs to this thread.
@@ -4364,6 +4960,54 @@ public final class AgentRunRepository: @unchecked Sendable {
         try st.bind(1, threadId.value.uuidString)
         guard try st.step() else { return nil }
         return decodeRun(st, fallbackThread: threadId.value)
+    }
+
+    /// Cheap pending/running presence for Stop-wait / Stop chrome / desk live
+    /// threads. Avoids the 10-column `latestActive` get (including
+    /// `error_message`) when callers only need existence.
+    public func hasActive(for threadId: AgentThreadID) throws -> Bool {
+        hasActiveProbeCountForTesting += 1
+        let st = try db.prepare("""
+            SELECT 1 FROM agent_runs
+            WHERE thread_id = ? AND status IN ('pending', 'running')
+            LIMIT 1;
+            """)
+        try st.bind(1, threadId.value.uuidString)
+        return try st.step()
+    }
+
+    /// Cheap id + started_at for a known run when it is still pending/running.
+    /// Avoids the 10-column `get` (including `error_message`) on live-poll
+    /// and Stop targeting. Returns nil when the row is gone or terminal.
+    public func activeRunChrome(of id: AgentRunID) throws -> ActiveRunChrome? {
+        activeChromeProbeCountForTesting += 1
+        let st = try db.prepare(
+            "SELECT id, started_at, status FROM agent_runs WHERE id = ? LIMIT 1;"
+        )
+        try st.bind(1, id.value.uuidString)
+        guard try st.step() else { return nil }
+        let status = AgentRunStatus(rawValue: st.columnText(2) ?? "") ?? .pending
+        guard status == .pending || status == .running else { return nil }
+        let rawID = st.columnText(0) ?? ""
+        let runId = UUID(uuidString: rawID).map(AgentRunID.init) ?? id
+        return ActiveRunChrome(id: runId, startedAt: parseDate(st.columnText(1)))
+    }
+
+    /// Cheap latest pending/running id + started_at for a thread. Avoids
+    /// `latestActive`'s 10-column get (including `error_message`) for
+    /// LaunchAgent-owned Working-for clocks and iOS active-run snapshots.
+    public func latestActiveChrome(for threadId: AgentThreadID) throws -> ActiveRunChrome? {
+        activeChromeProbeCountForTesting += 1
+        let st = try db.prepare("""
+            SELECT id, started_at FROM agent_runs
+            WHERE thread_id = ? AND status IN ('pending', 'running')
+            ORDER BY started_at DESC
+            LIMIT 1;
+            """)
+        try st.bind(1, threadId.value.uuidString)
+        guard try st.step() else { return nil }
+        guard let uuid = UUID(uuidString: st.columnText(0) ?? "") else { return nil }
+        return ActiveRunChrome(id: AgentRunID(uuid), startedAt: parseDate(st.columnText(1)))
     }
 
     /// All pending/running runs (for launch reconcile ledger stamping).
@@ -4846,7 +5490,17 @@ public final class AgentRunRepository: @unchecked Sendable {
                     )
                 }
 
-                try upsert(run)
+                guard try stampTerminal(
+                    id: run.id,
+                    status: run.status,
+                    finishedAt: run.finishedAt ?? Date(),
+                    errorMessage: run.errorMessage,
+                    terminalReason: run.terminalReason
+                ) else {
+                    throw SQLiteError.execute(
+                        "Run row missing while committing terminal run \(run.id.value.uuidString)."
+                    )
+                }
 
                 if let thread {
                     let threadRepo = AgentThreadRepository(db: database)
@@ -4855,7 +5509,13 @@ public final class AgentRunRepository: @unchecked Sendable {
                             "Thread row missing while committing terminal run \(run.id.value.uuidString)."
                         )
                     }
-                    try threadRepo.upsert(thread)
+                    try threadRepo.stampTerminal(
+                        id: thread.id,
+                        status: thread.status,
+                        hasUnread: thread.hasUnread,
+                        providerThreadId: thread.providerThreadId,
+                        at: thread.updatedAt
+                    )
                 }
 
                 if let providerSession {
@@ -7210,6 +7870,7 @@ public final class ProviderSessionRuntimeRepository {
     public private(set) var runtimePayloadJSONProbeCountForTesting = 0
     public private(set) var activeChromeProbeCountForTesting = 0
     public private(set) var forkSourceIdentityProbeCountForTesting = 0
+    public private(set) var adapterRecoverySessionProbeCountForTesting = 0
 
     /// Thread-select rehydrate only needs resume_cursor + payload JSON.
     public struct ActiveChrome: Equatable, Sendable {
@@ -7222,6 +7883,22 @@ public final class ProviderSessionRuntimeRepository {
         public let adapterKey: String?
         public let binaryIdentity: String?
         public let cwd: String?
+    }
+
+    /// Adapter-session recovery only needs cursor/cwd/model/status and
+    /// payload `activeTurnId`. Avoids the 16-column `get` (including
+    /// `last_error_message` and compiling `runtime_payload_json`) on
+    /// open/read/stop when there is no live provider session.
+    public struct AdapterRecoverySession: Equatable, Sendable {
+        public let provider: AgentProvider
+        public let status: AgentRunStatus
+        public let resumeCursor: String?
+        public let cwd: String?
+        public let model: String?
+        public let serviceTier: AgentServiceTier
+        public let runtimeMode: AgentPermissionMode
+        public let lastRunId: AgentRunID?
+        public let activeTurnId: String?
     }
 #if DEBUG
     private var diagnosticsLoadCountStorageForTesting = 0
@@ -7441,6 +8118,40 @@ public final class ProviderSessionRuntimeRepository {
             adapterKey: statement.columnText(0),
             binaryIdentity: statement.columnText(1),
             cwd: statement.columnText(2)
+        )
+    }
+
+    /// Cheap adapter-recovery session chrome for `recoverAdapterSessionIfNeeded`.
+    /// Avoids the 16-column `get` (including `last_error_message` and
+    /// compiling `runtime_payload_json`) when only provider, status, cursor,
+    /// cwd, model, mode, last_run_id, and payload `activeTurnId` resume
+    /// the adapter. `json_extract` copies the turn id without Swift-decoding
+    /// the blob; invalid JSON yields nil, matching decode fail-open.
+    /// Returns nil when the durable row is gone.
+    public func adapterRecoverySession(of threadId: AgentThreadID) throws -> AdapterRecoverySession? {
+        adapterRecoverySessionProbeCountForTesting += 1
+        let statement = try db.prepare("""
+            SELECT provider, status, resume_cursor, cwd, model, service_tier, runtime_mode, last_run_id,
+                   CASE
+                     WHEN json_valid(runtime_payload_json)
+                     THEN json_extract(runtime_payload_json, '$.activeTurnId')
+                     ELSE NULL
+                   END
+            FROM provider_session_runtime
+            WHERE thread_id = ? LIMIT 1;
+            """)
+        try statement.bind(1, threadId.value.uuidString)
+        guard try statement.step() else { return nil }
+        return AdapterRecoverySession(
+            provider: AgentProvider(rawValue: statement.columnText(0) ?? "") ?? .codex,
+            status: AgentRunStatus(rawValue: statement.columnText(1) ?? "") ?? .pending,
+            resumeCursor: statement.columnText(2),
+            cwd: statement.columnText(3),
+            model: statement.columnText(4),
+            serviceTier: AgentServiceTier(rawValue: statement.columnText(5) ?? "") ?? .auto,
+            runtimeMode: AgentPermissionMode(rawValue: statement.columnText(6) ?? "") ?? .supervised,
+            lastRunId: statement.columnText(7).flatMap(UUID.init(uuidString:)).map(AgentRunID.init),
+            activeTurnId: statement.columnText(8)
         )
     }
 
