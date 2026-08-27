@@ -2014,17 +2014,20 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               let input = params["input"] as? [String: Any],
               let kind = input["kind"] as? String,
               kind == task["axis"] as? String else { throw Error.guestConflict }
-        func point(_ xKey: String, _ yKey: String) -> Bool {
-            guard let x = input[xKey] as? Int, let y = input[yKey] as? Int else { return false }
-            return (0..<width).contains(x) && (0..<height).contains(y)
+        func point(_ xKey: String, _ yKey: String) -> (x: Int, y: Int)? {
+            guard let x = Self.integralGuestCoordinate(input[xKey], maximum: width - 1),
+                  let y = Self.integralGuestCoordinate(input[yKey], maximum: height - 1) else {
+                return nil
+            }
+            return (x, y)
         }
         switch kind {
         case "pointer":
-            guard point("x", "y") else { throw Error.invalidParams }
+            guard point("x", "y") != nil else { throw Error.invalidParams }
         case "drag":
-            guard point("from_x", "from_y"), point("to_x", "to_y"),
-                  input["from_x"] as? Int != input["to_x"] as? Int
-                    || input["from_y"] as? Int != input["to_y"] as? Int else {
+            guard let from = point("from_x", "from_y"),
+                  let to = point("to_x", "to_y"),
+                  from.x != to.x || from.y != to.y else {
                 throw Error.invalidParams
             }
         case "text":
@@ -2037,6 +2040,19 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         default:
             throw Error.invalidParams
         }
+    }
+
+    private static func integralGuestCoordinate(_ raw: Any?, maximum: Int) -> Int? {
+        guard maximum >= 0 else { return nil }
+        guard let number = raw as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite,
+              number.doubleValue.rounded(.towardZero) == number.doubleValue,
+              let value = Int(exactly: number.doubleValue),
+              (0...maximum).contains(value) else {
+            return nil
+        }
+        return value
     }
 
     private func invalidateGuestGrant(state: inout [String: Any], status: String) {

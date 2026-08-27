@@ -3281,20 +3281,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return readback
     }
 
-    private static func guestInputSteps(_ params: [String: Any]) throws -> [BotComputerActStep] {
+    static func guestInputSteps(_ params: [String: Any]) throws -> [BotComputerActStep] {
         if let input = params["input"] as? [String: Any],
-           let kind = input["kind"] as? String {
+            let kind = input["kind"] as? String {
             switch kind {
             case "pointer":
-                guard let x = input["x"] as? Int, let y = input["y"] as? Int else {
+                guard let x = Self.integralGuestCoordinate(input["x"]),
+                      let y = Self.integralGuestCoordinate(input["y"]) else {
                     throw BotRemoteControlAuthority.Error.invalidParams
                 }
                 return [BotComputerActStep(action: "click", x: x, y: y)]
             case "drag":
-                guard let fromX = input["from_x"] as? Int,
-                      let fromY = input["from_y"] as? Int,
-                      let toX = input["to_x"] as? Int,
-                      let toY = input["to_y"] as? Int else {
+                guard let fromX = Self.integralGuestCoordinate(input["from_x"]),
+                      let fromY = Self.integralGuestCoordinate(input["from_y"]),
+                      let toX = Self.integralGuestCoordinate(input["to_x"]),
+                      let toY = Self.integralGuestCoordinate(input["to_y"]) else {
                     throw BotRemoteControlAuthority.Error.invalidParams
                 }
                 return [BotComputerActStep(action: "drag", x: fromX, y: fromY, toX: toX, toY: toY)]
@@ -3316,8 +3317,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let steps = raw.map { dict in
                 BotComputerActStep(
                     action: dict["action"] as? String ?? "",
-                    x: dict["x"] as? Int ?? (dict["x"] as? NSNumber)?.intValue,
-                    y: dict["y"] as? Int ?? (dict["y"] as? NSNumber)?.intValue,
+                    x: Self.integralGuestCoordinate(dict["x"]),
+                    y: Self.integralGuestCoordinate(dict["y"]),
                     text: dict["text"] as? String,
                     key: dict["key"] as? String
                 )
@@ -3331,11 +3332,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if let key = params["key"] as? String, !key.isEmpty {
             return [BotComputerActStep(action: "key", key: key)]
         }
-        if let x = params["x"] as? Int ?? (params["x"] as? NSNumber)?.intValue,
-           let y = params["y"] as? Int ?? (params["y"] as? NSNumber)?.intValue {
+        if let x = Self.integralGuestCoordinate(params["x"]),
+           let y = Self.integralGuestCoordinate(params["y"]) {
             return [BotComputerActStep(action: "click", x: x, y: y)]
         }
         throw BotRemoteControlAuthority.Error.invalidParams
+    }
+
+    private static func integralGuestCoordinate(_ raw: Any?) -> Int? {
+        guard let number = raw as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite,
+              number.doubleValue.rounded(.towardZero) == number.doubleValue,
+              let value = Int(exactly: number.doubleValue) else {
+            return nil
+        }
+        return value
     }
 
     private static func pairedBotDeskRouting(

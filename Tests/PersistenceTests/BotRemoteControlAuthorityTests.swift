@@ -2551,6 +2551,104 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         }
     }
 
+    func test_guestPointerAndDragAcceptIntegralJSONNumbersAndRejectInvalidCoordinates() throws {
+        // WHY: paired JSON numbers are decoded as Double on the macOS host;
+        // valid integral coordinates must pass the authority boundary with
+        // their exact values and retain the existing task/frame fences.
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "guest-json-number-input",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let state = try runningGuest(botID: botID)
+        let runtime = try XCTUnwrap(state["runtime"] as? [String: Any])
+        let frame = try XCTUnwrap(state["frame"] as? [String: Any])
+        let beforeFrameID = try XCTUnwrap(frame["frame_id"] as? String)
+        var received: [[String: Any]] = []
+        authority.onGuestInput = { _, params, _, _ in
+            if let input = params["input"] as? [String: Any] {
+                received.append(input)
+            }
+        }
+
+        func dispatchInput(
+            requestID: String,
+            axis: String,
+            input: [String: Any]
+        ) throws -> [String: Any] {
+            let task = try guestTask(botID: botID, axis: axis)
+            return try authority.dispatch(method: "bot.guest.input", params: [
+                "client_request_id": requestID,
+                "bot_id": botID,
+                "host_id": guestHostID,
+                "task_id": try XCTUnwrap(task["id"] as? String),
+                "runtime": runtime,
+                "before_frame_id": beforeFrameID,
+                "input": input,
+            ])
+        }
+
+        for (index, axis) in ["pointer", "drag"].enumerated() {
+            let input: [String: Any] = axis == "pointer"
+                ? ["kind": "pointer", "x": 320.0, "y": 480.0]
+                : [
+                    "kind": "drag",
+                    "from_x": 40.0,
+                    "from_y": 80.0,
+                    "to_x": 640.0,
+                    "to_y": 720.0,
+                ]
+            let accepted = try dispatchInput(
+                requestID: "guest-json-number-\(index)",
+                axis: axis,
+                input: input
+            )
+            XCTAssertEqual(accepted["status"] as? String, "accepted")
+        }
+
+        XCTAssertEqual(received.count, 2)
+        XCTAssertEqual(received[0]["x"] as? Double, 320.0)
+        XCTAssertEqual(received[0]["y"] as? Double, 480.0)
+        XCTAssertEqual(received[1]["from_x"] as? Double, 40.0)
+        XCTAssertEqual(received[1]["to_y"] as? Double, 720.0)
+
+        let invalidInputs: [(requestID: String, axis: String, input: [String: Any])] = [
+            ("guest-json-number-invalid-fractional", "pointer", ["kind": "pointer", "x": 320.5, "y": 480.0]),
+            ("guest-json-number-invalid-negative", "pointer", ["kind": "pointer", "x": -1.0, "y": 480.0]),
+            ("guest-json-number-invalid-malformed", "pointer", ["kind": "pointer", "x": 320.0]),
+            ("guest-json-number-invalid-bounds", "drag", [
+                "kind": "drag",
+                "from_x": 40.0,
+                "from_y": 80.0,
+                "to_x": 1_600.0,
+                "to_y": 720.0,
+            ]),
+        ]
+        for item in invalidInputs {
+            XCTAssertThrowsError(
+                try dispatchInput(requestID: item.requestID, axis: item.axis, input: item.input),
+                "invalid coordinate payload must be rejected"
+            )
+        }
+
+        let failed = try authority.dispatch(method: "bot.receipt.status", params: [
+            "client_request_id": invalidInputs[0].requestID,
+        ])
+        XCTAssertEqual(failed["status"] as? String, "failed")
+        XCTAssertEqual((failed["readback"] as? [String: Any])?["error"] as? String, "Invalid params")
+
+        let afterInvalid = try guestState(botID: botID)
+        XCTAssertEqual(afterInvalid["status"] as? String, "running")
+        XCTAssertEqual(
+            (afterInvalid["runtime"] as? [String: Any])?["grant_id"] as? String,
+            runtime["grant_id"] as? String
+        )
+        XCTAssertEqual(
+            (afterInvalid["frame"] as? [String: Any])?["frame_id"] as? String,
+            beforeFrameID
+        )
+    }
+
     func test_guestRebuildRotatesRuntimeAndStopInvalidatesReplacementGrant() throws {
         let created = try authority.dispatch(method: "bot.create", params: [
             "client_request_id": "guest-lifecycle",

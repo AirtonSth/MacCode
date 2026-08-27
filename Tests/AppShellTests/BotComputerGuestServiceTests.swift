@@ -100,6 +100,55 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
 
 @MainActor
 final class BotComputerGuestServiceTests: XCTestCase {
+    func test_guestInputStepsAcceptsIntegralJSONNumbersForPointerAndDrag() throws {
+        // WHY: JSONValue stores every JSON number as a Double before the
+        // paired router reaches this parser; integral coordinates must keep
+        // their exact values instead of being rejected as non-Int payloads.
+        let pointer = try AppCommandRouter.guestInputSteps([
+            "input": [
+                "kind": "pointer",
+                "x": 320.0,
+                "y": 480.0,
+            ],
+        ])
+        XCTAssertEqual(pointer, [BotComputerActStep(action: "click", x: 320, y: 480)])
+
+        let drag = try AppCommandRouter.guestInputSteps([
+            "input": [
+                "kind": "drag",
+                "from_x": 40.0,
+                "from_y": 80.0,
+                "to_x": 640.0,
+                "to_y": 960.0,
+            ],
+        ])
+        XCTAssertEqual(
+            drag,
+            [BotComputerActStep(action: "drag", x: 40, y: 80, toX: 640, toY: 960)]
+        )
+    }
+
+    func test_guestInputStepsRejectsFractionalOrMalformedCoordinates() {
+        let invalidInputs: [[String: Any]] = [
+            ["kind": "pointer", "x": 10.5, "y": 20.0],
+            ["kind": "pointer", "x": 10.0],
+            [
+                "kind": "drag",
+                "from_x": 10.0,
+                "from_y": 20.0,
+                "to_x": 30.5,
+                "to_y": 40.0,
+            ],
+        ]
+
+        for input in invalidInputs {
+            XCTAssertThrowsError(
+                try AppCommandRouter.guestInputSteps(["input": input]),
+                "invalid coordinate payload must remain rejected: \(input)"
+            )
+        }
+    }
+
     func test_guestFrameReadbackAdvancesExactFrameAndFailureInvalidatesGrant() throws {
         // WHY: Docker's physical inspect identity validates the capture, but it
         // must not replace the logical image identity authorized by the recipe.
