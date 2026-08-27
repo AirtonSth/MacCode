@@ -521,6 +521,31 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         XCTAssertEqual(thread.reasoningEffort, .max)
     }
 
+    func test_selectThread_disableAuto_updatesRailForCacheFirstReselect() throws {
+        // WHY: selectThread now reads the rail instead of SQLite. Disabling Auto
+        // used to restore Manual on the VM but leave Auto on the rail row, so a
+        // cache-first reselect would put Auto back.
+        let (vm, _, root) = try fixture()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        vm.createThread(title: "rail-routing")
+        XCTAssertTrue(vm.setAutoModelRoutingEnabled(true))
+        XCTAssertTrue(vm.setAutoModelRoutingEnabled(false))
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        let railRow = try XCTUnwrap(vm.threads.first(where: { $0.id == tid }))
+        XCTAssertEqual(
+            railRow.effectiveRoutingConfiguration.mode,
+            .manual,
+            "disabling Auto must update the painted rail row, not only durable storage"
+        )
+        vm.selectThread(tid)
+        XCTAssertTrue(
+            vm.lastThreadSelectionUsedRailForTesting,
+            "reselect after a routing change must stay on the rail cache"
+        )
+        XCTAssertEqual(vm.routingMode, .manual,
+                       "cache-first reselect must keep the Manual routing just saved")
+    }
+
     func testAutoManualTransitionPersistsAndRestoresFastManualSelection() throws {
         let (vm, threads, root) = try fixture()
         defer {

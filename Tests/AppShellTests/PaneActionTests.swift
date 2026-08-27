@@ -262,6 +262,49 @@ final class PaneActionTests: XCTestCase {
         XCTAssertFalse(router.isWorkspaceBusy(ws.id))
     }
 
+    func test_workspaceBusyProjectionAndRunPayload_useChromeNotDurableGet() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/AppShell/AppContext.swift"),
+            encoding: .utf8
+        )
+        let payloadRange = try XCTUnwrap(source.range(of: "func agentRunPayload(threadId: AgentThreadID, runId: AgentRunID? = nil, status: AgentRunStatus? = nil)"))
+        let payloadBody = String(source[payloadRange.lowerBound...].prefix(1200))
+        XCTAssertTrue(
+            payloadBody.contains("threadRepo.workspaceId(of: threadId)"),
+            "EventBus run payload must probe workspace_id instead of a full get"
+        )
+        XCTAssertTrue(
+            payloadBody.contains("runRepo.timing(of: runId)"),
+            "EventBus run payload must probe started_at/finished_at instead of a full get"
+        )
+        XCTAssertFalse(
+            payloadBody.contains("threadRepo.get(id: threadId)"),
+            "EventBus run payload must not full-get a thread just for workspace_id"
+        )
+        XCTAssertFalse(
+            payloadBody.contains("runRepo.get(id: runId)"),
+            "EventBus run payload must not full-get a run just for clocks"
+        )
+
+        let projectionRange = try XCTUnwrap(source.range(of: "private func refreshActiveAgentWorkspaceProjection()"))
+        let projectionBody = String(source[projectionRange.lowerBound...].prefix(1800))
+        XCTAssertTrue(
+            projectionBody.contains("threadRepo.listChrome(ids: newlyActiveThreadIDs)"),
+            "workspace busy titles must hydrate from listChrome, not N full gets"
+        )
+        XCTAssertFalse(
+            projectionBody.contains("threadRepo.get(id: threadID)"),
+            "newly active workspace titles must not compile N durable gets"
+        )
+
+        XCTAssertTrue(source.contains("let chrome = (try? self.threadRepo.listChrome(ids: [tid]))?[tid]"))
+        XCTAssertTrue(source.contains("let chrome = (try? threadRepo.listChrome(ids: [threadId]))?[threadId]"))
+    }
+
     func test_sshSurfaceCreatesSavedHostSidebarInsteadOfDisconnectedTerminalPlaceholder() throws {
         let (_, router) = try makeContext()
         let ws = try router.createWorkspace(name: "ssh", cwd: NSTemporaryDirectory())

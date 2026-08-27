@@ -680,23 +680,29 @@ public final class ScheduledTaskScheduler {
                     || context.coordinator.activeRunId(threadId: threadID) != nil
                 if hasLocalSession { continue }
             }
-            if let agentRunID = run.agentRunID, let agentRun = try context.runRepo.get(id: agentRunID) {
-                switch agentRun.status {
+            // Status + finished_at only. A leftover 10-column `get` (including
+            // `error_message`) hitchs launch reclaim of every orphaned occurrence.
+            if let agentRunID = run.agentRunID,
+               let chrome = try context.runRepo.terminal(of: agentRunID) {
+                switch chrome.status {
                 case .completed:
-                    try store.finish(runID: run.id, status: .completed, at: agentRun.finishedAt ?? now)
+                    try store.finish(runID: run.id, status: .completed, at: chrome.finishedAt ?? now)
                 case .failed, .interrupted:
+                    let errorSummary = (try? context.runRepo.errorMessage(of: agentRunID))
+                        ?? "Scheduled run ended after app restart."
                     try store.finish(
                         runID: run.id,
                         status: .failed,
-                        errorSummary: agentRun.errorMessage ?? "Scheduled run ended after app restart.",
-                        at: agentRun.finishedAt ?? now
+                        errorSummary: errorSummary,
+                        at: chrome.finishedAt ?? now
                     )
                 case .cancelled:
+                    let errorSummary = try? context.runRepo.errorMessage(of: agentRunID)
                     try store.finish(
                         runID: run.id,
                         status: .cancelled,
-                        errorSummary: agentRun.errorMessage,
-                        at: agentRun.finishedAt ?? now
+                        errorSummary: errorSummary,
+                        at: chrome.finishedAt ?? now
                     )
                 case .pending, .running:
                     try store.finish(
@@ -747,17 +753,32 @@ public final class ScheduledTaskScheduler {
     private func observeRunning(now: Date) throws {
         for run in try store.listActiveRuns() where run.status == .running {
             try store.heartbeat(runID: run.id, at: now)
-            guard let agentRunID = run.agentRunID, let agentRun = try context.runRepo.get(id: agentRunID) else { continue }
-            switch agentRun.status {
+            guard let agentRunID = run.agentRunID else { continue }
+            // Status + finished_at only. A leftover 10-column `get` (including
+            // `error_message`) hitchs every scheduler tick while the run is live.
+            guard let chrome = try context.runRepo.terminal(of: agentRunID) else { continue }
+            switch chrome.status {
             case .completed:
-                try store.finish(runID: run.id, status: .completed, at: agentRun.finishedAt ?? now)
+                try store.finish(runID: run.id, status: .completed, at: chrome.finishedAt ?? now)
                 ScheduledTaskCrossProcess.notifyStoreChanged(reason: "completed")
             case .failed, .interrupted:
-                try store.finish(runID: run.id, status: .failed, errorSummary: agentRun.errorMessage, at: agentRun.finishedAt ?? now)
+                let errorSummary = try? context.runRepo.errorMessage(of: agentRunID)
+                try store.finish(
+                    runID: run.id,
+                    status: .failed,
+                    errorSummary: errorSummary,
+                    at: chrome.finishedAt ?? now
+                )
                 ScheduledTaskCrossProcess.notifyStoreChanged(reason: "failed")
                 notifyFailure(for: run)
             case .cancelled:
-                try store.finish(runID: run.id, status: .cancelled, errorSummary: agentRun.errorMessage, at: agentRun.finishedAt ?? now)
+                let errorSummary = try? context.runRepo.errorMessage(of: agentRunID)
+                try store.finish(
+                    runID: run.id,
+                    status: .cancelled,
+                    errorSummary: errorSummary,
+                    at: chrome.finishedAt ?? now
+                )
                 ScheduledTaskCrossProcess.notifyStoreChanged(reason: "cancelled")
             case .pending, .running:
                 break
