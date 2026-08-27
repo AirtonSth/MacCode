@@ -39,6 +39,63 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
                        "stream-json control messages must be newline-terminated for the CLI line reader to flush")
     }
 
+    func test_userPromptPayload_textOnlyWhenAttachmentsEmpty() throws {
+        let payload = try ClaudeStreamingCLIAdapter.userPromptPayload(text: "hello", attachments: [])
+        XCTAssertEqual(payload["type"] as? String, "user")
+        let message = try XCTUnwrap(payload["message"] as? [String: Any])
+        let content = try XCTUnwrap(message["content"] as? [[String: Any]])
+        XCTAssertEqual(content.count, 1, "empty attachments must stay a single text block")
+        XCTAssertEqual(content[0]["type"] as? String, "text")
+        XCTAssertEqual(content[0]["text"] as? String, "hello")
+    }
+
+    func test_userPromptPayload_includesImageAndFileBlocks() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-claude-cli-attach-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let pngData = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")!
+        let png = tmp.appendingPathComponent("dot.png")
+        try pngData.write(to: png)
+        let note = tmp.appendingPathComponent("note.txt")
+        try "hello file".write(to: note, atomically: true, encoding: .utf8)
+
+        let payload = try ClaudeStreamingCLIAdapter.userPromptPayload(
+            text: "see these",
+            attachments: [
+                AgentAttachment(path: png.path, displayName: "dot.png", kind: .image, mimeType: "image/png"),
+                AgentAttachment(path: note.path, displayName: "note.txt", kind: .file, mimeType: "text/plain")
+            ]
+        )
+        let content = try XCTUnwrap((payload["message"] as? [String: Any])?["content"] as? [[String: Any]])
+        XCTAssertEqual(content.count, 3)
+        XCTAssertEqual(content[0]["type"] as? String, "text")
+        XCTAssertEqual(content[1]["type"] as? String, "image")
+        let source = try XCTUnwrap(content[1]["source"] as? [String: Any])
+        XCTAssertEqual(source["type"] as? String, "base64")
+        XCTAssertEqual(source["media_type"] as? String, "image/png")
+        XCTAssertEqual(source["data"] as? String, pngData.base64EncodedString())
+        XCTAssertEqual(content[2]["type"] as? String, "text")
+        let fileText = try XCTUnwrap(content[2]["text"] as? String)
+        XCTAssertTrue(fileText.contains("note.txt"))
+        XCTAssertTrue(fileText.contains(note.path))
+    }
+
+    func test_userPromptPayload_rejectsUnsupportedImageMIME() {
+        do {
+            _ = try ClaudeStreamingCLIAdapter.userPromptPayload(
+                text: "nope",
+                attachments: [AgentAttachment(path: "/tmp/x.svg", kind: .image, mimeType: "image/svg+xml")]
+            )
+            XCTFail("unsupported image MIME must throw before stdin write")
+        } catch let AgentProviderAdapterError.unsupported(message) {
+            XCTAssertTrue(message.contains("image/svg+xml"))
+        } catch {
+            XCTFail("expected AgentProviderAdapterError.unsupported, got \(error)")
+        }
+    }
+
     // MARK: - control_response permission wire (pure)
 
     func test_controlPermissionResponseLine_approveIsOneShotAllow() throws {

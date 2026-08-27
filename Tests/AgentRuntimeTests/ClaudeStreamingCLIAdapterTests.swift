@@ -2668,6 +2668,26 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(ClaudeAgentSDKBridgeAdapter.installedSDKPackage(at: packageJSON, matches: ClaudeAgentSDKBridgeAdapter.defaultSDKPackageSpec))
     }
 
+    func test_sdkBridgeQueryOptionsForwardSubagentTextWithoutPinBump() throws {
+        // WHY: CLAUDE-SDK-002 matches CLI --forward-subagent-text without a
+        // reckless SDK major bump. The live CLI is selected via
+        // pathToClaudeCodeExecutable; the pin stays 0.3.157.
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        XCTAssertTrue(
+            source.contains("forwardSubagentText: true"),
+            "SDK query options must set forwardSubagentText to match CLI --forward-subagent-text"
+        )
+        XCTAssertEqual(
+            ClaudeAgentSDKBridgeAdapter.defaultSDKPackageSpec,
+            "@anthropic-ai/claude-agent-sdk@0.3.157"
+        )
+    }
+
     // MARK: - CLAUDE-BG-LIFECYCLE (background tasks + async subagents)
 
     /// Writes a fake `claude` that replays the REAL wire sequence captured from
