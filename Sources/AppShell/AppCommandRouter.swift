@@ -3227,7 +3227,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         var readback = context
         var runtime = context["runtime"] as? [String: Any] ?? [:]
         runtime["container_id"] = evidence.containerID
-        runtime["image_reference"] = evidence.imageReference
         runtime["viewer_path"] = evidence.viewerPath
         let previousFrame = context["frame"] as? [String: Any]
         let sequence = (previousFrame?["sequence"] as? Int ?? -1) + 1

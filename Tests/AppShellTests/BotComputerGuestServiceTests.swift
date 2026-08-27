@@ -101,6 +101,8 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
 @MainActor
 final class BotComputerGuestServiceTests: XCTestCase {
     func test_guestFrameReadbackAdvancesExactFrameAndFailureInvalidatesGrant() throws {
+        // WHY: Docker's physical inspect identity validates the capture, but it
+        // must not replace the logical image identity authorized by the recipe.
         let runtime: [String: Any] = [
             "host_id": "host",
             "bot_id": UUID().uuidString.lowercased(),
@@ -146,7 +148,9 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertEqual(frame["png_hash"] as? String, "png-hash")
         XCTAssertEqual(readback["before_frame_id"] as? String, "before-frame")
         XCTAssertEqual(readback["after_frame_id"] as? String, afterFrameID)
-        XCTAssertEqual((readback["runtime"] as? [String: Any])?["image_reference"] as? String, "sha256:runtime-image")
+        XCTAssertNotEqual(evidence.imageReference, runtime["image_reference"] as? String)
+        XCTAssertEqual((readback["runtime"] as? [String: Any])?["image_reference"] as? String, "recipe-image")
+        XCTAssertEqual((frame["runtime"] as? [String: Any])?["image_reference"] as? String, "recipe-image")
 
         let failed = AppCommandRouter.guestFailureReadback(context: readback, message: "capture failed")
         XCTAssertNil(failed["runtime"])

@@ -9963,6 +9963,13 @@ final class BotsWindowTests: XCTestCase {
         let startTask = try XCTUnwrap(tasks.compactMap(\.objectValue).first {
             $0["operation"]?.stringValue == "bot.guest.start"
         })
+        let catalogRecipe = try XCTUnwrap(startTask["recipe"]?.objectValue)
+        XCTAssertEqual(catalogRecipe["image_reference"]?.stringValue, BotComputerGuestSpec.imageTag)
+        XCTAssertNotEqual(
+            catalogRecipe["image_reference"]?.stringValue,
+            "img",
+            "the host-authorized logical image must remain distinct from Docker's physical inspect identity"
+        )
         let requestID = "paired-guest-frame"
         let recorder = GuestEventRecorder()
         let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
@@ -10021,7 +10028,11 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(receiptRuntime["host_id"]?.stringValue, hostID)
         XCTAssertEqual(receiptRuntime["bot_id"]?.stringValue, botID)
         XCTAssertEqual(receiptRuntime["container_id"]?.stringValue, BotComputerGuestSpec.containerName(botID: bot.id))
-        XCTAssertEqual(receiptRuntime["image_reference"]?.stringValue, "img")
+        XCTAssertEqual(receiptRuntime["image_reference"]?.stringValue, BotComputerGuestSpec.imageTag)
+        XCTAssertEqual(
+            receiptFrame["runtime"]?.objectValue?["image_reference"]?.stringValue,
+            BotComputerGuestSpec.imageTag
+        )
         XCTAssertEqual(receiptFrame["pixel_width"]?.intValue, 1_600)
         XCTAssertEqual(receiptFrame["pixel_height"]?.intValue, 1_200)
         XCTAssertEqual(receiptFrame["png_base64"]?.stringValue, docker.png.base64EncodedString())
