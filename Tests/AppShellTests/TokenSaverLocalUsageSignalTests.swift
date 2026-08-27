@@ -190,9 +190,10 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
             dayMeasuredCap,
             "Today Estimated save must not stay at the 2.6M day-measured × 200 cap"
         )
-        XCTAssertGreaterThanOrEqual(
+        XCTAssertGreaterThan(
             row.totalCredible,
-            3_000_000 * TokenSaverBareUserEstimator.cacheAmortizationMaxExtraTurns
+            3_000_000 * TokenSaverBareUserEstimator.cacheAmortizationMaxExtraTurns,
+            "52 runs must beat the old 50 extra-turn cap"
         )
         XCTAssertEqual(row.formulaVersion, TokenSaverDailyEconomyRepository.formulaVersion)
     }

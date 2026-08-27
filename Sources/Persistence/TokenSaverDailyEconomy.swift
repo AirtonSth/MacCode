@@ -62,9 +62,9 @@ public struct TokenSaverDailyEconomyRecord: Sendable, Equatable {
 /// Persists per-day credible totals so Week = Σ(day.total_credible).
 /// Does **not** backfill historical days; only upserts days that are recomputed going forward.
 public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
-    /// v9: Estimated save is never capped against day-measured pipes
-    /// (Today and historical days). v8 still capped non-today days.
-    public static let formulaVersion = "credible_v9"
+    /// v10: extra-turn cache amort is uncapped; dialect/graphify are granted
+    /// raw (no 4× measured / 12% billed scale-down); unscoped wraps amortize.
+    public static let formulaVersion = "credible_v10"
 
     private let db: SQLiteDB
     private let calendar: Calendar

@@ -379,6 +379,38 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(scopes.first?["Attempt-ID"], "")
     }
 
+    func test_alwaysOnSubagentThreadForwardsSavingsHeaderWhenTokenSaverThreadMissing() async throws {
+        // WHY: PATH wraps that only inherited RC_REMOTE_CODE_SUBAGENT_THREAD_ID
+        // used to POST distill without X-RemoteCode-Thread-ID, so the footer
+        // never saw the delivered savings.
+        let recorder = ScopeHeaderRecorder()
+        let response = try JSONEncoder().encode(DistillResponse(
+            requestID: UUID(), output: "compressed", inputCharacters: 20,
+            originalHandle: nil, routeStage: .deterministic
+        ))
+        let thread = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        let environment = [
+            "RC_REMOTE_CODE_SUBAGENT_THREAD_ID": thread,
+            "REMOTE_CODE_AGENT_PROVIDER": "claude",
+        ]
+        XCTAssertEqual(
+            TokenSaverRecoveryRequestContext.savingsThreadID(environment: environment),
+            thread
+        )
+        let cli = ManagedDistillCLI(
+            arguments: [], stdin: Data("provider input".utf8), state: state,
+            provider: "claude",
+            recoveryContext: ManagedDistillCLI.recoveryContext(environment: environment)
+        ) { request in
+            await recorder.append(request)
+            return (response, 200)
+        }
+        _ = await cli.run()
+        let scopes = await recorder.all()
+        XCTAssertEqual(scopes.count, 1)
+        XCTAssertEqual(scopes.first?["Thread-ID"], thread)
+    }
+
     func test_compress_noState_failsOpenToRawStdin() async {
         let raw = Data("the exact tool output that must NOT be lost".utf8)
         let cli = ManagedDistillCLI(arguments: [], stdin: raw, state: nil) { _ in nil }

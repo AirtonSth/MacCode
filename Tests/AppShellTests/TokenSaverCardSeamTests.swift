@@ -800,6 +800,37 @@ final class TokenSaverCardSeamTests: XCTestCase {
             agents.contains("Estimated save must never go down"),
             "Agents.md must keep the one-way Estimated save ratchet"
         )
+        XCTAssertTrue(
+            agents.contains("Token Saver counting algorithm"),
+            "Agents.md must document the counting algorithm so later agents cannot shrink it"
+        )
+        XCTAssertTrue(
+            agents.contains("permanentSaved × max(0, runs − 1)")
+                || agents.contains("permanentSaved × max(0, runs - 1)"),
+            "Agents.md must document uncapped extra-turn amort"
+        )
+        XCTAssertTrue(
+            agents.contains("Token Saver display"),
+            "Agents.md must document footer / Today / Week display"
+        )
+        XCTAssertTrue(
+            agents.contains("min(runs − 1, 50)") || agents.contains("min(runs - 1, 50)"),
+            "Agents.md must forbid the 50 extra-turn cap"
+        )
+        let estimator = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/AgentRuntime/TokenSaverBareUserEstimator.swift"
+            ),
+            encoding: .utf8
+        )
+        XCTAssertFalse(
+            estimator.contains("min(max(0, turnCount - 1), cacheAmortizationMaxExtraTurns)"),
+            "cache amort must not cap extra turns at 50"
+        )
+        XCTAssertFalse(
+            estimator.contains("applyAttributedCaps("),
+            "dialect/graphify must not be scaled down by attributed caps"
+        )
     }
 
     func test_sinceInstallLine_usesAttributedOnly() {

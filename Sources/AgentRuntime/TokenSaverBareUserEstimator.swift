@@ -16,8 +16,8 @@ public enum TokenSaverAttributedCapBinding: String, Sendable, Equatable {
 /// ```
 /// totalCredible = measuredPipes
 ///               + dialect(from observed/calibrated output share)
-///               + graphify(only with activity signals, capped)
-///               + cacheAmortization(measured × extra turns, capped)
+///               + graphify(only with activity signals)
+///               + cacheAmortization(measured × extra turns, uncapped)
 ///               + orchestration(Auto cheaper-model token-equivalent when active)
 /// ```
 ///
@@ -210,14 +210,10 @@ public enum TokenSaverBareUserEstimator {
     public static let graphifyExplorationMinTokens: Int = 400
     public static let graphifyExplorationMaxTokens: Int = 8_000
 
-    /// Attributed (dialect+graphify) ≤ max(measured × this, …).
+    /// Historical dialect/graphify ceilings. Kept only so older tests can name
+    /// the values that Estimated save must no longer apply.
     public static let attributedCapMultipleOfMeasured: Double = 4.0
-
-    /// Attributed ≤ this × window **billed** usage (hard ceiling for credibility).
     public static let attributedCapShareOfUsed: Double = 0.12
-
-    /// No-proof usage allowance when pipes are empty (and floor for all measured).
-    /// WHY: must stay available for measured > 0 so totals are monotone in measured.
     public static let noProofAttributedShareOfUsed: Double = 0.02
 
     // MARK: - Estimate
@@ -298,14 +294,6 @@ public enum TokenSaverBareUserEstimator {
             graphifyRaw = 0
         }
 
-        let capped = applyAttributedCaps(
-            measured: measured,
-            usedBilled: usedBilled,
-            usageAnchoredAvailable: usageAnchoredAvailable,
-            dialect: dialectRaw,
-            graphify: graphifyRaw
-        )
-
         // Auto / model routing: cheaper models at same quality. Token-equivalent is
         // a bounded share of measured pipes (not a pricing join).
         let orchestration = orchestrationActive
@@ -313,7 +301,7 @@ public enum TokenSaverBareUserEstimator {
             : 0
 
         // Multi-turn: compressed tool results would otherwise re-enter every later
-        // turn's context / cache. Credit measured once per extra turn (capped).
+        // turn's context / cache. Credit measured once per extra turn.
         let cacheAmort = estimateCacheAmortizationTokens(
             measured: measured,
             turnCount: observation.turnCount,
@@ -322,15 +310,15 @@ public enum TokenSaverBareUserEstimator {
 
         return TokenSaverBareUserBreakdown(
             measuredToolOutput: measured,
-            estimatedDialect: capped.dialect,
-            estimatedGraphify: capped.graphify,
+            estimatedDialect: dialectRaw,
+            estimatedGraphify: graphifyRaw,
             estimatedOrchestration: orchestration,
             estimatedCacheAmortization: cacheAmort,
             appliedOutputShare: share,
             usedCalibratedDefaults: usedDefault,
             dialectRawTokens: dialectRaw,
             graphifyRawTokens: graphifyRaw,
-            capBinding: capped.binding,
+            capBinding: .none,
             windowUsageBilledUnits: billedKnown,
             usageAnchoredAvailable: usageAnchoredAvailable
         )
@@ -338,14 +326,10 @@ public enum TokenSaverBareUserEstimator {
 
     // MARK: - Cache amortization / Auto
 
-    /// Max extra re-reads that multiply a thread's permanent saved chip into cache
-    /// impact. Product-trusted Today headline (~476M) uses lifetime thread totals ×
-    /// min(runs − 1, this). Keep high enough for long multi-turn threads (not 8).
+    /// Historical extra-turn ceiling. Estimated save must not apply this.
     public static let cacheAmortizationMaxExtraTurns: Int = 50
 
-    /// Optional soft cap of total amort vs window measured (nil / very high = off).
-    /// WHY: the 3× measured cap under-counted the permanent stack the UI was
-    /// designed around; leave headroom so permanent thread amort can surface.
+    /// Historical day-measured multiple. Production callers must not pass it.
     public static let cacheAmortizationMaxMultipleOfMeasured: Int = 200
 
     /// Fraction of measured pipes credited as Auto cheaper-model token-equivalent.
@@ -353,12 +337,11 @@ public enum TokenSaverBareUserEstimator {
 
     /// Multi-turn cache impact of earlier tool-output savings.
     ///
-    /// Primary: `measured × min(turns − 1, maxExtraTurns)` — each subsequent turn
-    /// would re-read the avoided full tool payload.
+    /// Primary: `measured × max(0, turns − 1)` — each subsequent turn would
+    /// re-read the avoided full tool payload. Extra turns are never capped.
     /// Floor from known `cacheReadInputTokens`: when the provider reports large
-    /// cache reads and we have measured pipes, credit a small billed-weighted
-    /// slice so the chip reflects real provider usage pressure (cache reads are
-    /// ~0.1× uncached in Anthropic-style billing).
+    /// cache reads and we have measured pipes, credit a billed-weighted slice
+    /// (cache reads are ~0.1× uncached in Anthropic-style billing).
     public static func estimateCacheAmortizationTokens(
         measured: Int,
         turnCount: Int,
@@ -366,15 +349,9 @@ public enum TokenSaverBareUserEstimator {
     ) -> Int {
         let m = max(0, measured)
         guard m > 0 else { return 0 }
-        let extraTurns = min(max(0, turnCount - 1), cacheAmortizationMaxExtraTurns)
+        let extraTurns = max(0, turnCount - 1)
         let fromTurns = saturatingMul(m, extraTurns)
-        // Billed-weight signal: cache reads dominate long Claude threads (~0.1× uncached).
-        // Cap at measured × maxExtraTurns so day/week cards cannot invent unbounded fantasy.
-        let maxCap = saturatingMul(m, cacheAmortizationMaxExtraTurns)
-        let fromCacheReads = min(
-            clampedInt(from: Double(max(0, cacheReadInputTokens)) * 0.1),
-            maxCap
-        )
+        let fromCacheReads = clampedInt(from: Double(max(0, cacheReadInputTokens)) * 0.1)
         return max(fromTurns, fromCacheReads)
     }
 
@@ -387,8 +364,7 @@ public enum TokenSaverBareUserEstimator {
     /// Sum multi-turn cache impact across threads active in a day/week window.
     /// Inputs are **permanent** thread saved/runs for threads with window activity
     /// (see `threadCacheAmortizationInputs`). `runs` is treated as the turn count
-    /// for `saved × min(runs − 1, maxExtraTurns)` — matching the thread-footer stack
-    /// that produced the trusted ~476M Estimated save figure.
+    /// for `saved × max(0, runs − 1)` — matching the thread-footer stack.
     public static func sumThreadCacheAmortization(
         savedTokens: Int,
         runs: Int
@@ -406,7 +382,7 @@ public enum TokenSaverBareUserEstimator {
     public static func weakTurnProxy(fromCompressEventCount runs: Int, hasSavings: Bool) -> Int {
         let r = max(0, runs)
         if r <= 0 { return hasSavings ? 1 : 0 }
-        return min(r, cacheAmortizationMaxExtraTurns + 1)
+        return r
     }
 
     public static func sumThreadCacheAmortization(
@@ -415,21 +391,19 @@ public enum TokenSaverBareUserEstimator {
         sumThreadCacheAmortization(inputs: inputs, windowMeasuredTokens: nil)
     }
 
-    /// Sum per-thread amort, optionally capped at `windowMeasured × maxMultiple`.
+    /// Sum per-thread amort. `windowMeasuredTokens` is ignored — Estimated save
+    /// is never capped against day-measured pipes.
     public static func sumThreadCacheAmortization(
         inputs: [(savedTokens: Int, runs: Int)],
         windowMeasuredTokens: Int?
     ) -> Int {
+        _ = windowMeasuredTokens
         var total = 0
         for row in inputs {
             total = saturatingAdd(total, sumThreadCacheAmortization(
                 savedTokens: row.savedTokens,
                 runs: row.runs
             ))
-        }
-        if let measured = windowMeasuredTokens, measured > 0 {
-            let cap = saturatingMul(measured, cacheAmortizationMaxMultipleOfMeasured)
-            return min(total, cap)
         }
         return total
     }
@@ -569,7 +543,8 @@ public enum TokenSaverBareUserEstimator {
     /// avoided    = max(0, count × replacedExploration − answerTokensSum)
     /// graphify   = min(shareModel, avoided) when answer sum > 0, else shareModel
     /// ```
-    /// Prefer under-count: no answer data → share model only (never invent answers).
+    /// Prefer the larger of share-model and measured avoided exploration.
+    /// No answer data → share model only (never invent answers).
     /// `used` must be **billed** units (caller responsibility).
     public static func estimateGraphifyRaw(
         signalCount: Int,
@@ -580,135 +555,23 @@ public enum TokenSaverBareUserEstimator {
     ) -> Int {
         let count = max(0, signalCount)
         guard count > 0, used > 0 else { return 0 }
-        let intensity = min(1.0, Double(count) / graphifySignalSoftCap)
+        let intensity = Double(count) / graphifySignalSoftCap
         let inputTokens = Double(used) * (1.0 - min(max(share, 0), 1))
         let shareModel = clampedInt(from: inputTokens * graphifyInputAvoidanceRate * intensity)
-        guard shareModel > 0 else { return 0 }
 
         let median = medianExplorationTokens ?? graphifyDefaultExplorationTokens
         let replacedPerQuery = clampExploration(
             clampedInt(from: Double(median) * graphifyReplacedExplorationFactor)
         )
         let avoided = max(0, count * replacedPerQuery - max(0, answerTokensSum))
-        // When we have no measured answers yet, keep share-model only so a day of
-        // pending tool_results does not get full exploration credit by accident.
         if answerTokensSum > 0 {
-            return min(shareModel, avoided)
+            return max(shareModel, avoided)
         }
-        return shareModel
+        return max(shareModel, 0)
     }
 
     public static func clampExploration(_ tokens: Int) -> Int {
         min(max(tokens, graphifyExplorationMinTokens), graphifyExplorationMaxTokens)
-    }
-
-    /// Caps attributed (dialect+graphify) with:
-    /// 1. **Monotonicity** in measured at fixed billed usage (no-proof floor always),
-    /// 2. **Displacement**: at most 1 estimated token displaced per measured token,
-    ///    never above the zero-measured (no-proof) grant or the usage ceiling.
-    static func applyAttributedCaps(
-        measured: Int,
-        usedBilled: Double,
-        usageAnchoredAvailable: Bool,
-        dialect: Int,
-        graphify: Int
-    ) -> (dialect: Int, graphify: Int, binding: TokenSaverAttributedCapBinding) {
-        var d = max(0, dialect)
-        var g = max(0, graphify)
-        // Double sum avoids Int overflow when both legs clamp to Int.max from corrupt billed.
-        let attributedDouble = Double(d) + Double(g)
-        let attributed = saturatingAdd(d, g)
-        let m = max(0, measured)
-
-        // Usage-anchored legs unavailable when billed unknown → allowance 0.
-        // Clamp Double→Int so corrupt billed units cannot trap.
-        let used = usageAnchoredAvailable ? sanitizedNonNegativeFinite(usedBilled) : 0
-        let capMeasured = clampedInt(from: Double(m) * attributedCapMultipleOfMeasured)
-        let capUsed = clampedInt(from: used * attributedCapShareOfUsed)
-        let noProofAllowance = clampedInt(from: used * noProofAttributedShareOfUsed)
-
-        // Credible ceiling (monotone non-decreasing in measured at fixed usage):
-        //   tightCap = max(noProofAllowance(used), min(max(capMeasured, measured), capUsed))
-        // WHY: pre-v4 dropped the no-proof floor once measured > 0, so recording a
-        // few real pipe tokens collapsed dialect from ~0.5M to ~8 (55,061× smaller).
-        let tightCap: Int
-        let bindingForTight: TokenSaverAttributedCapBinding
-        if m == 0 && used == 0 {
-            tightCap = 0
-            bindingForTight = .none
-        } else {
-            let measuredBound = max(capMeasured, m)
-            let usageLimited = min(measuredBound, capUsed)
-            tightCap = max(noProofAllowance, usageLimited)
-            bindingForTight = classifyCapBinding(
-                tightCap: tightCap,
-                noProofAllowance: noProofAllowance,
-                measuredBound: measuredBound,
-                capUsed: capUsed
-            )
-        }
-
-        // Zero-measured (no-proof) grant for the same `used`. Displacement may only
-        // protect that no-proof envelope — never the uncapped raw estimate.
-        // tightCap(m=0) = max(noProof, min(0, capUsed)) = noProofAllowance.
-        let tightCapAtZeroMeasured = noProofAllowance
-
-        // Displacement: ≥ max(0, min(raw, no-proof) − m) so each measured token
-        // displaces at most one *granted* estimated token, not fantasy raw.
-        let displacementFloor = max(0, min(attributed, tightCapAtZeroMeasured) - m)
-        // effectiveCap never exceeds usage ceiling; displacement cannot bypass it.
-        let raisedCap = max(tightCap, displacementFloor)
-        let effectiveCap = min(raisedCap, capUsed)
-
-        if attributedDouble <= Double(effectiveCap) {
-            // No scale: either under tightCap, or displacement forbids any cut.
-            return (d, g, .none)
-        }
-        if attributedDouble == 0 || effectiveCap == 0 {
-            return (0, 0, bindingForActualCap(
-                effectiveCap: effectiveCap,
-                tightCap: tightCap,
-                raisedCap: raisedCap,
-                capUsed: capUsed,
-                bindingForTight: bindingForTight
-            ))
-        }
-        let scale = Double(effectiveCap) / attributedDouble
-        d = clampedInt(from: Double(d) * scale)
-        g = clampedInt(from: Double(g) * scale)
-        let sumAfter = saturatingAdd(d, g)
-        let drift = sumAfter - effectiveCap
-        if drift > 0 { d = max(0, d - drift) }
-
-        // Report the component that actually bound the scaled result — never claim
-        // measuredMultiple for a usage-ceiling or no-proof outcome.
-        let binding = bindingForActualCap(
-            effectiveCap: effectiveCap,
-            tightCap: tightCap,
-            raisedCap: raisedCap,
-            capUsed: capUsed,
-            bindingForTight: bindingForTight
-        )
-        return (d, g, binding)
-    }
-
-    /// Prefer the binding of the component that actually set `effectiveCap`.
-    private static func bindingForActualCap(
-        effectiveCap: Int,
-        tightCap: Int,
-        raisedCap: Int,
-        capUsed: Int,
-        bindingForTight: TokenSaverAttributedCapBinding
-    ) -> TokenSaverAttributedCapBinding {
-        // Usage ceiling clipped a higher raised floor.
-        if raisedCap > capUsed && effectiveCap == capUsed {
-            return .usageShare
-        }
-        // Displacement alone raised the floor above pure tightCap.
-        if effectiveCap > tightCap {
-            return .measuredMultiple
-        }
-        return bindingForTight
     }
 
     /// Non-finite → 0; otherwise non-negative finite.
@@ -745,30 +608,6 @@ public enum TokenSaverBareUserEstimator {
         let (product, overflow) = x.multipliedReportingOverflow(by: y)
         if overflow { return Int.max }
         return product
-    }
-
-    /// Prefer the most restrictive component when values tie.
-    private static func classifyCapBinding(
-        tightCap: Int,
-        noProofAllowance: Int,
-        measuredBound: Int,
-        capUsed: Int
-    ) -> TokenSaverAttributedCapBinding {
-        if tightCap == 0 { return .none }
-        // tightCap = max(noProof, min(measuredBound, capUsed))
-        let usageLimited = min(measuredBound, capUsed)
-        if noProofAllowance >= usageLimited && tightCap == noProofAllowance {
-            return .noProofAllowance
-        }
-        if capUsed <= measuredBound && tightCap == capUsed {
-            return .usageShare
-        }
-        if tightCap == measuredBound || tightCap == max(measuredBound, 0) {
-            return .measuredMultiple
-        }
-        if tightCap == noProofAllowance { return .noProofAllowance }
-        if tightCap == capUsed { return .usageShare }
-        return .measuredMultiple
     }
 
     private static func clampShare(_ share: Double) -> Double {

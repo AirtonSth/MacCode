@@ -196,6 +196,10 @@ public enum TokenSaverSavingsRepositoryError: Error, Equatable, CustomStringConv
 /// Each `record` is atomic insert-update-prune on the DB serial queue, so
 /// concurrent agent runs cannot lose or corrupt rows.
 public final class TokenSaverSavingsRepository: @unchecked Sendable {
+    /// Delivered wraps with no thread id still need a permanent amort bucket
+    /// so Today Estimated save does not drop PATH-wrapper savings.
+    public static let unscopedThreadID = "unscoped"
+
     private let db: SQLiteDB
     private let retentionDays: Int
     private let calendar: Calendar
@@ -303,7 +307,8 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
         let content = trimmedContent.isEmpty ? "unknown" : trimmedContent
         let trimmedEngine = engine.trimmingCharacters(in: .whitespacesAndNewlines)
         let eng = trimmedEngine.isEmpty ? "unknown" : trimmedEngine
-        let thread = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedThread = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let thread = trimmedThread.isEmpty ? Self.unscopedThreadID : trimmedThread
         let key = idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let inserted = try db.performSync { database in
             try database.transaction {

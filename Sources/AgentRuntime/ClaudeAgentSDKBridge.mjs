@@ -478,6 +478,12 @@ function tokenSaverRecoveryHeaders(env) {
     const value = env && typeof env[envKey] === 'string' ? env[envKey].trim() : '';
     if (value) headers[header] = value;
   }
+  if (!headers['X-RemoteCode-Thread-ID']) {
+    const alwaysOn = env && typeof env.RC_REMOTE_CODE_SUBAGENT_THREAD_ID === 'string'
+      ? env.RC_REMOTE_CODE_SUBAGENT_THREAD_ID.trim()
+      : '';
+    if (alwaysOn) headers['X-RemoteCode-Thread-ID'] = alwaysOn;
+  }
   return headers;
 }
 

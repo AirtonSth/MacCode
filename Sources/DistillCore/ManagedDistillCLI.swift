@@ -991,7 +991,7 @@ public struct ManagedDistillCLI: Sendable {
         let context = TokenSaverRecoveryRequestContext(
             workspaceID: environment["RC_TOKEN_SAVER_WORKSPACE_ID"] ?? "",
             projectID: environment["RC_TOKEN_SAVER_PROJECT_ID"] ?? "",
-            threadID: environment["RC_TOKEN_SAVER_THREAD_ID"] ?? "",
+            threadID: TokenSaverRecoveryRequestContext.savingsThreadID(environment: environment),
             provider: environment["REMOTE_CODE_AGENT_PROVIDER"] ?? "",
             attemptID: environment["RC_TOKEN_SAVER_ATTEMPT_ID"] ?? "",
             operationID: ""

@@ -299,6 +299,19 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         XCTAssertGreaterThan(manyTurns, noTurns)
         XCTAssertGreaterThan(manyTurns, measured * 10,
                              "77-turn thread must show large cache-amortized savings")
+        let fiftyOneTurns = AgentAppView.tokenSaverThreadFooterDisplayTokens(
+            measuredDelivered: measured,
+            assistantChars: 0,
+            tokenSaverEnabled: true,
+            graphifyActive: false,
+            turnCount: 51
+        )
+        XCTAssertGreaterThan(
+            manyTurns,
+            fiftyOneTurns,
+            "extra turns beyond 50 must keep raising the footer"
+        )
+        XCTAssertGreaterThanOrEqual(manyTurns, measured * 76)
     }
 
     func test_displayTokens_autoRoutingAddsOrchestration() {

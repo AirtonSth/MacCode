@@ -42,41 +42,47 @@ final class TokenSaverBareUserEstimatorTests: XCTestCase {
         )
     }
 
-    func test_cacheAmortization_scalesWithTurnsAndCaps() {
-        // WHY: multi-turn re-read of compressed tool output must raise the figure.
+    func test_cacheAmortization_scalesWithTurnsUncapped() {
+        // WHY: threads with more than 51 runs used to stop at 50 extra turns.
         let measured = 5_000
         let none = TokenSaverBareUserEstimator.estimateCacheAmortizationTokens(
             measured: measured, turnCount: 1
         )
         XCTAssertEqual(none, 0)
+        let fiftyOneRuns = TokenSaverBareUserEstimator.estimateCacheAmortizationTokens(
+            measured: measured, turnCount: 51
+        )
+        XCTAssertEqual(fiftyOneRuns, measured * 50)
         let multi = TokenSaverBareUserEstimator.estimateCacheAmortizationTokens(
             measured: measured, turnCount: 77
         )
-        XCTAssertEqual(multi, measured * TokenSaverBareUserEstimator.cacheAmortizationMaxExtraTurns)
+        XCTAssertEqual(multi, measured * 76)
+        XCTAssertGreaterThan(multi, fiftyOneRuns)
         let fromCache = TokenSaverBareUserEstimator.estimateCacheAmortizationTokens(
             measured: measured, turnCount: 0, cacheReadInputTokens: 1_000_000
         )
-        // 0.1 × 1M = 100k, capped at measured × maxExtraTurns
-        let maxCap = measured * TokenSaverBareUserEstimator.cacheAmortizationMaxExtraTurns
-        XCTAssertEqual(fromCache, min(100_000, maxCap))
+        XCTAssertEqual(fromCache, 100_000)
     }
 
-    func test_sumThreadCacheAmortization_usesPermanentRunsCappedAtMaxExtraTurns() {
-        // WHY: product-trusted Estimated save (~476M) multiplies permanent thread
-        // chips by min(runs − 1, maxExtraTurns=50) — not a weak log proxy of 8.
+    func test_sumThreadCacheAmortization_usesPermanentRunsWithoutExtraTurnCap() {
+        // WHY: Estimated save multiplies permanent thread chips by (runs − 1).
         let inputs = [
             (savedTokens: 3_000_000, runs: 400),
             (savedTokens: 2_000_000, runs: 200)
         ]
         let total = TokenSaverBareUserEstimator.sumThreadCacheAmortization(inputs: inputs)
-        let maxExtra = TokenSaverBareUserEstimator.cacheAmortizationMaxExtraTurns
-        let expected = 3_000_000 * maxExtra + 2_000_000 * maxExtra
+        let expected = 3_000_000 * 399 + 2_000_000 * 199
         XCTAssertEqual(total, expected)
+        XCTAssertGreaterThan(
+            total,
+            3_000_000 * TokenSaverBareUserEstimator.cacheAmortizationMaxExtraTurns
+                + 2_000_000 * TokenSaverBareUserEstimator.cacheAmortizationMaxExtraTurns
+        )
         let proxy = TokenSaverBareUserEstimator.weakTurnProxy(
             fromCompressEventCount: 400,
             hasSavings: true
         )
-        XCTAssertEqual(proxy, maxExtra + 1)
+        XCTAssertEqual(proxy, 400)
     }
 
     func test_orchestration_shareOfMeasuredWhenActive() {
@@ -123,9 +129,9 @@ final class TokenSaverBareUserEstimatorTests: XCTestCase {
         XCTAssertLessThan(withHits.estimatedGraphify, 5_000_000, "graphify must not be 18% of all input")
     }
 
-    func test_graphifyPhase2_minOfShareAndMeasuredAvoided() {
-        // WHY: when answer sizes are known, counterfactual must not exceed share-model
-        // and must use measured avoided exploration — never preference-on alone.
+    func test_graphifyPhase2_grantsMaxOfShareAndMeasuredAvoided() {
+        // WHY: min(share, avoided) dropped Graphify to 0 whenever answers were large.
+        // Grant the larger leg so Estimated save does not under-count.
         let used = 10_000_000
         let share = TokenSaverBareUserEstimator.calibratedDefaultOutputShare
         let shareOnly = TokenSaverBareUserEstimator.estimateGraphifyRaw(
@@ -137,7 +143,6 @@ final class TokenSaverBareUserEstimatorTests: XCTestCase {
         )
         XCTAssertGreaterThan(shareOnly, 0)
 
-        // Huge answers → avoided near 0 → min pulls graphify down.
         let hugeAnswers = TokenSaverBareUserEstimator.estimateGraphifyRaw(
             signalCount: 10,
             used: used,
@@ -145,22 +150,30 @@ final class TokenSaverBareUserEstimatorTests: XCTestCase {
             answerTokensSum: 10 * 50_000,
             medianExplorationTokens: 2_000
         )
-        XCTAssertLessThanOrEqual(hugeAnswers, shareOnly)
-        XCTAssertEqual(hugeAnswers, 0, "if answers ≥ replaced exploration, no graphify credit")
+        XCTAssertEqual(hugeAnswers, shareOnly, "zero avoided must not wipe the share-model leg")
 
-        let modest = TokenSaverBareUserEstimator.estimateGraphifyRaw(
-            signalCount: 10,
-            used: used,
+        let smallUsed = 1_000_000
+        let largeAvoided = TokenSaverBareUserEstimator.estimateGraphifyRaw(
+            signalCount: 40,
+            used: smallUsed,
             share: share,
             answerTokensSum: 500,
-            medianExplorationTokens: 2_000
+            medianExplorationTokens: 8_000
         )
-        XCTAssertGreaterThan(modest, 0)
-        XCTAssertLessThanOrEqual(modest, shareOnly)
+        let shareAtForty = TokenSaverBareUserEstimator.estimateGraphifyRaw(
+            signalCount: 40,
+            used: smallUsed,
+            share: share,
+            answerTokensSum: 0,
+            medianExplorationTokens: 8_000
+        )
+        XCTAssertGreaterThan(largeAvoided, shareAtForty, "measured avoided must raise Graphify above the share model")
+        XCTAssertGreaterThan(largeAvoided, shareOnly)
     }
 
-    func test_zeroMeasured_limitsAttributedFantasy() {
-        // WHY: empty pipe day must not report tens of millions of "savings".
+    func test_zeroMeasured_dialectStaysOnOutputShare() {
+        // WHY: empty pipes still credit dialect from billed output share (~0.7%),
+        // not the old 22% fantasy and not a 2% usage clip.
         let used = 100_000_000
         let b = TokenSaverBareUserEstimator.estimate(
             measuredToolOutputSaved: 0,
@@ -172,7 +185,10 @@ final class TokenSaverBareUserEstimatorTests: XCTestCase {
                 windowProviderBilledTokenUnits: Double(used)
             )
         )
-        XCTAssertLessThanOrEqual(b.totalCredible, 2_000_000 + 1) // ≤2% of used
+        XCTAssertEqual(b.estimatedGraphify, 0, "no graphify signals → no graphify credit")
+        XCTAssertGreaterThan(b.estimatedDialect, 100_000)
+        XCTAssertLessThan(b.estimatedDialect, 2_000_000)
+        XCTAssertEqual(b.estimatedDialect, b.dialectRawTokens)
     }
 
     func test_liveSharePreferredWhenEnoughSamples() {
@@ -426,18 +442,12 @@ final class TokenSaverBareUserEstimatorTests: XCTestCase {
 
     // MARK: - Displacement floor + safe Double→Int
 
-    func test_displacementFloor_neverExceedsNoProofOrUsageCeiling() {
-        // WHY (must fail on pre-fix code): displacement used uncapped raw estimate, so
-        // measured>=1 set effectiveCap ≈ attributed − m and bypassed credibility ceilings.
-        // Granted attributed must stay ≤ capUsed and ≤ max(no-proof, min(4×m, capUsed)).
+    func test_dialectAndGraphify_areGrantedRawWithoutUsageCeiling() {
+        // WHY: 4× measured / 12% billed used to shrink dialect+Graphify below
+        // the raw counterfactual. Estimated save must keep the raw legs.
         let usedBilled = 1_000_000.0
         let measured = 1
         let capUsed = Int((usedBilled * TokenSaverBareUserEstimator.attributedCapShareOfUsed).rounded())
-        let noProof = Int((usedBilled * TokenSaverBareUserEstimator.noProofAttributedShareOfUsed).rounded())
-        let measuredBound = max(Int((Double(measured) * TokenSaverBareUserEstimator.attributedCapMultipleOfMeasured).rounded()), measured)
-        let credibleCeiling = max(noProof, min(measuredBound, capUsed))
-
-        // Large assistant text → huge dialect raw, independent of output-share coincidence.
         let hugeAssistantChars = 50_000_000
         let b = TokenSaverBareUserEstimator.estimate(
             measuredToolOutputSaved: measured,
@@ -451,28 +461,14 @@ final class TokenSaverBareUserEstimatorTests: XCTestCase {
                 graphifySignalCount: 40
             )
         )
-        XCTAssertGreaterThan(
-            b.dialectRawTokens + b.graphifyRawTokens,
-            credibleCeiling,
-            "fixture must produce raw attributed above the credible ceiling"
-        )
-        XCTAssertLessThanOrEqual(b.attributedOnly, capUsed, "granted estimate must stay under usage ceiling")
-        XCTAssertLessThanOrEqual(
-            b.attributedOnly,
-            credibleCeiling,
-            "granted estimate must not exceed max(no-proof, min(4×measured, capUsed))"
-        )
-        // Displacement must not mislabel a no-proof / usage-bound result as measuredMultiple.
-        XCTAssertNotEqual(
-            b.capBinding,
-            .measuredMultiple,
-            "cap_binding must report the component that actually bound (not displacement of raw)"
-        )
+        XCTAssertEqual(b.estimatedDialect, b.dialectRawTokens)
+        XCTAssertEqual(b.estimatedGraphify, b.graphifyRawTokens)
+        XCTAssertEqual(b.capBinding, .none)
+        XCTAssertGreaterThan(b.attributedOnly, capUsed)
     }
 
-    func test_largeAssistantChars_cannotExceedUsageCeiling() {
-        // WHY: assistantChars is a public observation input; unbounded floor must still
-        // be clipped by attributedCapShareOfUsed so the UI cannot show fantasy totals.
+    func test_largeAssistantChars_areNotClippedByUsageCeiling() {
+        // WHY: assistant-char dialect used to be clipped to 12% of billed usage.
         let usedBilled = 500_000.0
         let capUsed = Int((usedBilled * TokenSaverBareUserEstimator.attributedCapShareOfUsed).rounded())
         let b = TokenSaverBareUserEstimator.estimate(
@@ -486,9 +482,9 @@ final class TokenSaverBareUserEstimatorTests: XCTestCase {
                 assistantChars: 200_000_000
             )
         )
-        XCTAssertGreaterThan(b.dialectRawTokens, capUsed, "fixture needs raw dialect above capUsed")
-        XCTAssertLessThanOrEqual(b.attributedOnly, capUsed)
-        XCTAssertLessThanOrEqual(b.estimatedDialect, capUsed)
+        XCTAssertGreaterThan(b.dialectRawTokens, capUsed)
+        XCTAssertEqual(b.estimatedDialect, b.dialectRawTokens)
+        XCTAssertGreaterThan(b.attributedOnly, capUsed)
     }
 
     func test_totalCredible_isMonotoneNonDecreasingInMeasured_withGraphifyActive() {

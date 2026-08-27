@@ -990,6 +990,54 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertTrue(record.delivered)
     }
 
+    func test_httpServerSuccessHookAttributesAlwaysOnSubagentThreadHeader() async throws {
+        // WHY: Claude/PATH wraps may only send the always-on parent thread.
+        let configuration = try DistillServiceConfiguration(
+            authToken: "subagent-thread-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 2
+        )
+        let recorder = RecordingSuccessHandler()
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        ) { request, response, threadID in
+            await recorder.record(request: request, response: response, threadID: threadID)
+        }
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let original = String(repeating: "same log line that repeats many times\n", count: 20) + "exit code: 0\n"
+        let delivered = "same log line that repeats many times\n… (x20)\nexit code: 0"
+        let distillRequest = DistillRequest(
+            mode: .commandOutput,
+            input: original,
+            provider: "claude",
+            recordSavings: true,
+            cacheState: "wave_prepass_A",
+            maxOutputCharacters: 4000,
+            precomputedOutput: delivered,
+            precomputedRouteStage: .llmMLX
+        )
+        let body = try JSONEncoder().encode(distillRequest)
+        var request = URLRequest(url: URL(string: ready.baseURL + "/v1/distill")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 3
+        request.setValue("Bearer subagent-thread-token", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", forHTTPHeaderField: "X-RemoteCode-Subagent-Thread-ID")
+        request.httpBody = body
+
+        let (_, httpResponse) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(httpResponse as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 200)
+        let records = await recorder.allRecords()
+        let record = try XCTUnwrap(records.first)
+        XCTAssertEqual(record.threadID, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        XCTAssertGreaterThan(record.savedTokens, 0)
+        XCTAssertTrue(record.delivered)
+    }
+
     func test_clientSendsThreadIdHeaderWithoutCompleteRecoveryScope() async throws {
         let configuration = try DistillServiceConfiguration(
             authToken: "partial-scope-token",

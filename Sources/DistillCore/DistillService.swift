@@ -61,6 +61,31 @@ public struct TokenSaverRecoveryRequestContext: Sendable, Equatable {
         set(provider, header: "X-RemoteCode-Provider")
         set(attemptID, header: "X-RemoteCode-Attempt-ID")
     }
+
+    /// Thread id for the savings ledger. PATH wraps must attribute even when
+    /// store-before-loss scope is incomplete. Prefer the Token Saver key, then
+    /// the always-on parent/subagent thread that every provider process carries.
+    public static func savingsThreadID(environment: [String: String]) -> String {
+        firstNonEmpty(
+            environment["RC_TOKEN_SAVER_THREAD_ID"],
+            environment["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"]
+        )
+    }
+
+    public static func savingsThreadID(headers: [String: String]) -> String {
+        firstNonEmpty(
+            headers["x-remotecode-thread-id"],
+            headers["x-remotecode-subagent-thread-id"]
+        )
+    }
+
+    private static func firstNonEmpty(_ values: String?...) -> String {
+        for value in values {
+            let trimmed = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return ""
+    }
 }
 
 public enum TokenSaverScopedRecoveryState: String, Sendable, Equatable {
@@ -1546,9 +1571,10 @@ public final class DistillHTTPServer: @unchecked Sendable {
         do {
             let distillRequest = try decoder.decode(DistillRequest.self, from: request.body)
             let deferDeliveryConfirmation = request.headers["x-remotecode-delivery-deferred"] == "1"
-            // Prefer scoped recovery header; empty for bare CLI pipes.
-            let savingsThreadID = (request.headers["x-remotecode-thread-id"] ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            // Prefer Token Saver thread header; fall back to always-on parent id.
+            let savingsThreadID = TokenSaverRecoveryRequestContext.savingsThreadID(
+                headers: request.headers
+            )
             if distillRequest.mode == .commandOutput {
                 await metrics.recordToolOutputEligible()
             }
