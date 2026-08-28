@@ -3442,7 +3442,7 @@ public struct SidebarRootView: View {
 
     /// Window-aligned provider usage for bare-user estimator inputs only.
     /// Prefer `snapshot.daily` buckets (same retention window as the savings ledger).
-    /// Not a green-ring denominator — the green ring uses fixed 5M/35M goals.
+    /// Not a green-ring denominator — the green ring uses fixed 100M/700M goals.
     private func tokenSaverScopeUsedTokens(in snapshot: TokenSaverUsageSnapshot, scope: TokenSaverUsageScope) -> Int {
         switch scope {
         case .currentSession:
@@ -3608,7 +3608,7 @@ public struct SidebarRootView: View {
         return TokenSaverBareUserEstimator.saturatingAdd(measured, amort)
     }
 
-    /// Fixed green-ring goal for the selected scope (5M today / 35M week).
+    /// Fixed green-ring goal for the selected scope (100M today / 700M week).
     private func tokenSaverSavingsGoalTokens(for scope: TokenSaverUsageScope) -> Int {
         Self.tokenSaverSavingsGoalTokens(isDailyScope: scope == .currentSession)
     }
@@ -4198,12 +4198,13 @@ public struct SidebarRootView: View {
         ).totalCredible
     }
 
-    /// Absolute goals for the green Token Saver ring: 5M today / 35M week.
+    /// Absolute goals for the green Token Saver ring: 100M today / 700M week.
+    /// Display fill only — does not change Estimated save.
     nonisolated public static func tokenSaverSavingsGoalTokens(isDailyScope: Bool) -> Int {
-        isDailyScope ? 5_000_000 : 35_000_000
+        isDailyScope ? 100_000_000 : 700_000_000
     }
 
-    /// Absolute goal progress for the green Token Saver ring (5M today / 35M week).
+    /// Absolute goal progress for the green Token Saver ring (100M today / 700M week).
     nonisolated public static func savingsToGoalProgress(
         savedTokens: Int,
         goalTokens: Int
@@ -4232,7 +4233,7 @@ public struct SidebarRootView: View {
 
     /// Green savings ring fraction for a scope window.
     ///
-    /// - Comparable window (Today/Week) → `saved / goal` clamped to 1 (5M today / 35M week).
+    /// - Comparable window (Today/Week) → `saved / goal` clamped to 1 (100M today / 700M week).
     /// - No comparable usage window (all-time) → explicit unavailable (never 100% from used=0).
     public enum TokenSaverSavingsRingFraction: Equatable, Sendable {
         case comparable(progress: Double, goalTokens: Int)
@@ -4248,7 +4249,7 @@ public struct SidebarRootView: View {
             return 0
         }
 
-        /// Fixed goal denominator when comparable (5M today / 35M week).
+        /// Fixed goal denominator when comparable (100M today / 700M week).
         public var mixTokens: Int? {
             if case .comparable(_, let goal) = self { return goal }
             return nil
@@ -4562,7 +4563,7 @@ public struct SidebarRootView: View {
         scope: String,
         savedTokens: Int,
         savedProgress: Double,
-        savedGoalTokens: Int = 35_000_000,
+        savedGoalTokens: Int = 700_000_000,
         savingsRingComparable: Bool = true,
         savingsRingUnavailableReason: String? = nil,
         claudeUsedProgress: Double,
@@ -4580,7 +4581,7 @@ public struct SidebarRootView: View {
                 : "\(savedTokens)"
         let savingsPart: String
         if savingsRingComparable {
-            // WHY: ring is fixed-goal (5M today / 35M week); a11y names that goal.
+            // WHY: ring is fixed-goal (100M today / 700M week); a11y names that goal.
             let goalStr = savedGoalTokens >= 1_000_000
                 ? String(format: "%.0fM", Double(savedGoalTokens) / 1_000_000)
                 : savedGoalTokens >= 1_000

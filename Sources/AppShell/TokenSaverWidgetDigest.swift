@@ -22,13 +22,10 @@ public enum TokenSaverWidgetDigest {
     private static let lock = NSLock()
     private static var lastBody: [String: JSONValue]?
 
-    /// Absolute green-ring goals — keep in lockstep with
+    /// Absolute green-ring goals — same numbers as
     /// `SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope:)`.
     public static func savingsGoalTokens(scope: Scope) -> Int {
-        switch scope {
-        case .today: return 5_000_000
-        case .week: return 35_000_000
-        }
+        SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: scope == .today)
     }
 
     public static func savingsProgress(savedTokens: Int, scope: Scope) -> Double {

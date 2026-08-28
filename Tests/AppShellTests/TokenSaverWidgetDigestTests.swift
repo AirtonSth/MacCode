@@ -25,19 +25,27 @@ final class TokenSaverWidgetDigestTests: XCTestCase {
         XCTAssertEqual(body["codex_used_percent"], .number(1))
         XCTAssertEqual(body["grok_used_percent"], .number(87))
         XCTAssertEqual(body["token_saver_ring_available"], .bool(true))
-        // 2170M / 35M goal clamps to 1.0
+        // 2170M / 700M goal clamps to 1.0
         XCTAssertEqual(body["token_saver_progress"], .number(1.0))
         XCTAssertEqual(body["updated_at_ms"], .number(1_700_000_000_000))
     }
 
     func testSavingsProgressUsesFixedGoals() {
         XCTAssertEqual(
-            TokenSaverWidgetDigest.savingsProgress(savedTokens: 5_000_000, scope: .today),
+            TokenSaverWidgetDigest.savingsGoalTokens(scope: .today),
+            SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: true)
+        )
+        XCTAssertEqual(
+            TokenSaverWidgetDigest.savingsGoalTokens(scope: .week),
+            SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: false)
+        )
+        XCTAssertEqual(
+            TokenSaverWidgetDigest.savingsProgress(savedTokens: 100_000_000, scope: .today),
             1.0,
             accuracy: 0.0001
         )
         XCTAssertEqual(
-            TokenSaverWidgetDigest.savingsProgress(savedTokens: 17_500_000, scope: .week),
+            TokenSaverWidgetDigest.savingsProgress(savedTokens: 350_000_000, scope: .week),
             0.5,
             accuracy: 0.0001
         )
@@ -51,7 +59,7 @@ final class TokenSaverWidgetDigestTests: XCTestCase {
         let body = TokenSaverWidgetDigest.payload(
             enabled: true,
             subscribed: true,
-            estimatedSaveTokens: 1_250_000,
+            estimatedSaveTokens: 25_000_000,
             claudeUsedPercent: 10,
             codexUsedPercent: 20,
             grokUsedPercent: 30,

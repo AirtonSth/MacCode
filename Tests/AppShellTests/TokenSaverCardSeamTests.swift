@@ -291,13 +291,13 @@ final class TokenSaverCardSeamTests: XCTestCase {
     }
 
     func test_ringsAccessibilityLabel_namesFixedGoalDenominator() {
-        // WHY: green ring fills against fixed goals (5M today / 35M week) — a11y must
+        // WHY: green ring fills against fixed goals (100M today / 700M week) — a11y must
         // name that goal so VoiceOver matches the visible fill.
         let label = SidebarRootView.ringsAccessibilityLabel(
             scope: "week",
-            savedTokens: 35_000_000,
+            savedTokens: 700_000_000,
             savedProgress: 1,
-            savedGoalTokens: 35_000_000,
+            savedGoalTokens: 700_000_000,
             claudeUsedProgress: 0.4,
             codexUsedProgress: 0.2,
             grokUsedProgress: 0.1
@@ -308,7 +308,7 @@ final class TokenSaverCardSeamTests: XCTestCase {
                        "A11y must not claim measured when the figure is credible total: \(label)")
         XCTAssertTrue(label.contains("100%") || label.contains("~100%"),
                       "Rings label must include progress percent: \(label)")
-        XCTAssertTrue(label.lowercased().contains("goal") || label.contains("35M"),
+        XCTAssertTrue(label.lowercased().contains("goal") || label.contains("700M"),
                       "Rings label must name the fixed goal denominator: \(label)")
         XCTAssertFalse(label.contains("provider spend"),
                        "Rings label must not describe the old denominator: \(label)")
@@ -386,24 +386,42 @@ final class TokenSaverCardSeamTests: XCTestCase {
 
     // MARK: - Token Saver saved-token targets
 
-    func test_tokenSaverSavingsGoalTokens_dailyIs5M_weekIs35M() {
-        // WHY: Product rule: Today fills at 5M; Week fills at 35M.
-        XCTAssertEqual(SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: true), 5_000_000)
-        XCTAssertEqual(SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: false), 35_000_000)
+    func test_tokenSaverSavingsGoalTokens_dailyIs100M_weekIs700M() {
+        // WHY: Product rule: Today fills at 100M; Week fills at 700M.
+        // Display scale only — Estimated save is unchanged.
+        XCTAssertEqual(SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: true), 100_000_000)
+        XCTAssertEqual(SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: false), 700_000_000)
     }
 
-    func test_savingsToGoalProgress_dailyFiveMillionSaved_returnsFull() {
-        // WHY: Today target is 5M saved tokens.
+    func test_savingsToGoalProgress_dailyHundredMillionSaved_returnsFull() {
+        // WHY: Today target is 100M saved tokens.
         XCTAssertEqual(
-            SidebarRootView.savingsToGoalProgress(savedTokens: 5_000_000, goalTokens: 5_000_000),
+            SidebarRootView.savingsToGoalProgress(savedTokens: 100_000_000, goalTokens: 100_000_000),
             1
         )
     }
 
-    func test_savingsToGoalProgress_weekSeventeenPointFiveMillionSaved_returnsHalf() {
-        // WHY: Week target is 35M, so 17.5M saved should show a half ring.
+    func test_savingsToGoalProgress_todayNinetySixMillion_isNotFullAgainstHundredMillionGoal() {
+        // WHY: screenshot class — Estimated save 96M must not paint a full green
+        // Today ring. Fill is 96M/100M.
         XCTAssertEqual(
-            SidebarRootView.savingsToGoalProgress(savedTokens: 17_500_000, goalTokens: 35_000_000),
+            SidebarRootView.savingsToGoalProgress(savedTokens: 96_000_000, goalTokens: 100_000_000),
+            0.96,
+            accuracy: 0.000_001
+        )
+        XCTAssertLessThan(
+            SidebarRootView.savingsToGoalProgress(
+                savedTokens: 96_000_000,
+                goalTokens: SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: true)
+            ),
+            1
+        )
+    }
+
+    func test_savingsToGoalProgress_weekThreeHundredFiftyMillionSaved_returnsHalf() {
+        // WHY: Week target is 700M, so 350M saved should show a half ring.
+        XCTAssertEqual(
+            SidebarRootView.savingsToGoalProgress(savedTokens: 350_000_000, goalTokens: 700_000_000),
             0.5,
             accuracy: 0.000_001
         )
@@ -412,7 +430,7 @@ final class TokenSaverCardSeamTests: XCTestCase {
     func test_savingsToGoalProgress_moreThanGoal_clampsToFull() {
         // WHY: the ring cannot render beyond 100%; savings above the tab target stay full.
         XCTAssertEqual(
-            SidebarRootView.savingsToGoalProgress(savedTokens: 40_000_000, goalTokens: 35_000_000),
+            SidebarRootView.savingsToGoalProgress(savedTokens: 800_000_000, goalTokens: 700_000_000),
             1
         )
     }
@@ -420,7 +438,7 @@ final class TokenSaverCardSeamTests: XCTestCase {
     func test_savingsToGoalProgress_zeroSaved_returnsEmpty() {
         // WHY: no measured savings must not show a filled impact ring.
         XCTAssertEqual(
-            SidebarRootView.savingsToGoalProgress(savedTokens: 0, goalTokens: 5_000_000),
+            SidebarRootView.savingsToGoalProgress(savedTokens: 0, goalTokens: 100_000_000),
             0
         )
     }
@@ -452,12 +470,12 @@ final class TokenSaverCardSeamTests: XCTestCase {
         XCTAssertEqual(SidebarRootView.savingsAvoidanceRatio(savedTokens: 10, usedTokens: 0), 1)
     }
 
-    // MARK: - Green ring: fixed goal (5M today / 35M week)
+    // MARK: - Green ring: fixed goal (100M today / 700M week)
 
-    func test_savingsRingFraction_today_usesFiveMillionGoal() {
-        // WHY: Today ring fill is saved/5M, independent of billed usage.
+    func test_savingsRingFraction_today_usesHundredMillionGoal() {
+        // WHY: Today ring fill is saved/100M, independent of billed usage.
         let fraction = SidebarRootView.tokenSaverSavingsRingFraction(
-            savedTokens: 2_500_000,
+            savedTokens: 50_000_000,
             goalTokens: SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: true),
             hasComparableUsageWindow: true
         )
@@ -465,15 +483,15 @@ final class TokenSaverCardSeamTests: XCTestCase {
             return XCTFail("Expected comparable ring, got \(fraction)")
         }
         XCTAssertEqual(progress, 0.5, accuracy: 0.000_001)
-        XCTAssertEqual(goal, 5_000_000)
+        XCTAssertEqual(goal, 100_000_000)
         XCTAssertTrue(fraction.isComparable)
-        XCTAssertEqual(fraction.mixTokens, 5_000_000)
+        XCTAssertEqual(fraction.mixTokens, 100_000_000)
     }
 
-    func test_savingsRingFraction_week_usesThirtyFiveMillionGoal() {
-        // WHY: Week ring fill is saved/35M, independent of billed usage.
+    func test_savingsRingFraction_week_usesSevenHundredMillionGoal() {
+        // WHY: Week ring fill is saved/700M, independent of billed usage.
         let fraction = SidebarRootView.tokenSaverSavingsRingFraction(
-            savedTokens: 7_000_000,
+            savedTokens: 140_000_000,
             goalTokens: SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: false),
             hasComparableUsageWindow: true
         )
@@ -481,21 +499,21 @@ final class TokenSaverCardSeamTests: XCTestCase {
             return XCTFail("Expected comparable ring, got \(fraction)")
         }
         XCTAssertEqual(progress, 0.2, accuracy: 0.000_001)
-        XCTAssertEqual(goal, 35_000_000)
+        XCTAssertEqual(goal, 700_000_000)
         XCTAssertTrue(fraction.isComparable)
     }
 
     func test_savingsRingFraction_fullGoal_returnsFull() {
         // WHY: hitting the fixed goal must paint a complete green ring.
         let today = SidebarRootView.tokenSaverSavingsRingFraction(
-            savedTokens: 5_000_000,
-            goalTokens: 5_000_000,
+            savedTokens: 100_000_000,
+            goalTokens: 100_000_000,
             hasComparableUsageWindow: true
         )
         XCTAssertEqual(today.progress, 1)
         let week = SidebarRootView.tokenSaverSavingsRingFraction(
-            savedTokens: 35_000_000,
-            goalTokens: 35_000_000,
+            savedTokens: 700_000_000,
+            goalTokens: 700_000_000,
             hasComparableUsageWindow: true
         )
         XCTAssertEqual(week.progress, 1)
@@ -507,7 +525,7 @@ final class TokenSaverCardSeamTests: XCTestCase {
         let attributed = 96_041_366
         let fraction = SidebarRootView.tokenSaverSavingsRingFraction(
             savedTokens: attributed,
-            goalTokens: 35_000_000,
+            goalTokens: 700_000_000,
             hasComparableUsageWindow: false
         )
         XCTAssertEqual(fraction, .noComparableUsageWindow)
