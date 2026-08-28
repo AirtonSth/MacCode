@@ -53,7 +53,7 @@ final class SidebarViewTests: XCTestCase {
         let end = tail.range(of: "\n    private func")?.lowerBound ?? tail.endIndex
         let body = String(tail[..<end])
         XCTAssertTrue(body.contains("destinationPersistenceTask"))
-        XCTAssertTrue(body.contains("await Task.yield()"))
+        XCTAssertTrue(body.contains("waitForCommittedFrame"))
         XCTAssertTrue(body.contains("window.isVisible"))
     }
 
@@ -239,7 +239,7 @@ extension ActiveThreadsWindowTests {
             encoding: .utf8
         )
         XCTAssertTrue(source.contains("router.windowController?.presentWorkspaceContent()"))
-        XCTAssertTrue(source.contains("await Task.yield()"))
+        XCTAssertTrue(source.contains("waitForCommittedFrame"))
         XCTAssertTrue(source.contains("openAgentThread(thread: threadID"))
     }
 }
@@ -291,7 +291,7 @@ extension ScheduledTasksWindowTests {
         XCTAssertTrue(source.contains(".onAppear { vm.scheduleFreshnessPass() }"))
         XCTAssertTrue(source.contains("freshnessTask?.cancel()"))
         XCTAssertTrue(source.contains("freshnessGeneration &+= 1"))
-        XCTAssertTrue(source.contains("await Task.yield()"))
+        XCTAssertTrue(source.contains("waitForCommittedFrame"))
         XCTAssertTrue(source.contains("defer { self.finishFreshnessTask(ownedBy: generation) }"))
         XCTAssertTrue(source.contains("guard freshnessGeneration == generation else { return }"))
     }
@@ -352,7 +352,7 @@ extension ScheduledTasksWindowTests {
         XCTAssertTrue(body.contains("router.windowController?.presentWorkspaceContent()"))
         XCTAssertTrue(body.contains("navigationTask?.cancel()"))
         XCTAssertTrue(body.contains("navigationGeneration &+= 1"))
-        XCTAssertTrue(body.contains("await Task.yield()"))
+        XCTAssertTrue(body.contains("waitForCommittedFrame"))
         XCTAssertTrue(body.contains("openAgentThread(thread: threadID, markRead: true)"))
         XCTAssertTrue(body.contains("defer { self.finishNavigationTask(ownedBy: generation) }"))
         XCTAssertTrue(source.contains("guard navigationGeneration == generation else { return }"))

@@ -218,6 +218,12 @@ public final class ScheduledTasksViewModel: ObservableObject {
         navigationTask?.cancel()
     }
 
+    private static func waitForCommittedFrame() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
     /// Mount callers use the existing published cache for the first frame and
     /// ask the model for one coalesced freshness pass on the next main turn.
     public func scheduleFreshnessPass() {
@@ -226,7 +232,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
         freshnessGeneration &+= 1
         let generation = freshnessGeneration
         freshnessTask = Task { @MainActor [weak self] in
-            await Task.yield()
+            await Self.waitForCommittedFrame()
             guard let self else { return }
             defer { self.finishFreshnessTask(ownedBy: generation) }
             guard !Task.isCancelled,
@@ -270,7 +276,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
         tasksRefreshGeneration &+= 1
         let generation = tasksRefreshGeneration
         tasksRefreshTask = Task { @MainActor [weak self] in
-            await Task.yield()
+            await Self.waitForCommittedFrame()
             guard let self else { return }
             defer { self.finishTasksRefreshTask(ownedBy: generation) }
             guard !Task.isCancelled,
@@ -288,7 +294,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
         runsRefreshGeneration &+= 1
         let generation = runsRefreshGeneration
         runsRefreshTask = Task { @MainActor [weak self] in
-            await Task.yield()
+            await Self.waitForCommittedFrame()
             guard let self else { return }
             defer { self.finishRunsRefreshTask(ownedBy: generation) }
             guard !Task.isCancelled,
@@ -456,7 +462,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
             navigationGeneration &+= 1
             let generation = navigationGeneration
             navigationTask = Task { @MainActor [weak self] in
-                await Task.yield()
+                await Self.waitForCommittedFrame()
                 guard let self else { return }
                 defer { self.finishNavigationTask(ownedBy: generation) }
                 guard !Task.isCancelled,

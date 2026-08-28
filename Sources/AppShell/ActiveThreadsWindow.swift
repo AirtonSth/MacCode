@@ -54,6 +54,12 @@ public final class ActiveThreadsViewModel: ObservableObject {
         navigationTask?.cancel()
     }
 
+    private static func waitForCommittedFrame() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
     /// Use the published cache for the first frame, then perform one
     /// cancellation-safe repository/coordinator refresh.
     public func scheduleFreshnessPass() {
@@ -62,7 +68,7 @@ public final class ActiveThreadsViewModel: ObservableObject {
         freshnessGeneration &+= 1
         let generation = freshnessGeneration
         freshnessTask = Task { @MainActor [weak self] in
-            await Task.yield()
+            await Self.waitForCommittedFrame()
             guard let self,
                   !Task.isCancelled,
                   self.freshnessGeneration == generation else { return }
@@ -178,7 +184,7 @@ public final class ActiveThreadsViewModel: ObservableObject {
         tabRefreshGeneration &+= 1
         let generation = tabRefreshGeneration
         tabRefreshTask = Task { @MainActor [weak self] in
-            await Task.yield()
+            await Self.waitForCommittedFrame()
             guard let self else { return }
             defer {
                 if self.tabRefreshGeneration == generation {
@@ -207,7 +213,7 @@ public final class ActiveThreadsViewModel: ObservableObject {
                 navigationGeneration &+= 1
                 let generation = navigationGeneration
                 navigationTask = Task { @MainActor [weak self] in
-                    await Task.yield()
+                    await Self.waitForCommittedFrame()
                     guard let self,
                           !Task.isCancelled,
                           self.navigationGeneration == generation else { return }
@@ -263,7 +269,7 @@ public final class ActiveThreadsViewModel: ObservableObject {
         navigationGeneration &+= 1
         let generation = navigationGeneration
         navigationTask = Task { @MainActor [weak self] in
-            await Task.yield()
+            await Self.waitForCommittedFrame()
             guard let self,
                   !Task.isCancelled,
                   self.navigationGeneration == generation else { return }

@@ -451,11 +451,19 @@ final class SSHSurface: NSObject, SSHTransferSurface, TerminalRuntimeRoutingSurf
         }
     }
 
+    private static func waitForCommittedFrame() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
     private func connect(_ host: SSHHostProfile) {
         // Phase 1 (.painting): update the label now so SwiftUI can commit the
-        // frame. Phase 2 (.connecting) runs after Task.yield() hands control back
-        // to the runloop, guaranteeing the "Connecting…" text paints before the
-        // keychain read + forkpty stall (PERF-SSH-001 / UX-MAC_SSH-002).
+        // frame. Phase 2 (.connecting) runs after waitForCommittedFrame hands
+        // control back after the CATransaction, guaranteeing the "Connecting…"
+        // text paints before the keychain read + forkpty stall (PERF-SSH-001 /
+        // UX-MAC_SSH-002). Task.yield() is only an executor hop, not proof
+        // that the frame painted — use committed-frame barrier (AGENTS.md).
         enqueueConnection(host)
     }
 
@@ -468,7 +476,7 @@ final class SSHSurface: NSObject, SSHTransferSurface, TerminalRuntimeRoutingSurf
         viewModel.error = nil
         guard connectionWorker == nil else { return generation }
         connectionWorker = Task { @MainActor [weak self] in
-            await Task.yield()   // let SwiftUI paint the "Connecting…" label
+            await Self.waitForCommittedFrame()
             await self?.drainConnectionRequests()
         }
         return generation
