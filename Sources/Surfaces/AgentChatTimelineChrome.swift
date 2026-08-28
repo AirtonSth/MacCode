@@ -2,16 +2,19 @@ import AppKit
 import DesignSystemKit
 import SwiftUI
 
-/// Shared Agent App / Desk adaptive history layout.
+/// Shared Agent App / Desk transcript history layout.
 ///
-/// Short self-sizing transcripts stay mounted. Lazy rematerialization of tall
-/// text rows can cycle in AttributeGraph during scroll and starve MainActor.
+/// Self-sizing `AgentLinkedInlineText` NSTextView rows must never sit in
+/// `LazyVStack`. Live sample pid 36908 (binary already had `liveTurnActive`
+/// and `resetFittedSizeCache`) still spent 100% of the main thread in
+/// `LazySubviewPlacements.placeSubviews`. Eager VStack is the policy that
+/// removes that placement loop. `entryCount` / `liveTurnActive` stay in the
+/// signature so existing call sites compile.
 public enum AgentChatTimelineHistoryLayout {
     public static let eagerEntryLimit = 8
 
-    public static func usesLazyLayout(entryCount: Int, liveTurnActive: Bool = false) -> Bool {
-        if liveTurnActive { return false }
-        return entryCount > eagerEntryLimit
+    public static func usesLazyLayout(entryCount _: Int, liveTurnActive _: Bool = false) -> Bool {
+        false
     }
 }
 

@@ -880,21 +880,20 @@ final class AgentAppUXGapsTests: XCTestCase {
             AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: 6),
             "the shared policy is what keeps a short self-sizing timeline mounted"
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             AgentAppView.usesLazyTranscriptHistoryLayout(entryCount: 9),
-            "larger transcript windows still need viewport virtualization"
+            "pid 36908 hung restoring a long thread in LazyVStack; history must stay eager at any count"
         )
-        XCTAssertTrue(AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: 9))
+        XCTAssertFalse(AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: 9))
         XCTAssertEqual(
             AgentAppView.usesLazyTranscriptHistoryLayout(entryCount: 8),
             AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: 8)
         )
         XCTAssertFalse(
-            AgentAppView.usesLazyTranscriptHistoryLayout(entryCount: 40, liveTurnActive: true),
-            "history must stay eager while a turn is live so LazyVStack does not re-place NSTextView rows on each token"
+            AgentAppView.usesLazyTranscriptHistoryLayout(entryCount: 40, liveTurnActive: true)
         )
         XCTAssertFalse(
-            AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: 40, liveTurnActive: true)
+            AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: 40, liveTurnActive: false)
         )
     }
 

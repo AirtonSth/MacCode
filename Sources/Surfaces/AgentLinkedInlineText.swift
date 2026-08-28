@@ -137,7 +137,6 @@ struct AgentLinkedAttributedText: View {
             maximumNumberOfLines: maximumNumberOfLines,
             openURL: openURL
         )
-        .fixedSize(horizontal: false, vertical: true)
     }
 }
 

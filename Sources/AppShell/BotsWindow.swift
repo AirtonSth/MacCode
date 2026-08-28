@@ -11365,33 +11365,15 @@ public struct BotsRootView: View {
                 if items.isEmpty {
                     deskTimelineEmptyState(bot)
                 }
-                // Match Agent App: stable history may virtualize, but the
-                // mutating live-turn suffix stays eager. Lazy placement of a
-                // tall streaming MCP row can cycle in AttributeGraph and starve
-                // both UI events and host-catalog MainActor hops.
-                if AgentChatTimelineHistoryLayout.usesLazyLayout(
-                    entryCount: historyItems.count,
-                    liveTurnActive: latestLiveTurnID != nil
-                ) {
-                    LazyVStack(alignment: .leading, spacing: DS.Space.xl) {
-                        ForEach(Array(historyItems.enumerated()), id: \.element.id) { index, item in
-                            deskTimelineEntry(
-                                item,
-                                index: index,
-                                items: items,
-                                columnWidth: columnWidth
-                            )
-                        }
-                    }
-                } else {
-                    ForEach(Array(historyItems.enumerated()), id: \.element.id) { index, item in
-                        deskTimelineEntry(
-                            item,
-                            index: index,
-                            items: items,
-                            columnWidth: columnWidth
-                        )
-                    }
+                // Never LazyVStack desk timeline rows: same hang class as
+                // Agent App ChatFlowRow (pid 36908 LazySubviewPlacements).
+                ForEach(Array(historyItems.enumerated()), id: \.element.id) { index, item in
+                    deskTimelineEntry(
+                        item,
+                        index: index,
+                        items: items,
+                        columnWidth: columnWidth
+                    )
                 }
                 ForEach(Array(liveItems.enumerated()), id: \.element.id) { index, item in
                     deskTimelineEntry(

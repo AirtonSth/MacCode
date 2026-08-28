@@ -11972,9 +11972,9 @@ final class BotsWindowTests: XCTestCase {
                 entryCount: AgentChatTimelineHistoryLayout.eagerEntryLimit
             )
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: 9),
-            "larger Desk windows still need viewport virtualization"
+            "pid 36908 hung restoring a long thread in LazyVStack; Desk history must stay eager"
         )
         let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         let start = try XCTUnwrap(bots.range(of: "private func deskTimeline"))
@@ -11985,18 +11985,13 @@ final class BotsWindowTests: XCTestCase {
             slice.contains("let items = vm.deskTimeline"),
             "Desk must compute the timeline once per paint"
         )
-        XCTAssertTrue(
-            slice.contains("AgentChatTimelineHistoryLayout.usesLazyLayout"),
-            "Desk must reuse the shared Agent App eager-history policy"
+        XCTAssertFalse(
+            slice.contains("LazyVStack("),
+            "Desk transcript history must not use LazyVStack for self-sizing NSTextView rows"
         )
-        XCTAssertTrue(slice.contains("LazyVStack("))
         XCTAssertTrue(
             slice.contains("VStack(alignment: .leading, spacing: DS.Space.xl)"),
             "short Desk timelines must have an eager placement path"
-        )
-        XCTAssertFalse(
-            slice.contains("LazyVStack(alignment: .leading, spacing: DS.Space.xl) {\n                if vm.deskTimeline.isEmpty"),
-            "Desk must not always-Lazy the self-sizing timeline"
         )
         XCTAssertTrue(slice.contains("let split = BotsDeskFollowThrough.splitLiveTail"))
         XCTAssertTrue(slice.contains("ForEach(Array(historyItems.enumerated())"))
@@ -12049,9 +12044,9 @@ final class BotsWindowTests: XCTestCase {
             items.map(\.id),
             "splitting layout ownership must not change transcript order"
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: split.history.count),
-            "stable history may still use viewport virtualization"
+            "stable history must stay eager; LazyVStack placement of NSTextView rows hangs"
         )
     }
 
