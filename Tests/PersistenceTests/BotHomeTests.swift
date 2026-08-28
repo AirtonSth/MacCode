@@ -38,6 +38,32 @@ final class BotHomeTests: XCTestCase {
         )
     }
 
+    func test_wipeRemovesOnlyTheExactBotAcrossEpochsAndIsIdempotent() throws {
+        // WHY: a terminal delete receipt must mean every physical home for
+        // that exact Bot is absent, without removing another Bot's home.
+        let removed = BotDefinition(handle: "removed", name: "Removed", title: "", description: "")
+        let survivor = BotDefinition(handle: "survivor", name: "Survivor", title: "", description: "")
+        let removedEpochOne = BotHome.url(appSupportDirectory: directory, botID: removed.id, epoch: 1)
+        let removedEpochTwo = BotHome.url(appSupportDirectory: directory, botID: removed.id, epoch: 2)
+        let survivorHome = BotHome(appSupportDirectory: directory, bot: survivor)
+        try FileManager.default.createDirectory(at: removedEpochOne, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: removedEpochTwo, withIntermediateDirectories: true)
+        try survivorHome.ensure(
+            name: survivor.name,
+            handle: survivor.handle,
+            title: survivor.title,
+            description: survivor.description,
+            soul: ""
+        )
+
+        try BotHome.wipe(appSupportDirectory: directory, botID: removed.id)
+        try BotHome.wipe(appSupportDirectory: directory, botID: removed.id)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: removedEpochOne.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: removedEpochTwo.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: survivorHome.root.path))
+    }
+
     func test_ensureSeedsFileMemoryNotProjection() throws {
         // WHY: Memory is the markdown the bot writes. A projection header
         // would tell the model the store still owns Forget/Correct.

@@ -39,13 +39,25 @@ public struct BotComputerActStep: Codable, Equatable, Sendable {
     public var action: String
     public var x: Int?
     public var y: Int?
+    public var toX: Int?
+    public var toY: Int?
     public var text: String?
     public var key: String?
 
-    public init(action: String, x: Int? = nil, y: Int? = nil, text: String? = nil, key: String? = nil) {
+    public init(
+        action: String,
+        x: Int? = nil,
+        y: Int? = nil,
+        toX: Int? = nil,
+        toY: Int? = nil,
+        text: String? = nil,
+        key: String? = nil
+    ) {
         self.action = action
         self.x = x
         self.y = y
+        self.toX = toX
+        self.toY = toY
         self.text = text
         self.key = key
     }
@@ -57,6 +69,20 @@ public struct BotComputerActStep: Codable, Equatable, Sendable {
                 throw BotComputerGuestError.observeFailed
             }
             return ["env", "DISPLAY=:1", "xdotool", "mousemove", "\(x)", "\(y)", "click", "1"]
+        case "drag":
+            guard let x, let y, let toX, let toY,
+                  (0...1600).contains(x), (0...1200).contains(y),
+                  (0...1600).contains(toX), (0...1200).contains(toY),
+                  x != toX || y != toY else {
+                throw BotComputerGuestError.observeFailed
+            }
+            return [
+                "env", "DISPLAY=:1", "xdotool",
+                "mousemove", "\(x)", "\(y)",
+                "mousedown", "1",
+                "mousemove", "--sync", "\(toX)", "\(toY)",
+                "mouseup", "1",
+            ]
         case "type":
             let typed = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !typed.isEmpty, typed.count <= 2000 else {

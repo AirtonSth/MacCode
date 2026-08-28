@@ -2627,7 +2627,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         return .object([
             "activity_id": .string(result.activityID.uuidString.lowercased()),
+            "lifecycle_receipt_id": .string(result.activityID.uuidString.lowercased()),
             BotPeerDelegation.consultationIDParameterKey: .string(result.consultationID.uuidString.lowercased()),
+            "conversation_id": .string(result.peerConversationID.value.uuidString.lowercased()),
+            "thread_id": .string(result.peerThreadID.value.uuidString.lowercased()),
+            "run_id": .string(result.peerRunID.value.uuidString.lowercased()),
             "bot": .object([
                 "id": .string(current.id.value.uuidString.lowercased()),
                 "handle": .string(current.handle),
@@ -2908,18 +2912,46 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private var pairedBotRemote: BotRemoteControlAuthority?
+    private var pairedBotSettlementWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private lazy var botRuntimeEvidenceProjector = BotRuntimeEvidenceProjector { [weak self] terminal in
+        _ = self?.pairedBotRemote?.settleRuntime(
+            botID: terminal.botID,
+            runID: terminal.runID,
+            failed: terminal.failed
+        )
+    }
 
     public func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
         let authority = try pairedBotAuthority()
         let foundation = Self.foundationObject(params)
         do {
             var result = try authority.dispatch(method: method, params: foundation)
+            if method == "bot.stop" || method == "bot.force_stop",
+               result["status"] as? String == BotRemoteControlAuthority.Status.accepted.rawValue,
+               let requestID = foundation["client_request_id"] as? String {
+                await waitForPairedBotSettlement(requestID: requestID)
+                result = try authority.dispatch(
+                    method: "bot.receipt.status",
+                    params: ["client_request_id": requestID]
+                )
+            }
             botsViewModel?.reloadQueuedFollowUpsFromStore()
             if method == "bot.get" || method == "bot.send" {
                 result = enrichPairedBotAssistant(params: foundation, result: result)
             }
+            if method == "bot.send" {
+                botRuntimeEvidenceProjector.registerCompletedSend(JSONValue.from(result))
+            }
             return JSONValue.from(result)
         } catch let error as BotRemoteControlAuthority.Error {
+            if let requestID = foundation["client_request_id"] as? String,
+               let failed = try? authority.dispatch(
+                   method: "bot.receipt.status",
+                   params: ["client_request_id": requestID]
+               ),
+               failed["status"] as? String == BotRemoteControlAuthority.Status.failed.rawValue {
+                return JSONValue.from(failed)
+            }
             throw JSONRPCError(code: error.code, message: error.message)
         }
     }
@@ -2959,7 +2991,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             self?.botsViewModel?.hasLiveRun(botID: id) ?? false
         }
         created.onStopRun = { [weak self] id, force, requestID in
-            self?.botsViewModel?.stopLiveRuns(for: id, force: force) { ok in
+            guard let self else { return }
+            guard let botsViewModel = self.botsViewModel else {
+                self.settlePairedBot(
+                    requestID: requestID,
+                    ok: false,
+                    readback: ["accepted": true, "force": force, "terminal": false]
+                )
+                return
+            }
+            botsViewModel.stopLiveRuns(for: id, force: force) { [weak self] ok in
                 self?.settlePairedBot(
                     requestID: requestID,
                     ok: ok,
@@ -2971,49 +3012,40 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 )
             }
         }
-        created.onStartGuest = { [weak self] id, _, requestID in
-            self?.botsViewModel?.presentGuestDesktop(botID: id) { ok in
-                self?.settlePairedBot(
+        created.onStartGuest = { [weak self] id, _, requestID, context in
+            self?.botsViewModel?.presentGuestDesktop(botID: id) { ready in
+                self?.settlePairedGuest(
+                    botID: id,
                     requestID: requestID,
-                    ok: ok,
-                    readback: [
-                        "bot_id": id.value.uuidString.lowercased(),
-                        "status": ok ? "running" : "failed",
-                        "viewer": "/vnc.html",
-                        "embed_html_is_not_runtime": true,
-                    ]
+                    context: context,
+                    ready: ready
                 )
             }
         }
-        created.onStopGuest = { [weak self] id, requestID in
+        created.onStopGuest = { [weak self] id, requestID, context in
             self?.botsViewModel?.stopDockerGuest(botID: id) { ok in
+                var readback = context
+                readback["last_request_id"] = requestID
+                readback["status"] = ok ? "stopped" : "failed"
+                readback["error_message"] = ok ? nil : "Could not stop the Linux desktop."
                 self?.settlePairedBot(
                     requestID: requestID,
                     ok: ok,
-                    readback: [
-                        "bot_id": id.value.uuidString.lowercased(),
-                        "status": ok ? "stopped" : "failed",
-                        "viewer": "/vnc.html",
-                        "embed_html_is_not_runtime": true,
-                    ]
+                    readback: readback
                 )
             }
         }
-        created.onRebuildGuest = { [weak self] id, requestID in
-            self?.botsViewModel?.rebuildDockerGuest(botID: id) { ok in
-                self?.settlePairedBot(
+        created.onRebuildGuest = { [weak self] id, requestID, context in
+            self?.botsViewModel?.rebuildDockerGuest(botID: id) { ready in
+                self?.settlePairedGuest(
+                    botID: id,
                     requestID: requestID,
-                    ok: ok,
-                    readback: [
-                        "bot_id": id.value.uuidString.lowercased(),
-                        "status": ok ? "running" : "failed",
-                        "viewer": "/vnc.html",
-                        "embed_html_is_not_runtime": true,
-                    ]
+                    context: context,
+                    ready: ready
                 )
             }
         }
-        created.onGuestInput = { [weak self] id, params, requestID in
+        created.onGuestInput = { [weak self] id, params, requestID, context in
             guard let service = self?.botsViewModel?.computerGuestService else {
                 throw BotRemoteControlAuthority.Error(
                     code: -32091,
@@ -3021,35 +3053,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 )
             }
             let steps = try Self.guestInputSteps(params)
-            Task.detached { [weak self] in
+            Task { @MainActor [weak self, service] in
                 do {
-                    try service.act(botID: id, steps: steps)
-                    await MainActor.run {
-                        self?.settlePairedBot(
-                            requestID: requestID,
-                            ok: true,
-                            readback: [
-                                "bot_id": id.value.uuidString.lowercased(),
-                                "status": "running",
-                                "viewer": "/vnc.html",
-                                "embed_html_is_not_runtime": true,
-                            ]
-                        )
-                    }
+                    let evidence = try await Task.detached { [service] in
+                        try service.act(botID: id, steps: steps)
+                        return try service.remoteFrame(botID: id)
+                    }.value
+                    var readback = Self.guestFrameReadback(context: context, evidence: evidence)
+                    readback["last_request_id"] = requestID
+                    self?.settlePairedBot(
+                        requestID: requestID,
+                        ok: true,
+                        readback: readback
+                    )
                 } catch {
-                    await MainActor.run {
-                        self?.settlePairedBot(
-                            requestID: requestID,
-                            ok: false,
-                            readback: [
-                                "bot_id": id.value.uuidString.lowercased(),
-                                "status": "failed",
-                                "error": String(describing: error),
-                                "viewer": "/vnc.html",
-                                "embed_html_is_not_runtime": true,
-                            ]
-                        )
-                    }
+                    var readback = Self.guestFailureReadback(context: context, error: error)
+                    readback["last_request_id"] = requestID
+                    self?.settlePairedBot(
+                        requestID: requestID,
+                        ok: false,
+                        readback: readback
+                    )
                 }
             }
         }
@@ -3062,14 +3086,24 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             try service.removeGuestRuntime(botID: id)
         }
-        created.onSend = { [weak self] id, text in
-            guard let vm = self?.botsViewModel else { return }
-            _ = try vm.enqueueHostMessage(
+        created.onSend = { [weak self] id, text, conversationID, routingValues in
+            guard let vm = self?.botsViewModel else {
+                throw BotRemoteControlAuthority.Error(
+                    code: -32091,
+                    message: "Bot runtime is unavailable."
+                )
+            }
+            let routing = try Self.pairedBotDeskRouting(routingValues)
+            let result = try vm.enqueueHostMessage(
                 botID: id,
                 text: text,
-                conversationID: nil,
-                routing: BotDeskRouting()
+                conversationID: conversationID,
+                routing: routing
             )
+            return Self.foundationObject(result.objectValue ?? [:])
+        }
+        created.onDelegatedAttentionSnapshot = { [weak self] in
+            self?.context?.botPeerHandoffAuthority.remoteAttentionOwnershipSnapshots() ?? []
         }
         created.onOpenFile = { [weak self] botID, path, split, root in
             guard let vm = self?.botsViewModel else {
@@ -3092,21 +3126,213 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// and `NSLock` is not recursive.
     private func settlePairedBot(requestID: String, ok: Bool, readback: [String: Any]) {
         DispatchQueue.main.async { [weak self] in
-            self?.pairedBotRemote?.settle(
+            guard let self else { return }
+            let settled = self.pairedBotRemote?.settle(
                 requestID: requestID,
                 status: ok ? .completed : .failed,
                 readback: readback
             )
+            if let settled,
+               let payload = Self.pairedGuestTerminalEventPayload(settled) {
+                EventBus.shared.publish(kind: "bot.guest.updated", payload: payload)
+            }
+            let waiters = self.pairedBotSettlementWaiters.removeValue(forKey: requestID) ?? []
+            waiters.forEach { $0.resume() }
         }
     }
 
-    private static func guestInputSteps(_ params: [String: Any]) throws -> [BotComputerActStep] {
+    static func pairedGuestTerminalEventPayload(_ receipt: [String: Any]) -> JSONValue? {
+        guard let requestID = receipt["request_id"] as? String, !requestID.isEmpty,
+              let receiptID = receipt["receipt_id"] as? String, !receiptID.isEmpty,
+              let botID = receipt["bot_id"] as? String, !botID.isEmpty,
+              let receiptStatus = receipt["status"] as? String,
+              let readback = receipt["readback"] as? [String: Any],
+              readback["bot_id"] as? String == botID,
+              readback["last_request_id"] as? String == requestID,
+              readback["viewer_path"] as? String == "/vnc.html",
+              readback["task_catalog"] is [String: Any],
+              let hostID = readback["host_id"] as? String, !hostID.isEmpty,
+              let status = readback["status"] as? String,
+              let generation = readback["grant_generation"] as? Int,
+              generation >= 0 else { return nil }
+        switch (receiptStatus, status) {
+        case (BotRemoteControlAuthority.Status.completed.rawValue, "running"),
+             (BotRemoteControlAuthority.Status.completed.rawValue, "stopped"),
+             (BotRemoteControlAuthority.Status.failed.rawValue, "failed"):
+            break
+        default:
+            return nil
+        }
+        let afterFrameID = readback["after_frame_id"] as? String
+        if status == "running" {
+            guard let afterFrameID, !afterFrameID.isEmpty,
+                  let frame = readback["frame"] as? [String: Any],
+                  frame["frame_id"] as? String == afterFrameID else { return nil }
+        }
+        var payload: [String: Any] = [
+            "host_id": hostID,
+            "bot_id": botID,
+            "request_id": requestID,
+            "client_request_id": requestID,
+            "receipt_id": receiptID,
+            "status": status,
+            "grant_generation": generation,
+        ]
+        if let afterFrameID, !afterFrameID.isEmpty {
+            payload["after_frame_id"] = afterFrameID
+        }
+        return JSONValue.from(payload)
+    }
+
+    private func waitForPairedBotSettlement(requestID: String) async {
+        await withCheckedContinuation { continuation in
+            pairedBotSettlementWaiters[requestID, default: []].append(continuation)
+        }
+    }
+
+    private func settlePairedGuest(
+        botID: BotID,
+        requestID: String,
+        context: [String: Any],
+        ready: BotComputerGuestReady?
+    ) {
+        guard let ready,
+              let service = botsViewModel?.computerGuestService else {
+            var readback = Self.guestFailureReadback(
+                context: context,
+                message: "Could not start the Linux desktop."
+            )
+            readback["last_request_id"] = requestID
+            settlePairedBot(
+                requestID: requestID,
+                ok: false,
+                readback: readback
+            )
+            return
+        }
+        Task { @MainActor [weak self, service] in
+            do {
+                let evidence = try await Task.detached { [service] in
+                    try service.remoteFrame(botID: botID, ready: ready)
+                }.value
+                var readback = Self.guestFrameReadback(context: context, evidence: evidence)
+                readback["last_request_id"] = requestID
+                self?.settlePairedBot(
+                    requestID: requestID,
+                    ok: true,
+                    readback: readback
+                )
+            } catch {
+                var readback = Self.guestFailureReadback(context: context, error: error)
+                readback["last_request_id"] = requestID
+                self?.settlePairedBot(
+                    requestID: requestID,
+                    ok: false,
+                    readback: readback
+                )
+            }
+        }
+    }
+
+    static func guestFrameReadback(
+        context: [String: Any],
+        evidence: BotComputerGuestFrameEvidence
+    ) -> [String: Any] {
+        var readback = context
+        var runtime = context["runtime"] as? [String: Any] ?? [:]
+        runtime["container_id"] = evidence.containerID
+        runtime["viewer_path"] = evidence.viewerPath
+        let previousFrame = context["frame"] as? [String: Any]
+        let sequence = (previousFrame?["sequence"] as? Int ?? -1) + 1
+        let frameID = UUID().uuidString.lowercased()
+        readback["runtime"] = runtime
+        readback["frame"] = [
+            "runtime": runtime,
+            "frame_id": frameID,
+            "sequence": sequence,
+            "pixel_width": evidence.pixelWidth,
+            "pixel_height": evidence.pixelHeight,
+            "png_base64": evidence.png.base64EncodedString(),
+            "png_hash": evidence.pngHash,
+        ]
+        readback["status"] = "running"
+        readback["viewer"] = evidence.viewerPath
+        readback["viewer_path"] = evidence.viewerPath
+        readback["grant_generation"] = runtime["grant_generation"]
+        readback["grant_invalidated"] = false
+        readback["before_frame_id"] = previousFrame?["frame_id"]
+        readback["after_frame_id"] = frameID
+        readback["error_message"] = nil
+        return readback
+    }
+
+    static func guestFailureReadback(
+        context: [String: Any],
+        error: Swift.Error
+    ) -> [String: Any] {
+        guestFailureReadback(context: context, message: String(describing: error))
+    }
+
+    static func guestFailureReadback(
+        context: [String: Any],
+        message: String
+    ) -> [String: Any] {
+        var readback = context
+        let previousGeneration = (context["runtime"] as? [String: Any])?["grant_generation"] as? Int
+            ?? context["grant_generation"] as? Int
+            ?? 0
+        readback["status"] = "failed"
+        readback["error_message"] = message
+        readback["runtime"] = nil
+        readback["frame"] = nil
+        readback["input"] = nil
+        readback["grant_generation"] = previousGeneration + 1
+        readback["grant_invalidated"] = true
+        readback["recovery"] = [
+            "method": "bot.guest.state",
+            "requires_new_start_grant": true,
+        ]
+        return readback
+    }
+
+    static func guestInputSteps(_ params: [String: Any]) throws -> [BotComputerActStep] {
+        if let input = params["input"] as? [String: Any],
+            let kind = input["kind"] as? String {
+            switch kind {
+            case "pointer":
+                guard let x = Self.integralGuestCoordinate(input["x"]),
+                      let y = Self.integralGuestCoordinate(input["y"]) else {
+                    throw BotRemoteControlAuthority.Error.invalidParams
+                }
+                return [BotComputerActStep(action: "click", x: x, y: y)]
+            case "drag":
+                guard let fromX = Self.integralGuestCoordinate(input["from_x"]),
+                      let fromY = Self.integralGuestCoordinate(input["from_y"]),
+                      let toX = Self.integralGuestCoordinate(input["to_x"]),
+                      let toY = Self.integralGuestCoordinate(input["to_y"]) else {
+                    throw BotRemoteControlAuthority.Error.invalidParams
+                }
+                return [BotComputerActStep(action: "drag", x: fromX, y: fromY, toX: toX, toY: toY)]
+            case "text":
+                guard let text = input["text"] as? String else {
+                    throw BotRemoteControlAuthority.Error.invalidParams
+                }
+                return [BotComputerActStep(action: "type", text: text)]
+            case "key":
+                guard let key = input["key"] as? String else {
+                    throw BotRemoteControlAuthority.Error.invalidParams
+                }
+                return [BotComputerActStep(action: "key", key: key)]
+            default:
+                throw BotRemoteControlAuthority.Error.invalidParams
+            }
+        }
         if let raw = params["steps"] as? [[String: Any]] {
             let steps = raw.map { dict in
                 BotComputerActStep(
                     action: dict["action"] as? String ?? "",
-                    x: dict["x"] as? Int ?? (dict["x"] as? NSNumber)?.intValue,
-                    y: dict["y"] as? Int ?? (dict["y"] as? NSNumber)?.intValue,
+                    x: Self.integralGuestCoordinate(dict["x"]),
+                    y: Self.integralGuestCoordinate(dict["y"]),
                     text: dict["text"] as? String,
                     key: dict["key"] as? String
                 )
@@ -3120,11 +3346,55 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if let key = params["key"] as? String, !key.isEmpty {
             return [BotComputerActStep(action: "key", key: key)]
         }
-        if let x = params["x"] as? Int ?? (params["x"] as? NSNumber)?.intValue,
-           let y = params["y"] as? Int ?? (params["y"] as? NSNumber)?.intValue {
+        if let x = Self.integralGuestCoordinate(params["x"]),
+           let y = Self.integralGuestCoordinate(params["y"]) {
             return [BotComputerActStep(action: "click", x: x, y: y)]
         }
         throw BotRemoteControlAuthority.Error.invalidParams
+    }
+
+    private static func integralGuestCoordinate(_ raw: Any?) -> Int? {
+        guard let number = raw as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite,
+              number.doubleValue.rounded(.towardZero) == number.doubleValue,
+              let value = Int(exactly: number.doubleValue) else {
+            return nil
+        }
+        return value
+    }
+
+    private static func pairedBotDeskRouting(
+        _ values: [String: Any]
+    ) throws -> BotDeskRouting {
+        guard let providerRaw = values["provider"] as? String,
+              let provider = AgentProvider(rawValue: providerRaw),
+              let providerInstanceID = values["provider_instance_id"] as? String,
+              !providerInstanceID.isEmpty,
+              let routingRaw = values["routing_mode"] as? String,
+              let routingMode = AgentRoutingMode(rawValue: routingRaw),
+              let permissionRaw = values["permission_mode"] as? String,
+              let permissionMode = AgentPermissionMode(rawValue: permissionRaw),
+              let reasoningRaw = values["reasoning_effort"] as? String,
+              let reasoningEffort = AgentReasoningEffort(rawValue: reasoningRaw),
+              let runAsObject = values["run_as_user"],
+              JSONSerialization.isValidJSONObject(runAsObject),
+              let runAsData = try? JSONSerialization.data(withJSONObject: runAsObject),
+              let runAsUser = try? JSONDecoder().decode(AgentRunAsUser.self, from: runAsData)
+        else {
+            throw BotRemoteControlAuthority.Error.invalidParams
+        }
+        return BotDeskRouting(
+            provider: provider,
+            providerInstanceID: providerInstanceID,
+            model: values["model"] as? String ?? "",
+            routingMode: routingMode,
+            permissionMode: permissionMode,
+            reasoningEffort: reasoningEffort,
+            serviceTier: (values["service_tier"] as? String)
+                .flatMap(AgentServiceTier.init(rawValue:)) ?? .auto,
+            runAsUser: runAsUser
+        )
     }
 
     private static func foundationObject(_ params: [String: JSONValue]) -> [String: Any] {
@@ -5740,6 +6010,26 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return nil
     }
 
+    public func activeAgentDelegation(
+        thread: AgentThreadID,
+        run: AgentRunID
+    ) throws -> AgentActiveDelegationSnapshot? {
+        guard let ctx = context,
+              let active = try ctx.coordinator.activeDelegationCapability(
+                threadId: thread,
+                runId: run
+              ) else {
+            return nil
+        }
+        return AgentActiveDelegationSnapshot(
+            threadId: active.threadId,
+            runId: active.runId,
+            hostId: ctx.liveActivityHostIdentity.serverId,
+            capability: active.capability,
+            expiresAt: active.expiresAt
+        )
+    }
+
     /// UX-MAC_AGENT-CONTINUE parity for mirror clients: resume a
     /// relaunch-interrupted thread exactly like the mac Continue button
     /// (AgentAppViewModel.continueInterruptedThread) — an empty prompt routes
@@ -7057,7 +7347,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let store = BotBrowserStore(appSupportDirectory: appSupport)
         try? store.persistTarget(BotBrowserTarget(url: url, title: title), botID: botID)
         let cookies = (try? store.readWebsiteData(botID: botID)) ?? [:]
-        try? store.persistPageState(BotBrowserPageState(url: url, title: title, cookies: cookies), botID: botID)
+        try? store.persistPageState(
+            BotBrowserPageState(
+                url: url,
+                title: title,
+                cookies: cookies,
+                loading: payload["loading"] as? Bool
+            ),
+            botID: botID
+        )
     }
 
     /// Drain MCP pending open/snapshot/act/state commands onto this bot's
@@ -7474,6 +7772,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func notificationList(workspaceId: WorkspaceID?, unreadOnly: Bool) throws -> [[String: JSONValue]] {
         guard let ctx = context else { return [] }
         let repo = NotificationRepository(db: ctx.db)
+        let botMetadata = BotAttentionNotificationMetadataStore(db: ctx.db)
+        let botMetadataByID = botMetadata.all()
         let list = try repo.list(workspaceId: workspaceId, unreadOnly: unreadOnly)
         return list.map { n in
             var d: [String: JSONValue] = [
@@ -7486,6 +7786,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             if let w = n.workspaceId { d["workspace_id"] = .string(w.value.uuidString) }
             if let s = n.surfaceId { d["surface_id"] = .string(s.value.uuidString) }
             if let r = n.readAt { d["read_at"] = .string(iso8601Formatter.string(from: r)) }
+            if let metadata = botMetadataByID[n.id] {
+                for (key, value) in metadata.fields { d[key] = .string(value) }
+            }
             d["push_policy"] = .string("background_only")
             return d
         }
@@ -7578,6 +7881,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return .object(result)
     }
 
+    public func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try BotAttentionPushBindingStore(db: ctx.db).bind(
+            profileID: profileID,
+            hostID: hostID,
+            deviceID: deviceID
+        )
+    }
+
     public func settingsGet(keys: [String]) throws -> [String: String] {
         guard let ctx = context else { return [:] }
         var values: [String: String] = [:]
@@ -7668,6 +7980,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             ], baseRevision: nil, deviceID: "mac-host")
         }
         return opened
+    }
+
+    public func filesEditSession(sessionID: String) throws -> JSONValue {
+        guard let session = FileEditSessionStore.shared.session(sessionID: sessionID) else {
+            throw JSONRPCError(
+                code: -32602,
+                message: "edit session not found",
+                data: .string(sessionID)
+            )
+        }
+        return session
     }
 
     public func filesEditApplyPatch(sessionID: String, baseDraftRevision: Int, rangeLocation: Int, rangeLength: Int, replacement: String, deviceID: String?) throws -> JSONValue {

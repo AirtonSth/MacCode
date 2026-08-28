@@ -8,6 +8,22 @@ public struct BotComputerGuestReady: Equatable, Sendable {
     public var pngHash: String
     public var pngMagic: String
     public var resumed: Bool
+    public var containerID: String
+    public var imageReference: String
+    public var capturedPNG: Data
+}
+
+/// Secret-free projection used by paired clients. The noVNC loopback URL and
+/// viewer bearer never leave the Mac; only a bounded PNG and exact runtime
+/// identity cross the paired host channel.
+public struct BotComputerGuestFrameEvidence: Equatable, Sendable {
+    public var containerID: String
+    public var imageReference: String
+    public var viewerPath: String
+    public var pixelWidth: Int
+    public var pixelHeight: Int
+    public var png: Data
+    public var pngHash: String
 }
 
 public enum BotComputerGuestServiceError: Error, Equatable, Sendable, CustomStringConvertible {
@@ -98,7 +114,10 @@ public final class BotComputerGuestService: @unchecked Sendable {
                 screenURL: url,
                 pngHash: hash,
                 pngMagic: Self.pngMagic(png),
-                resumed: false
+                resumed: false,
+                containerID: name,
+                imageReference: inspect.imageID,
+                capturedPNG: png
             )
             lastReason = ""
             return true
@@ -313,7 +332,10 @@ public final class BotComputerGuestService: @unchecked Sendable {
             screenURL: url,
             pngHash: hash,
             pngMagic: Self.pngMagic(png),
-            resumed: resumed
+            resumed: resumed,
+            containerID: name,
+            imageReference: inspect.imageID,
+            capturedPNG: png
         )
         lastReady = ready
         lastReason = ""
@@ -445,6 +467,38 @@ public final class BotComputerGuestService: @unchecked Sendable {
         return (png, hash, Self.pngMagic(png))
     }
 
+    public func remoteFrame(
+        botID: BotID,
+        ready: BotComputerGuestReady? = nil
+    ) throws -> BotComputerGuestFrameEvidence {
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        let inspect = try docker.inspect(name: name)
+        guard inspect.running else { throw BotComputerGuestError.notReady }
+        let png: Data
+        if let ready {
+            guard ready.containerID == name,
+                  ready.imageReference == inspect.imageID,
+                  ready.pngHash == (try BotComputerGuestObserve.validatePNG(ready.capturedPNG)),
+                  ready.pngMagic == Self.pngMagic(ready.capturedPNG) else {
+                throw BotComputerGuestError.notReady
+            }
+            png = ready.capturedPNG
+        } else {
+            png = try waitForPNG(name: name)
+        }
+        let hash = try BotComputerGuestObserve.validatePNG(png)
+        let dimensions = try Self.pngDimensions(png)
+        return BotComputerGuestFrameEvidence(
+            containerID: name,
+            imageReference: inspect.imageID,
+            viewerPath: "/vnc.html",
+            pixelWidth: dimensions.width,
+            pixelHeight: dimensions.height,
+            png: png,
+            pngHash: hash
+        )
+    }
+
     public func act(botID: BotID, steps: [BotComputerActStep]) throws {
         try BotComputerGuestObserve.assertActStepCount(steps.count)
         _ = try provision(botID: botID)
@@ -465,17 +519,44 @@ public final class BotComputerGuestService: @unchecked Sendable {
     }
 
     public func removeGuestRuntime(botID: BotID) throws {
-        var firstError: Error?
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        var removalError: Error?
         do {
-            try docker.remove(name: BotComputerGuestSpec.containerName(botID: botID))
+            try docker.remove(name: name)
         } catch {
-            firstError = error
+            removalError = error
         }
         do {
             try docker.removeNetwork(name: BotComputerGuestSpec.networkName(botID: botID))
         } catch {
-            if firstError == nil { firstError = error }
+            // Network cleanup is independent from executable container state.
+            // Verify the canonical runtime below before deciding the receipt.
         }
-        if let firstError { throw firstError }
+        let runtimeExists: Bool
+        do {
+            runtimeExists = try docker.containerExists(name: name)
+        } catch {
+            throw removalError ?? error
+        }
+        guard runtimeExists == false else {
+            throw removalError ?? BotComputerDockerError.provisioningFailed
+        }
+    }
+
+    private static func pngDimensions(_ data: Data) throws -> (width: Int, height: Int) {
+        guard data.count >= 24,
+              data.prefix(8) == Data([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+              data[12..<16] == Data("IHDR".utf8) else {
+            throw BotComputerGuestError.observeFailed
+        }
+        func value(at offset: Int) -> Int {
+            data[offset..<(offset + 4)].reduce(0) { ($0 << 8) | Int($1) }
+        }
+        let width = value(at: 16)
+        let height = value(at: 20)
+        guard width > 0, height > 0, width <= 8_192, height <= 8_192 else {
+            throw BotComputerGuestError.observeFailed
+        }
+        return (width, height)
     }
 }

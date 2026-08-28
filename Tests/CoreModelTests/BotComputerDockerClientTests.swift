@@ -2,6 +2,24 @@ import XCTest
 @testable import CoreModel
 
 final class BotComputerDockerClientTests: XCTestCase {
+    func test_containerExistsUsesAnExactAnchoredDockerCensus() throws {
+        // WHY: cleanup may forgive a failed rm only after Docker proves the
+        // exact canonical container is absent; prefix matches are not proof.
+        var calls: [[String]] = []
+        let present = BotComputerDockerCLI { args in
+            calls.append(args)
+            return Data("container-id\n".utf8)
+        }
+
+        XCTAssertTrue(try present.containerExists(name: "remotecode-bot-exact"))
+        XCTAssertEqual(calls, [["ps", "-aq", "--filter", "name=^/remotecode-bot-exact$"]])
+
+        let absent = BotComputerDockerCLI { _ in Data() }
+        XCTAssertFalse(try absent.containerExists(name: "remotecode-bot-exact"))
+        let unknown = BotComputerDockerCLI { _ in throw BotComputerDockerError.daemonUnavailable }
+        XCTAssertThrowsError(try unknown.containerExists(name: "remotecode-bot-exact"))
+    }
+
     func test_runProcessReturnsOutputLargerThanPipeCapacity() throws {
         // WHY: a real guest PNG is often larger than the OS pipe capacity, so
         // the runner must consume all bytes while the child is still writing.

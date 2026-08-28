@@ -100,6 +100,28 @@ public struct TokenSaverOutboundDelivery: Sendable {
     }
 }
 
+/// Process-local bearer for the exact currently active Agent run. The raw
+/// capability is never persisted; the durable orchestration receipt stores only
+/// its SHA-256 digest and remains the authority for thread/run/expiry checks.
+public struct AgentActiveDelegationCapability: Sendable, Equatable {
+    public let threadId: AgentThreadID
+    public let runId: AgentRunID
+    public let capability: String
+    public let expiresAt: Date
+
+    public init(
+        threadId: AgentThreadID,
+        runId: AgentRunID,
+        capability: String,
+        expiresAt: Date
+    ) {
+        self.threadId = threadId
+        self.runId = runId
+        self.capability = capability
+        self.expiresAt = expiresAt
+    }
+}
+
 /// Resolves an async translator/timeout race exactly once without structured
 /// concurrency waiting for the losing task. A local model can block in native
 /// code and ignore cancellation; the provider turn still has to complete.
@@ -1090,6 +1112,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var providers: [AgentProvider: AgentProviderAdapter]
     private var active: [AgentRunID: AgentRunHandle] = [:]
     private var activeThreads: [AgentThreadID: AgentRunID] = [:]
+    /// Raw delegation bearers exist only while this coordinator owns the exact
+    /// active run. Durable receipts retain only the digest.
+    private var activeDelegationCapabilities: [AgentRunID: (threadId: AgentThreadID, capability: String)] = [:]
     /// Every run-scoped in-memory residue must retain this association while it
     /// exists. Durable rows can cascade away before a late cumulative usage
     /// snapshot or receipt retry is cleared, so those maps cannot reconstruct a
@@ -1701,6 +1726,42 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public func activeRunId(threadId: AgentThreadID) -> AgentRunID? {
         lock.lock(); defer { lock.unlock() }
         return activeThreads[threadId]
+    }
+
+    /// Returns the raw bearer only when the in-memory owner, durable receipt,
+    /// exact thread/run binding, and lease expiry all still agree.
+    public func activeDelegationCapability(
+        threadId: AgentThreadID,
+        runId: AgentRunID
+    ) throws -> AgentActiveDelegationCapability? {
+        guard let orchestrationRuntime else { return nil }
+        lock.lock()
+        let stored = activeThreads[threadId] == runId
+            ? activeDelegationCapabilities[runId]
+            : nil
+        lock.unlock()
+        guard let stored, stored.threadId == threadId,
+              let receipt = try orchestrationRuntime.activeReceipt(
+                runId: runId,
+                threadId: threadId,
+                delegationCapability: stored.capability
+              ),
+              let expiresAt = receipt.deadlineAt,
+              expiresAt > Date() else {
+            return nil
+        }
+        lock.lock()
+        let stillOwned = activeThreads[threadId] == runId
+            && activeDelegationCapabilities[runId]?.threadId == threadId
+            && activeDelegationCapabilities[runId]?.capability == stored.capability
+        lock.unlock()
+        guard stillOwned else { return nil }
+        return AgentActiveDelegationCapability(
+            threadId: threadId,
+            runId: runId,
+            capability: stored.capability,
+            expiresAt: expiresAt
+        )
     }
 
     #if DEBUG
@@ -2390,6 +2451,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         if terminalStatus == nil {
             active[runId] = handle
             activeThreads[effectiveRequest.threadId] = runId
+            if let delegationCapability {
+                activeDelegationCapabilities[runId] = (
+                    threadId: effectiveRequest.threadId,
+                    capability: delegationCapability
+                )
+            }
             activeRunMetadata[runId] = (effectiveRequest.provider, effectiveRequest.providerInstanceId, effectiveRequest.model, effectiveRequest.cwd, effectiveRequest.serviceTier, effectiveRequest.permissionMode, effectiveRequest.interactionMode, adapterKey, binaryIdentity)
             // A runner may emit synchronously before sendTurn returns. Preserve
             // the sequence already assigned to those buffered events instead of
@@ -3619,6 +3686,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// callback run, preserving any active or foreign run on the same thread.
     private func purgeRunRuntimeLocked(_ runId: AgentRunID) {
         active.removeValue(forKey: runId)
+        activeDelegationCapabilities.removeValue(forKey: runId)
         activeRunMetadata.removeValue(forKey: runId)
         activeWireRequestTexts.removeValue(forKey: runId)
         activeTurnIds.removeValue(forKey: runId)
@@ -4204,6 +4272,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         var activeProjection: ActiveRunProjection?
         if let runId {
             active.removeValue(forKey: runId)
+            activeDelegationCapabilities.removeValue(forKey: runId)
             if activeThreads.removeValue(forKey: threadId) != nil {
                 activeProjection = activeRunProjectionLocked()
             }
@@ -4321,6 +4390,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // Cancel any still-registered handle so provider processes do not outlive
         // the durable terminal row (Stop-after-partial-finish path).
         let handle = active.removeValue(forKey: runId)
+        activeDelegationCapabilities.removeValue(forKey: runId)
         if activeThreads[threadId] == runId {
             activeThreads.removeValue(forKey: threadId)
         }
@@ -7421,6 +7491,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
             externalReceiptLeaseWorkItems.removeValue(forKey: runId)?.cancel()
             active.removeValue(forKey: runId)
+            activeDelegationCapabilities.removeValue(forKey: runId)
             activeThreads.removeValue(forKey: threadId)
             activeRunMetadata.removeValue(forKey: runId)
             activeWireRequestTexts.removeValue(forKey: runId)

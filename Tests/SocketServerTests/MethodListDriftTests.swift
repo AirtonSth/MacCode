@@ -24,6 +24,7 @@ final class MethodListDriftTests: XCTestCase {
         "files.tab.split",
         "files.state.get",
         "files.state.update",
+        "files.edit.session",
         "files.edit.open",
         "files.edit.apply_patch",
         "files.edit.save",
@@ -105,6 +106,30 @@ final class MethodListDriftTests: XCTestCase {
                       "methods in our contract list are missing from capabilities response: \(missing.sorted())")
         XCTAssertTrue(extra.isEmpty,
                       "capabilities response advertises extra methods not in our contract list: \(extra.sorted()) -- add them to the static list in this test so iOS can rely on them")
+    }
+
+    func test_filesEditSessionIsLegacyDiscoveryWithoutV1Claim() async {
+        // WHY: session readback closes legacy response-loss recovery, but it must
+        // not opt clients into the stricter bounded edit_v1 protocol by accident.
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let response = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "system.capabilities",
+            params: nil
+        ))
+        let authenticatedFiles = response.result?.objectValue?["files"]?.objectValue
+        let publicFiles = DirectHTTPServer.capabilitiesPayload(loopbackOnly: true)["files"] as? [String: Any]
+
+        XCTAssertEqual(
+            authenticatedFiles?["methods"]?.arrayValue?.contains(.string("files.edit.session")),
+            true
+        )
+        XCTAssertNil(authenticatedFiles?["edit_v1"], "legacy session discovery must not claim edit_v1")
+        XCTAssertTrue(
+            (publicFiles?["methods"] as? [String])?.contains("files.edit.session") == true
+        )
+        XCTAssertNil(publicFiles?["edit_v1"], "public discovery must not claim edit_v1")
     }
 
     func test_capabilitiesResponse_sshMethodsMatchStaticList() async {

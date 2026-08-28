@@ -130,6 +130,15 @@ final class ConnectionContractPhase0Tests: XCTestCase {
         }
     }
 
+    func test_eventKindAcceptsCanonicalNamespaceWithUnderscore() throws {
+        // WHY: token_saver.digest is the canonical macOS producer and iOS
+        // reducer name. Rejecting an underscore only in the first namespace
+        // segment makes every retained digest terminate WebSocket replay.
+        var object = try fixtureObject("event")
+        object["kind"] = "token_saver.digest"
+        XCTAssertNoThrow(try ConnectionTransportFrame.decodeStrict(try jsonData(object)))
+    }
+
     func test_optionalFieldsEncodeAsExplicitNullAndRemainStrictlyDecodable() throws {
         let closing = ConnectionTransportFrame.closing(ConnectionClosingFrame(
             protocolVersion: 3, type: "closing", connectionId: "connection-1",

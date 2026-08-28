@@ -1,6 +1,7 @@
 import XCTest
 @testable import SocketServer
 import CoreModel
+import Darwin
 
 /// QA-mac:45 -- real-socket integration coverage for `/v1/ws`. Previously only
 /// `WebSocketOutboundQueue` and `pongFrame` were unit-tested; nothing exercised
@@ -133,6 +134,67 @@ final class WebSocketIntegrationTests: XCTestCase {
     private func uniqueEventKind(_ prefix: String) -> String {
         let suffix = UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: "")
         return "\(prefix).\(suffix)"
+    }
+
+    private func connectRawLoopback(port: UInt16) throws -> Int32 {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw POSIXError(.EIO) }
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(port).bigEndian
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let connected = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard connected == 0 else {
+            Darwin.close(fd)
+            throw POSIXError(.ECONNREFUSED)
+        }
+        return fd
+    }
+
+    private func writeAll(_ data: Data, to fd: Int32) throws {
+        var offset = 0
+        while offset < data.count {
+            let written = data.withUnsafeBytes { bytes in
+                Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), data.count - offset)
+            }
+            guard written > 0 else { throw POSIXError(.EIO) }
+            offset += written
+        }
+    }
+
+    private func maskedPing(payload: [UInt8]) -> Data {
+        let mask: [UInt8] = [0x37, 0xFA, 0x21, 0x3D]
+        var frame: [UInt8] = [0x89, 0x80 | UInt8(payload.count)]
+        frame.append(contentsOf: mask)
+        frame.append(contentsOf: payload.enumerated().map { index, byte in
+            byte ^ mask[index & 3]
+        })
+        return Data(frame)
+    }
+
+    private func receiveRaw(
+        from fd: Int32,
+        until expected: Data,
+        timeoutSeconds: Double = 2
+    ) async -> Data {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        var received = Data()
+        var bytes = [UInt8](repeating: 0, count: 4096)
+        while Date() < deadline {
+            let count = Darwin.recv(fd, &bytes, bytes.count, MSG_DONTWAIT)
+            if count > 0 {
+                received.append(bytes, count: count)
+                if received.range(of: expected) != nil { return received }
+            } else if count == 0 {
+                return received
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return received
     }
 
     func test_CONN001_firstFrameIsCanonicalWelcomeBeforeReplay() async throws {
@@ -430,6 +492,38 @@ final class WebSocketIntegrationTests: XCTestCase {
         await fulfillment(of: [pong, welcome], timeout: 2)
     }
 
+    func testWebSocketPreservesInitialPingCoalescedWithHTTPUpgrade() async throws {
+        // WHY: Foundation/iOS may put the first ping in the same TCP read as
+        // the HTTP upgrade. Node-style clients normally wait for 101 before
+        // writing a frame. Both wire orderings must reach wsServeLoop.
+        let (server, port) = try startServer(clientReceiveTimeoutSeconds: 2)
+        defer { server.stop() }
+        let fd = try connectRawLoopback(port: port)
+        defer { Darwin.close(fd) }
+        let payload = Array("iOS".utf8)
+        let request = Data(
+            ("GET /v1/ws HTTP/1.1\r\n" +
+             "Host: 127.0.0.1:\(port)\r\n" +
+             "Upgrade: websocket\r\n" +
+             "Connection: Upgrade\r\n" +
+             "Sec-WebSocket-Version: 13\r\n" +
+             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+             "X-RC2-Since-Seq: \(EventBus.shared.currentSeq)\r\n\r\n").utf8
+        )
+        try writeAll(request + maskedPing(payload: payload), to: fd)
+
+        let pong = Data([0x8A, UInt8(payload.count)] + payload)
+        let response = await receiveRaw(from: fd, until: pong)
+        XCTAssertNotNil(
+            response.range(of: Data("HTTP/1.1 101 Switching Protocols".utf8)),
+            "the raw client must complete the HTTP upgrade"
+        )
+        XCTAssertNotNil(
+            response.range(of: pong),
+            "the ping already buffered after the upgrade headers must receive a pong"
+        )
+    }
+
     func test_CONN002_malformedOrUnknownClientEnvelope_failsClosedWithTypedErrorAndClosing() async throws {
         for invalid in [
             "{not-json",
@@ -480,6 +574,28 @@ final class WebSocketIntegrationTests: XCTestCase {
         XCTAssertEqual((event["bootEpoch"] as? NSNumber)?.uint64Value, bootEpoch)
         XCTAssertEqual((event["sequence"] as? NSNumber)?.int64Value, baseline + 1)
         XCTAssertNil(event["seq"], "v3 events must use the canonical sequence field")
+    }
+
+    func testRetainedTokenSaverDigestReplaysWithoutInvalidEventClose() async throws {
+        // WHY: token_saver.digest is retained before mobile reconnect. The
+        // canonical underscore namespace must replay as an event instead of
+        // terminating the new socket with closing.reason=invalidEvent.
+        let baseline = EventBus.shared.currentSeq
+        EventBus.shared.publish(
+            kind: "token_saver.digest",
+            payload: .object(["enabled": .bool(false)])
+        )
+        let (server, port) = try startServer(serverId: "token-saver-host")
+        defer { server.stop() }
+        let task = wsTask(port: port, sinceSeq: baseline)
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+
+        let welcome = try object(from: await receiveWithTimeout(task))
+        XCTAssertEqual(welcome["type"] as? String, "welcome")
+        let event = try await receiveEvent(task, kind: "token_saver.digest")
+        XCTAssertEqual(event["type"] as? String, "event")
+        XCTAssertEqual((event["sequence"] as? NSNumber)?.int64Value, baseline + 1)
+        XCTAssertEqual(event["hostId"] as? String, "token-saver-host")
     }
 
     func test_CONN005_welcomeExposesReplayWindowForGapDetection() async throws {
@@ -599,6 +715,30 @@ final class WebSocketIntegrationTests: XCTestCase {
         EventBus.shared.publish(kind: kind, payload: .object(["live": .bool(true)]))
         let event = try await receiveEvent(task, kind: kind)
         XCTAssertEqual(event["connectionId"] as? String, connectionId)
+    }
+
+    func test_CONN009_clientControlPingDoesNotSuppressTypedHeartbeat() async throws {
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        let task = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+        let welcome = try object(from: await receiveWithTimeout(task))
+        XCTAssertEqual((welcome["heartbeatIntervalMs"] as? NSNumber)?.int64Value, 10_000)
+
+        // Reproduce Foundation's ordering near the first heartbeat. Before the
+        // fix, the server counted this control ping as useful application
+        // traffic and postponed the typed heartbeat until the iOS deadline.
+        try await Task.sleep(nanoseconds: 8_000_000_000)
+        let pong = expectation(description: "client RFC ping receives pong")
+        task.sendPing { error in
+            XCTAssertNil(error)
+            pong.fulfill()
+        }
+        await fulfillment(of: [pong], timeout: 3)
+
+        let heartbeat = try object(from: await receiveWithTimeout(task, seconds: 4))
+        XCTAssertEqual(heartbeat["type"] as? String, "heartbeat")
+        XCTAssertEqual(heartbeat["connectionId"] as? String, welcome["connectionId"] as? String)
     }
 
     func testWebSocketCloseUnsubscribesEventBus() async throws {

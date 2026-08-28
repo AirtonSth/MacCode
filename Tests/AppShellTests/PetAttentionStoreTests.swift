@@ -1015,6 +1015,13 @@ final class PetAttentionStoreTests: XCTestCase {
         XCTAssertFalse(items[0].title.contains("secret"))
         XCTAssertFalse((items[0].detail ?? "").contains("private"))
         XCTAssertFalse(items.contains { if case .botsDesk(let id) = $0.route { return id == muted.id }; return false })
+
+        _ = try bots.updateProfile(id: muted.id, notificationsEnabled: true)
+        let resumed = try store.refresh().items
+        XCTAssertTrue(
+            resumed.contains { if case .botsDesk(let id) = $0.route { return id == muted.id }; return false },
+            "re-enabling must project the same authoritative Bot destination without rewriting attention"
+        )
     }
 
     func test_destLinkedThreadIsNotProjectedAsAgentAppRow() throws {

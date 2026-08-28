@@ -54,6 +54,9 @@ public final class BotStore: @unchecked Sendable {
     private let db: SQLiteDB
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
+#if DEBUG
+    var onBeforePublishCommitForTesting: (() throws -> Void)?
+#endif
     private let dates = LockedISO8601Formatter({
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
@@ -326,21 +329,35 @@ public final class BotStore: @unchecked Sendable {
         draft: BotRevisionDraft,
         avatarSymbol: String? = nil,
         notificationsEnabled: Bool? = nil,
-        now: Date = Date()
+        now: Date = Date(),
+        beforeCommit: ((BotRevision) throws -> Void)? = nil,
+        onRollback: (() throws -> Void)? = nil
     ) throws -> BotRevision {
-        try db.transaction {
-            guard let bot = try loadBot(id: botID, database: db), bot.deletedAt == nil else {
-                throw BotStoreError.notFound
+        var externalMutationApplied = false
+        do {
+            return try db.transaction {
+                guard let bot = try loadBot(id: botID, database: db), bot.deletedAt == nil else {
+                    throw BotStoreError.notFound
+                }
+                let revision = try publishLocked(
+                    bot: bot,
+                    expectedCurrentRevisionID: expectedCurrentRevisionID,
+                    draft: draft,
+                    avatarSymbol: avatarSymbol ?? bot.avatarSymbol,
+                    notificationsEnabled: notificationsEnabled ?? bot.notificationsEnabled,
+                    now: now,
+                    database: db
+                )
+                try beforeCommit?(revision)
+                externalMutationApplied = beforeCommit != nil
+#if DEBUG
+                try onBeforePublishCommitForTesting?()
+#endif
+                return revision
             }
-            return try publishLocked(
-                bot: bot,
-                expectedCurrentRevisionID: expectedCurrentRevisionID,
-                draft: draft,
-                avatarSymbol: avatarSymbol ?? bot.avatarSymbol,
-                notificationsEnabled: notificationsEnabled ?? bot.notificationsEnabled,
-                now: now,
-                database: db
-            )
+        } catch {
+            if externalMutationApplied { try onRollback?() }
+            throw error
         }
     }
 
@@ -472,6 +489,16 @@ public final class BotStore: @unchecked Sendable {
             try tombstone.bind(2, id.value.uuidString.lowercased())
             try tombstone.bind(3, string(now))
             _ = try tombstone.step()
+
+            let acknowledgeAttention = try db.prepare("""
+                UPDATE bot_attention_items
+                SET acknowledged_at = COALESCE(acknowledged_at, ?)
+                WHERE bot_id = ?;
+                """)
+            defer { acknowledgeAttention.reset() }
+            try acknowledgeAttention.bind(1, string(now))
+            try acknowledgeAttention.bind(2, id.value.uuidString.lowercased())
+            _ = try acknowledgeAttention.step()
 
             try executeBound("DELETE FROM bot_conversations WHERE bot_id = ?;", id: id)
             try executeBound("DELETE FROM bot_skill_bindings WHERE bot_id = ?;", id: id)

@@ -84,8 +84,11 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
     private(set) var createWorkspaceCallCount = 0
     private(set) var finalizationCallCount = 0
     private(set) var synchronousBatchEffectCallCount = 0
+    private(set) var pairedBotRemoteCallCount = 0
     private(set) var phase4ClaimCallCount = 0
     private(set) var finalizedEventKinds: [String: [String]] = [:]
+    private(set) var finalizedEvents: [String: [EventBus.MutationEventIntent]] = [:]
+    private(set) var botAttentionBindings: [(profileID: String, hostID: String, deviceID: String)] = []
     private var phase4Receipts: [String: Receipt] = [:]
 
     private func phase4ReceiptKey(method: String, clientRequestId: String) -> String {
@@ -95,6 +98,15 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
     override func createWorkspace(name: String, cwd: String) throws -> Workspace {
         createWorkspaceCallCount += 1
         return try super.createWorkspace(name: name, cwd: cwd)
+    }
+
+    override func dispatchPairedBotRemote(
+        method: String,
+        params: [String: JSONValue]
+    ) async throws -> JSONValue {
+        pairedBotRemoteCallCount += 1
+        synchronousBatchEffectCallCount += 1
+        return try await super.dispatchPairedBotRemote(method: method, params: params)
     }
 
     override func selectWorkspace(_ id: WorkspaceID) throws {
@@ -371,6 +383,10 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
     ) throws -> JSONValue {
         synchronousBatchEffectCallCount += 1
         return .object(["ok": .bool(true)])
+    }
+
+    override func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws {
+        botAttentionBindings.append((profileID, hostID, deviceID))
     }
 
     private func phase4FileEditResult(sessionID: String, action: String) throws -> JSONValue {
@@ -739,7 +755,9 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
             throw Phase4InjectedReceiptUnavailable()
         }
         finalizationCallCount += 1
-        finalizedEventKinds[phase4ReceiptKey(method: method, clientRequestId: clientRequestId)] = events.map(\.kind)
+        let key = phase4ReceiptKey(method: method, clientRequestId: clientRequestId)
+        finalizedEventKinds[key] = events.map(\.kind)
+        finalizedEvents[key] = events
         try commitCommandReceipt(
             method: method,
             clientRequestId: clientRequestId,
@@ -1163,7 +1181,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
     func test_canonicalManifestExactlyMatchesDispatcherMutationCatalog() throws {
         let canonical = try canonicalMutationMethods()
 
-        XCTAssertEqual(canonical.count, 99)
+        XCTAssertEqual(canonical.count, 142)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }
@@ -1279,7 +1297,11 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
                 method: method,
                 params: HostMutationContract.validPreflightProbe(method: method)
             ), method)
-            let probes = HostMutationContract.invalidPreflightProbes(method: method)
+            let probes = HostMutationContract.invalidPreflightProbes(method: method).filter { probe in
+                // Bot host identity is supplied by the authenticated transport,
+                // so client-declared host variants cannot exercise preflight.
+                !(method.hasPrefix("bot.") && probe.label.hasPrefix("host_id."))
+            }
             XCTAssertEqual(probes.isEmpty, parameterless.contains(method), method)
             covered.insert(method)
             for (index, probe) in probes.enumerated() {
@@ -1289,6 +1311,14 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
                 params["connection_id"] = .string("phase4-connection")
                 params["expected_host_id"] = .string("phase4-host")
                 params["expected_boot_epoch"] = .number(1)
+                if method == "private.push_token.update",
+                   params["server_id"]?.stringValue == "server" {
+                    // Typed push probes use a neutral valid sentinel. At the
+                    // authenticated HTTP boundary it must name this host so the
+                    // individual syntax defect, rather than host confirmation,
+                    // is the rejection being exercised.
+                    params["server_id"] = .string(context.hostId)
+                }
                 let response = await dispatcher.dispatch(JSONRPCRequest(
                     jsonrpc: "2.0",
                     id: .string("\(method):\(probe.label)"),
@@ -1296,7 +1326,9 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
                     params: params
                 ), mutationContext: context)
 
-                XCTAssertEqual(response.error?.code, -32602, "\(method):\(probe.label)")
+                let expectedCode = method == "private.push_token.update"
+                    && probe.label == "server_id.empty" ? -32098 : -32602
+                XCTAssertEqual(response.error?.code, expectedCode, "\(method):\(probe.label)")
                 XCTAssertNil(response.result, "\(method):\(probe.label)")
             }
         }
@@ -2021,6 +2053,191 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         }
     }
 
+    /// WHY: profile_id is local iOS routing identity. The Mac may persist it
+    /// only when a bearer-authenticated push registration binds the exact
+    /// device to this host; a client-declared foreign host must never bind.
+    func test_privatePushRegistrationBindsBotAttentionProfileToAuthenticatedHost() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_733)
+        defer { live.stop() }
+        var params = live.mutationParams(
+            requestId: "attention-profile-binding",
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        params.removeValue(forKey: "thread_id")
+        params.removeValue(forKey: "text")
+        params["push_token"] = "opaque-alert-token"
+        params["push_token_type"] = "apns"
+        params["device_id"] = "ios-device-1"
+        params["profile_id"] = "ios-profile-1"
+
+        let first = try await live.rpc(method: "private.push_token.update", params: params)
+        let replay = try await live.rpc(method: "private.push_token.update", params: params)
+        XCTAssertNil(first["error"])
+        XCTAssertEqual(first["result"] as? NSDictionary, replay["result"] as? NSDictionary)
+        XCTAssertEqual(router.botAttentionBindings.count, 1)
+        XCTAssertEqual(router.botAttentionBindings.first?.profileID, "ios-profile-1")
+        XCTAssertEqual(router.botAttentionBindings.first?.hostID, Phase4LiveServer.hostId)
+        XCTAssertEqual(router.botAttentionBindings.first?.deviceID, "ios-device-1")
+
+        var foreign = params
+        foreign["client_request_id"] = "attention-profile-foreign-host"
+        foreign["server_id"] = "foreign-host"
+        let rejected = try await live.rpc(method: "private.push_token.update", params: foreign)
+        XCTAssertNotNil(rejected["error"])
+        XCTAssertEqual(router.botAttentionBindings.count, 1)
+    }
+
+    /// WHY: only the exact completed acknowledgement may advance remote UI.
+    /// The canonical event must preserve the same profile/host/item/Bot tuple;
+    /// failed acknowledgements remain eventless.
+    func test_botAttentionAckPublishesExactCompletedIdentityAndNoFailedEvent() async throws {
+        let botID = UUID().uuidString.lowercased()
+        let itemID = UUID().uuidString.lowercased()
+        let profileID = UUID().uuidString.lowercased()
+        let router = Phase4ReceiptFakeRouter()
+        router.pairedBotRemoteResult = .object([
+            "status": .string("completed"),
+            "request_id": .string("attention-ack-completed"),
+            "receipt_id": .string("attention-receipt"),
+            "bot_id": .string(botID),
+            "readback": .object([
+                "state": .string("none"),
+                "profile_id": .string(profileID),
+                "host_id": .string(Phase4LiveServer.hostId),
+                "attention_item_id": .string(itemID),
+                "notification_id": .string(itemID),
+                "bot_id": .string(botID),
+                "source": .string("bot"),
+            ]),
+        ])
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_734)
+        defer { live.stop() }
+        var params = live.mutationParams(
+            requestId: "attention-ack-completed",
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        params.removeValue(forKey: "thread_id")
+        params.removeValue(forKey: "text")
+        params["profile_id"] = profileID
+        params["attention_item_id"] = itemID
+        params["bot_id"] = botID
+        _ = try await live.rpc(method: "bot.attention.ack", params: params)
+        let event = try XCTUnwrap(router.finalizedEvents["bot.attention.ack:attention-ack-completed"]?.first)
+        XCTAssertEqual(event.kind, "bot.attention.updated")
+        let payload = try XCTUnwrap(event.payload.objectValue)
+        XCTAssertEqual(payload["profile_id"]?.stringValue, profileID)
+        XCTAssertEqual(payload["host_id"]?.stringValue, Phase4LiveServer.hostId)
+        XCTAssertEqual(payload["attention_item_id"]?.stringValue, itemID)
+        XCTAssertEqual(payload["notification_id"]?.stringValue, itemID)
+        XCTAssertEqual(payload["bot_id"]?.stringValue, botID)
+
+        let failedRouter = Phase4ReceiptFakeRouter()
+        failedRouter.pairedBotRemoteResult = .object([
+            "status": .string("failed"),
+            "request_id": .string("attention-ack-failed"),
+            "receipt_id": .string("attention-failed-receipt"),
+            "bot_id": .string(botID),
+            "readback": .object(["state": .string("finished")]),
+        ])
+        let failedLive = try await Phase4LiveServer.start(router: failedRouter, bootEpoch: 1_735)
+        defer { failedLive.stop() }
+        params["client_request_id"] = "attention-ack-failed"
+        _ = try await failedLive.rpc(method: "bot.attention.ack", params: params)
+        XCTAssertTrue(failedRouter.finalizedEvents["bot.attention.ack:attention-ack-failed"]?.isEmpty ?? true)
+    }
+
+    /// WHY: iOS schedules Bot OS notifications only from notification.created.
+    /// A completed host mutation must atomically publish one scheduler-ready
+    /// payload, replay it zero times, and never publish it for accepted/failed.
+    func test_finishedBotAttentionPublishesOneCanonicalNotificationForIOSScheduler() async throws {
+        let botID = UUID().uuidString.lowercased()
+        let itemID = UUID().uuidString.lowercased()
+        let profileID = UUID().uuidString.lowercased()
+        let notification: JSONValue = .object([
+            "id": .string(itemID),
+            "title": .string("Scheduled Bot finished"),
+            "body": .string("The result is ready."),
+            "category": .string("RemoteCodeThreadUpdate"),
+            "profile_id": .string(profileID),
+            "host_id": .string(Phase4LiveServer.hostId),
+            "attention_item_id": .string(itemID),
+            "notification_id": .string(itemID),
+            "bot_id": .string(botID),
+            "source": .string("routine"),
+        ])
+        let router = Phase4ReceiptFakeRouter()
+        router.pairedBotRemoteResult = .object([
+            "status": .string("completed"),
+            "request_id": .string("bot-notification-completed"),
+            "receipt_id": .string("bot-notification-receipt"),
+            "readback": .object([
+                "runs": .array([]),
+                "notifications": .array([notification]),
+            ]),
+        ])
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_736)
+        defer { live.stop() }
+        var params = live.mutationParams(
+            requestId: "bot-notification-completed",
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        params.removeValue(forKey: "thread_id")
+        params.removeValue(forKey: "text")
+        let first = try await live.rpc(method: "bot.scheduler.tick", params: params)
+        let replay = try await live.rpc(method: "bot.scheduler.tick", params: params)
+        XCTAssertEqual(first["result"] as? NSDictionary, replay["result"] as? NSDictionary)
+        XCTAssertEqual(router.pairedBotRemoteCallCount, 1)
+        XCTAssertEqual(router.finalizationCallCount, 1)
+        let events = try XCTUnwrap(
+            router.finalizedEvents["bot.scheduler.tick:bot-notification-completed"]
+        )
+        XCTAssertEqual(events.map(\.kind), ["bot.scheduler.updated", "notification.created"])
+        let payload = try XCTUnwrap(events.last?.payload.objectValue)
+        XCTAssertEqual(payload["id"]?.stringValue, itemID)
+        XCTAssertEqual(payload["title"]?.stringValue, "Scheduled Bot finished")
+        XCTAssertEqual(payload["body"]?.stringValue, "The result is ready.")
+        XCTAssertEqual(payload["category"]?.stringValue, "RemoteCodeThreadUpdate")
+        XCTAssertEqual(payload["profile_id"]?.stringValue, profileID)
+        XCTAssertEqual(payload["host_id"]?.stringValue, Phase4LiveServer.hostId)
+        XCTAssertEqual(payload["attention_item_id"]?.stringValue, itemID)
+        XCTAssertEqual(payload["notification_id"]?.stringValue, itemID)
+        XCTAssertEqual(payload["bot_id"]?.stringValue, botID)
+        XCTAssertEqual(payload["source"]?.stringValue, "routine")
+        XCTAssertNil(payload["conversation_id"])
+
+        for status in ["accepted", "failed"] {
+            let terminalRouter = Phase4ReceiptFakeRouter()
+            let requestID = "bot-notification-\(status)"
+            terminalRouter.pairedBotRemoteResult = .object([
+                "status": .string(status),
+                "request_id": .string(requestID),
+                "receipt_id": .string("receipt-\(status)"),
+                "readback": .object(["notifications": .array([notification])]),
+            ])
+            let terminalLive = try await Phase4LiveServer.start(
+                router: terminalRouter,
+                bootEpoch: status == "accepted" ? 1_737 : 1_738
+            )
+            var terminalParams = terminalLive.mutationParams(
+                requestId: requestID,
+                threadId: AgentThreadID(),
+                text: "unused"
+            )
+            terminalParams.removeValue(forKey: "thread_id")
+            terminalParams.removeValue(forKey: "text")
+            _ = try await terminalLive.rpc(method: "bot.scheduler.tick", params: terminalParams)
+            XCTAssertTrue(
+                terminalRouter.finalizedEvents["bot.scheduler.tick:\(requestID)"]?.isEmpty ?? true,
+                status
+            )
+            terminalLive.stop()
+        }
+    }
+
     func test_gitSSHAndProjectLaunchBatchIsDurableAndNoReplay() async throws {
         let workspaceUUID = UUID()
         let workspaceID = workspaceUUID.uuidString
@@ -2620,6 +2837,609 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
 
         try assertStatusResult(committed, status: "committed", requestId: "status-committed")
         try assertStatusResult(absent, status: "absent", requestId: "status-absent")
+    }
+
+    /// WHY: paired Bot mutations used to return before the central receipt and
+    /// event transaction. A lost HTTP response then left iOS with neither a
+    /// replayable receipt nor a canonical event even though the Mac mutated.
+    func test_pairedBotMutationsFinalizeExactlyOnceWithCanonicalEvents() async throws {
+        let botID = UUID().uuidString.lowercased()
+        let routineID = UUID().uuidString.lowercased()
+        let conversationID = UUID().uuidString.lowercased()
+        let cases: [(method: String, params: [String: Any], event: String)] = [
+            ("bot.create", ["name": "Phase4 Bot"], "bot.created"),
+            ("bot.settings.set", ["bot_id": botID, "key": "notifications_enabled", "value": true], "bot.settings.updated"),
+            ("bot.routine.create", ["bot_id": botID, "name": "Daily", "prompt": "Report"], "bot.routine.updated"),
+            ("bot.routine.run", ["bot_id": botID, "routine_id": routineID], "bot.routine.run_requested"),
+            ("bot.conversation.select", ["bot_id": botID, "conversation_id": conversationID], "bot.conversation.selected"),
+            ("bot.delete", ["bot_id": botID], "bot.deleted"),
+        ]
+
+        for (index, testCase) in cases.enumerated() {
+            let router = Phase4ReceiptFakeRouter()
+            let requestID = "bot-phase4-\(index)"
+            router.pairedBotRemoteResult = .object([
+                "status": .string("completed"),
+                "request_id": .string(requestID),
+                "receipt_id": .string("receipt-\(index)"),
+                "bot_id": .string(botID),
+                "readback": .object([
+                    "bot_id": .string(botID),
+                    "routine_id": .string(routineID),
+                    "conversation_id": .string(conversationID),
+                ]),
+            ])
+            let live = try await Phase4LiveServer.start(
+                router: router,
+                bootEpoch: UInt64(1_400 + index)
+            )
+            var params = live.mutationParams(
+                requestId: requestID,
+                threadId: AgentThreadID(),
+                text: "unused"
+            )
+            params.removeValue(forKey: "thread_id")
+            params.removeValue(forKey: "text")
+            for (key, value) in testCase.params { params[key] = value }
+
+            let first = try await live.rpc(method: testCase.method, params: params)
+            let replay = try await live.rpc(method: testCase.method, params: params)
+
+            XCTAssertNil(first["error"], testCase.method)
+            XCTAssertEqual(first["result"] as? NSDictionary, replay["result"] as? NSDictionary, testCase.method)
+            XCTAssertEqual(router.pairedBotRemoteCallCount, 1, testCase.method)
+            XCTAssertEqual(router.finalizationCallCount, 1, testCase.method)
+            XCTAssertEqual(router.finalizedEventKinds["\(testCase.method):\(requestID)"], [testCase.event], testCase.method)
+            live.stop()
+        }
+    }
+
+    /// WHY: iOS removes published Bots through bot.delete and unpublished
+    /// drafts through bot.discard_new. Once either receipt proves durable Bot
+    /// absence, cleanup may still be partial, but replay must not redispatch or
+    /// lose the one canonical deletion event. A non-deletion never emits it.
+    func test_remoteBotRemovalPublishesOnlyDurableAbsenceWithCleanupReadback() async throws {
+        let botID = UUID().uuidString.lowercased()
+        for (index, method) in ["bot.delete", "bot.discard_new"].enumerated() {
+            let requestID = "remote-removal-partial-\(index)"
+            let router = Phase4ReceiptFakeRouter()
+            var readback: [String: JSONValue] = [
+                "bot_id": .string(botID),
+                "deleted": .bool(true),
+                "cleanup_complete": .bool(false),
+                "cleanup_residuals": .array([.string("docker_home")]),
+            ]
+            if method == "bot.discard_new" { readback["unpublished"] = .bool(false) }
+            router.pairedBotRemoteResult = .object([
+                "status": .string("partial"),
+                "request_id": .string(requestID),
+                "receipt_id": .string("\(requestID)-receipt"),
+                "bot_id": .string(botID),
+                "readback": .object(readback),
+            ])
+            let live = try await Phase4LiveServer.start(router: router, bootEpoch: UInt64(1_440 + index))
+            var params = live.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "unused")
+            params.removeValue(forKey: "thread_id")
+            params.removeValue(forKey: "text")
+            params["bot_id"] = botID
+            if method == "bot.delete" { params["confirm"] = "delete" }
+
+            let first = try await live.rpc(method: method, params: params)
+            let replay = try await live.rpc(method: method, params: params)
+
+            XCTAssertEqual(first["result"] as? NSDictionary, replay["result"] as? NSDictionary, method)
+            XCTAssertEqual(router.pairedBotRemoteCallCount, 1, method)
+            XCTAssertEqual(router.finalizationCallCount, 1, method)
+            let event = try XCTUnwrap(router.finalizedEvents["\(method):\(requestID)"]?.first, method)
+            XCTAssertEqual(event.kind, "bot.deleted", method)
+            let payload = try XCTUnwrap(event.payload.objectValue)
+            XCTAssertEqual(payload["bot_id"]?.stringValue, botID, method)
+            XCTAssertEqual(payload["deleted"]?.boolValue, true, method)
+            XCTAssertEqual(payload["cleanup_complete"]?.boolValue, false, method)
+            XCTAssertEqual(payload["cleanup_residuals"]?.arrayValue, [.string("docker_home")], method)
+            XCTAssertEqual(payload["unpublished"]?.boolValue, method == "bot.discard_new" ? false : nil, method)
+            live.stop()
+        }
+
+        for (index, status) in ["partial", "failed"].enumerated() {
+            let method = index == 0 ? "bot.delete" : "bot.discard_new"
+            let requestID = "remote-removal-not-deleted-\(status)"
+            let router = Phase4ReceiptFakeRouter()
+            router.pairedBotRemoteResult = .object([
+                "status": .string(status),
+                "request_id": .string(requestID),
+                "receipt_id": .string("\(requestID)-receipt"),
+                "bot_id": .string(botID),
+                "readback": .object([
+                    "bot_id": .string(botID),
+                    "deleted": .bool(false),
+                    "cleanup_complete": .bool(false),
+                    "cleanup_residuals": .array([.string("bot_store")]),
+                ]),
+            ])
+            let live = try await Phase4LiveServer.start(router: router, bootEpoch: UInt64(1_450 + index))
+            var params = live.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "unused")
+            params.removeValue(forKey: "thread_id")
+            params.removeValue(forKey: "text")
+            params["bot_id"] = botID
+            if method == "bot.delete" { params["confirm"] = "delete" }
+
+            _ = try await live.rpc(method: method, params: params)
+
+            XCTAssertEqual(router.pairedBotRemoteCallCount, 1, status)
+            XCTAssertEqual(router.finalizationCallCount, 1, status)
+            XCTAssertTrue(router.finalizedEvents["\(method):\(requestID)"]?.isEmpty ?? true, status)
+            live.stop()
+        }
+    }
+
+    /// WHY: a completed stop receipt without a durable event range can
+    /// leave iOS showing a live Stop control after the exact host run ended.
+    /// Only a terminal receipt carrying the matching host/Bot/run tuple may
+    /// publish, and replay must never stop or emit twice.
+    func test_botStopVariantsFinalizeOneExactRunEventWithoutFabricationOrReplay() async throws {
+        let botID = UUID().uuidString.lowercased()
+        let conversationID = UUID().uuidString.lowercased()
+        let runID = UUID().uuidString.lowercased()
+        let runRequestID = "original-send"
+        func stopReceipt(requestID: String, force: Bool) -> JSONValue {
+            .object([
+                "status": .string("completed"),
+                "request_id": .string(requestID),
+                "receipt_id": .string("\(requestID)-receipt"),
+                "bot_id": .string(botID),
+                "readback": .object([
+                    "accepted": .bool(true),
+                    "force": .bool(force),
+                    "terminal": .bool(true),
+                    "run": .object([
+                        "host_id": .string(Phase4LiveServer.hostId),
+                        "bot_id": .string(botID),
+                        "conversation_id": .string(conversationID),
+                        "request_id": .string(runRequestID),
+                        "client_request_id": .string(runRequestID),
+                        "run_id": .string(runID),
+                    ]),
+                ]),
+            ])
+        }
+        for (index, method) in ["bot.stop", "bot.force_stop"].enumerated() {
+            let force = method == "bot.force_stop"
+            let requestID = "bot-stop-\(index)"
+            let router = Phase4ReceiptFakeRouter()
+            router.pairedBotRemoteResult = stopReceipt(requestID: requestID, force: force)
+            let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_535 + UInt64(index))
+            var params = live.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "unused")
+            params.removeValue(forKey: "thread_id")
+            params.removeValue(forKey: "text")
+            params["bot_id"] = botID
+
+            let first = try await live.rpc(method: method, params: params)
+            let replay = try await live.rpc(method: method, params: params)
+
+            XCTAssertEqual(first["result"] as? NSDictionary, replay["result"] as? NSDictionary, method)
+            XCTAssertEqual(router.pairedBotRemoteCallCount, 1, method)
+            XCTAssertEqual(router.finalizationCallCount, 1, method)
+            let events = try XCTUnwrap(router.finalizedEvents["\(method):\(requestID)"], method)
+            XCTAssertEqual(events.count, 1, method)
+            let event = try XCTUnwrap(events.first)
+            XCTAssertEqual(event.kind, "bot.run.stop_requested", method)
+            let payload = try XCTUnwrap(event.payload.objectValue)
+            XCTAssertEqual(payload["host_id"]?.stringValue, Phase4LiveServer.hostId, method)
+            XCTAssertEqual(payload["bot_id"]?.stringValue, botID, method)
+            XCTAssertEqual(payload["conversation_id"]?.stringValue, conversationID, method)
+            XCTAssertEqual(payload["run_id"]?.stringValue, runID, method)
+            XCTAssertEqual(payload["request_id"]?.stringValue, runRequestID, method)
+            XCTAssertEqual(payload["client_request_id"]?.stringValue, runRequestID, method)
+            XCTAssertEqual(payload["stop_request_id"]?.stringValue, requestID, method)
+            XCTAssertEqual(payload["terminal"]?.boolValue, true, method)
+            XCTAssertEqual(payload["force"]?.boolValue, force, method)
+            live.stop()
+        }
+
+        let unmatchedRouter = Phase4ReceiptFakeRouter()
+        unmatchedRouter.pairedBotRemoteResult = .object([
+            "status": .string("completed"),
+            "request_id": .string("bot-force-stop-missing-run"),
+            "receipt_id": .string("force-stop-missing-run-receipt"),
+            "bot_id": .string(botID),
+            "readback": .object([
+                "accepted": .bool(true),
+                "force": .bool(true),
+                "terminal": .bool(true),
+                "run": .object([
+                    "host_id": .string(Phase4LiveServer.hostId),
+                    "bot_id": .string(botID),
+                    "conversation_id": .string(conversationID),
+                    "request_id": .string(runRequestID),
+                    "client_request_id": .string("other-send"),
+                    "run_id": .string(runID),
+                ]),
+            ]),
+        ])
+        let unmatchedLive = try await Phase4LiveServer.start(router: unmatchedRouter, bootEpoch: 1_536)
+        var unmatchedParams = unmatchedLive.mutationParams(
+            requestId: "bot-force-stop-missing-run",
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        unmatchedParams.removeValue(forKey: "thread_id")
+        unmatchedParams.removeValue(forKey: "text")
+        unmatchedParams["bot_id"] = botID
+
+        _ = try await unmatchedLive.rpc(method: "bot.force_stop", params: unmatchedParams)
+
+        XCTAssertEqual(unmatchedRouter.pairedBotRemoteCallCount, 1)
+        XCTAssertEqual(unmatchedRouter.finalizationCallCount, 1)
+        XCTAssertEqual(unmatchedRouter.finalizedEventKinds["bot.force_stop:bot-force-stop-missing-run"], [])
+        unmatchedLive.stop()
+
+        let lostRouter = Phase4ReceiptFakeRouter()
+        lostRouter.finalizationPersistenceUnavailable = true
+        let requestID = "bot-force-stop"
+        lostRouter.pairedBotRemoteResult = stopReceipt(requestID: requestID, force: true)
+        let lostLive = try await Phase4LiveServer.start(router: lostRouter, bootEpoch: 1_537)
+        defer { lostLive.stop() }
+        var lostParams = lostLive.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "unused")
+        lostParams.removeValue(forKey: "thread_id")
+        lostParams.removeValue(forKey: "text")
+        lostParams["bot_id"] = botID
+
+        let lost = try await lostLive.rpc(method: "bot.force_stop", params: lostParams)
+        let lostReplay = try await lostLive.rpc(method: "bot.force_stop", params: lostParams)
+
+        XCTAssertEqual(errorCode(lost), commandOutcomeUnknown)
+        XCTAssertEqual(errorCode(lostReplay), commandOutcomeUnknown)
+        XCTAssertEqual(lostRouter.pairedBotRemoteCallCount, 1)
+        XCTAssertEqual(lostRouter.finalizationCallCount, 0)
+        XCTAssertNil(lostRouter.finalizedEvents["bot.force_stop:\(requestID)"])
+    }
+
+    /// WHY: a Bot send is not usable on iOS without one exact receipt plus a
+    /// lifecycle event that survives response replay without a second effect.
+    func test_botSendPublishesExactStartedOrQueuedLifecycleOnce() async throws {
+        let botID = UUID().uuidString.lowercased()
+        let conversationID = UUID().uuidString.lowercased()
+        let runID = UUID().uuidString.lowercased()
+        let threadID = UUID().uuidString.lowercased()
+        for (index, queued) in [false, true].enumerated() {
+            let requestID = queued ? "bot-send-queued" : "bot-send-started"
+            var readback: [String: JSONValue] = [
+                "host_id": .string(Phase4LiveServer.hostId),
+                "bot_id": .string(botID),
+                "conversation_id": .string(conversationID),
+                "request_id": .string(requestID),
+                "client_request_id": .string(requestID),
+                "run_id": .string(runID),
+                "enqueued": .bool(queued),
+            ]
+            if queued {
+                readback["id"] = .string("queue-item")
+                readback["queue"] = .array([])
+            } else {
+                readback["run"] = .object([
+                    "host_id": .string(Phase4LiveServer.hostId),
+                    "bot_id": .string(botID),
+                    "conversation_id": .string(conversationID),
+                    "request_id": .string(requestID),
+                    "client_request_id": .string(requestID),
+                    "run_id": .string(runID),
+                    "thread_id": .string(threadID),
+                ])
+            }
+            let router = Phase4ReceiptFakeRouter()
+            router.pairedBotRemoteResult = .object([
+                "status": .string("completed"),
+                "host_id": .string(Phase4LiveServer.hostId),
+                "bot_id": .string(botID),
+                "request_id": .string(requestID),
+                "client_request_id": .string(requestID),
+                "receipt_id": .string("receipt-\(index)"),
+                "readback": .object(readback),
+            ])
+            let live = try await Phase4LiveServer.start(router: router, bootEpoch: UInt64(1_530 + index))
+            var params = live.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "send")
+            params.removeValue(forKey: "thread_id")
+            params["bot_id"] = botID
+            params["conversation_id"] = conversationID
+
+            let first = try await live.rpc(method: "bot.send", params: params)
+            let replay = try await live.rpc(method: "bot.send", params: params)
+            XCTAssertEqual(first["result"] as? NSDictionary, replay["result"] as? NSDictionary)
+            XCTAssertEqual(router.pairedBotRemoteCallCount, 1)
+            XCTAssertEqual(router.finalizationCallCount, 1)
+            let events = try XCTUnwrap(router.finalizedEvents["bot.send:\(requestID)"])
+            XCTAssertEqual(events.map(\.kind), [
+                "bot.message.accepted",
+                queued ? "bot.message.queued" : "bot.run.started",
+            ])
+            let payload = try XCTUnwrap(events.last?.payload.objectValue)
+            XCTAssertEqual(payload["host_id"]?.stringValue, Phase4LiveServer.hostId)
+            XCTAssertEqual(payload["bot_id"]?.stringValue, botID)
+            XCTAssertEqual(payload["conversation_id"]?.stringValue, conversationID)
+            XCTAssertEqual(payload["request_id"]?.stringValue, requestID)
+            XCTAssertEqual(payload["client_request_id"]?.stringValue, requestID)
+            XCTAssertEqual(payload["run_id"]?.stringValue, runID)
+            live.stop()
+        }
+    }
+
+    /// WHY: response loss must retain the original request identity without a
+    /// second Bot effect or any falsely committed lifecycle event.
+    func test_botSendResponseLossDoesNotReplayEffectOrLifecycleEvent() async throws {
+        let requestID = "bot-send-response-loss"
+        let botID = UUID().uuidString.lowercased()
+        let router = Phase4ReceiptFakeRouter()
+        router.finalizationPersistenceUnavailable = true
+        router.pairedBotRemoteResult = .object([
+            "status": .string("completed"),
+            "host_id": .string(Phase4LiveServer.hostId),
+            "bot_id": .string(botID),
+            "request_id": .string(requestID),
+            "client_request_id": .string(requestID),
+            "receipt_id": .string("lost-receipt"),
+            "readback": .object([:]),
+        ])
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_532)
+        defer { live.stop() }
+        var params = live.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "lost")
+        params.removeValue(forKey: "thread_id")
+        params["bot_id"] = botID
+
+        let first = try await live.rpc(method: "bot.send", params: params)
+        let replay = try await live.rpc(method: "bot.send", params: params)
+        XCTAssertEqual(errorCode(first), commandOutcomeUnknown)
+        XCTAssertEqual(errorCode(replay), commandOutcomeUnknown)
+        XCTAssertEqual(router.pairedBotRemoteCallCount, 1)
+        XCTAssertEqual(router.finalizationCallCount, 0)
+        XCTAssertNil(router.finalizedEvents["bot.send:\(requestID)"])
+    }
+
+    /// WHY: Files/Browser projections are invalid without their authority
+    /// coordinates. Phase4 must publish those exact completed fields once,
+    /// while accepted and failed receipts remain eventless.
+    func test_pairedBotFilesAndBrowserEventsCarryAuthorityAndExcludeNonCompletedStatuses() async throws {
+        let botID = UUID().uuidString.lowercased()
+        let completedCases: [(method: String, event: String, readback: [String: JSONValue])] = [
+            (
+                "bot.files.mutate",
+                "bot.files.changed",
+                [
+                    "bot_id": .string(botID),
+                    "host_id": .string(Phase4LiveServer.hostId),
+                    "root": .string("bot_home"),
+                    "root_handle": .string("opaque-root-grant"),
+                    "root_cas": .string("root-cas-7"),
+                    "handle": .string("opaque-file-grant"),
+                    "entry_generation": .number(7),
+                    "entry_cas": .string("root-cas-7"),
+                    "path": .string("SOUL.md"),
+                    "op": .string("write"),
+                    "generation": .number(7),
+                    "current_revision_id": .string("profile-revision-7"),
+                    "revision": .number(7),
+                    "soul": .string("Exact instructions"),
+                    "description": .string("Exact description"),
+                    "security": .object(["opaque_handle": .bool(true), "symlink_safe": .bool(true)]),
+                ]
+            ),
+            (
+                "bot.browser.action",
+                "bot.browser.updated",
+                [
+                    "bot_id": .string(botID),
+                    "host_id": .string(Phase4LiveServer.hostId),
+                    "surface_id": .string("bot-surface"),
+                    "snapshot_generation": .number(11),
+                    "generation": .number(12),
+                    "url": .string("https://example.test/home"),
+                    "title": .string("Home"),
+                    "loading": .bool(false),
+                    "action": .string("login.complete"),
+                    "session_after_digest": .string("opaque-session-after"),
+                    "security": .object(["cookie_exported": .bool(false)]),
+                    "session": .object(["authenticated": .bool(true), "cookie_exported": .bool(false)]),
+                ]
+            ),
+            (
+                "bot.link.open",
+                "bot.files.opened",
+                [
+                    "bot_id": .string(botID),
+                    "host_id": .string(Phase4LiveServer.hostId),
+                    "conversation_id": .string("conversation-file-link"),
+                    "link_kind": .string("file"),
+                    "root": .string("bot_home"),
+                    "root_handle": .string("opaque-root-grant"),
+                    "root_cas": .string("root-cas-9"),
+                    "handle": .string("opaque-file-grant"),
+                    "entry_generation": .number(9),
+                    "entry_cas": .string("root-cas-9"),
+                    "generation": .number(9),
+                    "mounted": .bool(true),
+                    "split": .bool(false),
+                    "security": .object(["opaque_handle": .bool(true), "symlink_safe": .bool(true)]),
+                ]
+            ),
+        ]
+
+        for (index, testCase) in completedCases.enumerated() {
+            let router = Phase4ReceiptFakeRouter()
+            let requestID = "bot-authority-completed-\(index)"
+            router.pairedBotRemoteResult = .object([
+                "status": .string("completed"),
+                "request_id": .string(requestID),
+                "receipt_id": .string("authority-receipt-\(index)"),
+                "bot_id": .string(botID),
+                "readback": .object(testCase.readback),
+            ])
+            let live = try await Phase4LiveServer.start(router: router, bootEpoch: UInt64(1_510 + index))
+            defer { live.stop() }
+            var params = live.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "unused")
+            params.removeValue(forKey: "thread_id")
+            params.removeValue(forKey: "text")
+            params["bot_id"] = botID
+
+            _ = try await live.rpc(method: testCase.method, params: params)
+            let event = try XCTUnwrap(router.finalizedEvents["\(testCase.method):\(requestID)"]?.first)
+            XCTAssertEqual(event.kind, testCase.event)
+            let payload = try XCTUnwrap(event.payload.objectValue)
+            XCTAssertEqual(payload["bot_id"]?.stringValue, botID)
+            for key in testCase.readback.keys where key != "bot_id" {
+                XCTAssertEqual(payload[key], testCase.readback[key], "\(testCase.method) must publish \(key)")
+            }
+        }
+
+        for (index, status) in ["accepted", "failed"].enumerated() {
+            let router = Phase4ReceiptFakeRouter()
+            let requestID = "bot-authority-nonterminal-\(status)"
+            router.pairedBotRemoteResult = .object([
+                "status": .string(status),
+                "request_id": .string(requestID),
+                "receipt_id": .string("authority-\(status)"),
+                "bot_id": .string(botID),
+                "readback": .object(["bot_id": .string(botID), "generation": .number(99)]),
+            ])
+            let live = try await Phase4LiveServer.start(router: router, bootEpoch: UInt64(1_520 + index))
+            defer { live.stop() }
+            var params = live.mutationParams(requestId: requestID, threadId: AgentThreadID(), text: "unused")
+            params.removeValue(forKey: "thread_id")
+            params.removeValue(forKey: "text")
+            params["bot_id"] = botID
+
+            _ = try await live.rpc(method: "bot.files.mutate", params: params)
+            XCTAssertEqual(router.finalizedEventKinds["bot.files.mutate:\(requestID)"], [])
+        }
+    }
+
+    /// WHY: once the authoritative Bot mutation returns, failed receipt/event
+    /// persistence is an unknown outcome. Retrying must never execute it twice.
+    func test_pairedBotResponseLossStaysUnknownWithoutDuplicateEffectOrEvent() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        router.finalizationPersistenceUnavailable = true
+        router.pairedBotRemoteResult = .object([
+            "status": .string("completed"),
+            "request_id": .string("bot-response-loss"),
+            "receipt_id": .string("authority-receipt"),
+            "bot_id": .string(UUID().uuidString.lowercased()),
+            "readback": .object([:]),
+        ])
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_499)
+        defer { live.stop() }
+        var params = live.mutationParams(
+            requestId: "bot-response-loss",
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        params.removeValue(forKey: "thread_id")
+        params["name"] = "Lost Response Bot"
+
+        let first = try await live.rpc(method: "bot.create", params: params)
+        let retry = try await live.rpc(method: "bot.create", params: params)
+
+        XCTAssertEqual(errorCode(first), commandOutcomeUnknown)
+        XCTAssertEqual(errorCode(retry), commandOutcomeUnknown)
+        XCTAssertEqual(router.pairedBotRemoteCallCount, 1)
+        XCTAssertEqual(router.finalizationCallCount, 0)
+        XCTAssertNil(router.finalizedEventKinds["bot.create:bot-response-loss"])
+    }
+
+    /// WHY: an authoritative domain rejection is itself durable readback. It
+    /// must replay without rerunning and must never masquerade as a mutation
+    /// event merely because transport delivery succeeded.
+    func test_pairedBotFailedReceiptReplaysWithoutCanonicalEvent() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        router.pairedBotRemoteResult = .object([
+            "status": .string("failed"),
+            "request_id": .string("bot-domain-rejection"),
+            "receipt_id": .string("failed-authority-receipt"),
+            "bot_id": .null,
+            "readback": .object(["error": .string("Account limit reached")]),
+        ])
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_500)
+        defer { live.stop() }
+        var params = live.mutationParams(
+            requestId: "bot-domain-rejection",
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        params.removeValue(forKey: "thread_id")
+        params["name"] = "Rejected Bot"
+
+        let first = try await live.rpc(method: "bot.create", params: params)
+        let replay = try await live.rpc(method: "bot.create", params: params)
+
+        XCTAssertEqual((first["result"] as? [String: Any])?["status"] as? String, "failed")
+        XCTAssertEqual(first["result"] as? NSDictionary, replay["result"] as? NSDictionary)
+        XCTAssertEqual(router.pairedBotRemoteCallCount, 1)
+        XCTAssertEqual(router.finalizationCallCount, 1)
+        XCTAssertEqual(router.finalizedEventKinds["bot.create:bot-domain-rejection"], [])
+    }
+
+    /// WHY: Guest execution is intentionally accepted before Docker/frame
+    /// settlement, but that accepted authority transition still needs one
+    /// durable canonical event so paired clients never depend on local UI.
+    func test_pairedGuestAcceptedReceiptFinalizesCanonicalIdentityEvent() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        let botID = UUID().uuidString.lowercased()
+        let taskID = UUID().uuidString.lowercased()
+        let requestID = "guest-accepted"
+        router.pairedBotRemoteResult = .object([
+            "status": .string("accepted"),
+            "request_id": .string(requestID),
+            "receipt_id": .string(UUID().uuidString.lowercased()),
+            "bot_id": .string(botID),
+            "readback": .object([
+                "host_id": .string("phase4-host"),
+                "bot_id": .string(botID),
+                "status": .string("starting"),
+                "viewer_path": .string("/vnc.html"),
+                "url": .string("http://127.0.0.1:6080/vnc.html?token=unsafe"),
+                "bearer_token": .string("unsafe-bearer"),
+                "grant_generation": .number(1),
+                "grant_invalidated": .bool(false),
+                "runtime": .object([
+                    "container_id": .string("container"),
+                    "session_id": .string("session"),
+                    "grant_id": .string("grant"),
+                    "loopback_url": .string("http://127.0.0.1:6080"),
+                ]),
+                "security": .object([
+                    "loopback_url_exported": .bool(false),
+                    "bearer_exported": .bool(false),
+                    "bearer_token": .string("unsafe-bearer"),
+                ]),
+            ]),
+        ])
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_501)
+        defer { live.stop() }
+        var params = live.mutationParams(
+            requestId: requestID,
+            threadId: AgentThreadID(),
+            text: "unused"
+        )
+        params.removeValue(forKey: "thread_id")
+        params.removeValue(forKey: "text")
+        params["bot_id"] = botID
+        params["host_id"] = "phase4-host"
+        params["task_id"] = taskID
+        params["recipe_id"] = UUID().uuidString.lowercased()
+
+        let response = try await live.rpc(method: "bot.guest.start", params: params)
+
+        XCTAssertEqual((response["result"] as? [String: Any])?["status"] as? String, "accepted")
+        XCTAssertEqual(
+            router.finalizedEventKinds["bot.guest.start:\(requestID)"],
+            ["bot.guest.updated"]
+        )
+        let event = try XCTUnwrap(router.finalizedEvents["bot.guest.start:\(requestID)"]?.first)
+        XCTAssertEqual(event.payload.objectValue?["host_id"]?.stringValue, "phase4-host")
+        XCTAssertEqual(event.payload.objectValue?["viewer_path"]?.stringValue, "/vnc.html")
+        XCTAssertEqual(event.payload.objectValue?["security"]?.objectValue?["bearer_exported"]?.boolValue, false)
+        let eventData = try JSONEncoder().encode(event.payload)
+        let eventWire = try XCTUnwrap(String(data: eventData, encoding: .utf8))
+        XCTAssertFalse(eventWire.contains("127.0.0.1"))
+        XCTAssertFalse(eventWire.contains("unsafe-bearer"))
     }
 
     private func canonicalMutationMethods() throws -> Set<String> {

@@ -799,6 +799,70 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         return handoffs
     }
 
+    func remoteAttentionOwnershipSnapshots() -> [[String: Any]] {
+        refreshStorageProjection()
+        var latestByPeer: [BotID: PersistedBotPeerHandoff] = [:]
+        for handoff in handoffs.values where handoff.originBotID != nil {
+            guard let existing = latestByPeer[handoff.peerBotID] else {
+                latestByPeer[handoff.peerBotID] = handoff
+                continue
+            }
+            if existing.createdAt < handoff.createdAt
+                || (existing.createdAt == handoff.createdAt
+                    && existing.activityID.uuidString < handoff.activityID.uuidString) {
+                latestByPeer[handoff.peerBotID] = handoff
+            }
+        }
+        return latestByPeer.values.compactMap(Self.remoteAttentionOwnershipSnapshot)
+    }
+
+    private static func remoteAttentionOwnershipSnapshot(
+        _ handoff: PersistedBotPeerHandoff
+    ) -> [String: Any]? {
+        guard let peerThreadID = handoff.peerThreadID,
+              let peerRunID = handoff.peerRunID,
+              let originBotID = handoff.originBotID,
+              let originConversationID = handoff.originConversationID else { return nil }
+        let state: String
+        let finishedAt: Any
+        switch handoff.phase {
+        case .peerPrepared, .peerRunning:
+            state = "working"
+            finishedAt = NSNull()
+        case .needsAttention:
+            state = "needs_attention"
+            finishedAt = NSNull()
+        case .peerCompleted, .hostPrepared, .hostRunning, .completed:
+            guard let replyCreatedAt = handoff.replyCreatedAt else { return nil }
+            state = "finished"
+            finishedAt = replyCreatedAt.timeIntervalSince1970
+        }
+        var item: [String: Any] = [
+            "id": handoff.activityID.uuidString.lowercased(),
+            "lifecycle_receipt_id": handoff.activityID.uuidString.lowercased(),
+            "bot_id": handoff.peerBotID.value.uuidString.lowercased(),
+            "conversation_id": handoff.peerConversationID.value.uuidString.lowercased(),
+            "thread_id": peerThreadID.value.uuidString.lowercased(),
+            "run_id": peerRunID.value.uuidString.lowercased(),
+            "owner_bot_id": originBotID.value.uuidString.lowercased(),
+            "owner_conversation_id": originConversationID.value.uuidString.lowercased(),
+            "state": state,
+            "finished_at": finishedAt,
+            "ownership": "delegated",
+            "primary": false,
+            "delegated": true,
+            "source": "bot_peer_handoff",
+            "peer_phase": handoff.phase.rawValue,
+        ]
+        if let ownerThreadID = handoff.hostThreadID {
+            item["owner_thread_id"] = ownerThreadID.value.uuidString.lowercased()
+        }
+        if let ownerRunID = handoff.hostRunID {
+            item["owner_run_id"] = ownerRunID.value.uuidString.lowercased()
+        }
+        return item
+    }
+
     func claimContinuation(
         consultationID: UUID,
         callerThread: AgentThreadID,
@@ -1125,7 +1189,14 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         hostRunID: AgentRunID,
         providerSnapshots: [AgentProviderSnapshot],
         consultationID: UUID? = nil
-    ) async -> (activityID: UUID, reply: String, consultationID: UUID)? {
+    ) async -> (
+        activityID: UUID,
+        reply: String,
+        consultationID: UUID,
+        peerConversationID: BotConversationID,
+        peerThreadID: AgentThreadID,
+        peerRunID: AgentRunID
+    )? {
         refreshStorageProjection()
         let originConversation = try? botStore.conversationLinked(to: originThread.id)
         let originBot = originConversation.flatMap { try? botStore.get(id: $0.botID) }
@@ -1170,8 +1241,18 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         ) else { return nil }
         await milestone.value
         guard let reply = replyText(forActivityID: activityID.value),
-              let consultationID = handoffs[activityID.value]?.consultationID else { return nil }
-        return (activityID.value, reply, consultationID)
+              let handoff = handoffs[activityID.value],
+              let consultationID = handoff.consultationID,
+              let peerThreadID = handoff.peerThreadID,
+              let peerRunID = handoff.peerRunID else { return nil }
+        return (
+            activityID.value,
+            reply,
+            consultationID,
+            handoff.peerConversationID,
+            peerThreadID,
+            peerRunID
+        )
     }
 
     private func awaitAgentAppDispatch(activityID: UUID) async {
@@ -5471,20 +5552,19 @@ public final class BotsViewModel: ObservableObject {
                 throw BotStoreError.notFound
             }
             if let threadID = existing.linkedAgentThreadID,
-               context.coordinator.activeRunId(threadId: threadID) != nil {
-                enqueueFollowUp(
-                    BotQueuedFollowUp(
-                        text: message,
-                        conversationID: existing.id,
-                        routing: routing
-                    ),
-                    botID: bot.id
+               let activeRunID = context.coordinator.activeRunId(threadId: threadID) {
+                let followUp = BotQueuedFollowUp(
+                    text: message,
+                    conversationID: existing.id,
+                    routing: routing
                 )
+                enqueueFollowUp(followUp, botID: bot.id)
                 return .object([
+                    "id": .string(followUp.id.uuidString.lowercased()),
                     "bot_id": .string(bot.id.value.uuidString.lowercased()),
                     "conversation_id": .string(existing.id.value.uuidString.lowercased()),
                     "thread_id": .string(threadID.value.uuidString.lowercased()),
-                    "run_id": .null,
+                    "run_id": .string(activeRunID.value.uuidString.lowercased()),
                     "enqueued": .bool(true),
                     "queued_follow_up": .bool(true),
                 ])
@@ -8838,7 +8918,7 @@ public final class BotsViewModel: ObservableObject {
                 _ = await self.followLinkedRun(bot: bot, started: started)
             } else {
                 self.deskSendInFlightStartedAt = nil
-                self.recordNeedsAttention(bot: bot, conversation: conversation, userText: userText)
+                self.recordNeedsAttention(bot: bot, conversation: prepared.conversation, userText: userText)
             }
         }
         rememberDeskSend(work, botID: bot.id)
@@ -9305,9 +9385,9 @@ public final class BotsViewModel: ObservableObject {
         objectWillChange.send()
     }
 
-    func presentGuestDesktop(botID: BotID, onSettled: ((Bool) -> Void)? = nil) {
+    func presentGuestDesktop(botID: BotID, onSettled: ((BotComputerGuestReady?) -> Void)? = nil) {
         guard guestLaunchState(for: botID) != .starting else {
-            DispatchQueue.main.async { onSettled?(false) }
+            DispatchQueue.main.async { onSettled?(nil) }
             return
         }
         guard dockerGuestReadyOverrideForTesting == nil,
@@ -9315,7 +9395,7 @@ public final class BotsViewModel: ObservableObject {
             guestLaunchStateByBot[botID.value] = .failed(
                 BotComputerDockerError.cliMissing.description
             )
-            DispatchQueue.main.async { onSettled?(false) }
+            DispatchQueue.main.async { onSettled?(nil) }
             return
         }
         guestLaunchStateByBot[botID.value] = .starting
@@ -9325,7 +9405,7 @@ public final class BotsViewModel: ObservableObject {
                 let url = try BotComputerGuestSpec.viewerURL(ready.screenURL)
                 await MainActor.run {
                     self.rememberGuestScreen(url: url, botID: botID, running: true)
-                    onSettled?(true)
+                    onSettled?(ready)
                 }
             } catch {
                 await MainActor.run {
@@ -9336,7 +9416,7 @@ public final class BotsViewModel: ObservableObject {
                             ?? BotComputerDockerError.provisioningFailed.description
                     )
                     self.objectWillChange.send()
-                    onSettled?(false)
+                    onSettled?(nil)
                 }
             }
         }
@@ -9365,14 +9445,14 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
-    func rebuildDockerGuest(botID: BotID, onSettled: ((Bool) -> Void)? = nil) {
+    func rebuildDockerGuest(botID: BotID, onSettled: ((BotComputerGuestReady?) -> Void)? = nil) {
         guard !isGuestRebuilding(botID) else {
-            DispatchQueue.main.async { onSettled?(false) }
+            DispatchQueue.main.async { onSettled?(nil) }
             return
         }
         guard let service = computerGuestService else {
             errorMessage = "Docker desktop is not ready."
-            DispatchQueue.main.async { onSettled?(false) }
+            DispatchQueue.main.async { onSettled?(nil) }
             return
         }
         let wasRunning = isGuestRunning(botID)
@@ -9384,7 +9464,7 @@ public final class BotsViewModel: ObservableObject {
                 await MainActor.run {
                     self.guestRebuildingByBot[botID.value] = false
                     self.rememberGuestScreen(url: url, botID: botID, running: true)
-                    onSettled?(true)
+                    onSettled?(ready)
                 }
             } catch {
                 await MainActor.run {
@@ -9392,7 +9472,7 @@ public final class BotsViewModel: ObservableObject {
                     self.errorMessage = wasRunning
                         ? "Could not rebuild the Linux desktop. The current desktop is still running."
                         : "Could not rebuild the Linux desktop."
-                    onSettled?(false)
+                    onSettled?(nil)
                 }
             }
         }
