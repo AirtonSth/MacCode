@@ -20,9 +20,13 @@ public func unixSocketListenerEventPayload(bound: Bool, path: String) -> [String
 /// and requests intentionally use shared domain handlers without remote
 /// transport identity or durable transport receipts.
 public final class UnixSocketServer: @unchecked Sendable {
-    private static let maxClientLineBytes = 1024 * 1024
+    /// Peak inbound JSON-RPC line reassembly per Unix client.
+    /// Keep at 1 MiB: host-catalog methods such as `agent.plan.notes.save` still
+    /// admit full-body legacy requests in the 512 KiB–1 MiB range; dropping the
+    /// shared line ceiling below that disconnects without a JSON-RPC error.
+    static let maxClientLineBytes = 1024 * 1024
     /// Peak per-connection outbound EventBus stream backlog. Was 1 MiB; 512 KiB
-    /// matches LineBuffer / provider pipe ceilings (memory-loop tip).
+    /// matches LineBuffer / provider pipe ceilings.
     static let maxStreamQueuedBytes = 512 * 1024
     static let maxConnectedClients = 64
     static let maxActiveRequests = 64

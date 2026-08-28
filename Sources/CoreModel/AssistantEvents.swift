@@ -1075,6 +1075,12 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     // (Dictionary has no stable order; a legit early-arriving delta is always the
     // newest entry and must survive eviction until its itemStarted lands).
     private var pendingItemDeltaOrder: [String]
+    /// Last exact `aggregateHotTextByteCount` from enforce/evict. Optional so
+    /// persisted snapshots without the key still decode.
+    private var lastMeasuredAggregateHotTextBytes: Int? = nil
+    /// Upper bound of hot-text growth since last exact measure (`apply` event
+    /// estimates). Optional for the same Codable compatibility.
+    private var aggregateHotTextDirtyBytes: Int? = nil
 
     private struct PendingItemDelta: Codable, Sendable, Equatable {
         var body: String = ""
@@ -1266,11 +1272,27 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     /// (full timeline walk) after every `removeFirst`. That is O(n²) on long streams.
     /// Eviction now debits the exact contribution of each removed element; bulk clears
     /// still re-sync once via a full recount.
+    ///
+    /// Under the limit, skip the exact walk when `lastMeasured + dirty <= limit`.
+    /// Dirty is an event-estimate watermark updated on `apply`; over-limit still
+    /// takes the exact eviction path.
     public mutating func enforceAggregateHotTextBudget(
         byteLimit: Int = aggregateHotTextByteLimit
     ) {
         let limit = max(1, byteLimit)
+        let dirty = aggregateHotTextDirtyBytes ?? 0
+        if let lastMeasured = lastMeasuredAggregateHotTextBytes,
+           lastMeasured + dirty <= limit {
+            return
+        }
+        #if DEBUG
+        Self.aggregateHotTextExactWalksForTesting &+= 1
+        #endif
         var total = aggregateHotTextByteCount
+        defer {
+            lastMeasuredAggregateHotTextBytes = total
+            aggregateHotTextDirtyBytes = 0
+        }
         guard total > limit else { return }
         func debit(_ amount: Int) {
             total -= amount
@@ -1446,6 +1468,8 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         _ ev: AssistantEvent,
         nowMs: Int64? = Int64(Date().timeIntervalSince1970 * 1000)
     ) {
+        aggregateHotTextDirtyBytes =
+            (aggregateHotTextDirtyBytes ?? 0) + max(1, ev.estimatedHotQueueBytes)
         switch ev {
         case .threadStarted(let tid, let ptid):
             self.threadId = tid; self.providerThreadId = ptid
@@ -1984,6 +2008,11 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     /// for the same reason as above: `cappedText` runs on both the UI main actor and
     /// the runner's background thread.
     nonisolated(unsafe) static var cappedTextGraphemeWalksForTesting = 0
+
+    /// Test-only observability for `enforceAggregateHotTextBudget`'s exact
+    /// `aggregateHotTextByteCount` walk. Under-limit repeats with a dirty
+    /// watermark still below the ceiling must not increment this.
+    nonisolated(unsafe) static var aggregateHotTextExactWalksForTesting = 0
 
     /// Test-only observability for the F39 pendingItemDeltas bound: the buffer is
     /// private (pairing internals), so the memory-cap test reads its size here
