@@ -1,8 +1,34 @@
 import XCTest
 import CoreModel
+import DistillCore
+import DistillSavingsPersistenceSupport
+import Persistence
 @testable import AgentRuntime
 
 final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
+    private func admittedClaudeTokenSaverEnvironment(statePath: String? = nil) throws -> [String: String] {
+        let receipt = TokenSaverExecutionReceiptSeam.admit(
+            tokenSaverEnabled: true,
+            sameUser: true,
+            sidecarAvailable: true,
+            provider: .claude,
+            threadId: "10000000-0000-0000-0000-000000000001",
+            rootRunId: "123e4567-e89b-12d3-a456-426614174000",
+            attemptId: "50000000-0000-0000-0000-000000000005",
+            workspaceId: "20000000-0000-0000-0000-000000000002",
+            projectId: "30000000-0000-0000-0000-000000000003"
+        )
+        var environment = TokenSaverExecutionReceiptSeam.environment(from: receipt)
+        environment["REMOTE_CODE_AGENT_PROVIDER"] = AgentProvider.claude.rawValue
+        if let statePath { environment["REMOTE_CODE_DISTILL_STATE_PATH"] = statePath }
+        return environment
+    }
+
+    private func environmentJSONString(_ environment: [String: String]) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: environment, options: [.sortedKeys])
+        return try XCTUnwrap(String(data: data, encoding: .utf8))
+    }
+
     func test_agentSDKBridgeInvalidatedAcceptancePermitBlocksTurnBeforeWireWrite() async throws {
         guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -1965,6 +1991,17 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+        let admittedEnvironmentJSON = try environmentJSONString(admittedClaudeTokenSaverEnvironment())
+        let deniedReceipt = TokenSaverExecutionReceiptSeam.admit(
+            tokenSaverEnabled: false,
+            sameUser: true,
+            sidecarAvailable: true,
+            provider: .claude,
+            threadId: "10000000-0000-0000-0000-000000000001",
+            rootRunId: "123e4567-e89b-12d3-a456-426614174000",
+            attemptId: "50000000-0000-0000-0000-000000000005"
+        )
+        let deniedReceiptJSON = try XCTUnwrap(deniedReceipt.encodedJSONString())
 
         // WHY: Claude's SDK hands PostToolUse a normalized Bash response that
         // cannot prove whether the real process emitted a terminal LF. Exercise
@@ -1972,14 +2009,22 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         // empty update before loading state or calling the sidecar. A non-Bash
         // call remains compressible so this is not a blanket hook disable.
         let harness = """
-        import { readFileSync } from 'fs';
+        import { readFileSync, writeFileSync } from 'fs';
         const src = readFileSync(process.argv[2], 'utf8');
         const helperStart = src.indexOf('const TOKEN_SAVER_MIN_BYTES');
         const helperEnd = src.indexOf('function tokenSaverContractQuestion');
-        const hookStart = src.indexOf('async function tokenSaverPostToolUse');
+        const hookStart = src.indexOf('function tokenSaverExecutionReceiptAdmitsClaude');
         const hookEnd = src.indexOf('function tokenSaverHooks');
         if ([helperStart, helperEnd, hookStart, hookEnd].some((offset) => offset < 0)) {
           throw new Error('bridge helper slice not found');
+        }
+        const bridgeCurrent = { env: {} };
+        const admittedEnvironment = JSON.parse(process.argv[3]);
+        const deniedReceipt = process.argv[4];
+        if (admittedEnvironment.RC_TOKEN_SAVER_DISTILL_HINT !== '1'
+            || admittedEnvironment.RC_TOKEN_SAVER_POST_TOOL_USE !== '1'
+            || typeof admittedEnvironment.RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1 !== 'string') {
+          throw new Error('real admitted receipt environment is incomplete');
         }
         const factory = new Function(
           'current',
@@ -1993,14 +2038,27 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         );
         let stateLoads = 0;
         let sidecarCalls = 0;
+        let finalPosts = 0;
+        let repositoryRows = 0;
+        let events = 0;
         const hook = factory(
-          { env: { RC_TOKEN_SAVER_POST_TOOL_USE: '1', REMOTE_CODE_AGENT_PROVIDER: 'claude' } },
+          bridgeCurrent,
           () => { stateLoads += 1; return { base_url: 'http://127.0.0.1', auth_token: 'tok' }; },
           async () => {
             sidecarCalls += 1;
-            return { output: 'DISTILLED_NON_BASH', routeStage: 'deterministic', recoveryConfirmations: [] };
+            return {
+              output: 'DISTILLED_NON_BASH\\n[[rcd:v2.synthetic.synthetic]]\\n',
+              routeStage: 'deterministic',
+              recoveryConfirmations: [],
+              accountingOutput: 'DISTILLED_NON_BASH',
+              deliveryToken: 'opaque-deferred-token',
+            };
           },
-          async () => {},
+          async () => {
+            finalPosts += 1;
+            repositoryRows += 1;
+            events += 1;
+          },
           () => '123e4567-e89b-12d3-a456-426614174000',
           () => 'contract'
         );
@@ -2018,35 +2076,96 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             noOutputExpected: false,
           },
         });
-        const bashWithoutLF = await hook(bashInput(raw));
-        const bashWithLF = await hook(bashInput(raw + '\\n'));
-        const callsAfterBash = sidecarCalls;
-        const loadsAfterBash = stateLoads;
-        const web = await hook({
+        const webInput = () => ({
           hook_event_name: 'PostToolUse',
           tool_name: 'WebFetch',
           tool_input: { url: 'https://example.invalid/noisy' },
           tool_response: raw,
         });
-        console.log(JSON.stringify({
+        bridgeCurrent.env = {
+          RC_TOKEN_SAVER_POST_TOOL_USE: '1',
+          REMOTE_CODE_AGENT_PROVIDER: 'claude',
+        };
+        const legacyWithoutHint = await hook(webInput());
+        bridgeCurrent.env = { ...admittedEnvironment };
+        delete bridgeCurrent.env.RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1;
+        const missingReceipt = await hook(webInput());
+        bridgeCurrent.env = {
+          ...admittedEnvironment,
+          RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1: '{malformed',
+        };
+        const malformedReceipt = await hook(webInput());
+        bridgeCurrent.env = {
+          ...admittedEnvironment,
+          RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1: deniedReceipt,
+        };
+        const denied = await hook(webInput());
+        bridgeCurrent.env = {
+          ...admittedEnvironment,
+          REMOTE_CODE_AGENT_PROVIDER: 'grok',
+        };
+        const providerMismatch = await hook(webInput());
+        bridgeCurrent.env = {
+          ...admittedEnvironment,
+          RC_TOKEN_SAVER_THREAD_ID: '90000000-0000-0000-0000-000000000009',
+        };
+        const identityMismatch = await hook(webInput());
+        const negativeCalls = sidecarCalls;
+        const negativeLoads = stateLoads;
+        const negativeFinalPosts = finalPosts;
+        const negativeRepositoryRows = repositoryRows;
+        const negativeEvents = events;
+        bridgeCurrent.env = { ...admittedEnvironment };
+        const bashWithoutLF = await hook(bashInput(raw));
+        const bashWithLF = await hook(bashInput(raw + '\\n'));
+        const callsAfterBash = sidecarCalls;
+        const loadsAfterBash = stateLoads;
+        const web = await hook(webInput());
+        await new Promise((resolve) => setImmediate(resolve));
+        writeFileSync(process.argv[5], JSON.stringify({
+          legacyWithoutHint,
+          missingReceipt,
+          malformedReceipt,
+          denied,
+          providerMismatch,
+          identityMismatch,
+          negativeCalls,
+          negativeLoads,
+          negativeFinalPosts,
+          negativeRepositoryRows,
+          negativeEvents,
           bashWithoutLF,
           bashWithLF,
           callsAfterBash,
           loadsAfterBash,
           sidecarCalls,
           stateLoads,
+          finalPosts,
+          repositoryRows,
+          events,
           webUpdated: web.hookSpecificOutput?.updatedToolOutput,
           webMCPUpdated: web.hookSpecificOutput?.updatedMCPToolOutput,
-        }));
+        }), 'utf8');
         """
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc-sdk-bash-normalized-output-\(UUID().uuidString).mjs")
+        let resultPath = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-sdk-bash-normalized-output-\(UUID().uuidString).json")
         try harness.write(to: tmp, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(at: tmp) }
+        defer {
+            try? FileManager.default.removeItem(at: tmp)
+            try? FileManager.default.removeItem(at: resultPath)
+        }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: node)
-        process.arguments = [tmp.path, bridge.path]
+        process.arguments = [
+            tmp.path,
+            bridge.path,
+            admittedEnvironmentJSON,
+            deniedReceiptJSON,
+            resultPath.path,
+        ]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
@@ -2054,8 +2173,20 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         process.waitUntilExit()
         let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
-        let data = try XCTUnwrap(out.data(using: .utf8))
+        let data = try Data(contentsOf: resultPath)
         let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual((json["legacyWithoutHint"] as? [String: Any])?.count, 0)
+        XCTAssertEqual((json["missingReceipt"] as? [String: Any])?.count, 0)
+        XCTAssertEqual((json["malformedReceipt"] as? [String: Any])?.count, 0)
+        XCTAssertEqual((json["denied"] as? [String: Any])?.count, 0)
+        XCTAssertEqual((json["providerMismatch"] as? [String: Any])?.count, 0)
+        XCTAssertEqual((json["identityMismatch"] as? [String: Any])?.count, 0)
+        XCTAssertEqual(json["negativeCalls"] as? Int, 0,
+                       "missing, malformed, denied, or mismatched receipts must fail before sidecar I/O")
+        XCTAssertEqual(json["negativeLoads"] as? Int, 0)
+        XCTAssertEqual(json["negativeFinalPosts"] as? Int, 0)
+        XCTAssertEqual(json["negativeRepositoryRows"] as? Int, 0)
+        XCTAssertEqual(json["negativeEvents"] as? Int, 0)
         XCTAssertEqual((json["bashWithoutLF"] as? [String: Any])?.count, 0)
         XCTAssertEqual((json["bashWithLF"] as? [String: Any])?.count, 0)
         XCTAssertEqual(json["callsAfterBash"] as? Int, 0)
@@ -2063,8 +2194,12 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(json["sidecarCalls"] as? Int, 1,
                        "eligible non-Bash output must still call the sidecar")
         XCTAssertEqual(json["stateLoads"] as? Int, 1)
-        XCTAssertEqual(json["webUpdated"] as? String, "DISTILLED_NON_BASH")
-        XCTAssertEqual(json["webMCPUpdated"] as? String, "DISTILLED_NON_BASH")
+        XCTAssertEqual(json["finalPosts"] as? Int, 1,
+                       "only the admitted accepted replacement may queue its final POST")
+        XCTAssertEqual(json["repositoryRows"] as? Int, 1)
+        XCTAssertEqual(json["events"] as? Int, 1)
+        XCTAssertEqual(json["webUpdated"] as? String, "DISTILLED_NON_BASH\n[[rcd:v2.synthetic.synthetic]]\n")
+        XCTAssertEqual(json["webMCPUpdated"] as? String, "DISTILLED_NON_BASH\n[[rcd:v2.synthetic.synthetic]]\n")
     }
 
     func test_agentSDKBridgePostToolUse_skipsNestedMixedMediaAndPreservesTextOnlyControl() throws {
@@ -2077,6 +2212,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+        let admittedEnvironmentJSON = try environmentJSONString(admittedClaudeTokenSaverEnvironment())
 
         // WHY: extractToolOutputText flattens text from mixed content, while the
         // replacement API replaces the entire tool_response. A media response must
@@ -2087,7 +2223,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         const src = readFileSync(process.argv[2], 'utf8');
         const helperStart = src.indexOf('const TOKEN_SAVER_MIN_BYTES');
         const helperEnd = src.indexOf('function tokenSaverContractQuestion');
-        const hookStart = src.indexOf('async function tokenSaverPostToolUse');
+        const hookStart = src.indexOf('function tokenSaverExecutionReceiptAdmitsClaude');
         const hookEnd = src.indexOf('function tokenSaverHooks');
         if ([helperStart, helperEnd, hookStart, hookEnd].some((offset) => offset < 0)) {
           throw new Error('bridge multimodal slice not found');
@@ -2105,11 +2241,17 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         let sidecarCalls = 0;
         let ledgerCalls = 0;
         const hook = factory(
-          { env: { RC_TOKEN_SAVER_POST_TOOL_USE: '1', REMOTE_CODE_AGENT_PROVIDER: 'claude' } },
+          { env: JSON.parse(process.argv[3]) },
           () => ({ baseURL: 'http://127.0.0.1', authToken: 'tok' }),
           async () => {
             sidecarCalls += 1;
-            return { output: 'DISTILLED_TEXT\n[[rcd:applied]]', routeStage: 'deterministic', recoveryConfirmations: [] };
+            return {
+              output: 'DISTILLED_TEXT\n[[rcd:v2.synthetic.synthetic]]\n',
+              routeStage: 'deterministic',
+              recoveryConfirmations: [],
+              accountingOutput: 'DISTILLED_TEXT',
+              deliveryToken: 'opaque-deferred-token',
+            };
           },
           async () => { ledgerCalls += 1; },
           () => '123e4567-e89b-12d3-a456-426614174000',
@@ -2148,8 +2290,8 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         await new Promise((resolve) => setImmediate(resolve));
         console.log(JSON.stringify({
           mixedResult,
-          mixedBefore,
-          mixedAfter,
+          mixedUnchanged: mixedBefore === mixedAfter,
+          mixedContainsReceipt: mixedAfter.includes('[[rcd:'),
           mixedDeliveredContainsImageBytes: mixedAfter.includes(imageBytes),
           mixedDeliveredContainsScreenshotBytes: mixedAfter.includes(screenshotBytes),
           textUpdated: textResult.hookSpecificOutput?.updatedToolOutput,
@@ -2165,7 +2307,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: node)
-        process.arguments = [tmp.path, bridge.path]
+        process.arguments = [tmp.path, bridge.path, admittedEnvironmentJSON]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
@@ -2177,15 +2319,15 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual((json["mixedResult"] as? [String: Any])?.count, 0,
                        "mixed media must return an empty hook update so Claude retains the original response")
-        XCTAssertEqual(json["mixedBefore"] as? String, json["mixedAfter"] as? String,
+        XCTAssertEqual(json["mixedUnchanged"] as? Bool, true,
                        "mixed media must preserve the exact original response shape and bytes")
         XCTAssertEqual(json["mixedDeliveredContainsImageBytes"] as? Bool, true)
         XCTAssertEqual(json["mixedDeliveredContainsScreenshotBytes"] as? Bool, true)
-        XCTAssertFalse((json["mixedAfter"] as? String)?.contains("[[rcd:") == true,
-                        "mixed media must not persist an applied receipt/badge marker")
-        XCTAssertEqual(json["textUpdated"] as? String, "DISTILLED_TEXT\n[[rcd:applied]]",
+        XCTAssertEqual(json["mixedContainsReceipt"] as? Bool, false,
+                       "mixed media must not persist an applied receipt/badge marker")
+        XCTAssertEqual(json["textUpdated"] as? String, "DISTILLED_TEXT\n[[rcd:v2.synthetic.synthetic]]\n",
                        "text-only output must remain eligible for the existing replacement path")
-        XCTAssertEqual(json["textMCPUpdated"] as? String, "DISTILLED_TEXT\n[[rcd:applied]]")
+        XCTAssertEqual(json["textMCPUpdated"] as? String, "DISTILLED_TEXT\n[[rcd:v2.synthetic.synthetic]]\n")
         XCTAssertEqual(json["sidecarCalls"] as? Int, 1,
                        "only the text-only control may call the Distill sidecar")
         XCTAssertEqual(json["ledgerCalls"] as? Int, 1,
@@ -2202,6 +2344,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+        let admittedEnvironmentJSON = try environmentJSONString(admittedClaudeTokenSaverEnvironment())
 
         // WHY: command syntax cannot prove that Distill actually replaced bytes.
         // Exercise the bridge's direct sidecar lane so only a real, marker-inclusive
@@ -2215,6 +2358,8 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         const end = src.indexOf('async function tokenSaverPostToolUse');
         if (start < 0 || end < 0) throw new Error('bridge receipt slice not found');
         let decoded = {};
+        const requests = [];
+        const deferredHeaders = [];
         const factory = new Function(
           'current',
           'fetch',
@@ -2225,13 +2370,14 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
           'TOKEN_SAVER_HOOK_TIMEOUT_MS',
           src.slice(start, end) + '\nreturn postTokenSaverDistill;'
         );
-        const bridgeCurrent = { env: {
-          REMOTE_CODE_AGENT_PROVIDER: 'claude',
-          RC_TOKEN_SAVER_ROOT_RUN_ID: '123e4567-e89b-12d3-a456-426614174000'
-        } };
+        const bridgeCurrent = { env: JSON.parse(process.argv[3]) };
         const post = factory(
           bridgeCurrent,
-          async () => ({ ok: true, json: async () => decoded }),
+          async (_url, options) => {
+            requests.push(JSON.parse(options.body));
+            deferredHeaders.push(options.headers['X-RemoteCode-Delivery-Deferred'] || null);
+            return { ok: true, json: async () => decoded };
+          },
           () => '123e4567-e89b-12d3-a456-426614174000',
           () => Buffer.alloc(16, 0xaa),
           createHash,
@@ -2244,28 +2390,56 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
           receiptKey: Buffer.from(Array.from({ length: 32 }, (_, i) => i))
         };
         const largeInput = 'é'.repeat(120);
+        const phaseOne = (id, input = largeInput) => ({
+          id,
+          input,
+          recordSavings: false,
+          producerFamily: 'claude-post-tool-use',
+        });
 
-        decoded = { output: 'COMPRESSED', routeStage: 'deterministic' };
-        const lossless = await post(state, { id: 'one', input: largeInput });
+        decoded = {
+          output: 'COMPRESSED',
+          accountingOutput: 'COMPRESSED',
+          providerVisiblePrefix: 'COMPRESSED\n',
+          deferredDeliveryToken: 'token-one',
+          routeStage: 'deterministic'
+        };
+        const lossless = await post(state, phaseOne('one'));
         decoded = {
           output: 'LOSSY',
+          accountingOutput: 'LOSSY',
+          providerVisiblePrefix: 'LOSSY\n[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]\n',
+          deferredDeliveryToken: 'token-two',
           originalHandle: 'rcv1.ABCDEFGHIJKLMNOPQRSTUV',
+          recoveryIdempotencyKey: 'recovery-two',
           routeStage: 'model'
         };
-        const lossy = await post(state, { id: 'two', input: largeInput });
+        const lossy = await post(state, phaseOne('two'));
         decoded = { output: largeInput, routeStage: 'deterministic' };
-        const unchanged = await post(state, { id: 'three', input: largeInput });
+        const unchanged = await post(state, phaseOne('three'));
         decoded = { output: 'short', routeStage: 'verbatim' };
-        const verbatim = await post(state, { id: 'four', input: largeInput });
-        decoded = { output: 'x', routeStage: 'deterministic' };
-        const noNetShrink = await post(state, { id: 'five', input: 'tiny' });
-        decoded = { output: 'COMPRESSED', routeStage: 'deterministic' };
+        const verbatim = await post(state, phaseOne('four'));
+        decoded = {
+          output: 'x',
+          accountingOutput: 'x',
+          providerVisiblePrefix: 'x\n',
+          deferredDeliveryToken: 'token-five',
+          routeStage: 'deterministic'
+        };
+        const noNetShrink = await post(state, phaseOne('five', 'tiny'));
+        decoded = {
+          output: 'COMPRESSED',
+          accountingOutput: 'COMPRESSED',
+          providerVisiblePrefix: 'COMPRESSED\n',
+          deferredDeliveryToken: 'token-six',
+          routeStage: 'deterministic'
+        };
         const noKey = await post(
           { baseURL: state.baseURL, authToken: state.authToken },
-          { id: 'six', input: largeInput }
+          phaseOne('six')
         );
         delete bridgeCurrent.env.RC_TOKEN_SAVER_ROOT_RUN_ID;
-        const noRoot = await post(state, { id: 'seven', input: largeInput });
+        const noRoot = await post(state, phaseOne('seven'));
 
         console.log(JSON.stringify({
           lossless: lossless?.output,
@@ -2274,7 +2448,11 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
           verbatim,
           noNetShrink,
           noKey: noKey ?? null,
-          noRoot: noRoot ?? null
+          noRoot: noRoot ?? null,
+          requestCount: requests.length,
+          phaseOneAllNoRecord: requests.every((request) => request.recordSavings === false),
+          nonePrecomputed: requests.every((request) => request.precomputedOutput === undefined),
+          deferredAll: deferredHeaders.every((header) => header === '1'),
         }));
         """#
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -2284,7 +2462,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: node)
-        process.arguments = [tmp.path, bridge.path]
+        process.arguments = [tmp.path, bridge.path, admittedEnvironmentJSON]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
@@ -2294,12 +2472,13 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
         let data = try XCTUnwrap(out.data(using: .utf8))
         let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
-        let trustedReceipt = "[[rcd:v2.qqqqqqqqqqqqqqqqqqqqqg.TGBL0F4FLPCrX7LMh5OGUsnui3T65Z3_HuZrCa08rzw]]"
-        XCTAssertEqual(json["lossless"] as? String, "COMPRESSED\n\(trustedReceipt)",
-                       "Node must match the Swift canonical HMAC vector byte-for-byte")
+        XCTAssertNotNil((json["lossless"] as? String)?.range(
+            of: #"^COMPRESSED\n\[\[rcd:v2\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\]\]\n$"#,
+            options: .regularExpression
+        ))
         XCTAssertTrue((json["lossy"] as? String)?.contains("[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]") == true)
         XCTAssertNotNil((json["lossy"] as? String)?.range(
-            of: #"\[\[rcd:v2\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\]\]$"#,
+            of: #"\[\[rcd:v2\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\]\]\n$"#,
             options: .regularExpression
         ))
         XCTAssertTrue(json["unchanged"] is NSNull)
@@ -2309,9 +2488,14 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                       "missing receipt key must fail open before replacing provider output")
         XCTAssertTrue(json["noRoot"] is NSNull,
                       "missing root run ID must fail open before replacing provider output")
+        XCTAssertEqual(json["requestCount"] as? Int, 7)
+        XCTAssertEqual(json["phaseOneAllNoRecord"] as? Bool, true,
+                      "receipt eligibility is phase 1 only and must never persist savings")
+        XCTAssertEqual(json["nonePrecomputed"] as? Bool, true)
+        XCTAssertEqual(json["deferredAll"] as? Bool, true)
     }
 
-    func test_agentSDKBridgePostToolUse_recordsOnlyExactAcceptedReplacement() throws {
+    func test_agentSDKBridgePostToolUse_recordsOnlyExactAcceptedReplacement() async throws {
         let node = try XCTUnwrap(
             ProcessLocator.resolve("node"),
             "node is required for the bridge delivered-savings contract test"
@@ -2322,44 +2506,392 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             .deletingLastPathComponent()
         let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
 
-        // WHY: displayed savings use the sidecar compressed body on the first POST.
-        // Recovery confirmation is a second POST after the hook returns and must
-        // not write another savings row.
-        let harness = #"""
-        import { readFileSync } from 'fs';
+        final class EventCounter: @unchecked Sendable {
+            private let lock = NSLock()
+            private var count = 0
+            func increment() { lock.withLock { count += 1 } }
+            func read() -> Int { lock.withLock { count } }
+        }
+        final class RecoveryStore: TokenSaverScopedRecoveryStoring, @unchecked Sendable {
+            private let lock = NSLock()
+            private var original: Data?
+            func prepareOriginal(
+                _ data: Data,
+                context: TokenSaverRecoveryRequestContext,
+                lane: String
+            ) throws -> TokenSaverScopedPreparation {
+                lock.withLock { original = data }
+                return .init(
+                    capability: "rcv1.ABCDEFGHIJKLMNOPQRSTUV",
+                    idempotencyKey: context.operationID,
+                    readBackVerified: true
+                )
+            }
+            func retrieveOriginal(
+                capability: String,
+                context: TokenSaverRecoveryRequestContext
+            ) throws -> Data? { lock.withLock { original } }
+            func markDelivered(
+                capability: String,
+                idempotencyKey: String,
+                context: TokenSaverRecoveryRequestContext,
+                outcome: TokenSaverScopedDeliveryOutcome
+            ) throws -> Bool { try retrieveOriginal(capability: capability, context: context) != nil }
+            func ack(
+                capability: String,
+                idempotencyKey: String,
+                context: TokenSaverRecoveryRequestContext
+            ) throws -> Bool { true }
+        }
+        struct Runtime: DistillRuntime {
+            func distill(_ request: DistillRequest) async throws -> String { "BUILD FAILED: 3 errors" }
+            func distillStaged(_ request: DistillRequest) async throws -> DistillStageResult {
+                .init(output: "BUILD FAILED: 3 errors", stage: .llmMLX)
+            }
+        }
+
+        let tmpRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-sdk-delivered-savings-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpRoot) }
+        let database = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(database)
+        let repository = TokenSaverSavingsRepository(db: database)
+        let events = EventCounter()
+        let recorder = DeferredSavingsRecorder(
+            repository: repository,
+            eventSink: { _ in events.increment() }
+        )
+        let receiptKey = Data((0..<32).map(UInt8.init))
+        let configuration = try DistillServiceConfiguration(
+            authToken: "synthetic-bearer",
+            appSupportDirectory: tmpRoot.path,
+            maxConcurrentRequests: 1
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: Runtime(), maxConcurrentRequests: 1),
+            scopedRecoveryStore: RecoveryStore(),
+            onSuccess: recorder.successHandler,
+            deliveryReceiptKey: receiptKey,
+            deferredDeliveryAuthority: .init(keyGenerator: { Data(repeating: 0x31, count: 32) })
+        )
+        let baseURL = try await server.start().baseURL
+        defer { server.stop() }
+
+        let statePath = tmpRoot.appendingPathComponent("DistillCLIState.json")
+        let encodedState = try JSONSerialization.data(withJSONObject: [
+            "base_url": baseURL,
+            "auth_token": "synthetic-bearer",
+            "receipt_key": receiptKey.base64EncodedString(),
+        ])
+        try encodedState.write(to: statePath, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: statePath.path)
+        let admittedEnvironmentJSON = try environmentJSONString(
+            admittedClaudeTokenSaverEnvironment(statePath: statePath.path)
+        )
+
+        let timeoutConfiguration = try DistillServiceConfiguration(
+            authToken: "synthetic-bearer",
+            appSupportDirectory: tmpRoot.appendingPathComponent("timeout").path,
+            maxConcurrentRequests: 1
+        )
+        let timeoutServer = DistillHTTPServer(
+            configuration: timeoutConfiguration,
+            scheduler: DistillScheduler(runtime: Runtime(), maxConcurrentRequests: 1),
+            scopedRecoveryStore: RecoveryStore(),
+            onSuccess: recorder.successHandler,
+            deliveryReceiptKey: receiptKey,
+            deferredDeliveryClock: {
+                Thread.sleep(forTimeInterval: 0.65)
+                return Date()
+            },
+            deferredDeliveryAuthority: .init(keyGenerator: { Data(repeating: 0x32, count: 32) })
+        )
+        let timeoutBaseURL = try await timeoutServer.start().baseURL
+        defer { timeoutServer.stop() }
+        let timeoutStatePath = tmpRoot.appendingPathComponent("TimeoutDistillCLIState.json")
+        try JSONSerialization.data(withJSONObject: [
+            "base_url": timeoutBaseURL,
+            "auth_token": "synthetic-bearer",
+            "receipt_key": receiptKey.base64EncodedString(),
+        ]).write(to: timeoutStatePath, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: timeoutStatePath.path
+        )
+        let timeoutEnvironmentJSON = try environmentJSONString(
+            admittedClaudeTokenSaverEnvironment(statePath: timeoutStatePath.path)
+        )
+
+        let unavailableConfiguration = try DistillServiceConfiguration(
+            authToken: "synthetic-bearer",
+            appSupportDirectory: tmpRoot.appendingPathComponent("unavailable").path,
+            maxConcurrentRequests: 1
+        )
+        let unavailableServer = DistillHTTPServer(
+            configuration: unavailableConfiguration,
+            scheduler: DistillScheduler(runtime: Runtime(), maxConcurrentRequests: 1),
+            scopedRecoveryStore: RecoveryStore(),
+            onSuccess: recorder.successHandler,
+            deliveryReceiptKey: receiptKey,
+            deferredDeliveryAuthority: .init(keyGenerator: { Data(repeating: 0x33, count: 32) })
+        )
+        let unavailableBaseURL = try await unavailableServer.start().baseURL
+        defer { unavailableServer.stop() }
+        let unavailableStatePath = tmpRoot.appendingPathComponent("UnavailableDistillCLIState.json")
+        try JSONSerialization.data(withJSONObject: [
+            "base_url": unavailableBaseURL,
+            "auth_token": "synthetic-bearer",
+            "receipt_key": receiptKey.base64EncodedString(),
+        ]).write(to: unavailableStatePath, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: unavailableStatePath.path
+        )
+        let unavailableEnvironmentJSON = try environmentJSONString(
+            admittedClaudeTokenSaverEnvironment(statePath: unavailableStatePath.path)
+        )
+
+        // WHY: accounting happens after Claude has already accepted the replacement.
+        // Every phase one below crosses a real HTTP socket into DistillHTTPServer.
+        // Construction/queue failures never send; non-2xx is rejected by that server;
+        // timeout reaches a deliberately late server clock; unavailable closes the
+        // real endpoint after phase one and before releasing the queued final POST.
+        let failureHarness = #"""
+        import fs from 'fs';
         import { createHash, createHmac, randomBytes, randomUUID } from 'crypto';
-        const src = readFileSync(process.argv[2], 'utf8');
+        const src = fs.readFileSync(process.argv[2], 'utf8');
+        const admittedEnvironment = JSON.parse(process.argv[3]);
+        const timeoutEnvironment = JSON.parse(process.argv[4]);
+        const unavailableEnvironment = JSON.parse(process.argv[5]);
+        const start = src.indexOf('function tokenSaverAppliedReceipt');
+        const end = src.indexOf('function tokenSaverHooks');
+        if (start < 0 || end < 0) throw new Error('bridge failure slice not found');
+        const originalStringify = JSON.stringify.bind(JSON);
+        const originalSetImmediate = globalThis.setImmediate;
+        const factory = new Function(
+          'current',
+          'fetch',
+          'randomUUID',
+          'randomBytes',
+          'createHash',
+          'createHmac',
+          'fs',
+          'TOKEN_SAVER_HOOK_TIMEOUT_MS',
+          'TOKEN_SAVER_MIN_BYTES',
+          'TOKEN_SAVER_MIN_LINES',
+          'TOKEN_SAVER_STORE_MIN_BYTES',
+          src.slice(start, end) + '\nreturn tokenSaverPostToolUse;'
+        );
+        const makeHook = (environment, actualFetch = globalThis.fetch) => {
+          const current = { env: { ...environment } };
+          const hook = factory(
+            current,
+            actualFetch,
+            randomUUID,
+            randomBytes,
+            createHash,
+            createHmac,
+            fs,
+            45000,
+            1024,
+            10,
+            2048
+          );
+          return { current, hook };
+        };
+        const raw = Array.from({ length: 180 }, (_, i) => `diagnostic line ${i}`).join('\n')
+          + '\nFINAL_SENTINEL';
+        const envelope = () => ({
+          hook_event_name: 'PostToolUse',
+          tool_name: 'WebFetch',
+          tool_input: { url: 'https://example.invalid/noisy' },
+          tool_response: raw,
+        });
+        const preservesAcceptedOutput = (result) => {
+          const updated = result.hookSpecificOutput?.updatedToolOutput;
+          return typeof updated === 'string'
+            && updated.startsWith('BUILD FAILED: 3 errors\n')
+            && /\[\[rcd:v2\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\]\]\n$/.test(updated);
+        };
+        const results = {};
+
+        const construction = makeHook(admittedEnvironment);
+        JSON.stringify = (value, ...arguments_) => {
+          if (value?.recordSavings === true) {
+            throw new Error('synthetic final request construction failure');
+          }
+          return originalStringify(value, ...arguments_);
+        };
+        results.construction = preservesAcceptedOutput(await construction.hook(envelope()));
+        JSON.stringify = (...arguments_) => originalStringify(...arguments_);
+
+        const queue = makeHook(admittedEnvironment);
+        globalThis.setImmediate = () => { throw new Error('synthetic queue failure'); };
+        results.queue = preservesAcceptedOutput(await queue.hook(envelope()));
+        globalThis.setImmediate = originalSetImmediate;
+
+        let non2xxStatus = null;
+        const observedRealFetch = async (url, options) => {
+          const response = await globalThis.fetch(url, options);
+          if (JSON.parse(options.body).recordSavings === true) non2xxStatus = response.status;
+          return response;
+        };
+        const non2xx = makeHook(admittedEnvironment, observedRealFetch);
+        let non2xxFinal = null;
+        globalThis.setImmediate = (callback) => { non2xxFinal = callback; };
+        const non2xxResult = await non2xx.hook(envelope());
+        non2xx.current.env.RC_TOKEN_SAVER_THREAD_ID = '90000000-0000-0000-0000-000000000009';
+        globalThis.setImmediate = originalSetImmediate;
+        non2xxFinal();
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        results.non2xx = preservesAcceptedOutput(non2xxResult);
+
+        const NativeAbortController = globalThis.AbortController;
+        let abortElapsed = null;
+        globalThis.AbortController = class extends NativeAbortController {
+          constructor() {
+            super();
+            this.startedAt = Date.now();
+          }
+          abort(...arguments_) {
+            abortElapsed = Date.now() - this.startedAt;
+            return super.abort(...arguments_);
+          }
+        };
+        const timeout = makeHook(timeoutEnvironment);
+        const timeoutResult = await timeout.hook(envelope());
+        await new Promise((resolve) => setTimeout(resolve, 750));
+        globalThis.AbortController = NativeAbortController;
+        results.timeout = preservesAcceptedOutput(timeoutResult);
+
+        const unavailable = makeHook(unavailableEnvironment);
+        let unavailableFinal = null;
+        globalThis.setImmediate = (callback) => { unavailableFinal = callback; };
+        const unavailableResult = await unavailable.hook(envelope());
+        globalThis.setImmediate = originalSetImmediate;
+        fs.writeFileSync(process.argv[7], 'ready', 'utf8');
+        const stopDeadline = Date.now() + 3000;
+        while (!fs.existsSync(process.argv[8]) && Date.now() < stopDeadline) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        if (!fs.existsSync(process.argv[8])) throw new Error('unavailable server was not stopped');
+        unavailableFinal();
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        results.unavailable = preservesAcceptedOutput(unavailableResult);
+
+        fs.writeFileSync(
+          process.argv[6],
+          originalStringify({ results, abortElapsed, non2xxStatus }),
+          'utf8'
+        );
+        """#
+        let failureHarnessPath = tmpRoot.appendingPathComponent("transport-failures.mjs")
+        let failureResultPath = tmpRoot.appendingPathComponent("transport-failures.json")
+        let unavailableReadyPath = tmpRoot.appendingPathComponent("unavailable-ready")
+        let unavailableStoppedPath = tmpRoot.appendingPathComponent("unavailable-stopped")
+        try failureHarness.write(to: failureHarnessPath, atomically: true, encoding: .utf8)
+        let failureProcess = Process()
+        failureProcess.executableURL = URL(fileURLWithPath: node)
+        failureProcess.arguments = [
+            failureHarnessPath.path,
+            bridge.path,
+            admittedEnvironmentJSON,
+            timeoutEnvironmentJSON,
+            unavailableEnvironmentJSON,
+            failureResultPath.path,
+            unavailableReadyPath.path,
+            unavailableStoppedPath.path,
+        ]
+        let failurePipe = Pipe()
+        failureProcess.standardOutput = failurePipe
+        failureProcess.standardError = failurePipe
+        try failureProcess.run()
+        let unavailableReadyDeadline = Date().addingTimeInterval(5)
+        while !FileManager.default.fileExists(atPath: unavailableReadyPath.path),
+              failureProcess.isRunning,
+              Date() < unavailableReadyDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        guard FileManager.default.fileExists(atPath: unavailableReadyPath.path) else {
+            failureProcess.terminate()
+            failureProcess.waitUntilExit()
+            let output = String(
+                decoding: failurePipe.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+            return XCTFail("failure harness never reached unavailable handoff: \(output)")
+        }
+        unavailableServer.stop()
+        try Data("stopped".utf8).write(to: unavailableStoppedPath, options: .atomic)
+        failureProcess.waitUntilExit()
+        let failureOutput = String(
+            decoding: failurePipe.fileHandleForReading.readDataToEndOfFile(),
+            as: UTF8.self
+        )
+        XCTAssertEqual(failureProcess.terminationStatus, 0, "node failure harness failed: \(failureOutput)")
+        let failureData = try Data(contentsOf: failureResultPath)
+        let failureJSON = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: failureData) as? [String: Any]
+        )
+        let failureResults = try XCTUnwrap(failureJSON["results"] as? [String: Bool])
+        XCTAssertEqual(failureResults.count, 5)
+        XCTAssertTrue(failureResults.values.allSatisfy { $0 })
+        let abortElapsed = try XCTUnwrap(failureJSON["abortElapsed"] as? NSNumber).intValue
+        XCTAssertGreaterThanOrEqual(abortElapsed, 450)
+        XCTAssertLessThanOrEqual(abortElapsed, 900)
+        XCTAssertEqual(failureJSON["non2xxStatus"] as? Int, 409,
+                       "identity mismatch must be rejected by the real DistillHTTPServer")
+        let mainFailureMetrics = await server.metrics.snapshot(activeRequests: 0, maxConcurrentRequests: 1)
+        let timeoutFailureMetrics = await timeoutServer.metrics.snapshot(activeRequests: 0, maxConcurrentRequests: 1)
+        let unavailableFailureMetrics = await unavailableServer.metrics.snapshot(activeRequests: 0, maxConcurrentRequests: 1)
+        XCTAssertEqual(mainFailureMetrics.totalRequests, 4,
+                       "construction and queue send phase one only; non-2xx reaches the real final endpoint")
+        XCTAssertEqual(timeoutFailureMetrics.totalRequests, 2,
+                       "timeout must reach the real server for phase one and the late final POST")
+        XCTAssertEqual(unavailableFailureMetrics.totalRequests, 1,
+                       "the closed endpoint must see phase one but cannot receive the queued final POST")
+        XCTAssertEqual(try repository.summary().totalRuns, 0,
+                       "failed detached final POSTs must not create SQLite rows")
+        XCTAssertEqual(events.read(), 0,
+                       "failed detached final POSTs must not emit savings events")
+
+        // WHY: this executes the production Claude PostToolUse callback against a
+        // real DistillHTTPServer. The phase-one response may replace provider
+        // output, but only the detached post-callback phase two may reach the
+        // production DeferredSavingsRecorder, SQLite repository, and event sink.
+        let harness = #"""
+        import fs from 'fs';
+        import { createHash, createHmac, randomBytes, randomUUID } from 'crypto';
+        const src = fs.readFileSync(process.argv[2], 'utf8');
+        const admittedEnvironment = JSON.parse(process.argv[6]);
         const start = src.indexOf('function tokenSaverAppliedReceipt');
         const end = src.indexOf('function tokenSaverHooks');
         if (start < 0 || end < 0) throw new Error('bridge delivered-savings slice not found');
 
-        let scenario = 'accepted';
-        let stateMode = 0o100600;
-        let includeReceiptKey = true;
-        let requests = [];
-        let deferredHeaders = [];
-        const fakeFetch = async (_url, options) => {
-          const body = JSON.parse(options.body);
-          requests.push(body);
-          deferredHeaders.push(options.headers['X-RemoteCode-Delivery-Deferred'] || null);
-          if (body.recordSavings === false && body.precomputedOutput) {
-            return { ok: true, json: async () => ({
-              output: body.precomputedOutput,
-              routeStage: body.precomputedRouteStage
-            }) };
+        const realFetch = globalThis.fetch;
+        const requests = [];
+        const tracedFetch = async (url, options) => {
+          const entry = {
+            url,
+            body: JSON.parse(options.body),
+            headers: { ...options.headers },
+            startedAt: Date.now(),
+            status: null,
+            response: null,
+            completed: false,
+          };
+          requests.push(entry);
+          try {
+            const response = await realFetch(url, options);
+            const text = await response.text();
+            entry.status = response.status;
+            entry.response = text ? JSON.parse(text) : null;
+            return { ok: response.ok, json: async () => entry.response };
+          } finally {
+            entry.completed = true;
           }
-          if (scenario === 'accepted') {
-            return { ok: true, json: async () => ({
-              output: 'BUILD FAILED: 3 errors',
-              originalHandle: 'rcv1.ABCDEFGHIJKLMNOPQRSTUV',
-              recoveryIdempotencyKey: 'recovery-key',
-              routeStage: 'llm_mlx'
-            }) };
-          }
-          return { ok: true, json: async () => ({
-            output: 'x'.repeat(Buffer.byteLength(body.input, 'utf8') - 1),
-            routeStage: 'deterministic'
-          }) };
         };
         const factory = new Function(
           'current',
@@ -2375,34 +2907,22 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
           'TOKEN_SAVER_STORE_MIN_BYTES',
           src.slice(start, end) + '\nreturn tokenSaverPostToolUse;'
         );
+        const bridgeCurrent = { env: {} };
         const hook = factory(
-          { env: {
-            RC_TOKEN_SAVER_POST_TOOL_USE: '1',
-            REMOTE_CODE_AGENT_PROVIDER: 'claude',
-            RC_TOKEN_SAVER_ROOT_RUN_ID: '123e4567-e89b-12d3-a456-426614174000',
-            REMOTE_CODE_DISTILL_STATE_PATH: '/tmp/state.json'
-          } },
-          fakeFetch,
+          bridgeCurrent,
+          tracedFetch,
           randomUUID,
           randomBytes,
           createHash,
           createHmac,
-          {
-            statSync: () => ({ isFile: () => true, uid: process.getuid(), mode: stateMode }),
-            readFileSync: () => JSON.stringify({
-              base_url: 'http://127.0.0.1',
-              auth_token: 'tok',
-              ...(includeReceiptKey ? {
-                receipt_key: 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8='
-              } : {})
-            })
-          },
-          100,
+          fs,
+          45000,
           1024,
           10,
           2048
         );
-        const raw = Array.from({ length: 80 }, (_, i) => `diagnostic line ${i}`).join('\n');
+        const raw = Array.from({ length: 180 }, (_, i) => `diagnostic line ${i}`).join('\n')
+          + '\nFINAL_SENTINEL';
         const envelope = () => ({
           hook_event_name: 'PostToolUse',
           tool_name: 'WebFetch',
@@ -2410,48 +2930,106 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
           tool_response: raw,
         });
 
+        bridgeCurrent.env = {
+          RC_TOKEN_SAVER_POST_TOOL_USE: '1',
+          REMOTE_CODE_AGENT_PROVIDER: 'claude',
+          REMOTE_CODE_DISTILL_STATE_PATH: process.argv[4],
+        };
+        const legacyWithoutAdmission = await hook(envelope());
+        bridgeCurrent.env.RC_TOKEN_SAVER_DISTILL_HINT = 'stale';
+        bridgeCurrent.env.RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1 = 'stale-receipt';
+        const staleAdmissionReceipt = await hook(envelope());
+        bridgeCurrent.env = {
+          REMOTE_CODE_AGENT_PROVIDER: 'claude',
+          REMOTE_CODE_DISTILL_STATE_PATH: process.argv[4],
+        };
+        const inactive = await hook(envelope());
+        const negativeRequestCount = requests.length;
+        bridgeCurrent.env = { ...admittedEnvironment };
         const accepted = await hook(envelope());
         const acceptedRequestCountAtReturn = requests.length;
-        await new Promise((resolve) => setImmediate(resolve));
-        const acceptedRequests = requests.splice(0);
-        const acceptedDeferredHeaders = deferredHeaders.splice(0);
-        scenario = 'rejected';
-        const rejected = await hook(envelope());
-        await new Promise((resolve) => setImmediate(resolve));
-        const rejectedRequests = requests.splice(0);
-        const rejectedDeferredHeaders = deferredHeaders.splice(0);
-        scenario = 'accepted';
-        stateMode = 0o100644;
-        const worldReadable = await hook(envelope());
-        await new Promise((resolve) => setImmediate(resolve));
-        const worldReadableRequests = requests.splice(0);
-        stateMode = 0o100600;
-        includeReceiptKey = false;
-        const legacyState = await hook(envelope());
-        await new Promise((resolve) => setImmediate(resolve));
-        const legacyStateRequests = requests.splice(0);
-        console.log(JSON.stringify({
-          accepted,
+        const callbackReturnedAt = Date.now();
+        const waitDeadline = Date.now() + 1000;
+        while ((!requests[1] || !requests[1].completed) && Date.now() < waitDeadline) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        const finalCall = requests[1] || null;
+        let replayStatus = null;
+        if (finalCall?.completed && finalCall.status === 200) {
+          const replay = await realFetch(finalCall.url, {
+            method: 'POST',
+            headers: finalCall.headers,
+            body: JSON.stringify(finalCall.body),
+          });
+          replayStatus = replay.status;
+          await replay.text();
+        }
+        const updated = accepted.hookSpecificOutput?.updatedToolOutput || null;
+        const markerCount = typeof updated === 'string'
+          ? (updated.match(/\[\[rcd:v2\./g) || []).length
+          : 0;
+        const phaseOne = requests[0] || {};
+        const phaseTwo = requests[1] || {};
+        const phaseOneResponse = phaseOne.response || {};
+        const accountingOutput = phaseOneResponse.accountingOutput ?? phaseOneResponse.accounting_output;
+        const providerVisiblePrefix = phaseOneResponse.providerVisiblePrefix
+          ?? phaseOneResponse.provider_visible_prefix;
+        const deliveryToken = phaseOneResponse.deferredDeliveryToken
+          ?? phaseOneResponse.deferred_delivery_token;
+        const finalDeadline = phaseTwo.headers?.['X-RemoteCode-Handoff-Deadline-Unix-Milliseconds'] || null;
+        fs.writeFileSync(process.argv[5], JSON.stringify({
+          legacyWithoutAdmissionEmpty: Object.keys(legacyWithoutAdmission).length === 0,
+          staleAdmissionReceiptEmpty: Object.keys(staleAdmissionReceipt).length === 0,
+          inactiveEmpty: Object.keys(inactive).length === 0,
+          negativeRequestCount,
+          acceptedHasHookOutput: accepted.hookSpecificOutput?.updatedToolOutput === updated,
+          updatedContainsHandle: typeof updated === 'string'
+            && updated.includes('[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]'),
+          updatedHasTerminalReceipt: typeof updated === 'string'
+            && /\[\[rcd:v2\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\]\]\n$/.test(updated),
           acceptedRequestCountAtReturn,
-          acceptedRequests,
-          acceptedDeferredHeaders,
-          rejected,
-          rejectedRequests,
-          rejectedDeferredHeaders,
-          worldReadable,
-          worldReadableRequests,
-          legacyState,
-          legacyStateRequests
-        }));
+          callbackReturnedAt,
+          replayStatus,
+          markerCount,
+          requestCount: requests.length,
+          phaseOneStatus: phaseOne.status,
+          phaseOneRecordSavings: phaseOne.body?.recordSavings,
+          phaseOneHasPrecomputed: phaseOne.body?.precomputedOutput !== undefined,
+          phaseOneDeferredHeader: phaseOne.headers?.['X-RemoteCode-Delivery-Deferred'] || null,
+          phaseOneHasDeadline: phaseOne.headers?.['X-RemoteCode-Handoff-Deadline-Unix-Milliseconds'] !== undefined,
+          accountingMatches: accountingOutput === 'BUILD FAILED: 3 errors',
+          prefixEndsInLF: typeof providerVisiblePrefix === 'string' && providerVisiblePrefix.endsWith('\n'),
+          prefixContainsReceipt: typeof providerVisiblePrefix === 'string' && providerVisiblePrefix.includes('[[rcd:'),
+          updatedHasPrefix: typeof updated === 'string' && updated.startsWith(providerVisiblePrefix || ''),
+          phaseTwoStatus: phaseTwo.status,
+          phaseTwoRecordSavings: phaseTwo.body?.recordSavings,
+          phaseTwoHasPrecomputed: phaseTwo.body?.precomputedOutput !== undefined,
+          phaseTwoRouteStage: phaseTwo.body?.precomputedRouteStage,
+          phaseTwoAccountingMatches: phaseTwo.body?.accountingOutput === 'BUILD FAILED: 3 errors',
+          phaseTwoDeliveredMatches: phaseTwo.body?.deliveredOutput === updated,
+          phaseTwoTokenMatches: phaseTwo.body?.deferredDeliveryToken === deliveryToken,
+          confirmationCount: phaseTwo.body?.precomputedRecoveryConfirmations?.length,
+          confirmationCapability: phaseTwo.body?.precomputedRecoveryConfirmations?.[0]?.capability,
+          phaseTwoDeferredHeader: phaseTwo.headers?.['X-RemoteCode-Delivery-Deferred'] || null,
+          finalDeadline,
+          phaseTwoStartedAt: phaseTwo.startedAt,
+        }), 'utf8');
         """#
-        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+        let tmp = tmpRoot
             .appendingPathComponent("rc-sdk-delivered-savings-\(UUID().uuidString).mjs")
+        let resultPath = tmpRoot.appendingPathComponent("result.json")
         try harness.write(to: tmp, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(at: tmp) }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: node)
-        process.arguments = [tmp.path, bridge.path]
+        process.arguments = [
+            tmp.path,
+            bridge.path,
+            baseURL,
+            statePath.path,
+            resultPath.path,
+            admittedEnvironmentJSON,
+        ]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
@@ -2459,51 +3037,63 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         process.waitUntilExit()
         let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
-        let data = try XCTUnwrap(out.data(using: .utf8))
+        let data = try Data(contentsOf: resultPath)
         let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
 
-        let accepted = try XCTUnwrap(json["accepted"] as? [String: Any])
-        let acceptedHook = try XCTUnwrap(accepted["hookSpecificOutput"] as? [String: Any])
-        let updated = try XCTUnwrap(acceptedHook["updatedToolOutput"] as? String)
-        XCTAssertTrue(updated.contains("[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]"))
-        XCTAssertNotNil(updated.range(
-            of: #"\[\[rcd:v2\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\]\]$"#,
-            options: .regularExpression
-        ))
+        XCTAssertEqual(json["legacyWithoutAdmissionEmpty"] as? Bool, true)
+        XCTAssertEqual(json["staleAdmissionReceiptEmpty"] as? Bool, true)
+        XCTAssertEqual(json["inactiveEmpty"] as? Bool, true)
+        XCTAssertEqual(json["negativeRequestCount"] as? Int, 0,
+                       "legacy, stale, and inactive runs must preserve provider output without sidecar/final POST")
+        XCTAssertEqual(json["acceptedHasHookOutput"] as? Bool, true)
+        XCTAssertEqual(json["updatedContainsHandle"] as? Bool, true)
+        XCTAssertEqual(json["updatedHasTerminalReceipt"] as? Bool, true)
+        XCTAssertEqual(json["markerCount"] as? Int, 1,
+                       "provider output must contain exactly one terminal applied receipt")
         XCTAssertEqual(json["acceptedRequestCountAtReturn"] as? Int, 1,
-                       "recovery confirm must not start until after the native hook result returns")
-        let acceptedRequests = try XCTUnwrap(json["acceptedRequests"] as? [[String: Any]])
-        XCTAssertEqual(acceptedRequests.count, 2)
-        XCTAssertEqual(acceptedRequests[0]["recordSavings"] as? Bool, true)
-        XCTAssertNil(acceptedRequests[0]["precomputedOutput"])
-        XCTAssertEqual(acceptedRequests[1]["recordSavings"] as? Bool, false)
-        XCTAssertEqual(acceptedRequests[1]["precomputedOutput"] as? String, updated)
-        XCTAssertEqual(acceptedRequests[1]["precomputedRouteStage"] as? String, "llm_mlx")
-        let confirmations = try XCTUnwrap(
-            acceptedRequests[1]["precomputedRecoveryConfirmations"] as? [[String: Any]]
+                       "phase two must not start until the native hook callback has returned")
+        XCTAssertEqual(json["requestCount"] as? Int, 2)
+        XCTAssertEqual(json["phaseOneStatus"] as? Int, 200)
+        XCTAssertEqual(json["phaseOneRecordSavings"] as? Bool, false)
+        XCTAssertEqual(json["phaseOneHasPrecomputed"] as? Bool, false)
+        XCTAssertEqual(json["phaseOneDeferredHeader"] as? String, "1")
+        XCTAssertEqual(json["phaseOneHasDeadline"] as? Bool, false)
+        XCTAssertEqual(json["accountingMatches"] as? Bool, true)
+        XCTAssertEqual(json["prefixEndsInLF"] as? Bool, true)
+        XCTAssertEqual(json["prefixContainsReceipt"] as? Bool, false,
+                       "accounting/prefix must remain free of the applied receipt")
+        XCTAssertEqual(json["updatedHasPrefix"] as? Bool, true)
+        XCTAssertEqual(json["phaseTwoStatus"] as? Int, 200)
+        XCTAssertEqual(json["phaseTwoRecordSavings"] as? Bool, true)
+        XCTAssertEqual(json["phaseTwoHasPrecomputed"] as? Bool, false)
+        XCTAssertEqual(json["phaseTwoRouteStage"] as? String, "llm_mlx")
+        XCTAssertEqual(json["phaseTwoAccountingMatches"] as? Bool, true)
+        XCTAssertEqual(json["phaseTwoDeliveredMatches"] as? Bool, true)
+        XCTAssertEqual(json["phaseTwoTokenMatches"] as? Bool, true)
+        XCTAssertEqual(json["confirmationCount"] as? Int, 1)
+        XCTAssertEqual(json["confirmationCapability"] as? String, "rcv1.ABCDEFGHIJKLMNOPQRSTUV")
+        XCTAssertEqual(json["phaseTwoDeferredHeader"] as? String, "1")
+        let handoffDeadline = try XCTUnwrap(
+            UInt64(json["finalDeadline"] as? String ?? "")
         )
-        XCTAssertEqual(confirmations.count, 1)
-        XCTAssertEqual(confirmations[0]["capability"] as? String, "rcv1.ABCDEFGHIJKLMNOPQRSTUV")
-        XCTAssertEqual(confirmations[0]["idempotencyKey"] as? String, "recovery-key")
-        let acceptedDeferredHeaders = try XCTUnwrap(json["acceptedDeferredHeaders"] as? [Any])
-        XCTAssertEqual(acceptedDeferredHeaders.first as? String, "1")
-        XCTAssertTrue(acceptedDeferredHeaders.last is NSNull)
-
-        XCTAssertEqual((json["rejected"] as? [String: Any])?.count, 0)
-        let rejectedRequests = try XCTUnwrap(json["rejectedRequests"] as? [[String: Any]])
-        XCTAssertEqual(rejectedRequests.count, 1)
-        XCTAssertEqual(rejectedRequests[0]["recordSavings"] as? Bool, true)
-        XCTAssertNil(rejectedRequests[0]["precomputedOutput"])
-        XCTAssertEqual(json["rejectedDeferredHeaders"] as? [String], ["1"])
-        XCTAssertEqual((json["worldReadable"] as? [String: Any])?.count, 0,
-                       "a group/world-readable key file must fail open")
-        XCTAssertEqual((json["worldReadableRequests"] as? [[String: Any]])?.count, 0,
-                       "an insecure state file must be rejected before sidecar I/O")
-        XCTAssertEqual((json["legacyState"] as? [String: Any])?.count, 0,
-                       "a secure pre-v2 state must decode but cannot authorize replacement")
-        let legacyRequests = try XCTUnwrap(json["legacyStateRequests"] as? [[String: Any]])
-        XCTAssertEqual(legacyRequests.count, 1)
-        XCTAssertEqual(legacyRequests.first?["recordSavings"] as? Bool, true)
+        let callbackReturnedAt = try XCTUnwrap(json["callbackReturnedAt"] as? NSNumber).uint64Value
+        let phaseTwoStartedAt = try XCTUnwrap(json["phaseTwoStartedAt"] as? NSNumber).uint64Value
+        XCTAssertGreaterThanOrEqual(handoffDeadline, callbackReturnedAt)
+        XCTAssertLessThanOrEqual(
+            handoffDeadline >= callbackReturnedAt ? handoffDeadline - callbackReturnedAt : UInt64.max,
+            500
+        )
+        XCTAssertGreaterThanOrEqual(phaseTwoStartedAt, callbackReturnedAt)
+        XCTAssertLessThanOrEqual(
+            phaseTwoStartedAt >= callbackReturnedAt ? phaseTwoStartedAt - callbackReturnedAt : UInt64.max,
+            500,
+            "detached final POST must be queued inside the 500 ms handoff budget"
+        )
+        XCTAssertEqual(json["replayStatus"] as? Int, 200)
+        XCTAssertEqual(try repository.summary().totalRuns, 1,
+                       "phase one records zero and a lost-200 phase-two replay remains one durable row")
+        XCTAssertEqual(events.read(), 1,
+                       "only the first accepted post-callback delivery emits the production savings event")
     }
 
     func test_agentSDKBridgeRecoversRawNewlineSplitPromptCommand() throws {

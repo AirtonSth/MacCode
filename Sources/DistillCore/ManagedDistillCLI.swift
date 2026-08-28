@@ -16,6 +16,11 @@ import CoreModel
 /// wires a real URLSession transport.
 public struct ManagedDistillCLI: Sendable {
     public typealias Transport = @Sendable (URLRequest) async -> (data: Data, status: Int)?
+    public enum DeferredPostDiagnostic: Sendable, Equatable {
+        case response(status: Int)
+        case unavailable
+    }
+    public typealias DeferredPostObserver = @Sendable (DeferredPostDiagnostic) -> Void
     /// Live paid-feature admission. The executable wires this to the authoritative
     /// app setting plus the current sidecar lease; it is deliberately independent
     /// of inherited environment hints, which can outlive a toggle or app teardown.
@@ -97,6 +102,7 @@ public struct ManagedDistillCLI: Sendable {
     public let reversibleStoreMinBytes: Int?
     public let distillAdmission: DistillAdmission
     public let transport: Transport
+    public let deferredPostObserver: DeferredPostObserver?
 
     public init(
         arguments: [String],
@@ -109,6 +115,7 @@ public struct ManagedDistillCLI: Sendable {
         maxOutputCharacters: Int = 4_000,
         reversibleStoreMinBytes: Int? = nil,
         distillAdmission: @escaping DistillAdmission = { true },
+        deferredPostObserver: DeferredPostObserver? = nil,
         transport: @escaping Transport
     ) {
         self.arguments = arguments
@@ -128,6 +135,7 @@ public struct ManagedDistillCLI: Sendable {
         self.maxOutputCharacters = max(128, maxOutputCharacters)
         self.reversibleStoreMinBytes = reversibleStoreMinBytes
         self.distillAdmission = distillAdmission
+        self.deferredPostObserver = deferredPostObserver
         self.transport = transport
     }
 
@@ -396,6 +404,7 @@ public struct ManagedDistillCLI: Sendable {
             maxOutputCharacters: maxChars,
             reversibleStoreMinBytes: decision.reversibleStoreMinBytes,
             distillAdmission: distillAdmission,
+            deferredPostObserver: deferredPostObserver,
             transport: transport
         )
         // Use runResult (not run) so Wave A ledger POST stays deferred until after
@@ -567,6 +576,102 @@ public struct ManagedDistillCLI: Sendable {
         return emitted
     }
 
+    private static func receiptedDeferredPrefix(
+        original: Data,
+        prefix: String,
+        rootRunID: String?,
+        receiptKey: Data?
+    ) -> Data? {
+        guard !prefix.contains("\r"), prefix.hasSuffix("\n"),
+              let rootRunID, let receiptKey,
+              let marker = DistillAppliedReceipt.makeV2Marker(
+                rootRunID: rootRunID,
+                payload: Data(prefix.utf8),
+                key: receiptKey
+              ) else { return nil }
+        let emitted = Data((prefix + marker + "\n").utf8)
+        guard emitted.count < original.count else { return nil }
+        return emitted
+    }
+
+    private func applyDeferredHeaders(
+        to request: inout URLRequest,
+        operationID: String,
+        producerFamily: String,
+        invocationID: String? = nil
+    ) {
+        applyRecoveryScope(to: &request)
+        request.setValue("1", forHTTPHeaderField: "X-RemoteCode-Delivery-Deferred")
+        request.setValue(invocationID ?? self.invocationID, forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
+        request.setValue(operationID, forHTTPHeaderField: "X-RemoteCode-Operation-ID")
+        request.setValue(producerFamily, forHTTPHeaderField: "X-RemoteCode-Producer-Family")
+        if let rootRunID { request.setValue(rootRunID, forHTTPHeaderField: "X-RemoteCode-Root-Run-ID") }
+    }
+
+    private func preparedDeferredFinalPost(
+        phaseOneRequest: DistillRequest,
+        phaseOneResponse: DistillResponse,
+        deliveredOutput: String,
+        recoveryConfirmations: [DistillRecoveryDeliveryConfirmation],
+        operationID: String,
+        producerFamily: String
+    ) -> URLRequest? {
+        guard distillAdmission(),
+              let state,
+              let url = URL(string: state.baseURL + "/v1/distill"),
+              let token = phaseOneResponse.deferredDeliveryToken,
+              let accountingOutput = phaseOneResponse.accountingOutput,
+              phaseOneResponse.providerVisiblePrefix != nil else { return nil }
+        let final = DistillRequest(
+            id: phaseOneRequest.id,
+            mode: phaseOneRequest.mode,
+            priority: phaseOneRequest.priority,
+            input: phaseOneRequest.input,
+            question: phaseOneRequest.question,
+            provider: phaseOneRequest.provider,
+            recordSavings: true,
+            runMode: phaseOneRequest.effectiveRunMode,
+            cacheState: phaseOneRequest.cacheState,
+            maxOutputCharacters: phaseOneRequest.maxOutputCharacters,
+            reversibleStoreMinBytes: phaseOneRequest.reversibleStoreMinBytes,
+            precomputedRouteStage: phaseOneResponse.routeStage,
+            precomputedRecoveryConfirmations: recoveryConfirmations.isEmpty ? nil : recoveryConfirmations,
+            deferredDeliveryToken: token,
+            accountingOutput: accountingOutput,
+            deliveredOutput: deliveredOutput,
+            producerFamily: producerFamily,
+            deferredOperationID: operationID
+        )
+        guard let body = Self.canonicalBody(final) else { return nil }
+        var urlRequest = URLRequest(url: url)
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyDeferredHeaders(to: &urlRequest, operationID: operationID, producerFamily: producerFamily)
+        urlRequest.httpBody = body
+        return urlRequest
+    }
+
+    private func sendPreparedDeferredFinalPost(_ preparedRequest: URLRequest) async {
+        guard distillAdmission(),
+              let deadline = DistillDeferredDelivery.handoffDeadlineUnixMilliseconds() else { return }
+        var requestAtHandoff = preparedRequest
+        requestAtHandoff.setValue(
+            String(deadline),
+            forHTTPHeaderField: DistillDeferredDelivery.handoffDeadlineHeader
+        )
+        let finalURLRequest = requestAtHandoff
+        let transport = self.transport
+        let observer = deferredPostObserver
+        await DistillDeferredDelivery.awaitBestEffortHandoff {
+            if let response = await transport(finalURLRequest) {
+                observer?(.response(status: response.status))
+            } else {
+                observer?(.unavailable)
+            }
+        }
+    }
+
     private func compress(prompt: String) async -> RunResult {
         // Fail-open: hand back exactly what was piped in. exit 0 so the agent never
         // sees an error in place of its tool output.
@@ -577,44 +682,66 @@ public struct ManagedDistillCLI: Sendable {
         guard let input = String(data: stdin, encoding: .utf8) else { return failOpen() }
         guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return failOpen() }
 
-        // Live Wave A/B lossless pre-pass: shrink before (or without) the sidecar.
+        // Live Wave A/B lossless pre-pass. The server independently recomputes the
+        // deterministic result and issues the same process-local delivery token as
+        // scheduler output; arbitrary client-precomputed text is never authorized.
         // Only when Token Saver env is present (hint) so free builds never save tokens.
         let tokenSaverHintOn = ProcessInfo.processInfo.environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
             || ProcessInfo.processInfo.environment["RC_TOKEN_SAVER_WAVE_LIVE"] != nil
         if tokenSaverHintOn,
            let pre = TokenSaverWaveLosslessPrepass.apply(input: input, toolHint: prompt) {
-            guard distillAdmission() else { return failOpen() }
-            guard let compressed = Self.receiptedCompression(
-                original: stdin,
-                transformed: pre.output,
-                rootRunID: rootRunID,
-                receiptKey: state?.receiptKey
-            ) else {
-                return failOpen()
-            }
+            guard distillAdmission(), let state,
+                  let url = URL(string: state.baseURL + "/v1/distill") else { return failOpen() }
+            let request = DistillRequest(
+                mode: .commandOutput,
+                priority: .agent,
+                input: input,
+                question: prompt.isEmpty ? nil : prompt,
+                provider: provider,
+                recordSavings: false,
+                cacheState: "wave_prepass_\(pre.waveID)",
+                maxOutputCharacters: maxOutputCharacters,
+                reversibleStoreMinBytes: reversibleStoreMinBytes,
+                precomputedOutput: pre.output,
+                precomputedRouteStage: .deterministic,
+                producerFamily: "managed-cli",
+                deterministicLosslessPrepass: true
+            )
+            guard let body = Self.canonicalBody(request) else { return failOpen() }
+            let operationID = Self.recoveryOperationID(kind: "distill", canonicalPayload: body)
+            var urlRequest = URLRequest(url: url)
+            urlRequest.httpMethod = "POST"
+            urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
+            urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            applyDeferredHeaders(to: &urlRequest, operationID: operationID, producerFamily: "managed-cli")
+            urlRequest.httpBody = body
+            guard let (data, status) = await transport(urlRequest), status == 200,
+                  let response = Self.decodeResponse(DistillResponse.self, from: data),
+                  let prefix = response.providerVisiblePrefix,
+                  let compressed = Self.receiptedDeferredPrefix(
+                    original: stdin,
+                    prefix: prefix,
+                    rootRunID: rootRunID,
+                    receiptKey: state.receiptKey
+                  ) else { return failOpen() }
             FileHandle.standardError.write(Data(
                 "rc-wave-prepass wave=\(pre.waveID) trigger=\(pre.trigger) saved_bytes=\(pre.savedBytes) frac=\(String(format: "%.3f", pre.savedFraction))\n".utf8
             ))
-            // Display accounting uses the sidecar-body (prepass) delta — the same
-            // estimate(raw) − estimate(compressed) stack as before receipts existed.
-            // The provider-visible stdout still carries the applied receipt.
-            let recordOriginal = input
-            let recordPrompt = prompt
-            let recordPre = pre
             let recordSelf = self
+            let delivered = String(decoding: compressed, as: UTF8.self)
+            guard let preparedFinalPost = preparedDeferredFinalPost(
+                phaseOneRequest: request,
+                phaseOneResponse: response,
+                deliveredOutput: delivered,
+                recoveryConfirmations: [],
+                operationID: operationID,
+                producerFamily: "managed-cli"
+            ) else { return failOpen() }
             return RunResult(
                 stdout: compressed,
                 exitCode: 0,
                 deferredSideEffect: {
-                    await recordSelf.bestEffortSidecarPost(
-                        original: recordOriginal,
-                        prompt: recordPrompt,
-                        precomputedOutput: recordPre.output,
-                        cacheState: "wave_prepass_\(recordPre.waveID)",
-                        routeStage: .deterministic,
-                        recordSavings: true,
-                        invocationSuffix: "wave-prepass"
-                    )
+                    await recordSelf.sendPreparedDeferredFinalPost(preparedFinalPost)
                 }
             )
         }
@@ -630,9 +757,10 @@ public struct ManagedDistillCLI: Sendable {
             input: input,
             question: prompt.isEmpty ? nil : prompt,
             provider: provider,
-            recordSavings: true,
+            recordSavings: false,
             maxOutputCharacters: maxOutputCharacters,
-            reversibleStoreMinBytes: reversibleStoreMinBytes
+            reversibleStoreMinBytes: reversibleStoreMinBytes,
+            producerFamily: "managed-cli"
         )
         guard let body = Self.canonicalBody(request) else { return failOpen() }
 
@@ -640,10 +768,8 @@ public struct ManagedDistillCLI: Sendable {
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        applyRecoveryScope(to: &urlRequest)
-        urlRequest.setValue("1", forHTTPHeaderField: "X-RemoteCode-Delivery-Deferred")
-        urlRequest.setValue(invocationID, forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
-        urlRequest.setValue(Self.recoveryOperationID(kind: "distill", canonicalPayload: body), forHTTPHeaderField: "X-RemoteCode-Operation-ID")
+        let operationID = Self.recoveryOperationID(kind: "distill", canonicalPayload: body)
+        applyDeferredHeaders(to: &urlRequest, operationID: operationID, producerFamily: "managed-cli")
         urlRequest.httpBody = body
 
         guard distillAdmission() else { return failOpen() }
@@ -653,13 +779,10 @@ public struct ManagedDistillCLI: Sendable {
             return failOpen()
         }
         guard response.routeStage != .verbatim else { return failOpen() }
-        var out = response.output
-        if let handle = response.originalHandle, !handle.isEmpty {
-            out += "\n[[rc:\(handle)]]"
-        }
-        guard let emitted = Self.receiptedCompression(
+        guard let prefix = response.providerVisiblePrefix,
+              let emitted = Self.receiptedDeferredPrefix(
             original: stdin,
-            transformed: out,
+            prefix: prefix,
             rootRunID: rootRunID,
             receiptKey: state.receiptKey
         ) else {
@@ -668,89 +791,21 @@ public struct ManagedDistillCLI: Sendable {
         let delivered = String(decoding: emitted, as: UTF8.self)
         let recoveryConfirmations = Self.recoveryConfirmations(response)
         let recordSelf = self
-        let confirmRecovery: (@Sendable () async -> Void)?
-        if recoveryConfirmations.isEmpty {
-            confirmRecovery = nil
-        } else {
-            confirmRecovery = {
-                await recordSelf.bestEffortSidecarPost(
-                    original: input,
-                    prompt: prompt,
-                    precomputedOutput: delivered,
-                    routeStage: response.routeStage,
-                    recoveryConfirmations: recoveryConfirmations,
-                    recordSavings: false,
-                    invocationSuffix: "delivered"
-                )
-            }
-        }
+        guard let preparedFinalPost = preparedDeferredFinalPost(
+            phaseOneRequest: request,
+            phaseOneResponse: response,
+            deliveredOutput: delivered,
+            recoveryConfirmations: recoveryConfirmations,
+            operationID: operationID,
+            producerFamily: "managed-cli"
+        ) else { return failOpen() }
         return RunResult(
             stdout: emitted,
             exitCode: 0,
-            deferredSideEffect: confirmRecovery
-        )
-    }
-
-    /// Best-effort follow-up `/v1/distill` POST. Used for:
-    /// - Wave A/B: `recordSavings: true` with the **sidecar body** (no receipt), so the
-    ///   displayed delta matches estimate(raw) − estimate(compressed).
-    /// - Recovery confirm: `recordSavings: false` so handle delivery is attested
-    ///   without writing a second savings row.
-    ///
-    /// Never gates compressed stdout. One bounded retry covers a sidecar restart.
-    private func bestEffortSidecarPost(
-        original: String,
-        prompt: String,
-        precomputedOutput: String,
-        cacheState: String? = nil,
-        routeStage: TokenSaverRouteStage?,
-        recoveryConfirmations: [DistillRecoveryDeliveryConfirmation] = [],
-        recordSavings: Bool,
-        invocationSuffix: String
-    ) async {
-        guard precomputedOutput != original else { return }
-        guard distillAdmission() else { return }
-        guard let state, let url = URL(string: state.baseURL + "/v1/distill") else { return }
-
-        let request = DistillRequest(
-            mode: .commandOutput,
-            priority: .agent,
-            input: original,
-            question: prompt.isEmpty ? nil : prompt,
-            provider: provider,
-            recordSavings: recordSavings,
-            cacheState: cacheState,
-            maxOutputCharacters: maxOutputCharacters,
-            reversibleStoreMinBytes: reversibleStoreMinBytes,
-            precomputedOutput: precomputedOutput,
-            precomputedRouteStage: routeStage,
-            precomputedRecoveryConfirmations: recoveryConfirmations.isEmpty ? nil : recoveryConfirmations
-        )
-        guard let body = Self.canonicalBody(request) else { return }
-
-        var urlRequest = URLRequest(url: url)
-        urlRequest.httpMethod = "POST"
-        urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        applyRecoveryScope(to: &urlRequest)
-        urlRequest.setValue("\(invocationID).\(invocationSuffix)", forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
-        urlRequest.setValue(
-            Self.recoveryOperationID(kind: "distill", canonicalPayload: body),
-            forHTTPHeaderField: "X-RemoteCode-Operation-ID"
-        )
-        urlRequest.httpBody = body
-
-        for attempt in 0..<2 {
-            if let (_, status) = await transport(urlRequest), status == 200 {
-                return
+            deferredSideEffect: {
+                await recordSelf.sendPreparedDeferredFinalPost(preparedFinalPost)
             }
-            if attempt == 0 {
-                try? await Task.sleep(nanoseconds: 200_000_000)
-            }
-        }
-        FileHandle.standardError.write(Data(
-            "rc-distill ledger-post-failed delivered_bytes=\(precomputedOutput.utf8.count)\n".utf8
-        ))
+        )
     }
 
     /// Pure seam: the DistillSavingsRecord a Wave A/B prepass hit produces when the
@@ -782,33 +837,45 @@ public struct ManagedDistillCLI: Sendable {
         let chunks = Self.utf8Chunks(input, maxBytes: Self.stdinCapBytes)
         guard chunks.count > 1 else { return failOpen() }
 
-        var emitted: [String] = []
-        var routeStages: [TokenSaverRouteStage] = []
-        var recoveryConfirmations: [DistillRecoveryDeliveryConfirmation] = []
-        emitted.reserveCapacity(chunks.count)
-        routeStages.reserveCapacity(chunks.count)
-        recoveryConfirmations.reserveCapacity(chunks.count)
+        var manifests: [DistillDeferredMemberManifest] = []
+        manifests.reserveCapacity(chunks.count)
+        let aggregateOperationID = Self.recoveryOperationID(
+            kind: "distill-chunks",
+            canonicalPayload: Data((input + "\u{1e}" + prompt).utf8)
+        )
+        var byteOffset = 0
         for (offset, chunk) in chunks.enumerated() {
             let question = Self.chunkQuestion(prompt: prompt, index: offset + 1, count: chunks.count)
+            let descriptor = DistillDeferredChunkDescriptor(
+                index: offset,
+                count: chunks.count,
+                originalUTF8ByteOffset: byteOffset,
+                originalUTF8ByteLength: chunk.utf8.count,
+                aggregateOperationID: aggregateOperationID
+            )
             let request = DistillRequest(
                 mode: .commandOutput,
                 priority: .agent,
                 input: chunk,
                 question: question,
                 provider: provider,
-                recordSavings: true,
+                recordSavings: false,
                 maxOutputCharacters: maxOutputCharacters,
-                reversibleStoreMinBytes: reversibleStoreMinBytes
+                reversibleStoreMinBytes: reversibleStoreMinBytes,
+                producerFamily: "managed-cli-chunks",
+                deferredChunk: descriptor
             )
             guard let body = Self.canonicalBody(request) else { return failOpen() }
             var urlRequest = URLRequest(url: url)
             urlRequest.httpMethod = "POST"
             urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
             urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            applyRecoveryScope(to: &urlRequest)
-            urlRequest.setValue("1", forHTTPHeaderField: "X-RemoteCode-Delivery-Deferred")
-            urlRequest.setValue("\(invocationID).chunk-\(offset + 1)", forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
-            urlRequest.setValue(Self.recoveryOperationID(kind: "distill", canonicalPayload: body), forHTTPHeaderField: "X-RemoteCode-Operation-ID")
+            applyDeferredHeaders(
+                to: &urlRequest,
+                operationID: "\(aggregateOperationID).member.\(offset)",
+                producerFamily: "managed-cli-chunks",
+                invocationID: "\(invocationID).member.\(offset)"
+            )
             urlRequest.httpBody = body
 
             guard distillAdmission() else { return failOpen() }
@@ -818,48 +885,72 @@ public struct ManagedDistillCLI: Sendable {
                 return failOpen()
             }
             guard response.routeStage != .verbatim else { return failOpen() }
-            var out = response.output
-            if let handle = response.originalHandle, !handle.isEmpty {
-                out += "\n[[rc:\(handle)]]"
-            }
-            emitted.append(out)
-            if let routeStage = response.routeStage {
-                routeStages.append(routeStage)
-            }
-            recoveryConfirmations.append(contentsOf: Self.recoveryConfirmations(response))
+            guard let accountingOutput = response.accountingOutput,
+                  let memberToken = response.deferredMemberToken else { return failOpen() }
+            let memberConfirmations = Self.recoveryConfirmations(response)
+            manifests.append(DistillDeferredMemberManifest(
+                descriptor: descriptor,
+                question: question,
+                routeStage: response.routeStage,
+                recoveryConfirmations: memberConfirmations,
+                accountingOutput: accountingOutput,
+                memberToken: memberToken
+            ))
+            byteOffset += chunk.utf8.count
         }
-        guard let output = Self.receiptedCompression(
+        let aggregateRequest = DistillRequest(
+            mode: .commandOutput,
+            priority: .agent,
+            input: input,
+            question: prompt.isEmpty ? nil : prompt,
+            provider: provider,
+            recordSavings: false,
+            maxOutputCharacters: maxOutputCharacters,
+            reversibleStoreMinBytes: reversibleStoreMinBytes,
+            producerFamily: "managed-cli-chunks",
+            deferredMembers: manifests
+        )
+        guard let aggregateBody = Self.canonicalBody(aggregateRequest) else { return failOpen() }
+        var aggregateURLRequest = URLRequest(url: url)
+        aggregateURLRequest.httpMethod = "POST"
+        aggregateURLRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
+        aggregateURLRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyDeferredHeaders(
+            to: &aggregateURLRequest,
+            operationID: aggregateOperationID,
+            producerFamily: "managed-cli-chunks"
+        )
+        aggregateURLRequest.httpBody = aggregateBody
+        guard distillAdmission(),
+              let (aggregateData, aggregateStatus) = await transport(aggregateURLRequest),
+              aggregateStatus == 200,
+              let aggregateResponse = Self.decodeResponse(DistillResponse.self, from: aggregateData),
+              let prefix = aggregateResponse.providerVisiblePrefix,
+              let output = Self.receiptedDeferredPrefix(
             original: stdin,
-            transformed: emitted.joined(separator: "\n\n"),
+            prefix: prefix,
             rootRunID: rootRunID,
             receiptKey: state.receiptKey
         ) else {
             return failOpen()
         }
         let delivered = String(decoding: output, as: UTF8.self)
-        let aggregateRouteStage = Self.aggregateRouteStage(routeStages)
-        let deliveredRecoveryConfirmations = recoveryConfirmations
+        let deliveredRecoveryConfirmations = manifests.flatMap(\.recoveryConfirmations)
         let recordSelf = self
-        let confirmRecovery: (@Sendable () async -> Void)?
-        if deliveredRecoveryConfirmations.isEmpty {
-            confirmRecovery = nil
-        } else {
-            confirmRecovery = {
-                await recordSelf.bestEffortSidecarPost(
-                    original: input,
-                    prompt: prompt,
-                    precomputedOutput: delivered,
-                    routeStage: aggregateRouteStage,
-                    recoveryConfirmations: deliveredRecoveryConfirmations,
-                    recordSavings: false,
-                    invocationSuffix: "chunked-delivered"
-                )
-            }
-        }
+        guard let preparedFinalPost = preparedDeferredFinalPost(
+            phaseOneRequest: aggregateRequest,
+            phaseOneResponse: aggregateResponse,
+            deliveredOutput: delivered,
+            recoveryConfirmations: deliveredRecoveryConfirmations,
+            operationID: aggregateOperationID,
+            producerFamily: "managed-cli-chunks"
+        ) else { return failOpen() }
         return RunResult(
             stdout: output,
             exitCode: 0,
-            deferredSideEffect: confirmRecovery
+            deferredSideEffect: {
+                await recordSelf.sendPreparedDeferredFinalPost(preparedFinalPost)
+            }
         )
     }
 

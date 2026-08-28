@@ -13,6 +13,11 @@ public struct ManagedRetrieveMCP: Sendable {
     public typealias SearchFn = @Sendable (_ query: String, _ topK: Int) async -> [CCRSearchResult]
     public typealias StatsFn = @Sendable () async -> DistillStatsSnapshot?
     public typealias CompressFn = @Sendable (_ request: DistillRequest) async -> DistillResponse?
+    public typealias PreparedCompressFn = @Sendable (
+        _ request: DistillRequest,
+        _ preparedBody: Data,
+        _ handoffDeadlineUnixMilliseconds: UInt64
+    ) async -> DistillResponse?
     public typealias AskFn = @Sendable (_ op: String, _ input: String, _ question: String, _ handle: String?) async -> String?
     public typealias DistillAdmission = @Sendable () -> Bool
     public typealias DeferredSideEffect = @Sendable () async -> Void
@@ -37,6 +42,7 @@ public struct ManagedRetrieveMCP: Sendable {
     private let search: SearchFn
     private let stats: StatsFn
     private let compress: CompressFn?
+    private let preparedCompress: PreparedCompressFn?
     private let ask: AskFn?
     private let scopedRecoveryAvailable: Bool
     private let rootRunID: String?
@@ -48,6 +54,7 @@ public struct ManagedRetrieveMCP: Sendable {
         search: @escaping SearchFn = { _, _ in [] },
         stats: @escaping StatsFn = { nil },
         compress: CompressFn? = nil,
+        preparedCompress: PreparedCompressFn? = nil,
         ask: AskFn? = nil,
         scopedRecoveryAvailable: Bool = false,
         rootRunID: String? = nil,
@@ -58,6 +65,7 @@ public struct ManagedRetrieveMCP: Sendable {
         self.search = search
         self.stats = stats
         self.compress = compress
+        self.preparedCompress = preparedCompress
         self.ask = ask
         self.scopedRecoveryAvailable = scopedRecoveryAvailable
         let trimmedRootRunID = rootRunID?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -360,15 +368,20 @@ public struct ManagedRetrieveMCP: Sendable {
 
         let maxOutputCharacters = args?["maxOutputCharacters"] as? Int ?? 4_000
         let reversibleStoreMinBytes = args?["reversibleStoreMinBytes"] as? Int ?? 256
+        let requestID = UUID()
+        let operationID = "managed-retrieve.\(requestID.uuidString.lowercased())"
         let request = DistillRequest(
+            id: requestID,
             mode: .commandOutput,
             priority: .agent,
             input: input,
             question: args?["question"] as? String,
             provider: args?["provider"] as? String,
-            recordSavings: true,
+            recordSavings: false,
             maxOutputCharacters: maxOutputCharacters,
-            reversibleStoreMinBytes: reversibleStoreMinBytes
+            reversibleStoreMinBytes: reversibleStoreMinBytes,
+            producerFamily: "managed-retrieve-mcp",
+            deferredOperationID: operationID
         )
         guard let response = await compress(request),
               trustedCompressionAvailable,
@@ -376,20 +389,22 @@ public struct ManagedRetrieveMCP: Sendable {
               !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let handle = response.originalHandle, !handle.isEmpty,
               let recoveryIdempotencyKey = response.recoveryIdempotencyKey,
-              !recoveryIdempotencyKey.isEmpty else {
+              !recoveryIdempotencyKey.isEmpty,
+              let token = response.deferredDeliveryToken,
+              let accountingOutput = response.accountingOutput,
+              let prefix = response.providerVisiblePrefix,
+              prefix.hasSuffix("\n"), !prefix.contains("\r") else {
             return failOpen()
         }
 
-        let outputSeparator = response.output.hasSuffix("\n") ? "" : "\n"
-        let signedPayload = Data((response.output + outputSeparator + "[[rc:\(handle)]]\n").utf8)
         guard let marker = DistillAppliedReceipt.makeV2Marker(
             rootRunID: rootRunID,
-            payload: signedPayload,
+            payload: Data(prefix.utf8),
             key: receiptKey
         ) else {
             return failOpen()
         }
-        let deliveredData = signedPayload + Data((marker + "\n").utf8)
+        let deliveredData = Data((prefix + marker + "\n").utf8)
         guard deliveredData.count < Data(input.utf8).count,
               let delivered = String(data: deliveredData, encoding: .utf8) else {
             return failOpen()
@@ -402,26 +417,41 @@ public struct ManagedRetrieveMCP: Sendable {
         }
 
         let ledgerRequest = DistillRequest(
+            id: requestID,
             mode: .commandOutput,
             priority: .agent,
             input: input,
             question: args?["question"] as? String,
             provider: args?["provider"] as? String,
-            recordSavings: false,
+            recordSavings: true,
             maxOutputCharacters: maxOutputCharacters,
             reversibleStoreMinBytes: reversibleStoreMinBytes,
-            precomputedOutput: delivered,
             precomputedRouteStage: response.routeStage,
             precomputedRecoveryConfirmations: [
                 .init(capability: handle, idempotencyKey: recoveryIdempotencyKey),
-            ]
+            ],
+            deferredDeliveryToken: token,
+            accountingOutput: accountingOutput,
+            deliveredOutput: delivered,
+            producerFamily: "managed-retrieve-mcp",
+            deferredOperationID: operationID
         )
+        guard let preparedBody = encodeData(ledgerRequest) else { return failOpen() }
         let admission = distillAdmission
+        let preparedCompress = self.preparedCompress
         return HandleResult(
             response: responseLine,
             deferredSideEffect: {
-                guard admission() else { return }
-                _ = await compress(ledgerRequest)
+                guard admission(),
+                      let deadline = DistillDeferredDelivery.handoffDeadlineUnixMilliseconds() else { return }
+                await DistillDeferredDelivery.awaitBestEffortHandoff {
+                    if let preparedCompress {
+                        _ = await preparedCompress(ledgerRequest, preparedBody, deadline)
+                    } else {
+                        let compatibilityRequest = ledgerRequest.withDeferredHandoffDeadline(deadline)
+                        _ = await compress(compatibilityRequest)
+                    }
+                }
             }
         )
     }
@@ -466,5 +496,12 @@ public struct ManagedRetrieveMCP: Sendable {
         Self.encodeLock.unlock()
         guard let data else { return nil }
         return String(data: data, encoding: .utf8)
+    }
+
+    private func encodeData<T: Encodable>(_ value: T) -> Data? {
+        Self.encodeLock.lock()
+        let data = try? Self.encoder.encode(value)
+        Self.encodeLock.unlock()
+        return data
     }
 }

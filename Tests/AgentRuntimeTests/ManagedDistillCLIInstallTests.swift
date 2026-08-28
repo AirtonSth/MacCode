@@ -1,4 +1,6 @@
 import XCTest
+import Foundation
+import DistillCore
 @testable import AgentRuntime
 import CoreModel
 
@@ -245,6 +247,102 @@ final class ManagedDistillCLIInstallTests: XCTestCase {
             ),
             binary.path
         )
+    }
+
+    func test_installedWrappers_executeRealLaunchDispatchForEveryProviderAndKeepShortExactOutputRaw() throws {
+        // WHY: symlink shape is insufficient. The installed artifact must dispatch
+        // by argv[0], find the real command outside managed PATH, and preserve both
+        // short and exact-output bytes for Claude, Codex, and Grok without a sidecar.
+        guard let binary = AgentSkillInstaller.resolveServiceBinary(),
+              FileManager.default.isExecutableFile(atPath: binary.path) else {
+            throw XCTSkip("RemoteCodeDistillService debug binary not built")
+        }
+
+        let home = tempHome()
+        let providerBin = home.appendingPathComponent("provider-bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: providerBin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let shortCommand = providerBin.appendingPathComponent("workspace-report")
+        try Data("#!/bin/sh\n/usr/bin/printf 'oi\\n'\n".utf8).write(to: shortCommand)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shortCommand.path)
+
+        let exactCommand = providerBin.appendingPathComponent("cat")
+        try Data("#!/bin/sh\n/usr/bin/printf '%s' \"$RC_EXACT_FIXTURE\"\n".utf8).write(to: exactCommand)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: exactCommand.path)
+
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let installed = try installer.installCommandWrappers(
+            serviceBinaryURL: binary,
+            searchDirectoriesOverride: [providerBin.path]
+        )
+        XCTAssertTrue(installed.contains("workspace-report"))
+        XCTAssertTrue(installed.contains("cat"))
+
+        let managedBin = home.appendingPathComponent(".remote-code/bin", isDirectory: true)
+        let shortWrapper = managedBin.appendingPathComponent("workspace-report")
+        let exactWrapper = managedBin.appendingPathComponent("cat")
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: shortWrapper.path),
+            binary.path
+        )
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: exactWrapper.path),
+            binary.path
+        )
+
+        let exact = (1...120)
+            .map { "exact synthetic line=\($0) identifier=item-\($0)" }
+            .joined(separator: "\n") + "\n"
+        for provider in [AgentProvider.claude, .codex, .grok] {
+            let environment = [
+                "HOME": home.path,
+                "PATH": "\(managedBin.path):\(providerBin.path):/usr/bin:/bin",
+                "REMOTE_CODE_AGENT_PROVIDER": provider.rawValue,
+                "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+                "RC_TOKEN_SAVER_THREAD_ID": "wrapper-child-\(provider.rawValue)",
+                "RC_TOKEN_SAVER_ROOT_RUN_ID": "wrapper-root",
+                "RC_EXACT_FIXTURE": exact,
+                "REMOTE_CODE_DISTILL_STATE_PATH": home
+                    .appendingPathComponent("missing/DistillCLIState.json").path,
+            ]
+
+            let short = try runInstalledWrapper(shortWrapper, environment: environment)
+            XCTAssertEqual(short.status, 0, "\(provider) short command exit")
+            XCTAssertEqual(short.stdout, Data("oi\n".utf8), "\(provider) short output")
+            XCTAssertFalse(
+                DistillAppliedReceipt.containsMarker(String(decoding: short.stdout, as: UTF8.self)),
+                "\(provider) short output must remain an honest zero"
+            )
+
+            let raw = try runInstalledWrapper(exactWrapper, environment: environment)
+            XCTAssertEqual(raw.status, 0, "\(provider) exact command exit")
+            XCTAssertEqual(raw.stdout, Data(exact.utf8), "\(provider) exact-output bytes")
+            XCTAssertFalse(
+                DistillAppliedReceipt.containsMarker(String(decoding: raw.stdout, as: UTF8.self)),
+                "\(provider) exact-output command must never claim savings"
+            )
+        }
+    }
+
+    private func runInstalledWrapper(
+        _ executable: URL,
+        environment additions: [String: String]
+    ) throws -> (stdout: Data, status: Int32) {
+        let process = Process()
+        process.executableURL = executable
+        var environment = ProcessInfo.processInfo.environment
+        additions.forEach { environment[$0.key] = $0.value }
+        process.environment = environment
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        _ = stderr.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (output, process.terminationStatus)
     }
 
     func test_installCommandWrappers_reconcilesLegacyExactOutputSymlinksToServiceInterceptor() throws {

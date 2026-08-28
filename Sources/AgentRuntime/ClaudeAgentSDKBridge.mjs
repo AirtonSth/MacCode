@@ -1,7 +1,7 @@
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk';
 import * as claudeSDK from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -473,6 +473,7 @@ function tokenSaverRecoveryHeaders(env) {
     ['RC_TOKEN_SAVER_THREAD_ID', 'X-RemoteCode-Thread-ID'],
     ['RC_TOKEN_SAVER_ATTEMPT_ID', 'X-RemoteCode-Attempt-ID'],
     ['REMOTE_CODE_AGENT_PROVIDER', 'X-RemoteCode-Provider'],
+    ['RC_TOKEN_SAVER_ROOT_RUN_ID', 'X-RemoteCode-Root-Run-ID'],
   ];
   for (const [envKey, header] of map) {
     const value = env && typeof env[envKey] === 'string' ? env[envKey].trim() : '';
@@ -487,10 +488,16 @@ function tokenSaverRecoveryHeaders(env) {
   return headers;
 }
 
-async function postTokenSaverRequest(state, body, extraHeaders = {}) {
+async function postPreparedTokenSaverRequest(
+  state,
+  body,
+  preparedBody,
+  extraHeaders = {},
+  timeoutMS = TOKEN_SAVER_HOOK_TIMEOUT_MS
+) {
   if (typeof fetch !== 'function') return null;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TOKEN_SAVER_HOOK_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMS);
   try {
     const invocationID = typeof body.id === 'string' && body.id ? body.id : randomUUID();
     const headers = {
@@ -499,12 +506,13 @@ async function postTokenSaverRequest(state, body, extraHeaders = {}) {
       ...tokenSaverRecoveryHeaders(current.env),
       ...extraHeaders,
       'X-RemoteCode-Invocation-ID': invocationID,
-      'X-RemoteCode-Operation-ID': `ptuhook1.${invocationID}`,
+      'X-RemoteCode-Operation-ID': body.deferredOperationID || `ptuhook1.${invocationID}`,
+      'X-RemoteCode-Producer-Family': body.producerFamily || 'claude-post-tool-use',
     };
     const response = await fetch(`${state.baseURL}/v1/distill`, {
       method: 'POST',
       headers,
-      body: JSON.stringify(body),
+      body: preparedBody,
       signal: controller.signal,
     });
     if (!response.ok) return null;
@@ -517,6 +525,16 @@ async function postTokenSaverRequest(state, body, extraHeaders = {}) {
   }
 }
 
+async function postTokenSaverRequest(state, body, extraHeaders = {}, timeoutMS = TOKEN_SAVER_HOOK_TIMEOUT_MS) {
+  let preparedBody;
+  try {
+    preparedBody = JSON.stringify(body);
+  } catch (_) {
+    return null;
+  }
+  return postPreparedTokenSaverRequest(state, body, preparedBody, extraHeaders, timeoutMS);
+}
+
 async function postTokenSaverDistill(state, body) {
   const decoded = await postTokenSaverRequest(state, body, {
     'X-RemoteCode-Delivery-Deferred': '1',
@@ -526,21 +544,20 @@ async function postTokenSaverDistill(state, body) {
     const input = body && typeof body.input === 'string' ? body.input : '';
     const routeStage = decoded.routeStage ?? decoded.route_stage;
     if (!input || routeStage === 'verbatim' || decoded.output === input) return null;
-    // Preserve store-before-loss recoverability: the agent must see [[rc:handle]]
-    // when the sidecar stored the original (AGENTS.md).
-    let output = decoded.output;
+    const accountingOutput = decoded.accountingOutput ?? decoded.accounting_output;
+    const receiptPrefix = decoded.providerVisiblePrefix ?? decoded.provider_visible_prefix;
+    const deliveryToken = decoded.deferredDeliveryToken ?? decoded.deferred_delivery_token;
+    if (typeof accountingOutput !== 'string' || typeof receiptPrefix !== 'string'
+      || typeof deliveryToken !== 'string' || !deliveryToken) return null;
+    if (!receiptPrefix.endsWith('\n') || receiptPrefix.includes('\r')) return null;
     const handle = (typeof decoded.originalHandle === 'string' && decoded.originalHandle.trim())
       || (typeof decoded.original_handle === 'string' && decoded.original_handle.trim())
       || '';
-    if (handle && !output.includes(`[[rc:${handle}]]`)) {
-      output = `${output}\n[[rc:${handle}]]`;
-    }
     // A distinct applied receipt drives the persisted Distilled badge. Command
     // syntax is not proof: an explicit pipe can fail open and return raw bytes.
-    const receiptPrefix = `${output}\n`;
     const receipt = tokenSaverAppliedReceipt(receiptPrefix, state);
     if (!receipt) return null;
-    const withReceipt = `${receiptPrefix}${receipt}`;
+    const withReceipt = `${receiptPrefix}${receipt}\n`;
     if (Buffer.byteLength(withReceipt, 'utf8') >= Buffer.byteLength(input, 'utf8')) return null;
     const capability = handle;
     const idempotencyKey = (typeof decoded.recoveryIdempotencyKey === 'string'
@@ -551,7 +568,13 @@ async function postTokenSaverDistill(state, body) {
     const recoveryConfirmations = capability && idempotencyKey
       ? [{ capability, idempotencyKey }]
       : [];
-    return { output: withReceipt, routeStage, recoveryConfirmations };
+    return {
+      output: withReceipt,
+      routeStage,
+      recoveryConfirmations,
+      accountingOutput,
+      deliveryToken,
+    };
   } catch (_) {
     return null;
   }
@@ -559,24 +582,99 @@ async function postTokenSaverDistill(state, body) {
 
 async function bestEffortRecordTokenSaverSavings(
   state,
-  candidate,
-  delivered,
-  routeStage,
-  recoveryConfirmations
+  finalRequest,
+  preparedBody,
+  handoffDeadlineUnixMilliseconds
 ) {
-  if (!delivered || delivered === candidate.input) return;
-  if (!recoveryConfirmations?.length) return;
-  await postTokenSaverRequest(state, {
-    ...candidate,
-    id: randomUUID(),
-    recordSavings: false,
-    precomputedOutput: delivered,
-    precomputedRouteStage: routeStage,
-    precomputedRecoveryConfirmations: recoveryConfirmations,
+  await postPreparedTokenSaverRequest(state, finalRequest, preparedBody, {
+    'X-RemoteCode-Delivery-Deferred': '1',
+    'X-RemoteCode-Handoff-Deadline-Unix-Milliseconds': String(handoffDeadlineUnixMilliseconds),
+  }, 500);
+}
+
+function tokenSaverExecutionReceiptAdmitsClaude(env) {
+  // Swift's TokenSaverExecutionReceiptSeam is the authority and emits this
+  // canonical, content-free v1 JSON. The bridge only validates that projection
+  // before using any inherited optimization flag; it does not mint receipts.
+  const encoded = env?.RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1;
+  if (env?.RC_TOKEN_SAVER_DISTILL_HINT !== '1'
+      || typeof encoded !== 'string'
+      || Buffer.byteLength(encoded, 'utf8') > 4096) return false;
+  const lower = encoded.toLowerCase();
+  const disallowed = [
+    'prompt', 'transcript', 'raw_output', 'tool_output', 'authorization',
+    'password', 'secret', 'api_key', 'private_key', 'bootstrap_token',
+    'sidecar_token', 'sk-ant-', 'sk-or-',
+  ];
+  if (disallowed.some((marker) => lower.includes(marker))) return false;
+  let receipt;
+  try {
+    receipt = JSON.parse(encoded);
+  } catch (_) {
+    return false;
+  }
+  if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return false;
+  const allowedReceiptKeys = new Set([
+    'v', 'root_run_id', 'thread_id', 'attempt_id', 'provider', 'admitted',
+    'same_user', 'denial_reason', 'capabilities', 'disabled_lanes',
+    'enabled_lanes', 'workspace_id', 'project_id', 'wave_live',
+  ]);
+  if (Object.keys(receipt).some((key) => !allowedReceiptKeys.has(key))) return false;
+  const capabilities = receipt.capabilities;
+  if (!capabilities || typeof capabilities !== 'object' || Array.isArray(capabilities)) {
+    return false;
+  }
+  const allowedCapabilityKeys = new Set([
+    'distill', 'graphify', 'post_tool_use', 'recovery_scope', 'managed_path',
+  ]);
+  if (Object.keys(capabilities).some((key) => !allowedCapabilityKeys.has(key))) return false;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const optionalUUID = (value) => value == null
+    || (typeof value === 'string' && uuid.test(value));
+  const optionalBoolean = (value) => value == null || typeof value === 'boolean';
+  const safeToken = (value) => typeof value === 'string'
+    && [...value].length > 0
+    && [...value].length <= 64
+    && /^[\p{L}\p{N}_.-]+$/u.test(value);
+  if (receipt.v !== 1
+      || typeof receipt.thread_id !== 'string' || !uuid.test(receipt.thread_id)
+      || !optionalUUID(receipt.root_run_id)
+      || !optionalUUID(receipt.attempt_id)
+      || !optionalUUID(receipt.workspace_id)
+      || !optionalUUID(receipt.project_id)
+      || !Array.isArray(receipt.disabled_lanes)
+      || !receipt.disabled_lanes.every(safeToken)
+      || !Array.isArray(receipt.enabled_lanes)
+      || !receipt.enabled_lanes.every(safeToken)
+      || !optionalBoolean(capabilities.graphify)
+      || !optionalBoolean(capabilities.recovery_scope)
+      || (receipt.wave_live != null && (typeof receipt.wave_live !== 'string'
+        || !receipt.wave_live.split(',').filter(Boolean).every(safeToken)))) return false;
+  if (receipt.provider !== 'claude'
+      || env.REMOTE_CODE_AGENT_PROVIDER !== receipt.provider
+      || receipt.admitted !== true
+      || receipt.same_user !== true
+      || receipt.denial_reason !== 'none'
+      || capabilities.distill !== true
+      || capabilities.managed_path !== true
+      || capabilities.post_tool_use !== true) return false;
+  const identity = [
+    ['thread_id', 'RC_TOKEN_SAVER_THREAD_ID', true],
+    ['root_run_id', 'RC_TOKEN_SAVER_ROOT_RUN_ID', false],
+    ['attempt_id', 'RC_TOKEN_SAVER_ATTEMPT_ID', false],
+    ['workspace_id', 'RC_TOKEN_SAVER_WORKSPACE_ID', false],
+    ['project_id', 'RC_TOKEN_SAVER_PROJECT_ID', false],
+  ];
+  return identity.every(([receiptKey, environmentKey, required]) => {
+    const receiptValue = receipt[receiptKey];
+    const environmentValue = env[environmentKey];
+    if (receiptValue == null) return !required && environmentValue == null;
+    return environmentValue === receiptValue;
   });
 }
 
 async function tokenSaverPostToolUse(input) {
+  if (!tokenSaverExecutionReceiptAdmitsClaude(current.env)) return {};
   if (current.env.RC_TOKEN_SAVER_POST_TOOL_USE !== '1') return {};
   if (!input || input.hook_event_name !== 'PostToolUse') return {};
   // Text extraction flattens mixed content; replacing the response would drop
@@ -600,12 +698,14 @@ async function tokenSaverPostToolUse(input) {
     // Display accounting uses the sidecar compressed body (before handle/receipt).
     // A follow-up POST only attests recovery delivery — it must not write a
     // second savings row.
-    recordSavings: true,
+    recordSavings: false,
     runMode: 'optimize',
     maxOutputCharacters: Math.max(512, Math.min(rawOutput.length, 48000)),
     cacheState: 'tool_output_hooked',
     reversibleStoreMinBytes: TOKEN_SAVER_STORE_MIN_BYTES,
+    producerFamily: 'claude-post-tool-use',
   };
+  candidate.deferredOperationID = `ptuhook1.${candidate.id}`;
   const compressed = await postTokenSaverDistill(state, candidate);
   const output = compressed && compressed.output;
   if (!output || Buffer.byteLength(output, 'utf8') >= Buffer.byteLength(rawOutput, 'utf8')) return {};
@@ -620,22 +720,105 @@ async function tokenSaverPostToolUse(input) {
       updatedMCPToolOutput: replaced,
     },
   };
+  const finalRequest = {
+    ...candidate,
+    recordSavings: true,
+    precomputedRouteStage: compressed.routeStage,
+    precomputedRecoveryConfirmations: compressed.recoveryConfirmations,
+    deferredDeliveryToken: compressed.deliveryToken,
+    accountingOutput: compressed.accountingOutput,
+    deliveredOutput: output,
+  };
+  let preparedFinalRequest;
+  try {
+    preparedFinalRequest = JSON.stringify(finalRequest);
+  } catch (_) {
+    return hookOutput;
+  }
   // The bridge is long-lived, so recovery confirmation can run after the
   // replacement has cleared every gate without delaying Claude's hook response.
-  setImmediate(() => {
-    void bestEffortRecordTokenSaverSavings(
-      state,
-      candidate,
-      output,
-      compressed.routeStage,
-      compressed.recoveryConfirmations
-    );
-  });
+  const handoffDeadlineUnixMilliseconds = Date.now() + 500;
+  try {
+    setImmediate(() => {
+      void bestEffortRecordTokenSaverSavings(
+        state,
+        finalRequest,
+        preparedFinalRequest,
+        handoffDeadlineUnixMilliseconds
+      );
+    });
+  } catch (_) {
+    // Queue construction is best-effort accounting. The accepted provider
+    // replacement must remain visible even when the detached handoff cannot start.
+  }
   return hookOutput;
+}
+
+function managedDistillExecutable() {
+  const override = typeof current.env.RC_REMOTE_CODE_MANAGED_BIN === 'string'
+    ? current.env.RC_REMOTE_CODE_MANAGED_BIN.trim()
+    : '';
+  return path.join(override || path.join(os.homedir(), '.remote-code', 'bin'), 'distill');
+}
+
+async function tokenSaverPreToolUse(input) {
+  if (!tokenSaverExecutionReceiptAdmitsClaude(current.env)) return {};
+  if (!input || input.hook_event_name !== 'PreToolUse'
+      || normalizeToolName(input.tool_name) !== 'bash') return {};
+  const executable = managedDistillExecutable();
+  try {
+    await fs.promises.access(executable, fs.constants.X_OK);
+  } catch (_) {
+    return {};
+  }
+  return await new Promise((resolve) => {
+    let settled = false;
+    let stdout = '';
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value && typeof value === 'object' ? value : {});
+    };
+    const child = spawn(executable, ['hook', 'pre-tool-pipe'], {
+      env: current.env,
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      finish({});
+    }, 5000);
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      if (stdout.length > 1024 * 1024) {
+        child.kill('SIGKILL');
+        finish({});
+      }
+    });
+    child.on('error', () => finish({}));
+    child.on('close', (code) => {
+      if (code !== 0) {
+        finish({});
+        return;
+      }
+      try {
+        finish(JSON.parse(stdout || '{}'));
+      } catch (_) {
+        finish({});
+      }
+    });
+    child.stdin.end(JSON.stringify(input));
+  });
 }
 
 function tokenSaverHooks() {
   return {
+    PreToolUse: [{
+      matcher: 'Bash',
+      timeout: 5,
+      hooks: [tokenSaverPreToolUse],
+    }],
     PostToolUse: [{
       matcher: '*',
       timeout: Math.ceil(TOKEN_SAVER_HOOK_TIMEOUT_MS / 1000),

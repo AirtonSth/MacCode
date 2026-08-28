@@ -1,6 +1,9 @@
 import CryptoKit
+import Darwin
 import XCTest
+import AgentRuntime
 import CoreModel
+import DistillSavingsPersistenceSupport
 import Persistence
 @testable import DistillCore
 
@@ -18,6 +21,7 @@ private extension ManagedDistillCLI {
         maxOutputCharacters: Int = 4_000,
         reversibleStoreMinBytes: Int? = nil,
         distillAdmission: @escaping DistillAdmission = { true },
+        deferredPostObserver: DeferredPostObserver? = nil,
         transport: @escaping Transport
     ) {
         self.init(
@@ -31,12 +35,87 @@ private extension ManagedDistillCLI {
             maxOutputCharacters: maxOutputCharacters,
             reversibleStoreMinBytes: reversibleStoreMinBytes,
             distillAdmission: distillAdmission,
+            deferredPostObserver: deferredPostObserver,
             transport: transport
         )
     }
 }
 
 final class ManagedDistillCLITests: XCTestCase {
+    private final class LockedCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        func increment() { lock.withLock { value += 1 } }
+        func read() -> Int { lock.withLock { value } }
+    }
+    private final class DiagnosticRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [ManagedDistillCLI.DeferredPostDiagnostic] = []
+        func append(_ value: ManagedDistillCLI.DeferredPostDiagnostic) {
+            lock.withLock { values.append(value) }
+        }
+        func read() -> [ManagedDistillCLI.DeferredPostDiagnostic] {
+            lock.withLock { values }
+        }
+    }
+
+    private struct ChunkRuntime: DistillRuntime {
+        func distill(_ request: DistillRequest) async throws -> String { "chunk summary" }
+        func distillStaged(_ request: DistillRequest) async throws -> DistillStageResult {
+            .init(output: "chunk summary", stage: .encoderBERT)
+        }
+    }
+    private final class BatchRecoveryStore: TokenSaverScopedRecoveryStoring, @unchecked Sendable {
+        private let lock = NSLock()
+        private var originals: [String: Data] = [:]
+        func prepareOriginal(
+            _ data: Data,
+            context: TokenSaverRecoveryRequestContext,
+            lane: String
+        ) throws -> TokenSaverScopedPreparation {
+            let capability = UUID().uuidString
+            lock.withLock { originals[capability] = data }
+            return .init(capability: capability, idempotencyKey: context.operationID, readBackVerified: true)
+        }
+        func retrieveOriginal(
+            capability: String,
+            context: TokenSaverRecoveryRequestContext
+        ) throws -> Data? { lock.withLock { originals[capability] } }
+        func markDelivered(
+            capability: String,
+            idempotencyKey: String,
+            context: TokenSaverRecoveryRequestContext,
+            outcome: TokenSaverScopedDeliveryOutcome
+        ) throws -> Bool { lock.withLock { originals[capability] != nil } }
+        func markDeliveredBatch(
+            confirmations: [DistillRecoveryDeliveryConfirmation],
+            context: TokenSaverRecoveryRequestContext,
+            outcome: TokenSaverScopedDeliveryOutcome
+        ) throws -> Bool {
+            lock.withLock {
+                !confirmations.isEmpty && confirmations.allSatisfy { originals[$0.capability] != nil }
+            }
+        }
+        func ack(
+            capability: String,
+            idempotencyKey: String,
+            context: TokenSaverRecoveryRequestContext
+        ) throws -> Bool { lock.withLock { originals[capability] != nil } }
+    }
+    private func phaseOneResponse(_ response: DistillResponse, member: Bool = false) -> DistillResponse {
+        let confirmations = DistillDeferredDelivery.recoveryConfirmations(response)
+        let prefix = DistillDeferredDelivery.providerVisiblePrefix(
+            accountingOutput: response.output,
+            recoveryConfirmations: confirmations
+        )!
+        return response.withDeferredDelivery(
+            token: member ? nil : "test-v1-token",
+            memberToken: member ? "test-member-v1-token" : nil,
+            accountingOutput: response.output,
+            providerVisiblePrefix: prefix
+        )
+    }
+
     override func tearDown() {
         TokenSaverWaveLiveRollout.resetForTesting()
         unsetenv("RC_TOKEN_SAVER_DISTILL_HINT")
@@ -118,14 +197,22 @@ final class ManagedDistillCLITests: XCTestCase {
     private actor HeaderRecorder {
         private var operationIDs: [String] = []
         private var invocationIDs: [String] = []
+        private var handoffDeadlines: [String?] = []
+        private var bodySizes: [Int] = []
 
         func append(_ request: URLRequest) {
             operationIDs.append(request.value(forHTTPHeaderField: "X-RemoteCode-Operation-ID") ?? "")
             invocationIDs.append(request.value(forHTTPHeaderField: "X-RemoteCode-Invocation-ID") ?? "")
+            handoffDeadlines.append(request.value(
+                forHTTPHeaderField: DistillDeferredDelivery.handoffDeadlineHeader
+            ))
+            bodySizes.append(request.httpBody?.count ?? 0)
         }
 
         func all() -> [String] { operationIDs }
         func invocations() -> [String] { invocationIDs }
+        func deadlines() -> [String?] { handoffDeadlines }
+        func sizes() -> [Int] { bodySizes }
     }
 
     private actor ScopeHeaderRecorder {
@@ -154,13 +241,13 @@ final class ManagedDistillCLITests: XCTestCase {
             inputTokens: 25, outputTokens: 1, originalHandle: "abc123",
             recoveryIdempotencyKey: "delivery-key", routeStage: .llmMLX
         )
-        let data = try! JSONEncoder().encode(resp)
+        let data = try! JSONEncoder().encode(phaseOneResponse(resp))
         let recorder = RequestRecorder()
         let cli = ManagedDistillCLI(arguments: ["Return PASS or FAIL only."], stdin: raw, state: state) { request in
             if let body = request.httpBody,
                let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
                 await recorder.append(decoded)
-                if decoded.recordSavings == true && decoded.precomputedOutput == nil {
+                if decoded.recordSavings == false && decoded.precomputedOutput == nil {
                     XCTAssertEqual(request.value(forHTTPHeaderField: "X-RemoteCode-Delivery-Deferred"), "1")
                 }
             }
@@ -178,17 +265,18 @@ final class ManagedDistillCLITests: XCTestCase {
         let requests = await recorder.all()
         XCTAssertEqual(requests.count, 2, "compression (savings) and recovery confirmation must be separate requests")
         let compress = try XCTUnwrap(requests.first)
-        XCTAssertEqual(compress.recordSavings, true, "displayed savings use the sidecar compressed body")
+        XCTAssertEqual(compress.recordSavings, false, "phase one must not record before stdout delivery")
         XCTAssertNil(compress.precomputedOutput)
         let confirm = try XCTUnwrap(requests.last)
-        XCTAssertEqual(confirm.recordSavings, false, "recovery confirm must not write a second savings row")
-        XCTAssertEqual(confirm.precomputedOutput, s)
+        XCTAssertEqual(confirm.recordSavings, true, "phase two records only after stdout delivery")
+        XCTAssertEqual(confirm.deliveredOutput, s)
+        XCTAssertEqual(confirm.accountingOutput, "PASS")
         XCTAssertEqual(
             confirm.precomputedRecoveryConfirmations,
             [.init(capability: "abc123", idempotencyKey: "delivery-key")]
         )
         let record = try XCTUnwrap(DistillSavingsCalculator.record(
-            for: compress,
+            for: confirm,
             response: resp
         ))
         XCTAssertEqual(record.outputTokens, 1)
@@ -210,7 +298,7 @@ final class ManagedDistillCLITests: XCTestCase {
             inputCharacters: rawText.count,
             routeStage: .deterministic
         )
-        let encoded = try JSONEncoder().encode(response)
+        let encoded = try JSONEncoder().encode(phaseOneResponse(response))
         let raw = Data(rawText.utf8)
         let cli = ManagedDistillCLI(arguments: [], stdin: raw, state: state) { _ in (encoded, 200) }
 
@@ -230,12 +318,12 @@ final class ManagedDistillCLITests: XCTestCase {
         // WHY: a marker is trustworthy only when it authenticates the exact bytes
         // the provider sees under this root run and the current On-lifecycle key.
         let raw = Data(String(repeating: "verbose output line\n", count: 40).utf8)
-        let encoded = try JSONEncoder().encode(DistillResponse(
+        let encoded = try JSONEncoder().encode(phaseOneResponse(DistillResponse(
             requestID: UUID(),
             output: "COMPRESSED\n",
             inputCharacters: raw.count,
             routeStage: .deterministic
-        ))
+        )))
         let key = Data(0..<32)
         let rootRunID = "123e4567-e89b-12d3-a456-426614174000"
         let cli = ManagedDistillCLI(
@@ -445,12 +533,14 @@ final class ManagedDistillCLITests: XCTestCase {
         let raw = Data(input.utf8)
         let admission = AdmissionLatch([true, true, false])
         let calls = CallCounter()
-        let response = try JSONEncoder().encode(DistillResponse(
+        let response = try JSONEncoder().encode(phaseOneResponse(DistillResponse(
             requestID: UUID(),
             output: "compressed chunk",
             inputCharacters: input.count,
-            originalHandle: "chunk"
-        ))
+            originalHandle: "chunk",
+            recoveryIdempotencyKey: "chunk-key",
+            routeStage: .deterministic
+        ), member: true))
         let cli = ManagedDistillCLI(
             arguments: ["summarize"],
             stdin: raw,
@@ -643,7 +733,7 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertFalse(DistillAppliedReceipt.containsMarker(String(decoding: out, as: UTF8.self)))
         let requests = await recorder.all()
         XCTAssertEqual(requests.count, 1)
-        XCTAssertEqual(requests.first?.recordSavings, true, "display savings use the sidecar body even if the receipt gate fail-opens")
+        XCTAssertEqual(requests.first?.recordSavings, false, "phase one never records before provider-visible delivery")
         XCTAssertNil(requests.first?.precomputedOutput)
     }
 
@@ -658,7 +748,7 @@ final class ManagedDistillCLITests: XCTestCase {
             inputCharacters: rawText.count,
             routeStage: .deterministic
         )
-        let encoded = try JSONEncoder().encode(response)
+        let encoded = try JSONEncoder().encode(phaseOneResponse(response))
         let recorder = RequestRecorder()
         let cli = ManagedDistillCLI(arguments: [], stdin: Data(rawText.utf8), state: state) { request in
             if let body = request.httpBody,
@@ -670,7 +760,7 @@ final class ManagedDistillCLITests: XCTestCase {
 
         let result = await cli.runResult()
         let emitted = String(decoding: result.stdout, as: UTF8.self)
-        XCTAssertNil(result.deferredSideEffect, "no recovery handle → no deferred confirm POST")
+        XCTAssertNotNil(result.deferredSideEffect, "authorized phase one defers confirmation until wrapper acceptance")
         XCTAssertFalse(CommandWrapPolicy.isFaithfulCompression(
             rawByteCount: Data(rawText.utf8).count,
             compressedContentByteCount: CommandWrapPolicy.compressedContentByteCount(emitted)
@@ -680,7 +770,7 @@ final class ManagedDistillCLITests: XCTestCase {
         await Task.yield()
         let requests = await recorder.all()
         XCTAssertEqual(requests.count, 1)
-        XCTAssertEqual(requests.first?.recordSavings, true, "sidecar-body savings already landed on the compress POST")
+        XCTAssertEqual(requests.first?.recordSavings, false, "rejected wrapper output never reaches phase-two accounting")
         XCTAssertNil(requests.first?.precomputedOutput)
     }
 
@@ -734,21 +824,18 @@ final class ManagedDistillCLITests: XCTestCase {
         }
         XCTAssertGreaterThan(pre.savedBytes, 0)
 
-        // DIFFERENT from pre.output — proves the client does not rely on the response body
-        // for the ledger delta (precomputed-output path ignores recompute).
-        let independentSidecarOutput = "INDEPENDENT_SIDECAR_RECOMPUTE_NOT_PRE_OUTPUT"
-        XCTAssertNotEqual(independentSidecarOutput, pre.output)
         let sidecarResponse = DistillResponse(
             requestID: UUID(),
-            output: independentSidecarOutput,
+            output: pre.output,
             inputCharacters: input.count,
             inputTokens: TokenEstimator.estimate(input),
-            outputTokens: TokenEstimator.estimate(independentSidecarOutput),
+            outputTokens: TokenEstimator.estimate(pre.output),
             routeStage: .deterministic
         )
-        let encoded = try JSONEncoder().encode(sidecarResponse)
+        let encoded = try JSONEncoder().encode(phaseOneResponse(sidecarResponse))
 
         let recorder = RequestRecorder()
+        let headers = HeaderRecorder()
         let calls = CallCounter()
         let cli = ManagedDistillCLI(
             arguments: ["summarize logs"],
@@ -757,11 +844,13 @@ final class ManagedDistillCLITests: XCTestCase {
             provider: "grok"
         ) { request in
             _ = await calls.increment()
+            await headers.append(request)
             if let body = request.httpBody,
                let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
                 await recorder.append(decoded)
             }
-            return (encoded, 200)
+            let requests = await recorder.all()
+            return requests.last?.recordSavings == true ? (Data("{}".utf8), 200) : (encoded, 200)
         }
 
         let (out, code) = await cli.run()
@@ -776,7 +865,6 @@ final class ManagedDistillCLITests: XCTestCase {
             "caller must receive the Wave A compressed output before the receipt"
         )
         XCTAssertLessThan(out.count, input.utf8.count, "Wave A receipt-inclusive output must still shrink")
-        XCTAssertFalse(text.contains(independentSidecarOutput), "caller must not see independent sidecar recompute")
         XCTAssertNotEqual(out, Data(input.utf8), "Wave A hit must not fail-open to raw stdin")
 
         let expectedRecord = ManagedDistillCLI.prepassSavingsRecord(
@@ -797,47 +885,30 @@ final class ManagedDistillCLITests: XCTestCase {
         )
 
         let transportCalls = await calls.count()
-        XCTAssertEqual(transportCalls, 1, "Wave A must emit exactly one recordSavings POST (no double-count)")
+        XCTAssertEqual(transportCalls, 2, "Wave A uses one authorization POST and one delivered accounting POST")
         let requests = await recorder.all()
-        XCTAssertEqual(requests.count, 1)
-        let posted = try XCTUnwrap(requests.first)
+        XCTAssertEqual(requests.count, 2)
+        let initial = try XCTUnwrap(requests.first)
+        let posted = try XCTUnwrap(requests.last)
+        XCTAssertEqual(initial.recordSavings, false)
+        XCTAssertEqual(initial.precomputedOutput, pre.output)
+        XCTAssertEqual(initial.deterministicLosslessPrepass, true)
         XCTAssertEqual(posted.recordSavings, true)
-        XCTAssertEqual(posted.input, input, "ledger POST must send original pre-prepass bytes")
+        XCTAssertEqual(posted.input, input, "phase two must send original pre-prepass bytes")
         XCTAssertEqual(
-            posted.precomputedOutput,
+            posted.accountingOutput,
             pre.output,
-            "ledger POST must carry the Wave A sidecar body, not the receipt-inclusive stdout"
+            "accounting must carry the marker-free prepass body"
         )
         XCTAssertEqual(posted.precomputedRouteStage, .deterministic)
         XCTAssertEqual(posted.cacheState, "wave_prepass_\(pre.waveID)")
         XCTAssertEqual(posted.provider, "grok")
-
-        let honest = DistillSavingsCalculator.record(
-            for: posted,
-            response: try XCTUnwrap(posted.responseUsingPrecomputedOutput())
-        )
-        XCTAssertEqual(honest?.savedTokens, expectedRecord?.savedTokens)
-        let wrongIfRecomputed = DistillSavingsCalculator.record(
-            for: DistillRequest(
-                mode: .commandOutput,
-                input: input,
-                provider: "grok",
-                recordSavings: true
-            ),
-            response: DistillResponse(
-                requestID: UUID(),
-                output: independentSidecarOutput,
-                inputCharacters: input.count,
-                inputTokens: TokenEstimator.estimate(input),
-                outputTokens: TokenEstimator.estimate(independentSidecarOutput),
-                routeStage: .deterministic
-            )
-        )
-        XCTAssertNotEqual(
-            honest?.savedTokens,
-            wrongIfRecomputed?.savedTokens,
-            "fixture must distinguish pre.output delta from independent sidecar recompute"
-        )
+        XCTAssertEqual(posted.deliveredOutput, text)
+        XCTAssertNil(posted.deferredHandoffDeadlineUnixMilliseconds, "phase-two body is encoded before handoff")
+        let deadlines = await headers.deadlines()
+        XCTAssertEqual(deadlines.count, 2)
+        XCTAssertNil(deadlines[0])
+        XCTAssertNotNil(deadlines[1], "handoff adds the authoritative absolute deadline header")
     }
 
     func test_waveAHit_runResultDeliversStdoutBeforeLedgerTransport() async {
@@ -854,6 +925,12 @@ final class ManagedDistillCLITests: XCTestCase {
             XCTFail("expected Wave A hit")
             return
         }
+        let phaseOne = phaseOneResponse(DistillResponse(
+            requestID: UUID(), output: pre.output, inputCharacters: input.count,
+            inputTokens: TokenEstimator.estimate(input),
+            outputTokens: TokenEstimator.estimate(pre.output), routeStage: .deterministic
+        ))
+        let phaseOneData = try! JSONEncoder().encode(phaseOne)
 
         let calls = CallCounter()
         let gate = TransportGate()
@@ -862,10 +939,14 @@ final class ManagedDistillCLITests: XCTestCase {
             stdin: Data(input.utf8),
             state: state,
             provider: "claude"
-        ) { _ in
-            await gate.waitUntilReleased()
+        ) { request in
+            let decoded = request.httpBody.flatMap { try? JSONDecoder().decode(DistillRequest.self, from: $0) }
             _ = await calls.increment()
-            return (Data("{}".utf8), 200)
+            if decoded?.recordSavings == true {
+                await gate.waitUntilReleased()
+                return (Data("{}".utf8), 200)
+            }
+            return (phaseOneData, 200)
         }
 
         let result = await cli.runResult()
@@ -879,7 +960,7 @@ final class ManagedDistillCLITests: XCTestCase {
         )
         XCTAssertNotNil(result.deferredSideEffect, "Wave A must defer ledger POST")
         let before = await calls.count()
-        XCTAssertEqual(before, 0, "ledger transport must not run before deferred side effect")
+        XCTAssertEqual(before, 1, "only phase-one authorization runs before stdout handoff")
 
         // Unblock transport and run deferred work.
         await gate.release()
@@ -887,7 +968,7 @@ final class ManagedDistillCLITests: XCTestCase {
             await deferred()
         }
         let after = await calls.count()
-        XCTAssertEqual(after, 1, "exactly one ledger POST after deferred side effect")
+        XCTAssertEqual(after, 2, "exactly one phase-two POST after deferred side effect")
     }
 
     func test_waveAHit_sidecarUnreachable_stillReturnsCompressedFailOpen() async {
@@ -916,14 +997,9 @@ final class ManagedDistillCLITests: XCTestCase {
 
         let (out, code) = await cli.run()
         XCTAssertEqual(code, 0)
-        let emitted = String(decoding: out, as: UTF8.self)
-        XCTAssertTrue(DistillAppliedReceipt.containsMarker(emitted))
-        XCTAssertEqual(
-            ManagedDistillCLI.stripTrailingNewlines(DistillAppliedReceipt.strip(emitted)),
-            ManagedDistillCLI.stripTrailingNewlines(pre.output)
-        )
+        XCTAssertEqual(out, Data(input.utf8), "unreachable authorization fails open byte-exact")
         let transportCalls = await calls.count()
-        XCTAssertEqual(transportCalls, 2, "one bounded retry after the initial failure, then gives up")
+        XCTAssertEqual(transportCalls, 1, "authorization failure does not claim or retry delivery")
     }
 
     func test_waveAHit_transientLedgerFailure_recoveredByOneRetry() async {
@@ -960,14 +1036,9 @@ final class ManagedDistillCLITests: XCTestCase {
 
         let (out, code) = await cli.run()
         XCTAssertEqual(code, 0)
-        let emitted = String(decoding: out, as: UTF8.self)
-        XCTAssertTrue(DistillAppliedReceipt.containsMarker(emitted))
-        XCTAssertEqual(
-            ManagedDistillCLI.stripTrailingNewlines(DistillAppliedReceipt.strip(emitted)),
-            ManagedDistillCLI.stripTrailingNewlines(pre.output)
-        )
+        XCTAssertEqual(out, Data(input.utf8), "phase-one failure fails open without a client-minted token")
         let transportCalls = await calls.count()
-        XCTAssertEqual(transportCalls, 2, "retry must recover the saving after one transient failure, then stop")
+        XCTAssertEqual(transportCalls, 1, "delivery authority is never retried or fabricated by the client")
     }
 
     func test_waveAHit_lostFirstHTTP200DoesNotDoubleSavingsLedger() async throws {
@@ -1011,7 +1082,8 @@ final class ManagedDistillCLITests: XCTestCase {
                 } catch {
                     XCTFail("savings persistence failed: \(error)")
                 }
-            }
+            },
+            deliveryReceiptKey: managedDistillCLITestReceiptKey
         )
         let ready = try await server.start()
         defer { server.stop() }
@@ -1034,7 +1106,7 @@ final class ManagedDistillCLITests: XCTestCase {
             do {
                 let (data, response) = try await URLSession.shared.data(for: request)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                if attempt == 1 { return nil } // server committed; client lost 200
+                if attempt == 2 { return nil } // phase two committed; client lost 200
                 return (data, status)
             } catch {
                 return nil
@@ -1066,9 +1138,15 @@ final class ManagedDistillCLITests: XCTestCase {
 
         let calls = CallCounter()
         let raw = Data(input.utf8)
+        let response = phaseOneResponse(DistillResponse(
+            requestID: UUID(), output: pre.output, inputCharacters: input.count,
+            inputTokens: TokenEstimator.estimate(input),
+            outputTokens: TokenEstimator.estimate(pre.output), routeStage: .deterministic
+        ))
+        let responseData = try JSONEncoder().encode(response)
         let cli = ManagedDistillCLI(arguments: [], stdin: raw, state: state) { _ in
             _ = await calls.increment()
-            return (Data("{}".utf8), 200)
+            return (responseData, 200)
         }
 
         let result = await cli.runResult()
@@ -1078,7 +1156,7 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertNil(result.deferredSideEffect)
         XCTAssertFalse(DistillAppliedReceipt.containsMarker(String(decoding: result.stdout, as: UTF8.self)))
         let transportCalls = await calls.count()
-        XCTAssertEqual(transportCalls, 0, "an undelivered Wave A candidate must not write savings")
+        XCTAssertEqual(transportCalls, 1, "phase one may authorize, but receipt-inclusive rejection sends no phase two")
     }
 
     // MARK: - hook pre-tool-pipe
@@ -1172,7 +1250,7 @@ final class ManagedDistillCLITests: XCTestCase {
             recoveryIdempotencyKey: "hook-delivery-key",
             routeStage: .deterministic
         )
-        let encoded = try JSONEncoder().encode(sidecarResponse)
+        let encoded = try JSONEncoder().encode(phaseOneResponse(sidecarResponse))
         let recorder = RequestRecorder()
 
         // Non-Bash tools retain their exact response string in the hook envelope,
@@ -1195,7 +1273,8 @@ final class ManagedDistillCLITests: XCTestCase {
                let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
                 await recorder.append(decoded)
             }
-            return (encoded, 200)
+            let decoded = request.httpBody.flatMap { try? JSONDecoder().decode(DistillRequest.self, from: $0) }
+            return decoded?.recordSavings == true ? (Data("{}".utf8), 200) : (encoded, 200)
         }
 
         let (out, code) = await cli.run()
@@ -1215,11 +1294,13 @@ final class ManagedDistillCLITests: XCTestCase {
 
         let requests = await recorder.all()
         XCTAssertEqual(requests.count, 2)
-        XCTAssertEqual(requests.first?.recordSavings, true, "hook compress POST records sidecar-body savings")
+        XCTAssertEqual(requests.first?.recordSavings, false, "hook phase one cannot record before callback delivery")
         XCTAssertEqual(requests.first?.input, rawToolOutput)
         XCTAssertEqual(requests.first?.provider, "claude")
-        XCTAssertEqual(requests.last?.recordSavings, false, "recovery confirm must not double-count savings")
-        XCTAssertEqual(requests.last?.precomputedOutput, updated)
+        XCTAssertEqual(requests.last?.recordSavings, true, "callback handoff triggers the sole accounting POST")
+        XCTAssertNil(requests.last?.precomputedOutput)
+        XCTAssertEqual(requests.last?.accountingOutput, compressed)
+        XCTAssertEqual(requests.last?.deliveredOutput, updated)
         XCTAssertEqual(requests.last?.precomputedRouteStage, .deterministic)
         XCTAssertEqual(
             requests.last?.precomputedRecoveryConfirmations,
@@ -1264,7 +1345,7 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}")
         let requests = await recorder.all()
         XCTAssertEqual(requests.count, 1)
-        XCTAssertEqual(requests.first?.recordSavings, true)
+        XCTAssertEqual(requests.first?.recordSavings, false)
         XCTAssertNil(requests.first?.precomputedOutput)
     }
 
@@ -1329,6 +1410,12 @@ final class ManagedDistillCLITests: XCTestCase {
             XCTFail("expected Wave A hit for hook fixture")
             return
         }
+        let phaseOne = phaseOneResponse(DistillResponse(
+            requestID: UUID(), output: pre.output, inputCharacters: rawToolOutput.count,
+            inputTokens: TokenEstimator.estimate(rawToolOutput),
+            outputTokens: TokenEstimator.estimate(pre.output), routeStage: .deterministic
+        ))
+        let phaseOneData = try JSONEncoder().encode(phaseOne)
 
         let hookJSON: [String: Any] = [
             "hook_event_name": "PostToolUse",
@@ -1346,15 +1433,19 @@ final class ManagedDistillCLITests: XCTestCase {
             state: state,
             provider: "claude"
         ) { request in
-            await gate.waitUntilReleased()
             _ = await calls.increment()
             if let body = request.httpBody,
                let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
-                XCTAssertEqual(decoded.recordSavings, true)
+                if decoded.recordSavings == true {
+                    XCTAssertEqual(decoded.accountingOutput, pre.output)
+                    XCTAssertFalse(DistillAppliedReceipt.containsMarker(decoded.accountingOutput ?? ""))
+                    await gate.waitUntilReleased()
+                    return (Data("{}".utf8), 200)
+                }
+                XCTAssertEqual(decoded.recordSavings, false)
                 XCTAssertEqual(decoded.precomputedOutput, pre.output)
-                XCTAssertFalse(DistillAppliedReceipt.containsMarker(decoded.precomputedOutput ?? ""))
             }
-            return (Data("{}".utf8), 200)
+            return (phaseOneData, 200)
         }
 
         let result = await cli.runResult()
@@ -1373,14 +1464,14 @@ final class ManagedDistillCLITests: XCTestCase {
         )
         XCTAssertNotNil(result.deferredSideEffect, "hook must propagate nested Wave A deferred ledger")
         let before = await calls.count()
-        XCTAssertEqual(before, 0, "hook output must not wait on ledger transport")
+        XCTAssertEqual(before, 1, "hook output waits only for phase-one authorization")
 
         await gate.release()
         if let deferred = result.deferredSideEffect {
             await deferred()
         }
         let after = await calls.count()
-        XCTAssertEqual(after, 1, "exactly one deferred ledger POST after hook output is ready")
+        XCTAssertEqual(after, 2, "exactly one deferred phase-two POST after hook output is ready")
     }
 
     func test_hookPostToolUse_sidecarUnreachable_returnsEmptyObjectExitZero() async throws {
@@ -1582,60 +1673,466 @@ final class ManagedDistillCLITests: XCTestCase {
         )
     }
 
-    func test_compress_oneMegabyteInputChunksInsteadOfRejecting() async throws {
+    func test_compressChunksMemberAttestationsAuthenticateExactManifestAndRecordOneAggregateEvent() async throws {
         // A 1 MB test log is a normal agent artifact. Token Saver must split it into
-        // bounded service calls, emit compressed chunks plus retrieve handles, and keep
-        // exit 0 so the shell pipeline remains usable.
-        let oneMB = Data(repeating: UInt8(ascii: "x"), count: 1_024 * 1_024)
-        let response = DistillResponse(
-            requestID: UUID(),
-            output: "chunk summary",
-            inputCharacters: ManagedDistillCLI.stdinCapBytes,
-            inputTokens: 1_000,
-            outputTokens: 10,
-            originalHandle: "h",
-            recoveryIdempotencyKey: "chunk-delivery-key",
-            routeStage: .encoderBERT
+        // bounded real HTTP member attestations and persist one aggregate event.
+        let oneMB = Data(
+            repeating: UInt8(ascii: "x"),
+            count: ManagedDistillCLI.stdinCapBytes + 1_024
         )
-        let encoded = try JSONEncoder().encode(response)
-        let recorder = RequestRecorder()
-        let cli = ManagedDistillCLI(arguments: ["summarize"], stdin: oneMB, state: state) { request in
-            if let body = request.httpBody,
-               let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
-                await recorder.append(decoded)
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let repository = TokenSaverSavingsRepository(db: db)
+        let events = LockedCounter()
+        let recorder = DeferredSavingsRecorder(
+            repository: repository,
+            eventSink: { _ in events.increment() }
+        )
+        let token = "chunk-real-token"
+        let configuration = try DistillServiceConfiguration(
+            authToken: token,
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 1
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: ChunkRuntime(), maxConcurrentRequests: 1),
+            scopedRecoveryStore: BatchRecoveryStore(),
+            onSuccess: recorder.successHandler,
+            deliveryReceiptKey: managedDistillCLITestReceiptKey,
+            deferredDeliveryAuthority: .init(keyGenerator: { Data(repeating: 0x64, count: 32) })
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+        let liveState = ManagedDistillCLI.State(
+            baseURL: ready.baseURL,
+            authToken: token,
+            receiptKey: managedDistillCLITestReceiptKey
+        )
+        let context = TokenSaverRecoveryRequestContext(
+            workspaceID: "workspace", projectID: "project", threadID: "thread",
+            provider: "codex", attemptID: "attempt", operationID: "unused", invocationID: "unused"
+        )
+        let requests = RequestRecorder()
+        let headers = HeaderRecorder()
+        let diagnostics = DiagnosticRecorder()
+        let cli = ManagedDistillCLI(
+            arguments: ["summarize"], stdin: oneMB, state: liveState,
+            provider: "codex", recoveryContext: context, invocationID: "chunk-run",
+            deferredPostObserver: { diagnostics.append($0) }
+        ) { request in
+            do {
+                await headers.append(request)
+                let decoded = request.httpBody.flatMap {
+                    try? JSONDecoder().decode(DistillRequest.self, from: $0)
+                }
+                if let decoded { await requests.append(decoded) }
+                let (data, response) = try await URLSession.shared.data(for: request)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                if decoded?.recordSavings == true {
+                    XCTAssertEqual(status, 200, String(decoding: data, as: UTF8.self))
+                }
+                return (data, status)
+            } catch {
+                return nil
             }
-            return (encoded, 200)
         }
 
-        let (out, code) = await cli.run()
-        let decodedRequests = await recorder.all()
+        let result = await cli.runResult()
+        let beforeHandoff = await requests.all()
+        XCTAssertEqual(beforeHandoff.count, 3, "members and aggregate authorize before stdout; final POST does not")
+        XCTAssertFalse(beforeHandoff.contains { $0.recordSavings == true })
+        let rejectedDeferred = GuardedStdoutWrite.deliveredValue(
+            result.deferredSideEffect,
+            afterWriting: result.stdout,
+            to: -1
+        )
+        XCTAssertNil(rejectedDeferred, "failed stdout delivery must drop phase two")
+        XCTAssertEqual(try repository.summary().totalRuns, 0)
+        let afterFailedWrite = await requests.all()
+        XCTAssertFalse(afterFailedWrite.contains { $0.recordSavings == true })
+        let nullFD = open("/dev/null", O_WRONLY)
+        XCTAssertGreaterThanOrEqual(nullFD, 0)
+        defer { if nullFD >= 0 { close(nullFD) } }
+        let deliveredDeferred = GuardedStdoutWrite.deliveredValue(
+            result.deferredSideEffect,
+            afterWriting: result.stdout,
+            to: nullFD
+        )
+        XCTAssertNotNil(deliveredDeferred)
+        let continuousClock = ContinuousClock()
+        let startedAt = continuousClock.now
+        let handoffStartMilliseconds = UInt64(Date().timeIntervalSince1970 * 1_000)
+        await deliveredDeferred?()
+        let handoffTail = startedAt.duration(to: continuousClock.now)
+        let out = result.stdout
+        let code = result.exitCode
 
         XCTAssertEqual(code, 0)
-        let savingsRequests = decodedRequests.filter { $0.recordSavings == true }
-        let confirmRequests = decodedRequests.filter { $0.recordSavings != true }
-        XCTAssertGreaterThan(savingsRequests.count, 1, "over-cap input must be split into multiple bounded savings requests")
-        XCTAssertTrue(savingsRequests.allSatisfy { $0.input.utf8.count <= ManagedDistillCLI.stdinCapBytes })
-        XCTAssertTrue(savingsRequests.allSatisfy { $0.precomputedOutput == nil })
         let text = String(decoding: out, as: UTF8.self)
         XCTAssertTrue(text.contains("chunk summary"))
-        XCTAssertTrue(text.contains("[[rc:h]]"), "each lossy chunk must remain retrievable")
+        XCTAssertTrue(text.contains("[[rc:"), "each lossy chunk must remain retrievable")
         XCTAssertTrue(DistillAppliedReceipt.containsMarker(text), "the completed chunk set must carry one trailing applied receipt")
         XCTAssertTrue(text.hasSuffix("\n"), "chunked CLI output must retain its terminal LF")
         XCTAssertLessThan(out.count, oneMB.count, "all chunk handles plus the final receipt must be a net UTF-8 shrink")
         XCTAssertNotEqual(out, oneMB, "successful chunked compression should not fall back to raw output")
-        XCTAssertEqual(confirmRequests.count, 1, "one recovery-confirm POST after all chunks")
-        let confirm = try XCTUnwrap(confirmRequests.first)
-        XCTAssertEqual(confirm.input, String(decoding: oneMB, as: UTF8.self))
-        XCTAssertEqual(confirm.precomputedOutput, text)
-        XCTAssertEqual(confirm.precomputedRouteStage, .encoderBERT)
-        XCTAssertEqual(confirm.precomputedRecoveryConfirmations?.count, savingsRequests.count)
-        XCTAssertTrue(confirm.precomputedRecoveryConfirmations?.allSatisfy {
-            $0.capability == "h" && $0.idempotencyKey == "chunk-delivery-key"
-        } == true)
-        XCTAssertNil(DistillSavingsCalculator.record(
-            for: confirm,
-            response: try XCTUnwrap(confirm.responseUsingPrecomputedOutput())
-        ), "recovery confirm must not mint a second savings row")
+        let summary = try repository.summary()
+        let deliveredRequests = await requests.all().filter { $0.recordSavings == true }
+        XCTAssertEqual(deliveredRequests.count, 1)
+        XCTAssertEqual(summary.totalRuns, 1, "one aggregate ledger row for the whole chunked run")
+        XCTAssertGreaterThan(summary.totalSavedTokens, 0)
+        XCTAssertEqual(events.read(), 1, "one production savings event for the aggregate")
+        XCTAssertLessThan(handoffTail, .milliseconds(275), "pre-encoded 525KB final POST stays inside the handoff tail")
+        let deadlines = await headers.deadlines()
+        let sizes = await headers.sizes()
+        let deadlineText = try XCTUnwrap(deadlines.last ?? nil)
+        let deadline = try XCTUnwrap(UInt64(deadlineText))
+        XCTAssertGreaterThan(deadline, handoffStartMilliseconds)
+        XCTAssertLessThanOrEqual(deadline, handoffStartMilliseconds + 250)
+        XCTAssertGreaterThanOrEqual(sizes.last ?? 0, 525_000, "large phase two body was encoded before handoff")
+        XCTAssertEqual(diagnostics.read(), [.response(status: 200)], "phase-two status remains observable")
+    }
+
+    func test_compressChunksRejectsOmissionDuplicateReorderTokenOutputAndPartialMutations() async throws {
+        // WHY: every member token binds its exact byte slice and ordinal; no
+        // partial aggregate can pass the real HTTP aggregate endpoint.
+        let bearer = "chunk-mutation-token"
+        let configuration = try DistillServiceConfiguration(
+            authToken: bearer, appSupportDirectory: NSTemporaryDirectory(), maxConcurrentRequests: 1
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: ChunkRuntime(), maxConcurrentRequests: 1),
+            scopedRecoveryStore: TestScopedRecoveryStore(),
+            deferredDeliveryAuthority: .init(keyGenerator: { Data(repeating: 0x61, count: 32) })
+        )
+        let baseURL = try await server.start().baseURL
+        defer { server.stop() }
+        let original = "alphabetagamma"
+        let slices = [("alpha", 0, 5), ("beta", 5, 4), ("gamma", 9, 5)]
+        let aggregateOperation = "aggregate-operation"
+        var manifests: [DistillDeferredMemberManifest] = []
+        for (index, item) in slices.enumerated() {
+            let descriptor = DistillDeferredChunkDescriptor(
+                index: index, count: slices.count,
+                originalUTF8ByteOffset: item.1, originalUTF8ByteLength: item.2,
+                aggregateOperationID: aggregateOperation
+            )
+            let question = "chunk \(index + 1) of \(slices.count)"
+            let request = DistillRequest(
+                mode: .commandOutput, input: item.0, question: question, provider: "codex",
+                recordSavings: false, producerFamily: "managed-cli-chunks",
+                deferredChunk: descriptor,
+                deferredOperationID: "\(aggregateOperation).member.\(index)"
+            )
+            let result = try await postChunkRequest(
+                request, baseURL: baseURL, bearer: bearer,
+                invocationID: "invocation.member.\(index)",
+                operationID: "\(aggregateOperation).member.\(index)"
+            )
+            XCTAssertEqual(result.status, 200)
+            let response = try JSONDecoder().decode(DistillResponse.self, from: result.data)
+            manifests.append(.init(
+                descriptor: descriptor, question: question, routeStage: response.routeStage,
+                recoveryConfirmations: DistillDeferredDelivery.recoveryConfirmations(response),
+                accountingOutput: try XCTUnwrap(response.accountingOutput),
+                memberToken: try XCTUnwrap(response.deferredMemberToken)
+            ))
+        }
+        let foreignMember = DistillRequest(
+            mode: .commandOutput,
+            input: slices[0].0,
+            question: "chunk 1 of \(slices.count)",
+            provider: "codex",
+            recordSavings: false,
+            producerFamily: "claude-sdk",
+            deferredChunk: manifests[0].descriptor
+        )
+        let foreignMemberStatus = try await postChunkRequest(
+            foreignMember,
+            baseURL: baseURL,
+            bearer: bearer,
+            invocationID: "foreign.member.0",
+            operationID: "\(aggregateOperation).member.0",
+            producerFamily: "claude-sdk"
+        ).status
+        XCTAssertEqual(foreignMemberStatus, 409, "member-v1 is owned by managed-cli-chunks")
+        let ownedMember = DistillRequest(
+            mode: .commandOutput,
+            input: slices[0].0,
+            question: "chunk 1 of \(slices.count)",
+            provider: "codex",
+            recordSavings: false,
+            producerFamily: "managed-cli-chunks",
+            deferredChunk: manifests[0].descriptor,
+            deferredOperationID: "\(aggregateOperation).member.0"
+        )
+        let omittedMemberFamily = try await postChunkRequest(
+            ownedMember,
+            baseURL: baseURL,
+            bearer: bearer,
+            invocationID: "omitted-family.member.0",
+            operationID: "\(aggregateOperation).member.0",
+            producerFamily: nil
+        ).status
+        let foreignMemberHeader = try await postChunkRequest(
+            ownedMember,
+            baseURL: baseURL,
+            bearer: bearer,
+            invocationID: "foreign-header.member.0",
+            operationID: "\(aggregateOperation).member.0",
+            producerFamily: "claude-sdk"
+        ).status
+        let mismatchedMemberOperation = DistillRequest(
+            mode: ownedMember.mode,
+            input: ownedMember.input,
+            question: ownedMember.question,
+            provider: ownedMember.provider,
+            recordSavings: false,
+            producerFamily: ownedMember.producerFamily,
+            deferredChunk: ownedMember.deferredChunk,
+            deferredOperationID: "mixed.member.0"
+        )
+        let mismatchedMemberOperationStatus = try await postChunkRequest(
+            mismatchedMemberOperation,
+            baseURL: baseURL,
+            bearer: bearer,
+            invocationID: "mixed-operation.member.0",
+            operationID: "\(aggregateOperation).member.0"
+        ).status
+        XCTAssertEqual(omittedMemberFamily, 409, "member family header is mandatory")
+        XCTAssertEqual(foreignMemberHeader, 409, "member body/header family mismatch")
+        XCTAssertEqual(mismatchedMemberOperationStatus, 409, "member body/header operation mismatch")
+        func aggregate(
+            _ members: [DistillDeferredMemberManifest],
+            bodyOperation: String? = aggregateOperation,
+            headerOperation: String? = aggregateOperation,
+            bodyFamily: String? = "managed-cli-chunks",
+            headerFamily: String? = "managed-cli-chunks"
+        ) async throws -> Int {
+            let request = DistillRequest(
+                mode: .commandOutput, input: original, provider: "codex", recordSavings: false,
+                producerFamily: bodyFamily, deferredMembers: members,
+                deferredOperationID: bodyOperation
+            )
+            return try await postChunkRequest(
+                request, baseURL: baseURL, bearer: bearer,
+                invocationID: "invocation", operationID: headerOperation,
+                producerFamily: headerFamily
+            ).status
+        }
+        let acceptedStatus = try await aggregate(manifests)
+        let omissionStatus = try await aggregate(Array(manifests.dropLast()))
+        let duplicateStatus = try await aggregate([manifests[0], manifests[0], manifests[2]])
+        let reorderStatus = try await aggregate([manifests[1], manifests[0], manifests[2]])
+        XCTAssertEqual(acceptedStatus, 200)
+        XCTAssertEqual(omissionStatus, 409, "omission")
+        XCTAssertEqual(duplicateStatus, 409, "duplicate")
+        XCTAssertEqual(reorderStatus, 409, "reorder")
+        let omittedOperation = try await aggregate(manifests, headerOperation: nil)
+        let mutatedOperation = try await aggregate(manifests, headerOperation: "mutated")
+        let mixedOperation = try await aggregate(manifests, bodyOperation: "mixed")
+        let mixedFamily = try await aggregate(manifests, bodyFamily: "claude-sdk")
+        let foreignFamily = try await aggregate(
+            manifests,
+            bodyFamily: "claude-sdk",
+            headerFamily: "claude-sdk"
+        )
+        XCTAssertEqual(omittedOperation, 409, "operation header omission")
+        XCTAssertEqual(mutatedOperation, 409, "operation header mutation")
+        XCTAssertEqual(mixedOperation, 409, "body/header operation mismatch")
+        XCTAssertEqual(mixedFamily, 409, "body/header family mismatch")
+        XCTAssertEqual(foreignFamily, 409, "aggregate issuance is owned by managed-cli-chunks")
+        var changedToken = manifests
+        let first = manifests[0]
+        changedToken[0] = .init(
+            descriptor: first.descriptor, question: first.question, routeStage: first.routeStage,
+            recoveryConfirmations: first.recoveryConfirmations, accountingOutput: first.accountingOutput,
+            memberToken: first.memberToken + "mutation"
+        )
+        let tokenMutationStatus = try await aggregate(changedToken)
+        XCTAssertEqual(tokenMutationStatus, 409, "token mutation")
+        var changedOutput = manifests
+        changedOutput[0] = .init(
+            descriptor: first.descriptor, question: first.question, routeStage: first.routeStage,
+            recoveryConfirmations: first.recoveryConfirmations, accountingOutput: first.accountingOutput + "partial",
+            memberToken: first.memberToken
+        )
+        let outputMutationStatus = try await aggregate(changedOutput)
+        XCTAssertEqual(outputMutationStatus, 409, "partial/output mutation")
+    }
+
+    func test_compressChunksRejectsQuestionRouteRecoveryPrefixSliceIdentityCrossInstanceAndExpiryMutations() throws {
+        // WHY: tokens are member attestations, not generic bearer capabilities.
+        final class Clock: @unchecked Sendable { var now: UInt64 = 1_000 }
+        let clock = Clock()
+        let key = Data(repeating: 0x62, count: 32)
+        let authority = DistillDeferredDeliveryAuthority(
+            keyGenerator: { key }, nowMilliseconds: { clock.now }
+        )
+        let descriptor = chunkDescriptor(index: 1, count: 3, offset: 5, length: 4)
+        let identity = chunkIdentity(index: 1)
+        let confirmations = [DistillRecoveryDeliveryConfirmation(capability: "cap", idempotencyKey: "idem")]
+        let prefix = try XCTUnwrap(DistillDeferredDelivery.providerVisiblePrefix(
+            accountingOutput: "two", recoveryConfirmations: confirmations
+        ))
+        let token = try XCTUnwrap(authority.issue(
+            identity: identity, original: "beta", accountingOutput: "two",
+            recoveryConfirmations: confirmations, providerVisiblePrefix: prefix,
+            routeStage: .encoderBERT, chunk: descriptor, question: "chunk 2 of 3"
+        ))
+        func verify(
+            identity candidateIdentity: DistillDeferredDeliveryAuthority.Identity = identity,
+            confirmations candidateConfirmations: [DistillRecoveryDeliveryConfirmation] = confirmations,
+            prefix candidatePrefix: String = prefix,
+            route: TokenSaverRouteStage = .encoderBERT,
+            question: String = "chunk 2 of 3"
+        ) -> Bool {
+            authority.verify(
+                token: token, identity: candidateIdentity, original: "beta",
+                accountingOutput: "two", recoveryConfirmations: candidateConfirmations,
+                providerVisiblePrefix: candidatePrefix, routeStage: route,
+                expectedChunk: descriptor, question: question
+            ) != nil
+        }
+        XCTAssertTrue(verify())
+        XCTAssertFalse(verify(question: "chunk 2 / 3"))
+        XCTAssertFalse(verify(route: .deterministic))
+        XCTAssertFalse(verify(confirmations: [.init(capability: "other", idempotencyKey: "idem")]))
+        XCTAssertFalse(verify(prefix: prefix + "extra"))
+        XCTAssertFalse(verify(identity: chunkIdentity(index: 2)))
+        let restarted = DistillDeferredDeliveryAuthority(keyGenerator: { Data(repeating: 0x63, count: 32) })
+        XCTAssertNil(restarted.verify(
+            token: token, identity: identity, original: "beta", accountingOutput: "two",
+            recoveryConfirmations: confirmations, providerVisiblePrefix: prefix,
+            routeStage: .encoderBERT, expectedChunk: descriptor, question: "chunk 2 of 3"
+        ))
+        clock.now = 1_000 + (try XCTUnwrap(DistillDeferredDelivery.memberTTLMilliseconds(chunkCount: 3)))
+        XCTAssertFalse(verify())
+    }
+
+    func test_memberTTLCountThreeBoundariesLaterMembersZeroOverflowRestartAndCrossInstance() throws {
+        // WHY: each member's signed expiry is issuance + (30s + count*20s);
+        // exact cutoffs, staggered later members, and restart isolation are contractual.
+        final class Clock: @unchecked Sendable { var now: UInt64 = 0 }
+        let clock = Clock()
+        let key = Data(repeating: 0x65, count: 32)
+        let authority = DistillDeferredDeliveryAuthority(
+            keyGenerator: { key }, nowMilliseconds: { clock.now }
+        )
+        func token(index: Int, count: Int, issued: UInt64) throws -> (String, DistillDeferredChunkDescriptor) {
+            clock.now = issued
+            let descriptor = chunkDescriptor(index: index, count: count, offset: index * 5, length: 5)
+            let prefix = try XCTUnwrap(DistillDeferredDelivery.providerVisiblePrefix(
+                accountingOutput: "part-\(index)", recoveryConfirmations: []
+            ))
+            let token = try XCTUnwrap(authority.issue(
+                identity: chunkIdentity(index: index), original: "slice",
+                accountingOutput: "part-\(index)", recoveryConfirmations: [],
+                providerVisiblePrefix: prefix, routeStage: .deterministic,
+                chunk: descriptor, question: "chunk \(index + 1) of \(count)"
+            ))
+            return (token, descriptor)
+        }
+        func verifies(_ issued: (String, DistillDeferredChunkDescriptor), at now: UInt64) -> Bool {
+            clock.now = now
+            let index = issued.1.index
+            let prefix = DistillDeferredDelivery.providerVisiblePrefix(
+                accountingOutput: "part-\(index)", recoveryConfirmations: []
+            )!
+            return authority.verify(
+                token: issued.0, identity: chunkIdentity(index: index), original: "slice",
+                accountingOutput: "part-\(index)", recoveryConfirmations: [],
+                providerVisiblePrefix: prefix, routeStage: .deterministic,
+                expectedChunk: issued.1, question: "chunk \(index + 1) of \(issued.1.count)"
+            ) != nil
+        }
+
+        let single = try token(index: 0, count: 1, issued: 10_000)
+        XCTAssertTrue(verifies(single, at: 59_999))
+        XCTAssertFalse(verifies(single, at: 60_000))
+        let first = try token(index: 0, count: 3, issued: 0)
+        XCTAssertTrue(verifies(first, at: 89_999))
+        XCTAssertFalse(verifies(first, at: 90_000))
+        let second = try token(index: 1, count: 3, issued: 20_000)
+        XCTAssertTrue(verifies(second, at: 109_999))
+        XCTAssertFalse(verifies(second, at: 110_000))
+        let third = try token(index: 2, count: 3, issued: 40_000)
+        XCTAssertTrue(verifies(third, at: 129_999))
+        XCTAssertFalse(verifies(third, at: 130_000))
+
+        XCTAssertEqual(DistillDeferredDelivery.memberTTLMilliseconds(chunkCount: 3), 90_000)
+        XCTAssertNil(DistillDeferredDelivery.memberTTLMilliseconds(chunkCount: 0))
+        XCTAssertNil(DistillDeferredDelivery.memberTTLMilliseconds(chunkCount: Int.max))
+        let restarted = DistillDeferredDeliveryAuthority(
+            keyGenerator: { Data(repeating: 0x66, count: 32) }, nowMilliseconds: { 40_001 }
+        )
+        XCTAssertNil(restarted.verify(
+            token: third.0, identity: chunkIdentity(index: 2), original: "slice",
+            accountingOutput: "part-2", recoveryConfirmations: [],
+            providerVisiblePrefix: "part-2\n", routeStage: .deterministic,
+            expectedChunk: third.1, question: "chunk 3 of 3"
+        ))
+    }
+
+    private func postChunkRequest(
+        _ body: DistillRequest,
+        baseURL: String,
+        bearer: String,
+        invocationID: String,
+        operationID: String?,
+        producerFamily: String? = "managed-cli-chunks"
+    ) async throws -> (status: Int, data: Data) {
+        var request = URLRequest(url: URL(string: baseURL + "/v1/distill")!)
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(body)
+        for (field, value) in [
+            "Authorization": "Bearer \(bearer)",
+            "Content-Type": "application/json",
+            "X-RemoteCode-Delivery-Deferred": "1",
+            "X-RemoteCode-Workspace-ID": "workspace",
+            "X-RemoteCode-Project-ID": "project",
+            "X-RemoteCode-Thread-ID": "thread",
+            "X-RemoteCode-Provider": "codex",
+            "X-RemoteCode-Attempt-ID": "attempt",
+            "X-RemoteCode-Root-Run-ID": managedDistillCLITestRootRunID,
+            "X-RemoteCode-Invocation-ID": invocationID,
+        ] { request.setValue(value, forHTTPHeaderField: field) }
+        if let operationID {
+            request.setValue(operationID, forHTTPHeaderField: "X-RemoteCode-Operation-ID")
+        }
+        if let producerFamily {
+            request.setValue(producerFamily, forHTTPHeaderField: "X-RemoteCode-Producer-Family")
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        return ((response as? HTTPURLResponse)?.statusCode ?? 0, data)
+    }
+
+    private func chunkDescriptor(
+        index: Int,
+        count: Int,
+        offset: Int,
+        length: Int
+    ) -> DistillDeferredChunkDescriptor {
+        .init(
+            index: index,
+            count: count,
+            originalUTF8ByteOffset: offset,
+            originalUTF8ByteLength: length,
+            aggregateOperationID: "aggregate-operation"
+        )
+    }
+
+    private func chunkIdentity(index: Int) -> DistillDeferredDeliveryAuthority.Identity {
+        .init(
+            provider: "codex",
+            threadID: "thread",
+            rootRunID: "root",
+            attemptID: "attempt",
+            invocationID: "invocation.member.\(index)",
+            operationID: "aggregate-operation.member.\(index)",
+            producerFamily: "managed-cli-chunks"
+        )
     }
 
     func test_compress_overCapChunkFailureFailsOpenToExactRawInput() async {

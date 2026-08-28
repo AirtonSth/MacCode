@@ -1029,6 +1029,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             cwd: request.cwd,
             prompt: request.prompt,
             userMessageContent: request.userMessageContent,
+            tokenSaverCanonicalProviderContent: request.tokenSaverCanonicalProviderContent,
             attachments: request.attachments,
             providerThreadId: nil,
             permissionMode: request.permissionMode,

@@ -133,6 +133,12 @@ public final class DistillServiceClient: @unchecked Sendable {
         do {
             let body = try encode(wireRequest)
             httpRequest.httpBody = body
+            if let deadline = request.deferredHandoffDeadlineUnixMilliseconds {
+                httpRequest.setValue(
+                    String(deadline),
+                    forHTTPHeaderField: DistillDeferredDelivery.handoffDeadlineHeader
+                )
+            }
             if let recoveryContext {
                 recoveryContext.applyIdentityHeaders(to: &httpRequest)
                 if recoveryContext.hasCompleteScope {

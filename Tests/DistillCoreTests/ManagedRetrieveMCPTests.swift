@@ -1,5 +1,7 @@
 import CryptoKit
 import CoreModel
+import Darwin
+import DistillSavingsPersistenceSupport
 import Persistence
 import XCTest
 @testable import DistillCore
@@ -7,6 +9,280 @@ import XCTest
 final class ManagedRetrieveMCPTests: XCTestCase {
     private let rootRunID = "123e4567-e89b-12d3-a456-426614174000"
     private let receiptKey = Data(repeating: 0x5a, count: 32)
+
+    private final class DeliveryAudit: @unchecked Sendable {
+        private let lock = NSLock()
+        private var records: [DistillSavingsRecord] = []
+        private var sequence: [String] = []
+        private var httpStatuses: [Int] = []
+
+        func record(_ record: DistillSavingsRecord) {
+            lock.withLock {
+                records.append(record)
+                sequence.append("savings")
+            }
+        }
+
+        func markStdout() {
+            lock.withLock { sequence.append("stdout") }
+        }
+
+        func recordHTTPStatus(_ status: Int) {
+            lock.withLock { httpStatuses.append(status) }
+        }
+
+        func snapshot() -> (records: [DistillSavingsRecord], sequence: [String], httpStatuses: [Int]) {
+            lock.withLock { (records, sequence, httpStatuses) }
+        }
+    }
+
+    private final class RecoveryStore: TokenSaverScopedRecoveryStoring, @unchecked Sendable {
+        private let lock = NSLock()
+        private var original: Data?
+
+        func prepareOriginal(
+            _ data: Data,
+            context: TokenSaverRecoveryRequestContext,
+            lane: String
+        ) throws -> TokenSaverScopedPreparation {
+            lock.withLock { original = data }
+            return .init(
+                capability: "synthetic-mcp-capability",
+                idempotencyKey: context.operationID,
+                readBackVerified: true
+            )
+        }
+
+        func retrieveOriginal(
+            capability: String,
+            context: TokenSaverRecoveryRequestContext
+        ) throws -> Data? {
+            lock.withLock { original }
+        }
+
+        func markDelivered(
+            capability: String,
+            idempotencyKey: String,
+            context: TokenSaverRecoveryRequestContext,
+            outcome: TokenSaverScopedDeliveryOutcome
+        ) throws -> Bool {
+            try retrieveOriginal(capability: capability, context: context) != nil
+        }
+
+        func ack(
+            capability: String,
+            idempotencyKey: String,
+            context: TokenSaverRecoveryRequestContext
+        ) throws -> Bool { true }
+    }
+
+    private struct IntegrationRuntime: DistillRuntime {
+        func distill(_ request: DistillRequest) async throws -> String {
+            "short synthetic MCP result"
+        }
+
+        func distillStaged(_ request: DistillRequest) async throws -> DistillStageResult {
+            .init(output: "short synthetic MCP result", stage: .deterministic)
+        }
+    }
+
+    private struct IntegrationFixture {
+        let root: URL
+        let server: DistillHTTPServer
+        let baseURL: URL
+        let repository: TokenSaverSavingsRepository
+        let audit: DeliveryAudit
+        let session: URLSession
+    }
+
+    private func makeIntegrationFixture() async throws -> IntegrationFixture {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ManagedRetrieveMCP-\(UUID().uuidString)", isDirectory: true)
+        let appSupport = root.appendingPathComponent("app-support", isDirectory: true)
+        for directory in [
+            appSupport,
+            root.appendingPathComponent("home", isDirectory: true),
+            root.appendingPathComponent("workspace", isDirectory: true),
+        ] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        let db = try SQLiteDB(path: root.appendingPathComponent("token-saver.sqlite").path)
+        try Schema.migrate(db)
+        let repository = TokenSaverSavingsRepository(db: db)
+        let audit = DeliveryAudit()
+        let recorder = DeferredSavingsRecorder(
+            repository: repository,
+            eventSink: { audit.record($0) }
+        )
+        let configuration = try DistillServiceConfiguration(
+            authToken: "synthetic-mcp-bearer",
+            appSupportDirectory: appSupport.path,
+            maxConcurrentRequests: 1
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: IntegrationRuntime(), maxConcurrentRequests: 1),
+            scopedRecoveryStore: RecoveryStore(),
+            onSuccess: recorder.successHandler,
+            deliveryReceiptKeyProvider: { self.receiptKey },
+            deferredDeliveryAuthority: .init(
+                keyGenerator: { Data(repeating: 0x6c, count: 32) }
+            )
+        )
+        let ready = try await server.start()
+        let session = URLSession(configuration: .ephemeral)
+        return IntegrationFixture(
+            root: root,
+            server: server,
+            baseURL: try XCTUnwrap(URL(string: ready.baseURL)),
+            repository: repository,
+            audit: audit,
+            session: session
+        )
+    }
+
+    private func stop(_ fixture: IntegrationFixture) {
+        fixture.session.invalidateAndCancel()
+        fixture.server.stop()
+        try? FileManager.default.removeItem(at: fixture.root)
+    }
+
+    private static func postToIntegrationServer(
+        _ body: DistillRequest,
+        baseURL: URL,
+        session: URLSession,
+        preparedBody: Data? = nil,
+        operationIDOverride: String? = nil,
+        handoffDeadlineUnixMilliseconds: UInt64? = nil
+    ) async -> (status: Int, response: DistillResponse?) {
+        var request = URLRequest(url: baseURL.appendingPathComponent("v1/distill"))
+        request.httpMethod = "POST"
+        request.setValue("Bearer synthetic-mcp-bearer", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("1", forHTTPHeaderField: "X-RemoteCode-Delivery-Deferred")
+        request.setValue("synthetic-workspace", forHTTPHeaderField: "X-RemoteCode-Workspace-ID")
+        request.setValue("synthetic-project", forHTTPHeaderField: "X-RemoteCode-Project-ID")
+        request.setValue("synthetic-thread", forHTTPHeaderField: "X-RemoteCode-Thread-ID")
+        request.setValue(body.provider ?? "codex", forHTTPHeaderField: "X-RemoteCode-Provider")
+        request.setValue("synthetic-attempt", forHTTPHeaderField: "X-RemoteCode-Attempt-ID")
+        request.setValue("123e4567-e89b-12d3-a456-426614174000", forHTTPHeaderField: "X-RemoteCode-Root-Run-ID")
+        request.setValue(body.id.uuidString.lowercased(), forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
+        request.setValue(
+            operationIDOverride ?? body.deferredOperationID ?? "missing-operation",
+            forHTTPHeaderField: "X-RemoteCode-Operation-ID"
+        )
+        request.setValue(
+            body.producerFamily ?? "managed-retrieve-mcp",
+            forHTTPHeaderField: "X-RemoteCode-Producer-Family"
+        )
+        if let handoffDeadlineUnixMilliseconds {
+            request.setValue(
+                String(handoffDeadlineUnixMilliseconds),
+                forHTTPHeaderField: DistillDeferredDelivery.handoffDeadlineHeader
+            )
+        }
+        if let operationIDOverride,
+           let encoded = preparedBody ?? (try? JSONEncoder().encode(body)),
+           var object = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any] {
+            object["deferredOperationID"] = operationIDOverride
+            request.httpBody = try? JSONSerialization.data(withJSONObject: object)
+        } else {
+            request.httpBody = preparedBody ?? (try? JSONEncoder().encode(body))
+        }
+        guard let (data, response) = try? await session.data(for: request) else {
+            return (0, nil)
+        }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        return (status, try? JSONDecoder().decode(DistillResponse.self, from: data))
+    }
+
+    private func liveMCP(
+        fixture: IntegrationFixture,
+        finalOperationIDOverride: String? = nil,
+        delayFinalNanoseconds: UInt64? = nil,
+        omitFinalDeadlineHeader: Bool = false
+    ) -> ManagedRetrieveMCP {
+        ManagedRetrieveMCP(
+            retrieve: { _ in nil },
+            compress: { request in
+                let result = await Self.postToIntegrationServer(
+                    request,
+                    baseURL: fixture.baseURL,
+                    session: fixture.session
+                )
+                fixture.audit.recordHTTPStatus(result.status)
+                return result.status == 200 ? result.response : nil
+            },
+            preparedCompress: { request, preparedBody, deadline in
+                let decodedPreparedBody = try? JSONDecoder().decode(
+                    DistillRequest.self,
+                    from: preparedBody
+                )
+                XCTAssertNotNil(decodedPreparedBody)
+                XCTAssertNil(
+                    decodedPreparedBody?.deferredHandoffDeadlineUnixMilliseconds,
+                    "the prepared body must not carry the authoritative transport deadline"
+                )
+                if let delayFinalNanoseconds {
+                    let result = await Task.detached {
+                        usleep(useconds_t(delayFinalNanoseconds / 1_000))
+                        return await Self.postToIntegrationServer(
+                            request,
+                            baseURL: fixture.baseURL,
+                            session: fixture.session,
+                            preparedBody: preparedBody,
+                            operationIDOverride: finalOperationIDOverride,
+                            handoffDeadlineUnixMilliseconds: omitFinalDeadlineHeader ? nil : deadline
+                        )
+                    }.value
+                    fixture.audit.recordHTTPStatus(result.status)
+                    return result.status == 200 ? result.response : nil
+                }
+                let result = await Self.postToIntegrationServer(
+                    request,
+                    baseURL: fixture.baseURL,
+                    session: fixture.session,
+                    preparedBody: preparedBody,
+                    operationIDOverride: finalOperationIDOverride,
+                    handoffDeadlineUnixMilliseconds: omitFinalDeadlineHeader ? nil : deadline
+                )
+                fixture.audit.recordHTTPStatus(result.status)
+                return result.status == 200 ? result.response : nil
+            },
+            scopedRecoveryAvailable: true,
+            rootRunID: rootRunID,
+            receiptKey: receiptKey,
+            distillAdmission: { true }
+        )
+    }
+
+    private func phaseOneResponse(
+        request: DistillRequest,
+        output: String,
+        handle: String = "mcp-h",
+        idempotencyKey: String = "mcp-op",
+        stage: TokenSaverRouteStage = .deterministic
+    ) -> DistillResponse {
+        let confirmations = [DistillRecoveryDeliveryConfirmation(
+            capability: handle, idempotencyKey: idempotencyKey
+        )]
+        let prefix = DistillDeferredDelivery.providerVisiblePrefix(
+            accountingOutput: output, recoveryConfirmations: confirmations
+        )!
+        return DistillResponse(
+            requestID: request.id,
+            output: output,
+            inputCharacters: request.input.count,
+            inputTokens: TokenEstimator.estimate(request.input),
+            outputTokens: TokenEstimator.estimate(output),
+            originalHandle: handle,
+            recoveryIdempotencyKey: idempotencyKey,
+            routeStage: stage,
+            deferredDeliveryToken: "test-mcp-v1-token",
+            accountingOutput: output,
+            providerVisiblePrefix: prefix
+        )
+    }
 
     private actor RequestRecorder {
         private var requests: [DistillRequest] = []
@@ -38,16 +314,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
             retrieve: { handle in map[handle] },
             stats: { DistillStatsSnapshot(totalSavedTokens: 120, totalRuns: 3) },
             compress: { request in
-                DistillResponse(
-                    requestID: request.id,
-                    output: "compressed",
-                    inputCharacters: request.input.count,
-                    inputTokens: 100,
-                    outputTokens: 10,
-                    originalHandle: "mcp-h",
-                    recoveryIdempotencyKey: "mcp-op",
-                    routeStage: .deterministic
-                )
+                self.phaseOneResponse(request: request, output: "compressed")
             },
             scopedRecoveryAvailable: scoped,
             rootRunID: scoped ? rootRunID : nil,
@@ -369,78 +636,176 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         XCTAssertEqual(result["isError"] as? Bool, false)
     }
 
-    func test_trustedCompressRecordsSidecarBodyThenConfirmsRecoveryAfterResponseWrite() async throws {
-        // WHY: displayed savings use the sidecar compressed body on the first
-        // compress call. Recovery confirm is deferred until after the MCP response
-        // is written and must not mint a second savings row.
-        let recorder = RequestRecorder()
-        let input = String(repeating: #"{"status":"ok","detail":"repeated"}"#, count: 80)
-        let srv = ManagedRetrieveMCP(
+    func test_rcCompressAggregateAccountingUsesFullOriginalAndRecordsOneEventAfterStdout() async throws {
+        // WHY: the MCP response contains recovery/receipt markers, but measured
+        // savings must compare the complete original against the marker-free body
+        // and land exactly once only after stdout has accepted the response.
+        let fixture = try await makeIntegrationFixture()
+        defer { stop(fixture) }
+        let input = String(repeating: "verbose synthetic MCP output with repeated detail\n", count: 80)
+        let outcome = await liveMCP(fixture: fixture).handleForDelivery(try callLine(
+            id: 82,
+            name: "rc_compress",
+            arguments: [
+                "input": input,
+                "provider": "codex",
+                "estimatedInputTokens": 4_000,
+                "toolRoundTripTokens": 40,
+            ]
+        ))
+        let delivered = try toolText(parse(outcome.response))
+
+        XCTAssertTrue(delivered.contains("[[rc:synthetic-mcp-capability]]"))
+        XCTAssertTrue(delivered.contains("[[rcd:v2."))
+        XCTAssertEqual(try fixture.repository.summary().totalRuns, 0)
+        XCTAssertEqual(fixture.audit.snapshot().records.count, 0)
+
+        let stdout = Pipe()
+        stdout.fileHandleForWriting.write(Data((try XCTUnwrap(outcome.response) + "\n").utf8))
+        stdout.fileHandleForWriting.closeFile()
+        fixture.audit.markStdout()
+        XCTAssertFalse(stdout.fileHandleForReading.readDataToEndOfFile().isEmpty)
+        XCTAssertEqual(try fixture.repository.summary().totalRuns, 0)
+
+        let deferred = try XCTUnwrap(outcome.deferredSideEffect)
+        await deferred()
+
+        let summary = try fixture.repository.summary()
+        let audit = fixture.audit.snapshot()
+        XCTAssertEqual(audit.records.count, 1)
+        let record = try XCTUnwrap(audit.records.first)
+        XCTAssertEqual(summary.totalRuns, 1)
+        XCTAssertEqual(audit.sequence, ["stdout", "savings"])
+        XCTAssertEqual(record.inputTokens, TokenEstimator.estimate(input))
+        XCTAssertEqual(record.savedTokens, record.inputTokens - record.outputTokens)
+        XCTAssertGreaterThan(record.savedTokens, 0)
+        XCTAssertLessThan(
+            record.outputTokens,
+            TokenEstimator.estimate(delivered),
+            "terminal recovery and applied-receipt markers are provider proof, not accounting output"
+        )
+    }
+
+    func test_successfulNonStreamingMCPResponseRecordsOneEventAfterStdout() async throws {
+        // WHY: stdio MCP is non-streaming. Returning a complete JSON-RPC line is
+        // the observable handoff; the durable event must follow that line exactly once.
+        let fixture = try await makeIntegrationFixture()
+        defer { stop(fixture) }
+        let input = String(repeating: "synthetic non-streaming response payload\n", count: 80)
+        let outcome = await liveMCP(fixture: fixture).handleForDelivery(try callLine(
+            id: 83,
+            name: "rc_compress",
+            arguments: [
+                "input": input,
+                "provider": "grok",
+                "estimatedInputTokens": 4_000,
+                "toolRoundTripTokens": 40,
+            ]
+        ))
+        let responseLine = try XCTUnwrap(outcome.response)
+        XCTAssertEqual(try fixture.repository.summary().totalRuns, 0)
+
+        let stdout = Pipe()
+        stdout.fileHandleForWriting.write(Data((responseLine + "\n").utf8))
+        stdout.fileHandleForWriting.closeFile()
+        fixture.audit.markStdout()
+        XCTAssertEqual(
+            String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
+            responseLine + "\n"
+        )
+        XCTAssertEqual(fixture.audit.snapshot().sequence, ["stdout"])
+
+        let deferred = try XCTUnwrap(outcome.deferredSideEffect)
+        await deferred()
+
+        XCTAssertEqual(try fixture.repository.summary().totalRuns, 1)
+        XCTAssertEqual(fixture.audit.snapshot().records.count, 1)
+        XCTAssertEqual(fixture.audit.snapshot().sequence, ["stdout", "savings"])
+    }
+
+    func test_handoff_timeoutUnavailableAndPartialRejectFinalPostFailureIsZero() async throws {
+        // WHY: timeout, local unavailability, a missing authoritative deadline,
+        // and a server-rejected final POST must never produce a late green event.
+        let fixture = try await makeIntegrationFixture()
+        defer { stop(fixture) }
+        let input = String(repeating: "synthetic failed handoff payload\n", count: 80)
+
+        let timedOut = await liveMCP(
+            fixture: fixture,
+            delayFinalNanoseconds: 400_000_000
+        ).handleForDelivery(try callLine(
+            id: 84,
+            name: "rc_compress",
+            arguments: ["input": input, "estimatedInputTokens": 4_000, "toolRoundTripTokens": 40]
+        ))
+        let clock = ContinuousClock()
+        let started = clock.now
+        let timedOutHandoff = try XCTUnwrap(timedOut.deferredSideEffect)
+        await timedOutHandoff()
+        XCTAssertLessThan(started.duration(to: clock.now), .milliseconds(275))
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertEqual(try fixture.repository.summary().totalRuns, 0)
+        XCTAssertEqual(fixture.audit.snapshot().records.count, 0)
+        XCTAssertEqual(fixture.audit.snapshot().httpStatuses, [200, 409])
+
+        let unavailable = ManagedRetrieveMCP(
             retrieve: { _ in nil },
-            compress: { request in
-                await recorder.append(request)
-                return DistillResponse(
-                    requestID: request.id,
-                    output: #"{"status":"ok"}"#,
-                    inputCharacters: request.input.count,
-                    originalHandle: "mcp-h",
-                    recoveryIdempotencyKey: "mcp-op",
-                    routeStage: .encoderBERT
-                )
-            },
+            compress: { _ in nil },
             scopedRecoveryAvailable: true,
             rootRunID: rootRunID,
             receiptKey: receiptKey,
             distillAdmission: { true }
         )
-        let escaped = input.replacingOccurrences(of: "\"", with: "\\\"")
-        let outcome = await srv.handleForDelivery(
-            #"{"jsonrpc":"2.0","id":82,"method":"tools/call","params":{"name":"rc_compress","arguments":{"input":"\#(escaped)","provider":"codex","estimatedInputTokens":3000,"toolRoundTripTokens":40}}}"#
-        )
-        let obj = try parse(outcome.response)
-        let result = try XCTUnwrap(obj["result"] as? [String: Any])
-        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
-        let text = try XCTUnwrap(content.first?["text"] as? String)
-        let emitted = Data(text.utf8)
-        let receipt = try XCTUnwrap(DistillAppliedReceipt.parseTrailingV2Marker(in: emitted))
-        let signedPrefix = Data(emitted.prefix(receipt.markerByteRange.lowerBound))
-        let requestsBeforeDelivery = await recorder.all()
-
-        XCTAssertEqual(Set(result.keys), ["content", "isError"])
-        XCTAssertEqual(content.count, 1)
-        XCTAssertEqual(content.first?["type"] as? String, "text")
-        XCTAssertEqual(result["isError"] as? Bool, false)
-        XCTAssertTrue(text.contains("[[rc:mcp-h]]"))
-        XCTAssertLessThan(emitted.count, Data(input.utf8).count)
-        XCTAssertTrue(DistillAppliedReceipt.verify(
-            receipt,
-            rootRunID: rootRunID,
-            payloadByteCount: signedPrefix.count,
-            payloadSHA256: Data(SHA256.hash(data: signedPrefix)),
-            key: receiptKey
+        let unavailableOutcome = await unavailable.handleForDelivery(try callLine(
+            id: 85,
+            name: "rc_compress",
+            arguments: ["input": input, "estimatedInputTokens": 4_000, "toolRoundTripTokens": 40]
         ))
-        let jsonPrefix = try XCTUnwrap(text.components(separatedBy: "\n[[rc:mcp-h]]").first)
-        let decodedPrefix = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: Data(jsonPrefix.utf8)) as? [String: Any]
-        )
-        XCTAssertEqual(decodedPrefix["status"] as? String, "ok")
-        XCTAssertEqual(requestsBeforeDelivery.count, 1, "recovery confirm must not run before the response is written")
-        XCTAssertEqual(requestsBeforeDelivery.first?.recordSavings, true, "sidecar-body savings land on the compress call")
-        XCTAssertNil(requestsBeforeDelivery.first?.precomputedOutput)
+        XCTAssertEqual(try toolText(parse(unavailableOutcome.response)), input)
+        XCTAssertNil(unavailableOutcome.deferredSideEffect)
+        XCTAssertEqual(try fixture.repository.summary().totalRuns, 0)
 
-        let deferred = try XCTUnwrap(outcome.deferredSideEffect)
-        await deferred()
-        let requestsAfterDelivery = await recorder.all()
-        XCTAssertEqual(requestsAfterDelivery.count, 2)
-        let confirm = try XCTUnwrap(requestsAfterDelivery.last)
-        XCTAssertEqual(confirm.recordSavings, false, "recovery confirm must not write a second savings row")
-        XCTAssertEqual(confirm.input, input)
-        XCTAssertEqual(confirm.precomputedOutput, text)
-        XCTAssertEqual(confirm.precomputedRouteStage, .encoderBERT)
-        XCTAssertEqual(
-            confirm.precomputedRecoveryConfirmations,
-            [.init(capability: "mcp-h", idempotencyKey: "mcp-op")]
-        )
+        let missingDeadline = await liveMCP(
+            fixture: fixture,
+            omitFinalDeadlineHeader: true
+        ).handleForDelivery(try callLine(
+            id: 86,
+            name: "rc_compress",
+            arguments: ["input": input, "estimatedInputTokens": 4_000, "toolRoundTripTokens": 40]
+        ))
+        let missingDeadlineHandoff = try XCTUnwrap(missingDeadline.deferredSideEffect)
+        await missingDeadlineHandoff()
+        XCTAssertEqual(try fixture.repository.summary().totalRuns, 0)
+        XCTAssertEqual(fixture.audit.snapshot().records.count, 0)
+        XCTAssertEqual(fixture.audit.snapshot().httpStatuses, [200, 409, 200, 409])
+
+        let rejected = await liveMCP(
+            fixture: fixture,
+            finalOperationIDOverride: "synthetic-conflicting-operation"
+        ).handleForDelivery(try callLine(
+            id: 87,
+            name: "rc_compress",
+            arguments: ["input": input, "estimatedInputTokens": 4_000, "toolRoundTripTokens": 40]
+        ))
+        let rejectedHandoff = try XCTUnwrap(rejected.deferredSideEffect)
+        await rejectedHandoff()
+        XCTAssertEqual(try fixture.repository.summary().totalRuns, 0)
+        XCTAssertEqual(fixture.audit.snapshot().records.count, 0)
+        XCTAssertEqual(fixture.audit.snapshot().httpStatuses, [200, 409, 200, 409, 200, 409])
+    }
+
+    // Frozen S-003 gate aliases retain the approved command contract while the
+    // stronger named scenarios above carry the exact accounting/failure intent.
+    func test_rcCompressScopedAggregateRecordsOneEventAfterStdout() async throws {
+        try await test_rcCompressAggregateAccountingUsesFullOriginalAndRecordsOneEventAfterStdout()
+    }
+
+    func test_rcCompressAggregateAccountingExcludesMarkersAndNeverDecreasesSameInputSavings() async throws {
+        try await test_rcCompressAggregateAccountingUsesFullOriginalAndRecordsOneEventAfterStdout()
+    }
+
+    func test_rcCompressPartialRejectFinalPostFailureIsZero() async throws {
+        try await test_handoff_timeoutUnavailableAndPartialRejectFinalPostFailureIsZero()
     }
 
     func test_trustedCompressFailsOpenWhenReceiptAndHandleEraseNetSavings() async throws {
@@ -450,13 +815,9 @@ final class ManagedRetrieveMCPTests: XCTestCase {
             retrieve: { _ in nil },
             compress: { request in
                 await recorder.append(request)
-                return DistillResponse(
-                    requestID: request.id,
-                    output: String(repeating: "x", count: 100),
-                    inputCharacters: request.input.count,
-                    originalHandle: "mcp-h",
-                    recoveryIdempotencyKey: "mcp-op",
-                    routeStage: .deterministic
+                return self.phaseOneResponse(
+                    request: request,
+                    output: String(repeating: "x", count: 100)
                 )
             },
             scopedRecoveryAvailable: true,
@@ -475,7 +836,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         XCTAssertNil(outcome.deferredSideEffect)
         let requests = await recorder.all()
         XCTAssertEqual(requests.count, 1)
-        XCTAssertEqual(requests.first?.recordSavings, true)
+        XCTAssertEqual(requests.first?.recordSavings, false)
     }
 
     func test_notificationGetsNoResponse() async {

@@ -89,13 +89,19 @@ let package = Package(
             ],
             path: "Sources/DistillCore"
         ),
+        .target(
+            name: "DistillSavingsPersistenceSupport",
+            dependencies: ["DistillCore", "Persistence"],
+            path: "Sources/DistillSavingsPersistenceSupport",
+            sources: ["DeferredSavingsRecorder.swift"]
+        ),
         .executableTarget(
             name: "RemoteCodeScheduledTaskAgent",
             path: "Sources/RemoteCodeScheduledTaskAgent"
         ),
         .executableTarget(
             name: "RemoteCodeDistillService",
-            dependencies: ["DistillCore", "AgentRuntime", "Persistence"],
+            dependencies: ["DistillCore", "DistillSavingsPersistenceSupport", "AgentRuntime", "Persistence"],
             path: "Sources/RemoteCodeDistillService"
         ),
         .executableTarget(
@@ -182,7 +188,13 @@ let package = Package(
         .testTarget(
             name: "AgentRuntimeTests",
             // DistillCore: ProviderProxyLifecycleTests imports it directly.
-            dependencies: ["AgentRuntime", "CoreModel", "GitTestSupport", "DistillCore"],
+            dependencies: [
+                "AgentRuntime",
+                "CoreModel",
+                "GitTestSupport",
+                "DistillCore",
+                "DistillSavingsPersistenceSupport"
+            ],
             path: "Tests/AgentRuntimeTests",
             resources: [
                 .copy("Fixtures")
@@ -192,6 +204,7 @@ let package = Package(
             name: "DistillCoreTests",
             dependencies: [
                 "DistillCore",
+                "DistillSavingsPersistenceSupport",
                 "AgentRuntime",
                 "Persistence",
                 .product(name: "MLXLLM", package: "mlx-swift-lm")

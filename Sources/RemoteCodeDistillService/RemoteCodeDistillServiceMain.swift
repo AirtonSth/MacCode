@@ -1,6 +1,7 @@
 import AgentRuntime
 import CoreModel
 import DistillCore
+import DistillSavingsPersistenceSupport
 import Darwin
 import Foundation
 import Persistence
@@ -365,7 +366,7 @@ struct RemoteCodeDistillServiceMain {
                 authToken: configuration.authToken,
                 pid: getpid()
             )
-            // Shared fail-open persist for DistillSavingsRecord (success + forfeit).
+            // Shared fail-open persist for DistillSavingsRecord (forfeit seam).
             // Persistence errors must never block or crash the HTTP response path.
             let persistSavings: DistillHTTPServer.SavingsRecordHandler = { record in
                 do {
@@ -394,6 +395,13 @@ struct RemoteCodeDistillServiceMain {
                     onFallback: { await sharedMetrics.recordFallback() }
                 )
             )
+            let deferredSavingsRecorder = DeferredSavingsRecorder(
+                repository: savingsRepo,
+                eventSink: { eventWriter.writeSavingsRecorded($0) },
+                errorSink: { error in
+                    FileHandle.standardError.write(Data("RemoteCodeDistillService savings record failed: \(error)\n".utf8))
+                }
+            )
             let server = DistillHTTPServer(
                 configuration: configuration,
                 scheduler: scheduler,
@@ -402,17 +410,7 @@ struct RemoteCodeDistillServiceMain {
                 statsProvider: statsProvider,
                 startsReady: false,
                 metricsRecorder: sharedMetrics,
-                onSuccess: { request, response, threadID in
-                    guard let record = DistillSavingsCalculator.record(
-                        for: request,
-                        response: response,
-                        threadID: threadID
-                    ) else {
-                        return
-                    }
-                    await persistSavings(record)
-                    eventWriter.writeSavingsRecorded(record)
-                },
+                onSuccess: deferredSavingsRecorder.successHandler,
                 // WHY: DistillCore emitForfeitedCompression only fires these optional
                 // seams. Without them, delivered=0 forfeit rows and token_saver_denial
                 // audits exist only in unit tests — production operators see nothing.
@@ -431,6 +429,14 @@ struct RemoteCodeDistillServiceMain {
                     }
                 },
                 librarianGenerate: librarianGenerate,
+                // The controller writes receipt_key only after this process emits
+                // ready. Resolve it at phase two, from the owner-only lease, so a
+                // clean start cannot strand every valid delivery at yellow zero.
+                deliveryReceiptKeyProvider: {
+                    DistillDeliveryReceiptKeyFileProvider.load(
+                        appSupportDirectory: configuration.appSupportDirectory
+                    )
+                },
                 distillAdmission: { liveDistillAdmission?.isAdmitted() == true }
             )
             let ready = try await server.start()
@@ -728,21 +734,68 @@ struct RemoteCodeDistillServiceMain {
                 request.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 applyRecoveryHeaders(to: &request, environment: environment)
-                if distillRequest.precomputedOutput == nil {
+                if distillRequest.recordSavings != true || distillRequest.deferredDeliveryToken != nil {
                     request.setValue("1", forHTTPHeaderField: "X-RemoteCode-Delivery-Deferred")
+                }
+                if let producerFamily = distillRequest.producerFamily {
+                    request.setValue(producerFamily, forHTTPHeaderField: "X-RemoteCode-Producer-Family")
+                }
+                if let deadline = distillRequest.deferredHandoffDeadlineUnixMilliseconds {
+                    request.setValue(
+                        String(deadline),
+                        forHTTPHeaderField: DistillDeferredDelivery.handoffDeadlineHeader
+                    )
                 }
                 mcpCodecLock.lock()
                 request.httpBody = try? mcpSortedEncoder.encode(distillRequest)
                 mcpCodecLock.unlock()
                 if let body = request.httpBody {
                     request.setValue(distillRequest.id.uuidString.lowercased(), forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
-                    request.setValue(ManagedDistillCLI.recoveryOperationID(kind: "distill", canonicalPayload: body), forHTTPHeaderField: "X-RemoteCode-Operation-ID")
+                    request.setValue(
+                        distillRequest.deferredOperationID
+                            ?? ManagedDistillCLI.recoveryOperationID(kind: "distill", canonicalPayload: body),
+                        forHTTPHeaderField: "X-RemoteCode-Operation-ID"
+                    )
                 }
                 guard admission?.isAdmitted() == true else { return nil }
                 guard let (data, response) = try? await session.data(for: request),
                       (response as? HTTPURLResponse)?.statusCode == 200 else {
                     return nil
                 }
+                mcpCodecLock.lock()
+                defer { mcpCodecLock.unlock() }
+                return try? mcpDecoder.decode(DistillResponse.self, from: data)
+            },
+            preparedCompress: { distillRequest, preparedBody, deadline in
+                guard admission?.isAdmitted() == true,
+                      let state,
+                      let url = URL(string: state.baseURL + "/v1/distill") else { return nil }
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.setValue("1", forHTTPHeaderField: "X-RemoteCode-Delivery-Deferred")
+                request.setValue(
+                    String(deadline),
+                    forHTTPHeaderField: DistillDeferredDelivery.handoffDeadlineHeader
+                )
+                applyRecoveryHeaders(to: &request, environment: environment)
+                if let producerFamily = distillRequest.producerFamily {
+                    request.setValue(producerFamily, forHTTPHeaderField: "X-RemoteCode-Producer-Family")
+                }
+                request.setValue(
+                    distillRequest.id.uuidString.lowercased(),
+                    forHTTPHeaderField: "X-RemoteCode-Invocation-ID"
+                )
+                request.setValue(
+                    distillRequest.deferredOperationID
+                        ?? ManagedDistillCLI.recoveryOperationID(kind: "distill", canonicalPayload: preparedBody),
+                    forHTTPHeaderField: "X-RemoteCode-Operation-ID"
+                )
+                request.httpBody = preparedBody
+                guard admission?.isAdmitted() == true,
+                      let (data, response) = try? await session.data(for: request),
+                      (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
                 mcpCodecLock.lock()
                 defer { mcpCodecLock.unlock() }
                 return try? mcpDecoder.decode(DistillResponse.self, from: data)
@@ -865,6 +918,10 @@ struct RemoteCodeDistillServiceMain {
             if !fallback.isEmpty {
                 request.setValue(fallback, forHTTPHeaderField: "X-RemoteCode-Thread-ID")
             }
+        }
+        if let rootRunID = environment["RC_TOKEN_SAVER_ROOT_RUN_ID"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rootRunID.isEmpty {
+            request.setValue(rootRunID, forHTTPHeaderField: "X-RemoteCode-Root-Run-ID")
         }
     }
 

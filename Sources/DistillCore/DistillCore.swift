@@ -125,6 +125,24 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
     /// Recovery capabilities whose markers are present in `precomputedOutput` and
     /// may transition from prepared to delivered at this final acceptance boundary.
     public let precomputedRecoveryConfirmations: [DistillRecoveryDeliveryConfirmation]?
+    /// Server-issued proof for phase-two delivery confirmation. Never persisted by clients.
+    public let deferredDeliveryToken: String?
+    /// Marker-free bytes used for savings accounting in phase two.
+    public let accountingOutput: String?
+    /// Exact bytes observed at the provider handoff, including one terminal rcd:v2 receipt.
+    public let deliveredOutput: String?
+    /// Identifies the handoff family without granting authority.
+    public let producerFamily: String?
+    /// Chunk metadata for ManagedDistillCLI member-v1 issuance.
+    public let deferredChunk: DistillDeferredChunkDescriptor?
+    /// Complete transient member manifest for aggregate token issuance.
+    public let deferredMembers: [DistillDeferredMemberManifest]?
+    /// Marks the only client-precomputed form the server may recompute and authorize.
+    public let deterministicLosslessPrepass: Bool?
+    /// Stable operation identity reused across phase one and phase two.
+    public let deferredOperationID: String?
+    /// Absolute server-clock cutoff for accepting the observable handoff.
+    public let deferredHandoffDeadlineUnixMilliseconds: UInt64?
 
     public init(
         id: UUID = UUID(),
@@ -143,7 +161,16 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
         reversibleStoreMinBytes: Int? = nil,
         precomputedOutput: String? = nil,
         precomputedRouteStage: TokenSaverRouteStage? = nil,
-        precomputedRecoveryConfirmations: [DistillRecoveryDeliveryConfirmation]? = nil
+        precomputedRecoveryConfirmations: [DistillRecoveryDeliveryConfirmation]? = nil,
+        deferredDeliveryToken: String? = nil,
+        accountingOutput: String? = nil,
+        deliveredOutput: String? = nil,
+        producerFamily: String? = nil,
+        deferredChunk: DistillDeferredChunkDescriptor? = nil,
+        deferredMembers: [DistillDeferredMemberManifest]? = nil,
+        deterministicLosslessPrepass: Bool = false,
+        deferredOperationID: String? = nil,
+        deferredHandoffDeadlineUnixMilliseconds: UInt64? = nil
     ) {
         self.id = id
         self.mode = mode
@@ -162,10 +189,50 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
         self.precomputedOutput = precomputedOutput
         self.precomputedRouteStage = precomputedRouteStage
         self.precomputedRecoveryConfirmations = precomputedRecoveryConfirmations
+        self.deferredDeliveryToken = deferredDeliveryToken
+        self.accountingOutput = accountingOutput
+        self.deliveredOutput = deliveredOutput
+        self.producerFamily = producerFamily?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.deferredChunk = deferredChunk
+        self.deferredMembers = deferredMembers
+        self.deterministicLosslessPrepass = deterministicLosslessPrepass
+        self.deferredOperationID = deferredOperationID
+        self.deferredHandoffDeadlineUnixMilliseconds = deferredHandoffDeadlineUnixMilliseconds
     }
 
     public var effectiveRunMode: DistillRunMode {
         runMode ?? .optimize
+    }
+
+    func withDeferredHandoffDeadline(_ deadline: UInt64) -> DistillRequest {
+        DistillRequest(
+            id: id,
+            mode: mode,
+            priority: priority,
+            input: input,
+            question: question,
+            provider: provider,
+            recordSavings: recordSavings == true,
+            runMode: effectiveRunMode,
+            cacheState: cacheState,
+            rerankQuery: rerankQuery,
+            topK: topK,
+            encoderLane: encoderLane,
+            maxOutputCharacters: maxOutputCharacters,
+            reversibleStoreMinBytes: reversibleStoreMinBytes,
+            precomputedOutput: precomputedOutput,
+            precomputedRouteStage: precomputedRouteStage,
+            precomputedRecoveryConfirmations: precomputedRecoveryConfirmations,
+            deferredDeliveryToken: deferredDeliveryToken,
+            accountingOutput: accountingOutput,
+            deliveredOutput: deliveredOutput,
+            producerFamily: producerFamily,
+            deferredChunk: deferredChunk,
+            deferredMembers: deferredMembers,
+            deterministicLosslessPrepass: deterministicLosslessPrepass == true,
+            deferredOperationID: deferredOperationID,
+            deferredHandoffDeadlineUnixMilliseconds: deadline
+        )
     }
 
     /// Build a DistillResponse from client-supplied precomputed output without a model call.
@@ -190,6 +257,9 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
         case id, mode, priority, input, question, provider
         case recordSavings, runMode, cacheState, rerankQuery, topK, encoderLane, maxOutputCharacters
         case reversibleStoreMinBytes, precomputedOutput, precomputedRouteStage, precomputedRecoveryConfirmations
+        case deferredDeliveryToken, accountingOutput, deliveredOutput, producerFamily
+        case deferredChunk, deferredMembers, deterministicLosslessPrepass
+        case deferredOperationID, deferredHandoffDeadlineUnixMilliseconds
     }
 
     /// Tolerant decoder: identical to the synthesized one EXCEPT a wire client may omit
@@ -219,6 +289,18 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
             [DistillRecoveryDeliveryConfirmation].self,
             forKey: .precomputedRecoveryConfirmations
         )
+        self.deferredDeliveryToken = try c.decodeIfPresent(String.self, forKey: .deferredDeliveryToken)
+        self.accountingOutput = try c.decodeIfPresent(String.self, forKey: .accountingOutput)
+        self.deliveredOutput = try c.decodeIfPresent(String.self, forKey: .deliveredOutput)
+        self.producerFamily = try c.decodeIfPresent(String.self, forKey: .producerFamily)
+        self.deferredChunk = try c.decodeIfPresent(DistillDeferredChunkDescriptor.self, forKey: .deferredChunk)
+        self.deferredMembers = try c.decodeIfPresent([DistillDeferredMemberManifest].self, forKey: .deferredMembers)
+        self.deterministicLosslessPrepass = try c.decodeIfPresent(Bool.self, forKey: .deterministicLosslessPrepass)
+        self.deferredOperationID = try c.decodeIfPresent(String.self, forKey: .deferredOperationID)
+        self.deferredHandoffDeadlineUnixMilliseconds = try c.decodeIfPresent(
+            UInt64.self,
+            forKey: .deferredHandoffDeadlineUnixMilliseconds
+        )
     }
 }
 
@@ -243,6 +325,10 @@ public struct DistillResponse: Codable, Sendable, Equatable {
     /// MLX LLM). Lets Token Saver attribute saved tokens per technique. Optional +
     /// synthesized Codable => decode tolerates payloads from older sidecars.
     public let routeStage: TokenSaverRouteStage?
+    public let deferredDeliveryToken: String?
+    public let deferredMemberToken: String?
+    public let accountingOutput: String?
+    public let providerVisiblePrefix: String?
 
     public init(
         requestID: UUID,
@@ -254,7 +340,11 @@ public struct DistillResponse: Codable, Sendable, Equatable {
         recoveryIdempotencyKey: String? = nil,
         runMode: DistillRunMode = .optimize,
         auditReport: DistillAuditReport? = nil,
-        routeStage: TokenSaverRouteStage? = nil
+        routeStage: TokenSaverRouteStage? = nil,
+        deferredDeliveryToken: String? = nil,
+        deferredMemberToken: String? = nil,
+        accountingOutput: String? = nil,
+        providerVisiblePrefix: String? = nil
     ) {
         self.requestID = requestID
         self.output = output
@@ -267,6 +357,10 @@ public struct DistillResponse: Codable, Sendable, Equatable {
         self.runMode = runMode
         self.auditReport = auditReport
         self.routeStage = routeStage
+        self.deferredDeliveryToken = deferredDeliveryToken
+        self.deferredMemberToken = deferredMemberToken
+        self.accountingOutput = accountingOutput
+        self.providerVisiblePrefix = providerVisiblePrefix
     }
 
     /// Tokens removed by compression. Never negative: a longer "compressed"
@@ -305,6 +399,30 @@ public struct DistillResponse: Codable, Sendable, Equatable {
             runMode: runMode ?? .optimize,
             auditReport: auditReport,
             routeStage: routeStage
+        )
+    }
+
+    public func withDeferredDelivery(
+        token: String?,
+        memberToken: String?,
+        accountingOutput: String,
+        providerVisiblePrefix: String
+    ) -> DistillResponse {
+        DistillResponse(
+            requestID: requestID,
+            output: output,
+            inputCharacters: inputCharacters,
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            originalHandle: originalHandle,
+            recoveryIdempotencyKey: recoveryIdempotencyKey,
+            runMode: runMode ?? .optimize,
+            auditReport: auditReport,
+            routeStage: routeStage,
+            deferredDeliveryToken: token,
+            deferredMemberToken: memberToken,
+            accountingOutput: accountingOutput,
+            providerVisiblePrefix: providerVisiblePrefix
         )
     }
 }

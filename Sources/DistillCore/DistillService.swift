@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import CryptoKit
 import CoreModel
 
 /// Abstraction over the CCR reversible store, injected into the HTTP layer so
@@ -811,6 +812,8 @@ public final class DistillHTTPServer: @unchecked Sendable {
     /// compression request. The sidecar executable wires this to authoritative
     /// settings; the default preserves standalone/test server compatibility.
     public typealias DistillAdmission = @Sendable () -> Bool
+    public typealias DeliveryReceiptKeyProvider = @Sendable () -> Data?
+    public typealias DeferredDeliveryClock = @Sendable () -> Date
     /// Optional ledger seam for forfeited (not-delivered) savings. DistillCore stays
     /// Persistence-free; the sidecar wires this to `TokenSaverSavingsRepository`.
     public typealias SavingsRecordHandler = @Sendable (DistillSavingsRecord) async -> Void
@@ -865,6 +868,9 @@ public final class DistillHTTPServer: @unchecked Sendable {
     private let distillAdmission: DistillAdmission
     private let onSavingsRecord: SavingsRecordHandler?
     private let onAuditEvent: AuditEventHandler?
+    private let deferredDeliveryAuthority: DistillDeferredDeliveryAuthority
+    private let deliveryReceiptKeyProvider: DeliveryReceiptKeyProvider
+    private let deferredDeliveryClock: DeferredDeliveryClock
     private let librarianGenerate: (any LibrarianGenerating)?
     private let reversibleStore: ReversibleStoring?
     private let scopedRecoveryStore: TokenSaverScopedRecoveryStoring?
@@ -890,6 +896,10 @@ public final class DistillHTTPServer: @unchecked Sendable {
         onSavingsRecord: SavingsRecordHandler? = nil,
         onAuditEvent: AuditEventHandler? = nil,
         librarianGenerate: (any LibrarianGenerating)? = nil,
+        deliveryReceiptKey: Data? = nil,
+        deliveryReceiptKeyProvider: DeliveryReceiptKeyProvider? = nil,
+        deferredDeliveryClock: @escaping DeferredDeliveryClock = { Date() },
+        deferredDeliveryAuthority: DistillDeferredDeliveryAuthority? = nil,
         distillAdmission: @escaping DistillAdmission = { true }
     ) {
         self.configuration = configuration
@@ -906,6 +916,10 @@ public final class DistillHTTPServer: @unchecked Sendable {
         self.onSavingsRecord = onSavingsRecord
         self.onAuditEvent = onAuditEvent
         self.librarianGenerate = librarianGenerate
+        let constantDeliveryReceiptKey = deliveryReceiptKey?.count == 32 ? deliveryReceiptKey : nil
+        self.deliveryReceiptKeyProvider = deliveryReceiptKeyProvider ?? { constantDeliveryReceiptKey }
+        self.deferredDeliveryClock = deferredDeliveryClock
+        self.deferredDeliveryAuthority = deferredDeliveryAuthority ?? DistillDeferredDeliveryAuthority()
     }
 
     /// Flip readiness on once the runtime is warm. Until then /readyz returns 503
@@ -1575,6 +1589,39 @@ public final class DistillHTTPServer: @unchecked Sendable {
             let savingsThreadID = TokenSaverRecoveryRequestContext.savingsThreadID(
                 headers: request.headers
             )
+            let carriesDeferredFinal = distillRequest.deferredDeliveryToken != nil
+                || distillRequest.accountingOutput != nil
+                || distillRequest.deliveredOutput != nil
+            if carriesDeferredFinal, !deferDeliveryConfirmation {
+                send(status: 409, body: ErrorBody(error: "deferred_delivery_header_required", message: "deferred delivery requires the managed handoff header"), connection: connection)
+                return
+            }
+            if deferDeliveryConfirmation,
+               distillRequest.recordSavings == true,
+               distillRequest.deferredDeliveryToken != nil {
+                await handleDeferredDeliveryFinal(
+                    distillRequest,
+                    headers: request.headers,
+                    savingsThreadID: savingsThreadID,
+                    connection: connection
+                )
+                return
+            }
+            if deferDeliveryConfirmation, let members = distillRequest.deferredMembers {
+                await handleDeferredAggregateIssuance(
+                    distillRequest,
+                    members: members,
+                    headers: request.headers,
+                    connection: connection
+                )
+                return
+            }
+            if deferDeliveryConfirmation,
+               distillRequest.recordSavings == true,
+               distillRequest.precomputedOutput != nil {
+                send(status: 409, body: ErrorBody(error: "deferred_delivery_token_required", message: "precomputed delivery requires a valid server token"), connection: connection)
+                return
+            }
             if distillRequest.mode == .commandOutput {
                 await metrics.recordToolOutputEligible()
             }
@@ -1590,6 +1637,33 @@ public final class DistillHTTPServer: @unchecked Sendable {
             // delta via onSuccess and skip the model/scheduler entirely — mirror the
             // terminal-recovery early-return below (build response, onSuccess, 200).
             if let response = distillRequest.responseUsingPrecomputedOutput() {
+                if deferDeliveryConfirmation {
+                    guard distillRequest.recordSavings != true,
+                          distillRequest.deterministicLosslessPrepass == true,
+                          response.routeStage == .deterministic,
+                          TokenSaverWaveLosslessPrepass.apply(
+                            input: distillRequest.input,
+                            toolHint: distillRequest.question ?? ""
+                          ).map({ Data($0.output.utf8) }) == Data(response.output.utf8),
+                          let deferred = deferredPhaseOneResponse(
+                            request: distillRequest,
+                            response: response,
+                            headers: request.headers
+                          ) else {
+                        send(
+                            status: 409,
+                            body: ErrorBody(
+                                error: "deferred_delivery_not_authorized",
+                                message: "precomputed output was not reproduced by the server"
+                            ),
+                            connection: connection
+                        )
+                        return
+                    }
+                    await metrics.recordSuccess()
+                    send(status: 200, body: deferred, connection: connection)
+                    return
+                }
                 if let confirmations = distillRequest.precomputedRecoveryConfirmations,
                    !confirmations.isEmpty {
                     guard let scopedRecoveryStore,
@@ -1688,6 +1762,20 @@ public final class DistillHTTPServer: @unchecked Sendable {
                 if distillRequest.mode == .commandOutput {
                     await metrics.recordToolOutputCompressed()
                 }
+                if deferDeliveryConfirmation {
+                    guard distillRequest.recordSavings != true,
+                          let deferred = deferredPhaseOneResponse(
+                            request: distillRequest,
+                            response: early,
+                            headers: request.headers
+                          ) else {
+                        send(status: 409, body: ErrorBody(error: "deferred_delivery_not_authorized", message: "delivery identity is incomplete"), connection: connection)
+                        return
+                    }
+                    await metrics.recordSuccess()
+                    send(status: 200, body: deferred, connection: connection)
+                    return
+                }
                 if let onSuccess {
                     await onSuccess(distillRequest, early, savingsThreadID)
                 }
@@ -1775,16 +1863,34 @@ public final class DistillHTTPServer: @unchecked Sendable {
                         // WHY: previously this path looked like saved_tokens=0 with no
                         // signal that the scheduler had already found a reduction. Emit
                         // a delivered=0 forfeit row + denial audit so operators see it.
-                        await emitForfeitedCompression(
-                            request: distillRequest,
-                            compressed: compressed,
-                            threadID: savingsThreadID
-                        )
+                        if !deferDeliveryConfirmation {
+                            await emitForfeitedCompression(
+                                request: distillRequest,
+                                compressed: compressed,
+                                threadID: savingsThreadID
+                            )
+                        }
                     }
                 }
             }
             if distillRequest.mode == .commandOutput, response.output != distillRequest.input {
                 await metrics.recordToolOutputCompressed()
+            }
+            if deferDeliveryConfirmation {
+                guard distillRequest.recordSavings != true,
+                      response.output != distillRequest.input,
+                      response.routeStage != .verbatim,
+                      let deferred = deferredPhaseOneResponse(
+                        request: distillRequest,
+                        response: response,
+                        headers: request.headers
+                      ) else {
+                    send(status: 409, body: ErrorBody(error: "deferred_delivery_not_authorized", message: "delivery identity is incomplete"), connection: connection)
+                    return
+                }
+                await metrics.recordSuccess()
+                send(status: 200, body: deferred, connection: connection)
+                return
             }
             if let onSuccess {
                 await onSuccess(distillRequest, response, savingsThreadID)
@@ -1807,6 +1913,334 @@ public final class DistillHTTPServer: @unchecked Sendable {
             await metrics.recordFailure()
             send(status: 400, body: ErrorBody(error: "bad_request", message: "invalid distill request"), connection: connection)
         }
+    }
+
+    private func deferredIdentity(
+        request: DistillRequest,
+        headers: [String: String],
+        operationIDOverride: String? = nil
+    ) -> DistillDeferredDeliveryAuthority.Identity? {
+        let provider = (request.provider ?? headers["x-remotecode-provider"] ?? "unknown")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let invocationID = (headers["x-remotecode-invocation-id"] ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let operationID = (operationIDOverride ?? request.deferredOperationID ?? headers["x-remotecode-operation-id"] ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let family = (request.producerFamily ?? headers["x-remotecode-producer-family"] ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let headerProvider = headers["x-remotecode-provider"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           !headerProvider.isEmpty, Data(headerProvider.utf8) != Data(provider.utf8) { return nil }
+        if let bodyFamily = request.producerFamily,
+           let headerFamily = headers["x-remotecode-producer-family"],
+           Data(bodyFamily.utf8) != Data(headerFamily.utf8) { return nil }
+        let rootRunID = headers["x-remotecode-root-run-id"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let attemptID = headers["x-remotecode-attempt-id"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let identity = DistillDeferredDeliveryAuthority.Identity(
+            provider: provider.isEmpty ? "unknown" : provider,
+            threadID: TokenSaverRecoveryRequestContext.savingsThreadID(headers: headers),
+            rootRunID: rootRunID?.isEmpty == false ? rootRunID : nil,
+            attemptID: attemptID?.isEmpty == false ? attemptID : nil,
+            invocationID: invocationID,
+            operationID: operationID,
+            producerFamily: family
+        )
+        return identity.isComplete ? identity : nil
+    }
+
+    private func deferredPhaseOneResponse(
+        request: DistillRequest,
+        response: DistillResponse,
+        headers: [String: String]
+    ) -> DistillResponse? {
+        if request.deferredChunk != nil {
+            let headerOperation = headers["x-remotecode-operation-id"]
+            let bodyOperationMatches = request.deferredOperationID.map {
+                Data($0.utf8) == Data((headerOperation ?? "").utf8)
+            } ?? true
+            guard let bodyFamily = request.producerFamily,
+                  let headerFamily = headers["x-remotecode-producer-family"],
+                  Data(bodyFamily.utf8) == Data("managed-cli-chunks".utf8),
+                  Data(headerFamily.utf8) == Data("managed-cli-chunks".utf8),
+                  headerOperation != nil,
+                  bodyOperationMatches else { return nil }
+        }
+        guard let identity = deferredIdentity(request: request, headers: headers) else { return nil }
+        if request.deferredChunk != nil,
+           Data(identity.producerFamily.utf8) != Data("managed-cli-chunks".utf8) { return nil }
+        let confirmations = DistillDeferredDelivery.recoveryConfirmations(response)
+        let accountingOutput = response.output
+        guard let prefix = DistillDeferredDelivery.providerVisiblePrefix(
+            accountingOutput: accountingOutput,
+            recoveryConfirmations: confirmations
+        ) else { return nil }
+        guard response.routeStage != nil else { return nil }
+        let token = deferredDeliveryAuthority.issue(
+            identity: identity,
+            original: request.input,
+            accountingOutput: accountingOutput,
+            recoveryConfirmations: confirmations,
+            providerVisiblePrefix: prefix,
+            routeStage: response.routeStage,
+            chunk: request.deferredChunk,
+            question: request.deferredChunk == nil ? nil : request.question
+        )
+        guard let token else { return nil }
+        return response.withDeferredDelivery(
+            token: request.deferredChunk == nil ? token : nil,
+            memberToken: request.deferredChunk == nil ? nil : token,
+            accountingOutput: accountingOutput,
+            providerVisiblePrefix: prefix
+        )
+    }
+
+    private func handleDeferredAggregateIssuance(
+        _ request: DistillRequest,
+        members: [DistillDeferredMemberManifest],
+        headers: [String: String],
+        connection: NWConnection
+    ) async {
+        guard request.recordSavings != true,
+              request.precomputedOutput == nil,
+              !members.isEmpty,
+              let count = members.first?.descriptor.count,
+              count == members.count,
+              let aggregateOperation = members.first?.descriptor.aggregateOperationID else {
+            send(status: 409, body: ErrorBody(error: "deferred_aggregate_invalid", message: "aggregate identity or count is invalid"), connection: connection)
+            return
+        }
+        let bodyOperationMatches = request.deferredOperationID.map {
+            Data($0.utf8) == Data(aggregateOperation.utf8)
+        } ?? true
+        let headerFamily = headers["x-remotecode-producer-family"]
+        let bodyFamilyMatches = request.producerFamily.map {
+            Data($0.utf8) == Data((headerFamily ?? "").utf8)
+        } ?? true
+        guard bodyOperationMatches,
+              let headerOperation = headers["x-remotecode-operation-id"],
+              Data(headerOperation.utf8) == Data(aggregateOperation.utf8),
+              let headerFamily,
+              Data(headerFamily.utf8) == Data("managed-cli-chunks".utf8),
+              bodyFamilyMatches,
+              let identity = deferredIdentity(
+                request: request,
+                headers: headers,
+                operationIDOverride: aggregateOperation
+              ) else {
+            send(status: 409, body: ErrorBody(error: "deferred_aggregate_invalid", message: "aggregate identity or count is invalid"), connection: connection)
+            return
+        }
+        let originalBytes = Data(request.input.utf8)
+        var expectedOffset = 0
+        var accounting: [String] = []
+        var confirmations: [DistillRecoveryDeliveryConfirmation] = []
+        var stages: [TokenSaverRouteStage] = []
+        for (expectedIndex, member) in members.enumerated() {
+            let descriptor = member.descriptor
+            guard descriptor.index == expectedIndex,
+                  descriptor.count == count,
+                  Data(descriptor.aggregateOperationID.utf8) == Data(aggregateOperation.utf8),
+                  descriptor.originalUTF8ByteOffset == expectedOffset,
+                  descriptor.originalUTF8ByteLength >= 0,
+                  expectedOffset <= originalBytes.count,
+                  descriptor.originalUTF8ByteLength <= originalBytes.count - expectedOffset else {
+                send(status: 409, body: ErrorBody(error: "deferred_aggregate_invalid", message: "member ordering or slice is invalid"), connection: connection)
+                return
+            }
+            let end = expectedOffset + descriptor.originalUTF8ByteLength
+            let slice = originalBytes.subdata(in: expectedOffset..<end)
+            let memberIdentity = DistillDeferredDeliveryAuthority.Identity(
+                provider: identity.provider,
+                threadID: identity.threadID,
+                rootRunID: identity.rootRunID,
+                attemptID: identity.attemptID,
+                invocationID: "\(identity.invocationID).member.\(expectedIndex)",
+                operationID: "\(aggregateOperation).member.\(expectedIndex)",
+                producerFamily: identity.producerFamily
+            )
+            guard let originalSlice = String(data: slice, encoding: .utf8),
+                  let prefix = DistillDeferredDelivery.providerVisiblePrefix(
+                    accountingOutput: member.accountingOutput,
+                    recoveryConfirmations: member.recoveryConfirmations
+                  ),
+                  deferredDeliveryAuthority.verify(
+                    token: member.memberToken,
+                    identity: memberIdentity,
+                    original: originalSlice,
+                    accountingOutput: member.accountingOutput,
+                    recoveryConfirmations: member.recoveryConfirmations,
+                    providerVisiblePrefix: prefix,
+                    routeStage: member.routeStage,
+                    expectedChunk: descriptor,
+                    question: member.question
+                  ) != nil else {
+                send(status: 409, body: ErrorBody(error: "deferred_aggregate_invalid", message: "member attestation is invalid"), connection: connection)
+                return
+            }
+            expectedOffset = end
+            accounting.append(member.accountingOutput)
+            confirmations.append(contentsOf: member.recoveryConfirmations)
+            if let stage = member.routeStage { stages.append(stage) }
+        }
+        guard expectedOffset == originalBytes.count else {
+            send(status: 409, body: ErrorBody(error: "deferred_aggregate_invalid", message: "member slices do not cover original"), connection: connection)
+            return
+        }
+        let accountingOutput = accounting.joined(separator: "\n\n")
+        let stage = Self.aggregateRouteStage(stages)
+        guard let prefix = DistillDeferredDelivery.providerVisiblePrefix(
+            accountingOutput: accountingOutput,
+            recoveryConfirmations: confirmations
+        ), let token = deferredDeliveryAuthority.issue(
+            identity: identity,
+            original: request.input,
+            accountingOutput: accountingOutput,
+            recoveryConfirmations: confirmations,
+            providerVisiblePrefix: prefix,
+            routeStage: stage
+        ) else {
+            send(status: 409, body: ErrorBody(error: "deferred_aggregate_invalid", message: "aggregate token could not be issued"), connection: connection)
+            return
+        }
+        let response = DistillResponse(
+            requestID: DeferredDeliveryIdempotency.requestID(for: identity),
+            output: accountingOutput,
+            inputCharacters: request.input.count,
+            inputTokens: TokenEstimator.estimate(request.input),
+            outputTokens: TokenEstimator.estimate(accountingOutput),
+            runMode: .optimize,
+            routeStage: stage,
+            deferredDeliveryToken: token,
+            accountingOutput: accountingOutput,
+            providerVisiblePrefix: prefix
+        )
+        await metrics.recordSuccess()
+        send(status: 200, body: response, connection: connection)
+    }
+
+    private func handleDeferredDeliveryFinal(
+        _ request: DistillRequest,
+        headers: [String: String],
+        savingsThreadID: String,
+        connection: NWConnection
+    ) async {
+        let confirmations = request.precomputedRecoveryConfirmations ?? []
+        let handoffDeadline = DistillDeferredDelivery.handoffDeadline(headers: headers)
+        guard DistillDeferredDelivery.isHandoffDeadlineValid(
+                handoffDeadline,
+                now: deferredDeliveryClock()
+              ),
+              let token = request.deferredDeliveryToken,
+              let accountingOutput = request.accountingOutput,
+              let deliveredOutput = request.deliveredOutput,
+              let routeStage = request.precomputedRouteStage,
+              let identity = deferredIdentity(request: request, headers: headers),
+              let prefix = DistillDeferredDelivery.providerVisiblePrefix(
+                accountingOutput: accountingOutput,
+                recoveryConfirmations: confirmations
+              ),
+              deferredDeliveryAuthority.verify(
+                token: token,
+                identity: identity,
+                original: request.input,
+                accountingOutput: accountingOutput,
+                recoveryConfirmations: confirmations,
+                providerVisiblePrefix: prefix,
+                routeStage: routeStage
+              ) != nil,
+              Self.validateDeferredDeliveredOutput(
+                deliveredOutput,
+                prefix: prefix,
+                rootRunID: identity.rootRunID,
+                receiptKey: deliveryReceiptKeyProvider().flatMap { $0.count == 32 ? $0 : nil }
+              ) else {
+            send(status: 409, body: ErrorBody(error: "deferred_delivery_rejected", message: "delivery proof is invalid or expired"), connection: connection)
+            return
+        }
+        if !confirmations.isEmpty {
+            guard DistillDeferredDelivery.isHandoffDeadlineValid(
+                    handoffDeadline,
+                    now: deferredDeliveryClock()
+                  ),
+                  let scopedRecoveryStore,
+                  let context = recoveryContext(headers: headers, requiresOperationID: false),
+                  (try? scopedRecoveryStore.markDeliveredBatch(
+                    confirmations: confirmations,
+                    context: context,
+                    outcome: .sentUnknown
+                  )) == true else {
+                send(status: 409, body: ErrorBody(error: "recovery_delivery_confirmation_failed", message: "scoped recovery confirmation was not recorded"), connection: connection)
+                return
+            }
+        }
+        let response = DistillResponse(
+            requestID: DeferredDeliveryIdempotency.requestID(for: identity),
+            output: accountingOutput,
+            inputCharacters: request.input.count,
+            inputTokens: TokenEstimator.estimate(request.input),
+            outputTokens: TokenEstimator.estimate(accountingOutput),
+            runMode: .optimize,
+            routeStage: routeStage
+        )
+        let persistedRequest = DistillRequest(
+            id: response.requestID,
+            mode: request.mode,
+            priority: request.priority,
+            input: request.input,
+            question: request.question,
+            provider: identity.provider,
+            recordSavings: true,
+            runMode: request.effectiveRunMode,
+            cacheState: request.cacheState,
+            rerankQuery: request.rerankQuery,
+            topK: request.topK,
+            encoderLane: request.encoderLane,
+            maxOutputCharacters: request.maxOutputCharacters,
+            reversibleStoreMinBytes: request.reversibleStoreMinBytes
+        )
+        guard DistillDeferredDelivery.isHandoffDeadlineValid(
+            handoffDeadline,
+            now: deferredDeliveryClock()
+        ) else {
+            send(status: 409, body: ErrorBody(error: "deferred_delivery_expired", message: "delivery handoff deadline elapsed"), connection: connection)
+            return
+        }
+        if let onSuccess { await onSuccess(persistedRequest, response, savingsThreadID) }
+        await metrics.recordSuccess()
+        send(status: 200, body: response, connection: connection)
+    }
+
+    static func validateDeferredDeliveredOutput(
+        _ delivered: String,
+        prefix: String,
+        rootRunID: String?,
+        receiptKey: Data?
+    ) -> Bool {
+        let deliveredBytes = Data(delivered.utf8)
+        let prefixBytes = Data(prefix.utf8)
+        guard let rootRunID, !rootRunID.isEmpty, let receiptKey,
+              !delivered.contains("\r"), deliveredBytes.starts(with: prefixBytes) else { return false }
+        let suffix = deliveredBytes.dropFirst(prefixBytes.count)
+        guard let marker = DistillAppliedReceipt.parseTrailingV2Marker(in: Data(suffix)),
+              marker.markerByteRange.lowerBound == 0,
+              marker.terminalSuffixByteCount == 1,
+              marker.markerByteRange.upperBound + marker.terminalSuffixByteCount == suffix.count,
+              DistillAppliedReceipt.verify(
+                marker,
+                rootRunID: rootRunID,
+                payloadByteCount: prefixBytes.count,
+                payloadSHA256: Data(SHA256.hash(data: prefixBytes)),
+                key: receiptKey
+              ) else { return false }
+        return true
+    }
+
+    private static func aggregateRouteStage(_ stages: [TokenSaverRouteStage]) -> TokenSaverRouteStage? {
+        if stages.contains(.apiExternal) { return .apiExternal }
+        if stages.contains(.llmMLX) { return .llmMLX }
+        if stages.contains(.encoderBERT) { return .encoderBERT }
+        if stages.contains(.deterministic) { return .deterministic }
+        return nil
     }
 
     private func denyDistill(connection: NWConnection) {

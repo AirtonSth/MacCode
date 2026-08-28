@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import Darwin
 import CoreModel
 @testable import AgentRuntime
 @testable import DistillCore
@@ -9,6 +10,66 @@ import CoreModel
 /// managed_path, tool-output policy, Claude-only PostToolUse). Conversation
 /// wire admission is per-turn and therefore deliberately absent here.
 final class TokenSaverCrossProviderMatrixTests: XCTestCase {
+    private actor HTTPRequestProbe {
+        struct Entry: Sendable {
+            let body: DistillRequest
+            let handoffDeadlineHeader: String?
+        }
+
+        private var requests: [Entry] = []
+
+        func append(_ request: URLRequest, body: DistillRequest) {
+            requests.append(Entry(
+                body: body,
+                handoffDeadlineHeader: request.value(
+                    forHTTPHeaderField: DistillDeferredDelivery.handoffDeadlineHeader
+                )
+            ))
+        }
+
+        func snapshot() -> [Entry] {
+            requests
+        }
+    }
+
+    private actor DeliveryProbe {
+        struct Entry: Sendable {
+            let provider: String?
+            let threadID: String
+            let recordSavings: Bool
+            let savedTokens: Int
+        }
+
+        private var entries: [Entry] = []
+
+        func append(request: DistillRequest, response: DistillResponse, threadID: String) {
+            entries.append(Entry(
+                provider: request.provider,
+                threadID: threadID,
+                recordSavings: request.recordSavings == true,
+                savedTokens: DistillSavingsCalculator.record(
+                    for: request,
+                    response: response,
+                    threadID: threadID
+                )?.savedTokens ?? 0
+            ))
+        }
+
+        func snapshot() -> [Entry] {
+            entries
+        }
+    }
+
+    private struct MatrixRuntime: DistillRuntime {
+        func distill(_ request: DistillRequest) async throws -> String {
+            "PASS\n"
+        }
+
+        func distillStaged(_ request: DistillRequest) async throws -> DistillStageResult {
+            DistillStageResult(output: "PASS\n", stage: .deterministic)
+        }
+    }
+
     private let threadID = "10000000-0000-0000-0000-000000000011"
     private let workspaceID = "20000000-0000-0000-0000-000000000012"
     private let projectID = "30000000-0000-0000-0000-000000000013"
@@ -467,9 +528,10 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             ],
             environment: env
         )
-        XCTAssertEqual(args[2], "developer_instructions=\"SHADOWED\"")
-        XCTAssertTrue(args[3].hasPrefix("--config=developer_instructions=\"EFFECTIVE\\n\\n"))
-        XCTAssertTrue(args[3].contains("TOKEN_SAVER_SAFETY_ABI_V1"))
+        XCTAssertTrue(args.contains("developer_instructions=\"SHADOWED\""))
+        let effective = args.last { $0.hasPrefix("--config=developer_instructions=") }
+        XCTAssertTrue(effective?.hasPrefix("--config=developer_instructions=\"EFFECTIVE\\n\\n") == true)
+        XCTAssertTrue(effective?.contains("TOKEN_SAVER_SAFETY_ABI_V1") == true)
         XCTAssertEqual(
             AgentSkillInstaller.providerProxyArguments(
                 provider: .codex,
@@ -495,12 +557,13 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             environment: env
         )
 
+        let effective = args.last { $0.hasPrefix("--config=developer_instructions=") }
         XCTAssertTrue(
-            args[1].hasPrefix(#"--config=developer_instructions="""KEEP_CALLER\n\n"#),
+            effective?.hasPrefix(#"--config=developer_instructions="""KEEP_CALLER\n\n"#) == true,
             "the existing triple-quoted value must remain the effective prefix"
         )
-        XCTAssertTrue(args[1].hasSuffix(#""""#), "the TOML multiline delimiter must remain balanced")
-        XCTAssertTrue(args[1].contains("TOKEN_SAVER_SAFETY_ABI_V1"))
+        XCTAssertTrue(effective?.hasSuffix(#""""#) == true, "the TOML multiline delimiter must remain balanced")
+        XCTAssertTrue(effective?.contains("TOKEN_SAVER_SAFETY_ABI_V1") == true)
     }
 
     func test_providerProxyArguments_nestedCodexMergesLiteralAndSpacedDeveloperInstructions() {
@@ -515,10 +578,10 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
                 arguments: ["exec", "-c", override, "do work"],
                 environment: env
             )
-            XCTAssertEqual(args.filter { $0 == "-c" }.count, 1,
-                           "the effective caller override must be merged in place")
-            XCTAssertTrue(args[2].hasPrefix("developer_instructions=\"KEEP_"))
-            XCTAssertTrue(args[2].contains("TOKEN_SAVER_SAFETY_ABI_V1"), override)
+            let merged = args.last { $0.hasPrefix("developer_instructions=") }
+            XCTAssertNotNil(merged, "the effective caller override must be merged in place")
+            XCTAssertTrue(merged?.hasPrefix("developer_instructions=\"KEEP_") == true)
+            XCTAssertTrue(merged?.contains("TOKEN_SAVER_SAFETY_ABI_V1") == true, override)
             XCTAssertEqual(
                 AgentSkillInstaller.providerProxyArguments(
                     provider: .codex,
@@ -545,10 +608,11 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             arguments: original,
             environment: env
         )
-        XCTAssertTrue(args[2].hasPrefix("developer_instructions=\"KEEP_CALLER\\n\\n"))
-        XCTAssertTrue(args[2].contains("MANDATORY default-pipe:"),
+        let merged = args.last { $0.hasPrefix("developer_instructions=") }
+        XCTAssertTrue(merged?.hasPrefix("developer_instructions=\"KEEP_CALLER\\n\\n") == true)
+        XCTAssertTrue(merged?.contains("MANDATORY default-pipe:") == true,
                       "a marker in a TOML comment must not bypass the semantic Distill prompt")
-        XCTAssertTrue(args[2].hasSuffix("# \(comment)"),
+        XCTAssertTrue(merged?.hasSuffix("# \(comment)") == true,
                       "merging the semantic value must preserve the caller's trailing comment")
         XCTAssertEqual(
             AgentSkillInstaller.providerProxyArguments(
@@ -670,6 +734,286 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
                 }
             }
         }
+    }
+
+    func test_realProviderPartitions_useHTTPAuthorityAndRecordOnlyAfterGuardedHandoff() async throws {
+        // WHY: environment and argv assertions alone cannot prove that primary,
+        // same-provider, and cross-provider Bot runs actually complete the shared
+        // two-phase delivery protocol. Exercise all partitions without paid CLIs.
+        struct Partition {
+            let parent: AgentProvider?
+            let child: AgentProvider
+
+            var label: String {
+                parent.map { "\($0.rawValue)-to-\(child.rawValue)" }
+                    ?? "primary-\(child.rawValue)"
+            }
+        }
+
+        let partitions = providers.map { Partition(parent: nil, child: $0) }
+            + providers.map { Partition(parent: $0, child: $0) }
+            + providers.flatMap { parent in
+                providers.compactMap { child in
+                    parent == child ? nil : Partition(parent: parent, child: child)
+                }
+            }
+        XCTAssertEqual(partitions.count, 12)
+
+        let support = FileManager.default.temporaryDirectory
+            .appendingPathComponent("provider-matrix-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: support) }
+
+        let deliveryProbe = DeliveryProbe()
+        let receiptKey = Data((0..<32).map(UInt8.init))
+        let server = DistillHTTPServer(
+            configuration: try DistillServiceConfiguration(
+                authToken: "synthetic-matrix-token",
+                appSupportDirectory: support.path,
+                maxConcurrentRequests: 2
+            ),
+            scheduler: DistillScheduler(runtime: MatrixRuntime(), maxConcurrentRequests: 2),
+            onSuccess: { request, response, threadID in
+                await deliveryProbe.append(request: request, response: response, threadID: threadID)
+            },
+            deliveryReceiptKey: receiptKey
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let session = URLSession(configuration: .ephemeral)
+        let transportProbe = HTTPRequestProbe()
+        let transport: ManagedDistillCLI.Transport = { request in
+            if let body = request.httpBody,
+               let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
+                await transportProbe.append(request, body: decoded)
+            }
+            do {
+                let (data, response) = try await session.data(for: request)
+                return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+            } catch {
+                return nil
+            }
+        }
+        let input = Data(String(repeating: "build passed with repeated synthetic diagnostics only\n", count: 72).utf8)
+
+        for (index, partition) in partitions.enumerated() {
+            let receipt: TokenSaverExecutionReceipt
+            if let parent = partition.parent {
+                receipt = TokenSaverExecutionReceiptSeam.reAdmitSidecarIfAvailable(
+                    receipt: admit(parent),
+                    sidecarAvailable: true,
+                    provider: partition.child,
+                    waveLive: "wave-a"
+                )
+            } else {
+                receipt = admit(partition.child)
+            }
+            XCTAssertEqual(receipt.capabilities.distill, true, partition.label)
+            XCTAssertEqual(receipt.capabilities.managedPath, true, partition.label)
+
+            let thread = "matrix-child-\(index)"
+            let beforeRequests = await transportProbe.snapshot().count
+            let beforeDeliveries = await deliveryProbe.snapshot().count
+            let cli = ManagedDistillCLI(
+                arguments: ["Return the build verdict only."],
+                stdin: input,
+                state: .init(
+                    baseURL: ready.baseURL,
+                    authToken: "synthetic-matrix-token",
+                    receiptKey: receiptKey
+                ),
+                rootRunID: rootRunID,
+                provider: partition.child.rawValue,
+                recoveryContext: .init(
+                    workspaceID: workspaceID,
+                    projectID: projectID,
+                    threadID: thread,
+                    provider: partition.child.rawValue,
+                    attemptID: "\(attemptID)-\(index)",
+                    operationID: ""
+                ),
+                invocationID: "matrix-invocation-\(index)",
+                reversibleStoreMinBytes: 1_000_000,
+                distillAdmission: { true },
+                transport: transport
+            )
+
+            let result = await cli.runResult()
+            XCTAssertEqual(result.exitCode, 0, partition.label)
+            XCTAssertNotEqual(result.stdout, input, partition.label)
+            XCTAssertLessThan(result.stdout.count, input.count, partition.label)
+            XCTAssertTrue(
+                DistillAppliedReceipt.containsMarker(String(decoding: result.stdout, as: UTF8.self)),
+                "\(partition.label) must receive one authenticated applied receipt"
+            )
+            let deliveriesAfterPhaseOne = await deliveryProbe.snapshot()
+            XCTAssertEqual(deliveriesAfterPhaseOne.count, beforeDeliveries,
+                           "\(partition.label) phase one must not record")
+
+            let delivered = try guardedDelivery(result.stdout, sideEffect: result.deferredSideEffect)
+            XCTAssertEqual(delivered, result.stdout, partition.label)
+            if let sideEffect = result.deferredSideEffect {
+                await sideEffect()
+            } else {
+                XCTFail("\(partition.label) must expose the post-handoff final POST")
+            }
+
+            let requests = await transportProbe.snapshot()
+            XCTAssertEqual(requests.count, beforeRequests + 2, partition.label)
+            let initial = requests[beforeRequests]
+            let final = requests[beforeRequests + 1]
+            XCTAssertEqual(initial.body.recordSavings, false, partition.label)
+            XCTAssertNil(initial.body.deferredDeliveryToken, partition.label)
+            XCTAssertNil(initial.handoffDeadlineHeader,
+                         "\(partition.label) phase one is not a handoff")
+            XCTAssertEqual(final.body.recordSavings, true, partition.label)
+            XCTAssertNotNil(final.body.deferredDeliveryToken, partition.label)
+            XCTAssertNil(final.body.deferredHandoffDeadlineUnixMilliseconds,
+                         "\(partition.label) deadline authority must not fall back to JSON")
+            XCTAssertNotNil(UInt64(final.handoffDeadlineHeader ?? ""),
+                            "\(partition.label) final POST needs an absolute handoff header")
+            let accountingOutput = try XCTUnwrap(
+                final.body.accountingOutput,
+                partition.label
+            )
+            XCTAssertFalse(accountingOutput.isEmpty, partition.label)
+            XCTAssertLessThan(accountingOutput.utf8.count, input.count, partition.label)
+            XCTAssertFalse(
+                final.body.accountingOutput?.contains("[[rc") == true,
+                "\(partition.label) accounting bytes must exclude recovery/applied markers"
+            )
+
+            let entries = await deliveryProbe.snapshot()
+            XCTAssertEqual(entries.count, beforeDeliveries + 1, partition.label)
+            let entry = try XCTUnwrap(entries.last)
+            XCTAssertEqual(entry.provider, partition.child.rawValue, partition.label)
+            XCTAssertEqual(entry.threadID, thread, partition.label)
+            XCTAssertTrue(entry.recordSavings, partition.label)
+            XCTAssertGreaterThan(entry.savedTokens, 0, partition.label)
+        }
+    }
+
+    func test_nestedClaudePostToolUse_realHTTPRecordsAfterHookJSONHandoff() async throws {
+        // WHY: Claude is the sole provider whose native PostToolUse hook can
+        // replace tool output. Prove that real hook JSON reaches the same HMAC
+        // phase-two path, and that no event occurs before its stdout handoff.
+        let support = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-post-tool-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: support) }
+
+        let deliveryProbe = DeliveryProbe()
+        let receiptKey = Data(repeating: 0x2a, count: 32)
+        let server = DistillHTTPServer(
+            configuration: try DistillServiceConfiguration(
+                authToken: "synthetic-claude-token",
+                appSupportDirectory: support.path
+            ),
+            scheduler: DistillScheduler(runtime: MatrixRuntime(), maxConcurrentRequests: 1),
+            onSuccess: { request, response, threadID in
+                await deliveryProbe.append(request: request, response: response, threadID: threadID)
+            },
+            deliveryReceiptKey: receiptKey
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let session = URLSession(configuration: .ephemeral)
+        let transportProbe = HTTPRequestProbe()
+        let transport: ManagedDistillCLI.Transport = { request in
+            if let body = request.httpBody,
+               let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
+                await transportProbe.append(request, body: decoded)
+            }
+            do {
+                let (data, response) = try await session.data(for: request)
+                return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+            } catch {
+                return nil
+            }
+        }
+        let rawOutput = String(repeating: "fetched synthetic documentation line with repeated boilerplate\n", count: 72)
+        let envelope = try JSONSerialization.data(withJSONObject: [
+            "hook_event_name": "PostToolUse",
+            "tool_name": "WebFetch",
+            "tool_input": ["url": "https://example.invalid/synthetic"],
+            "tool_response": rawOutput,
+        ])
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use"],
+            stdin: envelope,
+            state: .init(
+                baseURL: ready.baseURL,
+                authToken: "synthetic-claude-token",
+                receiptKey: receiptKey
+            ),
+            rootRunID: rootRunID,
+            provider: AgentProvider.claude.rawValue,
+            recoveryContext: .init(
+                workspaceID: workspaceID,
+                projectID: projectID,
+                threadID: "claude-child-thread",
+                provider: AgentProvider.claude.rawValue,
+                attemptID: attemptID,
+                operationID: ""
+            ),
+            invocationID: "claude-post-tool-invocation",
+            reversibleStoreMinBytes: 1_000_000,
+            distillAdmission: { true },
+            transport: transport
+        )
+
+        let result = await cli.runResult()
+        XCTAssertEqual(result.exitCode, 0)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: result.stdout) as? [String: Any]
+        )
+        let hook = try XCTUnwrap(object["hookSpecificOutput"] as? [String: Any])
+        let updated = try XCTUnwrap(hook["updatedToolOutput"] as? String)
+        XCTAssertTrue(DistillAppliedReceipt.containsMarker(updated))
+        XCTAssertLessThan(updated.utf8.count, rawOutput.utf8.count)
+        let deliveriesBeforeHandoff = await deliveryProbe.snapshot()
+        XCTAssertEqual(deliveriesBeforeHandoff.count, 0,
+                       "hook construction alone is not an observable provider handoff")
+
+        _ = try guardedDelivery(result.stdout, sideEffect: result.deferredSideEffect)
+        let sideEffect = try XCTUnwrap(result.deferredSideEffect)
+        await sideEffect()
+
+        let entries = await deliveryProbe.snapshot()
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(entries[0].provider, AgentProvider.claude.rawValue)
+        XCTAssertEqual(entries[0].threadID, "claude-child-thread")
+        XCTAssertGreaterThan(entries[0].savedTokens, 0)
+        let requests = await transportProbe.snapshot()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertNil(requests[0].handoffDeadlineHeader)
+        XCTAssertEqual(requests[1].body.recordSavings, true)
+        XCTAssertNil(requests[1].body.deferredHandoffDeadlineUnixMilliseconds)
+        XCTAssertNotNil(UInt64(requests[1].handoffDeadlineHeader ?? ""),
+                        "Claude final POST binds its deadline only after hook JSON handoff")
+    }
+
+    private func guardedDelivery(
+        _ data: Data,
+        sideEffect: (@Sendable () async -> Void)?
+    ) throws -> Data {
+        var descriptors: [Int32] = [0, 0]
+        guard Darwin.pipe(&descriptors) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        let readDescriptor = descriptors[0]
+        let writeDescriptor = descriptors[1]
+        defer { Darwin.close(readDescriptor) }
+        let delivered = GuardedStdoutWrite.deliveredValue(
+            sideEffect,
+            afterWriting: data,
+            to: writeDescriptor
+        )
+        Darwin.close(writeDescriptor)
+        XCTAssertNotNil(delivered, "the final POST may proceed only after all bytes were written")
+        return FileHandle(fileDescriptor: readDescriptor, closeOnDealloc: false).readDataToEndOfFile()
     }
 
     func test_wrapPolicy_noAllowlist_compressesGhApiAndMutatingStdoutForAllProviders() {
