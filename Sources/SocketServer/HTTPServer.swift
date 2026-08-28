@@ -814,6 +814,10 @@ private final class SocketReadyOnceFlag: @unchecked Sendable {
 final class WebSocketLivenessState: @unchecked Sendable {
     enum Action: Equatable {
         case none
+        /// Send the application heartbeat without an RFC control ping. Recent
+        /// inbound traffic proves the peer can still write, but it does not
+        /// prove the peer's application-frame receive pipeline is advancing.
+        case heartbeat(Data)
         case ping(Data)
         case timedOut
     }
@@ -823,7 +827,7 @@ final class WebSocketLivenessState: @unchecked Sendable {
     private let timeout: TimeInterval
     private let nonce: @Sendable () -> Data
     private var lastProofAt: TimeInterval
-    private var lastPingAt: TimeInterval
+    private var lastHeartbeatAt: TimeInterval
     private var outstandingPing: Data?
 
     init(
@@ -836,21 +840,26 @@ final class WebSocketLivenessState: @unchecked Sendable {
         self.timeout = timeout
         self.nonce = nonce
         self.lastProofAt = now
-        self.lastPingAt = now
+        self.lastHeartbeatAt = now
     }
 
     func nextAction(now: TimeInterval) -> Action {
         lock.lock(); defer { lock.unlock() }
         if now - lastProofAt >= timeout { return .timedOut }
         // Real inbound traffic (or a recent pong) is liveness: do not emit a
-        // spurious RFC ping while the peer is already proving the path.
+        // spurious RFC ping while the peer is already proving the path. Keep
+        // the application heartbeat cadence independent, though: an RFC ping
+        // from the peer must not suppress the useful frame its receive loop
+        // relies on for the negotiated heartbeat deadline.
         guard outstandingPing == nil,
-              now - lastProofAt >= interval,
-              now - lastPingAt >= interval else { return .none }
+              now - lastHeartbeatAt >= interval else { return .none }
         let payload = nonce().prefix(125)
         let ping = Data(payload)
+        lastHeartbeatAt = now
+        guard now - lastProofAt >= interval else {
+            return .heartbeat(ping)
+        }
         outstandingPing = ping
-        lastPingAt = now
         return .ping(ping)
     }
 
@@ -862,8 +871,8 @@ final class WebSocketLivenessState: @unchecked Sendable {
         if outstandingPing != nil {
             return max(0, timeoutAt - now)
         }
-        let nextPingAt = max(lastProofAt + interval, lastPingAt + interval)
-        return max(0, min(nextPingAt, timeoutAt) - now)
+        let nextHeartbeatAt = lastHeartbeatAt + interval
+        return max(0, min(nextHeartbeatAt, timeoutAt) - now)
     }
 
     @discardableResult
@@ -873,7 +882,7 @@ final class WebSocketLivenessState: @unchecked Sendable {
               payload == outstandingPing else { return false }
         outstandingPing = nil
         lastProofAt = now
-        lastPingAt = now
+        lastHeartbeatAt = now
         return true
     }
 
@@ -883,7 +892,6 @@ final class WebSocketLivenessState: @unchecked Sendable {
     func noteInboundTraffic(now: TimeInterval) {
         lock.lock(); defer { lock.unlock() }
         lastProofAt = now
-        lastPingAt = now
         outstandingPing = nil
     }
 }
@@ -1200,7 +1208,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "p1_unsupported": false
             ],
             "files": [
-                "methods": ["fs.mkdir", "fs.workspace.list", "fs.workspace.read", "fs.workspace.preview_url", "fs.workspace.create_file", "fs.workspace.rename", "fs.workspace.delete", "files.tab.open", "files.tab.split", "files.state.get", "files.state.update", "files.edit.open", "files.edit.apply_patch", "files.edit.save", "files.edit.discard", "files.edit.close"]
+                "methods": ["fs.mkdir", "fs.workspace.list", "fs.workspace.read", "fs.workspace.preview_url", "fs.workspace.create_file", "fs.workspace.rename", "fs.workspace.delete", "files.tab.open", "files.tab.split", "files.state.get", "files.state.update", "files.edit.session", "files.edit.open", "files.edit.apply_patch", "files.edit.save", "files.edit.discard", "files.edit.close"]
             ],
             "git": [
                 "read_only": false,
@@ -2779,6 +2787,17 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 switch liveness.nextAction(now: Date().timeIntervalSinceReferenceDate) {
                 case .none:
                     scheduleHeartbeatWake()
+                case .heartbeat(let payload):
+                    defer { scheduleHeartbeatWake() }
+                    guard let nonce = String(data: payload, encoding: .utf8),
+                          let heartbeatData = self.connectionHeartbeatData(
+                              connectionId: connectionId,
+                              nonce: nonce,
+                              lastReceivedSequence: sequenceWatermark.value
+                          ) else {
+                        return
+                    }
+                    _ = outbound.enqueueControl(opcode: 0x1, data: heartbeatData)
                 case .ping(let payload):
                     defer { scheduleHeartbeatWake() }
                     guard let nonce = String(data: payload, encoding: .utf8),
@@ -2837,7 +2856,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 liveness: liveness,
                 ownerFingerprint: webSocketOwnerFingerprint,
                 subscriberIDBox: subIDBox,
-                initialFilter: wsFilter
+                initialFilter: wsFilter,
+                initialBuffer: leftoverBuffer
             )
             heartbeatTimer.cancel()
             batcher.stop()
@@ -5278,7 +5298,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
         liveness: WebSocketLivenessState,
         ownerFingerprint: String,
         subscriberIDBox: LockedSubscriberID? = nil,
-        initialFilter: EventStreamFilter = .full
+        initialFilter: EventStreamFilter = .full,
+        initialBuffer: Data = Data()
     ) {
         // PERF-009: keep a contiguous [UInt8] buffer with a read offset
         // instead of Data + removeFirst(consumed). removeFirst is O(n) per
@@ -5290,35 +5311,47 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // park on DispatchSourceWrite inside writeAll when the kernel send
         // buffer is full; this loop only owns the read side and must treat
         // EAGAIN as "wait for readable", not peer death.
-        var buf = [UInt8]()
+        // Foundation may coalesce its first masked ping with the HTTP upgrade
+        // in one TCP read. Preserve bytes after CRLFCRLF when ownership moves
+        // from the HTTP parser to the WebSocket frame assembler.
+        var buf = [UInt8](initialBuffer)
         var offset = 0
         var tmp = [UInt8](repeating: 0, count: 4096)
         var liveFilter = initialFilter
+        var shouldRead = buf.isEmpty
+        if !buf.isEmpty {
+            liveness.noteInboundTraffic(now: Date().timeIntervalSinceReferenceDate)
+        }
         // RFC6455 reassembly lives in WebSocketClientFrameAssembler (FIN/
         // continuation, interleaved control, 1 MiB aggregate, UTF-8).
         var assembler = WebSocketClientFrameAssembler()
         while acceptedSockets.isActive(fd) {
-            connectionReadWaitObserverForTesting?(fd, .webSocket)
-            let n = Self.readRetryingInterrupts {
-                Darwin.read(fd, &tmp, tmp.count)
-            }
-            if n > 0 {
-                // continue below
-            } else if n == 0 {
-                return
-            } else {
-                let err = errno
-                if err == EAGAIN || err == EWOULDBLOCK {
-                    if !Self.waitForReadable(fd: fd, timeout: Self.wsSocketReadTimeout) {
-                        return
-                    }
-                    continue
+            if shouldRead {
+                connectionReadWaitObserverForTesting?(fd, .webSocket)
+                let n = Self.readRetryingInterrupts {
+                    Darwin.read(fd, &tmp, tmp.count)
                 }
-                return
+                if n > 0 {
+                    // continue below
+                } else if n == 0 {
+                    return
+                } else {
+                    let err = errno
+                    if err == EAGAIN || err == EWOULDBLOCK {
+                        if !Self.waitForReadable(fd: fd, timeout: Self.wsSocketReadTimeout) {
+                            return
+                        }
+                        continue
+                    }
+                    return
+                }
+                // Any bytes from the peer prove the path is live (C-06 traffic liveness).
+                liveness.noteInboundTraffic(now: Date().timeIntervalSinceReferenceDate)
+                buf.append(contentsOf: tmp[0..<n])
             }
-            // Any bytes from the peer prove the path is live (C-06 traffic liveness).
-            liveness.noteInboundTraffic(now: Date().timeIntervalSinceReferenceDate)
-            buf.append(contentsOf: tmp[0..<n])
+            // After inherited or newly-read bytes are drained, the next outer
+            // iteration reads more. A partial frame also reaches that read.
+            shouldRead = true
             parseFrames: while offset < buf.count {
                 let (event, consumed) = assembler.consume(buf: buf, from: offset)
                 switch event {

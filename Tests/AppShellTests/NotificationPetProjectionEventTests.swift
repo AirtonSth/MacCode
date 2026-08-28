@@ -114,6 +114,60 @@ final class NotificationPetProjectionEventTests: XCTestCase {
         XCTAssertEqual(payload["category"]?.stringValue, PetNotificationCategory.agentAttention.rawValue)
     }
 
+    /// WHY: iOS rehydrates notifications through notification.list after a
+    /// reconnect. The persisted row must expose the same Bot routing tuple as
+    /// the completed mutation readback that produced notification.created.
+    func test_botAttentionNotificationListMatchesCompletedReadback() throws {
+        let directory = NSTemporaryDirectory() + "RC2BotAttentionNotification-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let authority = BotRemoteControlAuthority(
+            db: context.db,
+            store: context.botStore,
+            settings: SettingsStore(db: context.db),
+            appSupportDirectory: context.appSupportDirectory
+        )
+        let profileID = "ios-bot-profile"
+        let hostID = "bot-host"
+        try BotAttentionPushBindingStore(db: context.db).bind(
+            profileID: profileID,
+            hostID: hostID,
+            deviceID: "ios-bot-device"
+        )
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "notification-list-bot",
+            "name": "List Bot",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "notification-list-send",
+            "host_id": hostID,
+            "bot_id": botID,
+            "text": "Finish for iOS",
+        ])
+        let stopped = try authority.dispatch(method: "bot.force_stop", params: [
+            "client_request_id": "notification-list-stop",
+            "host_id": hostID,
+            "bot_id": botID,
+        ])
+        let readback = try XCTUnwrap(stopped["readback"] as? [String: Any])
+        let notification = try XCTUnwrap(readback["notification"] as? [String: Any])
+        let notificationID = try XCTUnwrap(notification["id"] as? String)
+        let listed = try XCTUnwrap(
+            router.notificationList(workspaceId: nil, unreadOnly: false).first {
+                $0["id"]?.stringValue == notificationID
+            }
+        )
+        for key in [
+            "id", "title", "body", "category", "profile_id", "host_id",
+            "attention_item_id", "notification_id", "bot_id", "source",
+        ] {
+            XCTAssertEqual(listed[key]?.stringValue, notification[key] as? String, key)
+        }
+        XCTAssertNil(listed["conversation_id"])
+    }
+
     func test_serverFailureProjectionReopensStableRowAndPublishesSafeRefreshEvents() throws {
         let db = try SQLiteDB(path: ":memory:")
         try Schema.migrate(db)

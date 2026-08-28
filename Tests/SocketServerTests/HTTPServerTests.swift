@@ -961,7 +961,7 @@ final class HTTPServerTests: XCTestCase {
                        "a matching pong resets proof and schedules the next server ping")
     }
 
-    func test_webSocketLiveness_inboundTrafficCountsAsProofAndSuppressesPing() {
+    func test_webSocketLiveness_inboundTrafficCountsAsProofWithoutSuppressingApplicationHeartbeat() {
         let nonce = Data("server-nonce".utf8)
         let state = WebSocketLivenessState(
             now: 0,
@@ -971,14 +971,16 @@ final class HTTPServerTests: XCTestCase {
         )
         XCTAssertEqual(state.nextAction(now: 10), .ping(nonce))
         state.noteInboundTraffic(now: 12)
-        XCTAssertEqual(state.nextAction(now: 21.99), .none,
-                       "real traffic must suppress the next ping until a full interval elapses")
-        XCTAssertEqual(state.nextAction(now: 22), .ping(nonce))
+        XCTAssertEqual(state.nextAction(now: 19.99), .none,
+                       "real traffic must suppress the control ping until the heartbeat interval")
+        XCTAssertEqual(state.nextAction(now: 20), .heartbeat(nonce),
+                       "peer traffic must not suppress the application heartbeat")
         state.noteInboundTraffic(now: 25)
-        // Traffic at t=25 clears outstanding and restarts the interval clock.
-        XCTAssertEqual(state.nextAction(now: 35), .ping(nonce))
-        XCTAssertEqual(state.nextAction(now: 54.99), .none,
-                       "while a ping is outstanding the scheduler waits for proof or timeout")
+        XCTAssertEqual(state.nextAction(now: 30), .heartbeat(nonce),
+                       "each negotiated interval still produces a useful application frame")
+        XCTAssertEqual(state.nextAction(now: 40), .ping(nonce),
+                       "after one full silent interval the host also requests RFC pong proof")
+        XCTAssertEqual(state.nextAction(now: 54.99), .none)
         XCTAssertEqual(state.nextAction(now: 55), .timedOut,
                        "traffic only delays the hard timeout; silence still closes at the deadline")
     }
@@ -1002,6 +1004,17 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertTrue(state.acceptPong(nonce, now: 12))
         XCTAssertEqual(state.nextWakeDelay(now: 12), 10, accuracy: 0.001,
                        "after pong, next wake is interval from proof")
+
+        let inbound = WebSocketLivenessState(
+            now: 0,
+            interval: 10,
+            timeout: 30,
+            nonce: { nonce }
+        )
+        XCTAssertEqual(inbound.nextAction(now: 10), .ping(nonce))
+        inbound.noteInboundTraffic(now: 12)
+        XCTAssertEqual(inbound.nextWakeDelay(now: 12), 8, accuracy: 0.001,
+                       "peer traffic suppresses only the control ping, not the application heartbeat cadence")
     }
 
     func test_connectionOutboundOwner_ordersAcceptedWorkThenTerminalAndRejectsLaterFrames() throws {

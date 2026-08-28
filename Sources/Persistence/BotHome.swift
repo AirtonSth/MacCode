@@ -46,10 +46,25 @@ public struct BotHome: Sendable {
     }
 
     public static func url(appSupportDirectory: URL, botID: BotID, epoch: Int) -> URL {
+        botRootURL(appSupportDirectory: appSupportDirectory, botID: botID)
+            .appendingPathComponent("e\(epoch)", isDirectory: true)
+    }
+
+    public static func botsRootURL(appSupportDirectory: URL) -> URL {
         appSupportDirectory
             .appendingPathComponent("bots", isDirectory: true)
+    }
+
+    public static func botRootURL(appSupportDirectory: URL, botID: BotID) -> URL {
+        botsRootURL(appSupportDirectory: appSupportDirectory)
             .appendingPathComponent(botID.value.uuidString.lowercased(), isDirectory: true)
-            .appendingPathComponent("e\(epoch)", isDirectory: true)
+    }
+
+    public static func wipe(appSupportDirectory: URL, botID: BotID) throws {
+        let botRoot = botRootURL(appSupportDirectory: appSupportDirectory, botID: botID)
+        if FileManager.default.fileExists(atPath: botRoot.path) {
+            try FileManager.default.removeItem(at: botRoot)
+        }
     }
 
     public var identityURL: URL { root.appendingPathComponent(Self.identityName) }

@@ -37,6 +37,28 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         }
     }
 
+    func askBotPeer(
+        callerThread: AgentThreadID,
+        callerRun: AgentRunID,
+        handle: String,
+        prompt: String,
+        replyMode: BotPeerDelegation.ReplyMode,
+        consultationID: UUID?,
+        delegationCapability: String?
+    ) async throws -> JSONValue {
+        throw JSONRPCError.notSupported("Bot delegation")
+    }
+
+    func invokeDelegatedBotSelfConfig(
+        callerThread: AgentThreadID,
+        callerRun: AgentRunID,
+        toolName: String,
+        arguments: [String: JSONValue],
+        delegationCapability: String?
+    ) throws -> JSONValue {
+        throw JSONRPCError.notSupported("delegated Bot settings")
+    }
+
     func createHostBot(
         name: String,
         title: String,
@@ -804,8 +826,16 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         stoppedAgentThreads.append(thread)
     }
     var activeAgentRuns: [AgentThreadID: AgentActiveRunSnapshot] = [:]
+    var activeAgentDelegations: [AgentThreadID: AgentActiveDelegationSnapshot] = [:]
     func activeAgentRun(thread: AgentThreadID) throws -> AgentActiveRunSnapshot? {
         activeAgentRuns[thread]
+    }
+    func activeAgentDelegation(
+        thread: AgentThreadID,
+        run: AgentRunID
+    ) throws -> AgentActiveDelegationSnapshot? {
+        guard activeAgentDelegations[thread]?.runId == run else { return nil }
+        return activeAgentDelegations[thread]
     }
     var continueAgentRunCallCount = 0
     var continuedAgentThreads: [AgentThreadID] = []
@@ -988,6 +1018,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         )
         return .object(["ok": .bool(true), "push_token_type": .string(pushTokenType)])
     }
+    func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws {}
     var settings: [String: String] = [:]
     func settingsGet(keys: [String]) throws -> [String: String] {
         Dictionary(uniqueKeysWithValues: keys.map { ($0, settings[$0] ?? "") })
@@ -1013,6 +1044,12 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func fsWorkspaceCreateFile(workspace: WorkspaceID, path: String, content: String) throws -> JSONValue { try WorkspaceFileService().createFile(root: projectCwd, path: path, content: content) }
     func fsWorkspaceRename(workspace: WorkspaceID, path: String, newName: String) throws -> JSONValue { try WorkspaceFileService().rename(root: projectCwd, path: path, newName: newName) }
     func fsWorkspaceDelete(workspace: WorkspaceID, paths: [String]) throws -> JSONValue { try WorkspaceFileService().delete(root: projectCwd, paths: paths) }
+    func filesEditSession(sessionID: String) throws -> JSONValue {
+        guard let session = FileEditSessionStore.shared.session(sessionID: sessionID) else {
+            throw JSONRPCError(code: -32602, message: "edit session not found")
+        }
+        return session
+    }
     func filesEditOpen(surface: SurfaceID, path: String) throws -> JSONValue { try FileEditSessionStore.shared.open(surfaceID: surface, workspaceID: WorkspaceID(), root: projectCwd, path: path) }
     func filesEditApplyPatch(sessionID: String, baseDraftRevision: Int, rangeLocation: Int, rangeLength: Int, replacement: String, deviceID: String?) throws -> JSONValue {
         try FileEditSessionStore.shared.applyPatch(sessionID: sessionID, baseDraftRevision: baseDraftRevision, rangeLocation: rangeLocation, rangeLength: rangeLength, replacement: replacement, deviceID: deviceID)
@@ -1337,7 +1374,7 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
-    func test_httpBotCreateKeepsClientRequestIdOnPairedRemote() async {
+    func test_localBotCreateKeepsClientRequestIdOnPairedRemote() async {
         let router = FakeRouter()
         router.pairedBotRemoteResult = .object([
             "status": .string("completed"),
@@ -1346,7 +1383,7 @@ final class DispatcherTests: XCTestCase {
             "request_id": .string("e2e"),
         ])
         let d = JSONRPCDispatcher(router: router)
-        let resp = await d.dispatchHTTP(
+        let resp = await d.dispatch(
             JSONRPCRequest(
                 jsonrpc: "2.0",
                 id: .number(1),
@@ -1355,11 +1392,6 @@ final class DispatcherTests: XCTestCase {
                     "client_request_id": .string("e2e"),
                     "name": .string("Piper"),
                 ]
-            ),
-            mutationContext: MutationRequestContext(
-                ownerFingerprint: "owner",
-                hostId: "host",
-                bootEpoch: 1
             )
         )
         XCTAssertNil(resp.error, "paired Bot create must not fall through to methodNotFound")
@@ -1739,6 +1771,76 @@ final class DispatcherTests: XCTestCase {
         ]))
         XCTAssertEqual(deleted.result?.objectValue?["deleted"]?.arrayValue?.compactMap { $0.stringValue }, ["Sources/Renamed.swift"],
                        "bulk delete must delete every selected file through one RPC mutation")
+    }
+
+    @MainActor
+    func test_filesEditSession_routesAuthoritativeLegacyDraftReadback() async throws {
+        // WHY: after an ambiguous patch response, iOS must inspect the existing
+        // host draft instead of replaying the patch or reopening disk content.
+        let directory = NSTemporaryDirectory() + "rc2-disp-edit-session-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        try "before".write(toFile: directory + "/draft.txt", atomically: true, encoding: .utf8)
+        FileEditSessionStore.shared.resetForTests()
+        defer {
+            FileEditSessionStore.shared.resetForTests()
+            try? FileManager.default.removeItem(atPath: directory)
+        }
+
+        let router = FakeRouter()
+        router.projectCwd = directory
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let opened = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "files.edit.open",
+            params: [
+                "surface_id": .string(UUID().uuidString),
+                "path": .string("draft.txt"),
+            ]
+        ))
+        let openedBody = try XCTUnwrap(opened.result?.objectValue)
+        let sessionID = try XCTUnwrap(openedBody["session_id"]?.stringValue)
+        let revision = try XCTUnwrap(openedBody["draft_revision"]?.intValue)
+
+        let patched = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(2),
+            method: "files.edit.apply_patch",
+            params: [
+                "session_id": .string(sessionID),
+                "base_draft_revision": .number(Double(revision)),
+                "range_utf16": .object(["location": .number(6), "length": .number(0)]),
+                "replacement": .string(" after"),
+            ]
+        ))
+        XCTAssertNil(patched.error)
+
+        let readback = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(3),
+            method: "files.edit.session",
+            params: ["session_id": .string(sessionID)]
+        ))
+        XCTAssertNil(readback.error)
+        let readbackBody = try XCTUnwrap(readback.result?.objectValue)
+        XCTAssertEqual(readbackBody["session_id"], .string(sessionID))
+        XCTAssertEqual(readbackBody["content"], .string("before after"))
+        XCTAssertEqual(readbackBody["draft_revision"]?.intValue, revision + 1)
+        XCTAssertEqual(readbackBody["dirty"], .bool(true))
+
+        _ = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(4),
+            method: "files.edit.close",
+            params: ["session_id": .string(sessionID)]
+        ))
+        let missing = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(5),
+            method: "files.edit.session",
+            params: ["session_id": .string(sessionID)]
+        ))
+        XCTAssertEqual(missing.error?.code, -32602, "closed sessions must fail loudly, never return stale content")
     }
 
     @MainActor
@@ -4657,6 +4759,75 @@ final class DispatcherTests: XCTestCase {
         XCTAssertNotNil(result["events"]?.arrayValue?.first?.objectValue?["turnStarted"],
                         "the mirror snapshot must preserve the typed AssistantEvent wire shape")
         XCTAssertEqual(result["events_truncated"], .bool(false))
+    }
+
+    /// WHY: peer discovery is authenticated with the active-run bearer. iOS
+    /// must receive the exact bounded credential through readback without ever
+    /// persisting it in a mutating command receipt.
+    @MainActor
+    func testAgentThreadReadReturnsOnlyTheExactActiveRunDelegationCapability() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        let run = AgentRunID()
+        router.activeAgentRuns[thread] = AgentActiveRunSnapshot(runId: run, startedAt: Date())
+        router.activeAgentDelegations[thread] = AgentActiveDelegationSnapshot(
+            threadId: thread,
+            runId: run,
+            hostId: "host-delegation",
+            capability: "bounded-active-run-capability",
+            expiresAt: Date(timeIntervalSince1970: 1_900_000_000)
+        )
+        let dispatcher = JSONRPCDispatcher(router: router)
+
+        let response = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.thread.read",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "include_event_watermark": .bool(true)
+            ]
+        ))
+
+        let result = try XCTUnwrap(response.result?.objectValue)
+        XCTAssertEqual(result["delegation_capability"], .string("bounded-active-run-capability"))
+        XCTAssertEqual(result["delegation_thread_id"], .string(thread.value.uuidString.lowercased()))
+        XCTAssertEqual(result["delegation_run_id"], .string(run.value.uuidString.lowercased()))
+        XCTAssertEqual(result["delegation_host_id"], .string("host-delegation"))
+        XCTAssertEqual(result["delegation_expires_at_ms"], .number(1_900_000_000_000))
+
+        router.activeAgentRuns[thread] = AgentActiveRunSnapshot(runId: AgentRunID(), startedAt: Date())
+        let crossRun = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(2),
+            method: "agent.thread.read",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "include_event_watermark": .bool(true)
+            ]
+        ))
+        XCTAssertNil(crossRun.result?.objectValue?["delegation_capability"],
+                     "a credential bound to another run must fail closed")
+
+        router.activeAgentRuns[thread] = AgentActiveRunSnapshot(runId: run, startedAt: Date())
+        router.activeAgentDelegations[thread] = AgentActiveDelegationSnapshot(
+            threadId: thread,
+            runId: run,
+            hostId: "host-delegation",
+            capability: "expired-capability",
+            expiresAt: Date(timeIntervalSince1970: 1)
+        )
+        let expired = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(3),
+            method: "agent.thread.read",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "include_event_watermark": .bool(true)
+            ]
+        ))
+        XCTAssertNil(expired.result?.objectValue?["delegation_capability"],
+                     "an expired active-run credential must never cross the readback boundary")
     }
 
     @MainActor

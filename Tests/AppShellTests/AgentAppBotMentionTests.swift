@@ -314,6 +314,18 @@ final class AgentAppBotMentionTests: XCTestCase {
         ))
         let result = try await ask.value
         XCTAssertEqual(result.objectValue?["reply"]?.stringValue, "Meu nome atual é Quinn.")
+        XCTAssertEqual(
+            result.objectValue?["lifecycle_receipt_id"]?.stringValue,
+            result.objectValue?["activity_id"]?.stringValue,
+            "the peer receipt must name the exact persisted handoff"
+        )
+        XCTAssertEqual(result.objectValue?["bot"]?.objectValue?["id"]?.stringValue, quinn.id.value.uuidString.lowercased())
+        XCTAssertEqual(
+            result.objectValue?["conversation_id"]?.stringValue,
+            try ctx.botStore.conversationLinked(to: peerRequest.threadId)?.id.value.uuidString.lowercased()
+        )
+        XCTAssertEqual(result.objectValue?["thread_id"]?.stringValue, peerRequest.threadId.value.uuidString.lowercased())
+        XCTAssertEqual(result.objectValue?["run_id"]?.stringValue, peerRequest.runId.value.uuidString.lowercased())
 
         _ = try router.invokeDelegatedBotSelfConfig(
             callerThread: hostRequest.threadId,

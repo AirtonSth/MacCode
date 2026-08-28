@@ -1226,6 +1226,7 @@ public final class AppContext {
                 )
             case .itemDelta(let itemId, let bodyAppend, let outputAppend, let summary):
                 var p: [String: JSONValue] = ["thread_id": .string(t), "item_id": .string(itemId)]
+                p["run_id"] = .string(runId.value.uuidString.lowercased())
                 if let b = bodyAppend { p["body_append"] = .string(b) }
                 if let o = outputAppend { p["output_append"] = .string(o) }
                 if let s = summary { p["summary"] = .string(s) }
@@ -1261,6 +1262,7 @@ public final class AppContext {
                 }
             case .itemProgress(let itemId, let progress):
                 var p: [String: JSONValue] = ["thread_id": .string(t), "item_id": .string(itemId)]
+                p["run_id"] = .string(runId.value.uuidString.lowercased())
                 if let progress { p["progress"] = .number(progress) }
                 EventBus.shared.publish(kind: "agent.item.progress", payload: .object(p))
             case .itemCompleted(let itemId, let state):

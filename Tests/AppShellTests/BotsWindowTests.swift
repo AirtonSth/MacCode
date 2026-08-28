@@ -6,6 +6,7 @@ import CoreModel
 @testable import DistillCore
 @testable import AppShell
 @testable import Persistence
+import SocketServer
 import Surfaces
 
 @MainActor
@@ -5663,6 +5664,39 @@ final class BotsWindowTests: XCTestCase {
         vm.beforeBotRunDispatchForTesting = nil
     }
 
+    func test_pairedStopVariantsReturnOnlyAfterAsyncReceiptSettlement() async throws {
+        // WHY: Phase4 finalizes the value returned by this router. Returning
+        // the initial accepted receipt would permanently omit the terminal
+        // event range even though bot.receipt.status is promoted moments later.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        for (index, method) in ["bot.stop", "bot.force_stop"].enumerated() {
+            let bot = try vm.create(name: "Piper \(index)", title: "Scout", provider: .claude)
+            let requestID = "paired-stop-settlement-\(index)"
+            let stopped = try await router.dispatchPairedBotRemote(method: method, params: [
+                "client_request_id": .string(requestID),
+                "host_id": .string("paired-test-host"),
+                "bot_id": .string(bot.id.value.uuidString.lowercased()),
+            ])
+            let receipt = try XCTUnwrap(stopped.objectValue)
+            XCTAssertEqual(receipt["status"]?.stringValue, "completed", method)
+            XCTAssertEqual(receipt["request_id"]?.stringValue, requestID, method)
+            XCTAssertEqual(
+                receipt["readback"]?.objectValue?["force"]?.boolValue,
+                method == "bot.force_stop",
+                method
+            )
+
+            let status = try await router.dispatchPairedBotRemote(method: "bot.receipt.status", params: [
+                "client_request_id": .string(requestID),
+            ])
+            XCTAssertEqual(status.objectValue?["status"]?.stringValue, "completed", method)
+        }
+    }
+
     func test_stopDuringPreflightDoesNotStartProvider() async throws {
         // WHY: bot.stop in the sendAgentMessage preflight window must cancel
         // before startRun, not complete and then let the send continue.
@@ -6964,6 +6998,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(
             slice.contains("reasoningEffort: revision.reasoningEffort"),
             "Desk send must use the composer reasoning chip"
+        )
+        XCTAssertTrue(
+            source.contains("recordNeedsAttention(bot: bot, conversation: prepared.conversation"),
+            "a failed provider start must preserve the Agent thread linked during preparation"
         )
     }
 
@@ -8348,6 +8386,32 @@ final class BotsWindowTests: XCTestCase {
             "the active projection must be backed by the exact pre-bound provider run"
         )
 
+        router.botsViewModel = vm
+        let activeRemote = try await router.dispatchPairedBotRemote(
+            method: "bot.attention.list",
+            params: [:]
+        )
+        let activeItems = try XCTUnwrap(activeRemote.objectValue?["items"]?.arrayValue)
+        let delegated = try XCTUnwrap(activeItems.compactMap(\.objectValue).first {
+            $0["bot_id"]?.stringValue == quinn.id.value.uuidString.lowercased()
+        })
+        XCTAssertEqual(delegated["id"]?.stringValue, handoff.activityID.uuidString.lowercased())
+        XCTAssertEqual(delegated["conversation_id"]?.stringValue, handoff.peerConversationID.value.uuidString.lowercased())
+        XCTAssertEqual(delegated["thread_id"]?.stringValue, handoff.peerThreadID?.value.uuidString.lowercased())
+        XCTAssertEqual(delegated["run_id"]?.stringValue, handoff.peerRunID?.value.uuidString.lowercased())
+        XCTAssertEqual(delegated["owner_bot_id"]?.stringValue, piper.id.value.uuidString.lowercased())
+        XCTAssertEqual(delegated["owner_conversation_id"]?.stringValue, origin.id.value.uuidString.lowercased())
+        XCTAssertEqual(delegated["ownership"]?.stringValue, "delegated")
+        XCTAssertEqual(delegated["primary"]?.boolValue, false)
+        XCTAssertEqual(delegated["delegated"]?.boolValue, true)
+        XCTAssertEqual(
+            activeItems.compactMap(\.objectValue).filter {
+                $0["bot_id"]?.stringValue == quinn.id.value.uuidString.lowercased()
+            }.count,
+            1,
+            "one delegated handoff must produce one attention owner"
+        )
+
         XCTAssertTrue(peerRunner.finish(promptContaining: "DUAL_ACTIVE", reply: "released"))
         let handoffCompleted = await waitUntil(timeout: 5) {
             vm.peerHandoffSnapshotsForTesting(
@@ -8356,6 +8420,17 @@ final class BotsWindowTests: XCTestCase {
             ).contains { $0.phase == .completed }
         }
         XCTAssertTrue(handoffCompleted)
+        let finishedRemote = try await router.dispatchPairedBotRemote(
+            method: "bot.attention.list",
+            params: [:]
+        )
+        let finishedItems = try XCTUnwrap(finishedRemote.objectValue?["items"]?.arrayValue)
+        let finishedPeer = try XCTUnwrap(finishedItems.compactMap(\.objectValue).first {
+            $0["bot_id"]?.stringValue == quinn.id.value.uuidString.lowercased()
+        })
+        XCTAssertEqual(finishedPeer["id"]?.stringValue, handoff.activityID.uuidString.lowercased())
+        XCTAssertEqual(finishedPeer["state"]?.stringValue, "finished")
+        XCTAssertEqual(finishedPeer["ownership"]?.stringValue, "delegated")
         await milestone.value
     }
 
@@ -9868,12 +9943,15 @@ final class BotsWindowTests: XCTestCase {
         var created: [String] = []
         var builds: [URL] = []
         var png = BotComputerGuestObserve.pngSignature + Data(repeating: 1, count: 16)
+        var execCallCount = 0
+        var failExecAfterCall: Int?
         var containers: [String: BotComputerContainerInspect] = [:]
         var startError: Error?
         var startCallCount = 0
         var blockedStartName: String?
         var startGate: DispatchSemaphore?
         let startStarted = DispatchSemaphore(value: 0)
+        var stopCallCount = 0
         var stopGate: DispatchSemaphore?
         var blockedRemoveName: String?
         var removeGate: DispatchSemaphore?
@@ -9911,6 +9989,7 @@ final class BotsWindowTests: XCTestCase {
             containers[name] = BotComputerContainerInspect(running: true, imageID: "img", hostPort: 49152)
         }
         func stop(name: String) throws {
+            stopCallCount += 1
             stopGate?.wait()
             if var value = containers[name] {
                 value.running = false
@@ -9921,7 +10000,13 @@ final class BotsWindowTests: XCTestCase {
             guard let value = containers[name] else { throw BotComputerGuestError.notReady }
             return value
         }
-        func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data { png }
+        func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data {
+            execCallCount += 1
+            if let failExecAfterCall, execCallCount > failExecAfterCall {
+                throw BotComputerGuestError.observeFailed
+            }
+            return png
+        }
         func rename(from: String, to: String) throws {
             containers[to] = containers[from]
             containers[from] = nil
@@ -9939,6 +10024,23 @@ final class BotsWindowTests: XCTestCase {
             for name in containers.keys where name.hasPrefix(namePrefix) {
                 containers[name] = nil
             }
+        }
+    }
+
+    private final class GuestEventRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: [EventBus.Event] = []
+
+        func append(_ event: EventBus.Event) {
+            lock.lock()
+            storage.append(event)
+            lock.unlock()
+        }
+
+        var events: [EventBus.Event] {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
         }
     }
 
@@ -10025,6 +10127,462 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(fake.created.contains(BotComputerGuestSpec.containerName(botID: piper.id)))
         XCTAssertEqual(vm.guestScreenURL(for: piper.id)?.host, "127.0.0.1")
         XCTAssertTrue(vm.isGuestRunning(piper.id))
+    }
+
+    func test_pairedGuestStartSettlesOnlyWithExactRemoteFrameInReceiptAndState() async throws {
+        // WHY: a terminal start receipt without a frame leaves iOS showing a
+        // running guest it cannot observe or control. A delayed provision must
+        // cross the real router -> VM provision -> remoteFrame -> receipt/state
+        // boundary and publish one secret-free terminal hint without replaying Start.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let docker = RecordingDocker()
+        docker.png = Data([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x06, 0x40, 0x00, 0x00, 0x04, 0xb0,
+        ])
+        docker.failExecAfterCall = 1
+        docker.blockedStartName = BotComputerGuestSpec.containerName(botID: bot.id)
+        let startGate = DispatchSemaphore(value: 0)
+        docker.startGate = startGate
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: docker,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.dockerGuestReadyOverrideForTesting = nil
+        let botID = bot.id.value.uuidString.lowercased()
+        let hostID = "paired-guest-host"
+        let initial = try await router.dispatchPairedBotRemote(method: "bot.guest.state", params: [
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+        ])
+        let initialState = try XCTUnwrap(initial.objectValue)
+        let tasks = try XCTUnwrap(initialState["task_catalog"]?.objectValue?["tasks"]?.arrayValue)
+        let startTask = try XCTUnwrap(tasks.compactMap(\.objectValue).first {
+            $0["operation"]?.stringValue == "bot.guest.start"
+        })
+        let catalogRecipe = try XCTUnwrap(startTask["recipe"]?.objectValue)
+        XCTAssertEqual(catalogRecipe["image_reference"]?.stringValue, BotComputerGuestSpec.imageTag)
+        XCTAssertNotEqual(
+            catalogRecipe["image_reference"]?.stringValue,
+            "img",
+            "the host-authorized logical image must remain distinct from Docker's physical inspect identity"
+        )
+        let requestID = "paired-guest-frame"
+        let recorder = GuestEventRecorder()
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "bot.guest.updated",
+                  event.payload.objectValue?["request_id"]?.stringValue == requestID else { return }
+            recorder.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(subscription) }
+        let accepted = try await router.dispatchPairedBotRemote(method: "bot.guest.start", params: [
+            "client_request_id": .string(requestID),
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+            "task_id": try XCTUnwrap(startTask["id"]),
+            "recipe_id": try XCTUnwrap(startTask["recipe_id"]),
+        ])
+        XCTAssertEqual(docker.startStarted.wait(timeout: .now() + 1), .success)
+        let acceptedRuntime = try XCTUnwrap(
+            accepted.objectValue?["readback"]?.objectValue?["runtime"]?.objectValue
+        )
+        for _ in 0..<40 {
+            let pending = try await router.dispatchPairedBotRemote(method: "bot.receipt.status", params: [
+                "client_request_id": .string(requestID),
+            ])
+            XCTAssertEqual(pending.objectValue?["status"]?.stringValue, "accepted")
+        }
+        XCTAssertEqual(docker.startCallCount, 1)
+        XCTAssertTrue(recorder.events.isEmpty, "accepted is not a false terminal hint")
+        startGate.signal()
+        var receipt = accepted
+        for _ in 0..<200 {
+            receipt = try await router.dispatchPairedBotRemote(method: "bot.receipt.status", params: [
+                "client_request_id": .string(requestID),
+            ])
+            if receipt.objectValue?["status"]?.stringValue != "accepted" { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let terminal = try XCTUnwrap(receipt.objectValue)
+        XCTAssertEqual(terminal["status"]?.stringValue, "completed")
+        let receiptReadback = try XCTUnwrap(terminal["readback"]?.objectValue)
+        let receiptFrame = try XCTUnwrap(receiptReadback["frame"]?.objectValue)
+        let receiptRuntime = try XCTUnwrap(receiptReadback["runtime"]?.objectValue)
+
+        let state = try await router.dispatchPairedBotRemote(method: "bot.guest.state", params: [
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+        ])
+        let stateObject = try XCTUnwrap(state.objectValue)
+        let stateFrame = try XCTUnwrap(stateObject["frame"]?.objectValue)
+        let stateRuntime = try XCTUnwrap(stateObject["runtime"]?.objectValue)
+        XCTAssertEqual(stateObject["status"]?.stringValue, "running")
+        XCTAssertEqual(receiptFrame, stateFrame)
+        XCTAssertEqual(receiptRuntime, stateRuntime)
+        for key in ["host_id", "bot_id", "app_run_id", "session_id", "grant_id", "grant_generation"] {
+            XCTAssertEqual(receiptRuntime[key], acceptedRuntime[key], key)
+        }
+        XCTAssertEqual(receiptRuntime["host_id"]?.stringValue, hostID)
+        XCTAssertEqual(receiptRuntime["bot_id"]?.stringValue, botID)
+        XCTAssertEqual(receiptRuntime["container_id"]?.stringValue, BotComputerGuestSpec.containerName(botID: bot.id))
+        XCTAssertEqual(receiptRuntime["image_reference"]?.stringValue, BotComputerGuestSpec.imageTag)
+        XCTAssertEqual(
+            receiptFrame["runtime"]?.objectValue?["image_reference"]?.stringValue,
+            BotComputerGuestSpec.imageTag
+        )
+        XCTAssertEqual(receiptFrame["pixel_width"]?.intValue, 1_600)
+        XCTAssertEqual(receiptFrame["pixel_height"]?.intValue, 1_200)
+        XCTAssertEqual(receiptFrame["png_base64"]?.stringValue, docker.png.base64EncodedString())
+        XCTAssertEqual(receiptFrame["png_hash"]?.stringValue?.count, 64)
+        XCTAssertEqual(
+            docker.execCallCount,
+            1,
+            "the exact frame proven during start readiness must settle the receipt without another capture"
+        )
+        let replay = try await router.dispatchPairedBotRemote(method: "bot.guest.start", params: [
+            "client_request_id": .string(requestID),
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+            "task_id": try XCTUnwrap(startTask["id"]),
+            "recipe_id": try XCTUnwrap(startTask["recipe_id"]),
+        ])
+        XCTAssertEqual(replay, receipt)
+        XCTAssertEqual(docker.startCallCount, 1)
+
+        XCTAssertEqual(recorder.events.count, 1)
+        let event = try XCTUnwrap(recorder.events.first)
+        let payload = try XCTUnwrap(event.payload.objectValue)
+        XCTAssertEqual(payload["host_id"]?.stringValue, hostID)
+        XCTAssertEqual(payload["bot_id"]?.stringValue, botID)
+        XCTAssertEqual(payload["request_id"]?.stringValue, requestID)
+        XCTAssertEqual(payload["client_request_id"]?.stringValue, requestID)
+        XCTAssertEqual(payload["receipt_id"], terminal["receipt_id"])
+        XCTAssertEqual(payload["status"]?.stringValue, "running")
+        XCTAssertEqual(payload["after_frame_id"], receiptReadback["after_frame_id"])
+        XCTAssertEqual(payload["grant_generation"], receiptReadback["grant_generation"])
+        let eventWire = String(data: try JSONEncoder().encode(event.payload), encoding: .utf8) ?? ""
+        for secretKey in ["png_base64", "bearer", "token", "http://", "https://", "viewer_path"] {
+            XCTAssertFalse(eventWire.contains(secretKey), secretKey)
+        }
+    }
+
+    func test_pairedGuestInputSettlementPublishesExactPointerRequestIDForSuccessAndFailure() async throws {
+        // WHY: guest input settles asynchronously after the authority has
+        // accepted it. Each terminal readback/event must retain that input's
+        // request identity, rather than the Start (or preceding input) ID.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let docker = RecordingDocker()
+        docker.png = Data([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x06, 0x40, 0x00, 0x00, 0x04, 0xb0,
+        ])
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: docker,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.dockerGuestReadyOverrideForTesting = nil
+        let botID = bot.id.value.uuidString.lowercased()
+        let hostID = "paired-guest-input-host"
+        let initial = try await router.dispatchPairedBotRemote(method: "bot.guest.state", params: [
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+        ])
+        let initialState = try XCTUnwrap(initial.objectValue)
+        let tasks = try XCTUnwrap(initialState["task_catalog"]?.objectValue?["tasks"]?.arrayValue)
+        let startTask = try XCTUnwrap(tasks.compactMap(\.objectValue).first {
+            $0["operation"]?.stringValue == "bot.guest.start"
+        })
+        let pointerTask = try XCTUnwrap(tasks.compactMap(\.objectValue).first {
+            $0["operation"]?.stringValue == "bot.guest.input"
+                && $0["axis"]?.stringValue == "pointer"
+        })
+        let startRequestID = "paired-guest-input-start"
+        let successRequestID = "paired-guest-input-success"
+        let failureRequestID = "paired-guest-input-failure"
+        let recorder = GuestEventRecorder()
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "bot.guest.updated",
+                  let requestID = event.payload.objectValue?["request_id"]?.stringValue,
+                  [successRequestID, failureRequestID].contains(requestID) else { return }
+            recorder.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(subscription) }
+
+        func terminalReceipt(requestID: String) async throws -> [String: JSONValue] {
+            var latest = JSONValue.null
+            for _ in 0..<200 {
+                latest = try await router.dispatchPairedBotRemote(method: "bot.receipt.status", params: [
+                    "client_request_id": .string(requestID),
+                ])
+                if let object = latest.objectValue,
+                   object["status"]?.stringValue != "accepted" {
+                    return object
+                }
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            throw NSError(domain: "BotsWindowTests", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "receipt remained accepted: \(requestID)",
+            ])
+        }
+
+        _ = try await router.dispatchPairedBotRemote(method: "bot.guest.start", params: [
+            "client_request_id": .string(startRequestID),
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+            "task_id": try XCTUnwrap(startTask["id"]),
+            "recipe_id": try XCTUnwrap(startTask["recipe_id"]),
+        ])
+        let startTerminal = try await terminalReceipt(requestID: startRequestID)
+        XCTAssertEqual(startTerminal["status"]?.stringValue, "completed")
+        let startReadback = try XCTUnwrap(startTerminal["readback"]?.objectValue)
+        let startRuntime = try XCTUnwrap(startReadback["runtime"]?.objectValue)
+        let startFrameID = try XCTUnwrap(startReadback["frame"]?.objectValue?["frame_id"]?.stringValue)
+
+        let pointerParams: [String: JSONValue] = [
+            "client_request_id": .string(successRequestID),
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+            "task_id": try XCTUnwrap(pointerTask["id"]),
+            "runtime": .object(startRuntime),
+            "before_frame_id": .string(startFrameID),
+            "input": .object([
+                "kind": .string("pointer"),
+                "x": .number(100.0),
+                "y": .number(100.0),
+            ]),
+        ]
+        let acceptedSuccess = try await router.dispatchPairedBotRemote(
+            method: "bot.guest.input",
+            params: pointerParams
+        )
+        XCTAssertEqual(acceptedSuccess.objectValue?["status"]?.stringValue, "accepted")
+        let successTerminal = try await terminalReceipt(requestID: successRequestID)
+        XCTAssertEqual(successTerminal["status"]?.stringValue, "completed")
+        let successReadback = try XCTUnwrap(successTerminal["readback"]?.objectValue)
+        XCTAssertEqual(successReadback["last_request_id"]?.stringValue, successRequestID)
+        XCTAssertNotEqual(successReadback["last_request_id"]?.stringValue, startRequestID)
+        let successFrameID = try XCTUnwrap(successReadback["frame"]?.objectValue?["frame_id"]?.stringValue)
+        let successEvent = try XCTUnwrap(recorder.events.first {
+            $0.payload.objectValue?["request_id"]?.stringValue == successRequestID
+        })
+        XCTAssertEqual(successEvent.payload.objectValue?["request_id"]?.stringValue, successRequestID)
+        XCTAssertEqual(successEvent.payload.objectValue?["after_frame_id"]?.stringValue, successFrameID)
+
+        docker.failExecAfterCall = docker.execCallCount
+        let failureParams = pointerParams.merging([
+            "client_request_id": .string(failureRequestID),
+            "runtime": .object(try XCTUnwrap(successReadback["runtime"]?.objectValue)),
+            "before_frame_id": .string(successFrameID),
+        ]) { _, new in new }
+        let acceptedFailure = try await router.dispatchPairedBotRemote(
+            method: "bot.guest.input",
+            params: failureParams
+        )
+        XCTAssertEqual(acceptedFailure.objectValue?["status"]?.stringValue, "accepted")
+        let failureTerminal = try await terminalReceipt(requestID: failureRequestID)
+        XCTAssertEqual(failureTerminal["status"]?.stringValue, "failed")
+        let failureReadback = try XCTUnwrap(failureTerminal["readback"]?.objectValue)
+        XCTAssertEqual(failureReadback["last_request_id"]?.stringValue, failureRequestID)
+        XCTAssertNotEqual(failureReadback["last_request_id"]?.stringValue, startRequestID)
+        XCTAssertNotEqual(failureReadback["last_request_id"]?.stringValue, successRequestID)
+        let failureEvent = try XCTUnwrap(recorder.events.first {
+            $0.payload.objectValue?["request_id"]?.stringValue == failureRequestID
+        })
+        XCTAssertEqual(failureEvent.payload.objectValue?["request_id"]?.stringValue, failureRequestID)
+    }
+
+    func test_pairedGuestStopSettlementPublishesExactRequestIDWithoutReplay() async throws {
+        // WHY: stopping invalidates the grant before Docker finishes. The
+        // terminal receipt/event must retain Stop's request identity instead
+        // of the stale Start context, and replaying Stop must not publish it
+        // twice.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let docker = RecordingDocker()
+        docker.png = Data([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x06, 0x40, 0x00, 0x00, 0x04, 0xb0,
+        ])
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: docker,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        vm.dockerGuestReadyOverrideForTesting = nil
+        let botID = bot.id.value.uuidString.lowercased()
+        let hostID = "paired-guest-stop-host"
+        let initial = try await router.dispatchPairedBotRemote(method: "bot.guest.state", params: [
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+        ])
+        let initialState = try XCTUnwrap(initial.objectValue)
+        let tasks = try XCTUnwrap(initialState["task_catalog"]?.objectValue?["tasks"]?.arrayValue)
+        let startTask = try XCTUnwrap(tasks.compactMap(\.objectValue).first {
+            $0["operation"]?.stringValue == "bot.guest.start"
+        })
+        let stopTask = try XCTUnwrap(tasks.compactMap(\.objectValue).first {
+            $0["operation"]?.stringValue == "bot.guest.stop"
+        })
+        let startRequestID = "paired-guest-stop-start"
+        let stopRequestID = "paired-guest-stop"
+        let recorder = GuestEventRecorder()
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "bot.guest.updated",
+                  event.payload.objectValue?["request_id"]?.stringValue == stopRequestID else { return }
+            recorder.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(subscription) }
+
+        func terminalReceipt(requestID: String) async throws -> [String: JSONValue] {
+            var latest = JSONValue.null
+            for _ in 0..<200 {
+                latest = try await router.dispatchPairedBotRemote(method: "bot.receipt.status", params: [
+                    "client_request_id": .string(requestID),
+                ])
+                if let object = latest.objectValue,
+                   object["status"]?.stringValue != "accepted" {
+                    return object
+                }
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            throw NSError(domain: "BotsWindowTests", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "receipt remained accepted: \(requestID)",
+            ])
+        }
+
+        _ = try await router.dispatchPairedBotRemote(method: "bot.guest.start", params: [
+            "client_request_id": .string(startRequestID),
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+            "task_id": try XCTUnwrap(startTask["id"]),
+            "recipe_id": try XCTUnwrap(startTask["recipe_id"]),
+        ])
+        let startTerminal = try await terminalReceipt(requestID: startRequestID)
+        XCTAssertEqual(startTerminal["status"]?.stringValue, "completed")
+        let startReadback = try XCTUnwrap(startTerminal["readback"]?.objectValue)
+        let runtime = try XCTUnwrap(startReadback["runtime"]?.objectValue)
+
+        let stopParams: [String: JSONValue] = [
+            "client_request_id": .string(stopRequestID),
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+            "task_id": try XCTUnwrap(stopTask["id"]),
+            "runtime": .object(runtime),
+        ]
+        let accepted = try await router.dispatchPairedBotRemote(
+            method: "bot.guest.stop",
+            params: stopParams
+        )
+        XCTAssertEqual(accepted.objectValue?["status"]?.stringValue, "accepted")
+        let terminal = try await terminalReceipt(requestID: stopRequestID)
+        XCTAssertEqual(terminal["status"]?.stringValue, "completed")
+        XCTAssertEqual(terminal["request_id"]?.stringValue, stopRequestID)
+        let readback = try XCTUnwrap(terminal["readback"]?.objectValue)
+        XCTAssertEqual(readback["status"]?.stringValue, "stopped")
+        XCTAssertEqual(readback["last_request_id"]?.stringValue, stopRequestID)
+        XCTAssertNotEqual(readback["last_request_id"]?.stringValue, startRequestID)
+        XCTAssertNil(readback["runtime"])
+
+        let stoppedState = try await router.dispatchPairedBotRemote(method: "bot.guest.state", params: [
+            "host_id": .string(hostID),
+            "bot_id": .string(botID),
+        ])
+        XCTAssertEqual(stoppedState.objectValue?["status"]?.stringValue, "stopped")
+        XCTAssertEqual(stoppedState.objectValue?["last_request_id"]?.stringValue, stopRequestID)
+        XCTAssertEqual(docker.stopCallCount, 1)
+
+        let replay = try await router.dispatchPairedBotRemote(
+            method: "bot.guest.stop",
+            params: stopParams
+        )
+        XCTAssertEqual(replay.objectValue, terminal)
+        XCTAssertEqual(recorder.events.count, 1)
+        let event = try XCTUnwrap(recorder.events.first)
+        let payload = try XCTUnwrap(event.payload.objectValue)
+        XCTAssertEqual(payload["request_id"]?.stringValue, stopRequestID)
+        XCTAssertEqual(payload["client_request_id"]?.stringValue, stopRequestID)
+        XCTAssertEqual(payload["receipt_id"], terminal["receipt_id"])
+        XCTAssertEqual(payload["status"]?.stringValue, "stopped")
+    }
+
+    func test_guestTerminalHintKeepsFailureAndStopSecretFreeAndRejectsMismatchedFrame() throws {
+        // WHY: the terminal event is only a bounded reread hint. It must retain
+        // exact request ownership for failure/stop without becoming a second
+        // frame, URL, or capability transport.
+        let requestID = "guest-terminal-request"
+        let botID = UUID().uuidString.lowercased()
+        let baseReadback: [String: Any] = [
+            "host_id": "guest-terminal-host",
+            "bot_id": botID,
+            "last_request_id": requestID,
+            "viewer_path": "/vnc.html",
+            "task_catalog": ["tasks": []],
+            "grant_generation": 3,
+            "png_base64": "unsafe-frame",
+            "bearer_token": "unsafe-bearer",
+            "url": "http://127.0.0.1:6080/vnc.html",
+        ]
+        func receipt(status: String, readback: [String: Any]) -> [String: Any] {
+            [
+                "request_id": requestID,
+                "receipt_id": "guest-terminal-receipt",
+                "status": status,
+                "bot_id": botID,
+                "readback": readback,
+            ]
+        }
+
+        var failedReadback = baseReadback
+        failedReadback["status"] = "failed"
+        let failedValue = try XCTUnwrap(AppCommandRouter.pairedGuestTerminalEventPayload(
+            receipt(status: "failed", readback: failedReadback)
+        ))
+        let failed = try XCTUnwrap(failedValue.objectValue)
+        XCTAssertEqual(Set(failed.keys), [
+            "host_id", "bot_id", "request_id", "client_request_id",
+            "receipt_id", "status", "grant_generation",
+        ])
+        XCTAssertEqual(failed["status"]?.stringValue, "failed")
+
+        var stoppedReadback = baseReadback
+        stoppedReadback["status"] = "stopped"
+        stoppedReadback["after_frame_id"] = "last-visible-frame"
+        let stoppedValue = try XCTUnwrap(AppCommandRouter.pairedGuestTerminalEventPayload(
+            receipt(status: "completed", readback: stoppedReadback)
+        ))
+        let stopped = try XCTUnwrap(stoppedValue.objectValue)
+        XCTAssertEqual(stopped["status"]?.stringValue, "stopped")
+        XCTAssertEqual(stopped["after_frame_id"]?.stringValue, "last-visible-frame")
+
+        var mismatchedRunning = baseReadback
+        mismatchedRunning["status"] = "running"
+        mismatchedRunning["after_frame_id"] = "authoritative-frame"
+        mismatchedRunning["frame"] = ["frame_id": "other-frame"]
+        XCTAssertNil(AppCommandRouter.pairedGuestTerminalEventPayload(
+            receipt(status: "completed", readback: mismatchedRunning)
+        ))
     }
 
     func test_presentGuestDesktopPublishesLaunchProgressAndSupportsRetry() async throws {

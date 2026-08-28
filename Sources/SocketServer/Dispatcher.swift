@@ -13,6 +13,28 @@ public struct AgentActiveRunSnapshot: Sendable, Equatable {
     }
 }
 
+public struct AgentActiveDelegationSnapshot: Sendable, Equatable {
+    public let threadId: AgentThreadID
+    public let runId: AgentRunID
+    public let hostId: String
+    public let capability: String
+    public let expiresAt: Date
+
+    public init(
+        threadId: AgentThreadID,
+        runId: AgentRunID,
+        hostId: String,
+        capability: String,
+        expiresAt: Date
+    ) {
+        self.threadId = threadId
+        self.runId = runId
+        self.hostId = hostId
+        self.capability = capability
+        self.expiresAt = expiresAt
+    }
+}
+
 public struct AgentThreadMirrorSnapshot: Sendable, Equatable {
     public let events: [AssistantEvent]
     public let eventWatermark: Int64
@@ -228,6 +250,10 @@ public protocol CommandRouting: AnyObject {
     func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) async throws -> AgentTurnCheckpointSummary
     func stopAgentRun(thread: AgentThreadID) throws
     func activeAgentRun(thread: AgentThreadID) throws -> AgentActiveRunSnapshot?
+    func activeAgentDelegation(
+        thread: AgentThreadID,
+        run: AgentRunID
+    ) throws -> AgentActiveDelegationSnapshot?
     /// Resume a relaunch-interrupted thread (the mac Continue button path):
     /// the coordinator replays the saved resume cursor without a new user
     /// message. Returns the new run id when one started.
@@ -299,6 +325,7 @@ public protocol CommandRouting: AnyObject {
         contractVersion: Int?,
         capabilities: [String]?
     ) throws -> JSONValue
+    func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws
     // settings
     func settingsGet(keys: [String]) throws -> [String: String]
     func settingsSet(key: String, value: String) throws
@@ -311,6 +338,7 @@ public protocol CommandRouting: AnyObject {
     func fsWorkspaceCreateFile(workspace: WorkspaceID, path: String, content: String) throws -> JSONValue
     func fsWorkspaceRename(workspace: WorkspaceID, path: String, newName: String) throws -> JSONValue
     func fsWorkspaceDelete(workspace: WorkspaceID, paths: [String]) throws -> JSONValue
+    func filesEditSession(sessionID: String) throws -> JSONValue
     func filesEditOpen(surface: SurfaceID, path: String) throws -> JSONValue
     func filesEditApplyPatch(sessionID: String, baseDraftRevision: Int, rangeLocation: Int, rangeLength: Int, replacement: String, deviceID: String?) throws -> JSONValue
     func filesEditSave(sessionID: String) throws -> JSONValue
@@ -322,6 +350,8 @@ public extension CommandRouting {
     /// Test/fake hosts may omit Token Saver entirely.
     func tokenSaverDigest() -> JSONValue? { nil }
 
+    func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws {}
+
     func agentThreadHasMessages(thread: AgentThreadID) throws -> Bool {
         !(try listAgentMessages(thread: thread, limit: 1).isEmpty)
     }
@@ -331,6 +361,13 @@ public extension CommandRouting {
     }
 
     func activeAgentRun(thread: AgentThreadID) throws -> AgentActiveRunSnapshot? {
+        nil
+    }
+
+    func activeAgentDelegation(
+        thread: AgentThreadID,
+        run: AgentRunID
+    ) throws -> AgentActiveDelegationSnapshot? {
         nil
     }
 
@@ -692,7 +729,11 @@ public final class JSONRPCDispatcher {
     private nonisolated static let managedProviderSocketMethods =
         RemoteCodeHostCatalog.rpcMethods.union([
             "bot.peer.list", "bot.peer.ask", "bot.peer.self_config",
+            "bot.peer.receipt.status",
         ])
+    nonisolated static let managedPeerReceiptMethods: Set<String> = [
+        "bot.peer.ask", "bot.peer.self_config",
+    ]
     /// Bounded unknown-outcome fence (same cap as committed receipts). Does not
     /// store request payloads or secrets — only owner fingerprint + params hash.
     private var volatileUnknownReceipts = BoundedUnknownReceiptCache()
@@ -765,14 +806,48 @@ public final class JSONRPCDispatcher {
         "host.bot.thread.create",
         "host.bot.skill.create",
         "bot.create",
+        "bot.discard_new",
         "bot.save",
         "bot.delete",
+        "bot.set_pinned",
+        "bot.set_hidden",
+        "bot.duplicate",
         "bot.send",
-        "bot.settings.set",
+        "bot.stop",
         "bot.force_stop",
+        "bot.settings.set",
+        "bot.queue.remove",
+        "bot.conversation.create",
+        "bot.conversation.select",
+        "bot.conversation.clear_all",
+        "bot.routine.create",
+        "bot.routine.update",
+        "bot.routine.enable",
+        "bot.routine.run",
+        "bot.routine.delete",
+        "bot.attachment.stage",
+        "bot.attachment.remove",
         "bot.link.open",
+        "bot.browser.action",
         "bot.files.mutate",
+        "bot.files.open_tab",
+        "bot.files.split",
+        "bot.files.location.set",
+        "bot.guest.input",
+        "bot.guest.start",
+        "bot.guest.stop",
+        "bot.guest.rebuild",
+        "bot.guest.revoke",
         "bot.docker.clear",
+        "bot.notify.set",
+        "bot.desktop.set",
+        "bot.avatar.set",
+        "bot.handle.set",
+        "bot.soul.set",
+        "bot.routing.set",
+        "bot.attention.ack",
+        "bot.self_config",
+        "bot.scheduler.tick",
         "agent.thread.create",
         "agent.thread.prepare_pr",
         "agent.thread.rollback",
@@ -818,7 +893,7 @@ public final class JSONRPCDispatcher {
         "agent.attachment.import",
         "agent.provider.update",
     ]
-    private nonisolated static let canonicalImmediateEventMethods: Set<String> = [
+    private nonisolated static let canonicalImmediateEventMethods: Set<String> = Set([
         "agent.message.send",
         "agent.message.queue.cancel",
         "agent.message.queue.force_now",
@@ -835,7 +910,7 @@ public final class JSONRPCDispatcher {
         "agent.attachment.upload",
         "agent.attachment.import",
         "agent.provider.update",
-    ]
+    ]).union(durableSynchronousMutationMethods.filter { $0.hasPrefix("bot.") })
     public init(
         router: CommandRouting,
         commandReceiptMetrics: CommandReceiptMetrics = CommandReceiptMetrics(),
@@ -1042,7 +1117,139 @@ public final class JSONRPCDispatcher {
         func string(_ keys: String...) -> JSONValue? {
             keys.lazy.compactMap { params[$0]?.stringValue }.first.map(JSONValue.string)
         }
+        func canonicalBotNotification(_ value: JSONValue) -> JSONValue? {
+            guard let object = value.objectValue,
+                  let id = object["id"]?.stringValue,
+                  let profileID = object["profile_id"]?.stringValue,
+                  let hostID = object["host_id"]?.stringValue,
+                  let attentionItemID = object["attention_item_id"]?.stringValue,
+                  let notificationID = object["notification_id"]?.stringValue,
+                  let botID = object["bot_id"]?.stringValue,
+                  let source = object["source"]?.stringValue,
+                  let title = object["title"]?.stringValue,
+                  let category = object["category"]?.stringValue,
+                  !id.isEmpty, notificationID == id, attentionItemID == id,
+                  !profileID.isEmpty, !hostID.isEmpty, !botID.isEmpty,
+                  source == "bot" || source == "routine" else {
+                return nil
+            }
+            var payload: [String: JSONValue] = [
+                "id": .string(id),
+                "title": .string(title),
+                "category": .string(category),
+                "profile_id": .string(profileID),
+                "host_id": .string(hostID),
+                "attention_item_id": .string(attentionItemID),
+                "notification_id": .string(notificationID),
+                "bot_id": .string(botID),
+                "source": .string(source),
+            ]
+            if let body = object["body"]?.stringValue { payload["body"] = .string(body) }
+            return .object(payload)
+        }
+        func canonicalBotSendLifecycle(
+            receipt: [String: JSONValue],
+            readback: [String: JSONValue]
+        ) -> (kind: String, payload: JSONValue)? {
+            guard let hostID = receipt["host_id"]?.stringValue,
+                  let botID = receipt["bot_id"]?.stringValue,
+                  let requestID = receipt["request_id"]?.stringValue,
+                  receipt["client_request_id"]?.stringValue == requestID,
+                  readback["host_id"]?.stringValue == hostID,
+                  readback["bot_id"]?.stringValue == botID,
+                  readback["request_id"]?.stringValue == requestID,
+                  readback["client_request_id"]?.stringValue == requestID,
+                  let runID = readback["run_id"]?.stringValue,
+                  !hostID.isEmpty, !botID.isEmpty, !requestID.isEmpty, !runID.isEmpty,
+                  let enqueued = readback["enqueued"]?.boolValue else { return nil }
+            let conversationID = readback["conversation_id"] ?? .null
+            var payload: [String: JSONValue] = [
+                "host_id": .string(hostID),
+                "bot_id": .string(botID),
+                "conversation_id": conversationID,
+                "request_id": .string(requestID),
+                "client_request_id": .string(requestID),
+                "run_id": .string(runID),
+            ]
+            if enqueued {
+                guard let itemID = readback["id"]?.stringValue, !itemID.isEmpty else { return nil }
+                payload["queue_item_id"] = .string(itemID)
+                return ("bot.message.queued", .object(payload))
+            }
+            guard let run = readback["run"]?.objectValue,
+                  run["host_id"]?.stringValue == hostID,
+                  run["bot_id"]?.stringValue == botID,
+                  run["request_id"]?.stringValue == requestID,
+                  run["client_request_id"]?.stringValue == requestID,
+                  run["run_id"]?.stringValue == runID,
+                  (run["conversation_id"] ?? .null) == conversationID else { return nil }
+            if let threadID = run["thread_id"]?.stringValue, !threadID.isEmpty {
+                payload["thread_id"] = .string(threadID)
+            }
+            return ("bot.run.started", .object(payload))
+        }
+        func canonicalBotStop(
+            receipt: [String: JSONValue],
+            readback: [String: JSONValue],
+            force: Bool
+        ) -> [String: JSONValue]? {
+            guard readback["accepted"]?.boolValue == true,
+                  readback["force"]?.boolValue == force,
+                  readback["terminal"]?.boolValue == true,
+                  let hostID = params["host_id"]?.stringValue,
+                  let botID = receipt["bot_id"]?.stringValue,
+                  let requestID = receipt["request_id"]?.stringValue,
+                  let run = readback["run"]?.objectValue,
+                  run["host_id"]?.stringValue == hostID,
+                  run["bot_id"]?.stringValue == botID,
+                  let runRequestID = run["request_id"]?.stringValue,
+                  run["client_request_id"]?.stringValue == runRequestID,
+                  let runID = run["run_id"]?.stringValue,
+                  let conversationID = run["conversation_id"],
+                  !hostID.isEmpty, !botID.isEmpty, !requestID.isEmpty,
+                  !runRequestID.isEmpty, !runID.isEmpty else { return nil }
+            return [
+                "host_id": .string(hostID),
+                "bot_id": .string(botID),
+                "conversation_id": conversationID,
+                "request_id": .string(runRequestID),
+                "client_request_id": .string(runRequestID),
+                "stop_request_id": .string(requestID),
+                "run_id": .string(runID),
+                "terminal": .bool(true),
+                "force": .bool(force),
+            ]
+        }
+        func project(_ value: JSONValue?, keys: [String]) -> JSONValue? {
+            guard let object = value?.objectValue else { return nil }
+            return .object(Dictionary(uniqueKeysWithValues: keys.compactMap { key in
+                object[key].map { (key, $0) }
+            }))
+        }
+        func guestTaskCatalog(_ value: JSONValue?) -> JSONValue? {
+            guard let catalog = value?.objectValue,
+                  let tasks = catalog["tasks"]?.arrayValue else { return nil }
+            let projectedTasks = tasks.compactMap { task -> JSONValue? in
+                guard var projected = project(
+                    task,
+                    keys: ["id", "title", "axis", "operation", "interaction_mode", "recipe_id"]
+                )?.objectValue else { return nil }
+                projected["recipe"] = project(
+                    task.objectValue?["recipe"],
+                    keys: ["id", "immutable", "image_reference", "container_id", "viewer_path"]
+                )
+                return .object(projected)
+            }
+            var projected = Dictionary(uniqueKeysWithValues: ["id", "generation"].compactMap { key in
+                catalog[key].map { (key, $0) }
+            })
+            projected["tasks"] = .array(projectedTasks)
+            return .object(projected)
+        }
         var payload: [String: JSONValue] = [:]
+        var botNotifications: [JSONValue] = []
+        var botLifecycleEvents: [(kind: String, payload: JSONValue)] = []
+        var botTerminalPayload: [String: JSONValue]?
         let kind: String
         switch method {
         case "agent.message.send":
@@ -1123,10 +1330,149 @@ public final class JSONRPCDispatcher {
             payload["provider"] = result.objectValue?["provider"] ?? string("provider") ?? .string("codex")
             payload["ok"] = result.objectValue?["ok"]
             payload["status"] = result.objectValue?["status"]
+        case let botMethod where botMethod.hasPrefix("bot."):
+            guard let object = result.objectValue else { return }
+            let resultStatus = object["status"]?.stringValue
+            let readback = object["readback"]?.objectValue
+            let durablePartialDeletion = resultStatus == "partial"
+                && (botMethod == "bot.delete" || botMethod == "bot.discard_new")
+                && readback?["deleted"]?.boolValue == true
+            guard resultStatus == "completed"
+                    || (botMethod.hasPrefix("bot.guest.") && resultStatus == "accepted")
+                    || durablePartialDeletion else {
+                return
+            }
+            switch botMethod {
+            case "bot.create", "bot.duplicate": kind = "bot.created"
+            case "bot.discard_new", "bot.delete": kind = "bot.deleted"
+            case "bot.settings.set": kind = "bot.settings.updated"
+            case "bot.send": kind = "bot.message.accepted"
+            case "bot.stop", "bot.force_stop":
+                guard let readback = object["readback"]?.objectValue,
+                      let terminal = canonicalBotStop(
+                        receipt: object,
+                        readback: readback,
+                        force: method == "bot.force_stop"
+                      ) else {
+                    return
+                }
+                kind = "bot.run.stop_requested"
+                botTerminalPayload = terminal
+            case "bot.queue.remove": kind = "bot.queue.updated"
+            case "bot.conversation.select": kind = "bot.conversation.selected"
+            case "bot.conversation.create", "bot.conversation.clear_all":
+                kind = "bot.conversation.updated"
+            case "bot.routine.run": kind = "bot.routine.run_requested"
+            case "bot.routine.create", "bot.routine.update", "bot.routine.enable", "bot.routine.delete":
+                kind = "bot.routine.updated"
+            case "bot.attachment.stage", "bot.attachment.remove": kind = "bot.attachment.updated"
+            case "bot.files.mutate": kind = "bot.files.changed"
+            case "bot.files.open_tab", "bot.files.split": kind = "bot.files.opened"
+            case "bot.files.location.set": kind = "bot.files.updated"
+            case "bot.browser.action": kind = "bot.browser.updated"
+            case "bot.link.open":
+                kind = object["readback"]?.objectValue?["link_kind"]?.stringValue == "file"
+                    ? "bot.files.opened"
+                    : "bot.browser.updated"
+            case "bot.guest.input", "bot.guest.start", "bot.guest.stop", "bot.guest.rebuild", "bot.guest.revoke":
+                kind = "bot.guest.updated"
+            case "bot.docker.clear": kind = "bot.docker.cleared"
+            case "bot.attention.ack": kind = "bot.attention.updated"
+            case "bot.scheduler.tick": kind = "bot.scheduler.updated"
+            default: kind = "bot.updated"
+            }
+            payload["method"] = .string(botMethod)
+            payload["request_id"] = object["request_id"]
+                ?? string("client_request_id")
+            payload["client_request_id"] = object["client_request_id"]
+                ?? object["request_id"]
+                ?? string("client_request_id")
+            payload["receipt_id"] = object["receipt_id"]
+            payload["bot_id"] = object["bot_id"]
+                ?? object["readback"]?.objectValue?["bot_id"]
+                ?? string("bot_id")
+            if let readback = object["readback"]?.objectValue {
+                if botMethod == "bot.send",
+                   let lifecycle = canonicalBotSendLifecycle(receipt: object, readback: readback) {
+                    botLifecycleEvents.append(lifecycle)
+                }
+                if let notification = readback["notification"].flatMap(canonicalBotNotification) {
+                    botNotifications.append(notification)
+                }
+                if let notifications = readback["notifications"]?.arrayValue {
+                    botNotifications.append(contentsOf: notifications.compactMap(canonicalBotNotification))
+                }
+                if botMethod.hasPrefix("bot.guest.") {
+                    for key in [
+                        "host_id", "viewer_path", "grant_generation", "grant_invalidated",
+                        "before_frame_id", "after_frame_id", "status", "error_message",
+                    ] {
+                        payload[key] = readback[key]
+                    }
+                    payload["security"] = project(
+                        readback["security"],
+                        keys: [
+                            "bot_bound", "host_bound", "opaque_grant",
+                            "loopback_url_exported", "bearer_exported",
+                        ]
+                    )
+                    payload["task_catalog"] = guestTaskCatalog(readback["task_catalog"])
+                    payload["runtime"] = project(
+                        readback["runtime"],
+                        keys: [
+                            "host_id", "bot_id", "container_id", "app_run_id", "viewer_id",
+                            "viewer_path", "session_id", "grant_id", "grant_generation",
+                            "recipe_id", "image_reference",
+                        ]
+                    )
+                } else {
+                    payload["conversation_id"] = readback["conversation_id"]
+                        ?? readback["selected_id"]
+                        ?? string("conversation_id")
+                    payload["routine_id"] = readback["routine_id"]
+                        ?? string("routine_id")
+                    payload["run_id"] = readback["run_id"]
+                    payload["routing_receipt_id"] = readback["routing_receipt_id"]
+                    payload["key"] = readback["key"] ?? string("key")
+                    for key in [
+                        "host_id", "client_request_id", "root", "root_handle", "handle", "generation", "previous_generation",
+                        "root_cas", "previous_cas", "expected_cas", "current_cas",
+                        "entry_generation", "entry_cas", "path", "op",
+                        "current_revision_id", "revision", "soul", "description",
+                        "profile_id", "attention_item_id", "notification_id", "source", "enqueued", "id",
+                        "surface_id", "snapshot_generation", "url", "title", "loading", "action", "link_kind",
+                        "mounted", "split",
+                        "session_before_digest", "session_after_digest", "cleared", "removed_count", "partial",
+                        "deleted", "cleanup_complete", "cleanup_residuals", "unpublished",
+                    ] {
+                        payload[key] = readback[key]
+                    }
+                    payload["security"] = readback["security"]
+                    payload["session"] = readback["session"]
+                }
+                if botMethod.hasPrefix("bot.guest."), let frame = readback["frame"]?.objectValue {
+                    payload["frame"] = .object([
+                        "frame_id": frame["frame_id"] ?? .null,
+                        "sequence": frame["sequence"] ?? .null,
+                        "pixel_width": frame["pixel_width"] ?? .null,
+                        "pixel_height": frame["pixel_height"] ?? .null,
+                        "png_hash": frame["png_hash"] ?? .null,
+                    ])
+                }
+                if let botTerminalPayload {
+                    for (key, value) in botTerminalPayload { payload[key] = value }
+                }
+            }
         default:
             return
         }
         EventBus.shared.publish(kind: kind, payload: .object(payload.compactMapValues { $0 }))
+        for event in botLifecycleEvents {
+            EventBus.shared.publish(kind: event.kind, payload: event.payload)
+        }
+        for notification in botNotifications {
+            EventBus.shared.publish(kind: "notification.created", payload: notification)
+        }
     }
 
     /// Translate symbolic key names (cmux v2 contract) into raw bytes
@@ -1176,14 +1522,19 @@ public final class JSONRPCDispatcher {
     }
 
     private func dispatchManagedHostUnix(_ req: JSONRPCRequest) async -> JSONRPCResponse {
+        let params = req.params ?? [:]
+        let peerReceiptMethod = params["method"]?.stringValue
+        let isPeerReceiptStatus = req.method == "bot.peer.receipt.status"
+            || (req.method == "bot.receipt.status"
+                && peerReceiptMethod.map(Self.managedPeerReceiptMethods.contains) == true)
         let isPeer = req.method == "bot.peer.list"
             || req.method == "bot.peer.ask"
             || req.method == "bot.peer.self_config"
+            || isPeerReceiptStatus
         let isHost = RemoteCodeHostCatalog.rpcMethods.contains(req.method)
         guard isPeer || isHost else {
             return await dispatchLocalIPC(req)
         }
-        let params = req.params ?? [:]
         // Peer consultation/self-configuration is already constrained by the
         // exact bearer and Bot grant. It remains available to supervised runs;
         // only host catalog mutations require full-access admission.
@@ -1196,6 +1547,39 @@ public final class JSONRPCDispatcher {
             return .init(id: req.id, error: Self.mapDomainError(error, method: req.method))
         }
         return await Self.$managedProviderSocketAuthenticated.withValue(true) {
+            if Self.managedPeerReceiptMethods.contains(req.method) || isPeerReceiptStatus {
+                let context: MutationRequestContext
+                do {
+                    context = try managedPeerMutationContext(params)
+                } catch let error as JSONRPCError {
+                    return .init(id: req.id, error: error)
+                } catch {
+                    return .init(id: req.id, error: Self.mapDomainError(error, method: req.method))
+                }
+                if isPeerReceiptStatus {
+                    return commandReceiptStatus(
+                        req,
+                        context: context,
+                        allowedMethods: Self.managedPeerReceiptMethods,
+                        includeCommittedResult: true,
+                        peerIdentity: params
+                    )
+                }
+                guard let clientRequestId = params["client_request_id"]?.stringValue?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                      !clientRequestId.isEmpty else {
+                    return .init(id: req.id, error: JSONRPCError(
+                        code: -32097,
+                        message: "Mutation requires a non-empty client_request_id."
+                    ))
+                }
+                RemoteCodeHostCatalogDiagnostics.receipt(
+                    decision: "claim",
+                    method: req.method,
+                    operationID: clientRequestId
+                )
+                return await dispatchRemoteMutation(req, context: context)
+            }
             if isHost, RemoteCodeHostCatalog.rpcMutationMethods.contains(req.method) {
                 guard let clientRequestId = params["client_request_id"]?.stringValue?
                     .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1227,6 +1611,51 @@ public final class JSONRPCDispatcher {
             }
             return await dispatchLocalIPC(req)
         }
+    }
+
+    private func managedPeerMutationContext(
+        _ params: [String: JSONValue]
+    ) throws -> MutationRequestContext {
+        guard let threadUUID = params["thread_id"]?.stringValue.flatMap(UUID.init),
+              let runUUID = params["run_id"]?.stringValue.flatMap(UUID.init),
+              let capability = params[BotPeerDelegation.capabilityRPCParameterKey]?.stringValue,
+              !capability.isEmpty else {
+            throw JSONRPCError(code: -32047, message: "Host catalog requires an authenticated active run.")
+        }
+        let threadID = AgentThreadID(threadUUID)
+        let runID = AgentRunID(runUUID)
+        guard let active = try router.activeAgentDelegation(thread: threadID, run: runID),
+              active.threadId == threadID,
+              active.runId == runID,
+              active.capability == capability,
+              active.expiresAt > Date() else {
+            throw JSONRPCError(code: -32047, message: "Host catalog requires an authenticated active run.")
+        }
+        return MutationRequestContext(
+            ownerFingerprint: Self.managedPeerOwnerFingerprint(
+                hostID: active.hostId,
+                threadID: threadUUID.uuidString.lowercased(),
+                runID: runUUID.uuidString.lowercased(),
+                capability: capability
+            ),
+            hostId: active.hostId,
+            bootEpoch: 0
+        )
+    }
+
+    nonisolated static func managedPeerOwnerFingerprint(
+        hostID: String,
+        threadID: String,
+        runID: String,
+        capability: String
+    ) -> String {
+        AgentMessageTransport.bodySHA256Hex(
+            "peer-receipt-v1\u{0}\(hostID)\u{0}\(threadID.lowercased())\u{0}\(runID.lowercased())\u{0}\(capability)"
+        )
+    }
+
+    private nonisolated static func managedPeerDelegationFingerprint(_ capability: String) -> String {
+        AgentMessageTransport.bodySHA256Hex("peer-delegation-v1\u{0}\(capability)")
     }
 
     private func authenticateManagedHostParams(
@@ -1280,15 +1709,13 @@ public final class JSONRPCDispatcher {
            !Self.managedProviderSocketAuthenticated {
             return .init(id: req.id, error: .methodNotFound)
         }
-        // Paired Bot remote-control keeps its own receipts. Do not strip
-        // client_request_id through the host-mutation ledger or create
-        // lands in commandOutcomeUnknown / methodNotFound.
-        if req.method.hasPrefix("bot."), !req.method.hasPrefix("bot.peer.") {
-            return await dispatchCore(req)
-        }
         guard let mutationContext else { return await dispatchCore(req) }
         if req.method == "command.receipt.status" {
-            return commandReceiptStatus(req, context: mutationContext)
+            return commandReceiptStatus(
+                req,
+                context: mutationContext,
+                allowedMethods: Self.hostMutationMethods
+            )
         }
         guard Self.hostMutationMethods.contains(req.method) else {
             return await dispatchCore(req)
@@ -1307,7 +1734,24 @@ public final class JSONRPCDispatcher {
                 message: "Mutation requires a non-empty client_request_id."
             ))
         }
-        let businessParams = HostMutationContract.businessParams(params)
+        var businessParams = HostMutationContract.businessParams(params)
+        if req.method.hasPrefix("bot."), !req.method.hasPrefix("bot.peer.") {
+            // Paired Bot authority owns a second, user-visible receipt. Preserve
+            // its request identity while the Phase 4 ledger supplies response-
+            // loss safety, and inject the authenticated host binding rather
+            // than accepting a client-declared host id.
+            businessParams["client_request_id"] = .string(clientRequestId)
+            businessParams["host_id"] = .string(context.hostId)
+        } else if req.method == "private.push_token.update" {
+            if let declaredHost = businessParams["server_id"]?.stringValue,
+               declaredHost != context.hostId {
+                return .init(id: req.id, error: JSONRPCError(
+                    code: -32098,
+                    message: "Push registration host does not match the authenticated host."
+                ))
+            }
+            businessParams["authenticated_host_id"] = .string(context.hostId)
+        }
         do {
             try HostMutationContract.preflight(method: req.method, params: businessParams)
         } catch let error as JSONRPCError {
@@ -1481,11 +1925,19 @@ public final class JSONRPCDispatcher {
             )
         }
 
+        var executionParams = businessParams
+        if Self.managedPeerReceiptMethods.contains(req.method),
+           let capability = params[BotPeerDelegation.capabilityRPCParameterKey] {
+            // The domain authority verifies the same live bearer again. It is
+            // execution-only: paramsHash and durable receipt storage use the
+            // stripped business params plus digest-only owner identity.
+            executionParams[BotPeerDelegation.capabilityRPCParameterKey] = capability
+        }
         let businessRequest = JSONRPCRequest(
             jsonrpc: req.jsonrpc,
             id: req.id,
             method: req.method,
-            params: businessParams
+            params: executionParams
         )
         let eventSink: EventBus.MutationEventSink? = Self.durableSynchronousMutationMethods.contains(req.method)
             ? EventBus.MutationEventSink()
@@ -1535,6 +1987,14 @@ public final class JSONRPCDispatcher {
                 requiresSnapshot: true
             )
         }
+        let committedResult = peerReceiptResult(
+            result,
+            method: req.method,
+            clientRequestId: clientRequestId,
+            context: context,
+            params: params
+        )
+        let successfulResponse = JSONRPCResponse(id: req.id, result: committedResult)
         let finalizationStarted = DispatchTime.now().uptimeNanoseconds
         do {
             if let eventSink {
@@ -1545,7 +2005,7 @@ public final class JSONRPCDispatcher {
                         clientRequestId: clientRequestId,
                         ownerFingerprint: context.ownerFingerprint,
                         paramsHash: paramsHash,
-                        result: result,
+                        result: committedResult,
                         events: events,
                         minimumEventSequence: minimumEventSequence
                     )
@@ -1556,14 +2016,14 @@ public final class JSONRPCDispatcher {
                     clientRequestId: clientRequestId,
                     ownerFingerprint: context.ownerFingerprint,
                     paramsHash: paramsHash,
-                    result: result
+                    result: committedResult
                 )
             }
             commandReceiptMetrics.recordFinalization(
                 success: true,
                 latencyMilliseconds: Self.elapsedMilliseconds(since: finalizationStarted)
             )
-            return response
+            return successfulResponse
         } catch {
             commandReceiptMetrics.recordFinalization(
                 success: false,
@@ -1639,14 +2099,41 @@ public final class JSONRPCDispatcher {
         return nil
     }
 
+    private func peerReceiptResult(
+        _ result: JSONValue,
+        method: String,
+        clientRequestId: String,
+        context: MutationRequestContext,
+        params: [String: JSONValue]
+    ) -> JSONValue {
+        guard Self.managedPeerReceiptMethods.contains(method),
+              var object = result.objectValue,
+              let threadID = params["thread_id"]?.stringValue,
+              let runID = params["run_id"]?.stringValue,
+              let capability = params[BotPeerDelegation.capabilityRPCParameterKey]?.stringValue else {
+            return result
+        }
+        object["command_receipt"] = .object([
+            "client_request_id": .string(clientRequestId),
+            "host_id": .string(context.hostId),
+            "caller_thread_id": .string(threadID.lowercased()),
+            "caller_run_id": .string(runID.lowercased()),
+            "delegation_fingerprint": .string(Self.managedPeerDelegationFingerprint(capability)),
+        ])
+        return .object(object)
+    }
+
     private func commandReceiptStatus(
         _ req: JSONRPCRequest,
-        context: MutationRequestContext
+        context: MutationRequestContext,
+        allowedMethods: Set<String>,
+        includeCommittedResult: Bool = false,
+        peerIdentity: [String: JSONValue]? = nil
     ) -> JSONRPCResponse {
         let params = req.params ?? [:]
         guard let clientRequestId = mutationIdentity(params: params, context: context),
               let method = params["method"]?.stringValue,
-              Self.hostMutationMethods.contains(method),
+              allowedMethods.contains(method),
               let receiptRouter = router as? CommandReceiptStateRouting else {
             return .init(id: req.id, error: .invalidParams)
         }
@@ -1688,13 +2175,39 @@ public final class JSONRPCDispatcher {
         case .legacyUnverifiable: values = ("legacyUnverifiable", false, true)
         case .ownerMismatch: fatalError("handled above")
         }
-        return .init(id: req.id, result: .object([
+        var result: [String: JSONValue] = [
             "status": .string(values.0),
             "method": .string(method),
             "clientRequestId": .string(clientRequestId),
             "retryable": .bool(values.1),
             "requiresSnapshot": .bool(values.2),
-        ]))
+        ]
+        if let peerIdentity {
+            if let threadID = peerIdentity["thread_id"]?.stringValue {
+                result["caller_thread_id"] = .string(threadID.lowercased())
+            }
+            if let runID = peerIdentity["run_id"]?.stringValue {
+                result["caller_run_id"] = .string(runID.lowercased())
+            }
+        }
+        if includeCommittedResult, status == .committed {
+            guard let committed = router.commandReceipt(
+                method: method,
+                clientRequestId: clientRequestId
+            ) else {
+                return receiptFailure(
+                    id: req.id,
+                    code: -32092,
+                    reason: "legacyReceiptUnverifiable",
+                    method: method,
+                    clientRequestId: clientRequestId,
+                    retryable: false,
+                    requiresSnapshot: true
+                )
+            }
+            result["result"] = committed
+        }
+        return .init(id: req.id, result: .object(result))
     }
 
     /// HTTP-authoritative mutation identity.
@@ -1866,6 +2379,7 @@ public final class JSONRPCDispatcher {
                             .string("files.tab.split"),
                             .string("files.state.get"),
                             .string("files.state.update"),
+                            .string("files.edit.session"),
                             .string("files.edit.open"),
                             .string("files.edit.apply_patch"),
                             .string("files.edit.save"),
@@ -2099,6 +2613,9 @@ public final class JSONRPCDispatcher {
                 guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let patch = params["patch"]?.objectValue else { throw JSONRPCError.invalidParams }
                 return .init(id: id, result: try router.filesStateUpdate(surface: sid, patch: patch, baseRevision: params["base_revision"]?.intValue, deviceID: params["device_id"]?.stringValue))
+            case "files.edit.session":
+                guard let sessionID = params["session_id"]?.stringValue else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.filesEditSession(sessionID: sessionID))
             case "files.edit.open":
                 guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let path = params["path"]?.stringValue else { throw JSONRPCError.invalidParams }
@@ -3171,11 +3688,13 @@ public final class JSONRPCDispatcher {
                     }
                     let events = eventLimit.map { Array(snapshot.events.suffix($0)) }
                         ?? snapshot.events
-                    return .init(id: id, result: .object([
+                    var payload: [String: JSONValue] = [
                         "events": encode(events),
                         "event_watermark": .number(Double(snapshot.eventWatermark)),
                         "events_truncated": .bool(events.count < snapshot.events.count)
-                    ]))
+                    ]
+                    appendActiveDelegation(to: &payload, thread: tid)
+                    return .init(id: id, result: .object(payload))
                 }
                 return .init(id: id, result: encode(try await router.readAgentThreadEvents(thread: tid)))
             case "agent.thread.rollback":
@@ -3742,6 +4261,10 @@ public final class JSONRPCDispatcher {
                       let pushTokenType = params["push_token_type"]?.stringValue,
                       pushTokenType == "apns" || pushTokenType == "fcm" else { throw JSONRPCError.invalidParams }
                 let tokenPurpose = params["token_purpose"]?.stringValue
+                let profileID = params["profile_id"]?.stringValue
+                let authenticatedHostID = params["authenticated_host_id"]?.stringValue
+                var boundProfileID: String?
+                var boundHostID: String?
                 let environment = params["environment"]?.stringValue
                 let serverID = params["server_id"]?.stringValue
                 let bootEpoch = params["boot_epoch"]?.intValue
@@ -3797,7 +4320,7 @@ public final class JSONRPCDispatcher {
                         throw JSONRPCError.invalidParams
                     }
                 }
-                let result = try router.privatePushTokenUpdate(
+                var result = try router.privatePushTokenUpdate(
                     pushToken: pushToken,
                     pushTokenType: pushTokenType,
                     liveActivityToken: params["live_activity_token"]?.stringValue,
@@ -3813,9 +4336,30 @@ public final class JSONRPCDispatcher {
                     contractVersion: contractVersion,
                     capabilities: capabilities
                 )
+                if tokenPurpose == nil || tokenPurpose == "alert", let profileID {
+                    guard !profileID.isEmpty,
+                          let authenticatedHostID, !authenticatedHostID.isEmpty,
+                          let deviceID = params["device_id"]?.stringValue, !deviceID.isEmpty else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    try router.bindBotAttentionProfile(
+                        profileID: profileID,
+                        hostID: authenticatedHostID,
+                        deviceID: deviceID
+                    )
+                    boundProfileID = profileID
+                    boundHostID = authenticatedHostID
+                    var readback = result.objectValue ?? [:]
+                    readback["profile_id"] = .string(profileID)
+                    readback["host_id"] = .string(authenticatedHostID)
+                    readback["device_id"] = .string(deviceID)
+                    result = .object(readback)
+                }
                 EventBus.shared.publish(kind: "private.push_token.updated", payload: .object([
                     "push_token_type": .string(pushTokenType),
                     "device_id": params["device_id"] ?? .null,
+                    "profile_id": boundProfileID.map(JSONValue.string) ?? .null,
+                    "host_id": boundHostID.map(JSONValue.string) ?? .null,
                     "token_purpose": tokenPurpose.map(JSONValue.string) ?? .null,
                     "environment": environment.map(JSONValue.string) ?? .null
                 ]))
@@ -4041,7 +4585,7 @@ public final class JSONRPCDispatcher {
         "events.recent", "settings.get", "token_saver.digest.get",
         "ssh.host.list", "ssh.files.local.list", "ssh.files.remote.list",
         "fs.roots", "fs.list", "fs.workspace.list", "fs.workspace.read", "fs.workspace.preview_url",
-        "files.state.get",
+        "files.state.get", "files.edit.session",
         "workspace.list", "workspace.current",
         "surface.health", "surface.read_text", "surface.read_history",
         "agent.thread.list", "agent.message.queue.list", "agent.plan.notes.get",
@@ -4339,6 +4883,36 @@ public final class JSONRPCDispatcher {
         // Live Activity while the pet is correct — force the wire status to
         // running whenever we advertise a host-owned active_run_id.
         object["status"] = .string(AgentRunStatus.running.rawValue)
+    }
+
+    /// Raw delegation authority is added only to non-mutating active-run
+    /// readback. Mutation receipts must never persist or replay this bearer.
+    private func appendActiveDelegation(
+        to object: inout [String: JSONValue],
+        thread: AgentThreadID
+    ) {
+        guard let active = try? router.activeAgentRun(thread: thread),
+              let delegation = try? router.activeAgentDelegation(
+                thread: thread,
+                run: active.runId
+              ),
+              delegation.threadId == thread,
+              delegation.runId == active.runId,
+              !delegation.capability.isEmpty,
+              delegation.expiresAt > Date() else {
+            return
+        }
+        object["delegation_capability"] = .string(delegation.capability)
+        object["delegation_thread_id"] = .string(
+            delegation.threadId.value.uuidString.lowercased()
+        )
+        object["delegation_run_id"] = .string(
+            delegation.runId.value.uuidString.lowercased()
+        )
+        object["delegation_host_id"] = .string(delegation.hostId)
+        object["delegation_expires_at_ms"] = .number(Double(
+            Int64(delegation.expiresAt.timeIntervalSince1970 * 1_000)
+        ))
     }
 
     private func messageSendResultPayload(_ result: AgentMessageSendResult) -> JSONValue {

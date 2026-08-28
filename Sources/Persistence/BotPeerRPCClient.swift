@@ -20,6 +20,13 @@ enum BotPeerRPCError: Error, CustomStringConvertible, Equatable {
         case .remote(let message): return message
         }
     }
+
+    var requiresReceiptReconciliation: Bool {
+        switch self {
+        case .socket, .timeout, .invalidResponse: return true
+        case .missingContext, .invalidContext, .remote: return false
+        }
+    }
 }
 
 /// Blocking Unix-socket client used by the stdio MCP subprocess. The provider
@@ -31,6 +38,9 @@ enum BotPeerRPCError: Error, CustomStringConvertible, Equatable {
 /// operations use the short host budget.
 struct BotPeerRPCClient {
     static let maximumResponseBytes = 2 * 1_024 * 1_024
+    private static let durablePeerMethods: Set<String> = [
+        "bot.peer.ask", "bot.peer.self_config",
+    ]
 
     enum Budget: String, Equatable, Sendable {
         case peerConsultation
@@ -70,6 +80,53 @@ struct BotPeerRPCClient {
         if let capability = context.capability {
             params[BotPeerDelegation.capabilityRPCParameterKey] = capability
         }
+
+        guard Self.durablePeerMethods.contains(method) else {
+            return try callOnce(method: method, params: params, context: context, budget: budget)
+        }
+        let clientRequestID = UUID().uuidString.lowercased()
+        params["client_request_id"] = clientRequestID
+        do {
+            return try callOnce(method: method, params: params, context: context, budget: budget)
+        } catch let initialError as BotPeerRPCError {
+            guard initialError.requiresReceiptReconciliation else { throw initialError }
+            var statusParams: [String: Any] = [
+                "method": method,
+                "client_request_id": clientRequestID,
+                "thread_id": context.threadID,
+                "run_id": context.runID,
+            ]
+            if let capability = context.capability {
+                statusParams[BotPeerDelegation.capabilityRPCParameterKey] = capability
+            }
+            let statusMethod = method == "bot.peer.ask"
+                ? "bot.peer.receipt.status"
+                : "bot.receipt.status"
+            guard let statusResult = try? callOnce(
+                method: statusMethod,
+                params: statusParams,
+                context: context,
+                budget: .hostOperation
+            ),
+                  let status = statusResult as? [String: Any],
+                  status["status"] as? String == "committed",
+                  status["method"] as? String == method,
+                  status["clientRequestId"] as? String == clientRequestID,
+                  status["caller_thread_id"] as? String == context.threadID.lowercased(),
+                  status["caller_run_id"] as? String == context.runID.lowercased(),
+                  let result = status["result"] else {
+                throw initialError
+            }
+            return result
+        }
+    }
+
+    private func callOnce(
+        method: String,
+        params: [String: Any],
+        context: (socketPath: String, threadID: String, runID: String, capability: String?),
+        budget: Budget
+    ) throws -> Any {
 
         let request: [String: Any] = [
             "jsonrpc": "2.0",

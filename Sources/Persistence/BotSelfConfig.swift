@@ -347,11 +347,21 @@ public struct BotSelfConfigService: Sendable {
     }
 
     public let callerBotID: BotID
+    public let callerThreadID: AgentThreadID?
+    public let callerRunID: AgentRunID?
     public let store: BotStore
     public let appSupportDirectory: URL
 
-    public init(callerBotID: BotID, store: BotStore, appSupportDirectory: URL? = nil) {
+    public init(
+        callerBotID: BotID,
+        callerThreadID: AgentThreadID? = nil,
+        callerRunID: AgentRunID? = nil,
+        store: BotStore,
+        appSupportDirectory: URL? = nil
+    ) {
         self.callerBotID = callerBotID
+        self.callerThreadID = callerThreadID
+        self.callerRunID = callerRunID
         self.store = store
         self.appSupportDirectory = appSupportDirectory ?? Self.resolvedAppSupportDirectory(botID: callerBotID)
     }
@@ -363,7 +373,33 @@ public struct BotSelfConfigService: Sendable {
         let override = environment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let directory = override.flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
-        return BotSelfConfigService(callerBotID: caller, store: store, appSupportDirectory: directory)
+        let threadUUID = try contextUUID(
+            environment[BotPeerDelegation.threadEnvironmentKey],
+            key: BotPeerDelegation.threadEnvironmentKey
+        )
+        let runUUID = try contextUUID(
+            environment[BotPeerDelegation.runEnvironmentKey],
+            key: BotPeerDelegation.runEnvironmentKey
+        )
+        guard (threadUUID == nil) == (runUUID == nil) else {
+            throw BotSelfConfigError.invalid("Bot self-config requires matching thread and run context.")
+        }
+        return BotSelfConfigService(
+            callerBotID: caller,
+            callerThreadID: threadUUID.map(AgentThreadID.init),
+            callerRunID: runUUID.map(AgentRunID.init),
+            store: store,
+            appSupportDirectory: directory
+        )
+    }
+
+    private static func contextUUID(_ raw: String?, key: String) throws -> UUID? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let uuid = UUID(uuidString: trimmed) else {
+            throw BotSelfConfigError.invalid("Bot self-config received invalid \(key).")
+        }
+        return uuid
     }
 
     static func resolvedAppSupportDirectory(botID: BotID) -> URL {
@@ -580,7 +616,16 @@ public struct BotSelfConfigService: Sendable {
         }
         let text = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw BotSelfConfigError.invalid("question is required.") }
-        let conversation = try store.listConversations(botID: callerBotID).first
+        let conversation: BotConversation?
+        if let callerThreadID {
+            guard let linked = try store.conversationLinked(to: callerThreadID) else {
+                throw BotSelfConfigError.notFound
+            }
+            guard linked.botID == callerBotID else { throw BotSelfConfigError.crossBot }
+            conversation = linked
+        } else {
+            conversation = try store.listConversations(botID: callerBotID).first
+        }
         let item = BotAttentionItem(
             botID: callerBotID,
             conversationID: conversation?.id,
@@ -595,12 +640,17 @@ public struct BotSelfConfigService: Sendable {
             next.updatedAt = Date()
             try store.upsertConversation(next)
         }
-        return [
+        var result: [String: Any] = [
             "asked": true,
             "question": text,
             "attention_id": item.id.value.uuidString.lowercased(),
             "next": "End this turn. The user will answer in the next message.",
         ]
+        if let callerThreadID, let callerRunID {
+            result["thread_id"] = callerThreadID.value.uuidString.lowercased()
+            result["run_id"] = callerRunID.value.uuidString.lowercased()
+        }
+        return result
     }
 
     public func invoke(name: String, arguments: [String: Any] = [:]) throws -> [String: Any] {

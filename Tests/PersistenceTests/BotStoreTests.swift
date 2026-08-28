@@ -671,18 +671,35 @@ final class BotStoreTests: XCTestCase {
         XCTAssertEqual(try reopened.listMemory(botID: created.id).map(\.content), ["Keep it short"])
     }
 
-    func test_deleteRemovesConversationsAndRoutinesFromLiveRoster_butKeepsAttention() throws {
-        let bot = try store.create(name: "Piper", title: "", description: "", provider: .claude)
-        try store.upsertConversation(BotConversation(botID: bot.id, title: "Chat"))
-        let routine = BotRoutineDefinition(botID: bot.id, name: "Ping", prompt: "Ping")
+    func test_deleteAcknowledgesOnlyThatBotsAttention_becauseDeletedWorkCannotStayActionable() throws {
+        let deleted = try store.create(name: "Piper", title: "", description: "", provider: .claude)
+        let survivor = try store.create(name: "Quinn", title: "", description: "", provider: .grok)
+        try store.upsertConversation(BotConversation(botID: deleted.id, title: "Chat"))
+        let routine = BotRoutineDefinition(botID: deleted.id, name: "Ping", prompt: "Ping")
         try store.saveRoutine(routine)
-        try store.upsertAttention(BotAttentionItem(botID: bot.id, kind: .handoff, title: "Need you"))
+        let deletedQuestion = BotAttentionItem(
+            botID: deleted.id,
+            kind: .question,
+            title: "Which workspace?"
+        )
+        let survivorQuestion = BotAttentionItem(
+            botID: survivor.id,
+            kind: .question,
+            title: "Which branch?"
+        )
+        try store.upsertAttention(deletedQuestion)
+        try store.upsertAttention(survivorQuestion)
+        let deletedAt = Date(timeIntervalSince1970: 1_700_000_500)
 
-        try store.delete(id: bot.id)
+        try store.delete(id: deleted.id, now: deletedAt)
 
-        XCTAssertTrue(try store.listConversations(botID: bot.id).isEmpty)
-        XCTAssertTrue(try store.listRoutines(botID: bot.id).isEmpty)
-        XCTAssertEqual(try store.listAttention().map(\.title), ["Need you"])
+        XCTAssertTrue(try store.listConversations(botID: deleted.id).isEmpty)
+        XCTAssertTrue(try store.listRoutines(botID: deleted.id).isEmpty)
+        XCTAssertEqual(try store.listAttention().map(\.id), [survivorQuestion.id])
+        let audit = try store.listAttention(includeAcknowledged: true)
+        XCTAssertEqual(Set(audit.map(\.id)), Set([deletedQuestion.id, survivorQuestion.id]))
+        XCTAssertEqual(audit.first { $0.id == deletedQuestion.id }?.acknowledgedAt, deletedAt)
+        XCTAssertNil(audit.first { $0.id == survivorQuestion.id }?.acknowledgedAt)
     }
 
     func test_createWithoutHandleUniquesDerivedHandle_becauseRepeatedNewAgentMustNotCollide() throws {
