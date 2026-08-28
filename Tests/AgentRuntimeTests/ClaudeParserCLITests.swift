@@ -660,6 +660,22 @@ final class ClaudeParserCLITests: XCTestCase {
         }, "elicitation must not open a tool permission card")
     }
 
+    /// CLAUDE-CLI-013: request_user_dialog must not be dropped (CLI parks until response).
+    func test_controlRequestUserDialogOpensUserInput() {
+        let line = #"{"type":"control_request","request_id":"req-dialog-1","request":{"subtype":"request_user_dialog","dialog_kind":"computer_use_approval","payload":{"reason":"grant screen access"}}}"#
+        let evs = ClaudeParser().parseLine(line)
+        let request = evs.compactMap { event -> AssistantUserInputRequest? in
+            if case .userInputRequested(let request) = event { return request }
+            return nil
+        }.first
+        XCTAssertEqual(request?.id, "req-dialog-1")
+        XCTAssertEqual(request?.prompt, "Claude requested dialog: computer_use_approval")
+        XCTAssertTrue(evs.allSatisfy {
+            if case .requestOpened = $0 { return false }
+            return true
+        }, "request_user_dialog must not open a tool permission card")
+    }
+
     /// CLAUDE-CLI-008: control_cancel_request settles both approval and user-input pending.
     func test_controlCancelRequestResolvesPendingApprovalAndUserInput() {
         let line = #"{"type":"control_cancel_request","request_id":"req-cancel-me"}"#

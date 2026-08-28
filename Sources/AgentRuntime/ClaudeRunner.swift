@@ -281,7 +281,8 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             args.append(contentsOf: ["--permission-mode", "plan"])
         } else {
             switch request.permissionMode {
-            case .supervised: args.append(contentsOf: ["--permission-mode", "default"])
+            // CLI 2.1.250+ help lists `manual` (`default` remains an accepted alias).
+            case .supervised: args.append(contentsOf: ["--permission-mode", "manual"])
             case .autoAcceptEdits: args.append(contentsOf: ["--permission-mode", "acceptEdits"])
             case .fullAccess: args.append(contentsOf: ["--permission-mode", "bypassPermissions"])
             }
@@ -324,10 +325,16 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             args.append(contentsOf: ["--permission-mode", "plan"])
         } else {
             switch request.permissionMode {
-            case .supervised: args.append(contentsOf: ["--permission-mode", "default"])
+            // CLI 2.1.250+ help lists `manual` (`default` remains an accepted alias).
+            case .supervised: args.append(contentsOf: ["--permission-mode", "manual"])
             case .autoAcceptEdits: args.append(contentsOf: ["--permission-mode", "acceptEdits"])
             case .fullAccess: args.append(contentsOf: ["--permission-mode", "bypassPermissions"])
             }
+        }
+        // CLAUDE-CLI-014: non-image attachments outside cwd need --add-dir so Read/Edit
+        // can touch those parent directories. Images ride base64 content blocks instead.
+        for dir in extraAddDirs(cwd: request.cwd, attachments: request.attachments) {
+            args.append(contentsOf: ["--add-dir", dir])
         }
         // UX-MAC_AGENT-BG-AWAIT: always make the agent self-declare a background-await
         // stall with `awaitingMarker` so the host recovers it regardless of phrasing.
@@ -347,6 +354,29 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         args.append(contentsOf: ["--append-system-prompt", appendedSystemPrompt])
         args.append(contentsOf: extraArgsWithoutSettings(request.extraArgs))
         return args
+    }
+
+    /// Parent directories for non-image attachments that live outside `cwd`.
+    /// Sorted + de-duplicated so argv stays stable for tests.
+    nonisolated static func extraAddDirs(cwd: String, attachments: [AgentAttachment]) -> [String] {
+        guard !attachments.isEmpty else { return [] }
+        let cwdPath = URL(fileURLWithPath: cwd).resolvingSymlinksInPath().standardizedFileURL.path
+        var dirs = Set<String>()
+        for attachment in attachments {
+            let mime = attachment.mimeType ?? ""
+            let isImage = attachment.kind == .image || mime.hasPrefix("image/")
+            if isImage { continue }
+            let parent = URL(fileURLWithPath: attachment.path)
+                .resolvingSymlinksInPath()
+                .deletingLastPathComponent()
+                .standardizedFileURL
+            let parentPath = parent.path
+            guard !parentPath.isEmpty else { continue }
+            if parentPath == cwdPath { continue }
+            if parentPath.hasPrefix(cwdPath.hasSuffix("/") ? cwdPath : cwdPath + "/") { continue }
+            dirs.insert(parentPath)
+        }
+        return dirs.sorted()
     }
 
     /// Claude Code does not discover `mcpServers` from settings.json. Admit the

@@ -864,6 +864,16 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         let isForeignUser = request.runAsUser.map { $0.uid != getuid() } == true
+        let thinkingEnvironment = ClaudeRunner.thinkingEnvironment(request.environment)
+        let baseEnv = CodexRunner.processEnvironment(overrides: thinkingEnvironment, purpose: .agentTurn(.claude))
+        // CLAUDE-SDK-003: the bridge launches the live `claude` binary via
+        // pathToClaudeCodeExecutable, so the same headless mcp-needs-auth cache
+        // gate applies. Clear it with the same safeguards as the CLI adapter.
+        ClaudeMCPAuthCacheReset.resetAndLog(
+            home: baseEnv["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path,
+            isForeignUser: isForeignUser,
+            environment: baseEnv
+        )
         let askpass = isForeignUser
             ? RunAsUserProcessBootstrap.materializeAskpass(targetUser: request.runAsUser!.shortName)
             : nil
@@ -872,7 +882,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             executablePath: node,
             arguments: [bridgeScriptPath] + request.extraArgs,
             currentDirectory: request.cwd,
-            environment: ClaudeRunner.thinkingEnvironment(request.environment),
+            environment: thinkingEnvironment,
             runAsUser: request.runAsUser,
             askpassPath: askpass
         )

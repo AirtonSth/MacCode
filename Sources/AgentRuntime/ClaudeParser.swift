@@ -459,6 +459,21 @@ public final class ClaudeParser {
                     if let request = userInputRequest(from: flattened, now: now) {
                         out.append(.userInputRequested(request))
                     }
+                } else if subtype == "request_user_dialog" {
+                    // CLAUDE-CLI-013: tool-driven blocking dialogs (e.g. computer_use_approval).
+                    // Surface as user-input so the host can answer; never drop silently
+                    // (CLI parks the turn until control_response or timeout).
+                    var flattened = inner
+                    if let rid = envelopeId {
+                        flattened["request_id"] = rid
+                    }
+                    let kind = stringValue(inner["dialog_kind"]) ?? stringValue(inner["dialogKind"]) ?? "dialog"
+                    if flattened["prompt"] == nil && flattened["message"] == nil && flattened["title"] == nil {
+                        flattened["prompt"] = "Claude requested dialog: \(kind)"
+                    }
+                    if let request = userInputRequest(from: flattened, now: now) {
+                        out.append(.userInputRequested(request))
+                    }
                 }
             }
         case "control_cancel_request":
