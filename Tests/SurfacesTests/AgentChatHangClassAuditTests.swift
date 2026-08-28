@@ -61,6 +61,7 @@ final class AgentChatHangClassAuditTests: XCTestCase {
     func test_lazyStacksDoNotHostTranscriptNSTextView() throws {
         let needles = [
             "AgentLinkedInlineTextRepresentable",
+            "AgentLinkedAttributedText(",
             "AgentLinkedInlineText(",
             "AgentSelectablePlainText(",
             "AgentMessageMarkdownView(",
@@ -81,6 +82,18 @@ final class AgentChatHangClassAuditTests: XCTestCase {
         XCTAssertTrue(
             dirty.isEmpty,
             "LazyVStack/HStack/Grid must not host transcript NSTextView cells: \(dirty.joined(separator: ", "))"
+        )
+        let diff = Self.codeWithoutComments(try Self.readRepoFile("Sources/Surfaces/DiffPanelSurface.swift"))
+        let linesView = diff.components(separatedBy: "private var diffLinesView").last ?? ""
+        XCTAssertFalse(
+            linesView.contains("AgentLinkedAttributedText(")
+                || linesView.contains("AgentSelectablePlainText(")
+                || linesView.contains("AgentLinkedInlineText("),
+            "diff find-line LazyVStack must stay SwiftUI Text, not NSTextView cells"
+        )
+        XCTAssertTrue(
+            linesView.contains("Text(lineText)"),
+            "diff find-line rows must be SwiftUI Text so LazyVStack stays safe"
         )
     }
 
