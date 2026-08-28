@@ -313,6 +313,117 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(coldWire, wireRequest)
     }
 
+    func test_tokenSaverCompiledBotBrainUsesCanonicalProviderContentAfterAdmission() async throws {
+        // WHY: Token Saver selection belongs after Auto admission and must rank
+        // the complete compiled Bot brain. Compressing the human line first
+        // creates a brain whose user request is already a wire envelope, so the
+        // final provider runner cannot recover the original compiled request.
+        let context = try makeContext()
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
+        let configuration = try DistillServiceConfiguration(
+            authToken: "t016-canonical-brain-token",
+            appSupportDirectory: directory
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(
+                runtime: LocalDistillRuntime(),
+                maxConcurrentRequests: 2,
+                resultCacheCapacity: 0
+            ),
+            scopedRecoveryStore: DeskTokenSaverRecoveryStore(db: context.db)
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(
+            ready: ready,
+            authToken: "t016-canonical-brain-token"
+        )
+
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let hostRunner = ControlledBotHandoffRunner(provider: .grok)
+        let peerRunner = ControlledBotHandoffRunner(provider: .grok)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .grok,
+                models: [AgentModelDescriptor(id: "grok-4.6", label: "Grok 4.6", provider: .grok)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "grok"
+            ),
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let piper = try vm.create(name: "Piper", title: "Canonical Host", provider: .grok, model: "grok-4.6")
+        let quinn = try vm.create(name: "Quinn", title: "Canonical Peer", provider: .grok, model: "grok-4.6")
+        context.coordinator.replaceProvider(
+            .grok,
+            runner: CallerThreadHandoffRunner(hostRunner: hostRunner, peerRunners: [quinn.id: peerRunner])
+        )
+        vm.openDesk(piper)
+        vm.deskRouting = BotDeskRouting(
+            provider: .grok,
+            providerInstanceID: "grok",
+            model: "grok-4.6",
+            routingMode: .manual
+        )
+
+        let primaryHuman = String(
+            repeating: "T016 PRIMARY CANONICAL HUMAN must remain recoverable after the complete Bot brain is selected. ",
+            count: 90
+        )
+        XCTAssertTrue(vm.send(primaryHuman))
+        let primaryStarted = await waitUntil(timeout: 8) { hostRunner.requests.count == 1 }
+        XCTAssertTrue(primaryStarted, "the controlled final runner must receive the Desk primary")
+        let primaryRequest = try XCTUnwrap(hostRunner.requests.first)
+        XCTAssertEqual(primaryRequest.environment["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
+
+        let peerHuman = String(
+            repeating: "T016 NESTED CANONICAL HUMAN must remain recoverable after the peer Bot brain is selected. ",
+            count: 90
+        )
+        let peerCall = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: primaryRequest.threadId,
+                callerRun: primaryRequest.runId,
+                handle: quinn.handle,
+                prompt: peerHuman,
+                replyMode: .consult,
+                delegationCapability: primaryRequest.environment[
+                    AgentDelegationCapabilityTransport.environmentKey
+                ]
+            )
+        }
+        let peerStarted = await waitUntil(timeout: 8) { peerRunner.requests.count == 1 }
+        XCTAssertTrue(peerStarted, "the controlled final runner must receive the nested peer")
+        let peerRequest = try XCTUnwrap(peerRunner.requests.first)
+        XCTAssertTrue(peerRunner.finish(runID: peerRequest.runId, status: .completed, reply: "synthetic peer reply"))
+        _ = try await peerCall.value
+        XCTAssertTrue(hostRunner.finish(runID: primaryRequest.runId, status: .completed, reply: "synthetic host reply"))
+
+        func recoverProviderContent(_ prompt: String) -> String {
+            guard RCWireProtocol.isWire(prompt),
+                  let frames = try? RCWireProtocol.parse(prompt) else {
+                return prompt
+            }
+            return RCWireProtocol.renderEnglish(frames)
+        }
+        let finalProviderContents = [primaryRequest, peerRequest].map {
+            recoverProviderContent($0.prompt)
+        }
+        XCTAssertTrue(
+            finalProviderContents[0].contains("You are Piper")
+                && finalProviderContents[0].contains("Role: Canonical Host.")
+                && finalProviderContents[0].contains(primaryHuman)
+                && finalProviderContents[1].contains("You are Quinn")
+                && finalProviderContents[1].contains("Role: Canonical Peer.")
+                && finalProviderContents[1].contains(peerHuman),
+            "T016_FINAL_RUNNER_CANONICAL_BRAIN: primary and nested final runners must recover each complete uncompressed compiled Bot brain after admission"
+        )
+    }
+
     func test_deskFooterCalculatorMatchesAgentApp_onIdenticalInputs() {
         // WHY: Desk figures must be the Agent App calculator, not a second formula.
         let observation = TokenSaverThreadFooterReload.Observation(
