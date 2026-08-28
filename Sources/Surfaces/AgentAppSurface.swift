@@ -13594,35 +13594,18 @@ public struct AgentAppView: View {
                                 )
                                 .id("agent.transcript.revealControl")
                             }
-                            // Short histories stay mounted so scrolling tall,
-                            // self-sizing text rows cannot cross a Lazy rematerialization
-                            // boundary. Larger windows retain viewport virtualization.
-                            if Self.usesLazyTranscriptHistoryLayout(
-                                entryCount: historyRows.count,
-                                liveTurnActive: latestLiveId != nil
-                            ) {
-                                LazyVStack(alignment: .leading, spacing: 32) {
-                                    ForEach(historyRows) { row in
-                                        chatFlowRowView(
-                                            row,
-                                            columnWidth: timelineColumnWidth,
-                                            groupHeader: rowPaintContext.peerGroupHeader(for: row),
-                                            hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row)
-                                        )
-                                        .id(row.id)
-                                    }
-                                }
-                            } else {
-                                VStack(alignment: .leading, spacing: 32) {
-                                    ForEach(historyRows) { row in
-                                        chatFlowRowView(
-                                            row,
-                                            columnWidth: timelineColumnWidth,
-                                            groupHeader: rowPaintContext.peerGroupHeader(for: row),
-                                            hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row)
-                                        )
-                                        .id(row.id)
-                                    }
+                            // Never LazyVStack ChatFlowRow: pid 36908 hung in
+                            // LazySubviewPlacements even after liveTurnActive +
+                            // resetFittedSizeCache. Eager VStack is the policy.
+                            VStack(alignment: .leading, spacing: 32) {
+                                ForEach(historyRows) { row in
+                                    chatFlowRowView(
+                                        row,
+                                        columnWidth: timelineColumnWidth,
+                                        groupHeader: rowPaintContext.peerGroupHeader(for: row),
+                                        hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row)
+                                    )
+                                    .id(row.id)
                                 }
                             }
                             // Live streaming turns — eager, outside Lazy.
@@ -15386,8 +15369,8 @@ public struct AgentAppView: View {
                 // paintSlice caps at expandedPaintWindow — no nested ScrollView.
                 // Nested maxHeight ScrollView froze the live stream below the fold
                 // and stole the outer transcript pan (iOS). Keep this bounded
-                // inner list eager: nesting LazyVStack inside the transcript's
-                // LazyVStack can repeatedly place self-sizing text rows on scroll.
+                // inner list eager: nesting LazyVStack inside the transcript
+                // can repeatedly place self-sizing text rows on scroll.
                 VStack(alignment: .leading, spacing: DS.Space.lg) {
                     if slice.hiddenCount > 0 {
                         Button {

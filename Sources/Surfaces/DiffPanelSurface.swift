@@ -1938,8 +1938,8 @@ public struct DiffPanelView: View {
     }
 
     /// Cached per-line breakdown used while find is active. Each row carries
-    /// an id anchor so `ScrollViewReader` can jump to it. `LazyVStack` creates
-    /// only visible rows instead of eagerly materializing the whole preview.
+    /// an id anchor so `ScrollViewReader` can jump to it. `LazyVStack` is safe
+    /// here only because rows are SwiftUI `Text`, not self-sizing NSTextView.
     @ViewBuilder
     private var diffLinesView: some View {
         let currentLine = vm.findCurrentMatchLine ?? -1
@@ -1967,20 +1967,15 @@ public struct DiffPanelView: View {
                     }
                     return a
                 }()
-                AgentLinkedAttributedText(
-                    attributed: lineText,
-                    font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
-                    textColor: DS.NS.text,
-                    lineFragmentPadding: 0,
-                    lineSpacing: 0
-                )
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, DS.Space.lg)
-                .padding(.vertical, 0)
-                .background(isMatchLine
-                    ? DS.Palette.warning.opacity(0.25)
-                    : Color.clear)
-                .id("diff.line.\(idx)")
+                Text(lineText)
+                    .font(.system(size: 13, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, DS.Space.lg)
+                    .padding(.vertical, 0)
+                    .background(isMatchLine
+                        ? DS.Palette.warning.opacity(0.25)
+                        : Color.clear)
+                    .id("diff.line.\(idx)")
             }
         }
         .padding(.vertical, DS.Space.lg)
