@@ -12511,8 +12511,14 @@ public struct AgentAppView: View {
         return Array(entries.suffix(idleWindowCount))
     }
 
-    nonisolated static func usesLazyTranscriptHistoryLayout(entryCount: Int) -> Bool {
-        AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: entryCount)
+    nonisolated static func usesLazyTranscriptHistoryLayout(
+        entryCount: Int,
+        liveTurnActive: Bool = false
+    ) -> Bool {
+        AgentChatTimelineHistoryLayout.usesLazyLayout(
+            entryCount: entryCount,
+            liveTurnActive: liveTurnActive
+        )
     }
 
     /// Entries from the last user message (minus optional preceding context) to end.
@@ -13591,7 +13597,10 @@ public struct AgentAppView: View {
                             // Short histories stay mounted so scrolling tall,
                             // self-sizing text rows cannot cross a Lazy rematerialization
                             // boundary. Larger windows retain viewport virtualization.
-                            if Self.usesLazyTranscriptHistoryLayout(entryCount: historyRows.count) {
+                            if Self.usesLazyTranscriptHistoryLayout(
+                                entryCount: historyRows.count,
+                                liveTurnActive: latestLiveId != nil
+                            ) {
                                 LazyVStack(alignment: .leading, spacing: 32) {
                                     ForEach(historyRows) { row in
                                         chatFlowRowView(

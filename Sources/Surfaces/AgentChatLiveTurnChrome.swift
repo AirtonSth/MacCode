@@ -710,7 +710,13 @@ public struct AgentChatLiveItemRow: View {
                 .accessibilityIdentifier("bots.desk.thought.\(item.id)")
         case .assistantMessage:
             if !item.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                AgentChatAssistantReply(text: item.body)
+                if item.state == .streaming {
+                    AgentSelectablePlainText(text: item.body)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityIdentifier("bots.desk.role.assistant")
+                } else {
+                    AgentChatAssistantReply(text: item.body)
+                }
             }
         case .plan:
             VStack(alignment: .leading, spacing: DS.Space.xs) {

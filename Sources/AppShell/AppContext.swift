@@ -727,13 +727,19 @@ public final class AppContext {
         var createdAtMs: Int64
         var recordedInvocation: Bool = false
         var recordedExploration: Bool = false
+        /// True after a capped haystack was scanned with no Graphify match
+        /// (or the window filled without the substring). Later itemDelta must
+        /// not re-parse/split a growing body on the ACP parse queue.
+        var scannedNegative: Bool = false
 
         /// After the pending row exists, later command-text chunks are unused
         /// until finalize (detect already ran; answer tokens come from output).
         var isCommandBodyClosed: Bool {
-            recordedInvocation
-                && (recordedExploration
-                    || !GraphifyUsageDetector.isExplorationTool(summary: summary))
+            if recordedInvocation {
+                return recordedExploration
+                    || !GraphifyUsageDetector.isExplorationTool(summary: summary)
+            }
+            return scannedNegative
         }
     }
     private var graphifyItemBuffers: [String: GraphifyItemBuffer] = [:]
@@ -5538,7 +5544,9 @@ public final class AppContext {
             createdAtMs: createdAtMs
         )
         if let s = item.summary, !s.isEmpty { buf.summary = s }
-        if !item.body.isEmpty { buf.body = item.body }
+        if !item.body.isEmpty {
+            buf.body = GraphifyUsageDetector.cappedHaystack(item.body)
+        }
         if let o = item.output, !o.isEmpty { buf.output = o }
         graphifyItemBuffers[bufferKey] = buf
         graphifyItemBuffersLock.unlock()
@@ -5583,8 +5591,12 @@ public final class AppContext {
             // every itemDelta and processGraphifyBuffer copies it again just
             // to return. Result-phase output still accumulates for finalize.
             if !bodyClosed {
-                if let b = bodyAppend { existing.body += b }
-                if let o = outputAppend, !resultPhase { existing.body += o }
+                if let b = bodyAppend {
+                    existing.body = GraphifyUsageDetector.appendCapped(existing.body, b)
+                }
+                if let o = outputAppend, !resultPhase {
+                    existing.body = GraphifyUsageDetector.appendCapped(existing.body, o)
+                }
             }
             if let o = outputAppend, resultPhase { existing.output += o }
             graphifyItemBuffers[bufferKey] = existing
@@ -5609,7 +5621,9 @@ public final class AppContext {
             createdAtMs: nowMs
         )
         if let s = summary, !s.isEmpty { buf.summary = s }
-        if let b = bodyAppend { buf.body += b }
+        if let b = bodyAppend {
+            buf.body = GraphifyUsageDetector.appendCapped(buf.body, b)
+        }
         if let o = outputAppend {
             // Claude streams tool *input* as input_json_delta → outputAppend.
             // Real tool stdout for Claude is delivered as tool_result itemStarted
@@ -5620,7 +5634,7 @@ public final class AppContext {
             if resultPhase {
                 buf.output += o
             } else {
-                buf.body += o
+                buf.body = GraphifyUsageDetector.appendCapped(buf.body, o)
             }
         }
         graphifyItemBuffers[bufferKey] = buf
@@ -5678,6 +5692,7 @@ public final class AppContext {
         let createdAtMs = buf.createdAtMs
         let alreadyInvocation = buf.recordedInvocation
         let alreadyExploration = buf.recordedExploration
+        let alreadyNegative = buf.scannedNegative
         graphifyItemBuffersLock.unlock()
 
         // After a pending row is recorded, mid-stream deltas only grow the
@@ -5689,11 +5704,34 @@ public final class AppContext {
                 return
             }
         }
+        if alreadyNegative, !finalizeOutput {
+            if alreadyExploration
+                || !GraphifyUsageDetector.isExplorationTool(summary: summary) {
+                return
+            }
+        }
+
+        let cappedBody = GraphifyUsageDetector.cappedHaystack(body)
+        let mentionsGraphify = GraphifyUsageDetector.mentionsGraphify(cappedBody)
+            || GraphifyUsageDetector.mentionsGraphify(summary ?? "")
+        let windowFull = cappedBody.utf8.count >= GraphifyUsageDetector.maxHaystackUTF8Bytes
+        if !finalizeOutput, !mentionsGraphify, !windowFull,
+           !GraphifyUsageDetector.isExplorationTool(summary: summary) {
+            return
+        }
 
         graphifyDetectCountForTesting += 1
-        let combinedBody = GraphifyUsageDetector.commandText(fromBody: body)
-        let haystackBody = [body, combinedBody].joined(separator: "\n")
-        let invocations = GraphifyUsageDetector.detect(summary: summary, body: haystackBody)
+        let invocations = mentionsGraphify || finalizeOutput
+            ? GraphifyUsageDetector.detect(summary: summary, body: cappedBody)
+            : []
+        if invocations.isEmpty, !finalizeOutput, (mentionsGraphify || windowFull) {
+            graphifyItemBuffersLock.lock()
+            if var b = graphifyItemBuffers[bufferKey] {
+                b.scannedNegative = true
+                graphifyItemBuffers[bufferKey] = b
+            }
+            graphifyItemBuffersLock.unlock()
+        }
         // Exploration name is known on tool_use; result summary is often "result".
         let exploration = GraphifyUsageDetector.isExplorationTool(summary: summary)
             || alreadyExploration

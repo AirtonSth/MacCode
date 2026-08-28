@@ -17,6 +17,10 @@ public struct GraphifyInvocation: Sendable, Equatable {
 public enum GraphifyUsageDetector {
     public static let allowedSubcommands: Set<String> = ["query", "path", "explain"]
     public static let maxMatchesPerToolCall = 5
+    /// First-N-bytes window for detect(). Live itemDelta used to
+    /// `components(separatedBy:)` the full accumulated body on the ACP parse
+    /// queue; 8 KB covers a real `graphify query|path|explain` command.
+    public static let maxHaystackUTF8Bytes = 8192
 
     /// Tool names whose **output size** is a credible exploration sample for
     /// Phase-2 counterfactual (median bare-agent file read size).
@@ -94,8 +98,29 @@ public enum GraphifyUsageDetector {
 
     // MARK: - Internals
 
+    /// Prefix used for detect / JSON command extraction. Truncates on a UTF-8 boundary.
+    public static func cappedHaystack(_ text: String) -> String {
+        let limit = maxHaystackUTF8Bytes
+        if text.utf8.count <= limit { return text }
+        return String(decoding: text.utf8.prefix(limit), as: UTF8.self)
+    }
+
+    /// Append a stream chunk without letting the Graphify buffer grow past the detect window.
+    public static func appendCapped(_ existing: String, _ chunk: String) -> String {
+        if existing.utf8.count >= maxHaystackUTF8Bytes { return existing }
+        if chunk.isEmpty { return existing }
+        return cappedHaystack(existing + chunk)
+    }
+
+    /// Cheap reject before JSON parse + `components(separatedBy:)`.
+    public static func mentionsGraphify(_ text: String) -> Bool {
+        text.localizedCaseInsensitiveContains("graphify")
+    }
+
     static func detect(in text: String) -> [GraphifyInvocation] {
-        let command = commandText(fromBody: text)
+        let haystack = cappedHaystack(text)
+        guard mentionsGraphify(haystack) else { return [] }
+        let command = commandText(fromBody: haystack)
         // Split on common shell separators so `cd x && graphify query` still matches.
         let segments = command
             .components(separatedBy: shellSegmentSeparators)

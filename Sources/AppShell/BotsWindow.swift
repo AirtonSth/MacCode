@@ -11369,7 +11369,10 @@ public struct BotsRootView: View {
                 // mutating live-turn suffix stays eager. Lazy placement of a
                 // tall streaming MCP row can cycle in AttributeGraph and starve
                 // both UI events and host-catalog MainActor hops.
-                if AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: historyItems.count) {
+                if AgentChatTimelineHistoryLayout.usesLazyLayout(
+                    entryCount: historyItems.count,
+                    liveTurnActive: latestLiveTurnID != nil
+                ) {
                     LazyVStack(alignment: .leading, spacing: DS.Space.xl) {
                         ForEach(Array(historyItems.enumerated()), id: \.element.id) { index, item in
                             deskTimelineEntry(

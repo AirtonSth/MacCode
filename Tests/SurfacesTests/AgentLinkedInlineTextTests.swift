@@ -347,6 +347,43 @@ final class AgentLinkedInlineTextTests: XCTestCase {
     /// `.textSelection(.enabled)`. Callers (BotsWindow compiled payload) pass
     /// `monospaced: true`; that flag must map to the same NSFont as AppKit's
     /// monospaced system face, not a proportional system font.
+    /// WHY: live hang pid 62995 retriggered LazyVStack placement because
+    /// updateNSView called invalidateIntrinsicContentSize on every streaming
+    /// token. Height changes must reset the fitted cache only.
+    func test_resetFittedSizeCache_doesNotIncrementIntrinsicInvalidation() {
+        let tv = IntrinsicHeightTextView(usingTextLayoutManager: false)
+        tv.string = String(repeating: "wrapping word ", count: 60)
+        tv.font = NSFont.systemFont(ofSize: 13)
+        _ = tv.sizeThatFitsWidth(240)
+        let before = tv.intrinsicInvalidationCountForTesting
+        tv.resetFittedSizeCache()
+        XCTAssertEqual(
+            tv.intrinsicInvalidationCountForTesting,
+            before,
+            "cache reset must not ask SwiftUI to invalidate intrinsic size"
+        )
+        let refit = tv.sizeThatFitsWidth(240)
+        XCTAssertGreaterThan(refit.height, tv.font!.boundingRectForFont.height)
+    }
+
+    func test_applyPath_doesNotCallInvalidateIntrinsicContentSize() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/Surfaces/AgentLinkedInlineText.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        let apply = try XCTUnwrap(source.range(of: "private func apply(to tv: IntrinsicHeightTextView"))
+        let rest = source[apply.lowerBound...]
+        let end = rest.range(of: "\n    static func applyTextStorage")?.lowerBound ?? rest.endIndex
+        let chunk = String(source[apply.lowerBound..<end])
+        XCTAssertFalse(
+            chunk.contains("invalidateIntrinsicContentSize()"),
+            "apply() must not invalidate intrinsic size during SwiftUI transactions"
+        )
+        XCTAssertTrue(chunk.contains("resetFittedSizeCache()"))
+    }
+
     func test_nsFont_monospacedTrue_equalsMonospacedSystemFont() {
         let size: CGFloat = 11
         let weight = NSFont.Weight.regular
