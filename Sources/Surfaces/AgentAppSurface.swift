@@ -15531,6 +15531,7 @@ public struct AgentAppView: View {
                     textColor: DS.NS.textTertiary,
                     lineSpacing: 3
                 )
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

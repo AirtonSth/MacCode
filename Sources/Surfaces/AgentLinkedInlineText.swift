@@ -241,6 +241,9 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
         tv.setContentHuggingPriority(.defaultLow, for: .horizontal)
         tv.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         tv.setContentHuggingPriority(.required, for: .vertical)
+        // macOS 14+ NSView.clipsToBounds defaults off. Without this, a stale
+        // SwiftUI height lets wrapped Thinking… paint over Working for / Stop.
+        tv.clipsToBounds = true
         // Apple: default linkTextAttributes are blue + underline + pointing hand.
         // Keep pointing hand even when we restyle color to the DS accent.
         tv.linkTextAttributes = [
@@ -258,12 +261,18 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
     ///
     /// Unspecified / infinite / zero proposals are the hug path. Returning a
     /// 0×N size there collapses user bubbles into a 2-glyph column.
+    ///
+    /// Apply the current presentation *before* measuring. Live Thinking… tokens
+    /// change `attributed` while the NSTextView still holds the previous
+    /// snapshot; measuring first keeps the same-width wrap cache and paints
+    /// extra lines over "Working for Xs".
     func sizeThatFits(
         _ proposal: ProposedViewSize,
         nsView: IntrinsicHeightTextView,
         context: Context
     ) -> CGSize {
-        nsView.sizeThatFitsProposal(width: proposal.width)
+        apply(to: nsView, context: context)
+        return nsView.sizeThatFitsProposal(width: proposal.width)
     }
 
     func updateNSView(_ tv: IntrinsicHeightTextView, context: Context) {
@@ -274,6 +283,7 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
     }
 
     private func apply(to tv: IntrinsicHeightTextView, context: Context) {
+        tv.clipsToBounds = true
         let next = AgentLinkedInlineTextAppliedState(
             attributed: attributed,
             font: font,

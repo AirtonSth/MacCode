@@ -382,6 +382,10 @@ final class AgentLinkedInlineTextTests: XCTestCase {
             "apply() must not invalidate intrinsic size during SwiftUI transactions"
         )
         XCTAssertTrue(chunk.contains("resetFittedSizeCache()"))
+        XCTAssertTrue(
+            chunk.contains("clipsToBounds = true"),
+            "apply() must keep clipsToBounds on so stale height cannot paint over Working for"
+        )
     }
 
     func test_nsFont_monospacedTrue_equalsMonospacedSystemFont() {
@@ -478,6 +482,82 @@ final class AgentLinkedInlineTextTests: XCTestCase {
             tv.intrinsicInvalidationCountForTesting,
             afterMeasure,
             "settled-width sizeThatFits must not dirty intrinsic size"
+        )
+    }
+
+    /// WHY: screenshot class — live Thinking… grows in place while "Working for Xs"
+    /// sits in the same VStack. SwiftUI sizeThatFits can run against the previous
+    /// snapshot at the same column width, commit a short height, then updateNSView
+    /// writes the long body. AppKit draws extra lines over the Working strip.
+    /// sizeThatFits must apply-then-measure so the row grows with the tokens.
+    func test_sameWidthCache_afterReset_remeasuresTallerStreamingThinking() {
+        let font = NSFont.systemFont(ofSize: 12)
+        let tv = IntrinsicHeightTextView(usingTextLayoutManager: false)
+        tv.font = font
+        tv.textContainer?.lineFragmentPadding = 0
+        tv.textContainerInset = .zero
+        AgentLinkedInlineTextRepresentable.applyTextStorage(
+            NSAttributedString(string: "Hello", attributes: [.font: font]),
+            to: tv
+        )
+        let short = tv.sizeThatFitsWidth(240)
+        AgentLinkedInlineTextRepresentable.applyTextStorage(
+            NSAttributedString(
+                string: String(repeating: "wrapping word ", count: 80),
+                attributes: [.font: font]
+            ),
+            to: tv
+        )
+        tv.resetFittedSizeCache()
+        let tall = tv.sizeThatFitsWidth(240)
+        XCTAssertGreaterThan(
+            tall.height,
+            short.height * 2,
+            "apply-then-reset-then-measure must grow the row so Working for sits below Thinking…"
+        )
+    }
+
+    func test_makeNSView_enablesClipsToBounds_soOverflowCannotPaintOverWorkingStrip() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/Surfaces/AgentLinkedInlineText.swift"),
+            encoding: .utf8
+        )
+        let marker = try XCTUnwrap(source.range(of: "func makeNSView(context: Context) -> IntrinsicHeightTextView"))
+        let rest = source[marker.lowerBound...]
+        let end = rest.range(of: "\n    func sizeThatFits(")?.lowerBound ?? rest.endIndex
+        let chunk = String(source[marker.lowerBound..<end])
+        XCTAssertTrue(
+            chunk.contains("clipsToBounds = true"),
+            "Thinking… NSTextView must clip; macOS 14+ defaults clipsToBounds off"
+        )
+    }
+
+    func test_sizeThatFits_appliesCurrentPresentationBeforeMeasuring() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/Surfaces/AgentLinkedInlineText.swift"),
+            encoding: .utf8
+        )
+        let marker = try XCTUnwrap(
+            source.range(of: "nsView: IntrinsicHeightTextView,\n        context: Context\n    ) -> CGSize")
+        )
+        let rest = source[marker.lowerBound...]
+        let end = rest.range(of: "\n    func updateNSView")?.lowerBound ?? rest.endIndex
+        let chunk = String(source[marker.lowerBound..<end])
+        XCTAssertTrue(
+            chunk.contains("apply(to: nsView"),
+            "sizeThatFits must apply the current streaming snapshot before measuring"
+        )
+        XCTAssertTrue(
+            chunk.contains("sizeThatFitsProposal"),
+            "measurement must still use the SwiftUI width proposal after apply"
         )
     }
 }

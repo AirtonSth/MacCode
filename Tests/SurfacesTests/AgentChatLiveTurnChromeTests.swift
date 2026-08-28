@@ -399,4 +399,41 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
         XCTAssertTrue(AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn))
         XCTAssertTrue(AgentChatLiveTurnChrome.messageDuplicatesTurn(answer, turns: [turn]))
     }
+
+    /// WHY: screenshot class — live Thinking… body hugged its unwrapped width,
+    /// then AppKit wrapped at the column and drew extra lines over "Working for".
+    /// Column-filling reasoning must pin maxWidth so sizeThatFits gets the column.
+    func test_reasoningPlainTextPinsToColumnWidth() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let chrome = try String(
+            contentsOf: root.appendingPathComponent("Sources/Surfaces/AgentChatLiveTurnChrome.swift"),
+            encoding: .utf8
+        )
+        let marker = try XCTUnwrap(chrome.range(of: "public struct AgentChatReasoningRow"))
+        let rest = chrome[marker.lowerBound...]
+        let end = rest.range(of: "\n// MARK: - Tool rows")?.lowerBound ?? rest.endIndex
+        let chunk = String(chrome[marker.lowerBound..<end])
+        XCTAssertTrue(chunk.contains("AgentSelectablePlainText("))
+        XCTAssertTrue(
+            chunk.contains("lineSpacing: 3\n                )\n                .frame(maxWidth: .infinity, alignment: .leading)"),
+            "Thinking… body must take the chat column, not hug one long line"
+        )
+
+        let app = try String(
+            contentsOf: root.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        let row = try XCTUnwrap(app.range(of: "private func reasoningRow(_ item: AssistantItem)"))
+        let rowRest = app[row.lowerBound...]
+        let rowEnd = rowRest.range(of: "\n    private func reasoningText")?.lowerBound ?? rowRest.endIndex
+        let rowChunk = String(app[row.lowerBound..<rowEnd])
+        XCTAssertTrue(rowChunk.contains("AgentSelectablePlainText("))
+        XCTAssertTrue(
+            rowChunk.contains("lineSpacing: 3\n                )\n                .frame(maxWidth: .infinity, alignment: .leading)"),
+            "Agent App reasoningRow must pin the same column width as live-turn chrome"
+        )
+    }
 }
