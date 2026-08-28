@@ -1,5 +1,8 @@
 import XCTest
+import AppKit
 import CoreModel
+import DesignSystemKit
+import SwiftUI
 @testable import Surfaces
 
 final class AgentChatTranscriptChromeTests: XCTestCase {
@@ -213,6 +216,73 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
         )
     }
 
+    func test_userMessageBubbleContentWidth_hugsShortPromptInsteadOfTwoGlyphColumn() {
+        // WHY: the live screenshot showed "Go" / "Gr" because the selectable
+        // NSTextView reported width 0 and wrapped at two glyphs. Short prompts
+        // must hug; long prompts cap at the bubble text max.
+        let short = AgentChatTranscriptChrome.userMessageBubbleContentWidth(
+            text: "Go to my linear",
+            columnWidth: 900
+        )
+        XCTAssertGreaterThan(short, 80, "must not wrap the prompt into a 2-glyph column")
+        XCTAssertLessThan(
+            short,
+            AgentChatTranscriptChrome.userMessageBubbleMaxWidth - DS.Space.xl * 2
+        )
+
+        let long = AgentChatTranscriptChrome.userMessageBubbleContentWidth(
+            text: String(repeating: "long prompt word ", count: 40),
+            columnWidth: 900
+        )
+        let textMax = AgentChatTranscriptChrome.userMessageBubbleMaxWidth - DS.Space.xl * 2
+        XCTAssertEqual(long, textMax, accuracy: 0.5)
+
+        let narrow = AgentChatTranscriptChrome.userMessageBubbleContentWidth(
+            text: String(repeating: "long prompt word ", count: 40),
+            columnWidth: 280
+        )
+        let narrowMax = AgentChatTranscriptChrome.userMessageBubbleWidthCap(columnWidth: 280)
+            - DS.Space.xl * 2
+        XCTAssertEqual(narrow, narrowMax, accuracy: 0.5)
+    }
+
+    func test_userBubbleLayout_shortMessageDoesNotCollapseToTwoGlyphs() {
+        // WHY: user-visible proof for the collapsed bubble. Host the same
+        // AgentChatUserBubble Agent App / Desk mount and measure the NSTextView.
+        let canvas = AgentChatUserBubble(
+            text: "Go to my linear",
+            createdAt: Date(),
+            columnWidth: 800
+        )
+        .frame(width: 800, height: 160)
+        let hosting = NSHostingView(rootView: canvas)
+        hosting.frame = NSRect(x: 0, y: 0, width: 800, height: 160)
+        hosting.wantsLayer = true
+        let window = NSWindow(
+            contentRect: hosting.bounds,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        window.layoutIfNeeded()
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+
+        guard let textView = firstTextView(in: hosting) else {
+            return XCTFail("user bubble must mount AgentSelectablePlainText")
+        }
+        XCTAssertGreaterThan(
+            textView.bounds.width,
+            80,
+            "hosted user bubble must hug the prompt, not a 2-glyph column"
+        )
+        XCTAssertLessThan(
+            textView.bounds.width,
+            AgentChatTranscriptChrome.userMessageBubbleMaxWidth
+        )
+    }
+
     func test_userBubbleVoiceOverSpeaksMessage_becauseRoleLabelHidThePrompt() throws {
         // WHY: Computer Use on Desk saw user bubbles as AXStaticText value
         // `user` and the copy control as AXButton `user`. The parent
@@ -239,6 +309,14 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
         XCTAssertTrue(
             slice.contains(".accessibilityLabel(\"Copy message\")"),
             "copy control must stay Copy message after the role label is gone"
+        )
+        XCTAssertTrue(
+            slice.contains("userMessageBubbleContentWidth"),
+            "bubble width must be measured, not left to ViewThatFits + NSTextView ideal=0"
+        )
+        XCTAssertFalse(
+            slice.contains("ViewThatFits"),
+            "ViewThatFits treated a 0-wide NSTextView as fitting and collapsed the prompt"
         )
     }
 
@@ -329,5 +407,17 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
         XCTAssertTrue(source.contains("tokenSaverThreadFooter()"))
         XCTAssertTrue(source.contains("AgentChatTokenSaverDisplayControl("))
         XCTAssertTrue(source.contains("AgentChatTranscriptChrome.displayUserLine("))
+    }
+
+    private func firstTextView(in view: NSView) -> NSTextView? {
+        if let textView = view as? NSTextView {
+            return textView
+        }
+        for child in view.subviews {
+            if let found = firstTextView(in: child) {
+                return found
+            }
+        }
+        return nil
     }
 }

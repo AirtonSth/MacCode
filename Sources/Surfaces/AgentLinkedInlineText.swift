@@ -256,13 +256,15 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
     /// SwiftUI proposes a concrete width; we return the wrapped height.
     /// Measuring here (instead of `layout()` → `invalidateIntrinsicContentSize()`)
     /// is what stops LazyVStack AttributeGraph from growing without bound.
+    ///
+    /// Unspecified / infinite / zero proposals are the hug path. Returning a
+    /// 0×N size there collapses user bubbles into a 2-glyph column.
     func sizeThatFits(
         _ proposal: ProposedViewSize,
         nsView: IntrinsicHeightTextView,
         context: Context
     ) -> CGSize {
-        let width = proposal.width ?? nsView.bounds.width
-        return nsView.sizeThatFitsWidth(width)
+        nsView.sizeThatFitsProposal(width: proposal.width)
     }
 
     func updateNSView(_ tv: IntrinsicHeightTextView, context: Context) {
@@ -413,6 +415,75 @@ final class IntrinsicHeightTextView: NSTextView {
         return NSSize(width: NSView.noIntrinsicMetric, height: fitted.height)
     }
 
+    /// Map a SwiftUI width proposal onto wrap vs hug.
+    /// Concrete column widths wrap; nil / 0 / non-finite / huge values hug.
+    func sizeThatFitsProposal(width: CGFloat?) -> CGSize {
+        if let width, Self.wrappingWidth(width) != nil {
+            return sizeThatFitsWidth(width)
+        }
+        return sizeThatFitsIdeal()
+    }
+
+    /// Unwrapped used size. Unspecified SwiftUI proposals and user-bubble
+    /// hug sizing ask for this. Must not return width 0 — that is the
+    /// collapsed "Go / Gr" screenshot.
+    func sizeThatFitsIdeal() -> CGSize {
+        let fallback = font?.boundingRectForFont.height ?? 14
+        guard let layoutManager, let textContainer else {
+            return CGSize(width: 0, height: fallback)
+        }
+        let probe: CGFloat = 10_000
+        let saved = textContainer.containerSize
+        measuringProposedWidth = true
+        defer {
+            measuringProposedWidth = false
+            textContainer.containerSize = saved
+        }
+        textContainer.widthTracksTextView = false
+        textContainer.heightTracksTextView = false
+        textContainer.containerSize = NSSize(
+            width: probe,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        layoutManager.ensureLayout(for: textContainer)
+        // usedRect includes the insertion-point extra line fragment, which is
+        // the full container width (10_000). Glyph bounds are the hug width.
+        let glyphRange = layoutManager.glyphRange(for: textContainer)
+        let used = glyphRange.length == 0
+            ? .zero
+            : layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+        return CGSize(
+            width: max(ceil(used.width + textContainerInset.width * 2), 0),
+            height: max(ceil(used.height + textContainerInset.height * 2), fallback)
+        )
+    }
+
+    /// Same layout engine as the live NSTextView, without mounting a view.
+    static func idealSize(
+        string: String,
+        font: NSFont,
+        lineFragmentPadding: CGFloat = 0
+    ) -> CGSize {
+        let attributed = NSAttributedString(string: string, attributes: [.font: font])
+        let storage = NSTextStorage(attributedString: attributed)
+        let manager = NSLayoutManager()
+        let container = NSTextContainer(
+            size: NSSize(width: 10_000, height: CGFloat.greatestFiniteMagnitude)
+        )
+        container.lineFragmentPadding = lineFragmentPadding
+        container.widthTracksTextView = false
+        container.heightTracksTextView = false
+        manager.addTextContainer(container)
+        storage.addLayoutManager(manager)
+        manager.ensureLayout(for: container)
+        let used = manager.usedRect(for: container)
+        let fallback = font.boundingRectForFont.height
+        return CGSize(
+            width: max(ceil(used.width), 0),
+            height: max(ceil(used.height), fallback)
+        )
+    }
+
     func sizeThatFitsWidth(_ width: CGFloat) -> CGSize {
         textContainer?.widthTracksTextView = false
         textContainer?.heightTracksTextView = false
@@ -421,7 +492,7 @@ final class IntrinsicHeightTextView: NSTextView {
             ?? Self.wrappingWidth(bounds.width)
             ?? Self.wrappingWidth(lastFittedWidth)
         guard let target else {
-            return CGSize(width: 0, height: fallback)
+            return sizeThatFitsIdeal()
         }
         if abs(lastFittedWidth - target) <= 0.5, lastFittedSize.height > 0 {
             return lastFittedSize
