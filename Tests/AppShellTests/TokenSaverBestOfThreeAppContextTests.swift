@@ -490,6 +490,192 @@ final class TokenSaverBestOfThreeAppContextTests: XCTestCase {
         XCTAssertEqual(context.tokenSaverRCW1FinalizeInvocationsForTesting, 1)
     }
 
+    func test_autoDeepFallbackPreservesBotCanonicalSourceAndSelectsExactlyOnceAtFinalBoundary() async throws {
+        // WHY: actual Auto admission reconstructs the request before Token
+        // Saver. The admitted envelope must retain the Bot's complete canonical
+        // source and reach the one final selector exactly once.
+        let context = try makeContext()
+        defer { cleanup(context) }
+        let threadID = try makeAdmittedThread(in: context)
+        let adapter = C9CapturingAdapter()
+        let runtime = AgentOrchestrationRuntime(
+            repository: AgentOrchestrationRepository(db: context.db),
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        let coordinator = AgentRunCoordinator(
+            runRepo: context.runRepo,
+            messageRepo: context.messageRepo,
+            threadRepo: context.threadRepo,
+            orchestrationRuntime: runtime,
+            providerAdapters: [.codex: adapter]
+        )
+        let canonical = "compiled Bot brain\nuser request\n"
+        let original = AgentRunRequest(
+            threadId: threadID,
+            provider: .codex,
+            providerInstanceId: "codex-live",
+            model: "test-model",
+            cwd: context.appSupportDirectory.path,
+            prompt: canonical,
+            userMessageContent: "user request",
+            tokenSaverCanonicalProviderContent: canonical
+        )
+        let configuration = AgentRoutingConfiguration(
+            mode: .auto,
+            manualSelection: AgentModelSelection(
+                provider: .codex,
+                modelId: "gpt-5.6-sol",
+                reasoningEffort: .medium,
+                serviceTier: .auto
+            ),
+            manualProviderInstanceId: "codex-live",
+            eligibleProviders: [.codex],
+            policyDigest: runtime.policyDigest,
+            revision: 1
+        )
+        let snapshot = AgentProviderSnapshotFactory.snapshot(
+            provider: .codex,
+            models: [
+                AgentModelDescriptor(id: "gpt-5.6-sol", label: "Sol", provider: .codex),
+                AgentModelDescriptor(id: "gpt-5.6-luna", label: "Luna", provider: .codex),
+            ],
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            id: "codex-live",
+            capabilitiesOverride: AgentProviderCapabilities(supportsStreaming: true),
+            modelDiscoverySource: .live
+        )
+        let routingSnapshot = AgentOrchestrationRoutingSnapshot(
+            configuration: configuration,
+            providerSnapshots: [snapshot]
+        )
+
+        let selections = C9CallProbe()
+        let deliveries = C9CallProbe()
+        var selectedRequest: TokenSaverOutboundSelectionRequest?
+        coordinator.tokenSaverOutboundSelector = { request in
+            selections.record()
+            selectedRequest = request
+            return await TokenSaverBestOfThreeSelector.select(
+                canonicalHuman: request.canonicalHuman,
+                humanOutboundPrompt: request.admittedRequest.prompt,
+                humanEffectiveEnvelope: request.admittedRequest.prompt,
+                target: TokenSaverBestOfThreeSelector.Target(
+                    provider: request.admittedRequest.provider.rawValue,
+                    resolvedModel: request.admittedRequest.model,
+                    counterID: "unavailable",
+                    counterRevision: "unavailable",
+                    encoding: "unavailable"
+                ),
+                candidates: [],
+                counter: nil
+            )
+        }
+        coordinator.onTokenSaverOutboundDelivery = { _ in deliveries.record() }
+        _ = try await coordinator.startRun(original, routingSnapshot: routingSnapshot)
+
+        XCTAssertEqual(selections.count, 1)
+        XCTAssertEqual(deliveries.count, 1, "one admitted envelope must be delivered exactly once")
+        let admitted = try XCTUnwrap(selectedRequest)
+        XCTAssertNotNil(admitted.autoRoute, "the assertion must traverse actual Auto admission")
+        XCTAssertEqual(admitted.canonicalHuman, canonical)
+        XCTAssertEqual(admitted.admittedRequest.tokenSaverCanonicalProviderContent, canonical)
+        XCTAssertTrue(
+            AgentOrchestrationRuntime.promptAlreadyInvokesOrchestrateSkill(admitted.admittedRequest.prompt)
+        )
+        XCTAssertEqual(adapter.request?.tokenSaverCanonicalProviderContent, canonical)
+        XCTAssertEqual(adapter.request?.userMessageContent, "user request")
+        XCTAssertEqual(adapter.request?.prompt, admitted.admittedRequest.prompt)
+
+        // Package-unavailable Auto must traverse autoDeepFallbackRequest, keep
+        // the same byte-exact Bot source/display split, and still select only
+        // at the final provider boundary.
+        let deepThreadID = try makeAdmittedThread(in: context)
+        let deepAdapter = C9CapturingAdapter()
+        let deepRuntime = AgentOrchestrationRuntime(
+            repository: AgentOrchestrationRepository(db: context.db),
+            packageVerification: { false },
+            killSwitch: { false }
+        )
+        let deepCoordinator = AgentRunCoordinator(
+            runRepo: context.runRepo,
+            messageRepo: context.messageRepo,
+            threadRepo: context.threadRepo,
+            orchestrationRuntime: deepRuntime,
+            providerAdapters: [.codex: deepAdapter]
+        )
+        let deepCanonical = "compiled Bot brain\nUser request:\n\n  raw request bytes  "
+        let deepOriginal = AgentRunRequest(
+            threadId: deepThreadID,
+            provider: .codex,
+            providerInstanceId: "codex-live",
+            model: "test-model",
+            cwd: context.appSupportDirectory.path,
+            prompt: deepCanonical,
+            userMessageContent: "raw request bytes",
+            tokenSaverCanonicalProviderContent: deepCanonical
+        )
+        let deepConfiguration = AgentRoutingConfiguration(
+            mode: .auto,
+            manualSelection: configuration.manualSelection,
+            manualProviderInstanceId: configuration.manualProviderInstanceId,
+            eligibleProviders: configuration.eligibleProviders,
+            policyDigest: deepRuntime.policyDigest,
+            revision: configuration.revision
+        )
+        let deepRoutingSnapshot = AgentOrchestrationRoutingSnapshot(
+            configuration: deepConfiguration,
+            providerSnapshots: [snapshot]
+        )
+        let deepSelections = C9CallProbe()
+        let deepDeliveries = C9CallProbe()
+        var deepSelectedRequest: TokenSaverOutboundSelectionRequest?
+        deepCoordinator.tokenSaverOutboundSelector = { request in
+            deepSelections.record()
+            deepSelectedRequest = request
+            return await TokenSaverBestOfThreeSelector.select(
+                canonicalHuman: request.canonicalHuman,
+                humanOutboundPrompt: request.admittedRequest.prompt,
+                humanEffectiveEnvelope: request.admittedRequest.prompt,
+                target: .init(
+                    provider: request.admittedRequest.provider.rawValue,
+                    resolvedModel: request.admittedRequest.model,
+                    counterID: "unavailable",
+                    counterRevision: "unavailable",
+                    encoding: "unavailable"
+                ),
+                candidates: [],
+                counter: nil
+            )
+        }
+        deepCoordinator.onTokenSaverOutboundDelivery = { _ in deepDeliveries.record() }
+        _ = try await deepCoordinator.startRun(
+            deepOriginal,
+            routingSnapshot: deepRoutingSnapshot
+        )
+
+        XCTAssertEqual(deepSelections.count, 1)
+        XCTAssertEqual(deepDeliveries.count, 1)
+        let deepAdmitted = try XCTUnwrap(deepSelectedRequest)
+        XCTAssertNil(deepAdmitted.autoRoute, "package-unavailable admission must take DEEP")
+        XCTAssertEqual(deepAdmitted.canonicalHuman, deepCanonical)
+        XCTAssertEqual(deepAdmitted.admittedRequest.prompt, deepCanonical)
+        XCTAssertEqual(deepAdmitted.admittedRequest.userMessageContent, "raw request bytes")
+        XCTAssertEqual(
+            deepAdmitted.admittedRequest.tokenSaverCanonicalProviderContent,
+            deepCanonical
+        )
+        XCTAssertFalse(
+            AgentOrchestrationRuntime.promptAlreadyInvokesOrchestrateSkill(
+                deepAdmitted.admittedRequest.prompt
+            )
+        )
+        XCTAssertEqual(deepAdapter.request?.prompt, deepCanonical)
+        XCTAssertEqual(deepAdapter.request?.userMessageContent, "raw request bytes")
+        XCTAssertEqual(deepAdapter.request?.tokenSaverCanonicalProviderContent, deepCanonical)
+    }
+
     func test_unprovableHumanEnvelopeFailsClosedWithoutRCW1CountOrDistill() async throws {
         let context = try makeContext()
         defer { cleanup(context) }

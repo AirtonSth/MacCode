@@ -38,6 +38,158 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
     }
 
     @MainActor
+    static func exerciseProviderSpawnedWorkerPromptDoesNotRunBestOfThreeAgain() async throws {
+        // WHY: provider-native workers are events inside the admitted provider
+        // turn, not new host sends. Their real lifecycle boundary must inherit
+        // the admitted technique surface without selecting a format again.
+        // Child-produced delivery accounting is intentionally proved by S003;
+        // this request slice proves only that its ledger scope is applicable.
+        let appSupport = NSTemporaryDirectory() + "RC2ProviderWorker-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
+        let runners = Dictionary(uniqueKeysWithValues: [AgentProvider.claude, .codex, .grok].map {
+            ($0, ControlledBotHandoffRunner(provider: $0))
+        })
+        for (provider, runner) in runners {
+            context.coordinator.replaceProvider(provider, runner: runner)
+        }
+        let selections = TokenSaverSelectionCount()
+        context.coordinator.tokenSaverOutboundSelector = { request in
+            await selections.increment()
+            return await TokenSaverBestOfThreeSelector.select(
+                canonicalHuman: request.canonicalHuman,
+                humanOutboundPrompt: request.admittedRequest.prompt,
+                humanEffectiveEnvelope: request.admittedRequest.prompt,
+                target: .init(
+                    provider: request.admittedRequest.provider.rawValue,
+                    resolvedModel: request.admittedRequest.model,
+                    counterID: "unavailable",
+                    counterRevision: "unavailable",
+                    encoding: "unavailable"
+                ),
+                candidates: [],
+                counter: nil
+            )
+        }
+
+        var roots: [AgentProvider: AgentRunRequest] = [:]
+        for provider in [AgentProvider.claude, .codex, .grok] {
+            let thread = AgentThread(title: "provider worker", provider: provider, model: "test")
+            try context.threadRepo.upsert(thread)
+            let environment = router.providerEnvironment(
+                provider: provider,
+                instanceId: nil,
+                threadId: thread.id
+            )
+            _ = try await context.coordinator.startRun(AgentRunRequest(
+                threadId: thread.id,
+                provider: provider,
+                model: "test",
+                cwd: appSupport,
+                prompt: "root prompt that may spawn \(provider.rawValue) workers",
+                environment: environment
+            ))
+            let root = try XCTUnwrap(runners[provider]?.requests.first)
+            roots[provider] = root
+            let receipt = try XCTUnwrap(TokenSaverExecutionReceiptSeam.receipt(from: root.environment))
+            XCTAssertTrue(receipt.admitted && receipt.sameUser)
+            XCTAssertEqual(receipt.provider, provider.rawValue)
+            XCTAssertEqual(receipt.threadId.lowercased(), thread.id.value.uuidString.lowercased())
+            XCTAssertEqual(root.environment["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
+            XCTAssertEqual(root.environment["RC_REMOTE_CODE_ROOT_RUN_ID"]?.lowercased(), root.runId.value.uuidString.lowercased())
+            XCTAssertEqual(root.environment["RC_REMOTE_CODE_ATTEMPT_ID"]?.lowercased(), root.runId.value.uuidString.lowercased())
+            let managed = try XCTUnwrap(root.environment["RC_REMOTE_CODE_MANAGED_BIN"])
+            let path = try XCTUnwrap(root.environment["PATH"])
+            XCTAssertTrue(path == managed || path.hasPrefix(managed + ":"))
+            XCTAssertTrue(AgentSkillInstaller.tokenSaverProviderPrompt(
+                "provider-native worker prompt",
+                environment: root.environment
+            ).contains("| distill"))
+            if provider == .claude {
+                XCTAssertEqual(root.environment["RC_TOKEN_SAVER_POST_TOOL_USE"], "1")
+                XCTAssertNotNil(root.environment["REMOTE_CODE_DISTILL_STATE_PATH"])
+            } else {
+                XCTAssertNil(root.environment["RC_TOKEN_SAVER_POST_TOOL_USE"])
+            }
+
+            let ledgerThreadID = root.environment["RC_TOKEN_SAVER_THREAD_ID"]
+                ?? root.environment["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"]
+            XCTAssertEqual(ledgerThreadID?.lowercased(), thread.id.value.uuidString.lowercased())
+            XCTAssertNotNil(ledgerThreadID, "provider-native delivery can attribute to the admitted root thread")
+        }
+        let rootSelectionCount = await selections.value
+        XCTAssertEqual(rootSelectionCount, 3, "one root selection per provider")
+
+        let codexRoot = try XCTUnwrap(roots[.codex])
+        let codexChild = AgentRunID()
+        let codexStates = try JSONSerialization.data(withJSONObject: [
+            codexChild.value.uuidString.lowercased(): ["status": "running", "message": NSNull()],
+        ], options: [.sortedKeys])
+        XCTAssertTrue(runners[.codex]?.emit(
+            runID: codexRoot.runId,
+            event: .itemDelta(
+                itemId: "native-codex",
+                bodyAppend: nil,
+                outputAppend: String(decoding: codexStates, as: UTF8.self),
+                summary: "SpawnAgent"
+            )
+        ) == true)
+
+        let crossProviderChild = AgentRunID()
+        XCTAssertTrue(runners[.codex]?.emit(
+            runID: codexRoot.runId,
+            event: grokNativeWorkerEvent(childID: crossProviderChild, description: "cross-provider child")
+        ) == true)
+        let grokRoot = try XCTUnwrap(roots[.grok])
+        let grokChild = AgentRunID()
+        XCTAssertTrue(runners[.grok]?.emit(
+            runID: grokRoot.runId,
+            event: grokNativeWorkerEvent(childID: grokChild, description: "same-provider child")
+        ) == true)
+
+        for (child, provider, parent) in [
+            (codexChild, AgentProvider.codex, codexRoot),
+            (crossProviderChild, AgentProvider.grok, codexRoot),
+            (grokChild, AgentProvider.grok, grokRoot),
+        ] {
+            let receipt = try XCTUnwrap(context.orchestrationRuntime.receipt(runId: child))
+            XCTAssertEqual(receipt.provider, provider)
+            XCTAssertEqual(receipt.threadId, parent.threadId)
+            XCTAssertNotNil(receipt.parentReceiptId)
+            XCTAssertEqual(receipt.lifecycleStatus, .accepted)
+        }
+        let finalSelectionCount = await selections.value
+        XCTAssertEqual(finalSelectionCount, 3, "same/cross child events must not re-enter host selection")
+        for root in roots.values {
+            XCTAssertTrue(runners[root.provider]?.finish(runID: root.runId, status: .completed, reply: "done") == true)
+        }
+    }
+
+    private static func grokNativeWorkerEvent(childID: AgentRunID, description: String) -> AssistantEvent {
+        let payload: [String: Any] = [
+            "sessionId": "parent-session",
+            "update": [
+                "sessionUpdate": "subagent_spawned",
+                "subagent_id": childID.value.uuidString.lowercased(),
+                "child_session_id": childID.value.uuidString.lowercased(),
+                "description": description,
+            ],
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        return .providerRuntime(ProviderRuntimeEvent(
+            provider: .grok,
+            source: "grok.acp",
+            method: "x.ai/session_notification",
+            payloadJSON: String(decoding: data, as: UTF8.self),
+            receivedAtMs: 1
+        ))
+    }
+
+    @MainActor
     func test_autoAndNestedWorkerEnvironmentsCarryFullTokenSaverTechniqueSurface() async throws {
         // WHY: product rule — every Auto/orchestrate controller and every
         // orchestrated worker must receive the full Token Saver technique set
@@ -731,4 +883,10 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             "this-Mac PATH must not include the dockerDesktop stub dir"
         )
     }
+}
+
+private actor TokenSaverSelectionCount {
+    private var count = 0
+    func increment() { count += 1 }
+    var value: Int { count }
 }

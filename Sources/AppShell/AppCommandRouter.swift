@@ -324,6 +324,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     var sendAgentMessageResolvedAttachmentsProbeForTesting: (([AgentAttachment]) -> Void)?
     /// Fires after send preflight resolves, whether from cache or a catalog list.
     var sendAgentMessageAfterPreflightProbeForTesting: (() async -> Void)?
+    var graphifyEnvironmentApplierForTesting: (@Sendable (
+        [String: String],
+        UUID?,
+        String,
+        String?,
+        String,
+        [String]
+    ) -> (environment: [String: String], workingSet: GraphifyThreadWorkingSet))?
+    var graphifyWorkingSetPublisherForTesting: ((GraphifyThreadWorkingSet, AgentThreadID?) -> Void)?
     var listAgentProviderSnapshotsCallCountForTesting = 0
     var preflightListedProviderSnapshotsForTesting = false
     private var cachedProviderSnapshots: [AgentProviderSnapshot] = []
@@ -2613,7 +2622,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ctx.botPeerHandoffAuthority.router = self
         guard let result = await ctx.botPeerHandoffAuthority.askPeerFromActiveProvider(
             peer: peer,
-            prompt: delegatedPrompt,
+            prompt: prompt,
             originThread: originThread,
             hostRunID: callerRun,
             providerSnapshots: cachedProviderSnapshotsForSend(),
@@ -4594,6 +4603,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         providerInstanceId: String? = nil,
         attachments: [AgentAttachment] = [],
         requestedRunID: AgentRunID,
+        userMessageContent: String? = nil,
+        tokenSaverCanonicalProviderContent: String? = nil,
         routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil,
         orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil,
         executionCwdOverride: String? = nil,
@@ -4614,6 +4625,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             queueMessageId: nil,
             routingSnapshot: routingSnapshot,
             requestedRunID: requestedRunID,
+            userMessageContent: userMessageContent,
+            tokenSaverCanonicalProviderContent: tokenSaverCanonicalProviderContent,
             orchestrationRoutingSnapshot: orchestrationRoutingSnapshot,
             executionCwdOverride: executionCwdOverride,
             allowProviderCatalogListingDuringPreflight: allowProviderCatalogListingDuringPreflight
@@ -4735,7 +4748,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, userMessageContent: String? = nil, tokenSaverCanonicalProviderContent: String? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         // Status + permission + provider identity only. A leftover 26-column
         // + routing `get` hitchs every send before configureAgentThread loads
@@ -4994,6 +5007,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             model: m,
             cwd: cwd,
             prompt: text,
+            userMessageContent: userMessageContent,
+            tokenSaverCanonicalProviderContent: tokenSaverCanonicalProviderContent,
             attachments: resolvedAttachments,
             providerThreadId: t.providerThreadId,
             permissionMode: t.permissionMode,
@@ -5431,24 +5446,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     /// Authoritative Graphify resolve on send (RPC path). Agent App UI uses the same
     /// `GraphifyWorkspaceService.applyToAgentEnvironment` from AgentAppSurface.
-    private func applyGraphifyOnSend(
+    func applyGraphifyOnSend(
         thread: AgentThread,
         cwd: String,
         attachments: [AgentAttachment],
         baseEnvironment: [String: String]
     ) async -> [String: String] {
-        guard let ctx = context else { return baseEnvironment }
+        guard let ctx = context else {
+            return GraphifyWorkspaceService.stripGraphifyKeys(from: baseEnvironment)
+        }
         let settings = SettingsStore(db: ctx.db).load()
         guard ctx.isTokenSaverRuntimeActive(settings: settings),
-              settings.isGraphifyRuntimeActive else { return baseEnvironment }
-        // Bots Desk is workspace-less Local. Walking process cwd is the
-        // git-rev-parse beachball Agent App already pulled off send.
-        guard thread.workspaceId != nil else {
+              settings.isGraphifyRuntimeActive,
+              let workspace = Self.authoritativeGraphifyWorkspace(
+                thread: thread,
+                environment: baseEnvironment,
+                workspaces: ctx.state.workspaces
+              ) else {
             return GraphifyWorkspaceService.stripGraphifyKeys(from: baseEnvironment)
         }
         configureGraphifyService(from: settings)
 
-        let workspaceCwd = ctx.state.workspaces.first { $0.value.id == thread.workspaceId }?.value.cwd ?? cwd
         // Root resolution blocks on `git rev-parse` subprocesses (two per
         // candidate directory, whole-tree walk when the workspace root is not a
         // repo). Must not run on the MainActor — same beachball the Agent App
@@ -5456,21 +5474,66 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let graphifyThreadId = thread.id.value
         let graphifyWorktreePath = thread.worktreePath
         let graphifyAttachmentPaths = attachments.map(\.path)
-        let applied = await Task.detached(priority: .userInitiated) {
-            GraphifyWorkspaceService.shared.applyToAgentEnvironment(
-                base: baseEnvironment,
-                threadId: graphifyThreadId,
-                threadCwd: cwd,
-                worktreePath: graphifyWorktreePath,
-                workspaceCwd: workspaceCwd,
-                attachmentPaths: graphifyAttachmentPaths
+        let applier = graphifyEnvironmentApplierForTesting
+        let applied: (environment: [String: String], workingSet: GraphifyThreadWorkingSet)
+        if let applier {
+            applied = applier(
+                baseEnvironment,
+                graphifyThreadId,
+                workspace.cwd,
+                graphifyWorktreePath,
+                workspace.cwd,
+                graphifyAttachmentPaths
             )
-        }.value
+        } else {
+            applied = await Task.detached(priority: .userInitiated) {
+                GraphifyWorkspaceService.shared.applyToAgentEnvironment(
+                    base: baseEnvironment,
+                    threadId: graphifyThreadId,
+                    threadCwd: workspace.cwd,
+                    worktreePath: graphifyWorktreePath,
+                    workspaceCwd: workspace.cwd,
+                    attachmentPaths: graphifyAttachmentPaths
+                )
+            }.value
+        }
         publishGraphifyWorkingSet(applied.workingSet, threadId: thread.id)
         return applied.environment
     }
 
+    /// Graphify may run only from the owning workspace recorded by the host's
+    /// admitted same-user receipt. Caller cwd is intentionally not a fallback.
+    static func authoritativeGraphifyWorkspace(
+        thread: AgentThread,
+        environment: [String: String],
+        workspaces: [WorkspaceID: Workspace]
+    ) -> Workspace? {
+        guard let workspaceID = thread.workspaceId,
+              let workspace = workspaces[workspaceID],
+              (thread.runAsUser?.uid ?? getuid()) == getuid(),
+              Self.isResolvedGraphifyWorkspace(workspace),
+              let receipt = TokenSaverExecutionReceiptSeam.receipt(from: environment),
+              receipt.admitted,
+              receipt.sameUser,
+              receipt.capabilities.graphify == true,
+              receipt.provider == thread.provider.rawValue,
+              UUID(uuidString: receipt.threadId) == thread.id.value,
+              receipt.workspaceId.flatMap(UUID.init(uuidString:)) == workspaceID.value else {
+            return nil
+        }
+        return workspace
+    }
+
+    private static func isResolvedGraphifyWorkspace(_ workspace: Workspace) -> Bool {
+        let cwd = workspace.cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cwd.isEmpty else { return false }
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: cwd, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+    }
+
     private func publishGraphifyWorkingSet(_ set: GraphifyThreadWorkingSet, threadId: AgentThreadID?) {
+        graphifyWorkingSetPublisherForTesting?(set, threadId)
         var payload: [String: JSONValue] = [
             "workspace_kind": .string(set.workspaceKind),
             "ambiguous": .bool(set.ambiguous),

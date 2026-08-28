@@ -26,6 +26,170 @@ final class TokenSaverBotAgentAppInterceptorTests: XCTestCase {
         directory = nil
     }
 
+    static func exerciseBotToAgentAppGraphifyRequiresAuthoritativeOwningWorkspaceRecord(
+        directory: String
+    ) async throws {
+        // WHY: Graphify resolve/ensure/query-first state is consequential host
+        // work. The actual send gate must strip hostile leftovers and skip the
+        // service unless the persisted owning workspace and admitted same-user
+        // receipt agree exactly; caller cwd is never authority.
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let ownerRoot = (directory as NSString).appendingPathComponent("graphify-owner")
+        try FileManager.default.createDirectory(atPath: ownerRoot, withIntermediateDirectories: true)
+        let workspace = try router.createWorkspace(name: "Owner", cwd: ownerRoot)
+        var thread = AgentThread(
+            workspaceId: workspace.id,
+            title: "Owned continuation",
+            provider: .codex,
+            model: "test"
+        )
+        try context.threadRepo.upsert(thread)
+        SettingsStore(db: context.db).save(AppSettings(
+            tokenSaverEnabled: true,
+            graphifyEnabled: true,
+            graphifyAutoEnsure: true
+        ))
+        defer {
+            GraphifyWorkspaceService.shared.enabled = false
+            GraphifyWorkspaceService.shared.autoEnsure = false
+        }
+
+        let probe = BotGraphifyApplyProbe()
+        router.graphifyEnvironmentApplierForTesting = { base, threadID, threadCwd, _, workspaceCwd, _ in
+            probe.recordApply(threadID: threadID, threadCwd: threadCwd, workspaceCwd: workspaceCwd)
+            var environment = GraphifyWorkspaceService.stripGraphifyKeys(from: base)
+            environment["RC_GRAPHIFY_ENABLED"] = "1"
+            environment["RC_GRAPHIFY_GRAPH_JSON"] = ownerRoot + "/graph.json"
+            return (
+                environment,
+                GraphifyThreadWorkingSet(
+                    threadId: threadID,
+                    workspaceKind: "singleRepo",
+                    roots: [],
+                    ambiguous: false
+                )
+            )
+        }
+        router.graphifyWorkingSetPublisherForTesting = { set, threadID in
+            probe.recordPublication(set: set, threadID: threadID)
+        }
+
+        func admittedEnvironment(
+            for candidate: AgentThread,
+            workspaceID: WorkspaceID? = nil,
+            provider: AgentProvider? = nil,
+            sameUser: Bool = true
+        ) -> [String: String] {
+            let receipt = TokenSaverExecutionReceiptSeam.admit(
+                tokenSaverEnabled: true,
+                sameUser: sameUser,
+                sidecarAvailable: true,
+                provider: provider ?? candidate.provider,
+                threadId: candidate.id.value.uuidString,
+                workspaceId: (workspaceID ?? candidate.workspaceId)?.value.uuidString,
+                graphifyActive: true
+            )
+            var environment = TokenSaverExecutionReceiptSeam.environment(from: receipt)
+            environment["RC_GRAPHIFY_ENABLED"] = "hostile-leftover"
+            environment["RC_GRAPHIFY_GRAPH_JSON"] = "/caller/graph.json"
+            environment["RC_GRAPHIFY_STALE"] = "1"
+            environment["RC_GRAPHIFY_UNKNOWN_FUTURE_KEY"] = "must-strip"
+            return environment
+        }
+
+        func assertDenied(
+            _ candidate: AgentThread,
+            environment: [String: String],
+            callerCwd: String = "/tmp/caller-cwd-must-not-be-used",
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async {
+            let before = probe.snapshot()
+            let result = await router.applyGraphifyOnSend(
+                thread: candidate,
+                cwd: callerCwd,
+                attachments: [],
+                baseEnvironment: environment
+            )
+            XCTAssertFalse(
+                result.keys.contains(where: { $0.hasPrefix("RC_GRAPHIFY_") }),
+                "all current and future Graphify keys must be stripped",
+                file: file,
+                line: line
+            )
+            XCTAssertEqual(probe.snapshot(), before, "denial must not resolve/ensure/query/publish", file: file, line: line)
+        }
+
+        let authoritative = admittedEnvironment(for: thread)
+        let applied = await router.applyGraphifyOnSend(
+            thread: thread,
+            cwd: "/tmp/caller-cwd-must-not-be-used",
+            attachments: [],
+            baseEnvironment: authoritative
+        )
+        XCTAssertEqual(applied["RC_GRAPHIFY_ENABLED"], "1")
+        XCTAssertEqual(applied["RC_GRAPHIFY_GRAPH_JSON"], ownerRoot + "/graph.json")
+        XCTAssertEqual(probe.snapshot().applyThreadIDs, [thread.id.value])
+        XCTAssertEqual(probe.snapshot().publishedThreadIDs, [thread.id])
+        XCTAssertEqual(probe.snapshot().threadCwds, [ownerRoot])
+        XCTAssertEqual(probe.snapshot().workspaceCwds, [ownerRoot])
+
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = false }
+        await assertDenied(thread, environment: authoritative)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        var workspaceLess = thread
+        workspaceLess.workspaceId = nil
+        await assertDenied(workspaceLess, environment: admittedEnvironment(for: workspaceLess))
+
+        var missingRecord = thread
+        missingRecord.workspaceId = WorkspaceID()
+        await assertDenied(missingRecord, environment: admittedEnvironment(for: missingRecord))
+
+        let staleRoot = (directory as NSString).appendingPathComponent("removed-owner")
+        try FileManager.default.createDirectory(atPath: staleRoot, withIntermediateDirectories: true)
+        let staleWorkspace = try router.createWorkspace(name: "Stale", cwd: staleRoot)
+        var staleThread = thread
+        staleThread.workspaceId = staleWorkspace.id
+        try context.threadRepo.upsert(staleThread)
+        try FileManager.default.removeItem(atPath: staleRoot)
+        await assertDenied(staleThread, environment: admittedEnvironment(for: staleThread))
+
+        let unresolvedRoot = (directory as NSString).appendingPathComponent("owner-is-not-a-directory")
+        _ = FileManager.default.createFile(atPath: unresolvedRoot, contents: Data())
+        let unresolvedWorkspace = try router.createWorkspace(name: "Unresolved", cwd: unresolvedRoot)
+        var unresolvedThread = thread
+        unresolvedThread.workspaceId = unresolvedWorkspace.id
+        await assertDenied(unresolvedThread, environment: admittedEnvironment(for: unresolvedThread))
+
+        await assertDenied(thread, environment: admittedEnvironment(for: thread, workspaceID: WorkspaceID()))
+        await assertDenied(thread, environment: admittedEnvironment(for: thread, provider: .grok))
+        let mismatchedThread = AgentThread(
+            workspaceId: workspace.id,
+            title: "Mismatched thread",
+            provider: .codex,
+            model: "test"
+        )
+        await assertDenied(mismatchedThread, environment: authoritative)
+        await assertDenied(thread, environment: admittedEnvironment(for: thread, sameUser: false))
+        await assertDenied(thread, environment: ["RC_GRAPHIFY_ENABLED": "stale-no-receipt"])
+
+        thread.runAsUser = AgentRunAsUser(
+            generatedUID: "foreign",
+            shortName: "foreign",
+            uid: getuid() &+ 1,
+            gid: getgid(),
+            homePath: "/Users/foreign"
+        )
+        await assertDenied(
+            thread,
+            environment: admittedEnvironment(for: thread, sameUser: true),
+            callerCwd: ownerRoot
+        )
+    }
+
     func test_botDeskSendAdmitsDistillAndInterceptorForEveryProvider() async throws {
         // WHY: Bot Desk used to be proven only for Grok. Claude/Codex desk
         // turns must get the same DISTILL_HINT, managed PATH wrappers, and
@@ -186,5 +350,43 @@ final class TokenSaverBotAgentAppInterceptorTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
         return predicate()
+    }
+}
+
+private final class BotGraphifyApplyProbe: @unchecked Sendable {
+    struct Snapshot: Equatable {
+        let applyThreadIDs: [UUID?]
+        let publishedThreadIDs: [AgentThreadID?]
+        let threadCwds: [String]
+        let workspaceCwds: [String]
+    }
+
+    private let lock = NSLock()
+    private var applyThreadIDs: [UUID?] = []
+    private var publishedThreadIDs: [AgentThreadID?] = []
+    private var threadCwds: [String] = []
+    private var workspaceCwds: [String] = []
+
+    func recordApply(threadID: UUID?, threadCwd: String, workspaceCwd: String) {
+        lock.withLock {
+            applyThreadIDs.append(threadID)
+            threadCwds.append(threadCwd)
+            workspaceCwds.append(workspaceCwd)
+        }
+    }
+
+    func recordPublication(set _: GraphifyThreadWorkingSet, threadID: AgentThreadID?) {
+        lock.withLock { publishedThreadIDs.append(threadID) }
+    }
+
+    func snapshot() -> Snapshot {
+        lock.withLock {
+            Snapshot(
+                applyThreadIDs: applyThreadIDs,
+                publishedThreadIDs: publishedThreadIDs,
+                threadCwds: threadCwds,
+                workspaceCwds: workspaceCwds
+            )
+        }
     }
 }

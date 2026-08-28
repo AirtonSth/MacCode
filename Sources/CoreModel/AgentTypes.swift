@@ -605,6 +605,10 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     public let cwd: String
     public let prompt: String
     public let userMessageContent: String?
+    /// Complete provider-bound source text used by the shared Token Saver
+    /// selector after provider/Auto admission. Nil preserves the Agent App
+    /// behavior where `prompt` is already the canonical source.
+    public let tokenSaverCanonicalProviderContent: String?
     public let attachments: [AgentAttachment]
     public let providerThreadId: String?
     public let permissionMode: AgentPermissionMode
@@ -632,6 +636,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         cwd: String,
         prompt: String,
         userMessageContent: String? = nil,
+        tokenSaverCanonicalProviderContent: String? = nil,
         attachments: [AgentAttachment] = [],
         providerThreadId: String? = nil,
         permissionMode: AgentPermissionMode = .supervised,
@@ -654,6 +659,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         self.cwd = cwd
         self.prompt = prompt
         self.userMessageContent = userMessageContent
+        self.tokenSaverCanonicalProviderContent = tokenSaverCanonicalProviderContent
         self.attachments = attachments
         self.providerThreadId = providerThreadId
         self.permissionMode = permissionMode
@@ -670,7 +676,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case runId, threadId, provider, providerInstanceId, model, cwd, prompt, userMessageContent, attachments, providerThreadId, permissionMode, reasoningEffort, serviceTier, interactionMode, providerBinary, environment, extraArgs, runAsUser
+        case runId, threadId, provider, providerInstanceId, model, cwd, prompt, userMessageContent, tokenSaverCanonicalProviderContent, attachments, providerThreadId, permissionMode, reasoningEffort, serviceTier, interactionMode, providerBinary, environment, extraArgs, runAsUser
     }
 
     public init(from decoder: Decoder) throws {
@@ -683,6 +689,10 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         cwd = try c.decode(String.self, forKey: .cwd)
         prompt = try c.decode(String.self, forKey: .prompt)
         userMessageContent = try c.decodeIfPresent(String.self, forKey: .userMessageContent)
+        tokenSaverCanonicalProviderContent = try c.decodeIfPresent(
+            String.self,
+            forKey: .tokenSaverCanonicalProviderContent
+        )
         attachments = try c.decodeIfPresent([AgentAttachment].self, forKey: .attachments) ?? []
         providerThreadId = try c.decodeIfPresent(String.self, forKey: .providerThreadId)
         permissionMode = try c.decodeIfPresent(AgentPermissionMode.self, forKey: .permissionMode) ?? .supervised
@@ -705,6 +715,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
             && lhs.cwd == rhs.cwd
             && lhs.prompt == rhs.prompt
             && lhs.userMessageContent == rhs.userMessageContent
+            && lhs.tokenSaverCanonicalProviderContent == rhs.tokenSaverCanonicalProviderContent
             && lhs.attachments == rhs.attachments
             && lhs.providerThreadId == rhs.providerThreadId
             && lhs.permissionMode == rhs.permissionMode

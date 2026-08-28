@@ -281,13 +281,11 @@ final class BotsWindowTests: XCTestCase {
         let hydrated = await waitUntil(timeout: 5) {
             vm.selectDeskThread(conversationID)
             return vm.deskMessages.contains {
-                $0.role == .user && $0.tokenSaverWireRequest != nil
+                $0.role == .user && $0.agentMessageID?.value == request.runId.value
             }
         }
-        XCTAssertTrue(hydrated, "restore must hydrate the persisted RCW1 request onto the Desk user row")
+        XCTAssertTrue(hydrated, "restore must hydrate the selected Desk user row")
         let user = try XCTUnwrap(vm.deskMessages.first { $0.role == .user })
-        let wireRequest = try XCTUnwrap(user.tokenSaverWireRequest)
-        XCTAssertTrue(RCWireProtocol.isWire(wireRequest))
         XCTAssertFalse(
             RCWireProtocol.isWire(user.text),
             "Desk Human must keep the teammate line, not the provider-bound wire"
@@ -308,9 +306,15 @@ final class BotsWindowTests: XCTestCase {
             restored.text.contains("You are Piper"),
             "cold restore must not surface the compiled brain envelope"
         )
-        let coldWire = try XCTUnwrap(restored.tokenSaverWireRequest)
-        XCTAssertTrue(RCWireProtocol.isWire(coldWire))
-        XCTAssertEqual(coldWire, wireRequest)
+        XCTAssertEqual(restored.tokenSaverWireRequest, user.tokenSaverWireRequest)
+        if let wireRequest = user.tokenSaverWireRequest {
+            XCTAssertTrue(RCWireProtocol.isWire(wireRequest))
+        } else {
+            XCTAssertFalse(
+                RCWireProtocol.isWire(request.prompt),
+                "a lossless full-brain miss must fail open without painting RCW1 success"
+            )
+        }
     }
 
     func test_tokenSaverCompiledBotBrainUsesCanonicalProviderContentAfterAdmission() async throws {
@@ -473,6 +477,1179 @@ final class BotsWindowTests: XCTestCase {
                 "Token Saver: 0 tokens saved because Token Saver is deactivated"
             )
             XCTAssertEqual(vm.deskTokenSaverFooterPresentation, .deactivated)
+        }
+    }
+
+    func test_providerSpawnedWorkerPromptDoesNotRunBestOfThreeAgain() async throws {
+        try await ProviderEnvironmentAttributionTests
+            .exerciseProviderSpawnedWorkerPromptDoesNotRunBestOfThreeAgain()
+    }
+
+    func test_botToAgentAppGraphifyRequiresAuthoritativeOwningWorkspaceRecord() async throws {
+        try await TokenSaverBotAgentAppInterceptorTests
+            .exerciseBotToAgentAppGraphifyRequiresAuthoritativeOwningWorkspaceRecord(directory: directory)
+    }
+
+    func test_botSendNormalizesHumanTextButKeepsByteExactCanonicalProviderSource() async throws {
+        // WHY: Desk presentation historically trims surrounding whitespace,
+        // while the frozen Token Saver proof requires the complete provider
+        // source to remain byte-exact. These are two values on one accepted
+        // route, not divergent routing decisions.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .grok,
+                models: [AgentModelDescriptor(id: "test", label: "Test", provider: .grok)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "grok"
+            ),
+        ])
+        let runner = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.grok, runner: runner)
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Exact source", provider: .grok, model: "test")
+        vm.openDesk(bot)
+        vm.deskRouting = BotDeskRouting(
+            provider: .grok,
+            providerInstanceID: "grok",
+            model: "test",
+            routingMode: .manual
+        )
+        let raw = "  preserve these canonical boundary bytes  "
+
+        XCTAssertTrue(vm.send(raw))
+        let started = await waitUntil(timeout: 5) { runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        let request = try XCTUnwrap(runner.requests.first)
+        let canonical = try XCTUnwrap(request.tokenSaverCanonicalProviderContent)
+        XCTAssertEqual(request.userMessageContent, "preserve these canonical boundary bytes")
+        XCTAssertTrue(canonical.contains(raw), "compiled provider source must retain exact submitted bytes")
+        XCTAssertEqual(
+            vm.deskMessages.first(where: { $0.role == .user })?.text,
+            "preserve these canonical boundary bytes"
+        )
+        XCTAssertEqual(
+            try context.messageRepo.get(id: AgentMessageID(request.runId.value))?.content,
+            "preserve these canonical boundary bytes"
+        )
+        XCTAssertTrue(runner.finish(runID: request.runId, status: .completed, reply: "done"))
+    }
+
+    func test_tokenSaverFooterUsesSelectedThreadBeforePeerProjection() async throws {
+        // WHY: peer bubbles are useful transcript projection, but they belong
+        // to another ledger and must never inflate the selected thread footer.
+        let context = try makeContext()
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true))
+        PrivateAccountSessionStore(repo: context.settingsRepo).save(PrivateAccountSession(
+            accessToken: "token",
+            refreshToken: "refresh",
+            user: PrivateAccountUser(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "paid@example.com",
+                id: "paid-user",
+                subscribed: true
+            )
+        ))
+        let vm = BotsViewModel(context: context)
+        let owner = try vm.create(name: "Piper", title: "Owner")
+        let peer = try vm.create(name: "Quinn", title: "Peer")
+        let thread = AgentThread(title: "owner", provider: .codex, model: "test")
+        try context.threadRepo.upsert(thread)
+        try context.messageRepo.append(AgentMessage(threadId: thread.id, role: .user, content: "owner ask"))
+        try context.messageRepo.append(AgentMessage(threadId: thread.id, role: .assistant, content: "owner answer"))
+        let conversation = BotConversation(
+            botID: owner.id,
+            title: "Owner chat",
+            linkedAgentThreadID: thread.id
+        )
+        try context.botStore.upsertConversation(conversation)
+        vm.openDesk(owner)
+        vm.selectDeskThread(conversation.id)
+        vm.tokenSaverFooterDeliveredTotalLoaderForTesting = { _, _, _ in
+            TokenSaverThreadFooterReload.DeliveredTotal(savedTokens: 100, runs: 1)
+        }
+        vm.reloadTokenSaverThreadSavings()
+        await vm.awaitTokenSaverFooterReloadForTesting()
+        let ownerSaved = vm.tokenSaverThreadSavedTokens
+        XCTAssertGreaterThan(ownerSaved, 0)
+        let peerChrome = BotDeskPeer(
+            direction: .fromPeer,
+            botID: peer.id,
+            name: peer.name,
+            title: peer.title,
+            handle: peer.handle
+        )
+        vm.replaceDeskMessagesForTesting(vm.deskMessages + [
+            BotDeskMessage(
+                role: .assistant,
+                text: String(repeating: "peer-only ", count: 5_000),
+                peer: peerChrome
+            ),
+        ])
+        vm.reloadTokenSaverThreadSavings()
+        await vm.awaitTokenSaverFooterReloadForTesting()
+        XCTAssertEqual(vm.tokenSaverThreadSavedTokens, ownerSaved)
+    }
+
+    func test_tokenSaverFooterRejectsStaleSelectionAndPeerProjection() async throws {
+        // WHY: a cancelled A read may ignore cancellation and finish after B.
+        // Only the latest selected conversation may publish or clear the footer;
+        // peer projection remains covered independently above.
+        let context = try makeContext()
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true))
+        PrivateAccountSessionStore(repo: context.settingsRepo).save(PrivateAccountSession(
+            accessToken: "token",
+            refreshToken: "refresh",
+            user: PrivateAccountUser(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "paid@example.com",
+                id: "paid-user",
+                subscribed: true
+            )
+        ))
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Owner")
+        let threadA = AgentThread(title: "A", provider: .codex, model: "test")
+        let threadB = AgentThread(title: "B", provider: .codex, model: "test")
+        try context.threadRepo.upsert(threadA)
+        try context.threadRepo.upsert(threadB)
+        try context.messageRepo.append(AgentMessage(threadId: threadA.id, role: .user, content: "A"))
+        try context.messageRepo.append(AgentMessage(threadId: threadB.id, role: .user, content: "B"))
+        let conversationA = BotConversation(botID: bot.id, title: "A", linkedAgentThreadID: threadA.id)
+        let conversationB = BotConversation(botID: bot.id, title: "B", linkedAgentThreadID: threadB.id)
+        try context.botStore.upsertConversation(conversationA)
+        try context.botStore.upsertConversation(conversationB)
+        vm.openDesk(bot)
+        await vm.awaitTokenSaverFooterReloadForTesting()
+        vm.selectDeskThread(conversationA.id)
+        await vm.awaitTokenSaverFooterReloadForTesting()
+
+        let gate = BotFooterLoadGate()
+        vm.tokenSaverFooterDeliveredTotalLoaderForTesting = { _, threadId, _ in
+            await gate.read(threadId: threadId)
+        }
+        vm.reloadTokenSaverThreadSavings()
+        try await gate.waitForCalls(1)
+        vm.selectDeskThread(conversationB.id)
+        try await gate.waitForCalls(3)
+        let loadedThreadIDs = await gate.threadIDs()
+        XCTAssertEqual(loadedThreadIDs, [threadA.id, threadB.id, threadB.id])
+
+        await gate.release(call: 3, savedTokens: 2_000)
+        await vm.awaitTokenSaverFooterReloadForTesting()
+        XCTAssertEqual(vm.selectedConversation?.id, conversationB.id)
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 2_000)
+        XCTAssertEqual(vm.deskTokenSaverFooterPresentation, .savings)
+
+        await gate.release(call: 1, savedTokens: 1_000)
+        await gate.release(call: 2, savedTokens: 1_500)
+        try await gate.waitForReturns(3)
+        XCTAssertEqual(vm.selectedConversation?.id, conversationB.id)
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 2_000)
+        XCTAssertEqual(vm.deskTokenSaverFooterPresentation, .savings)
+        XCTAssertTrue(vm.tokenSaverFooterSnapshotReady)
+    }
+
+    func test_tokenSaverFooterABA_A1FinishesLastCannotPublishOrClearA2() async throws {
+        // WHY: identity checks alone cannot reject A1 after A→B→A. The latest
+        // A reload must own publication even when the cancelled A1 loader
+        // ignores cancellation and finishes last.
+        let context = try makeContext()
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true))
+        PrivateAccountSessionStore(repo: context.settingsRepo).save(PrivateAccountSession(
+            accessToken: "token",
+            refreshToken: "refresh",
+            user: PrivateAccountUser(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "paid@example.com",
+                id: "paid-user",
+                subscribed: true
+            )
+        ))
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Owner")
+        let threadA = AgentThread(title: "A", provider: .codex, model: "test")
+        let threadB = AgentThread(title: "B", provider: .codex, model: "test")
+        try context.threadRepo.upsert(threadA)
+        try context.threadRepo.upsert(threadB)
+        try context.messageRepo.append(AgentMessage(threadId: threadA.id, role: .user, content: "A"))
+        try context.messageRepo.append(AgentMessage(threadId: threadB.id, role: .user, content: "B"))
+        let conversationA = BotConversation(botID: bot.id, title: "A", linkedAgentThreadID: threadA.id)
+        let conversationB = BotConversation(botID: bot.id, title: "B", linkedAgentThreadID: threadB.id)
+        try context.botStore.upsertConversation(conversationA)
+        try context.botStore.upsertConversation(conversationB)
+        vm.openDesk(bot)
+        await vm.awaitTokenSaverFooterReloadForTesting()
+        vm.selectDeskThread(conversationB.id)
+        await vm.awaitTokenSaverFooterReloadForTesting()
+        vm.selectDeskThread(conversationA.id)
+        await vm.awaitTokenSaverFooterReloadForTesting()
+
+        let gate = BotFooterLoadGate()
+        vm.tokenSaverFooterDeliveredTotalLoaderForTesting = { _, threadId, _ in
+            await gate.read(threadId: threadId)
+        }
+        vm.reloadTokenSaverThreadSavings()
+        try await gate.waitForCalls(1)
+        vm.selectDeskThread(conversationB.id)
+        try await gate.waitForCalls(2)
+        vm.selectDeskThread(conversationA.id)
+        try await gate.waitForCalls(3)
+        let loadedThreadIDs = await gate.threadIDs()
+        XCTAssertEqual(loadedThreadIDs, [threadA.id, threadB.id, threadA.id])
+
+        await gate.release(call: 3, savedTokens: 3_000)
+        await vm.awaitTokenSaverFooterReloadForTesting()
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 3_000)
+
+        await gate.release(call: 1, savedTokens: 1_000)
+        await gate.release(call: 2, savedTokens: 2_000)
+        try await gate.waitForReturns(3)
+        XCTAssertEqual(vm.selectedConversation?.id, conversationA.id)
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 3_000)
+        XCTAssertTrue(vm.tokenSaverFooterSnapshotReady)
+    }
+
+    func test_tokenSaverFooterSameSelectionFailurePreservesPositiveSnapshot() async throws {
+        // WHY: a transient ledger read failure on the same selected thread
+        // must not erase a previously proven positive footer.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Owner")
+        let thread = AgentThread(title: "A", provider: .codex, model: "test")
+        try context.threadRepo.upsert(thread)
+        try context.messageRepo.append(AgentMessage(threadId: thread.id, role: .user, content: "A"))
+        try context.botStore.upsertConversation(BotConversation(
+            botID: bot.id,
+            title: "A",
+            linkedAgentThreadID: thread.id
+        ))
+        vm.openDesk(bot)
+        await vm.awaitTokenSaverFooterReloadForTesting()
+        vm.applyTokenSaverFooterSnapshotForTesting(.init(
+            enabled: true,
+            measuredTokens: 4_000,
+            displayTokens: 5_000
+        ))
+        vm.tokenSaverFooterDeliveredTotalLoaderForTesting = { _, _, _ in nil }
+
+        vm.reloadTokenSaverThreadSavings()
+        await vm.awaitTokenSaverFooterReloadForTesting()
+
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 4_000)
+        XCTAssertEqual(vm.tokenSaverThreadSavedTokens, 5_000)
+        XCTAssertTrue(vm.tokenSaverFooterSnapshotReady)
+    }
+
+    func test_agentAppCanonicalProviderOverrideIsNotApplicableByDefault() async throws {
+        // WHY: the extra canonical source belongs only to Bot-compiled turns.
+        // Ordinary Agent App sends already use their prompt as canonical and
+        // must keep the optional absent through coordinator reconstruction.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .codex,
+                models: [AgentModelDescriptor(id: "test", label: "Test", provider: .codex)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "codex"
+            ),
+        ])
+        let runner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: runner)
+        let thread = AgentThread(title: "agent app", provider: .codex, model: "test")
+        try context.threadRepo.upsert(thread)
+        let runID = AgentRunID()
+        _ = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "ordinary Agent App prompt",
+            provider: .codex,
+            model: "test",
+            permissionMode: .supervised,
+            reasoningEffort: nil,
+            providerInstanceId: "codex",
+            requestedRunID: runID,
+            executionCwdOverride: directory,
+            allowProviderCatalogListingDuringPreflight: false
+        )
+        let started = await waitUntil(timeout: 5) { runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        XCTAssertNil(runner.requests.first?.tokenSaverCanonicalProviderContent)
+        XCTAssertTrue(runner.finish(runID: runID, status: .completed, reply: "done"))
+    }
+
+    func test_tokenSaverPreparationTimeoutAndLateCompletionRouteManifest() async throws {
+        // WHY: every coordinator-owned compiled Bot route must select its full
+        // brain once after admission. A rejected, cancelled, timed-out, or late
+        // local result must stay fail-open and must never create green savings.
+        struct Route {
+            let name: String
+            let display: String
+            let botName: String
+            let request: AgentRunRequest
+        }
+
+        let context = try makeContext()
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true))
+        PrivateAccountSessionStore(repo: context.settingsRepo).save(PrivateAccountSession(
+            accessToken: "token",
+            refreshToken: "refresh",
+            user: PrivateAccountUser(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "paid@example.com",
+                id: "paid-user",
+                subscribed: true
+            )
+        ))
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .codex,
+                models: [AgentModelDescriptor(id: "test", label: "Test", provider: .codex)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "codex"
+            ),
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .grok,
+                models: [AgentModelDescriptor(id: "test", label: "Test", provider: .grok)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "grok"
+            ),
+        ])
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        let samePeerRunner = ControlledBotHandoffRunner(provider: .codex)
+        let grokHostRunner = ControlledBotHandoffRunner(provider: .grok)
+        let secondProviderPeerRunner = ControlledBotHandoffRunner(provider: .grok)
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let piper = try vm.create(name: "Piper", title: "Desk owner", provider: .codex, model: "test")
+        let quinn = try vm.create(name: "Quinn", title: "Same-provider peer", provider: .codex, model: "test")
+        let rory = try vm.create(name: "Rory", title: "Second-provider peer")
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(
+                hostRunner: hostRunner,
+                peerRunners: [
+                    quinn.id: samePeerRunner,
+                ]
+            )
+        )
+        context.coordinator.replaceProvider(
+            .grok,
+            runner: CallerThreadHandoffRunner(
+                hostRunner: grokHostRunner,
+                peerRunners: [rory.id: secondProviderPeerRunner]
+            )
+        )
+        let deskThread = AgentThread(title: "Desk manifest", provider: .codex, model: "test")
+        try context.threadRepo.upsert(deskThread)
+        let deskConversation = BotConversation(
+            botID: piper.id,
+            title: "Desk manifest",
+            linkedAgentThreadID: deskThread.id
+        )
+        try context.botStore.upsertConversation(deskConversation)
+        vm.openDesk(piper)
+        vm.selectDeskThread(deskConversation.id)
+        vm.deskRouting = BotDeskRouting(
+            provider: .codex,
+            providerInstanceID: "codex",
+            model: "test",
+            routingMode: .manual
+        )
+        let probe = BotPreparationProbe()
+        context.coordinator.promptCompressor = { prompt, _, _, _ in
+            probe.recordLegacy()
+            return prompt
+        }
+        context.coordinator.tokenSaverOutboundSelector = { request in
+            probe.recordSelection(request)
+            return await botHumanDecision(for: request)
+        }
+        context.coordinator.onTokenSaverOutboundDelivery = { delivery in
+            probe.recordDelivery(delivery)
+        }
+
+        let primaryDisplay = "primary display"
+        XCTAssertTrue(vm.send(primaryDisplay))
+        await hostRunner.waitForRequests(1)
+        let primaryRequest = try XCTUnwrap(hostRunner.requests.first)
+        let capability = try XCTUnwrap(
+            primaryRequest.environment[AgentDelegationCapabilityTransport.environmentKey]
+        )
+
+        let sameDisplay = "same-provider display"
+        let samePeer = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: primaryRequest.threadId,
+                callerRun: primaryRequest.runId,
+                handle: quinn.handle,
+                prompt: sameDisplay,
+                replyMode: .consult,
+                delegationCapability: capability
+            )
+        }
+        await samePeerRunner.waitForRequests(1)
+        let samePeerRequest = try XCTUnwrap(samePeerRunner.requests.first)
+        XCTAssertEqual(primaryRequest.provider, .codex)
+        XCTAssertEqual(samePeerRequest.provider, primaryRequest.provider)
+        XCTAssertTrue(samePeerRunner.finish(
+            runID: samePeerRequest.runId,
+            status: .completed,
+            reply: "same-provider reply"
+        ))
+        _ = try await samePeer.value
+
+        let secondProviderVM = BotsViewModel(context: context, router: router)
+        router.botsViewModel = secondProviderVM
+        secondProviderVM.openDesk(piper)
+        secondProviderVM.createDeskThread()
+        // This second provider case proves the same compiled peer path under
+        // Grok after the Codex case above. The peer inherits its active caller
+        // route, so the relationship is honestly Grok -> Grok; differing
+        // parent/child providers belong to the provider-spawned runtime matrix.
+        secondProviderVM.deskRouting = BotDeskRouting(
+            provider: .grok,
+            providerInstanceID: "grok",
+            model: "test",
+            routingMode: .manual
+        )
+        XCTAssertTrue(secondProviderVM.send("second-provider bootstrap host"))
+        await grokHostRunner.waitForRequests(1)
+        let grokHostRequest = try XCTUnwrap(grokHostRunner.requests.first)
+        let grokCapability = try XCTUnwrap(
+            grokHostRequest.environment[AgentDelegationCapabilityTransport.environmentKey]
+        )
+        let secondProviderDisplay = "second-provider display"
+        let secondProviderPeer = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: grokHostRequest.threadId,
+                callerRun: grokHostRequest.runId,
+                handle: rory.handle,
+                prompt: secondProviderDisplay,
+                replyMode: .consult,
+                delegationCapability: grokCapability
+            )
+        }
+        await secondProviderPeerRunner.waitForRequests(1)
+        let secondProviderPeerRequest = try XCTUnwrap(secondProviderPeerRunner.requests.first)
+        XCTAssertEqual(grokHostRequest.provider, .grok)
+        XCTAssertEqual(secondProviderPeerRequest.provider, grokHostRequest.provider)
+        XCTAssertTrue(secondProviderPeerRunner.finish(
+            runID: secondProviderPeerRequest.runId,
+            status: .completed,
+            reply: "second-provider reply"
+        ))
+        _ = try await secondProviderPeer.value
+        XCTAssertTrue(grokHostRunner.finish(
+            runID: grokHostRequest.runId,
+            status: .completed,
+            reply: "second-provider host reply"
+        ))
+
+        XCTAssertTrue(hostRunner.finish(
+            runID: primaryRequest.runId,
+            status: .completed,
+            reply: "primary reply"
+        ))
+        XCTAssertNil(context.coordinator.activeRunId(threadId: primaryRequest.threadId))
+        let continuationThread = AgentThread(
+            title: "Desk continuation",
+            provider: .codex,
+            model: "test",
+            status: .completed
+        )
+        try context.threadRepo.upsert(continuationThread)
+        try context.messageRepo.append(AgentMessage(
+            threadId: continuationThread.id,
+            role: .user,
+            content: "prior desk request"
+        ))
+        try context.messageRepo.append(AgentMessage(
+            threadId: continuationThread.id,
+            role: .assistant,
+            content: "prior desk answer"
+        ))
+        let continuationConversation = BotConversation(
+            botID: piper.id,
+            title: "Desk continuation",
+            linkedAgentThreadID: continuationThread.id
+        )
+        try context.botStore.upsertConversation(continuationConversation)
+        let continuationVM = BotsViewModel(context: context, router: router)
+        router.botsViewModel = continuationVM
+        continuationVM.openDesk(piper)
+        continuationVM.selectDeskThread(continuationConversation.id)
+        continuationVM.deskRouting = BotDeskRouting(
+            provider: .codex,
+            providerInstanceID: "codex",
+            model: "test",
+            routingMode: .manual
+        )
+        let continuationDisplay = "continuation display"
+        XCTAssertTrue(continuationVM.send(continuationDisplay))
+        await hostRunner.waitForRequests(2)
+        let continuationRequest = try XCTUnwrap(hostRunner.requests.last)
+        XCTAssertEqual(continuationRequest.threadId, continuationThread.id)
+        XCTAssertTrue(hostRunner.finish(
+            runID: continuationRequest.runId,
+            status: .completed,
+            reply: "continuation reply"
+        ))
+        XCTAssertNil(context.coordinator.activeRunId(threadId: continuationRequest.threadId))
+
+        let manifest = [
+            Route(name: "desk-primary", display: primaryDisplay, botName: piper.name, request: primaryRequest),
+            Route(name: "bot-to-bot-peer-inherited-origin-provider", display: sameDisplay, botName: quinn.name, request: samePeerRequest),
+            Route(name: "agentapp-to-bot-peer-inherited-origin-provider", display: secondProviderDisplay, botName: rory.name, request: secondProviderPeerRequest),
+            Route(name: "desk-host-continuation", display: continuationDisplay, botName: piper.name, request: continuationRequest),
+        ]
+        XCTAssertEqual(manifest.map(\.name), [
+            "desk-primary",
+            "bot-to-bot-peer-inherited-origin-provider",
+            "agentapp-to-bot-peer-inherited-origin-provider",
+            "desk-host-continuation",
+        ])
+        let manifestRunIDs = Set(manifest.map { $0.request.runId })
+        XCTAssertEqual(manifestRunIDs.count, manifest.count)
+        let routeSelections = probe.selectionRequests.filter {
+            manifestRunIDs.contains($0.admittedRequest.runId)
+        }
+        let providerRequests = hostRunner.requests
+            + samePeerRunner.requests
+            + grokHostRunner.requests
+            + secondProviderPeerRunner.requests
+        XCTAssertEqual(routeSelections.count, manifest.count)
+        for (route, selection) in zip(manifest, routeSelections) {
+            let canonical = try XCTUnwrap(route.request.tokenSaverCanonicalProviderContent)
+            XCTAssertEqual(
+                probe.selectionRequests.filter {
+                    $0.admittedRequest.runId == route.request.runId
+                }.count,
+                1,
+                route.name
+            )
+            XCTAssertEqual(
+                providerRequests.filter { $0.runId == route.request.runId }.count,
+                1,
+                route.name
+            )
+            XCTAssertEqual(selection.canonicalHuman, canonical, route.name)
+            XCTAssertEqual(route.request.prompt, canonical, route.name)
+            XCTAssertEqual(route.request.userMessageContent, route.display, route.name)
+            XCTAssertNotEqual(canonical, route.display, route.name)
+            XCTAssertTrue(canonical.contains("You are \(route.botName)"), route.name)
+            XCTAssertTrue(canonical.contains(route.display), route.name)
+        }
+        XCTAssertEqual(probe.legacyCalls, 0)
+        XCTAssertEqual(
+            probe.deliveries.filter { manifestRunIDs.contains($0.runId) }.count,
+            manifest.count
+        )
+
+        router.botsViewModel = vm
+        vm.openDesk(piper)
+        vm.createDeskThread()
+        let rejectedDisplay = "reject display"
+        context.coordinator.tokenSaverOutboundSelector = { request in
+            probe.recordSelection(request)
+            return await botHumanDecision(
+                canonical: "stale canonical",
+                outbound: "stale outbound",
+                provider: request.admittedRequest.provider,
+                model: request.admittedRequest.model
+            )
+        }
+        XCTAssertTrue(vm.send(rejectedDisplay))
+        await hostRunner.waitForRequests(3)
+        let rejectedSent = try XCTUnwrap(hostRunner.requests.last)
+        let rejectedCanonical = try XCTUnwrap(rejectedSent.tokenSaverCanonicalProviderContent)
+        XCTAssertEqual(rejectedSent.prompt, rejectedCanonical, "rejection must fail open exactly")
+        XCTAssertEqual(rejectedSent.userMessageContent, rejectedDisplay)
+        XCTAssertTrue(hostRunner.finish(runID: rejectedSent.runId, status: .completed, reply: "done"))
+        XCTAssertEqual(probe.deliveries.last?.receipt.reason, .candidateError)
+        let receipts = TokenSaverRequestSelectionReceiptRepository(db: context.db)
+        XCTAssertEqual(try receipts.load(runId: rejectedSent.runId)?.winner.reason, .candidateError)
+        XCTAssertEqual(
+            try receipts.load(runId: rejectedSent.runId)?.winner.lifecycle,
+            .deliveryUnknown,
+            "the controlled runner starts but intentionally does not claim the real provider permit"
+        )
+
+        vm.createDeskThread()
+        context.coordinator.tokenSaverOutboundSelector = { request in
+            probe.recordSelection(request)
+            return await botHumanDecision(for: request)
+        }
+        XCTAssertTrue(vm.send("timeout host"))
+        await hostRunner.waitForRequests(4)
+        let timeoutHost = try XCTUnwrap(hostRunner.requests.last)
+        let timeoutCapability = try XCTUnwrap(
+            timeoutHost.environment[AgentDelegationCapabilityTransport.environmentKey]
+        )
+        let timeoutGate = BotPreparationGate()
+        context.coordinator.tokenSaverOutboundSelectionDeadlineWaiterForTesting = {
+            await timeoutGate.waitForDeadlineFire()
+        }
+        context.coordinator.tokenSaverOutboundSelector = { request in
+            probe.recordSelection(request)
+            return await timeoutGate.select(request)
+        }
+        let timeoutDisplay = "timeout peer display"
+        let timeoutStart = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: timeoutHost.threadId,
+                callerRun: timeoutHost.runId,
+                handle: quinn.handle,
+                prompt: timeoutDisplay,
+                replyMode: .consult,
+                delegationCapability: timeoutCapability
+            )
+        }
+        let timeoutSelection = await timeoutGate.waitForSelection()
+        await timeoutGate.waitForDeadlineWaiter()
+        await timeoutGate.fireDeadline()
+        await samePeerRunner.waitForRequests(2)
+        let timeoutSent = try XCTUnwrap(samePeerRunner.requests.last)
+        XCTAssertEqual(
+            timeoutSent.prompt,
+            timeoutSelection.canonicalHuman,
+            "timeout must fail open the actual peer brain exactly"
+        )
+        XCTAssertEqual(timeoutSent.userMessageContent, timeoutDisplay)
+        XCTAssertTrue(samePeerRunner.finish(
+            runID: timeoutSent.runId,
+            status: .completed,
+            reply: "timeout fail-open reply"
+        ))
+        _ = try await timeoutStart.value
+        let timeoutStarts = samePeerRunner.requests.count
+        let timeoutDeliveries = probe.deliveries.count
+        let timeoutReceiptBeforeLate = try XCTUnwrap(receipts.load(runId: timeoutSent.runId))
+        XCTAssertEqual(timeoutReceiptBeforeLate.winner.selectedFormat, .human)
+        XCTAssertEqual(timeoutReceiptBeforeLate.winner.lifecycle, .deliveryUnknown)
+        let lateDecision = await botHumanDecision(for: timeoutSelection)
+        await timeoutGate.releaseSelection(lateDecision)
+        await timeoutGate.waitForSelectionReturn()
+        XCTAssertEqual(samePeerRunner.requests.count, timeoutStarts, "late selection must not start again")
+        XCTAssertEqual(probe.deliveries.count, timeoutDeliveries, "late selection must not deliver again")
+        XCTAssertEqual(timeoutSent.prompt, timeoutSelection.canonicalHuman, "late selection must not mutate payload")
+        XCTAssertEqual(
+            try receipts.load(runId: timeoutSent.runId),
+            timeoutReceiptBeforeLate,
+            "late selection must not replace the persisted winner"
+        )
+
+        let cancelledGate = BotPreparationGate()
+        context.coordinator.tokenSaverOutboundSelectionDeadlineWaiterForTesting = {
+            await cancelledGate.waitForDeadlineFire()
+        }
+        context.coordinator.tokenSaverOutboundSelector = { request in
+            probe.recordSelection(request)
+            return await cancelledGate.select(request)
+        }
+        let cancelledStart = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: timeoutHost.threadId,
+                callerRun: timeoutHost.runId,
+                handle: quinn.handle,
+                prompt: "cancelled peer display",
+                replyMode: .consult,
+                delegationCapability: timeoutCapability
+            )
+        }
+        let cancelledSelection = await cancelledGate.waitForSelection()
+        await cancelledGate.waitForDeadlineWaiter()
+        let cancelledRunID = cancelledSelection.admittedRequest.runId
+        context.coordinator.stopRun(threadId: cancelledSelection.admittedRequest.threadId)
+        let cancelledDecision = await botHumanDecision(for: cancelledSelection)
+        await cancelledGate.releaseSelection(cancelledDecision)
+        await cancelledGate.fireDeadline()
+        do {
+            _ = try await cancelledStart.value
+            XCTFail("cancelled preparation must not reach provider start")
+        } catch {
+            XCTAssertTrue(error is JSONRPCError)
+        }
+        XCTAssertFalse(samePeerRunner.requests.contains { $0.runId == cancelledRunID })
+        XCTAssertEqual(try receipts.load(runId: cancelledRunID)?.winner.selectedFormat, .human)
+        XCTAssertEqual(try receipts.load(runId: cancelledRunID)?.winner.lifecycle, .notDelivered)
+
+        XCTAssertTrue(hostRunner.finish(
+            runID: timeoutHost.runId,
+            status: .completed,
+            reply: "timeout host done"
+        ))
+
+        for threadID in [
+            rejectedSent.threadId,
+            timeoutSent.threadId,
+            cancelledSelection.admittedRequest.threadId,
+        ] {
+            XCTAssertEqual(try context.tokenSaverSavingsRepo.deliveredTotal(
+                forThreadID: threadID.value.uuidString
+            ).savedTokens, 0)
+        }
+        let timeoutConversation = try XCTUnwrap(
+            try context.botStore.conversationLinked(to: timeoutSent.threadId)
+        )
+        vm.openDesk(quinn)
+        vm.selectDeskThread(timeoutConversation.id)
+        await vm.awaitTokenSaverFooterReloadForTesting()
+        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0)
+        XCTAssertEqual(vm.deskTokenSaverFooterPresentation, .problem)
+        XCTAssertEqual(
+            vm.tokenSaverFooterTextForTesting(),
+            "Token Saver: 0 tokens saved because something went wrong"
+        )
+        XCTAssertEqual(probe.legacyCalls, 0)
+    }
+
+    func test_codexFreshThreadFallbackSeedsPriorContextAcrossOwnedBotRoutes() async throws {
+        // WHY: the seed must come from the Bot-owned thread selected by the
+        // real Desk/peer route. Hand-constructing a snapshot proves only the
+        // encoder; this exercises Bot ownership, coordinator capture, peer
+        // continuation reuse, and then the actual Codex fallback seam.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .codex,
+                models: [AgentModelDescriptor(id: "test", label: "Test", provider: .codex)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "codex"
+            ),
+        ])
+        let hostRunner = ControlledBotHandoffRunner(provider: .codex)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let piper = try vm.create(name: "Piper", title: "Desk owner", provider: .codex, model: "test")
+        let quinn = try vm.create(name: "Quinn", title: "Peer owner", provider: .codex, model: "test")
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(hostRunner: hostRunner, peerRunners: [quinn.id: peerRunner])
+        )
+
+        let deskThread = AgentThread(
+            title: "Desk owned",
+            provider: .codex,
+            model: "test",
+            providerThreadId: "lost-desk-destination",
+            status: .completed
+        )
+        try context.threadRepo.upsert(deskThread)
+        try context.messageRepo.append(AgentMessage(
+            threadId: deskThread.id,
+            role: .user,
+            content: "desk prior user"
+        ))
+        try context.messageRepo.append(AgentMessage(
+            threadId: deskThread.id,
+            role: .assistant,
+            content: "desk prior assistant"
+        ))
+        let deskConversation = BotConversation(
+            botID: piper.id,
+            title: "Desk owned",
+            linkedAgentThreadID: deskThread.id
+        )
+        try context.botStore.upsertConversation(deskConversation)
+        vm.openDesk(piper)
+        vm.selectDeskThread(deskConversation.id)
+        vm.deskRouting = BotDeskRouting(
+            provider: .codex,
+            providerInstanceID: "codex",
+            model: "test",
+            routingMode: .manual
+        )
+
+        XCTAssertTrue(vm.send("desk current request"))
+        let deskStarted = await waitUntil(timeout: 5) { hostRunner.requests.count == 1 }
+        XCTAssertTrue(deskStarted)
+        let deskRequest = try XCTUnwrap(hostRunner.requests.first)
+        XCTAssertEqual(deskRequest.threadId, deskThread.id)
+        XCTAssertEqual(deskRequest.contextSnapshot?.items.map(\.canonicalText), [
+            "desk prior user",
+            "desk prior assistant",
+        ])
+        let capability = try XCTUnwrap(
+            deskRequest.environment[AgentDelegationCapabilityTransport.environmentKey]
+        )
+        let firstPeer = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: deskRequest.threadId,
+                callerRun: deskRequest.runId,
+                handle: quinn.handle,
+                prompt: "  peer prior question  ",
+                replyMode: .consult,
+                delegationCapability: capability
+            )
+        }
+        let firstPeerStarted = await waitUntil(timeout: 5) { peerRunner.requests.count == 1 }
+        XCTAssertTrue(firstPeerStarted)
+        let firstPeerRequest = try XCTUnwrap(peerRunner.requests.first)
+        XCTAssertNil(firstPeerRequest.contextSnapshot, "new peer thread has no prior context")
+        XCTAssertEqual(firstPeerRequest.userMessageContent, "peer prior question")
+        XCTAssertTrue(
+            try XCTUnwrap(firstPeerRequest.tokenSaverCanonicalProviderContent)
+                .contains("  peer prior question  "),
+            "peer display is normalized while its canonical provider source stays byte-exact"
+        )
+        XCTAssertTrue(peerRunner.finish(
+            runID: firstPeerRequest.runId,
+            status: .completed,
+            reply: "peer prior answer"
+        ))
+        let firstPeerResult = try await firstPeer.value
+        let peerConversationID = BotConversationID(try XCTUnwrap(
+            firstPeerResult.objectValue?["conversation_id"]?.stringValue
+                .flatMap(UUID.init(uuidString:))
+        ))
+        let consultationID = try XCTUnwrap(
+            firstPeerResult.objectValue?[BotPeerDelegation.consultationIDParameterKey]?
+                .stringValue.flatMap(UUID.init(uuidString:))
+        )
+        vm.reconcilePeerHandoffsForTesting()
+        let firstHandoffSettled = await waitUntil(timeout: 5) {
+            vm.peerHandoffSnapshotsForTesting(originConversationID: deskConversation.id)
+                .contains { $0.consultationID == consultationID && $0.phase == .completed }
+        }
+        XCTAssertTrue(firstHandoffSettled)
+        let firstPeerSettled = await waitUntil(timeout: 5) {
+            context.coordinator.activeRunId(threadId: firstPeerRequest.threadId) == nil
+        }
+        XCTAssertTrue(firstPeerSettled, "continuation begins only after the owned peer run settles")
+
+        let peerThread = try XCTUnwrap(context.threadRepo.get(id: firstPeerRequest.threadId))
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(
+                hostRunner: hostRunner,
+                peerRunners: [quinn.id: peerRunner]
+            )
+        )
+        let continuation = Task { @MainActor in
+            try await router.askBotPeer(
+                callerThread: deskRequest.threadId,
+                callerRun: deskRequest.runId,
+                handle: quinn.handle,
+                prompt: "peer continuation current",
+                replyMode: .consult,
+                consultationID: consultationID,
+                delegationCapability: capability
+            )
+        }
+        let continuationStarted = await waitUntil(timeout: 5) { peerRunner.requests.count == 2 }
+        XCTAssertTrue(continuationStarted)
+        let continuationRequest = try XCTUnwrap(peerRunner.requests.last)
+        XCTAssertEqual(continuationRequest.threadId, firstPeerRequest.threadId)
+        XCTAssertEqual(continuationRequest.providerThreadId, peerThread.providerThreadId)
+        XCTAssertEqual(continuationRequest.contextSnapshot?.items.map(\.canonicalText), [
+            "peer prior question",
+            "peer prior answer",
+        ])
+        XCTAssertEqual(
+            try context.botStore.conversationLinked(to: continuationRequest.threadId)?.botID,
+            quinn.id,
+            "the peer-owned thread, not caller selection, owns fallback history"
+        )
+        XCTAssertEqual(
+            try context.botStore.conversationLinked(to: continuationRequest.threadId)?.id,
+            peerConversationID
+        )
+        XCTAssertTrue(peerRunner.finish(
+            runID: continuationRequest.runId,
+            status: .completed,
+            reply: "peer continuation answer"
+        ))
+        _ = try await continuation.value
+
+        let peerDestination = BotContextSeedMockClient(freshThreadId: "fresh-peer")
+        let peerFallback = botFallbackAdapter(destination: peerDestination)
+        peerFallback.contextSeedPreparer = TokenSaverHumanContextSeedPreparer()
+        let peerFallbackRequest = AgentRunRequest(
+            runId: continuationRequest.runId,
+            threadId: continuationRequest.threadId,
+            provider: continuationRequest.provider,
+            providerInstanceId: continuationRequest.providerInstanceId,
+            model: continuationRequest.model,
+            cwd: continuationRequest.cwd,
+            prompt: continuationRequest.prompt,
+            userMessageContent: continuationRequest.userMessageContent,
+            tokenSaverCanonicalProviderContent: continuationRequest.tokenSaverCanonicalProviderContent,
+            attachments: continuationRequest.attachments,
+            providerThreadId: "lost-peer-destination",
+            permissionMode: continuationRequest.permissionMode,
+            reasoningEffort: continuationRequest.reasoningEffort,
+            serviceTier: continuationRequest.serviceTier,
+            interactionMode: continuationRequest.interactionMode,
+            providerBinary: continuationRequest.providerBinary,
+            environment: continuationRequest.environment,
+            extraArgs: continuationRequest.extraArgs,
+            runAsUser: continuationRequest.runAsUser,
+            contextSnapshot: continuationRequest.contextSnapshot
+        )
+        _ = try await peerFallback.sendTurn(peerFallbackRequest) { _ in }
+        let peerFreshTurn = try XCTUnwrap(peerDestination.startedTurns.first)
+        XCTAssertEqual(peerFreshTurn.providerThreadId, "fresh-peer")
+        XCTAssertTrue(peerFreshTurn.request.preparedContextSeed?.encoded.hasPrefix("RCSEED1/1\n") == true)
+        XCTAssertEqual(
+            peerFreshTurn.request.preparedContextSeed?.document.items.map(\.payload),
+            ["peer prior question", "peer prior answer"]
+        )
+        XCTAssertTrue(hostRunner.finish(runID: deskRequest.runId, status: .completed, reply: "desk answer"))
+        let deskSettled = await waitUntil(timeout: 5) {
+            context.coordinator.activeRunId(threadId: deskThread.id) == nil
+        }
+        XCTAssertTrue(deskSettled)
+        vm.selectDeskThread(deskConversation.id)
+        XCTAssertTrue(vm.send("desk continuation current"))
+        let deskContinuationStarted = await waitUntil(timeout: 5) { hostRunner.requests.count == 2 }
+        XCTAssertTrue(deskContinuationStarted)
+        let deskContinuation = try XCTUnwrap(hostRunner.requests.last)
+        XCTAssertEqual(deskContinuation.threadId, deskThread.id)
+        XCTAssertTrue(deskContinuation.contextSnapshot?.items.contains {
+            $0.canonicalText == "desk prior user"
+        } == true)
+        XCTAssertTrue(deskContinuation.contextSnapshot?.items.contains {
+            $0.canonicalText == "desk answer"
+        } == true)
+        let deskDestination = BotContextSeedMockClient(freshThreadId: "fresh-desk")
+        let deskFallback = botFallbackAdapter(destination: deskDestination)
+        deskFallback.contextSeedPreparer = TokenSaverHumanContextSeedPreparer()
+        _ = try await deskFallback.sendTurn(deskContinuation) { _ in }
+        XCTAssertEqual(
+            deskDestination.startedTurns.first?.request.preparedContextSeed?.document.items.first?.payload,
+            "desk prior user"
+        )
+        XCTAssertTrue(hostRunner.finish(
+            runID: deskContinuation.runId,
+            status: .completed,
+            reply: "desk continuation answer"
+        ))
+
+        let crossProfile = try vm.create(
+            name: "Rory",
+            title: "Cross-profile peer",
+            provider: .grok,
+            model: "test"
+        )
+        let crossPeerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(
+            .codex,
+            runner: CallerThreadHandoffRunner(
+                hostRunner: hostRunner,
+                peerRunners: [quinn.id: peerRunner, crossProfile.id: crossPeerRunner]
+            )
+        )
+        let workspace = try router.createWorkspace(name: "Agent owner", cwd: directory)
+        let agentThread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "Agent App owner",
+            provider: .codex,
+            model: "test",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        try context.messageRepo.append(AgentMessage(
+            threadId: agentThread.id,
+            role: .user,
+            content: "agent prior user"
+        ))
+        try context.messageRepo.append(AgentMessage(
+            threadId: agentThread.id,
+            role: .assistant,
+            content: "agent prior assistant"
+        ))
+        try context.threadRepo.updateProviderThreadId(
+            id: agentThread.id,
+            providerThreadId: "lost-agent-app-destination"
+        )
+        let agentSurface = AgentAppSurface(
+            workspaceID: workspace.id,
+            cwd: directory,
+            coordinator: context.coordinator,
+            threadRepo: context.threadRepo,
+            messageRepo: context.messageRepo,
+            queuedMessageRepo: context.queuedMessageRepo,
+            providerSessionRepo: context.providerSessionRuntimeRepo,
+            checkpointRepo: context.turnCheckpointRepo,
+            initialThreadId: agentThread.id
+        )
+        agentSurface.viewModel.selectThread(agentThread.id)
+        let botToAgentApp = Task { @MainActor in
+            await router.dispatchAgentAppBotMentions(
+                peers: [crossProfile],
+                text: "@\(crossProfile.handle) inspect the owned context",
+                threadId: agentThread.id,
+                onto: agentSurface,
+                continueHost: true
+            )
+        }
+        let crossPeerStarted = await waitUntil(timeout: 5) { crossPeerRunner.requests.count == 1 }
+        XCTAssertTrue(crossPeerStarted)
+        let crossPeerRequest = try XCTUnwrap(crossPeerRunner.requests.first)
+        XCTAssertEqual(crossPeerRequest.provider, .codex)
+        XCTAssertTrue(crossPeerRunner.finish(
+            runID: crossPeerRequest.runId,
+            status: .completed,
+            reply: "cross-profile peer answer"
+        ))
+        let agentContinuationStarted = await waitUntil(timeout: 5) { hostRunner.requests.count == 3 }
+        XCTAssertTrue(agentContinuationStarted)
+        let agentContinuation = try XCTUnwrap(hostRunner.requests.last)
+        XCTAssertEqual(agentContinuation.threadId, agentThread.id)
+        XCTAssertEqual(agentContinuation.providerThreadId, "lost-agent-app-destination")
+        XCTAssertTrue(agentContinuation.contextSnapshot?.items.contains {
+            $0.canonicalText == "agent prior user"
+        } == true)
+        XCTAssertTrue(agentContinuation.contextSnapshot?.items.contains {
+            $0.canonicalText == "agent prior assistant"
+        } == true)
+        let agentDestination = BotContextSeedMockClient(freshThreadId: "fresh-agent-app")
+        let agentFallback = botFallbackAdapter(destination: agentDestination)
+        agentFallback.contextSeedPreparer = TokenSaverHumanContextSeedPreparer()
+        _ = try await agentFallback.sendTurn(agentContinuation) { _ in }
+        XCTAssertTrue(
+            agentDestination.startedTurns.first?.request.preparedContextSeed?
+                .document.items.contains { $0.payload == "agent prior user" } == true
+        )
+        XCTAssertTrue(hostRunner.finish(
+            runID: agentContinuation.runId,
+            status: .completed,
+            reply: "agent continuation answer"
+        ))
+        await botToAgentApp.value
+    }
+
+    func test_contextSeedIsNotApplicableWithoutPriorContextOrFallback() async throws {
+        // WHY: RCSEED1 is recovery-only. A successful Codex resume must not
+        // replay history, and a fresh fallback with no prior items has nothing
+        // truthful to seed.
+        let thread = AgentThreadID()
+        let snapshot = try XCTUnwrap(TokenSaverCanonicalConversationSnapshot.capture(
+            messages: [
+                AgentMessage(threadId: thread, role: .user, content: "prior"),
+                AgentMessage(threadId: thread, role: .assistant, content: "answer"),
+            ],
+            persistedRCW1ByMessageId: [:],
+            excludingCurrentUserText: "current"
+        ))
+        let resumed = BotContextSeedMockClient()
+        let resumeAdapter = CodexAppServerAdapter(clientFactory: { _, notification, _ in
+            resumed.notificationHandler = notification
+            return resumed
+        })
+        var resumedRequest = AgentRunRequest(
+            threadId: thread,
+            provider: .codex,
+            model: "test",
+            cwd: directory,
+            prompt: "current",
+            providerThreadId: "still-live"
+        )
+        resumedRequest.contextSnapshot = snapshot
+        _ = try await resumeAdapter.sendTurn(resumedRequest) { _ in }
+        XCTAssertNil(resumed.startedTurns.first?.request.preparedContextSeed)
+
+        let fresh = BotContextSeedMockClient(freshThreadId: "fresh-empty")
+        let fallbackAdapter = botFallbackAdapter(destination: fresh)
+        _ = try await fallbackAdapter.sendTurn(AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "test",
+            cwd: directory,
+            prompt: "no prior",
+            providerThreadId: "lost-empty"
+        )) { _ in }
+        XCTAssertNil(fresh.startedTurns.first?.request.preparedContextSeed)
+
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "test", label: "Test", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            ),
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .grok,
+                models: [AgentModelDescriptor(id: "test", label: "Test", provider: .grok)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "grok"
+            ),
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let providerRunners = Dictionary(uniqueKeysWithValues: [AgentProvider.claude, .grok].map {
+            ($0, ControlledBotHandoffRunner(provider: $0))
+        })
+        for (provider, runner) in providerRunners {
+            context.coordinator.replaceProvider(provider, runner: runner)
+            let bot = try vm.create(
+                name: "N/A \(provider.rawValue)",
+                title: "Non-Codex owner",
+                provider: provider,
+                model: "test"
+            )
+            let ownedThread = AgentThread(
+                title: "N/A \(provider.rawValue)",
+                provider: provider,
+                model: "test",
+                providerThreadId: "existing-\(provider.rawValue)",
+                status: .completed
+            )
+            try context.threadRepo.upsert(ownedThread)
+            try context.messageRepo.append(AgentMessage(
+                threadId: ownedThread.id,
+                role: .user,
+                content: "prior \(provider.rawValue) user"
+            ))
+            try context.messageRepo.append(AgentMessage(
+                threadId: ownedThread.id,
+                role: .assistant,
+                content: "prior \(provider.rawValue) assistant"
+            ))
+            let conversation = BotConversation(
+                botID: bot.id,
+                title: "N/A \(provider.rawValue)",
+                linkedAgentThreadID: ownedThread.id
+            )
+            try context.botStore.upsertConversation(conversation)
+            vm.openDesk(bot)
+            vm.selectDeskThread(conversation.id)
+            vm.deskRouting = BotDeskRouting(
+                provider: provider,
+                providerInstanceID: provider.rawValue,
+                model: "test",
+                routingMode: .manual
+            )
+            XCTAssertTrue(vm.send("current \(provider.rawValue)"))
+            let started = await waitUntil(timeout: 5) { runner.requests.count == 1 }
+            XCTAssertTrue(started)
+            let request = try XCTUnwrap(runner.requests.first)
+            XCTAssertEqual(request.threadId, ownedThread.id)
+            XCTAssertNotNil(request.contextSnapshot, "coordinator still captures owner context")
+            XCTAssertNil(request.preparedContextSeed, "RCSEED1 fallback is Codex-only")
+            XCTAssertTrue(runner.finish(runID: request.runId, status: .completed, reply: "done"))
         }
     }
 
@@ -15415,6 +16592,29 @@ final class BotsWindowTests: XCTestCase {
         try AppContext(channel: .debug, appSupportOverride: directory)
     }
 
+    private func botFallbackAdapter(destination: BotContextSeedMockClient) -> CodexAppServerAdapter {
+        let timedOut = BotContextSeedMockClient(
+            openThreadError: CodexAppServerError.requestTimedOut(
+                method: "thread/resume",
+                timeout: 30
+            )
+        )
+        let calls = BotContextSeedCounter()
+        return CodexAppServerAdapter(
+            clientFactory: { _, notification, _ in
+                calls.increment()
+                let client = calls.value <= 2 ? timedOut : destination
+                client.notificationHandler = notification
+                return client
+            },
+            threadResumeRetryPolicy: CodexThreadResumeRetryPolicy(
+                maxAttempts: 2,
+                backoffNanoseconds: [],
+                perAttemptTimeoutHint: 30
+            )
+        )
+    }
+
     private func seedBotCaller(
         context: AppContext,
         provider: AgentProvider,
@@ -15833,6 +17033,270 @@ private final class DeskTokenSaverRecoveryStore: TokenSaverScopedRecoveryStoring
     }
 }
 
+private func botHumanDecision(
+    canonical: String,
+    outbound: String,
+    provider: AgentProvider,
+    model: String
+) async -> TokenSaverBestOfThreeSelector.Decision {
+    await TokenSaverBestOfThreeSelector.select(
+        canonicalHuman: canonical,
+        humanOutboundPrompt: outbound,
+        humanEffectiveEnvelope: outbound,
+        target: .init(
+            provider: provider.rawValue,
+            resolvedModel: model,
+            counterID: "unavailable",
+            counterRevision: "unavailable",
+            encoding: "unavailable"
+        ),
+        candidates: [],
+        counter: nil
+    )
+}
+
+private func botHumanDecision(
+    for request: TokenSaverOutboundSelectionRequest
+) async -> TokenSaverBestOfThreeSelector.Decision {
+    await botHumanDecision(
+        canonical: request.canonicalHuman,
+        outbound: request.admittedRequest.prompt,
+        provider: request.admittedRequest.provider,
+        model: request.admittedRequest.model
+    )
+}
+
+private final class BotPreparationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedSelections: [TokenSaverOutboundSelectionRequest] = []
+    private var storedDeliveries: [TokenSaverOutboundDelivery] = []
+    private var storedLegacyCalls = 0
+
+    var selectionRequests: [TokenSaverOutboundSelectionRequest] {
+        lock.withLock { storedSelections }
+    }
+
+    var deliveries: [TokenSaverOutboundDelivery] {
+        lock.withLock { storedDeliveries }
+    }
+
+    var legacyCalls: Int {
+        lock.withLock { storedLegacyCalls }
+    }
+
+    func recordSelection(_ request: TokenSaverOutboundSelectionRequest) {
+        lock.withLock { storedSelections.append(request) }
+    }
+
+    func recordDelivery(_ delivery: TokenSaverOutboundDelivery) {
+        lock.withLock { storedDeliveries.append(delivery) }
+    }
+
+    func recordLegacy() {
+        lock.withLock { storedLegacyCalls += 1 }
+    }
+}
+
+private actor BotPreparationGate {
+    private var selectionRequest: TokenSaverOutboundSelectionRequest?
+    private var selectionContinuation: CheckedContinuation<TokenSaverBestOfThreeSelector.Decision, Never>?
+    private var selectionWaiters: [CheckedContinuation<TokenSaverOutboundSelectionRequest, Never>] = []
+    private var selectionReturned = false
+    private var selectionReturnWaiters: [CheckedContinuation<Void, Never>] = []
+    private var deadlineArmed = false
+    private var deadlineContinuation: CheckedContinuation<Void, Never>?
+    private var deadlineWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func select(
+        _ request: TokenSaverOutboundSelectionRequest
+    ) async -> TokenSaverBestOfThreeSelector.Decision {
+        selectionRequest = request
+        let waiters = selectionWaiters
+        selectionWaiters.removeAll()
+        waiters.forEach { $0.resume(returning: request) }
+        let decision = await withCheckedContinuation {
+            selectionContinuation = $0
+        }
+        selectionReturned = true
+        let returnWaiters = selectionReturnWaiters
+        selectionReturnWaiters.removeAll()
+        returnWaiters.forEach { $0.resume() }
+        return decision
+    }
+
+    func waitForSelection() async -> TokenSaverOutboundSelectionRequest {
+        if let selectionRequest { return selectionRequest }
+        return await withCheckedContinuation {
+            selectionWaiters.append($0)
+        }
+    }
+
+    func releaseSelection(_ decision: TokenSaverBestOfThreeSelector.Decision) {
+        selectionContinuation?.resume(returning: decision)
+        selectionContinuation = nil
+    }
+
+    func waitForSelectionReturn() async {
+        if selectionReturned { return }
+        await withCheckedContinuation { selectionReturnWaiters.append($0) }
+    }
+
+    func waitForDeadlineFire() async {
+        deadlineArmed = true
+        let waiters = deadlineWaiters
+        deadlineWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { deadlineContinuation = $0 }
+    }
+
+    func waitForDeadlineWaiter() async {
+        if deadlineArmed { return }
+        await withCheckedContinuation { deadlineWaiters.append($0) }
+    }
+
+    func fireDeadline() {
+        deadlineContinuation?.resume()
+        deadlineContinuation = nil
+    }
+}
+
+private actor BotFooterLoadGate {
+    private var loadedThreads: [AgentThreadID?] = []
+    private var continuations: [Int: CheckedContinuation<TokenSaverThreadFooterReload.DeliveredTotal?, Never>] = [:]
+    private var pendingResults: [Int: TokenSaverThreadFooterReload.DeliveredTotal] = [:]
+    private var returned = 0
+
+    func read(threadId: AgentThreadID?) async -> TokenSaverThreadFooterReload.DeliveredTotal? {
+        loadedThreads.append(threadId)
+        let call = loadedThreads.count
+        if let result = pendingResults.removeValue(forKey: call) {
+            returned += 1
+            return result
+        }
+        let result = await withCheckedContinuation {
+            continuations[call] = $0
+        }
+        returned += 1
+        return result
+    }
+
+    func release(call: Int, savedTokens: Int) {
+        let result = TokenSaverThreadFooterReload.DeliveredTotal(savedTokens: savedTokens, runs: 1)
+        if let continuation = continuations.removeValue(forKey: call) {
+            continuation.resume(returning: result)
+        } else {
+            pendingResults[call] = result
+        }
+    }
+
+    func waitForCalls(_ count: Int) async throws {
+        try await waitUntil("calls", count: count) { loadedThreads.count }
+    }
+
+    func waitForReturns(_ count: Int) async throws {
+        try await waitUntil("returns", count: count) { returned }
+    }
+
+    func threadIDs() -> [AgentThreadID?] { loadedThreads }
+
+    private func waitUntil(
+        _ label: String,
+        count: Int,
+        current: () -> Int
+    ) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while current() < count {
+            guard ContinuousClock.now < deadline else {
+                throw NSError(
+                    domain: "BotFooterLoadGate",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for \(count) \(label)"]
+                )
+            }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+    }
+}
+
+private final class BotContextSeedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.withLock { count } }
+    func increment() { lock.withLock { count += 1 } }
+}
+
+private final class BotContextSeedMockClient: CodexAppServerControlling, @unchecked Sendable {
+    struct StartedTurn {
+        let providerThreadId: String
+        let request: AgentRunRequest
+    }
+
+    var notificationHandler: CodexAppServerClient.NotificationHandler?
+    var terminationHandler: (@Sendable (Error) -> Void)?
+    let openThreadError: Error?
+    let freshThreadId: String
+    private let lock = NSLock()
+    private var captured: [StartedTurn] = []
+
+    init(openThreadError: Error? = nil, freshThreadId: String = "codex-thread") {
+        self.openThreadError = openThreadError
+        self.freshThreadId = freshThreadId
+    }
+
+    var startedTurns: [StartedTurn] { lock.withLock { captured } }
+
+    func initialize(
+        clientName: String,
+        clientTitle: String,
+        clientVersion: String
+    ) async throws -> CodexAppServerInitializeResult {
+        CodexAppServerInitializeResult(
+            userAgent: "bot-context-seed-mock",
+            codexHome: nil,
+            platformFamily: nil,
+            platformOs: nil
+        )
+    }
+
+    func openThread(for request: AgentRunRequest) async throws -> CodexAppServerThreadOpenResult {
+        if let openThreadError { throw openThreadError }
+        let id = request.providerThreadId?.isEmpty == false
+            ? request.providerThreadId!
+            : freshThreadId
+        return CodexAppServerThreadOpenResult(providerThreadId: id, response: ["id": id])
+    }
+
+    func startTurn(
+        providerThreadId: String,
+        for request: AgentRunRequest
+    ) async throws -> CodexAppServerClient.JSONObject {
+        lock.withLock {
+            captured.append(StartedTurn(providerThreadId: providerThreadId, request: request))
+        }
+        return ["turn": ["id": "turn-bot-context-seed"]]
+    }
+
+    func interruptTurn(providerThreadId: String, turnId: String) async throws {}
+    func readThread(
+        providerThreadId: String,
+        includeTurns: Bool
+    ) async throws -> CodexAppServerClient.JSONObject {
+        ["thread": ["id": providerThreadId, "turns": []]]
+    }
+    func forkThread(providerThreadId: String, lastTurnId: String?) async throws -> String { "child" }
+    func rollbackThread(
+        providerThreadId: String,
+        numTurns: Int
+    ) async throws -> CodexAppServerClient.JSONObject {
+        ["thread": ["id": providerThreadId]]
+    }
+    func updateThreadSettings(
+        providerThreadId: String,
+        permissionMode: AgentPermissionMode
+    ) async throws {}
+    func stop() {}
+}
+
 final class ControlledBotHandoffRunner: AgentProviderRunner, @unchecked Sendable {
     let provider: AgentProvider
 
@@ -15842,10 +17306,16 @@ final class ControlledBotHandoffRunner: AgentProviderRunner, @unchecked Sendable
         let onEvent: @Sendable (AgentRunEvent) -> Void
     }
 
+    private struct RequestWaiter {
+        let count: Int
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
     private let lock = NSLock()
     private var pendingByRunID: [AgentRunID: PendingRun] = [:]
     private var capturedRequests: [AgentRunRequest] = []
     private var capturedCancellationRequests: [AgentRunID] = []
+    private var requestWaiters: [RequestWaiter] = []
     private let defersCancellationForTesting: Bool
 
     init(provider: AgentProvider, defersCancellationForTesting: Bool = false) {
@@ -15863,6 +17333,25 @@ final class ControlledBotHandoffRunner: AgentProviderRunner, @unchecked Sendable
         lock.withLock { capturedCancellationRequests }
     }
 
+    func waitForRequests(_ count: Int) async {
+        await withCheckedContinuation { continuation in
+            let ready = lock.withLock { () -> Bool in
+                guard capturedRequests.count < count else { return true }
+                requestWaiters.append(RequestWaiter(count: count, continuation: continuation))
+                return false
+            }
+            if ready { continuation.resume() }
+        }
+    }
+
+    @discardableResult
+    func emit(runID: AgentRunID, event: AssistantEvent) -> Bool {
+        let callback = lock.withLock { pendingByRunID[runID]?.onEvent }
+        guard let callback else { return false }
+        callback(.event(event))
+        return true
+    }
+
     func listModels() async -> [AgentModelDescriptor] { [] }
 
     func startRun(
@@ -15870,14 +17359,18 @@ final class ControlledBotHandoffRunner: AgentProviderRunner, @unchecked Sendable
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void
     ) async throws -> AgentRunHandle {
         let turnID = "turn-\(request.runId.value.uuidString.lowercased())"
-        lock.lock()
-        capturedRequests.append(request)
-        pendingByRunID[request.runId] = PendingRun(
-            request: request,
-            turnID: turnID,
-            onEvent: onEvent
-        )
-        lock.unlock()
+        let readyWaiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            capturedRequests.append(request)
+            pendingByRunID[request.runId] = PendingRun(
+                request: request,
+                turnID: turnID,
+                onEvent: onEvent
+            )
+            let ready = requestWaiters.filter { capturedRequests.count >= $0.count }
+            requestWaiters.removeAll { capturedRequests.count >= $0.count }
+            return ready.map(\.continuation)
+        }
+        readyWaiters.forEach { $0.resume() }
 
         let providerThreadID = request.providerThreadId ?? request.threadId.value.uuidString
         onEvent(.status(.running))

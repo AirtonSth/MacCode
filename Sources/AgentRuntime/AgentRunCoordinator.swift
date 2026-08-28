@@ -142,6 +142,44 @@ private final class FirstStringContinuation: @unchecked Sendable {
     }
 }
 
+/// Resolves Token Saver preparation against its interactive deadline without
+/// waiting for a local selector that ignores cooperative cancellation.
+private final class FirstTokenSaverDecisionContinuation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<TokenSaverBestOfThreeSelector.Decision?, Never>?
+    private var tasks: [Task<Void, Never>] = []
+
+    init(
+        _ continuation: CheckedContinuation<TokenSaverBestOfThreeSelector.Decision?, Never>
+    ) {
+        self.continuation = continuation
+    }
+
+    func resume(returning value: TokenSaverBestOfThreeSelector.Decision?) {
+        let (pending, pendingTasks) = lock.withLock {
+            () -> (
+                CheckedContinuation<TokenSaverBestOfThreeSelector.Decision?, Never>?,
+                [Task<Void, Never>]
+            ) in
+            defer { continuation = nil }
+            let pendingTasks = tasks
+            tasks.removeAll(keepingCapacity: false)
+            return (continuation, pendingTasks)
+        }
+        pendingTasks.forEach { $0.cancel() }
+        pending?.resume(returning: value)
+    }
+
+    func register(_ task: Task<Void, Never>) {
+        let accepted = lock.withLock { () -> Bool in
+            guard continuation != nil else { return false }
+            tasks.append(task)
+            return true
+        }
+        if !accepted { task.cancel() }
+    }
+}
+
 private final class PendingProviderStart: @unchecked Sendable {
     let runId: AgentRunID
     let acceptancePermit: AgentRunAcceptancePermit
@@ -1392,6 +1430,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public var tokenSaverOutboundSelector: (@Sendable (
         _ request: TokenSaverOutboundSelectionRequest
     ) async -> TokenSaverBestOfThreeSelector.Decision)?
+    /// One second beyond the sidecar transport budget keeps preparation bounded
+    /// even when a custom/local selector ignores cancellation.
+    var tokenSaverOutboundSelectionDeadlineNanoseconds: UInt64 = 9_000_000_000
+    var tokenSaverOutboundSelectionDeadlineWaiterForTesting: (@Sendable () async -> Void)?
     /// Fires exactly once for every typed selection, including Human fallbacks
     /// and all pre-write/provider-write failures.
     public var onTokenSaverOutboundDelivery: (@Sendable (
@@ -2021,6 +2063,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // Token Saver: compress only the text sent to the provider; the
         // original prompt is preserved verbatim as the displayed user message.
         let preservedUserContent = request.userMessageContent ?? request.prompt
+        let canonicalProviderContent = request.tokenSaverCanonicalProviderContent
+            ?? preservedUserContent
         var outboundPrompt = request.prompt
         var selectedTransportFormat: TokenSaverBestOfThreeSelector.Format?
         var effectiveEnvironment = request.environment
@@ -2043,18 +2087,57 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 provider: request.provider
             )
             let selectionRequest = TokenSaverOutboundSelectionRequest(
-                canonicalHuman: preservedUserContent,
+                canonicalHuman: canonicalProviderContent,
                 admittedRequest: request,
                 autoRoute: admittedRequest.autoRoute,
                 admittedEnvironment: effectiveEnvironment
             )
-            var decision = await selectedSelector(selectionRequest)
-                .bindingToCurrentHuman(
-                    canonicalHuman: preservedUserContent,
-                    admittedPrompt: request.prompt,
-                    provider: request.provider.rawValue,
-                    resolvedModel: request.model
+            let selectionDeadlineWaiter = tokenSaverOutboundSelectionDeadlineWaiterForTesting
+            let selectionDeadlineNanoseconds = tokenSaverOutboundSelectionDeadlineNanoseconds
+            let selectedDecision = await withCheckedContinuation { continuation in
+                let first = FirstTokenSaverDecisionContinuation(continuation)
+                let selectionTask = Task {
+                    first.resume(returning: await selectedSelector(selectionRequest))
+                }
+                first.register(selectionTask)
+                let deadlineTask = Task {
+                    if let waiter = selectionDeadlineWaiter {
+                        await waiter()
+                    } else {
+                        try? await Task.sleep(
+                            nanoseconds: selectionDeadlineNanoseconds
+                        )
+                    }
+                    guard !Task.isCancelled else { return }
+                    first.resume(returning: nil)
+                }
+                first.register(deadlineTask)
+            }
+            let rawDecision: TokenSaverBestOfThreeSelector.Decision
+            if let selectedDecision {
+                rawDecision = selectedDecision
+            } else {
+                rawDecision = await TokenSaverBestOfThreeSelector.select(
+                    canonicalHuman: canonicalProviderContent,
+                    humanOutboundPrompt: request.prompt,
+                    humanEffectiveEnvelope: request.prompt,
+                    target: TokenSaverBestOfThreeSelector.Target(
+                        provider: request.provider.rawValue,
+                        resolvedModel: request.model,
+                        counterID: "unavailable",
+                        counterRevision: "unavailable",
+                        encoding: "unavailable"
+                    ),
+                    candidates: [],
+                    counter: nil
                 )
+            }
+            var decision = rawDecision.bindingToCurrentHuman(
+                canonicalHuman: canonicalProviderContent,
+                admittedPrompt: request.prompt,
+                provider: request.provider.rawValue,
+                resolvedModel: request.model
+            )
             if decision.selectedFormat == .rcw1 {
                 let projected = selectionRequest.environment(for: .rcw1)
                 let capable = projected[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] == "1"
@@ -2062,7 +2145,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     decision = decision.fallingBackToHuman(
                         payload: request.prompt,
                         reason: .candidateError,
-                        canonicalHuman: preservedUserContent
+                        canonicalHuman: canonicalProviderContent
                     )
                 }
             }
@@ -2074,7 +2157,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     decision = decision.fallingBackToHuman(
                         payload: request.prompt,
                         reason: .candidateError,
-                        canonicalHuman: preservedUserContent
+                        canonicalHuman: canonicalProviderContent
                     )
                 }
             }
@@ -2095,7 +2178,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // scoped-environment composition. Do not invert or double-run env.
             if let promptCompressor {
                 let transformed = await promptCompressor(
-                    preservedUserContent,
+                    canonicalProviderContent,
                     request.provider,
                     request.threadId,
                     request.runId
@@ -2177,6 +2260,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             cwd: request.cwd,
             prompt: outboundPrompt,
             userMessageContent: preservedUserContent,
+            tokenSaverCanonicalProviderContent: request.tokenSaverCanonicalProviderContent,
             attachments: request.attachments,
             providerThreadId: resumeCursor,
             permissionMode: recoveryContext?.runtimeMode ?? request.permissionMode,
@@ -2680,6 +2764,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 cwd: request.cwd,
                 prompt: orchestratedPrompt,
                 userMessageContent: displayPrompt,
+                tokenSaverCanonicalProviderContent: request.tokenSaverCanonicalProviderContent,
                 attachments: request.attachments,
                 providerThreadId: request.providerThreadId,
                 permissionMode: request.permissionMode,
@@ -2768,6 +2853,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             cwd: request.cwd,
             prompt: request.prompt,
             userMessageContent: displayPrompt,
+            tokenSaverCanonicalProviderContent: request.tokenSaverCanonicalProviderContent,
             attachments: request.attachments,
             providerThreadId: request.providerThreadId,
             permissionMode: request.permissionMode,

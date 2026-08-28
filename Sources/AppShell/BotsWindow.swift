@@ -20,25 +20,30 @@ public struct BotQueuedFollowUp: Equatable, Identifiable, Codable {
     /// Host sends also freeze the authenticated caller's execution route.
     /// Direct Desk follow-ups keep nil and use the user's current thread chips.
     public var routing: BotDeskRouting?
+    /// Exact provider source retained separately from normalized Desk text.
+    public var canonicalProviderText: String?
 
     public init(
         id: UUID = UUID(),
         text: String,
         attachments: [AgentAttachment] = [],
         conversationID: BotConversationID? = nil,
-        routing: BotDeskRouting? = nil
+        routing: BotDeskRouting? = nil,
+        canonicalProviderText: String? = nil
     ) {
         self.id = id
         self.text = text
         self.attachments = attachments
         self.conversationID = conversationID
         self.routing = routing
+        self.canonicalProviderText = canonicalProviderText
     }
 }
 
 private struct BotQueuedFollowUpStorePayload: Codable {
     var attachments: [AgentAttachment]
     var routing: BotDeskRouting?
+    var canonicalProviderText: String?
 }
 
 public struct BotDeskRouting: Equatable, Codable {
@@ -528,6 +533,7 @@ private struct BotPeerRunPlan {
     let attachments: [AgentAttachment]
     let providerSnapshots: [AgentProviderSnapshot]
     let executionCwd: String?
+    let userMessageContent: String
 
     func receipt(userText: String) -> ContextAssemblyReceipt {
         BotBrainCompiler.assemble(
@@ -1157,14 +1163,15 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 browser: browser ?? nil,
                 attachments: [],
                 providerSnapshots: providerSnapshots,
-                executionCwd: executionCwd
+                executionCwd: executionCwd,
+                userMessageContent: peerDisplay
             )
             submit(
                 BotPeerExecutionPlan(
                     activityID: activityID.value,
                     peer: peer,
                     peerRun: peerPlan,
-                    peerReceipt: peerPlan.receipt(userText: peerDisplay),
+                    peerReceipt: peerPlan.receipt(userText: peerText),
                     host: resumeHostAfterPeer ? hostRunID.map {
                         .agentApp(BotPeerAgentAppHostPlan(thread: originThread, runID: $0))
                     } : nil
@@ -1821,6 +1828,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                             providerInstanceId: routing.providerInstanceID,
                             attachments: plan.attachments,
                             requestedRunID: runID,
+                            userMessageContent: plan.userMessageContent,
+                            tokenSaverCanonicalProviderContent: receipt.compiledPayload,
                             orchestrationRoutingSnapshot: peerOrchestrationRoutingSnapshot(plan),
                             executionCwdOverride: plan.executionCwd,
                             allowProviderCatalogListingDuringPreflight: false
@@ -3336,6 +3345,13 @@ public final class BotsViewModel: ObservableObject {
     private var shellSidebarVisibilityObserver: NSObjectProtocol?
     private var deskLiveTurnWatch: Task<Void, Never>?
     private var tokenSaverFooterReloadTask: Task<Void, Never>?
+    private var tokenSaverFooterReloadGeneration: UInt64 = 0
+    private var tokenSaverFooterTranscriptObservations: [AgentThreadID: (assistantChars: Int, userTurns: Int)] = [:]
+    var tokenSaverFooterDeliveredTotalLoaderForTesting: (@Sendable (
+        Bool,
+        AgentThreadID?,
+        TokenSaverSavingsRepository?
+    ) async -> TokenSaverThreadFooterReload.DeliveredTotal?)?
     private var navigationFreshnessTask: Task<Void, Never>?
     private var navigationFreshnessGeneration: UInt64 = 0
     private var detachedDeskBotID: BotID?
@@ -4001,6 +4017,7 @@ public final class BotsViewModel: ObservableObject {
 
     private func resetTokenSaverFooterSnapshot() {
         tokenSaverFooterReloadTask?.cancel()
+        tokenSaverFooterReloadGeneration &+= 1
         guard tokenSaverFooterEnabled
             || tokenSaverFooterSnapshotReady
             || tokenSaverThreadMeasuredTokens != 0
@@ -4013,15 +4030,19 @@ public final class BotsViewModel: ObservableObject {
 
     func reloadTokenSaverThreadSavings() {
         tokenSaverFooterReloadTask?.cancel()
+        tokenSaverFooterReloadGeneration &+= 1
+        let generation = tokenSaverFooterReloadGeneration
         let ownerBotID = selectedBotID
         let ownerConversationID = selectedConversation?.id
         let threadId = selectedConversation?.linkedAgentThreadID
-        let assistantChars = deskMessages
+        let transcript = threadId.flatMap { tokenSaverFooterTranscriptObservations[$0] }
+        let selectedThreadMessages = deskMessages.filter { $0.peer == nil }
+        let assistantChars = transcript?.assistantChars ?? selectedThreadMessages
             .filter { $0.role == .assistant }
             .reduce(0) { $0 + $1.text.utf8.count }
         let turnCount = max(
             deskLiveTimeline.turns.count,
-            deskMessages.filter { $0.role == .user }.count
+            transcript?.userTurns ?? selectedThreadMessages.filter { $0.role == .user }.count
         )
         let usage = deskLiveTimeline.tokenUsage
         let observation = TokenSaverThreadFooterReload.Observation(
@@ -4036,15 +4057,21 @@ public final class BotsViewModel: ObservableObject {
         let settingsRepo = context.settingsRepo
         let savingsRepo = context.tokenSaverSavingsRepo
         let graphifyRepo = context.graphifyUsageRepo
+        let deliveredTotalLoader = tokenSaverFooterDeliveredTotalLoaderForTesting
         tokenSaverFooterReloadTask = Task { [weak self] in
             let eligible = SettingsStore(db: db).load().tokenSaverEnabled
                 && PrivateAccountSessionStore(repo: settingsRepo).load()?.user.subscribed == true
             let graphifyActive = SettingsStore(db: db).load().isGraphifyRuntimeActive
-            let total = await TokenSaverThreadFooterReload.loadDeliveredTotal(
-                eligible: eligible,
-                threadId: threadId,
-                repo: savingsRepo
-            )
+            let total: TokenSaverThreadFooterReload.DeliveredTotal?
+            if let deliveredTotalLoader {
+                total = await deliveredTotalLoader(eligible, threadId, savingsRepo)
+            } else {
+                total = await TokenSaverThreadFooterReload.loadDeliveredTotal(
+                    eligible: eligible,
+                    threadId: threadId,
+                    repo: savingsRepo
+                )
+            }
             guard let total else { return }
             guard !Task.isCancelled else { return }
             let next = TokenSaverThreadFooterReload.snapshot(
@@ -4066,7 +4093,8 @@ public final class BotsViewModel: ObservableObject {
             )
             await MainActor.run { [weak self] in
                 guard let self, !Task.isCancelled else { return }
-                guard self.selectedBotID == ownerBotID,
+                guard self.tokenSaverFooterReloadGeneration == generation,
+                      self.selectedBotID == ownerBotID,
                       self.selectedConversation?.id == ownerConversationID,
                       self.selectedConversation?.linkedAgentThreadID == threadId else {
                     return
@@ -5475,7 +5503,8 @@ public final class BotsViewModel: ObservableObject {
     @discardableResult
     public func send(_ text: String? = nil, relayHop: Int = 0) -> Bool {
         let attached = attachments
-        let message = (text ?? composerText).trimmingCharacters(in: .whitespacesAndNewlines)
+        let sourceMessage = text ?? composerText
+        let message = sourceMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         guard AgentChatTranscriptChrome.admitsSend(text: message, attachmentCount: attached.count) else { return false }
         guard let bot = selectedBot else { return false }
         do {
@@ -5503,7 +5532,11 @@ public final class BotsViewModel: ObservableObject {
         supervisedRunBotIDsForTesting = []
         if deskRunIsLive, text == nil {
             enqueueFollowUp(
-                BotQueuedFollowUp(text: message, attachments: attached),
+                BotQueuedFollowUp(
+                    text: message,
+                    attachments: attached,
+                    canonicalProviderText: sourceMessage
+                ),
                 botID: bot.id
             )
             return true
@@ -5516,6 +5549,7 @@ public final class BotsViewModel: ObservableObject {
                 bot: bot,
                 conversation: conversation,
                 userText: message,
+                canonicalProviderUserText: sourceMessage,
                 attachments: attached
             ) {
                 stampDeskUserMessageIdentity(runID: started.runID, botID: bot.id)
@@ -5556,7 +5590,8 @@ public final class BotsViewModel: ObservableObject {
                 let followUp = BotQueuedFollowUp(
                     text: message,
                     conversationID: existing.id,
-                    routing: routing
+                    routing: routing,
+                    canonicalProviderText: text
                 )
                 enqueueFollowUp(followUp, botID: bot.id)
                 return .object([
@@ -5588,6 +5623,7 @@ public final class BotsViewModel: ObservableObject {
             bot: bot,
             conversation: conversation,
             userText: message,
+            canonicalProviderUserText: text,
             attachments: [],
             routingOverride: routing
         ) else {
@@ -6979,7 +7015,8 @@ public final class BotsViewModel: ObservableObject {
     private func encodeQueuedFollowUpPayload(_ item: BotQueuedFollowUp) -> String {
         let payload = BotQueuedFollowUpStorePayload(
             attachments: item.attachments,
-            routing: item.routing
+            routing: item.routing,
+            canonicalProviderText: item.canonicalProviderText
         )
         guard let data = try? Self.encodeJSON(payload),
               let text = String(data: data, encoding: .utf8) else { return "{}" }
@@ -6995,7 +7032,8 @@ public final class BotsViewModel: ObservableObject {
             text: record.text,
             attachments: payload?.attachments ?? [],
             conversationID: record.conversationID.flatMap(UUID.init).map(BotConversationID.init),
-            routing: payload?.routing
+            routing: payload?.routing,
+            canonicalProviderText: payload?.canonicalProviderText
         )
     }
 
@@ -8096,6 +8134,12 @@ public final class BotsViewModel: ObservableObject {
                 cached: cached,
                 persisted: &persisted
             )
+            tokenSaverFooterTranscriptObservations[threadID] = (
+                assistantChars: persisted
+                    .filter { $0.role == .assistant }
+                    .reduce(0) { $0 + $1.text.utf8.count },
+                userTurns: persisted.filter { $0.role == .user }.count
+            )
         }
         var visible = BotsDeskFollowThrough.visibleDeskMessages(cached: cached, persisted: persisted)
         visible = mergePeerTurns(visible, conversationID: conversation?.id)
@@ -8836,6 +8880,7 @@ public final class BotsViewModel: ObservableObject {
         bot: BotDefinition,
         conversation: BotConversation,
         userText: String,
+        canonicalProviderUserText: String? = nil,
         attachments: [AgentAttachment],
         routingOverride: BotDeskRouting? = nil
     ) throws -> BotStartedRun? {
@@ -8901,6 +8946,7 @@ public final class BotsViewModel: ObservableObject {
                 revision: revision,
                 prepared: prepared,
                 userText: userText,
+                canonicalProviderUserText: canonicalProviderUserText,
                 attachments: attachments,
                 memoryFiles: brain.memoryFiles,
                 skills: brain.skills,
@@ -8930,6 +8976,7 @@ public final class BotsViewModel: ObservableObject {
         revision: BotRevision,
         prepared: BotStartedRun,
         userText: String,
+        canonicalProviderUserText: String? = nil,
         attachments: [AgentAttachment] = [],
         memoryFiles: [BotMemoryFileText],
         skills: [BotSkillBinding],
@@ -8953,16 +9000,11 @@ public final class BotsViewModel: ObservableObject {
             if selectedBotID == bot.id, screen == .desk {
                 startDeskLiveTurnWatch(botID: bot.id, threadID: prepared.thread.id)
             }
-            let compressedUser = await context.tokenSaverCompress(
-                prompt: userText,
-                provider: routing.provider,
-                threadId: prepared.thread.id,
-                runId: prepared.runID
-            )
+            let providerUserText = canonicalProviderUserText ?? userText
             var receipt = BotBrainCompiler.assemble(
                 bot: bot,
                 revision: revision,
-                userText: compressedUser,
+                userText: providerUserText,
                 memoryFiles: memoryFiles,
                 skills: skills,
                 ownedSkills: ownedSkillTexts(for: bot),
@@ -8991,7 +9033,7 @@ public final class BotsViewModel: ObservableObject {
                 runID: prepared.runID,
                 humanText: userText,
                 attachments: attachments,
-                wireRequest: compressedUser
+                wireRequest: receipt.compiledPayload
             )
             beforeBotRunDispatchForTesting?(prepared.runID)
             guard !Task.isCancelled, (deskStopEpoch[bot.id] ?? 0) == expectedEpoch else {
@@ -9014,7 +9056,9 @@ public final class BotsViewModel: ObservableObject {
                 ),
                 providerInstanceId: routing.providerInstanceID,
                 attachments: attachments,
-                requestedRunID: prepared.runID
+                requestedRunID: prepared.runID,
+                userMessageContent: userText,
+                tokenSaverCanonicalProviderContent: receipt.compiledPayload
             )
             // Dest persist cannot unstart a live provider turn.
             _ = try? persistWorkingConversation(prepared.conversation)
@@ -9169,7 +9213,7 @@ public final class BotsViewModel: ObservableObject {
             syncQueuedFollowUps()
             return
         }
-        composerText = next.text
+        composerText = next.canonicalProviderText ?? next.text
         attachments = next.attachments
         guard send() else { return }
         queuedFollowUpsByBot[bot.id]?.removeAll { $0.id == next.id }
@@ -9215,6 +9259,7 @@ public final class BotsViewModel: ObservableObject {
                 bot: bot,
                 conversation: target,
                 userText: next.text,
+                canonicalProviderUserText: next.canonicalProviderText,
                 attachments: next.attachments,
                 routingOverride: next.routing
             ) {
