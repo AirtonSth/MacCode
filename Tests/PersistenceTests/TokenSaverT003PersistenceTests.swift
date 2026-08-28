@@ -296,6 +296,42 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
         ) { XCTAssertEqual($0 as? TokenSaverRecoveryStoreError, .projectQuotaExceeded) }
     }
 
+    /// WHY: `max(5 GiB, 10% of volume)` on a ~4 TB disk required ~372 GiB free and
+    /// discarded every lossy Distill handle (`discarded-no-handle`) while ~14 GiB
+    /// remained. The floor is a fixed 5 GiB so large volumes keep working.
+    func test_scopedStore_diskFloorIsFixedFiveGiBNotPercentOfVolume() throws {
+        let store = TokenSaverScopedRecoveryStore(db: try makeDB())
+        let fourTiB: Int64 = 4 * 1_024 * 1_024 * 1_024 * 1_024
+        let fourteenGiB: Int64 = 14 * 1_024 * 1_024 * 1_024
+        let largeVolume = TokenSaverRecoveryDiskSnapshot(
+            freeBytes: fourteenGiB,
+            totalBytes: fourTiB
+        )
+        XCTAssertNoThrow(
+            try store.prepare(
+                Data("lossy original".utf8),
+                scope: scope(attempt: "large-volume"),
+                operationID: "large-volume-op",
+                expiresAt: nil,
+                disk: largeVolume
+            )
+        )
+
+        let belowFixedFloor = TokenSaverRecoveryDiskSnapshot(
+            freeBytes: TokenSaverRecoveryLimits.minimumFreeDiskBytes - 1,
+            totalBytes: fourTiB
+        )
+        XCTAssertThrowsError(
+            try store.prepare(
+                Data("x".utf8),
+                scope: scope(attempt: "below-fixed-floor"),
+                operationID: "below-fixed-floor-op",
+                expiresAt: nil,
+                disk: belowFixedFloor
+            )
+        ) { XCTAssertEqual($0 as? TokenSaverRecoveryStoreError, .diskFloorReached) }
+    }
+
     func test_scopedStore_expiryBoundaryDeniesReadsMutationsReplayAndReferences() throws {
         let store = TokenSaverScopedRecoveryStore(db: try makeDB())
         let expires = Date(timeIntervalSince1970: 10)

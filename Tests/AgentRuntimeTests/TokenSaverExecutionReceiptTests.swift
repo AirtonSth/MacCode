@@ -185,6 +185,28 @@ final class TokenSaverExecutionReceiptTests: XCTestCase {
         XCTAssertNil(TokenSaverExecutionReceiptSeam.environment(from: still)["RC_TOKEN_SAVER_DISTILL_HINT"])
     }
 
+    func test_admittedReceiptAlwaysInjectsThreadIdEvenWithoutRecoveryScope() {
+        // WHY: the Agent App chip sums token_saver_thread_totals. PATH wrappers
+        // stamp that column from RC_TOKEN_SAVER_THREAD_ID. Workspace-less runs
+        // still have a thread and must keep attributing delivered savings.
+        let admitted = TokenSaverExecutionReceiptSeam.admit(
+            tokenSaverEnabled: true,
+            sameUser: true,
+            sidecarAvailable: true,
+            provider: .codex,
+            threadId: threadID,
+            workspaceId: nil,
+            projectId: nil
+        )
+        XCTAssertEqual(admitted.capabilities.recoveryScope, false)
+        XCTAssertEqual(admitted.capabilities.distill, true)
+        let env = TokenSaverExecutionReceiptSeam.environment(from: admitted)
+        XCTAssertEqual(env["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
+        XCTAssertEqual(env["RC_TOKEN_SAVER_THREAD_ID"], threadID)
+        XCTAssertNil(env["RC_TOKEN_SAVER_WORKSPACE_ID"])
+        XCTAssertNil(env["RC_TOKEN_SAVER_PROJECT_ID"])
+    }
+
     func test_allProvidersEmitDistillHintWhenSidecarAvailable() {
         // WHY: provider-neutral admit signal must not be Claude-only.
         for provider in [AgentProvider.claude, .codex, .grok] {

@@ -1,18 +1,9 @@
 stages:
-  - lint
-  - test
-  - package
-  - attest
   - release
 
 workflow:
   rules:
-    - if: '$CI_COMMIT_TAG'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    - if: '$CI_PIPELINE_SOURCE == "push"'
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-    - if: '$CI_PIPELINE_SOURCE == "api"'
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
 
 variables:
   AWS_REGION: "us-east-1"
@@ -39,314 +30,6 @@ variables:
   tags:
     - saas-macos-large-m2pro
 
-main_thread_blocking_ratchet:
-  extends: .macos_medium
-  stage: lint
-  rules:
-    - if: '$RUN_ALL_MACOS_CI == "1"'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - Sources/**/*.swift
-        - scripts/lint-main-thread-blocking.sh
-        - scripts/main-thread-blocking-baseline.txt
-        - .gitlab-ci.yml
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-      when: manual
-      allow_failure: true
-  script:
-    - bash scripts/lint-main-thread-blocking.sh
-
-lint_scripts:
-  extends: .macos_medium
-  stage: lint
-  rules:
-    - if: '$RUN_ALL_MACOS_CI == "1"'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - scripts/**/*
-        - "**/*.plist"
-        - .gitlab-ci.yml
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-      when: manual
-      allow_failure: true
-  script:
-    - command -v shellcheck >/dev/null || brew install shellcheck
-    - shellcheck -S error scripts/*.sh
-    - |
-      for script in scripts/*.sh; do
-        bash -n "$script"
-      done
-    - |
-      found=0
-      while IFS= read -r plist; do
-        plutil -lint "$plist"
-        found=1
-      done < <(git ls-files '*.plist')
-      if [ "$found" = "0" ]; then
-        echo "no committed plists to lint"
-      fi
-    - |
-      if grep -nE 'PkgInfo"? *<<' scripts/package-app.sh; then
-        echo "PkgInfo must be printf'd (8 bytes), not heredoc'd (9 bytes)" >&2
-        exit 1
-      fi
-    - scripts/test-stable-release-guards.sh
-
-claude_agent_sdk_advisory:
-  extends: .macos_medium
-  stage: test
-  rules:
-    - if: '$RUN_ALL_MACOS_CI == "1"'
-    - if: '$SCHEDULED_JOB == "claude_agent_sdk_advisory"'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - Sources/AgentRuntime/ClaudeAgentSDKBridgeAdapter.swift
-        - scripts/check-claude-agent-sdk-spec.sh
-        - .gitlab-ci.yml
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-      when: manual
-      allow_failure: true
-  script:
-    - command -v node >/dev/null || brew install node@22
-    - export PATH="/opt/homebrew/opt/node@22/bin:$PATH"
-    - node --version
-    - scripts/check-claude-agent-sdk-spec.sh
-
-claude_streaming_tsan:
-  extends: .macos_medium
-  stage: test
-  rules:
-    - if: '$RUN_ALL_MACOS_CI == "1"'
-    - if: '$SCHEDULED_JOB == "claude_streaming_tsan"'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-      when: manual
-      allow_failure: true
-  script:
-    - swift test --sanitize=thread --filter ClaudeStreamingCLIAdapterConcurrencyTests/test_streamEventsAndSessionQueriesStayRaceFreeDuringStreamingTurn
-
-tsan_persistence:
-  extends: .macos_medium
-  stage: test
-  rules:
-    - if: '$RUN_ALL_MACOS_CI == "1"'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - Sources/Persistence/**/*
-        - Tests/PersistenceTests/PersistenceConcurrencyStressTests.swift
-        - .gitlab-ci.yml
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-      when: manual
-      allow_failure: true
-  script:
-    - swift test --sanitize=thread --filter PersistenceConcurrencyStressTests
-
-provider_binary_smoke:
-  extends: .macos_medium
-  stage: test
-  rules:
-    - if: '$RUN_ALL_MACOS_CI == "1"'
-    - if: '$SCHEDULED_JOB == "provider_binary_smoke"'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - Sources/AgentRuntime/**/*
-        - Tests/AgentRuntimeTests/**/*
-        - scripts/provider-binary-smoke.sh
-        - .gitlab-ci.yml
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-      when: manual
-      allow_failure: true
-  script:
-    - scripts/provider-binary-smoke.sh
-
-terminal_teardown:
-  extends: .macos_medium
-  stage: test
-  variables:
-    RC2_TERMINAL_TEARDOWN_ITERATIONS: "100"
-  rules:
-    - if: '$RUN_ALL_MACOS_CI == "1"'
-    - if: '$SCHEDULED_JOB == "terminal_teardown"'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-      when: manual
-      allow_failure: true
-  script:
-    - scripts/terminal-teardown-leak-ci.sh
-
-token_saver_mlx_live:
-  extends: .macos_large
-  stage: test
-  timeout: 90m
-  variables:
-    REMOTE_CODE_TOKEN_SAVER_LIVE_MODEL_TEST: "1"
-    REMOTE_CODE_TOKEN_SAVER_RSS_CEILING_GB: "21"
-  rules:
-    - if: '$RUN_ALL_MACOS_CI == "1"'
-    - if: '$SCHEDULED_JOB == "token_saver_mlx_live"'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - Sources/DistillCore/**/*
-        - Sources/AgentRuntime/TokenSaverModel*.swift
-        - Tests/DistillCoreTests/DistillLiveModelTests.swift
-        - Tests/DistillCoreTests/DistillLivePerfTests.swift
-        - Tests/DistillCoreTests/MLXHotPathSafetyTests.swift
-        - .gitlab-ci.yml
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-      when: manual
-      allow_failure: true
-  script:
-    - test "$(uname -m)" = "arm64"
-    - export REMOTE_CODE_TOKEN_SAVER_LIVE_MODEL_DIR="${TMPDIR:-/tmp}/RemoteCodeTokenSaverLiveModel"
-    - |
-      build_log="token-saver-mlx-live-build.log"
-      set +e
-      swift build --build-tests >"$build_log" 2>&1
-      build_status=$?
-      set -e
-      if [ "$build_status" -ne 0 ]; then
-        echo "token_saver_mlx_live prebuild failed (exit $build_status); last 200 log lines:" >&2
-        tail -n 200 "$build_log" >&2
-        exit "$build_status"
-      fi
-
-      bin_path="$(swift build --show-bin-path)"
-      metallib_path="$bin_path/mlx.metallib"
-      set +e
-      scripts/build-mlx-metallib.sh "$metallib_path" >>"$build_log" 2>&1
-      metallib_status=$?
-      set -e
-      if [ "$metallib_status" -ne 0 ]; then
-        echo "token_saver_mlx_live metallib build failed (exit $metallib_status); last 200 log lines:" >&2
-        tail -n 200 "$build_log" >&2
-        exit "$metallib_status"
-      fi
-
-      test_bundle="$bin_path/RemoteCodePackageTests.xctest"
-      if [ ! -s "$metallib_path" ] || [ ! -d "$test_bundle/Contents/MacOS" ]; then
-        echo "token_saver_mlx_live could not provision mlx.metallib in the test bundle" >&2
-        exit 1
-      fi
-      cp "$metallib_path" "$test_bundle/Contents/MacOS/mlx.metallib"
-      test -s "$test_bundle/Contents/MacOS/mlx.metallib"
-      echo "provisioned mlx.metallib in $test_bundle/Contents/MacOS"
-    - |
-      log_path="token-saver-mlx-live.log"
-      set +e
-      swift test --skip-build --filter 'DistillLiveModelTests|DistillLivePerfTests|MLXHotPathSafetyTests' >"$log_path" 2>&1
-      test_status=$?
-      set -e
-      if [ "$test_status" -ne 0 ]; then
-        echo "token_saver_mlx_live failed (exit $test_status); last 200 log lines:" >&2
-        tail -n 200 "$log_path" >&2
-        exit "$test_status"
-      fi
-      echo "token_saver_mlx_live passed; XCTest summary:"
-      grep -E "Test Suite 'Selected tests' passed|Executed [0-9]+ tests|✔ Test run" "$log_path" | tail -n 20 || true
-
-macos_agent_perf_guards:
-  extends: .macos_large
-  stage: test
-  variables:
-    RC2_WIDE_LAYOUT_REBUILD_BUDGET_MS: "3000"
-  rules:
-    - if: '$RUN_ALL_MACOS_CI == "1"'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - Sources/Surfaces/AgentAppSurface.swift
-        - Tests/SurfacesTests/AgentAppPerfBundleTests.swift
-        - .gitlab-ci.yml
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-      when: manual
-      allow_failure: true
-  script:
-    - swift test --filter 'AgentAppPerfBundleTests/test_threadOpenReplayFiveThousandEventsStaysWithinBudget|MainWindowControllerRebuildCountTests/test_wideLayoutSixPanesFortyTabs_rebuildsWithinBudget'
-
-pr_unit_tests:
-  extends: .macos_large
-  stage: test
-  interruptible: true
-  rules:
-    - if: '$RUN_ALL_MACOS_CI == "1"'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "june-09")'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-      when: manual
-      allow_failure: true
-  script:
-    - |
-      log_path="pr-unit-tests.log"
-      set +e
-      scripts/test-unit.sh >"$log_path" 2>&1
-      test_status=$?
-      set -e
-      if [ "$test_status" -ne 0 ]; then
-        echo "pr_unit_tests failed (exit $test_status); last 200 log lines:" >&2
-        tail -n 200 "$log_path" >&2
-        exit "$test_status"
-      fi
-      echo "pr_unit_tests passed; XCTest summary:"
-      grep -E "Test Suite 'Selected tests' passed|Executed [0-9]+ tests|✔ Test run" "$log_path" | tail -n 20 || true
-
-package_bundle_check:
-  extends: .macos_large
-  stage: package
-  rules:
-    - if: '$RUN_ALL_MACOS_CI == "1"'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - Sources/**/*
-        - Package.swift
-        - scripts/package-app.sh
-        - scripts/resolve-codesign-identity.sh
-        - scripts/test-resolve-codesign-identity.sh
-        - scripts/check-app-bundle.sh
-        - .gitlab-ci.yml
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-      when: manual
-      allow_failure: true
-  script:
-    - bash scripts/test-resolve-codesign-identity.sh
-    - xcodebuild -downloadComponent MetalToolchain
-    - RC2_CONFIG=debug bash scripts/package-app.sh
-    - bash scripts/check-app-bundle.sh dist/RemoteCode.app
-    - plutil -lint dist/RemoteCode.app/Contents/Info.plist
-    # A package that cannot launch is not releasable. The smoke helper owns its
-    # GUI-session diagnosis and fails loudly when the runner cannot prove launch.
-    - bash scripts/orchestrate-launch-smoke.sh dist/RemoteCode.app
-
-release_validation_receipt:
-  extends: .macos_medium
-  stage: attest
-  rules:
-    - if: '$RUN_ALL_MACOS_CI == "1" && $CI_COMMIT_BRANCH == "production"'
-  script:
-    - test "$RUN_ALL_MACOS_CI" = "1"
-    - test "$CI_COMMIT_BRANCH" = "production"
-    - |
-      jq -n -S \
-        --arg sha "$CI_COMMIT_SHA" \
-        --arg ref "$CI_COMMIT_REF_NAME" \
-        --arg pipeline_id "$CI_PIPELINE_ID" \
-        --arg job_id "$CI_JOB_ID" \
-        '{
-          schema_version: 1,
-          commit_sha: $sha,
-          ref: $ref,
-          pipeline_id: ($pipeline_id | tonumber),
-          validation_job_id: ($job_id | tonumber),
-          run_all_macos_ci: "1",
-          prior_stages_status: "success",
-          required_jobs: [
-            {id: "lint_scripts", status: "PASS"},
-            {id: "pr_unit_tests", status: "PASS"},
-            {id: "package_bundle_check", status: "PASS"}
-          ]
-        }' > release-validation-receipt.json
-      jq -e '.prior_stages_status == "success"' release-validation-receipt.json >/dev/null
-  artifacts:
-    when: on_success
-    expire_in: 1 week
-    paths:
-      - release-validation-receipt.json
-
 stable_macos_arm64_dmg:
   extends: .macos_large
   stage: release
@@ -356,19 +39,19 @@ stable_macos_arm64_dmg:
     GITLAB_OIDC_TOKEN:
       aud: sts.amazonaws.com
   rules:
-    # A bare tag never publishes. The controller explicitly starts this job on
-    # the tag with an exact-SHA validation pipeline and acceptance manifest.
-    - if: '$RELEASE_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $RC2_VALIDATED_PIPELINE_ID =~ /^[0-9]+$/ && $RC2_VALIDATED_JOB_ID =~ /^[0-9]+$/ && $RC2_ACCEPTANCE_MANIFEST_SHA256 =~ /^[0-9a-f]{64}$/ && $RC2_ACCEPTANCE_MANIFEST_BASE64'
+    # glab release create vX.Y.Z creates this tag and starts this pipeline.
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
   script:
     - |
       set -euo pipefail
 
       ASSET_NAME="stable-macos-arm64-RemoteCode.dmg"
-      TAG="${RELEASE_TAG:-${CI_COMMIT_TAG:-}}"
+      TAG="${CI_COMMIT_TAG:-}"
       if [ -z "$TAG" ]; then
-        echo "RELEASE_TAG or CI_COMMIT_TAG is required"
+        echo "CI_COMMIT_TAG is required"
         exit 1
       fi
+      export RELEASE_TAG="$TAG"
 
       git fetch --tags origin
       git checkout "$TAG"
@@ -433,8 +116,8 @@ stable_macos_arm64_dmg:
         --write-out "%{http_code}" \
         --header "JOB-TOKEN: $CI_JOB_TOKEN" \
         "$RELEASE_API/$TAG")"
-      if [ "$EXISTING_RELEASE_CODE" != "404" ]; then
-        echo "Expected no existing GitLab release for $TAG; HTTP $EXISTING_RELEASE_CODE" >&2
+      if [ "$EXISTING_RELEASE_CODE" != "404" ] && [ "$EXISTING_RELEASE_CODE" != "200" ]; then
+        echo "Unexpected GitLab release lookup for $TAG; HTTP $EXISTING_RELEASE_CODE" >&2
         cat "$EXISTING_RELEASE_RESPONSE" >&2 || true
         exit 1
       fi
@@ -615,53 +298,98 @@ stable_macos_arm64_dmg:
         --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
         --paths "/$S3_DOWNLOAD_PREFIX/appcast.xml" "/$S3_DOWNLOAD_PREFIX/latest/$ASSET_NAME" "/$S3_DOWNLOAD_PREFIX/$TAG/$ASSET_NAME"
 
-      RELEASE_PAYLOAD="$(jq -n \
-        --arg tag "$TAG" \
-        --arg ref "$TAG" \
-        --arg name "RemoteCode $VERSION" \
-        --arg description "RemoteCode macOS $VERSION
+      rc2_ensure_release_asset_link() {
+        local name="$1"
+        local url="$2"
+        local link_type="$3"
+        local links_file="$TEMP_DIR/release-asset-links.json"
+        local payload link_id
+        payload="$(jq -n --arg name "$name" --arg url "$url" --arg link_type "$link_type" \
+          '{name: $name, url: $url, link_type: $link_type}')"
+        curl --fail --silent --show-error \
+          --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+          "$RELEASE_API/$TAG/assets/links" > "$links_file"
+        link_id="$(jq -r --arg name "$name" --arg url "$url" \
+          '[.[] | select(.name == $name or .url == $url)] | first | .id // empty | tostring' \
+          "$links_file")"
+        if [ -n "$link_id" ] && [ "$link_id" != "null" ]; then
+          curl --fail --silent --show-error --request PUT \
+            --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data "$payload" \
+            "$RELEASE_API/$TAG/assets/links/$link_id" >/dev/null
+        else
+          curl --fail --silent --show-error --request POST \
+            --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data "$payload" \
+            "$RELEASE_API/$TAG/assets/links" >/dev/null
+        fi
+      }
+
+      PUBLISH_RELEASE_RESPONSE="$TEMP_DIR/publish-release.json"
+      PUBLISH_RELEASE_CODE="$(curl --silent --show-error \
+        --output "$PUBLISH_RELEASE_RESPONSE" \
+        --write-out "%{http_code}" \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        "$RELEASE_API/$TAG")"
+      if [ "$PUBLISH_RELEASE_CODE" = "200" ]; then
+        echo "GitLab release $TAG already exists; attaching download links"
+        rc2_ensure_release_asset_link "$ASSET_NAME" "$DMG_URL" "package"
+        rc2_ensure_release_asset_link "appcast.xml" "$APPCAST_URL" "other"
+      elif [ "$PUBLISH_RELEASE_CODE" = "404" ]; then
+        RELEASE_PAYLOAD="$(jq -n \
+          --arg tag "$TAG" \
+          --arg ref "$TAG" \
+          --arg name "RemoteCode $VERSION" \
+          --arg description "RemoteCode macOS $VERSION
 
       $(rc2_release_guard_ownership_marker)" \
-        --arg dmg_name "$ASSET_NAME" \
-        --arg dmg_url "$S3_DOWNLOAD_BASE_URL/$TAG/$ASSET_NAME" \
-        --arg appcast_url "$S3_DOWNLOAD_BASE_URL/appcast.xml" \
-        '{
-          tag_name: $tag,
-          ref: $ref,
-          name: $name,
-          description: $description,
-          assets: {
-            links: [
-              {name: $dmg_name, url: $dmg_url, link_type: "package"},
-              {name: "appcast.xml", url: $appcast_url, link_type: "other"}
-            ]
-          }
-        }')"
-      RELEASE_RESPONSE="$TEMP_DIR/gitlab-release-response.json"
-      RELEASE_CODE=""
-      RELEASE_REQUEST_SUCCEEDED=0
-      if RELEASE_CODE="$(curl --silent --show-error --output "$RELEASE_RESPONSE" --write-out "%{http_code}" \
-          --request POST \
-          --header "JOB-TOKEN: $CI_JOB_TOKEN" \
-          --header "Content-Type: application/json" \
-          --data "$RELEASE_PAYLOAD" \
-          "$RELEASE_API")"
-      then
-        RELEASE_REQUEST_SUCCEEDED=1
-      fi
-      RELEASE_OWNED=0
-      if [ "$RELEASE_REQUEST_SUCCEEDED" = "1" ] && [ "$RELEASE_CODE" = "201" ]; then
-        RELEASE_OWNED=1
-      elif rc2_release_guard_retry rc2_release_guard_confirm_release_ownership; then
-        echo "GitLab release creation was reconciled after an ambiguous response"
-        RELEASE_OWNED=1
-      fi
-      if [ "$RELEASE_OWNED" != "1" ]; then
-        echo "GitLab release API failed without proof of ownership (HTTP ${RELEASE_CODE:-transport-error})" >&2
-        cat "$RELEASE_RESPONSE" >&2 || true
+          --arg dmg_name "$ASSET_NAME" \
+          --arg dmg_url "$DMG_URL" \
+          --arg appcast_url "$APPCAST_URL" \
+          '{
+            tag_name: $tag,
+            ref: $ref,
+            name: $name,
+            description: $description,
+            assets: {
+              links: [
+                {name: $dmg_name, url: $dmg_url, link_type: "package"},
+                {name: "appcast.xml", url: $appcast_url, link_type: "other"}
+              ]
+            }
+          }')"
+        RELEASE_RESPONSE="$TEMP_DIR/gitlab-release-response.json"
+        RELEASE_CODE=""
+        RELEASE_REQUEST_SUCCEEDED=0
+        if RELEASE_CODE="$(curl --silent --show-error --output "$RELEASE_RESPONSE" --write-out "%{http_code}" \
+            --request POST \
+            --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data "$RELEASE_PAYLOAD" \
+            "$RELEASE_API")"
+        then
+          RELEASE_REQUEST_SUCCEEDED=1
+        fi
+        RELEASE_OWNED=0
+        if [ "$RELEASE_REQUEST_SUCCEEDED" = "1" ] && [ "$RELEASE_CODE" = "201" ]; then
+          RELEASE_OWNED=1
+        elif rc2_release_guard_retry rc2_release_guard_confirm_release_ownership; then
+          echo "GitLab release creation was reconciled after an ambiguous response"
+          RELEASE_OWNED=1
+        fi
+        if [ "$RELEASE_OWNED" != "1" ]; then
+          echo "GitLab release API failed without proof of ownership (HTTP ${RELEASE_CODE:-transport-error})" >&2
+          cat "$RELEASE_RESPONSE" >&2 || true
+          exit 1
+        fi
+        rc2_release_guard_note_release_created
+      else
+        echo "Unexpected GitLab release lookup before publish; HTTP $PUBLISH_RELEASE_CODE" >&2
+        cat "$PUBLISH_RELEASE_RESPONSE" >&2 || true
         exit 1
       fi
-      rc2_release_guard_note_release_created
 
       RELEASE_READBACK="$TEMP_DIR/gitlab-release-readback.json"
       curl --fail --silent --show-error \
@@ -670,8 +398,8 @@ stable_macos_arm64_dmg:
       jq -e \
         --arg tag "$TAG" \
         --arg sha "$CI_COMMIT_SHA" \
-        --arg dmg_url "$S3_DOWNLOAD_BASE_URL/$TAG/$ASSET_NAME" \
-        --arg appcast_url "$S3_DOWNLOAD_BASE_URL/appcast.xml" \
+        --arg dmg_url "$DMG_URL" \
+        --arg appcast_url "$APPCAST_URL" \
         '
           .tag_name == $tag
           and .commit.id == $sha

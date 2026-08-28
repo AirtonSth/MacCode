@@ -520,6 +520,213 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(AgentAppView.backgroundShellLabel(3), "3 shells")
     }
 
+    func test_backgroundTasks_readIdsFromSnapshot() {
+        let snapshot = { (payload: String) in
+            AssistantEvent.providerRuntime(ProviderRuntimeEvent(
+                id: "snap",
+                provider: .claude,
+                source: "claude.stream-json.session",
+                method: "claude.session.snapshot",
+                payloadJSON: payload,
+                receivedAtMs: 1
+            ))
+        }
+        let idsOnly = AgentAppViewModel.backgroundTasks(fromRuntimeEvent: snapshot(
+            #"{"reason":"background_work","pendingBackgroundTaskIds":["T1"]}"#
+        ))
+        XCTAssertEqual(idsOnly, [
+            AgentBackgroundTask(id: "T1", kind: .unknown)
+        ], "the adapter snapshot exports ids only; task details come from exact timeline rows")
+        XCTAssertEqual(
+            AgentAppViewModel.backgroundShellCount(fromRuntimeEvent: snapshot(
+                #"{"reason":"background_work","pendingBackgroundTaskIds":["T1"]}"#
+            )),
+            1,
+            "count must stay in lockstep with the producer's id list"
+        )
+        XCTAssertEqual(
+            AgentAppViewModel.backgroundTasks(fromRuntimeEvent: snapshot(
+                #"{"reason":"tool_started","pendingBackgroundTaskIds":["T1","T2"]}"#
+            )),
+            [
+            AgentBackgroundTask(id: "T1", kind: .unknown),
+            AgentBackgroundTask(id: "T2", kind: .unknown)
+            ],
+            "the producer's complete id set must preserve every holder"
+        )
+        XCTAssertEqual(
+            AgentAppViewModel.backgroundTasks(fromRuntimeEvent: snapshot(#"{"reason":"turn_started"}"#)),
+            nil,
+            "a snapshot without either field must not clear live tasks"
+        )
+        XCTAssertEqual(
+            AgentAppViewModel.visibleBackgroundTasks(
+                reported: [AgentBackgroundTask(id: "T1", kind: .shell, description: "Wait for CI")],
+                runIsLive: false
+            ),
+            [],
+            "a finished run must not keep advertising the shell that held Stop"
+        )
+    }
+
+    func test_enrichingBackgroundTasks_matchesTimelineDetailsByExactTaskId() {
+        var timeline = AssistantTimelineState()
+        timeline.apply(.turnStarted(turnId: "t1"))
+        timeline.apply(.itemStarted(item: AssistantItem(
+            id: "T1",
+            turnId: "t1",
+            type: .tool,
+            summary: "Background shell",
+            body: "Wait for CI",
+            startedAtMs: 1
+        )))
+        let anonymous = [AgentBackgroundTask(id: "T1", kind: .unknown)]
+        let enriched = AgentAppViewModel.enrichingBackgroundTasks(anonymous, timeline: timeline)
+        XCTAssertEqual(enriched, [
+            AgentBackgroundTask(id: "T1", kind: .shell, description: "Wait for CI")
+        ], "a single live shell must show the CLI description already on the timeline")
+        timeline.apply(.itemStarted(item: AssistantItem(
+            id: "T2",
+            turnId: "t1",
+            type: .tool,
+            summary: "Background agent",
+            body: "Review PR",
+            startedAtMs: 2
+        )))
+        timeline.apply(.itemStarted(item: AssistantItem(
+            id: "unrelated",
+            turnId: "t1",
+            type: .tool,
+            summary: "Background shell",
+            body: "Wrong task",
+            startedAtMs: 3
+        )))
+        let two = [
+            AgentBackgroundTask(id: "T1", kind: .unknown),
+            AgentBackgroundTask(id: "T2", kind: .unknown)
+        ]
+        XCTAssertEqual(
+            AgentAppViewModel.enrichingBackgroundTasks(two, timeline: timeline),
+            [
+                AgentBackgroundTask(id: "T1", kind: .shell, description: "Wait for CI"),
+                AgentBackgroundTask(id: "T2", kind: .agent, description: "Review PR")
+            ],
+            "each task must receive only the human details from its exact timeline id; unrelated rows must not cross-assign"
+        )
+
+        var unrelatedTimeline = AssistantTimelineState()
+        unrelatedTimeline.apply(.turnStarted(turnId: "t-unrelated"))
+        unrelatedTimeline.apply(.itemStarted(item: AssistantItem(
+            id: "other-task",
+            turnId: "t-unrelated",
+            type: .tool,
+            summary: "Background shell",
+            body: "Wrong task",
+            startedAtMs: 4
+        )))
+        XCTAssertEqual(
+            AgentAppViewModel.enrichingBackgroundTasks(anonymous, timeline: unrelatedTimeline),
+            anonymous,
+            "a task must not borrow the newest timeline row when its id is absent"
+        )
+
+        var rawTimeline = AssistantTimelineState()
+        rawTimeline.apply(.turnStarted(turnId: "t2"))
+        rawTimeline.apply(.itemStarted(item: AssistantItem(
+            id: "T1",
+            turnId: "t2",
+            type: .tool,
+            summary: "Background shell",
+            body: #"{"task_type":"local_bash","command":"sleep 30"}"#,
+            startedAtMs: 2
+        )))
+        XCTAssertEqual(
+            AgentAppViewModel.enrichingBackgroundTasks(anonymous, timeline: rawTimeline),
+            [AgentBackgroundTask(id: "T1", kind: .shell)],
+            "raw provider JSON must not leak into the Stop strip as a task description"
+        )
+    }
+
+    func test_reduceStreamQuantum_appliesBackgroundTaskIdsFromSnapshot() {
+        let tid = AgentThreadID()
+        let run = AgentRunID()
+        let event = AssistantEvent.providerRuntime(ProviderRuntimeEvent(
+            id: "snap",
+            provider: .claude,
+            source: "claude.stream-json.session",
+            method: "claude.session.snapshot",
+            payloadJSON: #"{"reason":"background_work","pendingBackgroundTaskIds":["T1"]}"#,
+            receivedAtMs: 1
+        ))
+        let input = StreamQuantumReduceInput(
+            selectedThreadId: tid,
+            timeline: AssistantTimelineState(),
+            suppressStaleActivePlanUpdates: false,
+            newestUserMessageAt: nil,
+            runStartedAt: Date(),
+            hasQueuedFollowUp: false,
+            currentRunId: run,
+            status: .running,
+            lastErrorRecoverable: false,
+            liveBackgroundShellCount: 0,
+            liveBackgroundTasks: [],
+            runsAllowedToMarkActive: [run],
+            entries: [StreamQuantumEntry(event: event, run: run, threadId: tid)]
+        )
+        let reduced = AgentAppViewModel.reduceStreamQuantum(input)
+        XCTAssertEqual(reduced.liveBackgroundShellCount, 1)
+        XCTAssertEqual(reduced.liveBackgroundTasks, [
+            AgentBackgroundTask(id: "T1", kind: .unknown)
+        ])
+    }
+
+    func test_reduceStreamQuantum_clearsRetainedBackgroundTasksWhenNewRunStarts() {
+        let tid = AgentThreadID()
+        let oldRun = AgentRunID()
+        let newRun = AgentRunID()
+        let input = StreamQuantumReduceInput(
+            selectedThreadId: tid,
+            timeline: AssistantTimelineState(),
+            suppressStaleActivePlanUpdates: false,
+            newestUserMessageAt: nil,
+            runStartedAt: nil,
+            hasQueuedFollowUp: false,
+            currentRunId: oldRun,
+            status: .completed,
+            lastErrorRecoverable: false,
+            liveBackgroundShellCount: 1,
+            liveBackgroundTasks: [
+                AgentBackgroundTask(id: "old-task", kind: .shell, description: "Old run")
+            ],
+            runsAllowedToMarkActive: [newRun],
+            entries: [
+                StreamQuantumEntry(
+                    event: .providerRuntime(ProviderRuntimeEvent(
+                        id: "old-snapshot",
+                        provider: .claude,
+                        source: "claude.stream-json.session",
+                        method: "claude.session.snapshot",
+                        payloadJSON: #"{"pendingBackgroundTaskIds":["old-task"]}"#,
+                        receivedAtMs: 1
+                    )),
+                    run: oldRun,
+                    threadId: tid
+                ),
+                StreamQuantumEntry(
+                    event: .turnStarted(turnId: "new-turn"),
+                    run: newRun,
+                    threadId: tid
+                )
+            ]
+        )
+
+        let reduced = AgentAppViewModel.reduceStreamQuantum(input)
+        XCTAssertEqual(reduced.liveBackgroundShellCount, 0,
+                       "a new run must not inherit the prior run's holder count")
+        XCTAssertEqual(reduced.liveBackgroundTasks, [],
+                       "a new run must not inherit the prior run's Stop-strip task details")
+    }
+
     func test_composerPlaceholder_staysNeutralWhenRunIsLiveDespiteStaleCompletedStatus() throws {
         // The load-bearing `!selectedThreadRunIsStartingOrRunning` guard: this VM's
         // `status` can be a stale `.completed` (e.g. a run started/owned elsewhere —

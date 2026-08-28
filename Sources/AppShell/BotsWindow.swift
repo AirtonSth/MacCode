@@ -88,7 +88,20 @@ public struct BotDeskRouting: Equatable, Codable {
     /// user's thread route; delegated calls freeze the exact provider/model
     /// selected for the active caller run so Auto cannot choose a new one.
     public init(thread: AgentThread, activeRun: AgentRun? = nil) {
-        let run = activeRun?.threadId == thread.id ? activeRun : nil
+        let route: AgentRunRepository.RouteChrome? = {
+            guard let run = activeRun, run.threadId == thread.id else { return nil }
+            return AgentRunRepository.RouteChrome(
+                threadId: run.threadId,
+                provider: run.provider,
+                providerInstanceId: run.providerInstanceId ?? run.provider.rawValue,
+                model: run.model
+            )
+        }()
+        self.init(thread: thread, activeRunRoute: route)
+    }
+
+    public init(thread: AgentThread, activeRunRoute: AgentRunRepository.RouteChrome?) {
+        let run = activeRunRoute?.threadId == thread.id ? activeRunRoute : nil
         let provider = run?.provider ?? thread.provider
         self.init(
             provider: provider,
@@ -101,6 +114,22 @@ public struct BotDeskRouting: Equatable, Codable {
             reasoningEffort: thread.reasoningEffort,
             serviceTier: thread.serviceTier,
             runAsUser: thread.runAsUser
+        )
+    }
+
+    public init(
+        route: AgentRunRepository.RouteChrome,
+        policy: AgentThreadRepository.DeskPolicyChrome
+    ) {
+        self.init(
+            provider: route.provider,
+            providerInstanceID: route.providerInstanceId,
+            model: route.model,
+            routingMode: .manual,
+            permissionMode: policy.permissionMode,
+            reasoningEffort: policy.reasoningEffort,
+            serviceTier: policy.serviceTier,
+            runAsUser: policy.runAsUser
         )
     }
 
@@ -892,7 +921,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
               conversation.botID == peerBotID,
               let peerThreadID = handoff.peerThreadID,
               conversation.linkedAgentThreadID == peerThreadID,
-              (try? threadRepo.get(id: peerThreadID)) != nil else {
+              (try? threadRepo.status(of: peerThreadID)) != nil else {
             return nil
         }
         return handoff
@@ -952,13 +981,13 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             return nil
         }
 
-        let activeCallerRun: AgentRun?
+        let activeCallerRoute: AgentRunRepository.RouteChrome?
         if let hostRunID,
-           let run = try? runRepo.get(id: hostRunID),
-           run.threadId == originThread.id {
-            activeCallerRun = run
+           let route = try? runRepo.route(of: hostRunID),
+           route.threadId == originThread.id {
+            activeCallerRoute = route
         } else {
-            activeCallerRun = nil
+            activeCallerRoute = nil
         }
         var conversation = BotConversation(
             botID: peer.id,
@@ -984,7 +1013,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                     botID: peer.id,
                     title: Self.titleFromFirstMessage(peerDisplay)
                 )
-                routing = BotDeskRouting(thread: originThread, activeRun: activeCallerRun)
+                routing = BotDeskRouting(thread: originThread, activeRunRoute: activeCallerRoute)
                 var peerInheritanceContext = originThread
                 peerInheritanceContext.workspaceId = nil
                 try botStore.upsertConversation(conversation)
@@ -1083,8 +1112,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 // child. Abort dispatch only on durable PROOF the host was
                 // stopped — cancelled/interrupted terminal row. Completed and
                 // unknown hosts still dispatch (late replies stay useful).
-                if let hostRun = try? runRepo.get(id: hostRunID),
-                   hostRun.status == .cancelled || hostRun.status == .interrupted {
+                if let status = try? runRepo.status(of: hostRunID),
+                   status == .cancelled || status == .interrupted {
                     coordinator.stopRun(threadId: thread.id)
                     finalizeDelegationTelemetry(runID: peerRunID, status: .cancelled)
                     markConversationNeedsAttention(conversation, detail: display)
@@ -1992,20 +2021,22 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                   stored.threadId == threadID,
                   stored.role == .assistant,
                   stored.content == content else { return false }
-            if var thread = try threadRepo.get(id: threadID) {
-                var changed = false
-                if let terminalStatus, thread.status != terminalStatus {
-                    thread.status = terminalStatus
-                    changed = true
+            let markUnread = router?.agentAppThreadIsSelected(threadID) != true
+            if let terminalStatus {
+                if markUnread {
+                    try threadRepo.updateStatus(
+                        id: threadID,
+                        status: terminalStatus,
+                        hasUnread: true
+                    )
+                } else {
+                    try threadRepo.updateStatusPreservingUnread(
+                        id: threadID,
+                        status: terminalStatus
+                    )
                 }
-                if router?.agentAppThreadIsSelected(threadID) != true, !thread.hasUnread {
-                    thread.hasUnread = true
-                    changed = true
-                }
-                if changed {
-                    thread.updatedAt = Date()
-                    try threadRepo.upsert(thread)
-                }
+            } else if markUnread {
+                _ = try threadRepo.markUnreadUpdatingActivity(of: threadID)
             }
             router?.projectAgentAppPeerMessage(
                 threadID: threadID,
@@ -2199,7 +2230,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 continue
             }
             if let threadID = handoff.originAgentThreadID,
-               (try? threadRepo.get(id: threadID)) == nil {
+               (try? threadRepo.status(of: threadID)) == nil {
                 removeRestoredHandoff(activityID: activityID, handoff: handoff)
                 continue
             }
@@ -2383,7 +2414,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
 
     private func settleCancelledQueuedHost(runID: AgentRunID, threadID: AgentThreadID) {
         let queuedID = AgentQueuedMessageID(runID.value)
-        guard (try? runRepo.get(id: runID)) == nil,
+        guard (try? runRepo.status(of: runID)) == nil,
               (try? queuedMessageRepo.get(id: queuedID)) == nil else { return }
         let activityIDs = handoffs.compactMap { activityID, handoff -> UUID? in
             guard handoff.hostRunID == runID,
@@ -2437,8 +2468,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                     dates.append(stamped)
                 }
                 if let threadID = handoff.peerThreadID,
-                   let thread = try? threadRepo.get(id: threadID) {
-                    dates.append(thread.updatedAt)
+                   let updatedAt = try? threadRepo.updatedAt(of: threadID) {
+                    dates.append(updatedAt)
                 }
             default:
                 break
@@ -2972,8 +3003,14 @@ public final class BotsViewModel: ObservableObject {
     public static let assistantPlaceholder = BotsDeskFollowThrough.noRouterPlaceholder
 
     @Published public private(set) var bots: [BotDefinition] = []
+    /// Stored roster snapshot so ForEach does not re-filter/sort `fleet` on
+    /// unrelated @Published writes (desk timeline, inspector, Token Saver).
+    @Published public private(set) var publishedRoster: [BotDefinition] = []
     @Published public var searchText: String = "" {
-        didSet { persistSearchText() }
+        didSet {
+            persistSearchText()
+            publishRosterIfNeeded()
+        }
     }
     @Published public var showHidden: Bool = false {
         didSet {
@@ -2983,6 +3020,7 @@ public final class BotsViewModel: ObservableObject {
             // conversations + recent messages) before the roster could
             // paint. Off filters locally; on lists hidden rows only.
             applyShowHiddenLocally()
+            publishRosterIfNeeded()
         }
     }
     @Published public var selectedBotID: BotID?
@@ -3035,10 +3073,21 @@ public final class BotsViewModel: ObservableObject {
     @Published public var studioDraft = BotStudioDraft() {
         didSet { persistStudioDraftIfHydrated() }
     }
-    @Published public var composerText: String = "" {
-        didSet { persistComposerIfHydrated() }
+    /// Keep live composer edits and caret movement off the Desk view model that
+    /// owns the transcript and live timeline. The computed proxies preserve the
+    /// existing API while publishing both fields only to the composer subtree.
+    public let composerState = BotsComposerState()
+    public var composerText: String {
+        get { composerState.text }
+        set {
+            composerState.text = newValue
+            persistComposerIfHydrated()
+        }
     }
-    @Published public var composerCursorOffset: Int? = nil
+    public var composerCursorOffset: Int? {
+        get { composerState.cursorOffset }
+        set { composerState.cursorOffset = newValue }
+    }
     @Published public var attachments: [AgentAttachment] = [] {
         didSet { persistComposerIfHydrated() }
     }
@@ -3063,6 +3112,7 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var deskMessages: [BotDeskMessage] = []
     /// Same Token Saver footer figures Agent App shows, from the same calculator.
     @Published public private(set) var tokenSaverFooterEnabled = false
+    @Published public private(set) var tokenSaverFooterSnapshotReady = false
     @Published public private(set) var tokenSaverThreadMeasuredTokens = 0
     @Published public private(set) var tokenSaverThreadSavedTokens = 0
     @Published public private(set) var tokenSaverOriginalDisplayMessageIds: Set<AgentMessageID> = []
@@ -3239,6 +3289,10 @@ public final class BotsViewModel: ObservableObject {
     private let draftPersistenceAuthority: BotDraftPersistenceAuthority
     private var messagesByBot: [BotID: [BotDeskMessage]] = [:]
     private var messagesConversationIDByBot: [BotID: BotConversationID] = [:]
+    /// Last painted transcript per conversation. `messagesByBot` is only the
+    /// last-viewed conversation of that teammate; switching threads must not
+    /// reuse it or flash empty while SQLite hydrates.
+    private var messagesByConversation: [BotConversationID: [BotDeskMessage]] = [:]
     private var selectedConversationByBot: [BotID: BotConversationID] = [:]
     private var attentionStateByBot: [BotID: BotAttentionState] = [:]
     private var lastPreviewByBot: [BotID: String] = [:]
@@ -3431,6 +3485,12 @@ public final class BotsViewModel: ObservableObject {
             result.insert(selected, at: 0)
         }
         return result
+    }
+
+    private func publishRosterIfNeeded() {
+        let next = fleet
+        guard next != publishedRoster else { return }
+        publishedRoster = next
     }
 
     public var openAttentionCount: Int { attentionItems.count }
@@ -3941,9 +4001,14 @@ public final class BotsViewModel: ObservableObject {
 
     private func resetTokenSaverFooterSnapshot() {
         tokenSaverFooterReloadTask?.cancel()
+        guard tokenSaverFooterEnabled
+            || tokenSaverFooterSnapshotReady
+            || tokenSaverThreadMeasuredTokens != 0
+            || tokenSaverThreadSavedTokens != 0 else { return }
         tokenSaverFooterEnabled = false
         tokenSaverThreadMeasuredTokens = 0
         tokenSaverThreadSavedTokens = 0
+        tokenSaverFooterSnapshotReady = false
     }
 
     func reloadTokenSaverThreadSavings() {
@@ -3970,21 +4035,34 @@ public final class BotsViewModel: ObservableObject {
         let db = context.db
         let settingsRepo = context.settingsRepo
         let savingsRepo = context.tokenSaverSavingsRepo
+        let graphifyRepo = context.graphifyUsageRepo
         tokenSaverFooterReloadTask = Task { [weak self] in
             let eligible = SettingsStore(db: db).load().tokenSaverEnabled
                 && PrivateAccountSessionStore(repo: settingsRepo).load()?.user.subscribed == true
             let graphifyActive = SettingsStore(db: db).load().isGraphifyRuntimeActive
-            let measured = await TokenSaverThreadFooterReload.loadMeasured(
+            let total = await TokenSaverThreadFooterReload.loadDeliveredTotal(
                 eligible: eligible,
                 threadId: threadId,
                 repo: savingsRepo
             )
+            guard let total else { return }
             guard !Task.isCancelled else { return }
             let next = TokenSaverThreadFooterReload.snapshot(
-                measuredDelivered: measured,
+                measuredDelivered: total.savedTokens,
                 eligible: eligible,
                 graphifyActive: graphifyActive,
-                observation: observation
+                observation: TokenSaverThreadFooterReload.Observation(
+                    assistantChars: observation.assistantChars,
+                    turnCount: observation.turnCount,
+                    cacheReadInputTokens: observation.cacheReadInputTokens,
+                    providerRawTokens: observation.providerRawTokens,
+                    providerBilledTokenUnits: observation.providerBilledTokenUnits,
+                    autoRoutingActive: observation.autoRoutingActive,
+                    graphifySignalCount: TokenSaverThreadFooterReload.currentDayGraphifySignalCount(
+                        repo: graphifyRepo
+                    )
+                ),
+                deliveredRuns: total.runs
             )
             await MainActor.run { [weak self] in
                 guard let self, !Task.isCancelled else { return }
@@ -3998,12 +4076,12 @@ public final class BotsViewModel: ObservableObject {
                     measuredTokens: self.tokenSaverThreadMeasuredTokens,
                     displayTokens: self.tokenSaverThreadSavedTokens
                 )
-                guard TokenSaverThreadFooterReload.shouldPublish(current: current, next: next) else {
-                    return
+                if TokenSaverThreadFooterReload.shouldPublish(current: current, next: next) {
+                    self.tokenSaverFooterEnabled = next.enabled
+                    self.tokenSaverThreadMeasuredTokens = next.measuredTokens
+                    self.tokenSaverThreadSavedTokens = next.displayTokens
                 }
-                self.tokenSaverFooterEnabled = next.enabled
-                self.tokenSaverThreadMeasuredTokens = next.measuredTokens
-                self.tokenSaverThreadSavedTokens = next.displayTokens
+                self.tokenSaverFooterSnapshotReady = true
             }
         }
     }
@@ -4059,7 +4137,16 @@ public final class BotsViewModel: ObservableObject {
             displayTokens: tokenSaverThreadSavedTokens,
             measuredTokens: tokenSaverThreadMeasuredTokens,
             enabled: tokenSaverFooterEnabled,
-            autoRoutingActive: deskRouting.routingMode == .auto
+            autoRoutingActive: deskRouting.routingMode == .auto,
+            snapshotReady: tokenSaverFooterSnapshotReady
+        )
+    }
+
+    var deskTokenSaverFooterPresentation: AgentChatTokenSaverThreadFooterPresentation? {
+        AgentChatTokenSaverDisplayMode.footerPresentation(
+            enabled: tokenSaverFooterEnabled,
+            measuredTokens: tokenSaverThreadMeasuredTokens,
+            snapshotReady: tokenSaverFooterSnapshotReady
         )
     }
 
@@ -4069,6 +4156,7 @@ public final class BotsViewModel: ObservableObject {
         tokenSaverFooterEnabled = snapshot.enabled
         tokenSaverThreadMeasuredTokens = snapshot.measuredTokens
         tokenSaverThreadSavedTokens = snapshot.displayTokens
+        tokenSaverFooterSnapshotReady = true
     }
 
     func awaitTokenSaverFooterReloadForTesting() async {
@@ -4323,18 +4411,45 @@ public final class BotsViewModel: ObservableObject {
     private func openDeskFromCache(_ bot: BotDefinition) {
         let cachedBot = bots.first(where: { $0.id == bot.id }) ?? bot
         adoptSelectedBot(cachedBot.id)
-        screen = .desk
+        if screen != .desk {
+            screen = .desk
+        }
         persistSelection()
         resetTokenSaverFooterSnapshot()
-        let cachedConversation = destConversation(for: cachedBot.id)
-        selectedConversation = cachedConversation
-        conversations = studioSupportByBot[cachedBot.id]?.conversations
-            ?? conversations.filter { $0.botID == cachedBot.id }
-        let cachedConversationID = messagesConversationIDByBot[cachedBot.id]
-        deskMessages = cachedConversation?.id == cachedConversationID
-            ? (messagesByBot[cachedBot.id] ?? [])
-            : []
-        if let threadID = cachedConversation?.linkedAgentThreadID {
+        if let snapshot = studioSupportByBot[cachedBot.id] {
+            applyStudioSupport(snapshot, prefetchRail: false)
+        } else {
+            conversations = conversations.filter { $0.botID == cachedBot.id }
+            selectedConversation = destConversation(for: cachedBot.id) ?? conversations.first
+            selectedConversationByBot[cachedBot.id] = selectedConversation?.id
+            selectedRevision = cachedBot.currentRevisionID.flatMap { revisionByID[$0] }
+            skillBindings = []
+            memoryItems = []
+            lastContextReceipt = nil
+            routines = []
+        }
+        applyDeskRouting(for: selectedConversation, allowStoreLookup: false)
+        let cached = cachedMessages(
+            botID: cachedBot.id,
+            conversationID: selectedConversation?.id
+        )
+        deskMessages = cached
+        if !cached.isEmpty {
+            storeCachedMessages(
+                cached,
+                botID: cachedBot.id,
+                conversationID: selectedConversation?.id
+            )
+        }
+        if deskMessages.isEmpty {
+            destDeskChatFromTitleIfNeeded(
+                botID: cachedBot.id,
+                cached: cached,
+                conversation: selectedConversation
+            )
+        }
+        deskWorkLog = []
+        if let threadID = selectedConversation?.linkedAgentThreadID {
             deskLiveTimeline = liveTimelineByThread[threadID] ?? AssistantTimelineState()
             deskStreamEventCount = liveStreamCountByThread[threadID] ?? 0
         } else {
@@ -4357,7 +4472,7 @@ public final class BotsViewModel: ObservableObject {
         let generation = navigationFreshnessGeneration
         navigationFreshnessTask?.cancel()
         navigationFreshnessTask = Task { @MainActor [weak self] in
-            await Task.yield()
+            await Self.waitForCommittedFrame()
             guard let self else { return }
             defer {
                 // A cancelled task may resume after its replacement has been
@@ -4393,6 +4508,16 @@ public final class BotsViewModel: ObservableObject {
         navigationFreshnessGeneration &+= 1
         navigationFreshnessTask?.cancel()
         navigationFreshnessTask = nil
+    }
+
+    /// Next main-queue turn after the current CATransaction. `Task.yield()`
+    /// is only an executor hop and can still run before SwiftUI paints.
+    private static func waitForCommittedFrame() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async {
+                continuation.resume()
+            }
+        }
     }
 
     private func navigationFreshnessIsCurrent(
@@ -4525,6 +4650,9 @@ public final class BotsViewModel: ObservableObject {
             deskRoutingByConversation[conversation.id] = nil
         }
         persistDeskRouting()
+        for conversation in conversations {
+            messagesByConversation[conversation.id] = nil
+        }
         conversations = []
         selectedConversation = nil
         selectedConversationByBot[bot.id] = nil
@@ -4550,26 +4678,46 @@ public final class BotsViewModel: ObservableObject {
         resetTokenSaverFooterSnapshot()
         selectedConversation = conversation
         selectedConversationByBot[conversation.botID] = conversation.id
-        applyDeskRouting(for: conversation)
+        applyDeskRouting(
+            for: conversation,
+            allowStoreLookup: !navigationFirstFrameDeferral
+        )
         rememberStudioSupport(for: conversation.botID)
+        let cached = cachedMessages(
+            botID: conversation.botID,
+            conversationID: conversation.id
+        )
+        deskMessages = cached
+        if !cached.isEmpty {
+            storeCachedMessages(
+                cached,
+                botID: conversation.botID,
+                conversationID: conversation.id
+            )
+        }
+        if deskMessages.isEmpty {
+            destDeskChatFromTitleIfNeeded(
+                botID: conversation.botID,
+                cached: cached,
+                conversation: conversation
+            )
+        }
+        deskWorkLog = []
+        if let threadID = conversation.linkedAgentThreadID {
+            deskLiveTimeline = liveTimelineByThread[threadID] ?? AssistantTimelineState()
+        } else {
+            deskLiveTimeline = AssistantTimelineState()
+        }
         guard !navigationFirstFrameDeferral else {
-            deskMessages = messagesByBot[conversation.botID] ?? []
-            if messagesConversationIDByBot[conversation.botID] != conversation.id {
-                deskMessages = []
-            }
-            deskWorkLog = []
-            if let threadID = conversation.linkedAgentThreadID {
-                deskLiveTimeline = liveTimelineByThread[threadID] ?? AssistantTimelineState()
-            } else {
-                deskLiveTimeline = AssistantTimelineState()
-            }
             deskTimelineRejoinToken &+= 1
             scheduleNavigationFreshness(
                 .thread(botID: conversation.botID, conversationID: conversation.id)
             )
             return
         }
-        restoreDeskMessages(botID: conversation.botID)
+        if cached.isEmpty {
+            restoreDeskMessages(botID: conversation.botID)
+        }
         restoreDeskWorkLog(botID: conversation.botID)
         restoreDeskLiveTurn(botID: conversation.botID)
         reloadTokenSaverThreadSavings()
@@ -4586,7 +4734,9 @@ public final class BotsViewModel: ObservableObject {
             botID: botID,
             conversationID: conversationID
         ) else { return }
-        restoreDeskMessages(botID: botID)
+        if cachedMessages(botID: botID, conversationID: conversationID).isEmpty {
+            restoreDeskMessages(botID: botID)
+        }
         guard navigationFreshnessIsCurrent(
             generation,
             botID: botID,
@@ -5263,7 +5413,7 @@ public final class BotsViewModel: ObservableObject {
                 ids.append(threadID)
                 continue
             }
-            if try context.coordinator.durableActiveRun(threadId: threadID) != nil {
+            if try context.coordinator.hasDurableActiveRun(threadId: threadID) {
                 ids.append(threadID)
             }
         }
@@ -6133,6 +6283,7 @@ public final class BotsViewModel: ObservableObject {
             }
             lastPreviewByBot = previews
             lastUpdatedByBot = updated
+            publishRosterIfNeeded()
             rebuildAttentionStates()
             pruneQueuedFollowUpsToFleet()
             pruneComposerDraftsToFleet()
@@ -6264,6 +6415,7 @@ public final class BotsViewModel: ObservableObject {
             conversationListCountForTesting += 1
             deskThreadRailRoutingCache.removeAll()
             conversations = try botStore.listConversations(botID: id)
+            prefetchDeskThreadRailRouting(for: conversations)
             if let remembered = selectedConversationByBot[id],
                let found = conversations.first(where: { $0.id == remembered }) {
                 selectedConversation = found
@@ -6294,8 +6446,14 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
-    private func applyStudioSupport(_ snapshot: BotStudioSupportSnapshot) {
+    private func applyStudioSupport(
+        _ snapshot: BotStudioSupportSnapshot,
+        prefetchRail: Bool = true
+    ) {
         conversations = snapshot.conversations
+        if prefetchRail {
+            prefetchDeskThreadRailRouting(for: conversations)
+        }
         selectedConversation = snapshot.selectedConversation
         selectedRevision = snapshot.selectedRevision
         skillBindings = snapshot.skillBindings
@@ -6403,8 +6561,10 @@ public final class BotsViewModel: ObservableObject {
     /// dest title/thread; dest dests dest preview from that dest.
     private func destSelectedChatIfNeeded() {
         guard let id = selectedBotID, bots.contains(where: { $0.id == id }) else { return }
-        deskMessages = messagesByBot[id] ?? []
-        if messagesByBot[id]?.isEmpty != false {
+        let conversationID = destConversation(for: id)?.id
+        let cached = cachedMessages(botID: id, conversationID: conversationID)
+        deskMessages = cached
+        if cached.isEmpty {
             restoreDeskMessages(botID: id)
         }
     }
@@ -6412,15 +6572,17 @@ public final class BotsViewModel: ObservableObject {
     private func reloadSelectedBot(id: BotID) {
         leaveDeskLiveWatch()
         resetTokenSaverFooterSnapshot()
-        let threadID = destConversation(for: id)?.linkedAgentThreadID
+        let conversation = destConversation(for: id)
+        let threadID = conversation?.linkedAgentThreadID
         deskLiveTimeline = threadID.flatMap { liveTimelineByThread[$0] } ?? AssistantTimelineState()
         deskStreamEventCount = threadID.flatMap { liveStreamCountByThread[$0] } ?? 0
-        deskMessages = messagesByBot[id] ?? []
+        let cached = cachedMessages(botID: id, conversationID: conversation?.id)
+        deskMessages = cached
         // Dest first. First paint dest used to dest inspector
         // (conversations, revision, skills, memory, routines,
         // receipt) before dest dested Chat. Dest dests this
         // bubble first; dest dests inspector after dest dested Chat.
-        if messagesByBot[id]?.isEmpty != false {
+        if cached.isEmpty {
             restoreDeskMessages(botID: id)
         }
         restoreDeskWorkLog(botID: id)
@@ -6464,9 +6626,7 @@ public final class BotsViewModel: ObservableObject {
         if let saved = deskRoutingByConversation[conversation.id] {
             return saved
         }
-        guard let threadID = conversation.linkedAgentThreadID,
-              let thread = try? context.threadRepo.get(id: threadID) else { return nil }
-        return BotDeskRouting(thread: thread)
+        return nil
     }
 
     private static let selectedBotDefaultsKey = "bots.selectedBotID"
@@ -6558,22 +6718,34 @@ public final class BotsViewModel: ObservableObject {
         UserDefaults.standard.set(Double(deskThreadRailWidth), forKey: Self.deskThreadRailWidthDefaultsKey)
     }
 
-    /// Memo for thread-rail provider · model chips: one repo point-get
-    /// per linked thread instead of one per row per render (the desk
+    /// Memo for thread-rail provider · model chips: one batched listChrome
+    /// per desk reload instead of one full get per row per render (the desk
     /// composer republishes this model on every keystroke).
     private var deskThreadRailRoutingCache: [AgentThreadID: BotDeskThreadRailRouting] = [:]
+
+    /// Prefetch provider · model for linked threads so first rail paint
+    /// does not compile N 26-column + routing `get`s.
+    private func prefetchDeskThreadRailRouting(for conversations: [BotConversation]) {
+        let missing = conversations.compactMap(\.linkedAgentThreadID).filter {
+            deskThreadRailRoutingCache[$0] == nil
+        }
+        guard !missing.isEmpty else { return }
+        let chrome = (try? context.threadRepo.listChrome(ids: missing)) ?? [:]
+        for (id, row) in chrome {
+            deskThreadRailRoutingCache[id] = BotDeskThreadRailRouting(
+                provider: row.provider,
+                model: row.model
+            )
+        }
+    }
 
     /// Provider · model for a desk thread row — the same chip data the
     /// Agent App rail shows. The linked run's thread wins; a never-run
     /// conversation shows what the desk would route it to today.
     public func deskThreadRailRouting(for conversation: BotConversation) -> BotDeskThreadRailRouting {
-        if let threadID = conversation.linkedAgentThreadID {
-            if let cached = deskThreadRailRoutingCache[threadID] { return cached }
-            if let thread = try? context.threadRepo.get(id: threadID) {
-                let routing = BotDeskThreadRailRouting(provider: thread.provider, model: thread.model)
-                deskThreadRailRoutingCache[threadID] = routing
-                return routing
-            }
+        if let threadID = conversation.linkedAgentThreadID,
+           let cached = deskThreadRailRoutingCache[threadID] {
+            return cached
         }
         return BotDeskThreadRailRouting(provider: deskRouting.provider, model: deskRouting.model)
     }
@@ -6907,7 +7079,10 @@ public final class BotsViewModel: ObservableObject {
             if deskRoutingHydrated {
                 captureDeskRouting()
             } else {
-                applyDeskRouting(for: selectedConversation)
+                applyDeskRouting(
+                    for: selectedConversation,
+                    allowStoreLookup: !navigationFirstFrameDeferral
+                )
             }
             return
         }
@@ -6922,6 +7097,7 @@ public final class BotsViewModel: ObservableObject {
         }
         flushPendingDraftPersistence()
         selectedBotID = id
+        publishRosterIfNeeded()
         applyComposerDraft(for: id)
         applyInspectorDraft(for: id)
     }
@@ -7160,16 +7336,25 @@ public final class BotsViewModel: ObservableObject {
         persistDeskRouting()
     }
 
-    private func applyDeskRouting(for conversation: BotConversation?) {
+    private func applyDeskRouting(
+        for conversation: BotConversation?,
+        allowStoreLookup: Bool = true
+    ) {
         isApplyingDeskRouting = true
         if let conversation, let saved = deskRoutingByConversation[conversation.id] {
-            deskRouting = saved
-        } else if let threadID = conversation?.linkedAgentThreadID,
+            if deskRouting != saved {
+                deskRouting = saved
+            }
+        } else if allowStoreLookup,
+                  let threadID = conversation?.linkedAgentThreadID,
                   let thread = try? context.threadRepo.get(id: threadID) {
             deskRouting = BotDeskRouting(thread: thread)
             normalizeDeskReasoning()
         } else {
-            deskRouting = BotDeskRouting()
+            let fallback = BotDeskRouting()
+            if deskRouting != fallback {
+                deskRouting = fallback
+            }
         }
         isApplyingDeskRouting = false
         deskRoutingHydrated = true
@@ -7248,6 +7433,10 @@ public final class BotsViewModel: ObservableObject {
         guard let handoff = peerHandoffs[messageID],
               handoff.originConversationID == originConversationID,
               let hostID = handoff.originBotID else { return }
+        if var messages = messagesByConversation[originConversationID] {
+            update(&messages)
+            messagesByConversation[originConversationID] = messages
+        }
         if var messages = messagesByBot[hostID],
            messagesConversationIDByBot[hostID] == originConversationID {
             update(&messages)
@@ -7777,6 +7966,31 @@ public final class BotsViewModel: ObservableObject {
         return (try? botStore.listConversations(botID: botID).first)
     }
 
+    private func cachedMessages(
+        botID: BotID,
+        conversationID: BotConversationID?
+    ) -> [BotDeskMessage] {
+        if let conversationID, let rows = messagesByConversation[conversationID] {
+            return rows
+        }
+        if let conversationID, messagesConversationIDByBot[botID] == conversationID {
+            return messagesByBot[botID] ?? []
+        }
+        return []
+    }
+
+    private func storeCachedMessages(
+        _ messages: [BotDeskMessage],
+        botID: BotID,
+        conversationID: BotConversationID?
+    ) {
+        if let conversationID {
+            messagesByConversation[conversationID] = messages
+        }
+        messagesByBot[botID] = messages
+        messagesConversationIDByBot[botID] = conversationID
+    }
+
     /// Persist dest already wrote this thread into dest cache. Settle
     /// dest must dest Chat from that cache instead of listing threads.
     private func destConversation(for botID: BotID) -> BotConversation? {
@@ -7811,10 +8025,7 @@ public final class BotsViewModel: ObservableObject {
         lastDeskRestoreAttentionListCountForTesting = attentionListCountForTesting
         lastDeskRestoreConversationListCountForTesting = conversationListCountForTesting
         let conversation = conversationForBot(botID)
-        var cached = messagesByBot[botID] ?? []
-        if messagesConversationIDByBot[botID] != conversation?.id {
-            cached = []
-        }
+        var cached = cachedMessages(botID: botID, conversationID: conversation?.id)
         // Dest first. First paint dest used to dest dest thread
         // (listRecent) before dest dested Chat. Dest dests dest
         // title now; dest dests dest thread after dest dested Chat.
@@ -7891,8 +8102,7 @@ public final class BotsViewModel: ObservableObject {
         if visible.isEmpty, let conversation, Self.shouldDestTitleAsBubble(conversation.title) {
             visible = [BotDeskMessage(role: .user, text: conversation.title, createdAt: conversation.createdAt)]
         }
-        messagesByBot[botID] = visible
-        messagesConversationIDByBot[botID] = conversation?.id
+        storeCachedMessages(visible, botID: botID, conversationID: conversation?.id)
         if selectedBotID == botID {
             deskMessages = visible
             if selectedConversation?.botID == botID {
@@ -7986,7 +8196,7 @@ public final class BotsViewModel: ObservableObject {
             text: humanText,
             attachments: attachments
         )
-        if try context.messageRepo.get(id: messageID) == nil {
+        if try context.messageRepo.exists(id: messageID) == false {
             try context.messageRepo.append(AgentMessage(
                 id: messageID,
                 threadId: threadID,
@@ -8014,15 +8224,12 @@ public final class BotsViewModel: ObservableObject {
         lastDeskRestoreMessageListCountForTesting = deskMessageRestoreCountForTesting
         if !cached.isEmpty {
             deskMessages = cached
-            messagesByBot[botID] = cached
             return
         }
         guard let conversation, Self.shouldDestTitleAsBubble(conversation.title) else { return }
-        let dest = [
+        deskMessages = [
             BotDeskMessage(role: .user, text: conversation.title, createdAt: conversation.createdAt)
         ]
-        deskMessages = dest
-        messagesByBot[botID] = dest
     }
 
     private func restoreDeskLiveTurn(
@@ -8233,7 +8440,7 @@ public final class BotsViewModel: ObservableObject {
         } else {
             run = linkedRun(for: threadID, botID: botID)
         }
-        let mode = (try? context.threadRepo.get(id: threadID))?.permissionMode
+        let mode = (try? context.threadRepo.permissionMode(of: threadID))
             ?? deskRouting.permissionMode
         let rows = BotsDeskFollowThrough.workLogRows(for: run, mode: mode)
         if selectedBotID == botID {
@@ -8270,6 +8477,9 @@ public final class BotsViewModel: ObservableObject {
         let threadID = conversationID
             ?? (selectedBotID == botID ? selectedConversation?.id : nil)
             ?? messagesConversationIDByBot[botID]
+        if let threadID {
+            messagesByConversation[threadID, default: []].append(message)
+        }
         if let threadID, messagesConversationIDByBot[botID] != threadID {
             messagesByBot[botID] = [message]
             messagesConversationIDByBot[botID] = threadID
@@ -8306,6 +8516,12 @@ public final class BotsViewModel: ObservableObject {
                 tokenSaverOriginal: next.tokenSaverOriginal,
                 tokenSaverTurnId: next.tokenSaverTurnId
             )
+        }
+        if let conversationID = (selectedBotID == botID ? selectedConversation?.id : nil)
+            ?? messagesConversationIDByBot[botID],
+           var cached = messagesByConversation[conversationID] {
+            stamp(&cached)
+            messagesByConversation[conversationID] = cached
         }
         if var cached = messagesByBot[botID] {
             stamp(&cached)
@@ -9450,7 +9666,8 @@ extension BotsViewModel: BotPeerHandoffAuthorityObserver {
                         activityPhase: .waiting
                     )
                 )
-                if !(messagesByBot[hostID] ?? []).contains(where: { $0.id == outbound.id }) {
+                if !cachedMessages(botID: hostID, conversationID: conversationID)
+                    .contains(where: { $0.id == outbound.id }) {
                     appendDeskMessage(outbound, botID: hostID, conversationID: conversationID)
                 }
             }
@@ -9482,7 +9699,8 @@ extension BotsViewModel: BotPeerHandoffAuthorityObserver {
                         avatarSymbol: handoff.peerAvatarSymbol
                     )
                 )
-                if !(messagesByBot[hostID] ?? []).contains(where: { $0.id == inbound.id }) {
+                if !cachedMessages(botID: hostID, conversationID: conversationID)
+                    .contains(where: { $0.id == inbound.id }) {
                     appendDeskMessage(inbound, botID: hostID, conversationID: conversationID)
                 }
                 if handoff.hostRunID != nil {
@@ -9668,7 +9886,6 @@ public struct BotsModeSwitcher: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .animation(DS.Motion.micro, value: selected)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityIdentifier(identifier)
     }
@@ -9768,14 +9985,14 @@ public struct BotsRosterList: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: DS.Space.lg) {
-                    if vm.fleet.isEmpty {
+                    if vm.publishedRoster.isEmpty {
                         Text(vm.searchText.isEmpty ? "No bots yet" : "No matches")
                             .font(DS.Font.body)
                             .foregroundColor(DS.Palette.textTertiary)
                             .padding(.horizontal, DS.Space.md)
                             .padding(.vertical, DS.Space.sm)
                     } else {
-                        ForEach(vm.fleet, id: \.id) { bot in
+                        ForEach(vm.publishedRoster, id: \.id) { bot in
                             rosterRow(bot)
                         }
                     }
@@ -9816,7 +10033,7 @@ public struct BotsRosterList: View {
                         name: bot.name,
                         handle: bot.handle,
                         symbol: bot.avatarSymbol,
-                        size: 16,
+                        size: BotsChrome.rosterAvatarSize,
                         attention: state
                     )
                     Circle()
@@ -9824,7 +10041,7 @@ public struct BotsRosterList: View {
                         .frame(width: 7, height: 7)
                         .overlay(Circle().stroke(DS.Palette.surface, lineWidth: 1))
                 }
-                .frame(width: 20, height: 20)
+                .frame(width: BotsChrome.rosterAvatarSize, height: BotsChrome.rosterAvatarSize)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(bot.name)
                         .font(selected ? DS.Font.bodyStrong : DS.Font.body)
@@ -10011,6 +10228,15 @@ struct BotsComposerTimelineSchedule: TimelineSchedule {
             return current
         }
     }
+}
+
+/// Scopes composer observation so a keystroke does not invalidate the enclosing
+/// Desk body, which also owns the transcript and live replay projection.
+private struct BotsComposerReactiveScope<Content: View>: View {
+    @ObservedObject var composerState: BotsComposerState
+    @ViewBuilder var content: () -> Content
+
+    var body: some View { content() }
 }
 
 public struct BotsRootView: View {
@@ -10732,7 +10958,9 @@ public struct BotsRootView: View {
                 if !vm.queuedFollowUps.isEmpty {
                     deskQueuedFollowUps
                 }
-                composerBar(bot)
+                BotsComposerReactiveScope(composerState: vm.composerState) {
+                    composerBar(bot)
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             if vm.isDeskSidePaneVisible {
@@ -10751,6 +10979,8 @@ public struct BotsRootView: View {
         }
         .animation(DS.Motion.standard, value: vm.isDeskSidePaneVisible)
         .animation(DS.Motion.standard, value: vm.isDeskThreadRailVisible)
+        .animation(nil, value: vm.selectedBotID)
+        .animation(nil, value: vm.selectedConversation?.id)
         .confirmationDialog(
             "Clear all threads?",
             isPresented: $pendingClearAllDeskThreads,
@@ -10929,11 +11159,13 @@ public struct BotsRootView: View {
             Text("Revision \(receipt.revisionNumber) · \(vm.providerChipTitle(receipt.provider)) · \(receipt.model.isEmpty ? "model unset" : receipt.model) · \(receipt.permissionMode.rawValue)")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textSecondary)
-            Text("payload \(receipt.payloadDigest)")
-                .font(.system(.caption, design: .monospaced))
-                .foregroundColor(DS.Palette.textTertiary)
-                .textSelection(.enabled)
-                .accessibilityIdentifier("bots.brain.digest")
+            AgentSelectablePlainText(
+                text: "payload \(receipt.payloadDigest)",
+                fontSize: 11,
+                monospaced: true,
+                textColor: DS.NS.textTertiary
+            )
+            .accessibilityIdentifier("bots.brain.digest")
             if !compact {
                 Text("compiler \(receipt.compilerVersion) · no opaque RemoteCode layer")
                     .font(DS.Font.caption)
@@ -10954,11 +11186,12 @@ public struct BotsRootView: View {
                             .foregroundColor(DS.Palette.text)
                     }
                     if !layer.text.isEmpty {
-                        Text(layer.text)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
+                        AgentSelectablePlainText(
+                            text: layer.text,
+                            fontSize: 11,
+                            textColor: DS.NS.textSecondary
+                        )
+                        .fixedSize(horizontal: false, vertical: true)
                     }
                     Text(layer.reason)
                         .font(DS.Font.caption)
@@ -10972,11 +11205,13 @@ public struct BotsRootView: View {
     }
 
     private func brainEffective(_ receipt: ContextAssemblyReceipt) -> some View {
-        Text(receipt.compiledPayload.isEmpty ? "(empty payload)" : receipt.compiledPayload)
-            .font(.system(.caption, design: .monospaced))
-            .foregroundColor(DS.Palette.text)
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        AgentSelectablePlainText(
+            text: receipt.compiledPayload.isEmpty ? "(empty payload)" : receipt.compiledPayload,
+            fontSize: 11,
+            monospaced: true,
+            textColor: DS.NS.text
+        )
+        .frame(maxWidth: .infinity, alignment: .leading)
             .padding(DS.Space.md)
             .background(DS.Palette.surfaceRaised)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
@@ -10995,10 +11230,11 @@ public struct BotsRootView: View {
             } else {
                 ForEach(receipt.memoryLayers) { layer in
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(layer.text.isEmpty ? "(empty fact)" : layer.text)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .textSelection(.enabled)
+                        AgentSelectablePlainText(
+                            text: layer.text.isEmpty ? "(empty fact)" : layer.text,
+                            fontSize: 11,
+                            textColor: DS.NS.textSecondary
+                        )
                         Text(layer.reason)
                             .font(DS.Font.caption)
                             .foregroundColor(DS.Palette.textTertiary)
@@ -11162,11 +11398,16 @@ public struct BotsRootView: View {
                         columnWidth: columnWidth
                     )
                 }
-                if !vm.deskRunIsLive && !vm.deskShowsLoading,
-                   let text = vm.deskTokenSaverFooterText {
+                if AgentAppView.shouldShowTokenSaverThreadFooter(
+                    runIsLive: vm.deskRunIsLive || vm.deskShowsLoading,
+                    footerText: vm.deskTokenSaverFooterText,
+                    hasFinishedTurn: vm.deskMessages.contains(where: { $0.role == .assistant })
+                ), let text = vm.deskTokenSaverFooterText,
+                   let presentation = vm.deskTokenSaverFooterPresentation {
                     AgentChatTokenSaverThreadFooter(
                         text: text,
-                        autoRouting: vm.deskRouting.routingMode == .auto
+                        autoRouting: vm.deskRouting.routingMode == .auto,
+                        presentation: presentation
                     )
                     .id("agent.tokenSaver.footer")
                 }
@@ -11343,7 +11584,6 @@ public struct BotsRootView: View {
                     }
                     AgentMessageMarkdownView(text: message.text)
                         .foregroundColor(DS.Palette.text)
-                        .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 if let messageId, let original,

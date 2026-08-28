@@ -349,6 +349,19 @@ final class BotsWindowTests: XCTestCase {
             let vm = BotsViewModel(context: context)
             XCTAssertNil(vm.tokenSaverFooterTextForTesting())
             XCTAssertFalse(vm.tokenSaverFooterEnabled)
+            XCTAssertFalse(vm.tokenSaverFooterSnapshotReady)
+            vm.applyTokenSaverFooterSnapshotForTesting(
+                TokenSaverThreadFooterReload.Snapshot(
+                    enabled: false,
+                    measuredTokens: 0,
+                    displayTokens: 0
+                )
+            )
+            XCTAssertEqual(
+                vm.tokenSaverFooterTextForTesting(),
+                "Token Saver: 0 tokens saved because Token Saver is deactivated"
+            )
+            XCTAssertEqual(vm.deskTokenSaverFooterPresentation, .deactivated)
         }
     }
 
@@ -1529,6 +1542,83 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(chrome.contains("stop.circle"))
     }
 
+    /// WHY: opening Desk used to full-get every linked thread just to paint
+    /// provider · model on the rail. First paint must reuse batched listChrome
+    /// so N rows cannot stall MainActor.
+    func test_deskThreadRailRouting_usesListChromeWithoutDurableGet() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        var conversations: [BotConversation] = []
+        conversations.reserveCapacity(20)
+        for index in 0..<20 {
+            let thread = AgentThread(
+                title: "desk-\(index)",
+                provider: .claude,
+                model: "opus-\(index)"
+            )
+            try context.threadRepo.upsert(thread)
+            let conversation = BotConversation(
+                botID: bot.id,
+                title: "desk-\(index)",
+                linkedAgentThreadID: thread.id
+            )
+            try context.botStore.upsertConversation(conversation)
+            conversations.append(conversation)
+        }
+        let getsBeforeOpen = context.threadRepo.durableGetCountForTesting
+        let chromeBeforeOpen = context.threadRepo.listChromeCallCountForTesting
+        vm.openDesk(bot)
+        XCTAssertGreaterThanOrEqual(
+            context.threadRepo.listChromeCallCountForTesting,
+            chromeBeforeOpen + 1,
+            "openDesk must prefetch rail routing with listChrome"
+        )
+        XCTAssertLessThan(
+            context.threadRepo.durableGetCountForTesting - getsBeforeOpen,
+            20,
+            "openDesk must not full-get once per linked thread for rail chrome"
+        )
+
+        let getsBeforeRows = context.threadRepo.durableGetCountForTesting
+        let chromeBeforeRows = context.threadRepo.listChromeCallCountForTesting
+        let painted = vm.conversations.map { vm.deskThreadRailRouting(for: $0) }
+        XCTAssertEqual(painted.count, 20)
+        XCTAssertEqual(Set(painted.map(\.model)), Set((0..<20).map { "opus-\($0)" }))
+        XCTAssertTrue(painted.allSatisfy { $0.provider == .claude })
+        XCTAssertEqual(
+            context.threadRepo.durableGetCountForTesting,
+            getsBeforeRows,
+            "desk thread rows must read rail routing from the prefetch cache"
+        )
+        XCTAssertEqual(
+            context.threadRepo.listChromeCallCountForTesting,
+            chromeBeforeRows,
+            "row paint must not re-query listChrome after prefetch"
+        )
+
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/AppShell/BotsWindow.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("prefetchDeskThreadRailRouting(for: conversations)"))
+        XCTAssertTrue(source.contains("threadRepo.listChrome(ids: missing)"))
+        let routingRange = try XCTUnwrap(source.range(of: "public func deskThreadRailRouting(for conversation: BotConversation)"))
+        let routingBody = String(source[routingRange.lowerBound...].prefix(900))
+        XCTAssertFalse(
+            routingBody.contains("threadRepo.get(id:"),
+            "deskThreadRailRouting must not full-get a thread for provider · model"
+        )
+        XCTAssertFalse(
+            routingBody.contains("listChrome"),
+            "row paint must not listChrome; prefetch after first frame fills the cache"
+        )
+    }
+
     func test_deskThreadRailOrdersWorkingFirst_becauseActiveMustStayOnTop() throws {
         // WHY: + / a newer idle dest thread used to insert at index 0 and
         // bury the live spinner. Dest must use the shared active-first sort
@@ -2533,14 +2623,22 @@ final class BotsWindowTests: XCTestCase {
             row.contains(".padding(.horizontal, DS.Space.sm)"),
             "roster rows must use the same horizontal inset as workspace rows"
         )
-        XCTAssertTrue(
-            row.contains("size: 16"),
-            "the avatar must sit inside the 20pt workspace icon slot, not overflow into the rail margin"
+        XCTAssertEqual(
+            BotsChrome.rosterAvatarSize, 48,
+            "roster avatars follow a messenger conversation list, not the 20pt workspace icon slot"
         )
-        XCTAssertTrue(row.contains(".frame(width: 20, height: 20)"))
+        XCTAssertGreaterThanOrEqual(
+            BotsChrome.rosterAvatarSize, 40,
+            "blobatar eyes/glance only paint at ≥40pt; a 16pt chip hides the teammate face"
+        )
+        XCTAssertTrue(
+            row.contains("size: BotsChrome.rosterAvatarSize"),
+            "the roster must paint the conversation-list avatar, not a one-off 16pt chip"
+        )
+        XCTAssertTrue(row.contains(".frame(width: BotsChrome.rosterAvatarSize, height: BotsChrome.rosterAvatarSize)"))
         XCTAssertFalse(
-            row.contains("size: 22"),
-            "a 22pt blob in a 20pt slot eats the Space.sm inset the folder icon keeps"
+            row.contains("size: 16"),
+            "a 16pt blob in a 20pt workspace slot is too small to read as a teammate"
         )
     }
 
@@ -7167,6 +7265,111 @@ final class BotsWindowTests: XCTestCase {
         vm.selectDeskThread(second.id)
         XCTAssertTrue(vm.deskMessages.contains { $0.text.contains("BRAVO") })
         XCTAssertFalse(vm.deskMessages.contains { $0.text.contains("ALPHA") })
+    }
+
+    func test_deferredSelectDeskThreadPaintsCachedConversationWithoutStoreRead() throws {
+        // WHY: messagesByBot was per-teammate, so a rail click painted empty
+        // (or the other thread) until listRecent ran after the first frame.
+        // Warm conversation cache is the dest; SQLite belongs in freshness.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .grok)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("ALPHA"))
+        let first = try XCTUnwrap(vm.selectedConversation)
+        vm.createDeskThread()
+        XCTAssertTrue(vm.send("BRAVO"))
+        let second = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertNotEqual(first.id, second.id)
+
+        vm.enableNavigationFirstFrameDeferral()
+        let restoresBefore = vm.deskMessageRestoreCountForTesting
+        let getsBefore = context.threadRepo.durableGetCountForTesting
+        vm.selectDeskThread(first.id)
+        XCTAssertEqual(vm.selectedConversation?.id, first.id)
+        XCTAssertTrue(
+            vm.deskMessages.contains { $0.text.contains("ALPHA") },
+            "first paint must already show the cached ALPHA thread"
+        )
+        XCTAssertFalse(vm.deskMessages.contains { $0.text.contains("BRAVO") })
+        XCTAssertEqual(
+            vm.deskMessageRestoreCountForTesting,
+            restoresBefore,
+            "warm thread switch must not listRecent on the click turn"
+        )
+        XCTAssertEqual(
+            context.threadRepo.durableGetCountForTesting,
+            getsBefore,
+            "warm thread switch must not get() routing on the click turn"
+        )
+
+        vm.selectDeskThread(second.id)
+        XCTAssertTrue(vm.deskMessages.contains { $0.text.contains("BRAVO") })
+        XCTAssertFalse(vm.deskMessages.contains { $0.text.contains("ALPHA") })
+        XCTAssertEqual(vm.deskMessageRestoreCountForTesting, restoresBefore)
+    }
+
+    func test_deferredOpenDeskPaintsCachedBotWithoutStoreRead() throws {
+        // WHY: roster click still prefetched listChrome and could paint the
+        // previous teammate's inspector until freshness. Warm dest must
+        // publish Piper's transcript and conversations with no store read.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .grok)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("PIPER-MSG"))
+        let piperConversation = try XCTUnwrap(vm.selectedConversation)
+        vm.openDesk(quinn)
+        XCTAssertTrue(vm.send("QUINN-MSG"))
+        let quinnConversation = try XCTUnwrap(vm.selectedConversation)
+        vm.openDesk(piper)
+
+        vm.enableNavigationFirstFrameDeferral()
+        let restoresBefore = vm.deskMessageRestoreCountForTesting
+        let chromeBefore = context.threadRepo.listChromeCallCountForTesting
+        let getsBefore = context.threadRepo.durableGetCountForTesting
+        let studioBefore = vm.studioSupportReloadCountForTesting
+
+        vm.openDesk(quinn)
+        XCTAssertEqual(vm.selectedBotID, quinn.id)
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.selectedConversation?.id, quinnConversation.id)
+        XCTAssertTrue(
+            vm.conversations.allSatisfy { $0.botID == quinn.id },
+            "first paint must not keep Piper's thread list"
+        )
+        XCTAssertTrue(
+            vm.deskMessages.contains { $0.text.contains("QUINN-MSG") },
+            "first paint must already show Quinn's cached transcript"
+        )
+        XCTAssertFalse(vm.deskMessages.contains { $0.text.contains("PIPER-MSG") })
+        XCTAssertEqual(vm.deskMessageRestoreCountForTesting, restoresBefore)
+        XCTAssertEqual(
+            context.threadRepo.listChromeCallCountForTesting,
+            chromeBefore,
+            "roster click must not prefetch rail chrome on the click turn"
+        )
+        XCTAssertEqual(
+            context.threadRepo.durableGetCountForTesting,
+            getsBefore,
+            "roster click must not get() thread routing on the click turn"
+        )
+        XCTAssertEqual(
+            vm.studioSupportReloadCountForTesting,
+            studioBefore,
+            "warm roster click must reuse the inspector snapshot"
+        )
+
+        vm.openDesk(piper)
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+        XCTAssertEqual(vm.selectedConversation?.id, piperConversation.id)
+        XCTAssertTrue(vm.deskMessages.contains { $0.text.contains("PIPER-MSG") })
+        XCTAssertFalse(vm.deskMessages.contains { $0.text.contains("QUINN-MSG") })
+        XCTAssertTrue(vm.conversations.allSatisfy { $0.botID == piper.id })
+        XCTAssertEqual(vm.deskMessageRestoreCountForTesting, restoresBefore)
+        XCTAssertEqual(context.threadRepo.listChromeCallCountForTesting, chromeBefore)
+        XCTAssertEqual(context.threadRepo.durableGetCountForTesting, getsBefore)
     }
 
     func test_deskThreadRailMountsSharedAgentChrome_becauseDestMustNotForkTheRail() throws {
@@ -14548,6 +14751,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(
             bots.contains("AgentChatTokenSaverThreadFooter"),
             "Desk must mount the shared Token Saver footer, not a lookalike capsule"
+        )
+        XCTAssertTrue(
+            bots.contains("presentation: presentation"),
+            "Desk must pass the shared on/off presentation so off-state red is not Agent-App-only"
         )
         XCTAssertTrue(bots.contains("AgentChatTokenSaverDisplayControl"))
         XCTAssertTrue(bots.contains("deskUserDisplayText"))

@@ -150,7 +150,7 @@ mkdir -p "$STAGING_APP/Contents/Library/LaunchAgents"
 cp "$BIN" "$STAGING_APP/Contents/MacOS/RemoteCode"
 cp "$SCHEDULED_TASK_AGENT" "$STAGING_APP/Contents/Resources/RemoteCodeScheduledTaskAgent"
 cp "$DISTILL_SERVICE" "$STAGING_APP/Contents/MacOS/RemoteCodeDistillService"
-# Privileged trampoline for sudo -u style agent execution. Not setuid in the
+# Privileged trampoline for shared-helper agent execution. Not setuid in the
 # bundle; install to /Library/PrivilegedHelperTools with root ownership for use.
 cp "$RUN_AS_USER_HELPER" "$STAGING_APP/Contents/MacOS/RemoteCodeRunAsUserHelper"
 cp "$MLX_METALLIB" "$STAGING_APP/Contents/MacOS/mlx.metallib"

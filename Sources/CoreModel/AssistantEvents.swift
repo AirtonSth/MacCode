@@ -225,6 +225,19 @@ public struct AssistantUserInputQuestion: Codable, Sendable, Equatable, Identifi
         self.allowsMultipleSelection = allowsMultipleSelection
     }
 
+    /// Stable per-question option rows. Duplicate labels stay unique without
+    /// using `ForEach(..., id: \.offset)` (AvdLee list-patterns).
+    public struct IdentifiedOption: Identifiable, Equatable, Sendable {
+        public let id: String
+        public let option: AssistantUserInputOption
+    }
+
+    public var identifiedOptions: [IdentifiedOption] {
+        options.enumerated().map { index, option in
+            IdentifiedOption(id: "\(id)#\(index)#\(option.label)", option: option)
+        }
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id, prompt, header, options, allowsMultipleSelection
     }
@@ -272,6 +285,18 @@ public struct AssistantUserInputRequest: Codable, Sendable, Equatable, Identifia
         self.state = state
         self.createdAtMs = createdAtMs
         self.resolvedAtMs = resolvedAtMs
+    }
+
+    /// Stable legacy option rows. Duplicate labels stay unique without `id: \.self`.
+    public struct IdentifiedOption: Identifiable, Equatable, Sendable {
+        public let id: String
+        public let option: String
+    }
+
+    public var identifiedOptions: [IdentifiedOption] {
+        options.enumerated().map { index, option in
+            IdentifiedOption(id: "\(id)#\(index)#\(option)", option: option)
+        }
     }
 
     private enum CodingKeys: String, CodingKey {

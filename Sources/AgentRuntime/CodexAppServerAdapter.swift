@@ -259,7 +259,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 : nil
             return try CodexAppServerClient(
                 binary: binary,
-                arguments: ["app-server"],
+                arguments: CodexRunner.appServerArguments(environment: request.environment),
                 cwd: request.cwd,
                 environment: request.environment,
                 runAsUser: request.runAsUser,

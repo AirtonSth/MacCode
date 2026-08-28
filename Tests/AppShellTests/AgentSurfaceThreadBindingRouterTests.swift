@@ -1553,6 +1553,158 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             "a deferred Pet route must not tell mirrors the thread was read before canonical acknowledgement")
     }
 
+    func test_openAgentThread_railResident_usesWorkspaceProbeInsteadOfFullGet() throws {
+        // WHY: Pet / Active Threads / notification clicks used to compile two
+        // full MainActor gets (open + select) just to read workspace_id.
+        let dir = NSTemporaryDirectory() + "RC2Bind-OpenProbe-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let controller = MainWindowController(context: ctx, router: router)
+        router.windowController = controller
+        defer { controller.window.orderOut(nil) }
+
+        let workspace = try router.createWorkspace(name: "PROBE", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        let previous = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "previous",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let target = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "target",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let existing = try router.createSurface(
+            workspace: workspace.id,
+            type: .agentApp,
+            paneID: nil,
+            title: "Agent App"
+        )
+        let surface = try XCTUnwrap(SurfaceRegistry.shared.surface(existing.id) as? AgentAppSurface)
+        surface.viewModel.selectThread(previous.id)
+        XCTAssertTrue(surface.viewModel.threads.contains(where: { $0.id == target.id }))
+
+        let getsBefore = ctx.threadRepo.durableGetCountForTesting
+        let probesBefore = ctx.threadRepo.workspaceIdProbeCountForTesting
+        let routed = try router.openAgentThread(thread: target.id, markRead: false)
+        let getsDelta = ctx.threadRepo.durableGetCountForTesting - getsBefore
+        let probesDelta = ctx.threadRepo.workspaceIdProbeCountForTesting - probesBefore
+
+        XCTAssertEqual(routed.id, existing.id)
+        XCTAssertEqual(surface.viewModel.selectedThreadId, target.id)
+        XCTAssertGreaterThanOrEqual(
+            probesDelta,
+            2,
+            "open + selectAgentThread must probe workspace_id; got \(probesDelta)"
+        )
+        // Transcript hydrate / rail refresh may still `get` after the destination
+        // is published. The router hops themselves must not: they only need
+        // workspace membership (see workspaceId(of:) in open/selectAgentThread).
+        _ = getsDelta
+        let routerSource = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/AppShell/AppCommandRouter.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(routerSource.contains("ctx.threadRepo.workspaceId(of: threadID)"))
+        XCTAssertTrue(routerSource.contains("ctx.threadRepo.workspaceId(of: thread)"))
+        let openRange = try XCTUnwrap(routerSource.range(of: "public func openAgentThread(thread threadID: AgentThreadID"))
+        let openTail = routerSource[openRange.lowerBound...]
+        let openBody = String(openTail.prefix(2200))
+        XCTAssertFalse(
+            openBody.contains("threadRepo.get(id: threadID)"),
+            "openAgentThread must not compile a full get to learn workspace_id"
+        )
+    }
+
+    func test_openAgentThread_missingThread_throwsWorkspaceNotFound() throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-OpenMissingThread-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let controller = MainWindowController(context: ctx, router: router)
+        router.windowController = controller
+        defer { controller.window.orderOut(nil) }
+        _ = try router.createWorkspace(name: "MISSING-THREAD", cwd: NSTemporaryDirectory())
+
+        let getsBefore = ctx.threadRepo.durableGetCountForTesting
+        XCTAssertThrowsError(try router.openAgentThread(thread: AgentThreadID(), markRead: false)) { error in
+            XCTAssertEqual(error as? LayoutError, .workspaceNotFound)
+        }
+        XCTAssertEqual(
+            ctx.threadRepo.durableGetCountForTesting,
+            getsBefore,
+            "a missing thread must fail on the workspace_id probe, not a full get"
+        )
+    }
+
+    func test_workspaceIdProbe_fasterThanDurableGet() throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-ProbeBench-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "BENCH", cwd: NSTemporaryDirectory())
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "bench",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let warmup = 3
+        let samples = 5
+        let iterations = 200
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        func timeMs(_ body: () throws -> Void) rethrows -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            try body()
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0
+        }
+        for _ in 0..<warmup {
+            _ = try ctx.threadRepo.workspaceId(of: thread.id)
+            _ = try ctx.threadRepo.get(id: thread.id)
+        }
+        var probeSamples: [Double] = []
+        var getSamples: [Double] = []
+        probeSamples.reserveCapacity(samples)
+        getSamples.reserveCapacity(samples)
+        for _ in 0..<samples {
+            probeSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = try ctx.threadRepo.workspaceId(of: thread.id)
+                }
+            })
+            getSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = try ctx.threadRepo.get(id: thread.id)
+                }
+            })
+        }
+        let probeMed = median(probeSamples)
+        let getMed = median(getSamples)
+        let improvement = (getMed - probeMed) / getMed * 100.0
+        NSLog(
+            "[perf-proof] open-thread workspace_probe_ms=%@ durable_get_ms=%@ improvement_pct=%.2f probe=%@ get=%@",
+            String(probeMed), String(getMed), improvement,
+            String(describing: probeSamples), String(describing: getSamples)
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5.0,
+            "workspace_id probe must beat durable get by ≥5% (got \(improvement)%; probe=\(probeMed)ms get=\(getMed)ms)"
+        )
+    }
+
     func test_openAgentThread_createsAgentSurface_andMarksReadOnlyAfterBinding() throws {
         let dir = NSTemporaryDirectory() + "RC2Bind-OpenCreate-" + UUID().uuidString
         let (ctx, router) = try makeRouter(dir)

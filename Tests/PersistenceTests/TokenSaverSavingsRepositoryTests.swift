@@ -215,10 +215,10 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
                        "Week/report-window savings must include both calendar-day buckets")
     }
 
-    /// WHY: day-card amort used permanent thread totals, so one long thread's
-    /// lifetime 8M × 50 turns painted Today ~400M and Week ~999M. Inputs must
-    /// only sum savings delivered inside the requested window.
-    func test_threadCacheAmortizationInputs_areDayScopedNotPermanent() throws {
+    /// WHY: the day/week card is eligible only when a thread delivered savings
+    /// inside the window, but its amortization input must remain the permanent
+    /// thread total so the card and completed-thread footer use the same stack.
+    func test_threadCacheAmortizationInputs_usePermanentTotalForActiveThread() throws {
         let db = try makeDB()
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
@@ -232,7 +232,7 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
             year: 2026, month: 8, day: 4, hour: 12
         ).date)
         let thread = "THREAD-AMORT-1"
-        // Lifetime pile-up on the same thread (must NOT enter today's amort base).
+        // Lifetime pile-up remains part of the permanent amortization base.
         _ = try repo.record(
             provider: "codex", mode: "x", inputTokens: 8_000_000, outputTokens: 0,
             attributability: "prompt_bound", delivered: true, threadID: thread, at: yesterday
@@ -254,9 +254,9 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
         XCTAssertEqual(inputs.count, 1)
         let row = try XCTUnwrap(inputs.first)
         XCTAssertEqual(row.threadID, thread)
-        XCTAssertEqual(row.savedTokens, 150_000,
-                       "must sum only today's delivered savings, not permanent 8.15M")
-        XCTAssertEqual(row.runs, 2, "run count is today's compress events only")
+        XCTAssertEqual(row.savedTokens, 8_150_000,
+                       "an active thread uses its permanent delivered total")
+        XCTAssertEqual(row.runs, 3, "an active thread uses its permanent delivered run count")
         XCTAssertEqual(row.provider, "codex")
     }
 
@@ -578,13 +578,70 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
         )
 
         XCTAssertEqual(try repo.savedTokens(forThreadID: threadA), 1_350)
+        XCTAssertEqual(try repo.deliveredTotal(forThreadID: threadA).runs, 2,
+                       "permanent runs count delivered rows so the footer can amortize extra turns")
+        XCTAssertEqual(try repo.deliveredTotal(forThreadID: threadA).savedTokens, 1_350)
         XCTAssertEqual(try repo.savedTokens(forThreadID: threadB), 180)
+        XCTAssertEqual(try repo.deliveredTotal(forThreadID: threadB).runs, 1)
         XCTAssertEqual(try repo.savedTokens(forThreadID: ""), 0)
         XCTAssertEqual(try repo.savedTokens(forThreadID: "missing"), 0)
+        XCTAssertEqual(try repo.deliveredTotal(forThreadID: "missing").runs, 0)
 
         // Prune deletes old event rows but must keep the permanent thread total.
         try repo.prune(now: now)
         XCTAssertEqual(try repo.savedTokens(forThreadID: threadA), 1_350,
                        "thread total must survive event prune")
+        XCTAssertEqual(try repo.deliveredTotal(forThreadID: threadA).runs, 2,
+                       "permanent runs must survive event prune")
+    }
+
+    func test_deliveredRecordWithoutThreadId_amortizesInUnscopedBucket() throws {
+        // WHY: PATH wraps that arrived without a thread id used to count in
+        // Today measured pipes but never entered thread_totals, so Estimated
+        // save dropped their cache amort and no footer claimed them.
+        let db = try makeDB()
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let repo = TokenSaverSavingsRepository(db: db, retentionDays: 14, calendar: calendar)
+        let thread = "33333333-3333-3333-3333-333333333333"
+        let now = try XCTUnwrap(DateComponents(
+            calendar: calendar, timeZone: calendar.timeZone,
+            year: 2026, month: 8, day: 5, hour: 12
+        ).date)
+
+        XCTAssertEqual(try repo.record(
+            provider: "codex", mode: "command-output", inputTokens: 1_000,
+            outputTokens: 250, savedTokens: 750, delivered: true,
+            threadID: "", idempotencyKey: "unattributed-today", at: now
+        ), 750)
+        XCTAssertEqual(try repo.record(
+            provider: "codex", mode: "command-output", inputTokens: 800,
+            outputTokens: 200, savedTokens: 600, delivered: true,
+            threadID: thread, idempotencyKey: "attributed-footer", at: now
+        ), 600)
+
+        XCTAssertEqual(try repo.summary().totalSavedTokens, 1_350)
+        XCTAssertEqual(try repo.savedTokens(forThreadID: thread), 600,
+                       "a real thread footer still does not steal unscoped wraps")
+        XCTAssertEqual(try repo.savedTokens(forThreadID: ""), 0)
+        XCTAssertEqual(
+            try repo.savedTokens(forThreadID: TokenSaverSavingsRepository.unscopedThreadID),
+            750
+        )
+        XCTAssertEqual(
+            try repo.deliveredTotal(forThreadID: TokenSaverSavingsRepository.unscopedThreadID).runs,
+            1
+        )
+        let dayStart = Int64(calendar.startOfDay(for: now).timeIntervalSince1970 * 1000)
+        let inputs = try repo.threadCacheAmortizationInputs(
+            dayStartMs: dayStart,
+            dayEndMsExclusive: dayStart + 86_400_000
+        )
+        XCTAssertTrue(
+            inputs.contains(where: {
+                $0.threadID == TokenSaverSavingsRepository.unscopedThreadID && $0.savedTokens == 750
+            }),
+            "Today amort must include unscoped wrap savings"
+        )
     }
 }

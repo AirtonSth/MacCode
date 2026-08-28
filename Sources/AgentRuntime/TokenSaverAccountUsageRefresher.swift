@@ -695,6 +695,9 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
 
     private let timeoutSeconds: TimeInterval
     private let jsonAPIFetcher: (@Sendable (URL, [String: String]) async -> [String: Any]?)?
+    private let refreshGate = NSLock()
+    private var inFlightRefresh: Task<[AssistantAccountUsage], Never>?
+    private var refreshGeneration: UInt64 = 0
 
     public init(
         timeoutSeconds: TimeInterval = 18.0,
@@ -718,6 +721,31 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     }
 
     public func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
+        let task: Task<[AssistantAccountUsage], Never>
+        let generation: UInt64
+        refreshGate.lock()
+        if let inFlightRefresh {
+            task = inFlightRefresh
+            refreshGate.unlock()
+            return await task.value
+        }
+        generation = refreshGeneration &+ 1
+        refreshGeneration = generation
+        task = Task { await self.performRefreshAccountUsage(request) }
+        inFlightRefresh = task
+        refreshGate.unlock()
+        let usages = await task.value
+        refreshGate.lock()
+        if refreshGeneration == generation {
+            inFlightRefresh = nil
+        }
+        refreshGate.unlock()
+        return usages
+    }
+
+    private func performRefreshAccountUsage(
+        _ request: TokenSaverAccountUsageRefreshRequest
+    ) async -> [AssistantAccountUsage] {
         async let codex = withProviderTimeout { await self.fetchCodexUsage(request) }
         async let claude = withProviderTimeout { await self.fetchClaudeUsage(request) }
         if request.includeGrok {
@@ -1043,9 +1071,9 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     }
 
     private func terminatePTYChild(_ pid: Int32) {
-        // Always terminate with a final waitpid so the child cannot remain <defunct>
-        // (plan-final W1: 0.4s WNOHANG-only window left permanent zombies).
-        _ = OwnedChildReaper.terminateAndReap(pid: pid)
+        // Bounded wait only. A stuck `/usage` child must not pin overlapping
+        // refreshes on blocking waitpid (freeze-class sample: two wait4).
+        _ = OwnedChildReaper.terminateAndReap(pid: pid, waitForZombie: false)
     }
 
     private func terminateScriptProcess(_ proc: Process) {

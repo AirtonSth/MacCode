@@ -219,6 +219,39 @@ final class TokenSaverT003ProgramTests: XCTestCase {
         )).allowed, "the new object must fit above the post-write disk floor")
     }
 
+    /// WHY: `max(5 GiB, 10% of volume)` on a ~4 TB disk required ~372 GiB free and
+    /// discarded every lossy Distill handle while ~14 GiB remained. Admission
+    /// uses the same fixed 5 GiB floor as the recovery store.
+    func test_admissionPolicy_diskFloorIsFixedFiveGiBNotPercentOfVolume() {
+        let fourTiB: Int64 = 4 * 1_024 * 1_024 * 1_024 * 1_024
+        let fourteenGiB: Int64 = 14 * 1_024 * 1_024 * 1_024
+        let largeVolume = TokenSaverAdmissionSnapshot(
+            objectBytes: 1,
+            threadBytes: 1,
+            projectBytes: 1,
+            globalBytes: 1,
+            freeDiskBytes: fourteenGiB,
+            totalDiskBytes: fourTiB
+        )
+        XCTAssertTrue(
+            TokenSaverAdmissionPolicy.evaluate(largeVolume).allowed,
+            "14 GiB free on a 4 TiB disk must admit; a 10%-of-volume floor would deny"
+        )
+        XCTAssertEqual(TokenSaverAdmissionPolicy.evaluate(largeVolume).reason, "admitted")
+
+        let belowFixedFloor = TokenSaverAdmissionSnapshot(
+            objectBytes: 1,
+            threadBytes: 1,
+            projectBytes: 1,
+            globalBytes: 1,
+            freeDiskBytes: TokenSaverAdmissionPolicy.minimumFreeDiskBytes - 1,
+            totalDiskBytes: fourTiB
+        )
+        let denied = TokenSaverAdmissionPolicy.evaluate(belowFixedFloor)
+        XCTAssertFalse(denied.allowed)
+        XCTAssertEqual(denied.reason, "free_disk_floor")
+    }
+
     func test_safetyABI_isVersionedMinimalAndRouteEquivalent() {
         let block = TokenSaverSafetyABI.block
         XCTAssertTrue(block.contains("TOKEN_SAVER_SAFETY_ABI_V1"))

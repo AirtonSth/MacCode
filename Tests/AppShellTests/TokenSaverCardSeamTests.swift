@@ -769,6 +769,70 @@ final class TokenSaverCardSeamTests: XCTestCase {
         )
     }
 
+    func test_estimatedSavePath_neverCapsAmortAgainstDayMeasured() throws {
+        // WHY: todayMeasured × 200 painted Estimated save 2.6M instead of the
+        // permanent thread stack. Estimated save must never be capped down.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let appContext = try String(
+            contentsOf: root.appendingPathComponent("Sources/AppShell/AppContext.swift"),
+            encoding: .utf8
+        )
+        let sidebar = try String(
+            contentsOf: root.appendingPathComponent("Sources/AppShell/SidebarView.swift"),
+            encoding: .utf8
+        )
+        let agents = try String(
+            contentsOf: root.appendingPathComponent("Agents.md"),
+            encoding: .utf8
+        )
+        XCTAssertFalse(
+            appContext.contains("windowMeasuredTokens:"),
+            "daily economy must not cap thread amort against day-measured pipes"
+        )
+        XCTAssertFalse(
+            sidebar.contains("cacheAmortizationMaxMultipleOfMeasured"),
+            "sidebar provider amort must not scale down to a measured multiple"
+        )
+        XCTAssertTrue(
+            agents.contains("Estimated save must never go down"),
+            "Agents.md must keep the one-way Estimated save ratchet"
+        )
+        XCTAssertTrue(
+            agents.contains("Token Saver counting algorithm"),
+            "Agents.md must document the counting algorithm so later agents cannot shrink it"
+        )
+        XCTAssertTrue(
+            agents.contains("permanentSaved × max(0, runs − 1)")
+                || agents.contains("permanentSaved × max(0, runs - 1)"),
+            "Agents.md must document uncapped extra-turn amort"
+        )
+        XCTAssertTrue(
+            agents.contains("Token Saver display"),
+            "Agents.md must document footer / Today / Week display"
+        )
+        XCTAssertTrue(
+            agents.contains("min(runs − 1, 50)") || agents.contains("min(runs - 1, 50)"),
+            "Agents.md must forbid the 50 extra-turn cap"
+        )
+        let estimator = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/AgentRuntime/TokenSaverBareUserEstimator.swift"
+            ),
+            encoding: .utf8
+        )
+        XCTAssertFalse(
+            estimator.contains("min(max(0, turnCount - 1), cacheAmortizationMaxExtraTurns)"),
+            "cache amort must not cap extra turns at 50"
+        )
+        XCTAssertFalse(
+            estimator.contains("applyAttributedCaps("),
+            "dialect/graphify must not be scaled down by attributed caps"
+        )
+    }
+
     func test_sinceInstallLine_usesAttributedOnly() {
         let line = SidebarRootView.tokenSaverSinceInstallLine(
             attributedSavedTokens: 96_041_366,

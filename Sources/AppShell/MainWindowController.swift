@@ -327,6 +327,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     private var botsViewModel: BotsViewModel?
     private var botsHostingView: NSView?
     private var currentShellHostingView: NSView?
+    /// Test seam: Workspaces <-> Bots must reattach this instance, not remount.
+    var botsHostingViewForTesting: NSView? { botsHostingView }
     private var destinationPersistenceTask: Task<Void, Never>?
     private var workspaceRebuildTask: Task<Void, Never>?
     private var workspaceRebuildGeneration: UInt64 = 0
@@ -1174,8 +1176,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         sidebar.setScheduledTasksSelected(true)
         sidebar.setActiveThreadsSelected(false)
         sidebar.setBotsSelected(false)
-        activeThreadsHostingView = nil
-        botsHostingView = nil
         persistBotsShellDestination()
         installScheduledTasksContent()
         updateCollapsedWorkspaceHeader()
@@ -1192,8 +1192,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         sidebar.setActiveThreadsSelected(true)
         sidebar.setScheduledTasksSelected(false)
         sidebar.setBotsSelected(false)
-        scheduledTasksHostingView = nil
-        botsHostingView = nil
         persistBotsShellDestination()
         installActiveThreadsContent()
         updateCollapsedWorkspaceHeader()
@@ -1207,8 +1205,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         sidebar.setBotsSelected(true)
         sidebar.setScheduledTasksSelected(false)
         sidebar.setActiveThreadsSelected(false)
-        scheduledTasksHostingView = nil
-        activeThreadsHostingView = nil
         persistBotsShellDestination()
         installBotsContent()
         updateCollapsedWorkspaceHeader()
@@ -1222,11 +1218,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         sidebar.setScheduledTasksSelected(false)
         sidebar.setActiveThreadsSelected(false)
         sidebar.setBotsSelected(false)
-        scheduledTasksHostingView = nil
-        activeThreadsHostingView = nil
         persistBotsShellDestination()
         currentShellHostingView?.removeFromSuperview()
-        botsHostingView = nil
         currentShellHostingView = nil
         let selectedWorkspaceID = context?.state.window.selectedWorkspaceID
         let cachedWorkspaceIsCurrent = cachedWorkspaceID == selectedWorkspaceID
@@ -1247,8 +1240,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
             pin(empty, to: workspaceContent)
             return
         }
-        let previous = currentShellHostingView
-        prepareShellMount(previous)
         let vm = scheduledTasksViewModel ?? ScheduledTasksViewModel(
             context: context,
             router: router,
@@ -1256,16 +1247,17 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         )
         scheduledTasksViewModel = vm
         vm.scheduleFreshnessPass()
+        if let existing = scheduledTasksHostingView {
+            attachShellHost(existing)
+            return
+        }
         let host = NSHostingView(rootView: ScheduledTasksRootView(vm: vm))
         host.translatesAutoresizingMaskIntoConstraints = false
         host.wantsLayer = true
         host.layer?.backgroundColor = DS.NS.bg.cgColor
         RemoteCodeAppearance.apply(to: host)
-        workspaceContent.addSubview(host)
-        pin(host, to: workspaceContent)
         scheduledTasksHostingView = host
-        currentShellHostingView = host
-        removePreviousShellHostAfterFirstFrame(previous)
+        attachShellHost(host)
     }
 
     private func installActiveThreadsContent() {
@@ -1275,8 +1267,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
             pin(empty, to: workspaceContent)
             return
         }
-        let previous = currentShellHostingView
-        prepareShellMount(previous)
         let vm = activeThreadsViewModel ?? ActiveThreadsViewModel(
             context: context,
             router: router,
@@ -1284,16 +1274,17 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         )
         activeThreadsViewModel = vm
         vm.scheduleFreshnessPass()
+        if let existing = activeThreadsHostingView {
+            attachShellHost(existing)
+            return
+        }
         let host = NSHostingView(rootView: ActiveThreadsRootView(vm: vm))
         host.translatesAutoresizingMaskIntoConstraints = false
         host.wantsLayer = true
         host.layer?.backgroundColor = DS.NS.bg.cgColor
         RemoteCodeAppearance.apply(to: host)
-        workspaceContent.addSubview(host)
-        pin(host, to: workspaceContent)
         activeThreadsHostingView = host
-        currentShellHostingView = host
-        removePreviousShellHostAfterFirstFrame(previous)
+        attachShellHost(host)
     }
 
     private func installBotsContent() {
@@ -1303,8 +1294,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
             pin(empty, to: workspaceContent)
             return
         }
-        let previous = currentShellHostingView
-        prepareShellMount(previous)
         let vm = sidebar.botsViewModel
         botsViewModel = vm
         vm.enableNavigationFirstFrameDeferral()
@@ -1313,13 +1302,35 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         }
         // Keep Desk / Studio / Attention. openFleet() here kicked users
         // home every time they left Bots and came back.
-        let host: NSView
-        host = makeBotsShellHost(vm: vm)
-        workspaceContent.addSubview(host)
-        pin(host, to: workspaceContent)
+        if let existing = botsHostingView {
+            attachShellHost(existing)
+            vm.scheduleFreshnessPass()
+            return
+        }
+        let host = makeBotsShellHost(vm: vm)
         botsHostingView = host
+        attachShellHost(host)
+    }
+
+    /// Reattach a retained shell host. Leaving Workspaces/Bots only
+    /// removeFromSuperviews; rebuilding workspace must not see these views
+    /// as children, or it would wipe the kept instance.
+    private func attachShellHost(_ host: NSView) {
+        let previous = currentShellHostingView
+        if previous !== host {
+            prepareShellMount(previous)
+        } else {
+            cachedWorkspaceContentViews.forEach { $0.isHidden = true }
+        }
+        if host.superview !== workspaceContent {
+            workspaceContent.addSubview(host)
+            pin(host, to: workspaceContent)
+        }
+        host.isHidden = false
         currentShellHostingView = host
-        removePreviousShellHostAfterFirstFrame(previous)
+        if previous !== host {
+            removePreviousShellHostAfterFirstFrame(previous)
+        }
     }
 
     private func makeBotsShellHost(vm: BotsViewModel) -> NSView {

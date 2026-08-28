@@ -1,6 +1,16 @@
 import Foundation
+import Combine
 import CoreModel
 import Surfaces
+
+/// Keeps both live composer fields off the Desk view model that owns transcript
+/// and replay state. Cursor movement is part of typing and must not republish
+/// the enclosing Desk body either.
+@MainActor
+public final class BotsComposerState: ObservableObject {
+    @Published public var text = ""
+    @Published public var cursorOffset: Int? = nil
+}
 
 /// Maps a linked Agent run onto Bot Desk / Attention so a teammate turn
 /// does not stay stuck on "Working…".

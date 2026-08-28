@@ -453,15 +453,42 @@ private final class TerminalHistoryReadOperation: @unchecked Sendable {
     }
 }
 
+/// Caps concurrent SQLite history writes per surface. The freeze-class disk
+/// diag was unbounded `flushReadyPending` WAL frames (8.6 GB dirty).
+enum TerminalHistoryFlushBackpressure: Sendable {
+    static let maxInFlightSQLiteWrites = 1
+
+    static func shouldEnqueueWrite(inFlightCount: Int) -> Bool {
+        inFlightCount < maxInFlightSQLiteWrites
+    }
+}
+
 private final class TerminalHistoryQueueState: @unchecked Sendable {
     private let condition = NSCondition()
     private var failureGeneration: UInt64 = 0
+    private var inFlightFlushCount = 0
     private var durablePartial = false
     private var retentionMaintenanceScheduled = false
     private var globalRetentionMaintenanceScheduled = false
     private var retentionCheckRequired = false
     private var retryDeadline = Date.distantFuture
     private var retriesCancelled = false
+
+    func beginFlushIfPermitted() -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        guard TerminalHistoryFlushBackpressure.shouldEnqueueWrite(
+            inFlightCount: inFlightFlushCount
+        ) else { return false }
+        inFlightFlushCount += 1
+        return true
+    }
+
+    func endFlush() {
+        condition.lock()
+        inFlightFlushCount = max(0, inFlightFlushCount - 1)
+        condition.unlock()
+    }
 
     func recordFailure() {
         condition.lock()
@@ -779,6 +806,10 @@ final class TerminalHistoryCoordinator {
     /// nor make progress.
     private var preflightData = Data()
     private var pendingData = Data()
+    /// Bytes that arrived while `pendingData` was already a full 64 KiB chunk
+    /// and a persist was in-flight. Without this, `ingestReadyData` trapped on
+    /// `available > 0` and a PTY burst >128 KiB crashed the coordinator.
+    private var deferredReadyData = Data()
     private var backlogOverflowed = false
     private var flushScheduled = false
     private var bytesSinceRetentionCheck: Int
@@ -827,6 +858,8 @@ final class TerminalHistoryCoordinator {
 
     var preparationStateForTesting: PreparationState { preparationState }
     var preflightBytesForTesting: Int { preflightData.count }
+    var deferredReadyBytesForTesting: Int { deferredReadyData.count }
+    var pendingReadyBytesForTesting: Int { pendingData.count }
     var activeReadWorkerCountForTesting: Int { activeReadOperation == nil ? 0 : 1 }
     var deferredBarrierCountForTesting: Int { deferredBarrier == nil ? 0 : 1 }
     var liveClearInFlightForTesting: Bool { liveClearInFlight }
@@ -1292,6 +1325,13 @@ final class TerminalHistoryCoordinator {
                 droppedTotal += drop
                 continue
             }
+            if !deferredReadyData.isEmpty {
+                let drop = min(deferredReadyData.count, outstandingBytes - target)
+                deferredReadyData.removeFirst(drop)
+                outstandingBytes = max(0, outstandingBytes - drop)
+                droppedTotal += drop
+                continue
+            }
             if !liveClearBuffer.isEmpty {
                 let drop = min(liveClearBuffer.count, outstandingBytes - target)
                 liveClearBuffer.removeFirst(drop)
@@ -1304,13 +1344,37 @@ final class TerminalHistoryCoordinator {
         return droppedTotal
     }
 
+    private func drainDeferredReadyData() {
+        if !deferredReadyData.isEmpty {
+            let extra = deferredReadyData
+            deferredReadyData = Data()
+            ingestReadyData(extra)
+        }
+        flushReadyPending()
+    }
+
     private func ingestReadyData(_ data: Data) {
-        var offset = data.startIndex
-        while offset < data.endIndex {
-            let available = Self.maxChunkBytes - pendingData.count
-            precondition(available > 0, "ready history accumulator must make progress")
-            let end = min(data.endIndex, offset + available)
-            pendingData.append(data[offset..<end])
+        var remaining = Data()
+        remaining.reserveCapacity(deferredReadyData.count + data.count)
+        if !deferredReadyData.isEmpty {
+            remaining.append(deferredReadyData)
+            deferredReadyData.removeAll(keepingCapacity: true)
+        }
+        remaining.append(data)
+        var offset = remaining.startIndex
+        while offset < remaining.endIndex {
+            var available = Self.maxChunkBytes - pendingData.count
+            if available <= 0 {
+                flushReadyPending()
+                available = Self.maxChunkBytes - pendingData.count
+                guard available > 0 else {
+                    deferredReadyData = remaining.subdata(in: offset..<remaining.endIndex)
+                    return
+                }
+            }
+            let end = remaining.index(offset, offsetBy: available, limitedBy: remaining.endIndex)
+                ?? remaining.endIndex
+            pendingData.append(remaining[offset..<end])
             offset = end
             if pendingData.count == Self.maxChunkBytes {
                 flushReadyPending()
@@ -1442,6 +1506,7 @@ final class TerminalHistoryCoordinator {
               let chunkIndex = nextChunkIndex,
               let writerGeneration,
               !pendingData.isEmpty else { return }
+        guard queueState.beginFlushIfPermitted() else { return }
 
         let data = pendingData
         pendingData = Data()
@@ -1463,6 +1528,12 @@ final class TerminalHistoryCoordinator {
         let beforePersistForTesting = beforePersistForTesting
 
         queue.async { [weak self] in
+            defer {
+                queueState.endFlush()
+                DispatchQueue.main.async { [weak self] in
+                    self?.drainDeferredReadyData()
+                }
+            }
             let reportFailure: @Sendable (Error) -> Void = { [weak self] error in
                 queueState.recordFailure()
                 let staleWriter = error as? TerminalHistoryRepositoryError
@@ -1690,6 +1761,7 @@ final class TerminalHistoryCoordinator {
                 // cleanup barriers resolve even while later queue jobs drain.
                 outstandingBytes = 0
                 pendingData = Data()
+                deferredReadyData = Data()
                 preflightData = Data()
                 backlogOverflowed = false
             } else {
@@ -2331,9 +2403,10 @@ final class TerminalHistoryCoordinator {
             liveClearBuffer = Data()
         }
         flushScheduled = false
-        let discardedBytes = pendingData.count + preflightData.count
+        let discardedBytes = pendingData.count + deferredReadyData.count + preflightData.count
         outstandingBytes = max(0, outstandingBytes - discardedBytes)
         pendingData = Data()
+        deferredReadyData = Data()
         preflightData = Data()
         let surfaceID = surfaceID
         let beforeLiveClearForTesting = beforeLiveClearForTesting
@@ -2517,6 +2590,7 @@ final class TerminalHistoryCoordinator {
         flushScheduled = false
         outstandingBytes = 0
         pendingData = Data()
+        deferredReadyData = Data()
         preflightData = Data()
         liveClearBuffer = Data()
         liveClearOverflowed = false

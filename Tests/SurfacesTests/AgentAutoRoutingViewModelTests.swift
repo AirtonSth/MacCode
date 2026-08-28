@@ -110,7 +110,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         )
     }
 
-    func testSubagentRefreshDemotesDeadExternalReceiptFromActive() throws {
+    func testSubagentRefreshDemotesDeadExternalReceiptFromActive() async throws {
         // WHY: the Agent App refresh is the user-visible boundary. It must use
         // the runtime's lease/PID reconciliation rather than project a stale
         // accepted receipt as an indefinitely active subagent.
@@ -186,13 +186,14 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         )
 
         vm.refreshSubagentActivity()
+        await vm.awaitSubagentActivityRefreshForTesting()
 
         XCTAssertEqual(vm.subagentActivity.activeCount, 0)
         XCTAssertEqual(vm.subagentActivity.unknownCount, 1)
         XCTAssertEqual(try repository.receipt(runId: runID)?.lifecycleStatus, .unknown)
     }
 
-    func testSubagentActivityIsScopedToSelectedThreadOnly() throws {
+    func testSubagentActivityIsScopedToSelectedThreadOnly() async throws {
         // WHY: the chrome badge was aggregating every workspace thread's done
         // workers onto empty/new threads. Subagents must be per-thread UI.
         let root = NSTemporaryDirectory() + "rc-subagent-thread-scope-" + UUID().uuidString
@@ -260,6 +261,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         try runtime.finalizeReceipt(runId: childRunID, status: .completed)
 
         vm.refreshSubagentActivity()
+        await vm.awaitSubagentActivityRefreshForTesting()
         XCTAssertEqual(vm.subagentActivity.doneCount, 1,
                        "selected busy thread must show its own finalized subagent")
         XCTAssertEqual(vm.subagentActivity.done.first?.nodeId, "busy-worker")
@@ -274,6 +276,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         )
 
         vm.selectThread(busyThreadID)
+        await vm.awaitSubagentActivityRefreshForTesting()
         XCTAssertEqual(vm.subagentActivity.doneCount, 1,
                        "returning to the busy thread must restore its own subagents only")
         XCTAssertEqual(vm.subagentActivity.done.first?.threadId, busyThreadID)
@@ -300,6 +303,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         try runtime.finalizeReceipt(runId: nestedRunID, status: .completed)
 
         vm.selectThread(busyThreadID)
+        await vm.awaitSubagentActivityRefreshForTesting()
         XCTAssertEqual(
             Set(vm.subagentActivity.done.map(\.nodeId)),
             Set(["busy-worker", "middleware-child"]),
@@ -312,7 +316,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         )
     }
 
-    func testSubagentRefreshClearsAfterDeletedSelectionRecovery() throws {
+    func testSubagentRefreshClearsAfterDeletedSelectionRecovery() async throws {
         // WHY: reloadThreads used to refresh before nil-ing a deleted selection,
         // leaving the badge stuck on the dead thread until the 2s poll.
         let root = NSTemporaryDirectory() + "rc-subagent-deleted-sel-" + UUID().uuidString
@@ -379,6 +383,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         )
         try runtime.finalizeReceipt(runId: childRunID, status: .completed)
         vm.refreshSubagentActivity()
+        await vm.awaitSubagentActivityRefreshForTesting()
         XCTAssertEqual(vm.subagentActivity.doneCount, 1)
 
         try threads.delete(ids: [threadID])
@@ -457,6 +462,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         )
         try runtime.finalizeReceipt(runId: childRunID, status: .completed)
         vm.refreshSubagentActivity()
+        await vm.awaitSubagentActivityRefreshForTesting()
         XCTAssertEqual(vm.subagentActivity.doneCount, 1)
 
         let clock = OneShotBlockingClock()
@@ -513,6 +519,31 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         XCTAssertEqual(thread.provider, .claude)
         XCTAssertEqual(thread.model, "claude-live")
         XCTAssertEqual(thread.reasoningEffort, .max)
+    }
+
+    func test_selectThread_disableAuto_updatesRailForCacheFirstReselect() throws {
+        // WHY: selectThread now reads the rail instead of SQLite. Disabling Auto
+        // used to restore Manual on the VM but leave Auto on the rail row, so a
+        // cache-first reselect would put Auto back.
+        let (vm, _, root) = try fixture()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        vm.createThread(title: "rail-routing")
+        XCTAssertTrue(vm.setAutoModelRoutingEnabled(true))
+        XCTAssertTrue(vm.setAutoModelRoutingEnabled(false))
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        let railRow = try XCTUnwrap(vm.threads.first(where: { $0.id == tid }))
+        XCTAssertEqual(
+            railRow.effectiveRoutingConfiguration.mode,
+            .manual,
+            "disabling Auto must update the painted rail row, not only durable storage"
+        )
+        vm.selectThread(tid)
+        XCTAssertTrue(
+            vm.lastThreadSelectionUsedRailForTesting,
+            "reselect after a routing change must stay on the rail cache"
+        )
+        XCTAssertEqual(vm.routingMode, .manual,
+                       "cache-first reselect must keep the Manual routing just saved")
     }
 
     func testAutoManualTransitionPersistsAndRestoresFastManualSelection() throws {

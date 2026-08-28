@@ -347,6 +347,15 @@ public enum AgentHostEnvironmentMerge {
             || key.hasPrefix("RC_DISTILL_")
             // Claude PostToolUse sidecar path is host-owned Token Saver state (not a secret).
             || key == "REMOTE_CODE_DISTILL_STATE_PATH"
+            // Managed Bot and Agent App MCPs receive these exact host-authoritative
+            // identity, run, socket, and capability values for the active request.
+            || key == BotSelfConfigCatalog.callerEnvironmentKey
+            || key == "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"
+            || key == BotPeerDelegation.threadEnvironmentKey
+            || key == BotPeerDelegation.runEnvironmentKey
+            || key == BotPeerDelegation.socketEnvironmentKey
+            || key == BotPeerDelegation.capabilityEnvironmentKey
+            || key == BotPeerDelegation.turnContextEnvironmentKey
     }
 }
 
@@ -623,7 +632,14 @@ public enum TokenSaverExecutionReceiptSeam {
         if receipt.capabilities.recoveryScope == true {
             env["RC_TOKEN_SAVER_WORKSPACE_ID"] = receipt.workspaceId
             env["RC_TOKEN_SAVER_PROJECT_ID"] = receipt.projectId
-            env["RC_TOKEN_SAVER_THREAD_ID"] = receipt.threadId
+        }
+        // Per-thread Token Saver chip reads `token_saver_thread_totals`. That
+        // accumulator only moves when delivered rows carry a thread id, which
+        // PATH wrappers/hooks take from this env var. Recovery scope needs a
+        // workspace; savings attribution does not.
+        let threadId = receipt.threadId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !threadId.isEmpty {
+            env["RC_TOKEN_SAVER_THREAD_ID"] = threadId
         }
         if let rootRunId = receipt.rootRunId {
             env["RC_TOKEN_SAVER_ROOT_RUN_ID"] = rootRunId
@@ -1543,16 +1559,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         try orchestrationRuntime?.reconcileReceipts(
             statusForRun: { [runRepo] runId in
-                try runRepo.get(id: runId)?.status
+                try runRepo.status(of: runId)
             },
             usageForRun: { [runRepo] runId in
-                guard let run = try runRepo.get(id: runId) else { return nil }
+                guard let threadId = try runRepo.threadId(of: runId) else { return nil }
                 // S3: never rehydrate full history on relaunch — bound the scan
                 // (newest window + byte budget) so oversized recovery cannot OOM.
                 let bound = 64
                 let byteBudget: Int64 = 4 * 1024 * 1024
                 return try runRepo.listLatestStreamEvents(
-                    threadId: run.threadId,
+                    threadId: threadId,
                     limit: bound,
                     maxPayloadBytes: byteBudget
                 )
@@ -1564,26 +1580,26 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     .first
             },
             qualityOutcomeForRun: { [messageRepo, runRepo] runId, status in
-                guard status == .completed, let run = try runRepo.get(id: runId) else {
+                guard status == .completed else {
                     return AgentOrchestrationRuntime.qualityOutcome(status: status, finalMessage: nil)
                 }
-                let hasOutput = try messageRepo.list(threadId: run.threadId).contains {
-                    $0.role == .assistant && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                guard let threadId = try runRepo.threadId(of: runId) else {
+                    return AgentOrchestrationRuntime.qualityOutcome(status: status, finalMessage: nil)
                 }
+                let hasOutput = try messageRepo.hasNonEmptyAssistantMessage(threadId: threadId)
                 return hasOutput
                     ? "verified:output-present"
                     : "rejected:missing-output"
             }
         )
         let now = Date()
-        for thread in try threadRepo.list() where thread.status == .running {
-            if preservingThreadIDs.contains(thread.id) { continue }
-            var copy = thread
-            copy.status = .interrupted
-            copy.hasUnread = Self.hasUnread(for: .interrupted)
-            copy.updatedAt = now
-            try threadRepo.upsert(copy)
-        }
+        // Status + unread + updated_at only. A leftover `list()` of every
+        // 26-column + routing row hitchs launch, then `upsert` rewrites routing.
+        try threadRepo.reconcileRunningOnLaunch(
+            preservingThreadIDs: preservingThreadIDs,
+            at: now,
+            hasUnread: Self.hasUnread(for: .interrupted)
+        )
         if let providerSessionRepo {
             let future = Date.distantFuture
             for session in try providerSessionRepo.list(status: .running, updatedBefore: future) {
@@ -1591,11 +1607,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 // A stale running session on an already-terminal thread is not a
                 // relaunch interrupt. Align the session to the thread so pet/open
                 // does not show "interrupted by an app restart" for finished work.
+                // Status only — a full 26-column + routing `get` hitchs launch.
                 let sessionStatus: AgentRunStatus
-                if let thread = try? threadRepo.get(id: session.threadId),
-                   Self.isTerminalThreadStatus(thread.status),
-                   thread.status != .interrupted {
-                    sessionStatus = thread.status
+                if let status = try? threadRepo.status(of: session.threadId),
+                   Self.isTerminalThreadStatus(status),
+                   status != .interrupted {
+                    sessionStatus = status
                 } else {
                     sessionStatus = .interrupted
                 }
@@ -1623,7 +1640,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     public func runStatus(_ runId: AgentRunID) throws -> AgentRunStatus? {
-        try runRepo.get(id: runId)?.status
+        try runRepo.status(of: runId)
     }
 
     /// Returns the persisted start time of the active run for `threadId`, or
@@ -1639,19 +1656,26 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let runId = activeThreads[threadId]
         lock.unlock()
         if let runId {
-            return try runRepo.get(id: runId)?.startedAt
+            return try runRepo.timing(of: runId)?.startedAt
         }
         // Path B: LaunchAgent owns the process; durable agent_runs still has the clock.
         return try runRepo.latestActive(for: threadId)?.startedAt
     }
 
     public func runStartedAt(runId: AgentRunID) throws -> Date? {
-        try runRepo.get(id: runId)?.startedAt
+        try runRepo.timing(of: runId)?.startedAt
     }
+
+    #if DEBUG
+    public let durableActiveRunThreadProbeForTesting = ActivityReceiptsThreadProbe()
+    #endif
 
     /// Durable active run row for a thread, including LaunchAgent-owned sessions
     /// this process does not track in `activeThreads`.
     public func durableActiveRun(threadId: AgentThreadID) throws -> AgentRun? {
+        #if DEBUG
+        durableActiveRunThreadProbeForTesting.recordCurrentThread()
+        #endif
         lock.lock()
         let runId = activeThreads[threadId]
         lock.unlock()
@@ -1660,6 +1684,40 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return run
         }
         return try runRepo.latestActive(for: threadId)
+    }
+
+    /// Existence-only durable active run. Avoids compiling the 10-column
+    /// `agent_runs` row (including `error_message`) on Stop-wait / Stop
+    /// chrome / desk live-thread discovery that only need pending/running.
+    public func hasDurableActiveRun(threadId: AgentThreadID) throws -> Bool {
+        #if DEBUG
+        durableActiveRunThreadProbeForTesting.recordCurrentThread()
+        #endif
+        lock.lock()
+        let runId = activeThreads[threadId]
+        lock.unlock()
+        if let runId,
+           let status = try runRepo.status(of: runId),
+           status == .pending || status == .running {
+            return true
+        }
+        return try runRepo.hasActive(for: threadId)
+    }
+
+    /// id + started_at only. Avoids compiling the 10-column `agent_runs` row
+    /// (including `error_message`) on LaunchAgent live poll, Working-for
+    /// clocks, iOS active-run snapshots, and Stop targeting.
+    public func durableActiveRunChrome(threadId: AgentThreadID) throws -> AgentRunRepository.ActiveRunChrome? {
+        #if DEBUG
+        durableActiveRunThreadProbeForTesting.recordCurrentThread()
+        #endif
+        lock.lock()
+        let runId = activeThreads[threadId]
+        lock.unlock()
+        if let runId, let chrome = try runRepo.activeRunChrome(of: runId) {
+            return chrome
+        }
+        return try runRepo.latestActiveChrome(for: threadId)
     }
 
     /// The currently-active run id for a thread (nil when idle). Lets a surface
@@ -1705,6 +1763,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             expiresAt: expiresAt
         )
     }
+
+    #if DEBUG
+    /// Test-only: the in-memory bind `startRun` writes before the provider
+    /// process is up. Lets a rail-prune race inject a live mapping without
+    /// waiting on FakeProviderRunner finish.
+    public func bindActiveThreadForTesting(threadId: AgentThreadID, runId: AgentRunID) {
+        lock.lock()
+        activeThreads[threadId] = runId
+        lock.unlock()
+    }
+    #endif
 
     /// Records the semantic mode selected by the primary AI's Bot tool call.
     /// This is run-scoped presentation deduplication, not prompt parsing.
@@ -2142,7 +2211,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 content: effectiveRequest.userMessageContent ?? effectiveRequest.prompt,
                 attachments: effectiveRequest.attachments
             )
-            if try messageRepo.get(id: userMsg.id) == nil {
+            if try messageRepo.exists(id: userMsg.id) == false {
                 try messageRepo.append(userMsg)
                 onMessageAppended?(userMsg)
             }
@@ -2172,35 +2241,45 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         } else {
             try runRepo.upsert(run)
         }
-        if var thread = try threadRepo.get(id: effectiveRequest.threadId) {
-            thread.status = .pending
-            thread.hasUnread = false
-            thread.updatedAt = Date()
-            try threadRepo.upsert(thread)
-        }
-        let existingProviderSession = try providerSessionRepo?.get(threadId: effectiveRequest.threadId)
-        let existingRuntimePayload = existingProviderSession?.runtimePayloadJSON
-        var nextRuntimePayload = ProviderSessionRuntimePayload.decode(existingRuntimePayload)
-        if existingProviderSession == nil,
-           effectiveEnvironment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] == "1" {
-            nextRuntimePayload.wireProtocolVersion = RCWireProtocol.version
-        }
-        try providerSessionRepo?.upsert(ProviderSessionRuntime(
-            threadId: effectiveRequest.threadId,
-            provider: effectiveRequest.provider,
-            providerInstanceId: effectiveRequest.providerInstanceId,
-            adapterKey: adapterKey,
-            binaryIdentity: binaryIdentity,
+        // Status + unread + updated_at only. A leftover 26-column + routing
+        // `get` then `upsert` hitchs every send and rewrites routing JSON.
+        try threadRepo.updateStatus(
+            id: effectiveRequest.threadId,
             status: .pending,
-            resumeCursor: effectiveRequest.providerThreadId,
-            cwd: effectiveRequest.cwd,
-            model: effectiveRequest.model,
-            serviceTier: effectiveRequest.serviceTier,
-            runtimeMode: effectiveRequest.permissionMode,
-            lastRunId: effectiveRequest.runId,
-            lastEventKind: "run.pending",
-            runtimePayloadJSON: nextRuntimePayload.encoded()
-        ))
+            hasUnread: false
+        )
+        if let repo = providerSessionRepo {
+            // Payload JSON only. A leftover 16-column session `get`
+            // (including cwd/model/status/error) hitchs every send just
+            // to copy `runtime_payload_json` into the pending upsert.
+            let existingPayload = try repo.runtimePayloadJSON(of: effectiveRequest.threadId)
+            let runtimePayloadJSON: String?
+            if let existingPayload {
+                runtimePayloadJSON = existingPayload
+            } else {
+                var nextRuntimePayload = ProviderSessionRuntimePayload.decode(nil)
+                if effectiveEnvironment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] == "1" {
+                    nextRuntimePayload.wireProtocolVersion = RCWireProtocol.version
+                }
+                runtimePayloadJSON = nextRuntimePayload.encoded()
+            }
+            try repo.upsert(ProviderSessionRuntime(
+                threadId: effectiveRequest.threadId,
+                provider: effectiveRequest.provider,
+                providerInstanceId: effectiveRequest.providerInstanceId,
+                adapterKey: adapterKey,
+                binaryIdentity: binaryIdentity,
+                status: .pending,
+                resumeCursor: effectiveRequest.providerThreadId,
+                cwd: effectiveRequest.cwd,
+                model: effectiveRequest.model,
+                serviceTier: effectiveRequest.serviceTier,
+                runtimeMode: effectiveRequest.permissionMode,
+                lastRunId: effectiveRequest.runId,
+                lastEventKind: "run.pending",
+                runtimePayloadJSON: runtimePayloadJSON
+            ))
+        }
         do {
             if let orchestrationRuntime,
                let delegationCapabilitySHA256 {
@@ -2340,35 +2419,26 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // handle exists. Keep the pre-handle graph pending, then atomically move
         // every durable projection to running. A provider may already have
         // emitted a terminal event synchronously; never overwrite that state.
-        if var startedRun = try runRepo.get(id: runId), startedRun.status == .pending {
-            startedRun.status = .running
-            var startedThread = try threadRepo.get(id: effectiveRequest.threadId)
-            startedThread?.status = .running
-            startedThread?.updatedAt = Date()
-            var startedSession = try providerSessionRepo?.get(threadId: effectiveRequest.threadId)
-            startedSession?.status = .running
-            startedSession?.lastEventKind = "run.started"
-            startedSession?.updatedAt = Date()
-            do {
-                try runRepo.persistActiveGraph(
-                    run: startedRun,
-                    thread: startedThread,
-                    providerSession: startedSession
-                )
-            } catch {
-                handle.cancel()
-                markStartFailure(
-                    error,
-                    request: effectiveRequest,
-                    runId: runId,
-                    adapterKey: adapterKey,
-                    binaryIdentity: binaryIdentity,
-                    preserveRecoverableSession: recoveryContext?.resumeCursor?.isEmpty == false
-                )
-                throw error
-            }
+        // Status chrome only. A leftover 10-column run get + 26-column thread
+        // get+upsert (rewriting routing) hitchs every send after sendTurn.
+        do {
+            _ = try runRepo.promotePendingStartToRunning(
+                runId: runId,
+                threadId: effectiveRequest.threadId
+            )
+        } catch {
+            handle.cancel()
+            markStartFailure(
+                error,
+                request: effectiveRequest,
+                runId: runId,
+                adapterKey: adapterKey,
+                binaryIdentity: binaryIdentity,
+                preserveRecoverableSession: recoveryContext?.resumeCursor?.isEmpty == false
+            )
+            throw error
         }
-        let terminalStatus = (try? runRepo.get(id: runId)?.status).flatMap { status -> AgentRunStatus? in
+        let terminalStatus = (try? runRepo.status(of: runId)).flatMap { status -> AgentRunStatus? in
             status == .running || status == .pending ? nil : status
         }
         if terminalStatus == .cancelled {
@@ -2447,7 +2517,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let runIds = Array(pendingTerminalEvents.keys)
         lock.unlock()
         return runIds.filter { runId in
-            (try? runRepo.get(id: runId)?.threadId == threadId) ?? false
+            (try? runRepo.threadId(of: runId) == threadId) ?? false
         }
     }
 
@@ -2548,15 +2618,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 routingSnapshot = suppliedSnapshot
             }
         } else {
-            guard let thread = try threadRepo.get(id: request.threadId),
-                  thread.effectiveRoutingConfiguration.mode == .auto else {
+            // Routing row only. A leftover 26-column `get` (plus routing JSON)
+            // hitchs scheduled / snapshot-less starts just to test Auto mode.
+            guard let routing = try threadRepo.routingConfiguration(of: request.threadId),
+                  routing.mode == .auto else {
                 return (request, nil)
             }
             guard let providerSnapshotSupplier else {
                 throw AgentOrchestrationAdmissionError.noEligibleProvider
             }
             routingSnapshot = AgentOrchestrationRoutingSnapshot(
-                configuration: thread.effectiveRoutingConfiguration,
+                configuration: routing,
                 providerSnapshots: try await providerSnapshotSupplier()
             )
         }
@@ -2788,8 +2860,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // spurious `.cancelled` (phantom "Thread cancelled" notification, queued
         // messages drained unprompted) or respawned a provider process for a dead
         // thread just to interrupt it. Guard BEFORE touching adapter sessions.
-        let thread = try? threadRepo.get(id: threadId)
-        let hasDurableRunningState = thread?.status == .running || thread?.status == .pending
+        // Status-only: do not compile the 26-column + routing get.
+        let durableStatus = try? threadRepo.status(of: threadId)
+        let hasDurableRunningState = durableStatus == .running || durableStatus == .pending
         guard hasDurableRunningState || pendingStart != nil else {
             lock.lock()
             pendingThreadStops.remove(threadId)
@@ -2899,7 +2972,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let activeHandle = activeRunId.flatMap { active[$0] }
         let pendingResult = settledPendingStart?.result()
         lock.unlock()
-        let durableRun = try durableActiveRun(threadId: threadId)
+        let durableRun = try durableActiveRunChrome(threadId: threadId)
         let runId = activeRunId
             ?? (pendingResult?.failed == true ? nil : settledPendingStart?.runId)
             ?? durableRun?.id
@@ -2928,7 +3001,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             processTracker?.refresh()
             let survivingPIDs = processTracker?.survivingPIDs() ?? []
             let processTreeDead = survivingPIDs.isEmpty
-            let durableStillActive = try durableActiveRun(threadId: threadId) != nil
+            let durableStillActive = try hasDurableActiveRun(threadId: threadId)
             let preparing = isPreparingProviderStart(threadId: threadId)
             let providerSessionAlive = adapter.map {
                 providerSessionIsLive($0, threadId: threadId)
@@ -3250,15 +3323,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         } ?? false
         lock.unlock()
         guard !hasActiveRun, !terminalBarrierPending else { return }
-        guard let thread = try? threadRepo.get(id: threadId),
-              Self.isTerminalThreadStatus(thread.status) else { return }
+        // Status + cursor only. A leftover 26-column + routing `get` hitchs
+        // every follow-up send that still has a live adapter session.
+        guard let status = try? threadRepo.status(of: threadId),
+              Self.isTerminalThreadStatus(status) else { return }
         if (try? runRepo.latestActive(for: threadId)) != nil {
             return
         }
+        guard let cursor = try? threadRepo.providerThreadId(of: threadId) else { return }
         reconcileProviderSessionAfterDurableTerminal(
             threadId: threadId,
-            status: thread.status,
-            providerThreadId: thread.providerThreadId
+            status: status,
+            providerThreadId: cursor.isEmpty ? nil : cursor
         )
     }
 
@@ -3464,7 +3540,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return try presence(threadId)
         }
         #endif
-        return try threadRepo.get(id: threadId) != nil
+        return try threadRepo.status(of: threadId) != nil
     }
 
     private func hasDurableActiveRun(_ threadId: AgentThreadID) throws -> Bool {
@@ -3746,8 +3822,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return try presence(runId, threadId) ? .present : .runAbsent
         }
         #endif
-        guard try threadRepo.get(id: threadId) != nil else { return .threadAbsent }
-        guard let run = try runRepo.get(id: runId), run.threadId == threadId else {
+        guard try threadRepo.status(of: threadId) != nil else { return .threadAbsent }
+        guard try runRepo.threadId(of: runId) == threadId else {
             return .runAbsent
         }
         return .present
@@ -4105,7 +4181,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // Exception: durable terminal + leftover in-memory ownership (partial
         // finish / multi-process reconcile race). Release the ghost active run so
         // Stop/Working cannot stick after finishedAt is already set.
-        if let runId, let row = try? runRepo.get(id: runId), row.finishedAt != nil {
+        if let runId, let row = try? runRepo.terminal(of: runId), row.finishedAt != nil {
             _ = releaseStaleInMemoryOwnershipIfDurableTerminal(
                 runId: runId,
                 threadId: threadId,
@@ -4178,12 +4254,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         if let runId {
             try? runRepo.markStopped(id: runId, status: .cancelled)
         }
-        if var thread = try? threadRepo.get(id: threadId), thread.status == .running || thread.status == .pending {
-            thread.status = .cancelled
-            thread.hasUnread = Self.hasUnread(for: .cancelled)
-            thread.updatedAt = Date()
-            try? threadRepo.upsert(thread)
-        }
+        // Status + unread + updated_at only. A leftover 26-column + routing
+        // `get` then `upsert` hitchs Stop when there is no live handle.
+        try? threadRepo.cancelIfActive(
+            id: threadId,
+            hasUnread: Self.hasUnread(for: .cancelled)
+        )
         try? providerSessionRepo?.markStopped(threadId: threadId)
         // PERF-MAC_AGENT-007: drain buffered stream writes for the genuine active
         // run before tearing it down, so a cancel does not drop the buffered tail.
@@ -4275,7 +4351,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.unlock()
         var released = 0
         for (threadId, runId) in snapshot {
-            guard let row = try? runRepo.get(id: runId), row.finishedAt != nil else { continue }
+            guard let row = try? runRepo.terminal(of: runId), row.finishedAt != nil else { continue }
             if releaseStaleInMemoryOwnershipIfDurableTerminal(
                 runId: runId,
                 threadId: threadId,
@@ -4357,7 +4433,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
         handle?.cancel()
         let status = preferredStatus
-            ?? (try? runRepo.get(id: runId))?.status
+            ?? (try? runRepo.status(of: runId))
             ?? .cancelled
         reconcileProviderSessionAfterDurableTerminal(
             threadId: threadId,
@@ -4387,6 +4463,38 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     // auto-continuation bookkeeping without driving a full stalled autonomous run.
     func seedAutoContinuationStateForTesting(_ threadId: AgentThreadID) {
         lock.lock(); autoContinuationCounts[threadId] = 1; autoContinuationTokens[threadId] = 1; lock.unlock()
+    }
+
+    func backgroundAwaitContinuationStillValidForTesting(
+        _ threadId: AgentThreadID,
+        token: Int
+    ) -> Bool {
+        backgroundAwaitContinuationStillValid(threadId: threadId, token: token)
+    }
+
+    func incompleteTurnContinuationRequestForTesting(
+        threadId: AgentThreadID,
+        provider: AgentProvider = .codex,
+        model: String = "fake-model",
+        cwd: String = "/tmp",
+        reason: IncompleteTurnContinuationReason = .backgroundAwait
+    ) -> AgentRunRequest {
+        incompleteTurnContinuationRequest(
+            threadId: threadId,
+            runMetadata: (
+                provider: provider,
+                providerInstanceId: provider.rawValue,
+                model: model,
+                cwd: cwd,
+                serviceTier: .auto,
+                runtimeMode: .fullAccess,
+                interactionMode: .default,
+                adapterKey: "test",
+                binaryIdentity: nil
+            ),
+            resumeCursor: nil,
+            reason: reason
+        )
     }
     var autoContinuationThreadIdsForTesting: Set<AgentThreadID> {
         lock.lock(); defer { lock.unlock() }
@@ -4561,7 +4669,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         runMetadata: RunMetadata?,
         resumeCursor: String?
     ) {
-        let isAutonomous = (runMetadata?.runtimeMode ?? (try? threadRepo.get(id: threadId))?.permissionMode) == .fullAccess
+        let isAutonomous = (runMetadata?.runtimeMode ?? (try? threadRepo.permissionMode(of: threadId))) == .fullAccess
         lock.lock()
         let prior = autoContinuationCounts[threadId] ?? 0
         lock.unlock()
@@ -4614,7 +4722,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             && !pendingThreadStops.contains(threadId)
         lock.unlock()
         guard ok else { return false }
-        return (try? threadRepo.get(id: threadId))?.status == .completed
+        return (try? threadRepo.status(of: threadId)) == .completed
     }
 
     private func incompleteTurnContinuationRequest(
@@ -4624,7 +4732,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         reason: IncompleteTurnContinuationReason
     ) -> AgentRunRequest {
         let prompt = IncompleteTurnContinuation.prompt(for: reason)
-        let runAsUser = (try? threadRepo.get(id: threadId))?.runAsUser
+        let runAsUser = (try? threadRepo.identity(of: threadId))?.runAsUser
         return AgentRunRequest(
             threadId: threadId,
             provider: runMetadata.provider,
@@ -4710,7 +4818,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     public func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) async throws {
         let adapter = try adapterForThread(threadId)
-        let activeRunID = (try? durableActiveRun(threadId: threadId))?.id
+        let activeRunID = (try? durableActiveRunChrome(threadId: threadId))?.id
         let outboundText: String
         if let followUpPromptCompressor {
             outboundText = await followUpPromptCompressor(text, adapter.provider, threadId, activeRunID)
@@ -4771,11 +4879,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// Correctness-critical state is stored in the compact provider-session row,
     /// independently of the evictable stream transcript.
     public func durableActiveThreadState(threadId: AgentThreadID) -> AgentActiveThreadState? {
-        guard let providerSessionRepo,
-              let session = try? providerSessionRepo.get(threadId: threadId) else { return nil }
-        let payload = ProviderSessionRuntimePayload.decode(session.runtimePayloadJSON)
+        guard let providerSessionRepo else { return nil }
+        // Cursor + payload JSON only. A leftover 16-column session `get`
+        // (including cwd/model/status/error) hitchs thread-select rehydrate
+        // just to restore plan/approval state.
+        guard let chrome = try? providerSessionRepo.activeChrome(of: threadId) else { return nil }
+        let payload = ProviderSessionRuntimePayload.decode(chrome.runtimePayloadJSON)
         return AgentActiveThreadState(
-            resumeCursor: session.resumeCursor ?? payload.providerThreadId,
+            resumeCursor: chrome.resumeCursor ?? payload.providerThreadId,
             activeTurnId: payload.activeTurnId,
             activePlan: payload.activePlan,
             pendingApprovalRequestIds: payload.pendingApprovalRequestIds,
@@ -4801,10 +4912,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         guard sourceThreadId != childThread.id else {
             throw AgentProviderAdapterError.unsupported("fork child must have a distinct local thread identity")
         }
-        guard let sourceThread = try threadRepo.get(id: sourceThreadId) else {
+        guard let sourceProvider = try threadRepo.provider(of: sourceThreadId) else {
             throw AgentProviderAdapterError.sessionNotFound(sourceThreadId)
         }
-        guard sourceThread.provider == childThread.provider else {
+        guard sourceProvider == childThread.provider else {
             throw AgentProviderAdapterError.unsupported("fork child must use the parent provider")
         }
         guard childThread.providerThreadId == nil else {
@@ -4892,7 +5003,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 )
             }
             if intent.state != .compensating,
-               try threadRepo.get(id: intent.sourceThreadId) != nil {
+               try threadRepo.status(of: intent.sourceThreadId) != nil {
                 try await recoverAdapterSessionIfNeeded(threadId: intent.sourceThreadId, adapter: adapter)
             }
             guard adapter.forkSafety(threadId: intent.sourceThreadId).supportsDurableFork else {
@@ -4965,9 +5076,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         adapter: AgentProviderAdapter
     ) async throws -> AgentThreadForkResult {
         var intent = try threadRepo.getForkIntent(childThreadId: initialIntent.childThread.id) ?? initialIntent
-        if let child = try threadRepo.get(id: intent.childThread.id) {
+        // Cheap existence + cursor. First-time fork misses the child; a 26-column
+        // + routing get would only compile nil. Load the full row only to return
+        // the idempotent committed child.
+        if let persistedProviderThreadId = try threadRepo.providerThreadId(of: intent.childThread.id) {
+            let persistedCursor = persistedProviderThreadId.isEmpty ? nil : persistedProviderThreadId
             guard intent.state == .localCommitted,
-                  child.providerThreadId == intent.providerChildThreadId else {
+                  persistedCursor == intent.providerChildThreadId else {
+                throw AgentThreadForkPersistenceError.childThreadConflict
+            }
+            guard let child = try threadRepo.get(id: intent.childThread.id) else {
                 throw AgentThreadForkPersistenceError.childThreadConflict
             }
             return AgentThreadForkResult(thread: child, prunedThreadIDs: [])
@@ -4980,7 +5098,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             childThreadId: intent.childThread.id,
             idempotencyKey: intent.idempotencyKey,
             workingDirectory: intent.childThread.worktreePath,
-            sourceProviderThreadId: try threadRepo.get(id: intent.sourceThreadId)?.providerThreadId
+            // Cursor only. A leftover 26-column + routing `get` hitchs fork
+            // recovery just to copy provider_thread_id.
+            sourceProviderThreadId: try threadRepo.providerThreadId(of: intent.sourceThreadId)
+                .flatMap { $0.isEmpty ? nil : $0 }
         )
 
         if intent.state == .compensated {
@@ -4999,7 +5120,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
 
         if intent.state == .prepared {
-            guard try threadRepo.get(id: intent.sourceThreadId) != nil else {
+            guard try threadRepo.status(of: intent.sourceThreadId) != nil else {
                 if !intent.providerCreationAttempted {
                     try threadRepo.markPreparedForkAbandoned(
                         childThreadId: intent.childThread.id,
@@ -5021,7 +5142,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 )
                 throw error
             }
-            let sourceProviderThreadId = try threadRepo.get(id: intent.sourceThreadId)?.providerThreadId
+            let sourceProviderThreadId = try threadRepo.providerThreadId(of: intent.sourceThreadId)
+                .flatMap { $0.isEmpty ? nil : $0 }
             guard !providerChildThreadId.isEmpty,
                   providerChildThreadId != sourceProviderThreadId else {
                 throw AgentProviderAdapterError.unsupported("provider-native fork did not return a distinct child session")
@@ -5041,7 +5163,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         persistedChild.status = .completed
         persistedChild.hasUnread = false
         persistedChild.updatedAt = Date()
-        let sourceRuntime = try providerSessionRepo?.get(threadId: intent.sourceThreadId)
+        let sourceRuntime = try providerSessionRepo?.forkSourceIdentity(of: intent.sourceThreadId)
         let childRuntime = providerSessionRepo.map { _ in
             ProviderSessionRuntime(
                 threadId: persistedChild.id,
@@ -5416,8 +5538,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// a stale session row still has a resume cursor or an `interrupted` status
     /// left behind by launch reconciliation of a leftover running session.
     public func hasRecoverableContext(threadId: AgentThreadID) -> Bool {
-        guard let thread = try? threadRepo.get(id: threadId),
-              thread.status == .interrupted else {
+        guard (try? threadRepo.status(of: threadId)) == .interrupted else {
             return false
         }
         guard let repo = providerSessionRepo else { return false }
@@ -5465,15 +5586,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         adapters.forEach { $0.stopAllForAppTermination() }
     }
 
+    /// Pick the adapter by durable provider only. A full 26-column + routing
+    /// `get` is wasted on send/queue `hasProviderSession` and fork/stop probes.
     private func adapterForThread(_ threadId: AgentThreadID) throws -> AgentProviderAdapter {
-        guard let thread = try threadRepo.get(id: threadId) else {
+        guard let provider = try threadRepo.listChrome(ids: [threadId])[threadId]?.provider else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
         lock.lock()
-        let adapter = providers[thread.provider]
+        let adapter = providers[provider]
         lock.unlock()
         guard let adapter else {
-            throw AgentRunError.missingBinary(thread.provider.rawValue)
+            throw AgentRunError.missingBinary(provider.rawValue)
         }
         return adapter
     }
@@ -5490,19 +5613,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if session.resumeCursor?.isEmpty == false {
                 return ProviderRecoveryContext(session: session)
             }
-            if let thread = try threadRepo.get(id: request.threadId), thread.providerThreadId?.isEmpty == false {
+            if let cursor = try threadRepo.providerThreadId(of: request.threadId), !cursor.isEmpty {
                 throw AgentProviderAdapterError.unsupported("Provider session is marked active but no live provider session or resume cursor is available; restart recovery cannot safely continue this thread.")
             }
             return nil
         case .stopped(let session) where session.provider == request.provider:
             if session.resumeCursor?.isEmpty != false,
-               let thread = try threadRepo.get(id: request.threadId),
-               thread.providerThreadId?.isEmpty != false {
+               let cursor = try threadRepo.providerThreadId(of: request.threadId),
+               cursor.isEmpty {
                 return nil
             }
             throw AgentProviderAdapterError.unsupported("Session was stopped. Tap Continue to resume from the last checkpoint, or start a new thread.")
         case .unrecoverable(let reason):
-            if let thread = try threadRepo.get(id: request.threadId), thread.providerThreadId?.isEmpty == false {
+            if let cursor = try threadRepo.providerThreadId(of: request.threadId), !cursor.isEmpty {
                 throw AgentProviderAdapterError.unsupported(reason)
             }
             return nil
@@ -5553,7 +5676,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     private func recoverAdapterSessionIfNeeded(threadId: AgentThreadID, adapter: AgentProviderAdapter) async throws {
         guard !adapter.hasSession(threadId: threadId) else { return }
-        guard let thread = try threadRepo.get(id: threadId) else {
+        guard let thread = try threadRepo.adapterRecovery(of: threadId) else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
         // Terminal completed/failed/cancelled: never spin recovery on open/read.
@@ -5567,7 +5690,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         case .pending, .running, .interrupted:
             break
         }
-        guard let session = try providerSessionRepo?.get(threadId: threadId),
+        guard let session = try providerSessionRepo?.adapterRecoverySession(of: threadId),
               session.provider == thread.provider,
               let resumeCursor = session.resumeCursor,
               !resumeCursor.isEmpty else {
@@ -5577,12 +5700,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         guard let cwd, !cwd.isEmpty else {
             throw AgentProviderAdapterError.unsupported("Provider session recovery requires cwd")
         }
-        let activeTurnId = ProviderSessionRuntimePayload.decode(session.runtimePayloadJSON).activeTurnId
+        let activeTurnId = session.activeTurnId
         // Recovered sessions are rebuilt here, bypassing the app shell's providerEnvironment, so
         // re-derive the Token Saver env or distill silently turns off on resume. Always keep the
         // provider tag so `| distill` savings attribute to claude/codex (not "unknown").
         let recoveryRunID = AgentRunID()
-        let recoveryEventRunId = try recoveryEventRunId(session: session, thread: thread)
+        let recoveryEventRunId = try recoveryEventRunId(session: session, thread: thread, threadId: threadId)
         var environment = await recoveryEnvironmentProvider?(thread.provider, threadId) ?? [:]
         environment["REMOTE_CODE_AGENT_PROVIDER"] = thread.provider.rawValue
         // Resume bypasses providerEnvironment; re-stamp attempt + receipt so distill
@@ -5649,10 +5772,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     private func recoveryEventRunId(
-        session: ProviderSessionRuntime,
-        thread: AgentThread
+        session: ProviderSessionRuntimeRepository.AdapterRecoverySession,
+        thread: AgentThreadRepository.AdapterRecoveryChrome,
+        threadId: AgentThreadID
     ) throws -> AgentRunID {
-        if let runId = session.lastRunId, try runRepo.get(id: runId) != nil {
+        if let runId = session.lastRunId, try runRepo.status(of: runId) != nil {
             return runId
         }
         let runId = AgentRunID()
@@ -5662,17 +5786,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         try runRepo.upsert(AgentRun(
             id: runId,
-            threadId: thread.id,
+            threadId: threadId,
             provider: thread.provider,
             providerInstanceId: thread.providerInstanceId,
             model: session.model ?? thread.model,
             status: status
         ))
-        if var persistedSession = try providerSessionRepo?.get(threadId: thread.id) {
-            persistedSession.lastRunId = runId
-            persistedSession.updatedAt = Date()
-            try providerSessionRepo?.upsert(persistedSession)
-        }
+        // last_run_id + updated_at only. A leftover 16-column session `get`
+        // then `upsert` hitchs recovery just to stamp the minted run,
+        // rewriting cwd/model/status/error and `runtime_payload_json`.
+        try providerSessionRepo?.stampLastRunId(threadId: threadId, lastRunId: runId)
         return runId
     }
 
@@ -5845,12 +5968,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         mutate: (inout ProviderSessionRuntimePayload) -> Void
     ) -> DeferredPersistenceIssue? {
         do {
-            guard var session = try providerSessionRepo?.get(threadId: threadId) else { return nil }
-            var payload = ProviderSessionRuntimePayload.decode(session.runtimePayloadJSON)
-            mutate(&payload)
-            session.runtimePayloadJSON = payload.encoded()
-            session.updatedAt = Date()
-            try providerSessionRepo?.upsert(session)
+            guard let repo = providerSessionRepo else { return nil }
+            // Payload JSON + updated_at only. A leftover 16-column session
+            // `get` then `upsert` hitchs every turn/request/plan stream
+            // event, rewriting cwd/model/status/error just to mutate
+            // `runtime_payload_json`.
+            try repo.stampRuntimePayload(threadId: threadId) { json in
+                var payload = ProviderSessionRuntimePayload.decode(json)
+                mutate(&payload)
+                json = payload.encoded()
+            }
             return nil
         } catch {
             return DeferredPersistenceIssue(
@@ -6831,20 +6958,20 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 case .threadStarted(let eventThreadId, let providerThreadId):
                     let resumeCursor = providerThreadId ?? eventThreadId
                     do {
-                        if var session = try providerSessionRepo?.get(threadId: threadId) {
-                            var payload = ProviderSessionRuntimePayload.decode(session.runtimePayloadJSON)
-                            session.resumeCursor = resumeCursor
-                            payload.providerThreadId = resumeCursor
-                            payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
-                            session.runtimePayloadJSON = payload.encoded()
-                            session.updatedAt = Date()
-                            try providerSessionRepo?.upsert(session)
-                        }
-                        if var thread = try threadRepo.get(id: threadId) {
-                            thread.providerThreadId = resumeCursor
-                            thread.updatedAt = Date()
-                            try threadRepo.upsert(thread)
-                        }
+                        // Resume cursor + payload.providerThreadId only. A leftover
+                        // 16-column session `get` then `upsert` hitchs every
+                        // `.threadStarted` event, rewriting cwd/model/status/error
+                        // and Swift-decoding `runtime_payload_json`.
+                        try providerSessionRepo?.stampResumeCursor(
+                            threadId: threadId,
+                            resumeCursor: resumeCursor
+                        )
+                        // Cursor + updated_at only. A leftover 26-column + routing
+                        // `get` then `upsert` hitchs every `.threadStarted` event.
+                        try threadRepo.updateProviderThreadId(
+                            id: threadId,
+                            providerThreadId: resumeCursor
+                        )
                     } catch {
                         resumeCursorFailure = error
                     }
@@ -7038,7 +7165,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if providerTerminalAcknowledged {
                 onProviderIdle?(threadId)
             }
-            if let row = try? runRepo.get(id: runId), row.finishedAt != nil {
+            if let row = try? runRepo.terminal(of: runId), row.finishedAt != nil {
                 // Durable row is terminal (possibly written by another process's
                 // launch reconciliation or a partial finish). If this process still
                 // owns the run in memory, release it and fan out didFinish once so
@@ -7192,10 +7319,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
             if needsTerminalClaim {
                 let provider = providerFromMeta
-                    ?? (try? threadRepo.get(id: threadId))?.provider
+                    ?? (try? threadRepo.listChrome(ids: [threadId])[threadId]?.provider)
                     ?? .codex
+                // Error text only. A leftover 16-column session `get`
+                // (including `runtime_payload_json`) hitchs terminal claim
+                // just to copy last_error_message for stderr classification.
                 let observedDetail = observedFromMemory
-                    ?? (try? providerSessionRepo?.get(threadId: threadId))?.lastErrorMessage
+                    ?? (try? providerSessionRepo?.lastErrorMessage(of: threadId))
                 let resolved = ProviderStderrClassifier.resolveTerminal(
                     provider: provider,
                     status: reportedStatus,
@@ -7439,9 +7569,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             } catch {
                 emitPersistenceIssue("run.provider_event.prune.finish", error: error, runId: runId, threadId: threadId)
             }
-            let durationMs = (try? runRepo.get(id: runId)).flatMap { row -> Int64? in
-                guard let finished = row.finishedAt else { return nil }
-                return Int64(finished.timeIntervalSince(row.startedAt) * 1000)
+            let durationMs = (try? runRepo.timing(of: runId)).flatMap { timing -> Int64? in
+                guard let finished = timing.finishedAt else { return nil }
+                return Int64(finished.timeIntervalSince(timing.startedAt) * 1000)
             } ?? -1
             agentRunLog.info("run.finished thread=\(threadId.value.uuidString, privacy: .public) run=\(runId.value.uuidString, privacy: .public) status=\(status.rawValue, privacy: .public) durationMs=\(durationMs, privacy: .public)")
             // S5: terminalize generation-owned prep so the next accept is not poisoned.
@@ -7494,10 +7624,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             latestRunErrorMessages[runId] = m
             lock.unlock()
             mirrorEventLock.lock()
-            let persistedSession = try? providerSessionRepo?.get(threadId: threadId)
-            let persistedThread = try? threadRepo.get(id: threadId)
+            // Cursor only. A leftover 16-column session `get` (including
+            // `runtime_payload_json`) hitchs the error path under
+            // `mirrorEventLock` just to copy resume_cursor for recoverable.
+            let persistedCursor = try? providerSessionRepo?.resumeCursor(of: threadId)
+            // Cursor only. A leftover 26-column + routing `get` hitchs the
+            // error path just to copy provider_thread_id for recoverable.
+            let threadCursor = (try? threadRepo.providerThreadId(of: threadId))
+                .flatMap { $0.isEmpty ? nil : $0 }
             mirrorEventLock.unlock()
-            let resumeCursor = (persistedSession?.resumeCursor ?? persistedThread?.providerThreadId)?
+            let resumeCursor = (persistedCursor ?? threadCursor)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let recoverable = resumeCursor?.isEmpty == false
             handle(
@@ -7521,14 +7657,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let priorAssistantMessageId = activeAssistantMessageIds[runId]
         lock.unlock()
 
-        guard var run = try runRepo.get(id: runId) else {
+        // Status + adapter-recovery chrome only. A leftover 10-column run
+        // `get` (including `error_message`) and 26-column + routing thread
+        // `get` hitch every finish just to stamp terminal columns.
+        guard try runRepo.status(of: runId) != nil else {
             throw NSError(
                 domain: "RemoteCode.AgentRunCoordinator",
                 code: 404,
                 userInfo: [NSLocalizedDescriptionKey: "Run row missing while committing terminal state."]
             )
         }
-        guard var thread = try threadRepo.get(id: threadId) else {
+        guard let chrome = try threadRepo.adapterRecovery(of: threadId) else {
             throw NSError(
                 domain: "RemoteCode.AgentRunCoordinator",
                 code: 404,
@@ -7536,16 +7675,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             )
         }
 
-        let finishedProvider = runMetadata?.provider ?? thread.provider
+        let finishedProvider = runMetadata?.provider ?? chrome.provider
         let finishedProviderInstanceId = runMetadata?.providerInstanceId
-            ?? thread.providerInstanceId
-            ?? finishedProvider.rawValue
-        let finishedModel = runMetadata?.model ?? thread.model
-        run.status = pending.status
-        run.finishedAt = pending.finishedAt
+            ?? chrome.providerInstanceId
+        let finishedModel = runMetadata?.model ?? chrome.model
         // Persist the resolved reason for abnormal ends. User cancel leaves this nil.
-        run.errorMessage = pending.errorMessage
-        run.terminalReason = pending.terminalReason
+        let terminalReason = pending.terminalReason
             ?? TerminalTransitionReason.classify(
                 requestedStatus: pending.status,
                 initiator: Self.terminalInitiator(
@@ -7554,18 +7689,42 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     errorMessage: pending.errorMessage
                 )
             ).rawValue
-
-        thread.status = pending.status
-        thread.hasUnread = Self.hasUnread(for: pending.status)
-        if let providerThreadId = pending.providerThreadId {
-            thread.providerThreadId = providerThreadId
+        let run = AgentRun(
+            id: runId,
+            threadId: threadId,
+            provider: finishedProvider,
+            providerInstanceId: finishedProviderInstanceId,
+            model: finishedModel,
+            status: pending.status,
+            finishedAt: pending.finishedAt,
+            errorMessage: pending.errorMessage,
+            terminalReason: terminalReason
+        )
+        let resumeCursor: String?
+        if let pendingCursor = pending.providerThreadId, !pendingCursor.isEmpty {
+            resumeCursor = pendingCursor
+        } else {
+            resumeCursor = try threadRepo.providerThreadId(of: threadId)
+                .flatMap { $0.isEmpty ? nil : $0 }
         }
-        thread.updatedAt = pending.finishedAt
-        let resumeCursor = pending.providerThreadId ?? thread.providerThreadId
+        let thread = AgentThread(
+            id: threadId,
+            title: "",
+            provider: finishedProvider,
+            providerInstanceId: finishedProviderInstanceId,
+            model: finishedModel,
+            providerThreadId: pending.providerThreadId,
+            status: pending.status,
+            updatedAt: pending.finishedAt,
+            hasUnread: Self.hasUnread(for: pending.status)
+        )
 
         let providerSession: ProviderSessionRuntime?
         if let providerSessionRepo {
-            let existingPayload = try providerSessionRepo.get(threadId: threadId)?.runtimePayloadJSON
+            // Payload JSON only. A leftover 16-column session `get`
+            // (including cwd/model/status/error) hitchs every finish just
+            // to copy `runtime_payload_json` into the terminal upsert.
+            let existingPayload = try providerSessionRepo.runtimePayloadJSON(of: threadId) ?? nil
             let runtimePayload = providerSessionRuntimePayloadJSON(
                 existingPayload,
                 status: pending.status,
@@ -7689,34 +7848,52 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
 
         do {
-            guard var run = try runRepo.get(id: runId) else {
+            guard try runRepo.status(of: runId) != nil else {
                 throw NSError(
                     domain: "RemoteCode.AgentRunCoordinator",
                     code: 404,
                     userInfo: [NSLocalizedDescriptionKey: "Run row missing while committing start failure."]
                 )
             }
-            run.status = .failed
-            run.finishedAt = pending.finishedAt
-            run.errorMessage = pending.message
+            let threadStatus: AgentRunStatus = pending.preserveRecoverableSession ? .interrupted : .failed
+            let run = AgentRun(
+                id: runId,
+                threadId: pending.request.threadId,
+                provider: pending.request.provider,
+                providerInstanceId: pending.request.providerInstanceId,
+                model: pending.request.model,
+                status: .failed,
+                finishedAt: pending.finishedAt,
+                errorMessage: pending.message
+            )
 
             var terminalThread: AgentThread?
             var providerSession: ProviderSessionRuntime?
             if !pending.otherRunActive {
-                guard var thread = try threadRepo.get(id: pending.request.threadId) else {
+                guard try threadRepo.status(of: pending.request.threadId) != nil else {
                     throw NSError(
                         domain: "RemoteCode.AgentRunCoordinator",
                         code: 404,
                         userInfo: [NSLocalizedDescriptionKey: "Thread row missing while committing start failure."]
                     )
                 }
-                thread.status = pending.preserveRecoverableSession ? .interrupted : .failed
-                thread.hasUnread = Self.hasUnread(for: thread.status)
-                thread.updatedAt = pending.finishedAt
-                terminalThread = thread
+                terminalThread = AgentThread(
+                    id: pending.request.threadId,
+                    title: "",
+                    provider: pending.request.provider,
+                    providerInstanceId: pending.request.providerInstanceId,
+                    model: pending.request.model,
+                    status: threadStatus,
+                    updatedAt: pending.finishedAt,
+                    hasUnread: Self.hasUnread(for: threadStatus)
+                )
 
                 if let providerSessionRepo {
-                    let existingPayload = try providerSessionRepo.get(threadId: pending.request.threadId)?.runtimePayloadJSON
+                    // Payload JSON only. A leftover 16-column session `get`
+                    // (including cwd/model/status/error) hitchs start-failure
+                    // commit just to copy `runtime_payload_json` into the
+                    // terminal upsert.
+                    let existingPayload = try providerSessionRepo.runtimePayloadJSON(of: pending.request.threadId) ?? nil
                     providerSession = ProviderSessionRuntime(
                         threadId: pending.request.threadId,
                         provider: pending.request.provider,
@@ -7866,8 +8043,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         if updates.isEmpty {
             if parentProvider != .codex, case .itemDelta = event {
                 let parentReceipt = try? orchestrationRuntime.receipt(runId: parentRunId)
-                let parentRun = try? runRepo.get(id: parentRunId)
-                parentProvider = parentReceipt?.provider ?? parentRun?.provider
+                // Provider only. A leftover 10-column `get` (including
+                // `error_message`) hitchs Codex-shaped itemDelta reparse.
+                parentProvider = parentReceipt?.provider
+                    ?? (try? runRepo.provider(of: parentRunId))
                 if let parentProvider {
                     updates = ProviderNativeSubagentLifecycle.updates(
                         from: event,
@@ -7881,15 +8060,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let parentReceipt = metadata == nil
             ? (try? orchestrationRuntime.receipt(runId: parentRunId))
             : nil
-        let parentRun = metadata == nil ? (try? runRepo.get(id: parentRunId)) : nil
-        guard let parentProvider = parentProvider
-                ?? parentReceipt?.provider
-                ?? parentRun?.provider else { return }
+        parentProvider = parentProvider
+            ?? parentReceipt?.provider
+            ?? (metadata == nil ? (try? runRepo.provider(of: parentRunId)) : nil)
+        guard let parentProvider else { return }
         let parentProviderInstanceId = metadata?.providerInstanceId
             ?? parentReceipt?.providerInstanceId
-            ?? parentRun?.providerInstanceId
             ?? parentProvider.rawValue
-        let parentModel = metadata?.model ?? parentReceipt?.model ?? parentRun?.model ?? "unknown"
+        let parentModel = metadata?.model
+            ?? parentReceipt?.model
+            ?? (metadata == nil ? (try? runRepo.model(of: parentRunId)) : nil)
+            ?? "unknown"
         for update in updates {
             do {
                 _ = try orchestrationRuntime.recordProviderNativeChild(
@@ -8424,7 +8605,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             let activeProvider = activeRunMetadata[runId]?.provider
             lock.unlock()
             if let activeProvider { return activeProvider }
-            return (try? threadRepo.get(id: threadId)?.provider) ?? .codex
+            return (try? threadRepo.listChrome(ids: [threadId])[threadId]?.provider) ?? .codex
         }()
         // Fail open on a hung local renderer: never let wire rendering block the turn
         // longer than the provider-terminal translation deadline. The translator

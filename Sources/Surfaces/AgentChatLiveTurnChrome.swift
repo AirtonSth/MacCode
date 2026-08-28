@@ -331,11 +331,12 @@ public struct AgentChatReasoningRow: View {
             .buttonStyle(.plain)
             .help(streaming ? "" : (text.isEmpty ? "" : (expanded ? "Hide reasoning" : "Show reasoning")))
             if expanded, !text.isEmpty {
-                Text(text)
-                    .font(DS.Font.bodyDense)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineSpacing(3)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: text,
+                    fontSize: 12,
+                    textColor: DS.NS.textTertiary,
+                    lineSpacing: 3
+                )
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -438,12 +439,14 @@ public struct AgentChatLiveToolRow: View {
 
             if let summary = commandSummary, !summary.isEmpty {
                 HStack(alignment: .top, spacing: DS.Space.xs) {
-                    Text(summary)
-                        .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
-                        .textSelection(.enabled)
-                        .lineLimit(expanded ? nil : 1)
-                        .truncationMode(.tail)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    AgentSelectablePlainText(
+                        text: summary,
+                        fontSize: 11,
+                        monospaced: true,
+                        textColor: DS.NS.textSecondary,
+                        maximumNumberOfLines: expanded ? nil : 1
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     if let full = commandFull, !full.isEmpty {
                         Button {
                             AgentChatTranscriptChrome.copyToPasteboard(full)
@@ -483,10 +486,12 @@ public struct AgentChatLiveToolRow: View {
             }
 
             if expanded, let full = commandFull, fullDiffersFromSummary, !full.isEmpty {
-                Text(full)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: full,
+                    fontSize: 11,
+                    monospaced: true,
+                    textColor: DS.NS.textTertiary
+                )
                     .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface.opacity(0.7))
@@ -495,9 +500,12 @@ public struct AgentChatLiveToolRow: View {
             }
 
             if expanded, let o = output, !o.isEmpty {
-                Text(AgentTimelineItemPresentation.cappedDetail(o, for: item))
-                    .font(DS.Font.mono).foregroundColor(DS.Palette.textSecondary)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: AgentTimelineItemPresentation.cappedDetail(o, for: item),
+                    fontSize: 12,
+                    monospaced: true,
+                    textColor: DS.NS.textSecondary
+                )
                     .padding(DS.Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface)
@@ -710,7 +718,6 @@ public struct AgentChatLiveItemRow: View {
                     .foregroundColor(DS.Palette.accent)
                 AgentMessageMarkdownView(text: item.body)
                     .foregroundColor(DS.Palette.text)
-                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         case .tool, .commandExecution, .fileChange, .mcpToolCall, .dynamicToolCall,
@@ -847,17 +854,20 @@ public struct AgentChatWorkingStatusStrip: View {
     public let startedAt: Date
     public let isStopping: Bool
     public let context: AgentChatWorkingContext?
+    public let hold: AgentBackgroundHoldSummary?
     public let onStop: () -> Void
 
     public init(
         startedAt: Date,
         isStopping: Bool,
         context: AgentChatWorkingContext? = nil,
+        hold: AgentBackgroundHoldSummary? = nil,
         onStop: @escaping () -> Void
     ) {
         self.startedAt = startedAt
         self.isStopping = isStopping
         self.context = context
+        self.hold = hold
         self.onStop = onStop
     }
 
@@ -866,34 +876,65 @@ public struct AgentChatWorkingStatusStrip: View {
             TimelineView(AgentChatElapsedTickSchedule(start: startedAt)) { timeline in
                 let seconds = max(0, Int(timeline.date.timeIntervalSince(startedAt)))
                 let seed = UInt64(max(0, startedAt.timeIntervalSince1970 * 1000))
-                HStack(spacing: DS.Space.sm) {
+                let showingHold = hold.map { !$0.isEmpty } ?? false
+                HStack(alignment: .center, spacing: DS.Space.sm) {
                     ProgressView()
                         .controlSize(.small)
-                        .accessibilityLabel("Running")
-                    Text(AgentChatWorkingCopy.statusLabel(
-                        context: context,
-                        elapsedSeconds: seconds,
-                        seed: seed
-                    ))
-                        .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
+                        .accessibilityLabel(showingHold ? "Holding on background work" : "Running")
+                    VStack(alignment: .leading, spacing: DS.Space.xs) {
+                        Text(AgentChatWorkingCopy.statusLabel(
+                            context: context,
+                            elapsedSeconds: seconds,
+                            seed: seed,
+                            hold: hold
+                        ))
+                        .font(DS.Font.body)
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                         .accessibilityLabel(AgentChatWorkingCopy.accessibilityLabel(
                             context: context,
-                            elapsedSeconds: seconds
+                            elapsedSeconds: seconds,
+                            hold: hold
                         ))
                         .accessibilityIdentifier("agent.workingStatus")
+                        if let extra = hold?.extraDescriptionsLine {
+                            Text(extra)
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.textTertiary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .accessibilityHidden(true)
+                                .accessibilityIdentifier("agent.workingStatus.holdDetail")
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .help(hold?.helpText ?? AgentChatWorkingCopy.accessibilityLabel(
+                        context: context,
+                        elapsedSeconds: seconds,
+                        hold: hold
+                    ))
                     Button(isStopping ? "Stopping… (click to force)" : "Stop", action: onStop)
                         .buttonStyle(.plain)
                         .font(DS.Font.body.weight(.medium))
                         .foregroundColor(DS.Palette.danger)
-                        .help(isStopping
-                              ? "Still stopping — click again to force-stop the provider"
-                              : "Stop running agent (press Esc to interrupt)")
+                        .help(stopHelp(showingHold: showingHold))
                         .accessibilityIdentifier("agent.working.stop")
                 }
             }
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func stopHelp(showingHold: Bool) -> String {
+        if isStopping {
+            return "Still stopping — click again to force-stop the provider"
+        }
+        if showingHold {
+            return "Stop the agent and any background shells or agents holding this run (Esc)"
+        }
+        return "Stop running agent (press Esc to interrupt)"
     }
 }
 

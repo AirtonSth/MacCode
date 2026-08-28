@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install RemoteCodeRunAsUserHelper as a setuid-root trampoline so Agent App can
-# execute provider CLIs as another macOS user (sudo -u style).
+# execute provider CLIs as another macOS user through the shared helper.
 #
 # Usage:
 #   sudo scripts/install-run-as-user-helper.sh [/path/to/RemoteCode.app]

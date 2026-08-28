@@ -47,6 +47,14 @@ public final class PetController {
     /// Host run start times for active threads. Progress republish must not
     /// wipe these — empty startedByThread maps used to drop elapsed detail.
     private var startedAtByThread: [AgentThreadID: Date] = [:]
+    /// Chrome from the last durable projection. Live Activity progress only
+    /// overlays `lastUpdatePreview` + retained `startedAt`; it must not repeat
+    /// N full `threadRepo.get` + bot list/link queries on MainActor.
+    private var activeThreadChromeByID: [AgentThreadID: CachedActiveThreadChrome] = [:]
+    /// Durable `threadRepo.get` calls from `applyActiveThreadIDs`.
+    private(set) var activeThreadDurableLookupCountForTesting = 0
+    /// True when the last progress republish reused cached chrome.
+    private(set) var progressRepublishUsedCachedChromeForTesting = false
     /// Local-LLM Live Activity descriptions, cached per card and debounced so a
     /// chatty run does not ask the model to summarize every tool line.
     private let liveActivitySummaries = LiveActivitySummaryStore()
@@ -62,6 +70,15 @@ public final class PetController {
     /// after coordinator start/finish (reconciles pet work pose).
     func applyActiveRunProjectionForTests(_ projection: ActiveRunProjection) {
         applyActiveRunProjection(projection)
+    }
+    func applyActiveThreadIDsForTests(
+        _ threadIDs: [AgentThreadID],
+        startedByThread: [AgentThreadID: Date] = [:]
+    ) {
+        applyActiveThreadIDs(threadIDs, startedByThread: startedByThread)
+    }
+    func republishActiveThreadsForLiveActivityForTests() {
+        republishActiveThreadsForLiveActivity()
     }
     var hasScheduledTasksForTests: Bool {
         transientTask != nil
@@ -587,10 +604,47 @@ public final class PetController {
         // when coordinator snapshot lags the projection callback.
         let projectedIDs = model.activeThreads.map(\.threadID)
         if projectedIDs.isEmpty {
+            progressRepublishUsedCachedChromeForTesting = false
             refreshActiveThreadsFromCoordinator()
             return
         }
+        if let reused = reuseProjectedActiveThreadsForProgress(threadIDs: projectedIDs) {
+            progressRepublishUsedCachedChromeForTesting = true
+            model.apply(activeThreads: reused)
+            publishLiveActivitySurface()
+            return
+        }
+        progressRepublishUsedCachedChromeForTesting = false
         applyActiveThreadIDs(projectedIDs, startedByThread: startedAtByThread)
+    }
+
+    /// Live Activity progress does not change workspace/provider/title/route.
+    /// Reuse the last durable projection's chrome so item.started does not
+    /// hitch behind FULLMUTEX SQLite on MainActor.
+    private func reuseProjectedActiveThreadsForProgress(
+        threadIDs: [AgentThreadID]
+    ) -> [PetActiveThreadItem]? {
+        let unique = Array(Set(threadIDs)).sorted {
+            $0.value.uuidString < $1.value.uuidString
+        }
+        var items: [PetActiveThreadItem] = []
+        items.reserveCapacity(unique.count)
+        for threadID in unique {
+            guard let chrome = activeThreadChromeByID[threadID] else { return nil }
+            items.append(
+                PetActiveThreadItem(
+                    threadID: threadID,
+                    workspaceID: chrome.workspaceID,
+                    workspaceName: chrome.workspaceName,
+                    providerName: chrome.providerName,
+                    threadTitle: chrome.threadTitle,
+                    startedAt: startedAtByThread[threadID],
+                    lastUpdatePreview: lastUpdatePreviewByThread[threadID],
+                    route: chrome.route
+                )
+            )
+        }
+        return items
     }
 
     /// Merge host-provided startedAt values with the retained cache for threads
@@ -1006,9 +1060,10 @@ public final class PetController {
     }
 
     private func applyActiveRunProjection(_ projection: ActiveRunProjection) {
+        let stamps = (try? context.runRepo.startedAt(ids: projection.runs.map(\.runId))) ?? [:]
         var startedByThread: [AgentThreadID: Date] = [:]
         for run in projection.runs {
-            guard let startedAt = try? context.runRepo.get(id: run.runId)?.startedAt else { continue }
+            guard let startedAt = stamps[run.runId] else { continue }
             if let existing = startedByThread[run.threadId] {
                 startedByThread[run.threadId] = min(existing, startedAt)
             } else {
@@ -1052,26 +1107,52 @@ public final class PetController {
             retained: startedAtByThread
         )
 
+        var nextChrome: [AgentThreadID: CachedActiveThreadChrome] = [:]
+        let chromeByID = (try? context.threadRepo.listChrome(ids: threadIDs)) ?? [:]
+        activeThreadDurableLookupCountForTesting += chromeByID.count
         let items = PetActiveThreadProjector.items(threadIDs: threadIDs) { [weak self] threadID in
-            guard let self,
-                  let thread = try? self.context.threadRepo.get(id: threadID) else {
+            guard let self, let meta = chromeByID[threadID] else {
+                nextChrome[threadID] = .empty(threadID: threadID)
                 return nil
             }
-            let workspaceName = thread.workspaceId.flatMap { self.context.state.workspaces[$0]?.name }
-            return (
-                workspaceID: thread.workspaceId,
+            let workspaceName = meta.workspaceId.flatMap { self.context.state.workspaces[$0]?.name }
+            let providerName = PetActiveThreadProjector.providerLabel(meta.provider)
+            nextChrome[threadID] = CachedActiveThreadChrome(
+                workspaceID: meta.workspaceId,
                 workspaceName: workspaceName,
-                providerName: PetActiveThreadProjector.providerLabel(thread.provider),
-                threadTitle: thread.title,
+                providerName: providerName,
+                threadTitle: meta.title,
+                route: .agentThread(threadID: threadID, workspaceID: meta.workspaceId)
+            )
+            return (
+                workspaceID: meta.workspaceId,
+                workspaceName: workspaceName,
+                providerName: providerName,
+                threadTitle: meta.title,
                 startedAt: self.startedAtByThread[threadID],
                 lastUpdatePreview: self.lastUpdatePreviewByThread[threadID]
             )
         }
-        let destNames = Dictionary(uniqueKeysWithValues: ((try? context.botStore.list()) ?? []).map { ($0.id, $0.name) })
+        let linked = (try? context.botStore.conversationsLinked(to: Set(threadIDs))) ?? [:]
+        let destNames: [BotID: String]
+        if linked.isEmpty {
+            destNames = [:]
+        } else {
+            let botIDs = Set(linked.values.map(\.botID))
+            destNames = ((try? context.botStore.bots(ids: botIDs)) ?? [:]).mapValues(\.name)
+        }
         let remapped = items.map { item -> PetActiveThreadItem in
-            guard let botID = (try? context.botStore.conversationLinked(to: item.threadID))?.botID else {
+            guard let botID = linked[item.threadID]?.botID else {
                 return item
             }
+            let chrome = CachedActiveThreadChrome(
+                workspaceID: nil,
+                workspaceName: "Bots",
+                providerName: nil,
+                threadTitle: destNames[botID],
+                route: .botsDesk(botID: botID)
+            )
+            nextChrome[item.threadID] = chrome
             return PetActiveThreadItem(
                 threadID: item.threadID,
                 workspaceID: nil,
@@ -1079,9 +1160,10 @@ public final class PetController {
                 threadTitle: destNames[botID],
                 startedAt: startedAtByThread[item.threadID],
                 lastUpdatePreview: item.lastUpdatePreview,
-                route: .botsDesk(botID: botID)
+                route: chrome.route
             )
         }
+        activeThreadChromeByID = nextChrome
         model.apply(activeThreads: remapped)
         // User-visible Active is empty → pet must leave work/plan even if EventBus
         // still holds a ghost run id (missed finished / stale projection lag).
@@ -1382,5 +1464,25 @@ public final class PetController {
 
     private func monotonicMilliseconds() -> Int64 {
         Int64(DispatchTime.now().uptimeNanoseconds / 1_000_000)
+    }
+}
+
+/// Painted pet-row chrome from the last durable projection. Progress ticks
+/// rebuild `PetActiveThreadItem` from this instead of SQLite.
+private struct CachedActiveThreadChrome {
+    let workspaceID: WorkspaceID?
+    let workspaceName: String?
+    let providerName: String?
+    let threadTitle: String?
+    let route: PetAttentionRoute
+
+    static func empty(threadID: AgentThreadID) -> CachedActiveThreadChrome {
+        CachedActiveThreadChrome(
+            workspaceID: nil,
+            workspaceName: nil,
+            providerName: nil,
+            threadTitle: nil,
+            route: .agentThread(threadID: threadID, workspaceID: nil)
+        )
     }
 }

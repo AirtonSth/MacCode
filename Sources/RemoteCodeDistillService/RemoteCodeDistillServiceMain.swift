@@ -860,6 +860,12 @@ struct RemoteCodeDistillServiceMain {
                   !value.isEmpty else { continue }
             request.setValue(value, forHTTPHeaderField: header)
         }
+        if request.value(forHTTPHeaderField: "X-RemoteCode-Thread-ID") == nil {
+            let fallback = TokenSaverRecoveryRequestContext.savingsThreadID(environment: environment)
+            if !fallback.isEmpty {
+                request.setValue(fallback, forHTTPHeaderField: "X-RemoteCode-Thread-ID")
+            }
+        }
     }
 
     private static func hasCompleteRecoveryScope(environment: [String: String]) -> Bool {

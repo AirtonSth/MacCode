@@ -62,9 +62,9 @@ public struct TokenSaverDailyEconomyRecord: Sendable, Equatable {
 /// Persists per-day credible totals so Week = Σ(day.total_credible).
 /// Does **not** backfill historical days; only upserts days that are recomputed going forward.
 public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
-    /// v7: restore permanent thread totals × min(runs−1, 50) amort for the
-    /// Estimated save headline (product-trusted ~476M Today stack).
-    public static let formulaVersion = "credible_v7"
+    /// v10: extra-turn cache amort is uncapped; dialect/graphify are granted
+    /// raw (no 4× measured / 12% billed scale-down); unscoped wraps amortize.
+    public static let formulaVersion = "credible_v10"
 
     private let db: SQLiteDB
     private let calendar: Calendar

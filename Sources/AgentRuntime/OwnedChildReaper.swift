@@ -19,12 +19,18 @@ public enum OwnedChildReaper {
         return nil
     }
 
-    /// Sends TERM, then KILL, then blocking waitpid so the child cannot remain `<defunct>`.
+    /// Sends TERM, then KILL, then waitpid so the child cannot remain `<defunct>`.
+    ///
+    /// `waitForZombie` defaults on so callers that own the child drain the
+    /// zombie. Usage-refresher PTY probes pass `false`: a child stuck in
+    /// uninterruptible sleep must not pin an overlapping refresh forever
+    /// (freeze-class: two concurrent `waitpid(0)` on Claude `/usage`).
     @discardableResult
     public static func terminateAndReap(
         pid: pid_t,
         termGrace: TimeInterval = 0.8,
-        killGrace: TimeInterval = 0.4
+        killGrace: TimeInterval = 0.4,
+        waitForZombie: Bool = true
     ) -> Outcome {
         guard pid > 0 else { return .alreadyReaped }
 
@@ -41,6 +47,8 @@ public enum OwnedChildReaper {
         if let status = waitUntil(pid: pid, deadline: Date().addingTimeInterval(max(0, killGrace))) {
             return .reaped(exitStatus: status)
         }
+
+        guard waitForZombie else { return .timedOutStillRunning }
 
         // Final blocking wait — zombies exist only until waitpid.
         var status: Int32 = 0

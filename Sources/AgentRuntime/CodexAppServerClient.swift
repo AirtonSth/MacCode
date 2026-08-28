@@ -226,7 +226,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
         self.foreignUserUID = runAsUser.flatMap { $0.uid == getuid() ? nil : $0.uid }
         if let forkProtocolSupportOverride {
             self.forkProtocolSupport = forkProtocolSupportOverride
-        } else if arguments == ["app-server"] {
+        } else if arguments.first == "app-server" {
             self.forkProtocolSupport = CodexForkProtocolSupport.probe(
                 binary: path,
                 environment: environment

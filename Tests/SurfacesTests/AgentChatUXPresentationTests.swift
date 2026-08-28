@@ -51,6 +51,86 @@ final class AgentChatUXPresentationTests: XCTestCase {
         XCTAssertNil(AgentWorkingStripPresentation.label(phase: .idle, elapsedSeconds: 10))
     }
 
+    func test_workingLabel_namesTheShellHoldingStopInsteadOfGenericAwaiting() {
+        // WHY: "Awaiting · 3h 36m" hid a sticky local_bash (Wait for CI). The
+        // pill must name the CLI task so Stop is diagnosable without expanding
+        // work logs.
+        let hold = AgentBackgroundHoldSummary(tasks: [
+            AgentBackgroundTask(id: "T1", kind: .shell, description: "Wait for CI")
+        ])
+        XCTAssertEqual(
+            AgentWorkingStripPresentation.label(
+                phase: .awaitingBackground,
+                elapsedSeconds: 3 * 3600 + 36 * 60,
+                hold: hold
+            ),
+            "1 shell — Wait for CI · 3h 36m"
+        )
+        XCTAssertEqual(
+            AgentWorkingStripPresentation.label(phase: .awaitingBackground, elapsedSeconds: 12),
+            "Awaiting · 12s",
+            "completed-awaiting (no live CLI tasks) keeps the generic pill"
+        )
+    }
+
+    func test_holdSummary_nounAndPrimaryDescriptionRules() {
+        let ci = AgentBackgroundTask(id: "T1", kind: .shell, description: "Wait for CI")
+        let record = AgentBackgroundTask(id: "T2", kind: .shell, description: "Playwright record")
+        let agent = AgentBackgroundTask(id: "A1", kind: .agent, description: "Review PR")
+        XCTAssertEqual(AgentBackgroundHoldSummary(tasks: [ci]).pillBase, "1 shell — Wait for CI")
+        XCTAssertEqual(AgentBackgroundHoldSummary(tasks: [ci]).holdingHeadline, "Holding: 1 shell — Wait for CI")
+        XCTAssertEqual(
+            AgentBackgroundHoldSummary(tasks: [ci, record]).pillBase,
+            "2 shells",
+            "two descriptions must not pick one title as if it were the only job"
+        )
+        XCTAssertEqual(
+            AgentBackgroundHoldSummary(tasks: [ci, record]).extraDescriptionsLine,
+            "Wait for CI · Playwright record"
+        )
+        XCTAssertEqual(
+            AgentBackgroundHoldSummary(tasks: [ci, AgentBackgroundTask(id: "T3", kind: .shell)]).pillBase,
+            "2 shells",
+            "one known title must not be attributed to an aggregate with another untitled task"
+        )
+        XCTAssertEqual(AgentBackgroundHoldSummary(tasks: [ci, agent]).nounLabel, "1 shell · 1 agent")
+        XCTAssertEqual(
+            AgentBackgroundHoldSummary(tasks: [
+                AgentBackgroundTask(id: "old", kind: .unknown)
+            ]).nounLabel,
+            "1 shell",
+            "id-only snapshots keep Claude CLI '1 shell' wording"
+        )
+    }
+
+    func test_workingCopy_holdBeatsCatRotation() {
+        let hold = AgentBackgroundHoldSummary(tasks: [
+            AgentBackgroundTask(id: "T1", kind: .shell, description: "Wait for CI")
+        ])
+        XCTAssertEqual(
+            AgentChatWorkingCopy.statusLabel(
+                context: nil,
+                elapsedSeconds: 95,
+                seed: 42,
+                hold: hold
+            ),
+            "Holding: 1 shell — Wait for CI · 1m 35s"
+        )
+        XCTAssertEqual(
+            AgentChatWorkingCopy.accessibilityLabel(
+                context: nil,
+                elapsedSeconds: 95,
+                hold: hold
+            ),
+            "Holding: 1 shell — Wait for CI · 1m 35s"
+        )
+        XCTAssertNotEqual(
+            AgentChatWorkingCopy.statusLabel(context: nil, elapsedSeconds: 95, seed: 42, hold: hold),
+            AgentWorkingCatCopy.statusLabel(elapsedSeconds: 95, seed: 42),
+            "a named shell must not hide behind rotating cat copy"
+        )
+    }
+
     func test_peerActivityCopyNamesWaitingBotAndWork() {
         let waiting = BotPeerActivitySnapshot(
             phase: .waiting,

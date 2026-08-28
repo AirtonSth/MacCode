@@ -180,6 +180,9 @@ public protocol CommandRouting: AnyObject {
     /// thread without issuing one query per thread.
     func threadIdsWithMessages() throws -> Set<AgentThreadID>
     func threadIdsWithMessagesOffMain() async throws -> Set<AgentThreadID>
+    /// Existence only for `provider_locked` on single-thread payloads.
+    /// `agent.thread.list` uses `threadIdsWithMessages()` once instead.
+    func agentThreadHasMessages(thread: AgentThreadID) throws -> Bool
     func getAgentMessage(id: AgentMessageID) throws -> AgentMessage?
     func getAgentMessageBodyChunk(
         id: AgentMessageID,
@@ -348,6 +351,10 @@ public extension CommandRouting {
     func tokenSaverDigest() -> JSONValue? { nil }
 
     func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws {}
+
+    func agentThreadHasMessages(thread: AgentThreadID) throws -> Bool {
+        !(try listAgentMessages(thread: thread, limit: 1).isEmpty)
+    }
 
     func closeWorkspace(_ id: WorkspaceID) throws {
         try closeWorkspace(id, publishEvent: true)
@@ -5266,6 +5273,6 @@ public final class JSONRPCDispatcher {
     }
 
     private func providerLocked(_ thread: AgentThread) -> Bool {
-        !((try? router.listAgentMessages(thread: thread.id, limit: 1)) ?? []).isEmpty
+        (try? router.agentThreadHasMessages(thread: thread.id)) ?? false
     }
 }

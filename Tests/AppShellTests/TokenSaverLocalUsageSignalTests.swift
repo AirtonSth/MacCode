@@ -119,6 +119,85 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         )
     }
 
+    /// WHY: Today "Estimated save 2.6M" was day-measured × 200. A long thread
+    /// with lifetime savings active today must use permanent saved × (runs − 1).
+    func test_todayEstimatedSave_usesPermanentThreadAmortNotDayMeasuredCap() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2TokenSaverTodayAmort-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true))
+        let repo = context.tokenSaverSavingsRepo
+        let now = Date()
+        let yesterday = now.addingTimeInterval(-86_400)
+        let thread = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+        XCTAssertEqual(
+            try repo.record(
+                provider: "claude",
+                mode: "command-output",
+                inputTokens: 3_000_000,
+                outputTokens: 0,
+                savedTokens: 3_000_000,
+                delivered: true,
+                threadID: thread,
+                idempotencyKey: "lifetime-base",
+                at: yesterday
+            ),
+            3_000_000
+        )
+        for index in 0..<50 {
+            _ = try repo.record(
+                provider: "claude",
+                mode: "command-output",
+                inputTokens: 20,
+                outputTokens: 10,
+                savedTokens: 10,
+                delivered: true,
+                threadID: thread,
+                idempotencyKey: "lifetime-run-\(index)",
+                at: yesterday
+            )
+        }
+        XCTAssertEqual(
+            try repo.record(
+                provider: "claude",
+                mode: "command-output",
+                inputTokens: 13_000,
+                outputTokens: 0,
+                savedTokens: 13_000,
+                delivered: true,
+                threadID: thread,
+                idempotencyKey: "today-active",
+                at: now
+            ),
+            13_000
+        )
+
+        context.recomputeTokenSaverDailyEconomyToday(now: now)
+        let todayMs = context.tokenSaverDailyEconomyRepo.dayStartMs(for: now)
+        let todayEnd = context.tokenSaverDailyEconomyRepo.dayEndMsExclusive(for: now)
+        let todayMeasured = try context.tokenSaverDailyEconomyRepo.measuredPipes(
+            dayStartMs: todayMs,
+            dayEndMsExclusive: todayEnd
+        )
+        XCTAssertEqual(todayMeasured, 13_000)
+        let row = try XCTUnwrap(context.tokenSaverDailyEconomyRepo.record(dayStartMs: todayMs))
+        let dayMeasuredCap = todayMeasured * TokenSaverBareUserEstimator.cacheAmortizationMaxMultipleOfMeasured
+        XCTAssertEqual(dayMeasuredCap, 2_600_000)
+        XCTAssertGreaterThan(
+            row.totalCredible,
+            dayMeasuredCap,
+            "Today Estimated save must not stay at the 2.6M day-measured × 200 cap"
+        )
+        XCTAssertGreaterThan(
+            row.totalCredible,
+            3_000_000 * TokenSaverBareUserEstimator.cacheAmortizationMaxExtraTurns,
+            "52 runs must beat the old 50 extra-turn cap"
+        )
+        XCTAssertEqual(row.formulaVersion, TokenSaverDailyEconomyRepository.formulaVersion)
+    }
+
     /// WHY: a 7-day heal used to construct a fresh SettingsStore + UsageStore
     /// per day (empty cache → 7 SQLite reads + 7 usage.json decodes) on the
     /// MainActor. Shared snapshot must load once per window call.
@@ -260,6 +339,48 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
             "thread provider must be SQLite-loaded once per thread, not per itemDelta"
         )
         XCTAssertEqual(context.graphifyProviderLabel(for: threadId), "unknown")
+    }
+
+    /// WHY: the first Graphify itemDelta used to full-get 26 columns + routing
+    /// JSON just to read provider. listChrome already returns that field.
+    func test_graphifyProviderLabel_usesListChromeWithoutDurableGet() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyProviderChrome-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        let thread = AgentThread(title: "graphify", provider: .grok, model: "grok-4")
+        try context.threadRepo.upsert(thread)
+        let getsBefore = context.threadRepo.durableGetCountForTesting
+        let chromeBefore = context.threadRepo.listChromeCallCountForTesting
+        context.graphifyProviderLookupCountForTesting = 0
+
+        XCTAssertEqual(context.graphifyProviderLabel(for: thread.id), "grok")
+        XCTAssertEqual(context.graphifyProviderLookupCountForTesting, 1)
+        XCTAssertEqual(
+            context.threadRepo.durableGetCountForTesting,
+            getsBefore,
+            "first Graphify provider lookup must not compile a full 26-column get"
+        )
+        XCTAssertEqual(
+            context.threadRepo.listChromeCallCountForTesting,
+            chromeBefore + 1
+        )
+        XCTAssertEqual(context.graphifyProviderLabel(for: thread.id), "grok")
+        XCTAssertEqual(context.graphifyProviderLookupCountForTesting, 1)
+        XCTAssertEqual(context.threadRepo.listChromeCallCountForTesting, chromeBefore + 1)
+
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/AppShell/AppContext.swift"),
+            encoding: .utf8
+        )
+        let range = try XCTUnwrap(source.range(of: "func graphifyProviderLabel(for threadId: AgentThreadID)"))
+        let body = String(source[range.lowerBound...].prefix(900))
+        XCTAssertTrue(body.contains("threadRepo.listChrome(ids: [threadId])"))
+        XCTAssertFalse(body.contains("threadRepo.get(id: threadId)"))
     }
 
     /// WHY: after a Graphify invocation is recorded, later itemDelta chunks

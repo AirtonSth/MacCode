@@ -1095,6 +1095,8 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     private let processIsAlive: @Sendable (Int32) -> Bool
     private let reservationLock = NSLock()
     private var reservations: [String: (tokens: Int?, costMicros: Int?, deadlineAt: Date?)] = [:]
+    /// Records whether `activityReceipts` (JSON/SQLite decode) ran on the MainActor.
+    public let activityReceiptsThreadProbeForTesting = ActivityReceiptsThreadProbe()
 
     public init(
         repository: AgentOrchestrationRepository = AgentOrchestrationRepository(),
@@ -2290,6 +2292,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         limit: Int,
         persistLifecycleReconciliation: Bool
     ) throws -> [AgentOrchestrationAdmissionReceipt] {
+        activityReceiptsThreadProbeForTesting.recordCurrentThread()
         // Nested function (not a stored closure) so the existing body can share
         // mutation vs read-only transaction wrappers without explicit `self.` noise.
         func loadBody() throws -> (receipts: [AgentOrchestrationAdmissionReceipt], reservationIds: [String]) {
@@ -3215,5 +3218,42 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
 
     private static func sha256Hex(_ data: Data) -> String {
         AgentDelegationCapability.hexDigest(SHA256.hash(data: data))
+    }
+}
+
+/// Counts `activityReceipts` calls by thread. MainActor hits are the freeze-class hang.
+public final class ActivityReceiptsThreadProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var mainThreadCalls = 0
+    private var backgroundCalls = 0
+
+    public init() {}
+
+    public func recordCurrentThread() {
+        let isMain = Thread.isMainThread
+        lock.lock()
+        if isMain {
+            mainThreadCalls += 1
+        } else {
+            backgroundCalls += 1
+        }
+        lock.unlock()
+    }
+
+    public var mainThreadCallCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return mainThreadCalls
+    }
+
+    public var backgroundCallCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return backgroundCalls
+    }
+
+    public func reset() {
+        lock.lock()
+        mainThreadCalls = 0
+        backgroundCalls = 0
+        lock.unlock()
     }
 }

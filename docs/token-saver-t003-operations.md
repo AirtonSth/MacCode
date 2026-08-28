@@ -12,7 +12,7 @@ This runbook governs every Token Saver lane in the macOS app and local sidecar. 
 
 ## Scope and retention
 
-Recovery authority is the exact tuple `workspace/project/thread/provider/attempt` plus an opaque capability. Initial admission limits are 32 MiB/object, 512 MiB/thread, 2 GiB/project, and 5 GiB/global. New lossy storage stops when free disk is below the greater of 5 GiB or 10%.
+Recovery authority is the exact tuple `workspace/project/thread/provider/attempt` plus an opaque capability. Initial admission limits are 32 MiB/object, 512 MiB/thread, 2 GiB/project, and 5 GiB/global. New lossy storage stops when free disk is below a fixed 5 GiB (not a percentage of volume size).
 
 Per-project retention is visible in Token Saver project controls. `0 days` means no persistent duplicate content. The lifecycle sweep runs at app startup, after retention changes, and after rollover creation. It:
 

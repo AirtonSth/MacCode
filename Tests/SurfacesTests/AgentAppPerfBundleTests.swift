@@ -530,6 +530,107 @@ final class AgentAppPerfBundleTests: XCTestCase {
                        "status event for a thread in a different workspace must be filtered by the cache and not update this surface's status")
     }
 
+    /// WHY: every mounted Agent App observes coordinator status. A cache miss
+    /// used to full-get the 26-column row (plus routing JSON) just to learn
+    /// workspace_id, then drop foreign events. The probe is the cheap path
+    /// already proven on rail selection.
+    func test_didChangeStatus_cacheMiss_usesWorkspaceIdProbeNotDurableGet() async throws {
+        let (vm, threadRepo) = try makeVM()
+        let initialStatus = vm.status
+        let foreign = AgentThread(
+            workspaceId: WorkspaceID(),
+            title: "foreign",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        try threadRepo.upsert(foreign)
+
+        let getsBefore = threadRepo.durableGetCountForTesting
+        let probesBefore = threadRepo.workspaceIdProbeCountForTesting
+        vm.runCoordinator(
+            vm.coordinator,
+            didChangeStatus: .running,
+            runId: AgentRunID(),
+            threadId: foreign.id
+        )
+        let deadline = Date().addingTimeInterval(4)
+        while threadRepo.workspaceIdProbeCountForTesting == probesBefore && Date() < deadline {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(
+            threadRepo.durableGetCountForTesting,
+            getsBefore,
+            "foreign cache-miss status must not compile a full 26-column get"
+        )
+        XCTAssertEqual(
+            threadRepo.workspaceIdProbeCountForTesting,
+            probesBefore + 1,
+            "foreign cache-miss status must probe workspace_id once"
+        )
+        XCTAssertEqual(vm.status, initialStatus)
+
+        let probesAfterMiss = threadRepo.workspaceIdProbeCountForTesting
+        vm.runCoordinator(
+            vm.coordinator,
+            didChangeStatus: .running,
+            runId: AgentRunID(),
+            threadId: foreign.id
+        )
+        let secondDeadline = Date().addingTimeInterval(1)
+        while Date() < secondDeadline {
+            await Task.yield()
+        }
+        XCTAssertEqual(
+            threadRepo.workspaceIdProbeCountForTesting,
+            probesAfterMiss,
+            "a cached foreign workspace must not re-probe on the next status event"
+        )
+        XCTAssertEqual(
+            threadRepo.durableGetCountForTesting,
+            getsBefore,
+            "a cached foreign workspace must not full-get on the next status event"
+        )
+    }
+
+    func test_lifecycleWorkspaceFilter_sourceUsesWorkspaceIdProbe() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            source.contains("private func resolvedWorkspaceID(for threadId: AgentThreadID)"),
+            "run-lifecycle fan-out must share one workspace probe helper"
+        )
+        XCTAssertTrue(source.contains("threadRepo.workspaceId(of: threadId)"))
+
+        func body(after needle: String, limit: Int) throws -> String {
+            let range = try XCTUnwrap(source.range(of: needle))
+            return String(source[range.lowerBound...].prefix(limit))
+        }
+        let queueBody = try body(after: "public func handleQueueLifecycleEvent(kind: String, threadId: String?, message: String?)", limit: 1600)
+        let finishBody = try body(after: "nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didFinish runId: AgentRunID, threadId: AgentThreadID, status: AgentRunStatus, finalMessage: String?, providerThreadId: String?)", limit: 2200)
+        let statusBody = try body(after: "nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didChangeStatus status: AgentRunStatus, runId: AgentRunID, threadId: AgentThreadID)", limit: 1800)
+        for (name, snippet) in [
+            ("handleQueueLifecycleEvent", queueBody),
+            ("didFinish", finishBody),
+            ("didChangeStatus", statusBody),
+        ] {
+            XCTAssertTrue(
+                snippet.contains("resolvedWorkspaceID(for:"),
+                "\(name) must resolve workspace membership via the probe helper"
+            )
+            XCTAssertFalse(
+                snippet.contains("threadRepo.get(id:"),
+                "\(name) must not full-get a thread just to read workspace_id"
+            )
+        }
+    }
+
     // MARK: - Stream quantum pure reduce
 
     /// WHY: production applies stream quanta off MainActor; the pure reducer must
@@ -550,6 +651,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
             status: .pending,
             lastErrorRecoverable: false,
             liveBackgroundShellCount: 0,
+            liveBackgroundTasks: [],
             runsAllowedToMarkActive: [run],
             entries: [
                 StreamQuantumEntry(event: .turnStarted(turnId: turnId), run: run, threadId: tid),
@@ -592,6 +694,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
             status: .pending,
             lastErrorRecoverable: false,
             liveBackgroundShellCount: 0,
+            liveBackgroundTasks: [],
             runsAllowedToMarkActive: [allowed],
             entries: [
                 StreamQuantumEntry(event: .turnStarted(turnId: "other"), run: denied, threadId: other),
@@ -1165,6 +1268,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
             status: .pending,
             lastErrorRecoverable: false,
             liveBackgroundShellCount: 0,
+            liveBackgroundTasks: [],
             runsAllowedToMarkActive: [run],
             entries: entries
         )
@@ -1346,6 +1450,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
             status: .running,
             lastErrorRecoverable: false,
             liveBackgroundShellCount: 0,
+            liveBackgroundTasks: [],
             suppressStaleActivePlanUpdates: false,
             seedRunStartedAt: false,
             runThreadBindings: [:],
@@ -2134,6 +2239,621 @@ final class AgentAppPerfBundleTests: XCTestCase {
         XCTAssertGreaterThan(
             improvement, 5.0,
             "debit-based enforceAggregate must beat full recount by ≥5% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+    }
+
+    // MARK: - Thread selection cache-first (no MainActor SQLite get on rail hits)
+
+    /// Rail-resident selection must not compile `threadRepo.get` (row + routing)
+    /// on MainActor. Clicking a visible thread has to acknowledge from memory.
+    func test_selectThread_railHit_skipsDurableLookup() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "rail-a")
+        let first = try XCTUnwrap(vm.selectedThreadId)
+        vm.createThread(title: "rail-b")
+        let second = try XCTUnwrap(vm.selectedThreadId)
+        XCTAssertNotEqual(first, second)
+        let lookupsBefore = vm.durableThreadSelectionLookupCountForTesting
+        let probesBefore = vm.durableThreadExistenceProbeCountForTesting
+        vm.selectThread(first)
+        XCTAssertEqual(vm.selectedThreadId, first,
+                       "selecting a rail thread must still bind that thread")
+        XCTAssertTrue(vm.lastThreadSelectionUsedRailForTesting,
+                      "a thread already painted on the rail must not wait on a full SQLite get")
+        XCTAssertEqual(
+            vm.durableThreadSelectionLookupCountForTesting,
+            lookupsBefore,
+            "rail hits must not increment the durable full-get counter"
+        )
+        XCTAssertEqual(
+            vm.durableThreadExistenceProbeCountForTesting,
+            probesBefore,
+            "rail switch must publish before the existence probe"
+        )
+        let deadline = Date().addingTimeInterval(1)
+        while vm.durableThreadExistenceProbeCountForTesting == probesBefore,
+              Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertEqual(
+            vm.durableThreadExistenceProbeCountForTesting,
+            probesBefore + 1,
+            "existence probe still runs after the first frame"
+        )
+        XCTAssertEqual(vm.selectedThreadId, first)
+    }
+
+    /// Same-thread reselect (rail re-click / host refresh) used to hit SQLite
+    /// before taking the soft path. That hitch is gone: stay on the rail row.
+    func test_selectThread_sameThreadReselect_staysOnRail() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "open")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        XCTAssertTrue(vm.lastThreadSelectionUsedRailForTesting)
+        let lookupsBefore = vm.durableThreadSelectionLookupCountForTesting
+        let probesBefore = vm.durableThreadExistenceProbeCountForTesting
+        vm.selectThread(tid)
+        XCTAssertEqual(vm.selectedThreadId, tid)
+        XCTAssertTrue(vm.lastThreadSelectionUsedRailForTesting,
+                      "re-selecting the already-open thread must stay cache-first")
+        XCTAssertEqual(vm.durableThreadSelectionLookupCountForTesting, lookupsBefore)
+        XCTAssertEqual(
+            vm.durableThreadExistenceProbeCountForTesting,
+            probesBefore,
+            "same-thread reselect must not re-probe SQLite"
+        )
+    }
+
+    /// Threads not on this surface's rail still load from SQLite, and a
+    /// different-workspace row is rejected instead of being bound.
+    func test_selectThread_cacheMiss_usesDurableLookup() throws {
+        let (vm, threadRepo) = try makeVM()
+        let foreign = AgentThread(
+            workspaceId: WorkspaceID(),
+            title: "foreign",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        try threadRepo.upsert(foreign)
+        let local = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "unlisted",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        try threadRepo.upsert(local)
+        XCTAssertFalse(vm.threads.contains(where: { $0.id == local.id }))
+
+        let lookupsBefore = vm.durableThreadSelectionLookupCountForTesting
+        vm.selectThread(foreign.id)
+        XCTAssertNil(vm.selectedThreadId,
+                     "a foreign-workspace durable row must not become the selection")
+        XCTAssertTrue(
+            vm.statusMessage.contains("another workspace"),
+            "cache-miss workspace rejection must keep the existing error copy"
+        )
+        XCTAssertEqual(
+            vm.durableThreadSelectionLookupCountForTesting,
+            lookupsBefore + 1,
+            "a rail miss must consult durable storage"
+        )
+
+        vm.selectThread(local.id)
+        XCTAssertEqual(vm.selectedThreadId, local.id,
+                       "a same-workspace thread missing from the rail must still open from SQLite")
+        XCTAssertFalse(vm.lastThreadSelectionUsedRailForTesting)
+        XCTAssertEqual(vm.durableThreadSelectionLookupCountForTesting, lookupsBefore + 2)
+    }
+
+    func test_railThreadForSelection_rejectsOtherWorkspaceAndMisses() {
+        let workspace = WorkspaceID()
+        let other = WorkspaceID()
+        let local = AgentThread(
+            workspaceId: workspace,
+            title: "local",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        let foreign = AgentThread(
+            workspaceId: other,
+            title: "foreign",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        let rail = [local, foreign]
+        XCTAssertEqual(
+            AgentAppViewModel.railThreadForSelection(
+                id: local.id,
+                workspaceID: workspace,
+                rail: rail
+            )?.id,
+            local.id
+        )
+        XCTAssertNil(
+            AgentAppViewModel.railThreadForSelection(
+                id: foreign.id,
+                workspaceID: workspace,
+                rail: rail
+            ),
+            "a painted row from another workspace must not be treated as a cache hit"
+        )
+        XCTAssertNil(
+            AgentAppViewModel.railThreadForSelection(
+                id: AgentThreadID(),
+                workspaceID: workspace,
+                rail: rail
+            )
+        )
+    }
+
+    /// The lookup this change removes (two SQLite statements + ISO parsing)
+    /// must stay cheaper than the durable get on the same machine.
+    func test_selectThread_railHit_fasterThanDurableGet() throws {
+        let (vm, threadRepo) = try makeVM()
+        vm.createThread(title: "lookup-cost")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        let rail = vm.threads
+        let workspaceID = vm.workspaceID
+        let warmup = 3
+        let samples = 5
+        let iterations = 200
+
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        func timeMs(_ body: () throws -> Void) rethrows -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            try body()
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup {
+            _ = AgentAppViewModel.railThreadForSelection(
+                id: tid, workspaceID: workspaceID, rail: rail
+            )
+            _ = try threadRepo.workspaceId(of: tid)
+            _ = try threadRepo.get(id: tid)
+        }
+
+        var probeSamples: [Double] = []
+        var getSamples: [Double] = []
+        probeSamples.reserveCapacity(samples)
+        getSamples.reserveCapacity(samples)
+        for _ in 0..<samples {
+            probeSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = AgentAppViewModel.railThreadForSelection(
+                        id: tid, workspaceID: workspaceID, rail: rail
+                    )
+                    _ = try threadRepo.workspaceId(of: tid)
+                }
+            })
+            getSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = try threadRepo.get(id: tid)
+                }
+            })
+        }
+        let probeMed = median(probeSamples)
+        let getMed = median(getSamples)
+        let improvement = (getMed - probeMed) / getMed * 100.0
+        NSLog(
+            "[perf-proof] thread-select rail+exists_ms=%@ durable_get_ms=%@ improvement_pct=%.2f probe=%@ get=%@",
+            String(probeMed), String(getMed), improvement,
+            String(describing: probeSamples), String(describing: getSamples)
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5.0,
+            "rail chrome + existence probe must beat durable get by ≥5% (got \(improvement)%; probe=\(probeMed)ms get=\(getMed)ms)"
+        )
+    }
+
+    /// WHY: queue-while-running and startProviderRun used to full-get the
+    /// selected thread just to read routing the painted rail already JOINs.
+    func test_sendRouting_usesPaintedRailWithoutDurableGet() throws {
+        let (vm, threadRepo) = try makeVM()
+        vm.createThread(title: "send-routing")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        XCTAssertTrue(vm.threads.contains(where: { $0.id == tid }))
+        let getsBefore = threadRepo.durableGetCountForTesting
+        let routing = vm.routingConfigurationForSendForTesting(threadId: tid)
+        XCTAssertEqual(routing.mode, vm.threads.first { $0.id == tid }?.effectiveRoutingConfiguration.mode)
+        XCTAssertEqual(
+            threadRepo.durableGetCountForTesting,
+            getsBefore,
+            "send routing must use the painted rail, not a 26-column get"
+        )
+        let missing = AgentThreadID()
+        let probesBefore = threadRepo.routingConfigurationProbeCountForTesting
+        _ = vm.routingConfigurationForSendForTesting(threadId: missing)
+        XCTAssertEqual(
+            threadRepo.durableGetCountForTesting,
+            getsBefore,
+            "a thread missing from the rail must probe routing, not a 26-column get"
+        )
+        XCTAssertEqual(threadRepo.routingConfigurationProbeCountForTesting, probesBefore + 1)
+    }
+
+    func test_sendRouting_sourceUsesPaintedRail() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("private func routingConfigurationForSend(threadId: AgentThreadID)"))
+        XCTAssertTrue(source.contains("threads.first(where: { $0.id == threadId })"))
+        let queueBodyRange = try XCTUnwrap(source.range(of: "private func enqueuePromptWhileRunning("))
+        let queueBody = String(source[queueBodyRange.lowerBound...].prefix(900))
+        XCTAssertTrue(queueBody.contains("routingConfigurationForSend(threadId: selectedThreadId)"))
+        XCTAssertFalse(queueBody.contains("threadRepo.get(id: selectedThreadId)"))
+        let startBodyRange = try XCTUnwrap(source.range(of: "private func startProviderRun("))
+        let startBody = String(source[startBodyRange.lowerBound...].prefix(2200))
+        XCTAssertTrue(startBody.contains("routingConfigurationForSend(threadId:"))
+        XCTAssertFalse(startBody.contains("threadRepo.get(id: $0)"))
+    }
+
+    func test_sendRouting_paintedRail_fasterThanDurableGet() throws {
+        let (vm, threadRepo) = try makeVM()
+        vm.createThread(title: "send-bench")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        let warmup = 3
+        let samples = 5
+        let iterations = 200
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        func timeMs(_ body: () throws -> Void) rethrows -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            try body()
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0
+        }
+        for _ in 0..<warmup {
+            _ = vm.routingConfigurationForSendForTesting(threadId: tid)
+            _ = try threadRepo.get(id: tid)
+        }
+        var railSamples: [Double] = []
+        var getSamples: [Double] = []
+        railSamples.reserveCapacity(samples)
+        getSamples.reserveCapacity(samples)
+        for _ in 0..<samples {
+            railSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = vm.routingConfigurationForSendForTesting(threadId: tid)
+                }
+            })
+            getSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = try threadRepo.get(id: tid)
+                }
+            })
+        }
+        let railMed = median(railSamples)
+        let getMed = median(getSamples)
+        let improvement = (getMed - railMed) / getMed * 100.0
+        NSLog(
+            "[perf-proof] send-routing rail_ms=%@ durable_get_ms=%@ improvement_pct=%.2f rail=%@ get=%@",
+            String(railMed), String(getMed), improvement,
+            String(describing: railSamples), String(describing: getSamples)
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5.0,
+            "painted-rail send routing must beat durable get by ≥5% (got \(improvement)%; rail=\(railMed)ms get=\(getMed)ms)"
+        )
+    }
+
+    /// WHY: bot-peer apply used to full-get 26 columns + routing JSON just to
+    /// confirm workspace membership before loading the message row.
+    func test_applyPersistedBotPeerMessage_usesWorkspaceIdProbeWithoutDurableGet() throws {
+        let (vm, threadRepo) = try makeVM()
+        vm.createThread(title: "peer-apply")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        let messageID = AgentMessageID()
+        try vm.messageRepo.append(AgentMessage(
+            id: messageID,
+            threadId: tid,
+            role: .assistant,
+            content: "peer"
+        ))
+        let getsBefore = threadRepo.durableGetCountForTesting
+        vm.applyPersistedBotPeerMessage(messageID: messageID, threadId: tid)
+        XCTAssertEqual(vm.messages.first?.id, messageID)
+        XCTAssertEqual(
+            threadRepo.durableGetCountForTesting,
+            getsBefore,
+            "same-workspace peer apply must not compile a full 26-column get"
+        )
+
+        let foreign = AgentThread(
+            workspaceId: WorkspaceID(),
+            title: "foreign-peer",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        try threadRepo.upsert(foreign)
+        let foreignMessageID = AgentMessageID()
+        try vm.messageRepo.append(AgentMessage(
+            id: foreignMessageID,
+            threadId: foreign.id,
+            role: .assistant,
+            content: "nope"
+        ))
+        let getsAfterForeignInsert = threadRepo.durableGetCountForTesting
+        let probesBeforeForeign = threadRepo.workspaceIdProbeCountForTesting
+        let countBefore = vm.messages.count
+        vm.applyPersistedBotPeerMessage(messageID: foreignMessageID, threadId: foreign.id)
+        XCTAssertEqual(vm.messages.count, countBefore)
+        XCTAssertEqual(
+            threadRepo.durableGetCountForTesting,
+            getsAfterForeignInsert,
+            "foreign-workspace peer apply must fail on the workspace_id probe, not a full get"
+        )
+        XCTAssertEqual(
+            threadRepo.workspaceIdProbeCountForTesting,
+            probesBeforeForeign + 1
+        )
+    }
+
+    func test_applyPersistedBotPeerMessage_sourceUsesWorkspaceIdProbe() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        let range = try XCTUnwrap(source.range(of: "public func applyPersistedBotPeerMessage("))
+        let body = String(source[range.lowerBound...].prefix(900))
+        XCTAssertTrue(body.contains("resolvedWorkspaceID(for: threadId)"))
+        XCTAssertFalse(body.contains("threadRepo.get(id: threadId)"))
+    }
+
+    func test_applyPersistedBotPeerMessage_workspaceIdProbe_fasterThanDurableGet() throws {
+        let (vm, threadRepo) = try makeVM()
+        vm.createThread(title: "peer-bench")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        let warmup = 3
+        let samples = 5
+        let iterations = 200
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        func timeMs(_ body: () throws -> Void) rethrows -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            try body()
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0
+        }
+        for _ in 0..<warmup {
+            _ = try threadRepo.workspaceId(of: tid)
+            _ = try threadRepo.get(id: tid)
+        }
+        var probeSamples: [Double] = []
+        var getSamples: [Double] = []
+        probeSamples.reserveCapacity(samples)
+        getSamples.reserveCapacity(samples)
+        for _ in 0..<samples {
+            probeSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = try threadRepo.workspaceId(of: tid)
+                }
+            })
+            getSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = try threadRepo.get(id: tid)
+                }
+            })
+        }
+        let probeMed = median(probeSamples)
+        let getMed = median(getSamples)
+        let improvement = (getMed - probeMed) / getMed * 100.0
+        NSLog(
+            "[perf-proof] peer-apply workspace_probe_ms=%@ durable_get_ms=%@ improvement_pct=%.2f probe=%@ get=%@",
+            String(probeMed), String(getMed), improvement,
+            String(describing: probeSamples), String(describing: getSamples)
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5.0,
+            "workspace_id probe must beat durable get by ≥5% (got \(improvement)%; probe=\(probeMed)ms get=\(getMed)ms)"
+        )
+    }
+
+    /// WHY: peer reconcile used to full-get 26 columns + routing JSON every ~1s
+    /// while a peer was waiting, just to copy durable status.
+    func test_peerReconcile_usesStatusProbeWithoutDurableGet() async throws {
+        let (vm, threadRepo) = try makeVM()
+        vm.botPeerReconciliationIntervalNanoseconds = 60_000_000_000
+        vm.createThread(title: "peer-reconcile")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        let peer = BotDefinition(handle: "quinn", name: "Quinn", title: "CRM", description: "")
+        let messageID = AgentMessageID()
+        try vm.messageRepo.append(AgentMessage(
+            id: messageID,
+            threadId: tid,
+            role: .assistant,
+            content: BotPeerTranscript.encode(peer: peer, text: "hello")
+        ))
+        vm.applyPersistedBotPeerMessage(messageID: messageID, threadId: tid)
+        XCTAssertEqual(vm.status, .pending)
+        let settle = Date().addingTimeInterval(0.2)
+        while Date() < settle { await Task.yield() }
+        var stored = try XCTUnwrap(try threadRepo.get(id: tid))
+        stored.status = .completed
+        try threadRepo.upsert(stored)
+        let probesBefore = threadRepo.statusProbeCountForTesting
+        await vm.reconcilePersistedBotPeerActivities()
+        XCTAssertEqual(vm.status, .completed)
+        XCTAssertEqual(
+            threadRepo.statusProbeCountForTesting,
+            probesBefore + 1,
+            "peer reconcile must probe status once, not compile a full 26-column get"
+        )
+        XCTAssertNil(try threadRepo.status(of: AgentThreadID()))
+    }
+
+    func test_peerReconcile_sourceUsesStatusProbe() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        let range = try XCTUnwrap(source.range(of: "func reconcilePersistedBotPeerActivities()"))
+        let body = String(source[range.lowerBound...].prefix(3200))
+        XCTAssertTrue(body.contains("threadRepo.status(of: threadID)"))
+        XCTAssertFalse(body.contains("threadRepo.get(id: threadID)"))
+    }
+
+    func test_peerReconcile_statusProbe_fasterThanDurableGet() throws {
+        let (vm, threadRepo) = try makeVM()
+        vm.createThread(title: "peer-status-bench")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        let warmup = 3
+        let samples = 5
+        let iterations = 200
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        func timeMs(_ body: () throws -> Void) rethrows -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            try body()
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0
+        }
+        for _ in 0..<warmup {
+            _ = try threadRepo.status(of: tid)
+            _ = try threadRepo.get(id: tid)
+        }
+        var probeSamples: [Double] = []
+        var getSamples: [Double] = []
+        probeSamples.reserveCapacity(samples)
+        getSamples.reserveCapacity(samples)
+        for _ in 0..<samples {
+            probeSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = try threadRepo.status(of: tid)
+                }
+            })
+            getSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = try threadRepo.get(id: tid)
+                }
+            })
+        }
+        let probeMed = median(probeSamples)
+        let getMed = median(getSamples)
+        let improvement = (getMed - probeMed) / getMed * 100.0
+        NSLog(
+            "[perf-proof] peer-reconcile status_probe_ms=%@ durable_get_ms=%@ improvement_pct=%.2f probe=%@ get=%@",
+            String(probeMed), String(getMed), improvement,
+            String(describing: probeSamples), String(describing: getSamples)
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5.0,
+            "status probe must beat durable get by ≥5% (got \(improvement)%; probe=\(probeMed)ms get=\(getMed)ms)"
+        )
+    }
+
+    /// WHY: Stop on a stale Working projection used to full-get 26 columns +
+    /// routing JSON just to copy durable status onto the selected thread.
+    func test_stopStaleProjection_usesStatusProbeWithoutDurableGet() throws {
+        let (vm, threadRepo) = try makeVM()
+        vm.createThread(title: "stale-stop")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        var stored = try XCTUnwrap(try threadRepo.get(id: tid))
+        stored.status = .completed
+        try threadRepo.upsert(stored)
+        vm.status = .running
+        let probesBefore = threadRepo.statusProbeCountForTesting
+        vm.stop()
+        XCTAssertEqual(vm.status, .completed)
+        XCTAssertFalse(vm.isStopping)
+        XCTAssertEqual(
+            threadRepo.statusProbeCountForTesting,
+            probesBefore + 1,
+            "stale Stop must probe status once instead of a 26-column get"
+        )
+    }
+
+    func test_stopStaleProjection_sourceUsesStatusProbe() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        let range = try XCTUnwrap(source.range(of: "private func clearStaleRunProjection(threadId: AgentThreadID)"))
+        let body = String(source[range.lowerBound...].prefix(900))
+        XCTAssertTrue(body.contains("threadRepo.status(of: threadId)"))
+        XCTAssertFalse(body.contains("threadRepo.get(id: threadId)"))
+    }
+
+    func test_stopStaleProjection_statusProbe_fasterThanDurableGet() throws {
+        let (vm, threadRepo) = try makeVM()
+        vm.createThread(title: "stale-stop-bench")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        let warmup = 3
+        let samples = 5
+        let iterations = 200
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        func timeMs(_ body: () throws -> Void) rethrows -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            try body()
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0
+        }
+        for _ in 0..<warmup {
+            _ = try threadRepo.status(of: tid)
+            _ = try threadRepo.get(id: tid)
+        }
+        var probeSamples: [Double] = []
+        var getSamples: [Double] = []
+        probeSamples.reserveCapacity(samples)
+        getSamples.reserveCapacity(samples)
+        for _ in 0..<samples {
+            probeSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = try threadRepo.status(of: tid)
+                }
+            })
+            getSamples.append(try timeMs {
+                for _ in 0..<iterations {
+                    _ = try threadRepo.get(id: tid)
+                }
+            })
+        }
+        let probeMed = median(probeSamples)
+        let getMed = median(getSamples)
+        let improvement = (getMed - probeMed) / getMed * 100.0
+        NSLog(
+            "[perf-proof] stop-stale status_probe_ms=%@ durable_get_ms=%@ improvement_pct=%.2f probe=%@ get=%@",
+            String(probeMed), String(getMed), improvement,
+            String(describing: probeSamples), String(describing: getSamples)
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5.0,
+            "status probe must beat durable get by ≥5% (got \(improvement)%; probe=\(probeMed)ms get=\(getMed)ms)"
         )
     }
 

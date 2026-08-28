@@ -229,9 +229,13 @@ final class PersistenceTests: XCTestCase {
         ))
 
         var upserts = 0
+        var diagnosticUpdates = 0
         db.beforeStatementStepForTesting = { sql in
             if sql.contains("INSERT INTO provider_session_runtime") {
                 upserts += 1
+            }
+            if sql.contains("UPDATE provider_session_runtime") && sql.contains("last_event_kind") {
+                diagnosticUpdates += 1
             }
         }
         defer { db.beforeStatementStepForTesting = nil }
@@ -244,6 +248,7 @@ final class PersistenceTests: XCTestCase {
         )
 
         XCTAssertEqual(upserts, 0, "same lastEventKind must not WAL-write the session row")
+        XCTAssertEqual(diagnosticUpdates, 0, "same lastEventKind must not UPDATE diagnostics")
         XCTAssertEqual(
             repo.diagnosticsLoadCountForTesting, 0,
             "upsert already remembered diagnostics; same-kind flush must not SELECT runtime_payload_json"
@@ -260,18 +265,21 @@ final class PersistenceTests: XCTestCase {
             lastErrorMessage: nil,
             at: Date(timeIntervalSince1970: 1_800_000_000)
         )
-        XCTAssertEqual(upserts, 1, "a new lastEventKind must still persist")
-        XCTAssertEqual(repo.diagnosticsLoadCountForTesting, 1, "kind change still reads the row once")
+        XCTAssertEqual(upserts, 0, "a new lastEventKind must not rewrite the full row")
+        XCTAssertEqual(diagnosticUpdates, 1, "a new lastEventKind must still persist")
+        XCTAssertEqual(repo.diagnosticsLoadCountForTesting, 0, "kind change must not SELECT runtime_payload_json")
         try repo.updateDiagnostics(
             threadId: thread.id,
             lastEventKind: "itemDelta(item-2)",
             lastErrorMessage: nil,
             at: Date(timeIntervalSince1970: 1_850_000_000)
         )
-        XCTAssertEqual(repo.diagnosticsLoadCountForTesting, 1, "repeat same kind after write must not SELECT again")
+        XCTAssertEqual(repo.diagnosticsLoadCountForTesting, 0, "repeat same kind after write must not SELECT again")
+        XCTAssertEqual(diagnosticUpdates, 1, "repeat same kind after write must not UPDATE again")
         let afterChange = try XCTUnwrap(try repo.get(threadId: thread.id))
         XCTAssertEqual(afterChange.lastEventKind, "itemDelta(item-2)")
         XCTAssertEqual(afterChange.updatedAt.timeIntervalSince1970, 1_800_000_000)
+        XCTAssertEqual(afterChange.runtimePayloadJSON, payload)
 
         try repo.updateDiagnostics(
             threadId: thread.id,
@@ -279,11 +287,13 @@ final class PersistenceTests: XCTestCase {
             lastErrorMessage: "boom",
             at: Date(timeIntervalSince1970: 1_900_000_000)
         )
-        XCTAssertEqual(upserts, 2, "a new lastErrorMessage must still persist")
-        XCTAssertEqual(repo.diagnosticsLoadCountForTesting, 2, "error change still reads the row")
+        XCTAssertEqual(upserts, 0, "a new lastErrorMessage must not rewrite the full row")
+        XCTAssertEqual(diagnosticUpdates, 2, "a new lastErrorMessage must still persist")
+        XCTAssertEqual(repo.diagnosticsLoadCountForTesting, 0, "error change must not SELECT runtime_payload_json")
         let afterError = try XCTUnwrap(try repo.get(threadId: thread.id))
         XCTAssertEqual(afterError.lastErrorMessage, "boom")
         XCTAssertEqual(afterError.lastEventKind, "itemDelta(item-2)")
+        XCTAssertEqual(afterError.runtimePayloadJSON, payload)
     }
 
     func test_interruptedProviderSessionWithCursorIsRecoverableButCancelledSessionIsStopped() throws {

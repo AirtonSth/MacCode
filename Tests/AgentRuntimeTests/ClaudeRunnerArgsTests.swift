@@ -43,6 +43,10 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                        "stream-json sessions must send user turns over stdin, not bake the first prompt into argv")
         XCTAssertFalse(zip(a, a.dropFirst()).contains { $0 == "--tools" && $1.isEmpty },
                        "the streaming fallback must not silently disable Claude tools and degrade into chat-only mode")
+        XCTAssertTrue(a.contains("--forward-subagent-text"),
+                      "stream-json sessions must forward nested Agent/Task text with parent_tool_use_id (CLAUDE-CLI-011)")
+        XCTAssertTrue(a.contains("--include-hook-events"),
+                      "stream-json sessions must request hook lifecycle events already understood by ClaudeParser (CLAUDE-CLI-012)")
     }
 
     func test_streamingLoadsUserProjectLocalSettingSources() {

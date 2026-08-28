@@ -13,7 +13,8 @@ case "$RC2_CHANNEL" in
   *) echo "unsupported RC2_CHANNEL=$RC2_CHANNEL" >&2; exit 1 ;;
 esac
 export SOCKET_PATH
-./script/build_and_run.sh --verify >/dev/null
+# Host-app smoke: relaunches the packaged desktop app. Agents must not run this.
+./scripts/run-app.sh --verify >/dev/null
 for _ in {1..40}; do
   if PING_JSON="$(.build/debug/rc2 --json ping 2>/dev/null)" && grep -q '"pong"' <<<"$PING_JSON"; then
     break

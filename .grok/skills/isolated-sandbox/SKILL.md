@@ -29,7 +29,7 @@ Identity, ports, and App Support are defined only in that script. Print them wit
 
 - `pkill -x RemoteCode`
 - `osascript` quit `io.remotecode.desktop`
-- `script/build_and_run.sh` and `scripts/run-app.sh` (stable bundle id + quit host)
+- `scripts/run-app.sh` (stable bundle id + quit host). `script/build_and_run.sh` is allowed; it routes to this sandbox.
 - `git checkout production` / reset / commit in the primary worktree
 - Token Saver / `~/.local/bin/distill` install from the sandbox
 - `open dist/RemoteCode.app` (stable packaging)

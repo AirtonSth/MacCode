@@ -196,6 +196,10 @@ public enum TokenSaverSavingsRepositoryError: Error, Equatable, CustomStringConv
 /// Each `record` is atomic insert-update-prune on the DB serial queue, so
 /// concurrent agent runs cannot lose or corrupt rows.
 public final class TokenSaverSavingsRepository: @unchecked Sendable {
+    /// Delivered wraps with no thread id still need a permanent amort bucket
+    /// so Today Estimated save does not drop PATH-wrapper savings.
+    public static let unscopedThreadID = "unscoped"
+
     private let db: SQLiteDB
     private let retentionDays: Int
     private let calendar: Calendar
@@ -303,7 +307,8 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
         let content = trimmedContent.isEmpty ? "unknown" : trimmedContent
         let trimmedEngine = engine.trimmingCharacters(in: .whitespacesAndNewlines)
         let eng = trimmedEngine.isEmpty ? "unknown" : trimmedEngine
-        let thread = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedThread = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let thread = trimmedThread.isEmpty ? Self.unscopedThreadID : trimmedThread
         let key = idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let inserted = try db.performSync { database in
             try database.transaction {
@@ -427,23 +432,29 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
         return inserted ? saved : 0
     }
 
-    /// Cumulative delivered tokens saved for one agent thread (permanent total).
-    /// Empty / unknown thread ids return 0.
-    public func savedTokens(forThreadID threadID: String) throws -> Int {
+    /// Permanent delivered savings and run count for one agent thread.
+    /// Empty / unknown / missing thread ids return `(0, 0)`.
+    public func deliveredTotal(forThreadID threadID: String) throws -> (savedTokens: Int, runs: Int) {
         let thread = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !thread.isEmpty else { return 0 }
+        guard !thread.isEmpty else { return (0, 0) }
         return try db.performSync { database in
             let stmt = try database.prepare("""
-                SELECT COALESCE(saved_tokens, 0)
+                SELECT COALESCE(saved_tokens, 0), COALESCE(runs, 0)
                 FROM token_saver_thread_totals
                 WHERE thread_id = ?
                 LIMIT 1;
             """)
             defer { stmt.reset() }
             try stmt.bind(1, thread)
-            guard try stmt.step() else { return 0 }
-            return Int(stmt.columnInt64(0))
+            guard try stmt.step() else { return (0, 0) }
+            return (Int(stmt.columnInt64(0)), Int(stmt.columnInt64(1)))
         }
+    }
+
+    /// Cumulative delivered tokens saved for one agent thread (permanent total).
+    /// Empty / unknown thread ids return 0.
+    public func savedTokens(forThreadID threadID: String) throws -> Int {
+        try deliveredTotal(forThreadID: threadID).savedTokens
     }
 
     /// Threads with activity in `[dayStartMs, dayEndMsExclusive)` plus their

@@ -480,6 +480,10 @@ public extension ProviderProcessSweeper {
         }
         let processes = try processList()
         let commandByPID = Dictionary(uniqueKeysWithValues: processes.map { ($0.pid, $0.command) })
+        _ = ProviderProcessSweeper.reapOrphanDistillMCPSidecars(processes: processes) { pid in
+            _ = Darwin.kill(pid, SIGTERM)
+            return Darwin.kill(pid, SIGKILL) == 0 || errno == ESRCH
+        }
         return try sweepPersistedOrphans(
             store: store,
             currentPID: currentPID,

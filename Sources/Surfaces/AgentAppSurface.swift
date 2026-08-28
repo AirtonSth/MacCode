@@ -70,6 +70,7 @@ struct TimelineItemIndex: Sendable, Equatable {
 @MainActor
 public final class AgentComposerState: ObservableObject {
     @Published public var prompt: String = ""
+    @Published public var cursorOffset: Int? = nil
 }
 
 /// Stream/transcript paint state on its OWN ObservableObject so token/tool storms
@@ -309,10 +310,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // suggestions anchor at the actual insertion point, not text.endIndex.
     // nil means "not yet reported by the editor" -- suggestions fall back to
     // the endIndex anchor so programmatic prompt mutations (tests, /clear) work.
-    @Published public var composerCursorOffset: Int? = nil
+    // Keep the public proxy so existing vm.composerCursorOffset call sites stay
+    // unchanged while cursor updates publish only through composerState.
+    public var composerCursorOffset: Int? {
+        get { composerState.cursorOffset }
+        set { composerState.cursorOffset = newValue }
+    }
     @Published public var provider: AgentProvider = .codex
     @Published public var providerInstanceId: String = AgentProvider.codex.rawValue
-    /// macOS account that will execute the next provider process (`sudo -u`).
+    /// macOS account that will execute the next provider process through the shared helper.
     /// Nil / current-account means no privileged trampoline.
     @Published public var runAsUser: AgentRunAsUser? = AgentRunAsUser.current()
     @Published public var availableRunAsUsers: [AgentRunAsUser] = MacOSLocalUserCatalog.listEligibleUsers()
@@ -358,6 +364,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// switch; read through `backgroundShellCount`, which also gates on a live
     /// run so a finished run cannot leave a stale count on screen.
     @Published public private(set) var liveBackgroundShellCount: Int = 0
+    /// Named CLI background tasks (type + description) for the Stop strip.
+    /// Gated through `visibleBackgroundTasks` so a finished run cannot keep
+    /// advertising work the adapter already dropped.
+    @Published public private(set) var liveBackgroundTasks: [AgentBackgroundTask] = []
     /// Thread footer display figure (credible total: measured + dialect + …).
     /// 0 when Token Saver is off, not subscribed, or no savings yet.
     @Published public private(set) var tokenSaverThreadSavedTokens: Int = 0
@@ -365,9 +375,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public private(set) var tokenSaverThreadMeasuredTokens: Int = 0
     /// True when Token Saver is enabled **and** the account is subscribed.
     @Published public private(set) var tokenSaverFooterEnabled: Bool = false
+    /// False after a thread switch until that thread's footer snapshot lands.
+    /// A reset publishes enabled=false + 0; that is pending, not "deactivated."
+    @Published public private(set) var tokenSaverFooterSnapshotReady: Bool = false
     private weak var tokenSaverSavingsRepo: TokenSaverSavingsRepository?
     private var tokenSaverFooterEligibleCheck: (@Sendable () -> Bool)?
     private var tokenSaverGraphifyActiveCheck: (@Sendable () -> Bool)?
+    private var tokenSaverGraphifySignalCountCheck: (@Sendable () -> Int)?
+    private var tokenSaverMeasuredLoader: (@Sendable (Bool, AgentThreadID?, TokenSaverSavingsRepository?) async -> Int?)?
     private var tokenSaverFooterObserver: NSObjectProtocol?
     private var tokenSaverFooterAccountObserver: NSObjectProtocol?
     private var tokenSaverFooterStatusObserver: NSObjectProtocol?
@@ -600,6 +615,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public let customModelStore: AgentCustomModelStore?
     public let planNotesStore: PlanNotesStore?
     private let orchestrationRuntime: AgentOrchestrationRuntime
+    private var subagentRefreshGeneration: UInt64 = 0
+    private var subagentRefreshTask: Task<Void, Never>?
+    private var titleRepairGeneration: UInt64 = 0
+    private var titleRepairTask: Task<Void, Never>?
+    private var pruneGeneration: UInt64 = 0
+    private var pruneTask: Task<Void, Never>?
+    private var publishedSubagentActivityThreadId: AgentThreadID?
+    #if DEBUG
+    let titleRepairStoreIOProbeForTesting = ActivityReceiptsThreadProbe()
+    #endif
     private var promptHistory: [String] = []
     private var promptHistoryCursor: Int?
     private var terminalRunIds = Set<AgentRunID>()
@@ -631,6 +656,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // every reloadThreads() call; threads from other workspaces arrive via the
     // coordinator's multi-workspace broadcast but are filtered out cheaply here.
     private var threadWorkspaceCache: [AgentThreadID: WorkspaceID] = [:]
+
+    /// Cache-first workspace membership for coordinator/event fan-out.
+    /// A miss probes `workspace_id` only — never the 26-column + routing `get`.
+    private func resolvedWorkspaceID(for threadId: AgentThreadID) -> WorkspaceID? {
+        if let cached = threadWorkspaceCache[threadId] {
+            return cached
+        }
+        let workspaceID = try? threadRepo.workspaceId(of: threadId)
+        if let workspaceID {
+            threadWorkspaceCache[threadId] = workspaceID
+        }
+        return workspaceID
+    }
 
     #if DEBUG
     /// Test seam for the partial-failure boundary after cap enforcement.
@@ -1042,6 +1080,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// onto closed VMs until ARC collects the weak observer.
     public func dispose() {
         guard !isDisposed else { return }
+        if let selectedThreadId { persistComposerDraft(for: selectedThreadId) }
         isDisposed = true
         AgentWorkspaceRailReloadCoordinator.shared.unregister(self)
         stopScheduledLivePoll()
@@ -1074,6 +1113,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         tokenSaverFooterReloadTask?.cancel()
         tokenSaverFooterReloadTask = nil
+        subagentRefreshTask?.cancel()
+        subagentRefreshTask = nil
+        subagentRefreshGeneration &+= 1
+        titleRepairTask?.cancel()
+        titleRepairTask = nil
+        titleRepairGeneration &+= 1
+        pruneTask?.cancel()
+        pruneTask = nil
+        pruneGeneration &+= 1
         tokenSaverSavingsRepo = nil
         tokenSaverFooterEligibleCheck = nil
         tokenSaverGraphifyActiveCheck = nil
@@ -1335,20 +1383,78 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// + JSON decode never sit on the main thread (hang_breach under multi-thread).
     public func refreshSubagentActivity() {
         guard !isDisposed else { return }
-        guard selectedThreadId != nil else {
+        guard let threadId = selectedThreadId else {
+            publishedSubagentActivityThreadId = nil
             applySubagentActivity(.empty)
             return
         }
-        // Synchronous path kept for event-driven reselect; poll uses the off-main loader.
-        let snapshot = loadSubagentActivitySnapshotSync(persistLifecycleReconciliation: true)
-        applySubagentActivity(snapshot)
+        // Switching threads must drop the previous thread's badge immediately.
+        // The receipt load stays off-main (freeze-class hang_breach).
+        if publishedSubagentActivityThreadId != threadId {
+            applySubagentActivity(.empty)
+            publishedSubagentActivityThreadId = threadId
+        }
+        // Off-main JSON/SQLite. The previous MainActor `loadSubagentActivitySnapshotSync`
+        // path is the freeze-class hang_breach (CPU diag: applyRailSnapshot → receipts).
+        let generation = subagentRefreshGeneration &+ 1
+        subagentRefreshGeneration = generation
+        subagentRefreshTask?.cancel()
+        subagentRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.subagentRefreshGeneration == generation else { return }
+            let snapshot = await self.loadSubagentActivitySnapshotsOffMainActor(
+                for: [threadId],
+                persistLifecycleReconciliation: true
+            )[threadId] ?? .empty
+            guard !Task.isCancelled else { return }
+            guard self.subagentRefreshGeneration == generation else { return }
+            self.applySubagentActivity(snapshot, loadedFor: threadId)
+            if self.subagentRefreshGeneration == generation {
+                self.subagentRefreshTask = nil
+            }
+        }
     }
+
+    #if DEBUG
+    public func awaitSubagentActivityRefreshForTesting() async {
+        await subagentRefreshTask?.value
+    }
+
+    public func awaitTitleRepairForTesting() async {
+        await titleRepairTask?.value
+    }
+
+    public func awaitPruneStaleRunProjectionsForTesting() async {
+        await pruneTask?.value
+    }
+
+    func seedRunThreadProjectionForTesting(runId: AgentRunID, threadId: AgentThreadID) {
+        runThreads[runId] = threadId
+    }
+
+    func trackedRunIdForTesting(_ threadId: AgentThreadID) -> AgentRunID? {
+        trackedRunId(for: threadId)
+    }
+
+    /// Resume-gated hook so tests can mutate the thread after apply schedules
+    /// repair but before firstUserMessage / persist.
+    var titleRepairBeforeFetchForTesting: (@Sendable () async -> Void)?
+
+    /// Resume-gated hook so tests can start a live run after prune is scheduled
+    /// but before durableActiveRun returns.
+    var pruneBeforeDurableLookupForTesting: (@Sendable () async -> Void)?
+
+    func clearRunThreadProjectionsForTesting() {
+        runThreads.removeAll()
+    }
+    #endif
 
     /// Apply a precomputed snapshot on the main actor (poll completion path).
     public func applySubagentActivity(_ next: SubagentActivitySnapshot) {
         guard !isDisposed else { return }
         guard Self.shouldPublishSubagentActivity(current: subagentActivity, next: next) else { return }
         subagentActivity = next
+        publishedSubagentActivityThreadId = selectedThreadId
     }
 
     /// Apply a poll result only while the thread that produced it is still selected.
@@ -1406,28 +1512,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }.value
     }
 
-    private func loadSubagentActivitySnapshotSync(
-        persistLifecycleReconciliation: Bool
-    ) -> SubagentActivitySnapshot {
-        guard let selectedThreadId else { return .empty }
-        let receipts = (try? orchestrationRuntime.activityReceipts(
-            threadIds: [selectedThreadId],
-            limit: SubagentActivityProjection.defaultReceiptFetchLimit,
-            persistLifecycleReconciliation: persistLifecycleReconciliation
-        )) ?? []
-        let activeRunIds = Set(
-            coordinator.activeThreadIdsSnapshot().compactMap { threadId in
-                coordinator.activeRunId(threadId: threadId)
-            }
-        )
-        return SubagentActivityProjection.project(
-            receipts: receipts,
-            threadIds: [selectedThreadId],
-            activeRunIds: activeRunIds,
-            now: clock()
-        )
-    }
-
     /// Skip equal subagent snapshot reloads (soft reselect / idle poll multipass).
     nonisolated public static func shouldPublishSubagentActivity(
         current: SubagentActivitySnapshot,
@@ -1444,36 +1528,67 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// can survive a missed workspace-filtered didFinish and leave "Threads · N
     /// active" after the work is done.
     private func pruneStaleRunThreadProjections() {
+        let generation = pruneGeneration &+ 1
+        pruneGeneration = generation
+        pruneTask?.cancel()
+        pruneTask = nil
         let snapshot = runThreads
-        guard !snapshot.isEmpty else { return }
-        var clearedSelected = false
+        var stillMaybeLive: [(AgentRunID, AgentThreadID)] = []
         for (runId, threadId) in snapshot {
             if coordinator.activeRunId(threadId: threadId) == runId {
                 continue
             }
-            if let durable = try? coordinator.durableActiveRun(threadId: threadId),
-               durable.id == runId {
-                continue
-            }
-            if isScheduledThreadRunning?(threadId) == true,
-               let durable = try? coordinator.durableActiveRun(threadId: threadId),
-               durable.id == runId {
-                continue
-            }
-            runThreads[runId] = nil
-            if currentRunId == runId {
-                currentRunId = nil
-                if selectedThreadId == threadId {
-                    clearedSelected = true
+            stillMaybeLive.append((runId, threadId))
+        }
+        guard !stillMaybeLive.isEmpty else { return }
+        let coordinator = coordinator
+        #if DEBUG
+        let hold = pruneBeforeDurableLookupForTesting
+        #endif
+        pruneTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.pruneGeneration == generation else { return }
+            #if DEBUG
+            await hold?()
+            #endif
+            guard self.pruneGeneration == generation else { return }
+            let keep: Set<AgentRunID> = await Task.detached(priority: .utility) {
+                var keep = Set<AgentRunID>()
+                for (runId, threadId) in stillMaybeLive {
+                    if let durable = try? coordinator.durableActiveRunChrome(threadId: threadId),
+                       durable.id == runId {
+                        keep.insert(runId)
+                    }
+                }
+                return keep
+            }.value
+            guard !Task.isCancelled else { return }
+            guard self.pruneGeneration == generation else { return }
+            var clearedSelected = false
+            for (runId, threadId) in stillMaybeLive {
+                guard !keep.contains(runId) else { continue }
+                guard self.runThreads[runId] == threadId else { continue }
+                if self.coordinator.activeRunId(threadId: threadId) == runId {
+                    continue
+                }
+                self.runThreads[runId] = nil
+                if self.currentRunId == runId {
+                    self.currentRunId = nil
+                    if self.selectedThreadId == threadId {
+                        clearedSelected = true
+                    }
                 }
             }
-        }
-        if clearedSelected, let sel = selectedThreadId, !isThreadStartingOrRunning(sel) {
-            runStartedAt = nil
-            if let durableStatus = threads.first(where: { $0.id == sel })?.status {
-                status = durableStatus
+            if clearedSelected, let sel = self.selectedThreadId, !self.isThreadStartingOrRunning(sel) {
+                self.runStartedAt = nil
+                if let durableStatus = self.threads.first(where: { $0.id == sel })?.status {
+                    self.status = durableStatus
+                }
+                self.isStopping = false
             }
-            isStopping = false
+            if self.pruneGeneration == generation {
+                self.pruneTask = nil
+            }
         }
     }
 
@@ -1493,62 +1608,164 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private func repairPlaceholderThreadTitles() {
         let toRepair = Self.indicesNeedingRepair(in: threads, alreadyRepaired: repairedThreadIds)
-        for index in toRepair {
-            // Mark as visited regardless of whether a user message exists — a thread
-            // with no user messages won't get a better title on the next call either.
-            // F13: fetch only the earliest user message (LIMIT 1) instead of loading
-            // the whole thread history + content blobs on the main actor per thread.
-            let firstUserMessage: AgentMessage
-            do {
-                guard let message = try messageRepo.firstUserMessage(threadId: threads[index].id) else {
-                    repairedThreadIds.insert(threads[index].id)
+        guard !toRepair.isEmpty else { return }
+        let generation = titleRepairGeneration &+ 1
+        titleRepairGeneration = generation
+        titleRepairTask?.cancel()
+        let threadIds = toRepair.map { threads[$0].id }
+        let messageRepo = messageRepo
+        let threadRepo = threadRepo
+        #if DEBUG
+        let probe = titleRepairStoreIOProbeForTesting
+        let hold = titleRepairBeforeFetchForTesting
+        #endif
+        titleRepairTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.titleRepairGeneration == generation else { return }
+            #if DEBUG
+            await hold?()
+            #endif
+            guard self.titleRepairGeneration == generation else { return }
+            struct Fetch: Sendable {
+                let threadId: AgentThreadID
+                let title: String?
+                let errorDescription: String?
+            }
+            let fetched: [Fetch] = await Task.detached(priority: .utility) {
+                var out: [Fetch] = []
+                out.reserveCapacity(threadIds.count)
+                for threadId in threadIds {
+                    #if DEBUG
+                    probe.recordCurrentThread()
+                    #endif
+                    do {
+                        guard let message = try messageRepo.firstUserMessage(threadId: threadId) else {
+                            out.append(Fetch(threadId: threadId, title: nil, errorDescription: nil))
+                            continue
+                        }
+                        out.append(Fetch(
+                            threadId: threadId,
+                            title: AgentThreadTitle.titleFromFirstMessage(message.content),
+                            errorDescription: nil
+                        ))
+                    } catch {
+                        out.append(Fetch(
+                            threadId: threadId,
+                            title: nil,
+                            errorDescription: String(describing: error)
+                        ))
+                    }
+                }
+                return out
+            }.value
+            guard !Task.isCancelled else { return }
+            guard self.titleRepairGeneration == generation else { return }
+            var titlesToPersist: [(AgentThreadID, String)] = []
+            for item in fetched {
+                if let errorDescription = item.errorDescription {
+                    self.statusMessage = "Could not repair thread title: \(errorDescription)"
                     continue
                 }
-                firstUserMessage = message
-            } catch {
-                statusMessage = "Could not repair thread title: \(error)"
-                continue
+                self.repairedThreadIds.insert(item.threadId)
+                guard let title = item.title else { continue }
+                guard let index = self.threads.firstIndex(where: { $0.id == item.threadId }) else {
+                    continue
+                }
+                guard AgentThreadTitle.isPlaceholder(self.threads[index].title) else { continue }
+                self.threads[index].title = title
+                titlesToPersist.append((item.threadId, title))
+                self.onThreadLifecycle?(.updated(self.threads[index]))
             }
-            var thread = threads[index]
-            thread.title = AgentThreadTitle.titleFromFirstMessage(firstUserMessage.content)
-            // PERSISTENCE-DATA-002: a cosmetic title repair must NOT bump
-            // updatedAt — doing so reorders the rail (updated_at is the visible
-            // tiebreak) and made repaired threads jump to the top. Preserve the
-            // thread's real activity time so only genuine activity reorders it.
-            do {
-                try threadRepo.upsert(thread)
-            } catch {
-                statusMessage = "Could not repair thread title: \(error)"
-                continue
+            if !titlesToPersist.isEmpty {
+                await Task.detached(priority: .utility) {
+                    for (threadId, title) in titlesToPersist {
+                        try? threadRepo.updateTitlePreservingActivity(threadId, title: title)
+                    }
+                }.value
             }
-            repairedThreadIds.insert(thread.id)
-            threads[index] = thread
-            // Mirror the repaired title so remote thread lists don't keep
-            // showing the placeholder. Loop-safe: repairedThreadIds plus the
-            // now-non-placeholder title prevent re-entry on the reloadThreads
-            // the host's event subscription triggers.
-            onThreadLifecycle?(.updated(thread))
+            if self.titleRepairGeneration == generation {
+                self.titleRepairTask = nil
+            }
         }
     }
 
     /// IMP-MAC_AGENT-011: unsent composer state, keyed by thread and persisted
     /// so text, attachments, and interaction mode survive switching/relaunch.
     private var composerDraftsByThread: [AgentThreadID: [String: AgentThreadDraft]] = [:]
+    private static let composerDraftPersistenceDelayNanoseconds: UInt64 = 250_000_000
+    private var composerDraftPersistenceTask: Task<Void, Never>?
+    private var pendingComposerDraftPersistenceThreadID: AgentThreadID?
+    private var pendingComposerDraftPersistenceProviderInstanceID: String?
     private var providerThreadSnapshotConfirmedAtByThread: [AgentThreadID: Date] = [:]
 
-    private func persistComposerDraft(for threadId: AgentThreadID) {
-        let draft = AgentThreadDraft(
+    private func makeComposerDraft(for threadId: AgentThreadID) -> AgentThreadDraft {
+        AgentThreadDraft(
             threadId: threadId,
             providerInstanceId: providerInstanceId,
             text: prompt,
             attachments: attachments,
             interactionMode: interactionMode
         )
-        composerDraftsByThread[threadId, default: [:]][providerInstanceId] = draft
+    }
+
+    private func cacheComposerDraft(_ draft: AgentThreadDraft) {
+        composerDraftsByThread[draft.threadId, default: [:]][draft.providerInstanceId] = draft
+    }
+
+    private func persistComposerDraftToRepository(_ draft: AgentThreadDraft) {
         do {
             try draftRepo?.upsert(draft)
         } catch {
             statusMessage = "Draft save failed: \(error)"
+        }
+    }
+
+    private func cancelPendingComposerDraftPersistence() {
+        composerDraftPersistenceTask?.cancel()
+        composerDraftPersistenceTask = nil
+        pendingComposerDraftPersistenceThreadID = nil
+        pendingComposerDraftPersistenceProviderInstanceID = nil
+    }
+
+    private func cancelPendingComposerDraftPersistence(
+        for threadId: AgentThreadID,
+        providerInstanceId: String
+    ) {
+        guard pendingComposerDraftPersistenceThreadID == threadId,
+              pendingComposerDraftPersistenceProviderInstanceID == providerInstanceId else {
+            return
+        }
+        cancelPendingComposerDraftPersistence()
+    }
+
+    private func persistComposerDraft(for threadId: AgentThreadID) {
+        cancelPendingComposerDraftPersistence()
+        let draft = makeComposerDraft(for: threadId)
+        cacheComposerDraft(draft)
+        persistComposerDraftToRepository(draft)
+    }
+
+    private func scheduleComposerDraftPersistence(for threadId: AgentThreadID) {
+        let draft = makeComposerDraft(for: threadId)
+        cacheComposerDraft(draft)
+        cancelPendingComposerDraftPersistence()
+        pendingComposerDraftPersistenceThreadID = draft.threadId
+        pendingComposerDraftPersistenceProviderInstanceID = draft.providerInstanceId
+        composerDraftPersistenceTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: Self.composerDraftPersistenceDelayNanoseconds)
+            } catch {
+                return
+            }
+            guard let self, !self.isDisposed else { return }
+            guard self.pendingComposerDraftPersistenceThreadID == draft.threadId,
+                  self.pendingComposerDraftPersistenceProviderInstanceID == draft.providerInstanceId else {
+                return
+            }
+            self.composerDraftPersistenceTask = nil
+            self.pendingComposerDraftPersistenceThreadID = nil
+            self.pendingComposerDraftPersistenceProviderInstanceID = nil
+            self.persistComposerDraftToRepository(draft)
         }
     }
 
@@ -1574,11 +1791,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     private func clearComposerDraft(threadId: AgentThreadID, providerInstanceId: String) throws {
+        cancelPendingComposerDraftPersistence(
+            for: threadId,
+            providerInstanceId: providerInstanceId
+        )
         try draftRepo?.delete(threadId: threadId, providerInstanceId: providerInstanceId)
         clearComposerDraftMemory(threadId: threadId, providerInstanceId: providerInstanceId)
     }
 
     private func clearComposerDraftMemory(threadId: AgentThreadID, providerInstanceId: String) {
+        cancelPendingComposerDraftPersistence(
+            for: threadId,
+            providerInstanceId: providerInstanceId
+        )
         composerDraftsByThread[threadId]?.removeValue(forKey: providerInstanceId)
         if composerDraftsByThread[threadId]?.isEmpty == true {
             composerDraftsByThread.removeValue(forKey: threadId)
@@ -1607,11 +1832,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func bindTokenSaverThreadFooter(
         savingsRepo: TokenSaverSavingsRepository,
         isEligible: @escaping @Sendable () -> Bool,
-        isGraphifyActive: @escaping @Sendable () -> Bool = { false }
+        isGraphifyActive: @escaping @Sendable () -> Bool = { false },
+        graphifySignalCount: @escaping @Sendable () -> Int = { 0 },
+        measuredLoader: @escaping @Sendable (Bool, AgentThreadID?, TokenSaverSavingsRepository?) async -> Int? = {
+            eligible, threadId, repo in
+            await TokenSaverThreadFooterReload.loadMeasured(
+                eligible: eligible,
+                threadId: threadId,
+                repo: repo
+            )
+        }
     ) {
         tokenSaverSavingsRepo = savingsRepo
         tokenSaverFooterEligibleCheck = isEligible
         tokenSaverGraphifyActiveCheck = isGraphifyActive
+        tokenSaverGraphifySignalCountCheck = graphifySignalCount
+        tokenSaverMeasuredLoader = measuredLoader
         if tokenSaverFooterObserver == nil {
             let handler: (Notification) -> Void = { [weak self] _ in
                 self?.reloadTokenSaverThreadSavings()
@@ -1647,6 +1883,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         tokenSaverFooterReloadTask?.cancel()
         let eligibleCheck = tokenSaverFooterEligibleCheck
         let graphifyCheck = tokenSaverGraphifyActiveCheck
+        let graphifySignalCountCheck = tokenSaverGraphifySignalCountCheck
+        let measuredLoader = tokenSaverMeasuredLoader
         let threadId = selectedThreadId
         let repo = tokenSaverSavingsRepo
         // Capture assistant size + turn/usage on MainActor (UI/timeline state).
@@ -1659,49 +1897,75 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let providerRaw = usage.map { max(0, $0.inputTokens) + max(0, $0.outputTokens) } ?? 0
         let providerBilled = usage.map { $0.billedTotalTokenUnits } ?? 0
         let autoRouting = routingMode == .auto
+        let observation = TokenSaverThreadFooterReload.Observation(
+            assistantChars: assistantChars,
+            turnCount: turnCount,
+            cacheReadInputTokens: cacheRead,
+            providerRawTokens: providerRaw,
+            providerBilledTokenUnits: providerBilled > 0 ? providerBilled : nil,
+            autoRoutingActive: autoRouting
+        )
         tokenSaverFooterReloadTask = Task { [weak self] in
             // Eligibility/settings reads off-main so a savings burst does not
             // stack cold SettingsStore performSync on the MainActor.
             let eligible = eligibleCheck?() == true
             let graphifyActive = graphifyCheck?() == true
-            let measured: Int
-            if eligible, let threadId, let repo {
-                let id = threadId.value.uuidString
-                measured = await Task.detached(priority: .utility) {
-                    (try? repo.savedTokens(forThreadID: id)) ?? 0
-                }.value
-            } else {
-                measured = 0
-            }
+            let graphifyCount = graphifySignalCountCheck?() ?? 0
+            let measured = await measuredLoader?(eligible, threadId, repo)
+            guard let measured else { return }
             guard !Task.isCancelled else { return }
-            let display = AgentAppView.tokenSaverThreadFooterDisplayTokens(
+            let deliveredRuns = await TokenSaverThreadFooterReload.loadDeliveredTotal(
+                eligible: eligible,
+                threadId: threadId,
+                repo: repo
+            )?.runs ?? 0
+            let next = TokenSaverThreadFooterReload.snapshot(
                 measuredDelivered: measured,
-                assistantChars: assistantChars,
-                tokenSaverEnabled: eligible,
+                eligible: eligible,
                 graphifyActive: graphifyActive,
-                turnCount: turnCount,
-                cacheReadInputTokens: cacheRead,
-                providerRawTokens: providerRaw,
-                providerBilledTokenUnits: providerBilled > 0 ? providerBilled : nil,
-                autoRoutingActive: autoRouting
+                observation: TokenSaverThreadFooterReload.Observation(
+                    assistantChars: observation.assistantChars,
+                    turnCount: observation.turnCount,
+                    cacheReadInputTokens: observation.cacheReadInputTokens,
+                    providerRawTokens: observation.providerRawTokens,
+                    providerBilledTokenUnits: observation.providerBilledTokenUnits,
+                    autoRoutingActive: observation.autoRoutingActive,
+                    graphifySignalCount: graphifyCount
+                ),
+                deliveredRuns: deliveredRuns
             )
             await MainActor.run { [weak self] in
                 guard let self, !self.isDisposed, !Task.isCancelled else { return }
+                guard self.selectedThreadId == threadId else { return }
                 // Soft reselect / stream ticks re-enter constantly. Skip identical
                 // footer assigns so @Published chrome does not multipass-repaint.
-                guard Self.shouldPublishTokenSaverFooter(
+                if Self.shouldPublishTokenSaverFooter(
                     currentEnabled: self.tokenSaverFooterEnabled,
-                    nextEnabled: eligible,
+                    nextEnabled: next.enabled,
                     currentMeasured: self.tokenSaverThreadMeasuredTokens,
-                    nextMeasured: measured,
+                    nextMeasured: next.measuredTokens,
                     currentDisplay: self.tokenSaverThreadSavedTokens,
-                    nextDisplay: display
-                ) else { return }
-                self.tokenSaverFooterEnabled = eligible
-                self.tokenSaverThreadMeasuredTokens = measured
-                self.tokenSaverThreadSavedTokens = display
+                    nextDisplay: next.displayTokens
+                ) {
+                    self.tokenSaverFooterEnabled = next.enabled
+                    self.tokenSaverThreadMeasuredTokens = next.measuredTokens
+                    self.tokenSaverThreadSavedTokens = next.displayTokens
+                }
+                self.tokenSaverFooterSnapshotReady = true
             }
         }
+    }
+
+    /// Drop published footer chrome for the leaving thread. Call after
+    /// `selectedThreadId` changes so an in-flight load for the previous thread
+    /// cannot republish (it checks selectedThreadId).
+    private func resetTokenSaverFooterSnapshot() {
+        tokenSaverFooterReloadTask?.cancel()
+        tokenSaverFooterReloadTask = nil
+        tokenSaverFooterEnabled = false
+        tokenSaverThreadMeasuredTokens = 0
+        tokenSaverThreadSavedTokens = 0
+        tokenSaverFooterSnapshotReady = false
     }
 
     /// Skip equal token-saver footer publishes (soft reselect / idle multipass).
@@ -1721,30 +1985,64 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Bumped on every full thread open so deferred provider-snapshot tasks for
     /// a prior open never wipe a newer selection (or the same thread re-selected soft).
     private var selectThreadOpenGeneration: UInt64 = 0
+    private var selectThreadHydrationTask: Task<Void, Never>?
+    private var paintedTimelineByThread: [AgentThreadID: AssistantTimelineState] = [:]
+    /// True when the last `selectThread` used the in-memory rail instead of a full `get`.
+    private(set) var lastThreadSelectionUsedRailForTesting = false
+    /// Count of durable `threadRepo.get` lookups from `selectThread` (cache misses).
+    private(set) var durableThreadSelectionLookupCountForTesting = 0
+    /// Count of cheap workspace-id probes used to reject stale rail rows.
+    private(set) var durableThreadExistenceProbeCountForTesting = 0
+
+    /// Cache-first thread row for selection. A rail click must not wait on
+    /// `threadRepo.get` — that path compiles two statements off the DB queue
+    /// on MainActor (row + routing) and can hitch behind a FULLMUTEX writer.
+    nonisolated static func railThreadForSelection(
+        id: AgentThreadID,
+        workspaceID: WorkspaceID,
+        rail: [AgentThread]
+    ) -> AgentThread? {
+        guard let thread = rail.first(where: { $0.id == id }) else { return nil }
+        guard thread.workspaceId == workspaceID else { return nil }
+        return thread
+    }
 
     public func selectThread(_ id: AgentThreadID, markRead: Bool = true) {
         guard !isDisposed else { return }
         let selectedThread: AgentThread
-        do {
-            guard let persistedThread = try threadRepo.get(id: id) else {
+        if let cached = Self.railThreadForSelection(
+            id: id,
+            workspaceID: workspaceID,
+            rail: threads
+        ) {
+            // Rail hits publish first. Existence probe runs after the first
+            // frame so a click is not blocked on SQLite.
+            selectedThread = cached
+            lastThreadSelectionUsedRailForTesting = true
+        } else {
+            lastThreadSelectionUsedRailForTesting = false
+            durableThreadSelectionLookupCountForTesting += 1
+            do {
+                guard let persistedThread = try threadRepo.get(id: id) else {
+                    if statusMessage.isEmpty {
+                        statusMessage = "Could not open thread: The thread is no longer available."
+                    }
+                    return
+                }
+                selectedThread = persistedThread
+            } catch {
+                statusMessage = "Could not open thread: \(error)"
+                return
+            }
+            guard let selectedWorkspaceID = selectedThread.workspaceId,
+                  selectedWorkspaceID == workspaceID else {
                 if statusMessage.isEmpty {
-                    statusMessage = "Could not open thread: The thread is no longer available."
+                    statusMessage = "Could not open thread: The thread belongs to another workspace."
                 }
                 return
             }
-            selectedThread = persistedThread
-        } catch {
-            statusMessage = "Could not open thread: \(error)"
-            return
         }
-        guard let selectedWorkspaceID = selectedThread.workspaceId,
-              selectedWorkspaceID == workspaceID else {
-            if statusMessage.isEmpty {
-                statusMessage = "Could not open thread: The thread belongs to another workspace."
-            }
-            return
-        }
-        threadWorkspaceCache[id] = selectedWorkspaceID
+        threadWorkspaceCache[id] = selectedThread.workspaceId ?? workspaceID
         if statusMessage.contains(Self.deletedThreadDraftRecoveryMessage) {
             statusMessage = ""
         }
@@ -1766,9 +2064,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         )
         // IMP-MAC_AGENT-011: stash the leaving thread's draft before swapping,
         // then restore the opened thread's draft.
-        if let previous = selectedThreadId { persistComposerDraft(for: previous) }
+        if let previous = selectedThreadId {
+            persistComposerDraft(for: previous)
+            paintedTimelineByThread[previous] = timeline
+        }
         selectedThreadId = id
         publishInterestedThreadId(id)
+        // Per-thread chip: never keep the leaving thread's savings on the
+        // newly selected one while its ledger read is in flight (or if it fails).
+        resetTokenSaverFooterSnapshot()
         providerThreadSnapshotStatusMessage = nil
         providerThreadSnapshotLastConfirmedAt = providerThreadSnapshotConfirmedAtByThread[id]
         // F6: Token Saver translation maps are per-thread state. Reset them on a
@@ -1793,6 +2097,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // count on its next snapshot, so carrying the previous thread's
         // shell count over would advertise work that isn't this thread's.
         liveBackgroundShellCount = 0
+        liveBackgroundTasks = []
         // Plan-suppression is per open thread session: do not carry a queued
         // follow-up suppress flag onto a different thread's durable plan.
         suppressStaleActivePlanUpdates = false
@@ -1844,6 +2149,95 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             stopScheduledLivePoll()
         }
         normalizeInteractionModeForSelectedProvider()
+        if let cachedTimeline = paintedTimelineByThread[id] {
+            timeline = cachedTimeline
+            timelineItemIndex = TimelineItemIndex(turns: cachedTimeline.turns)
+        } else {
+            timeline = AssistantTimelineState()
+            timelineItemIndex = TimelineItemIndex(turns: [])
+        }
+        loadAllMessages(id)
+        focusTick &+= 1
+        scheduleSelectThreadHydration(
+            thread: selectedThread,
+            markRead: markRead,
+            openGeneration: openGeneration,
+            probeExistence: lastThreadSelectionUsedRailForTesting
+        )
+    }
+
+    func waitForSelectThreadHydrationForTesting() async {
+        while let task = selectThreadHydrationTask {
+            let generation = selectThreadOpenGeneration
+            await task.value
+            if selectThreadOpenGeneration == generation,
+               selectThreadHydrationTask == nil {
+                return
+            }
+        }
+    }
+
+    private static func waitForCommittedFrame() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async {
+                continuation.resume()
+            }
+        }
+    }
+
+    private func scheduleSelectThreadHydration(
+        thread: AgentThread,
+        markRead: Bool,
+        openGeneration: UInt64,
+        probeExistence: Bool
+    ) {
+        let id = thread.id
+        selectThreadHydrationTask?.cancel()
+        selectThreadHydrationTask = Task { @MainActor [weak self] in
+            await Self.waitForCommittedFrame()
+            guard let self else { return }
+            defer {
+                if self.selectThreadOpenGeneration == openGeneration {
+                    self.selectThreadHydrationTask = nil
+                }
+            }
+            guard !Task.isCancelled,
+                  self.selectThreadOpenGeneration == openGeneration,
+                  self.selectedThreadId == id else { return }
+            if probeExistence {
+                do {
+                    self.durableThreadExistenceProbeCountForTesting += 1
+                    guard let durableWorkspace = try self.threadRepo.workspaceId(of: id) else {
+                        if self.statusMessage.isEmpty {
+                            self.statusMessage = "Could not open thread: The thread is no longer available."
+                        }
+                        return
+                    }
+                    guard durableWorkspace == self.workspaceID else {
+                        if self.statusMessage.isEmpty {
+                            self.statusMessage = "Could not open thread: The thread belongs to another workspace."
+                        }
+                        return
+                    }
+                } catch {
+                    self.statusMessage = "Could not open thread: \(error)"
+                    return
+                }
+            }
+            self.hydrateOpenedThread(
+                thread,
+                markRead: markRead,
+                openGeneration: openGeneration
+            )
+        }
+    }
+
+    private func hydrateOpenedThread(
+        _ selectedThread: AgentThread,
+        markRead: Bool,
+        openGeneration: UInt64
+    ) {
+        let id = selectedThread.id
         // UX-MAC_AGENT-CONTINUE: check whether the newly selected thread was
         // interrupted by a relaunch and has a recoverable provider session.
         selectedThreadHasRecoverableContext = coordinator.hasRecoverableContext(threadId: id)
@@ -1862,7 +2256,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 reloadThreads()
             }
         }
-        loadAllMessages(id)
         streamApplyGeneration &+= 1
         streamApplyInFlight = false
         streamFlushNeeded = false
@@ -1983,14 +2376,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             setPlanNotesWithoutSaving("", threadId: id)
             statusMessage = "Could not load plan notes: \(error)"
         }
-        // UX-MAC_AGENT-001: route first-responder to the composer on every
-        // open/switch so the user can type without a manual click.
-        focusTick &+= 1
-        // Subagents is thread-scoped chrome: rebuild immediately so switching
-        // threads never briefly shows another thread's Active/Done counts.
+        // Subagents is thread-scoped chrome: rebuild after first paint so
+        // switching threads never keeps another thread's Active/Done counts.
         refreshSubagentActivity()
         // Token Saver footer is per-thread; re-read the permanent total on open.
         reloadTokenSaverThreadSavings()
+        paintedTimelineByThread[id] = timeline
     }
 
     /// Called by the plan sidebar whenever planNotes changes to persist the
@@ -2215,7 +2606,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 // builds that mirrored queued text into the transcript. Only
                 // drop when not yet durable under that id (drain/start persist).
                 let mirrorId = AgentMessageID(cancelled.id.value)
-                if (try? messageRepo.get(id: mirrorId)) == nil,
+                if (try? messageRepo.exists(id: mirrorId)) != true,
                    let idx = messages.firstIndex(where: { $0.id == mirrorId }) {
                     messages.remove(at: idx)
                 }
@@ -3530,9 +3921,58 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         )
     }
 
+    public var visibleBackgroundTasks: [AgentBackgroundTask] {
+        Self.visibleBackgroundTasks(
+            reported: liveBackgroundTasks,
+            runIsLive: selectedThreadRunIsStartingOrRunning
+        )
+    }
+
+    /// Named work holding Stop, or nil when the run is idle / has no CLI tasks.
+    public var backgroundHoldSummary: AgentBackgroundHoldSummary? {
+        let tasks = Self.enrichingBackgroundTasks(
+            visibleBackgroundTasks,
+            timeline: timeline
+        )
+        guard !tasks.isEmpty else { return nil }
+        return AgentBackgroundHoldSummary(tasks: tasks)
+    }
+
+    /// CLI `task_started` rows already land in the timeline as
+    /// "Background shell" / "Background agent" with the human `description`.
+    /// Their `task_id` is the timeline item's id, so details are joined only to
+    /// the exact snapshot id that owns them.
+    nonisolated static func enrichingBackgroundTasks(
+        _ tasks: [AgentBackgroundTask],
+        timeline: AssistantTimelineState
+    ) -> [AgentBackgroundTask] {
+        var latestItemsByID: [String: AssistantItem] = [:]
+        for item in timeline.turns.flatMap(\.items).reversed() where latestItemsByID[item.id] == nil {
+            latestItemsByID[item.id] = item
+        }
+        return tasks.map { task in
+            guard task.description == nil, let item = latestItemsByID[task.id] else { return task }
+            let summary = item.summary ?? ""
+            let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
+            let kind: AgentBackgroundTaskKind
+            if summary == "Background shell" { kind = .shell }
+            else if summary == "Background agent" { kind = .agent }
+            else { return task }
+            let enriched = AgentBackgroundTask(id: task.id, kind: kind, description: body)
+            return enriched.description == nil ? AgentBackgroundTask(id: task.id, kind: kind) : enriched
+        }
+    }
+
     /// Pure seam for the staleness gate above.
     nonisolated static func visibleBackgroundShellCount(reported: Int, runIsLive: Bool) -> Int {
         runIsLive ? reported : 0
+    }
+
+    nonisolated static func visibleBackgroundTasks(
+        reported: [AgentBackgroundTask],
+        runIsLive: Bool
+    ) -> [AgentBackgroundTask] {
+        runIsLive ? reported : []
     }
 
     /// Reason for the incomplete-turn chrome, if any (drives Continue prompt).
@@ -4830,7 +5270,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     /// Seed Working-for clock + run id from durable agent_runs and start live poll.
     private func bindScheduledOwnedRun(threadId: AgentThreadID) {
-        let durable = try? coordinator.durableActiveRun(threadId: threadId)
+        let durable = try? coordinator.durableActiveRunChrome(threadId: threadId)
         runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
             current: runStartedAt,
             persisted: durable?.startedAt ?? (try? coordinator.runStartedAt(threadId: threadId))
@@ -4901,7 +5341,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
             scheduleTimelineUpdateTick()
         }
-        if let durable = try? coordinator.durableActiveRun(threadId: id) {
+        if let durable = try? coordinator.durableActiveRunChrome(threadId: id) {
             runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
                 current: runStartedAt,
                 persisted: durable.startedAt
@@ -4979,44 +5419,125 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         normalizeSelectedModelOptions()
         rememberNewThreadDefaults()
         guard let id = selectedThreadId else { return false }
+        // Painted rail already holds the config persist would write. A leftover
+        // 26-column + routing `get` then `upsert` hitchs every composer send
+        // and bumps routing revision even when picker/permission/run-as-user
+        // did not change.
+        if let painted = threads.first(where: { $0.id == id }),
+           Self.paintedThreadMatchesPersistedConfig(
+                painted,
+                provider: provider,
+                providerInstanceId: providerInstanceId,
+                runAsUser: runAsUser,
+                model: model,
+                permissionMode: permissionMode,
+                reasoningEffort: reasoningEffort,
+                serviceTier: serviceTier,
+                modelSelection: currentModelSelection,
+                interactionMode: interactionMode
+           ) {
+            persistComposerDraft(for: id)
+            return true
+        }
         do {
-            guard let stored = try threadRepo.get(id: id) else {
+            let now = Date()
+            let painted = threads.first(where: { $0.id == id })
+            let routingBase: AgentRoutingConfiguration
+            if let painted {
+                routingBase = painted.effectiveRoutingConfiguration
+            } else if let stored = try threadRepo.routingConfiguration(of: id) {
+                routingBase = stored
+            } else {
+                routingBase = .legacyManual(
+                    selection: currentModelSelection,
+                    providerInstanceId: providerInstanceId,
+                    updatedAt: now
+                )
+            }
+            let nextRouting = try routingBase.replacing(
+                expectedRevision: routingBase.revision,
+                mode: routingBase.mode,
+                manualSelection: currentModelSelection,
+                manualProviderInstanceId: providerInstanceId,
+                eligibleProviders: routingBase.eligibleProviders,
+                policyDigest: routingBase.policyDigest,
+                updatedAt: now
+            )
+            // Picker chrome + routing CAS only. A leftover 26-column `get`
+            // then full-row `upsert` hitchs model/permission changes and
+            // rewrites title/status/unread/color/pin/execution.
+            guard try threadRepo.setPickerConfig(
+                of: id,
+                provider: provider,
+                providerInstanceId: providerInstanceId,
+                runAsUser: runAsUser,
+                model: model,
+                permissionMode: permissionMode,
+                reasoningEffort: reasoningEffort,
+                serviceTier: serviceTier,
+                modelSelection: currentModelSelection,
+                interactionMode: interactionMode,
+                at: now
+            ) else {
                 statusMessage = "Could not save thread configuration: thread not found."
                 return false
             }
-            var updated = stored
-            updated.provider = provider
-            updated.providerInstanceId = providerInstanceId
-            updated.runAsUser = runAsUser
-            updated.model = model
-            updated.permissionMode = permissionMode
-            updated.reasoningEffort = reasoningEffort
-            updated.serviceTier = serviceTier
-            updated.modelSelection = currentModelSelection
-            updated.interactionMode = interactionMode
-            updated.updatedAt = Date()
-            let routing = stored.effectiveRoutingConfiguration
-            updated.routingConfiguration = try routing.replacing(
-                expectedRevision: routing.revision,
-                mode: routing.mode,
-                manualSelection: currentModelSelection,
-                manualProviderInstanceId: providerInstanceId,
-                eligibleProviders: routing.eligibleProviders,
-                policyDigest: routing.policyDigest,
-                updatedAt: updated.updatedAt
+            try threadRepo.setRoutingConfiguration(
+                nextRouting,
+                threadId: id,
+                expectedRevision: routingBase.revision
             )
-            try threadRepo.upsert(updated)
             if let i = threads.firstIndex(where: { $0.id == id }) {
-                threads[i] = updated
+                threads[i].provider = provider
+                threads[i].providerInstanceId = providerInstanceId
+                threads[i].runAsUser = runAsUser
+                threads[i].model = model
+                threads[i].permissionMode = permissionMode
+                threads[i].reasoningEffort = reasoningEffort
+                threads[i].serviceTier = serviceTier
+                threads[i].modelSelection = currentModelSelection
+                threads[i].interactionMode = interactionMode
+                threads[i].updatedAt = now
+                threads[i].routingConfiguration = nextRouting
+                persistComposerDraft(for: id)
+                onThreadConfigPersisted?(threads[i])
+            } else {
+                persistComposerDraft(for: id)
             }
-            persistComposerDraft(for: id)
-            onThreadConfigPersisted?(updated)
             return true
         } catch {
             if let stored = try? threadRepo.get(id: id) { restoreThreadConfiguration(from: stored) }
             statusMessage = "Could not save thread configuration: \(error)"
             return false
         }
+    }
+
+    /// Config persist would only copy picker/permission/run-as-user onto the
+    /// painted row. Matching means SQLite already has that chrome.
+    nonisolated static func paintedThreadMatchesPersistedConfig(
+        _ painted: AgentThread,
+        provider: AgentProvider,
+        providerInstanceId: String,
+        runAsUser: AgentRunAsUser?,
+        model: String,
+        permissionMode: AgentPermissionMode,
+        reasoningEffort: AgentReasoningEffort,
+        serviceTier: AgentServiceTier,
+        modelSelection: AgentModelSelection,
+        interactionMode: AgentInteractionMode
+    ) -> Bool {
+        let routing = painted.effectiveRoutingConfiguration
+        return painted.provider == provider
+            && (painted.providerInstanceId ?? painted.provider.rawValue) == providerInstanceId
+            && painted.runAsUser == runAsUser
+            && painted.model == model
+            && painted.permissionMode == permissionMode
+            && painted.reasoningEffort == reasoningEffort
+            && painted.serviceTier == serviceTier
+            && painted.modelSelection == modelSelection
+            && painted.effectiveInteractionMode == interactionMode
+            && routing.manualSelection == modelSelection
+            && (routing.manualProviderInstanceId ?? painted.provider.rawValue) == providerInstanceId
     }
 
     /// Changes the thread-owned routing mode with optimistic revision protection.
@@ -5031,11 +5552,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return true
         }
         do {
-            guard let stored = try threadRepo.get(id: id) else {
+            // Routing chrome only. A leftover 26-column `get` before Auto
+            // toggle and another `get` after CAS hitchs the composer switch.
+            let storedRouting = try threadRepo.routingConfiguration(of: id)
+            let current: AgentRoutingConfiguration
+            if let storedRouting {
+                current = storedRouting
+            } else if let picker = try threadRepo.threadWithoutRouting(of: id) {
+                current = picker.effectiveRoutingConfiguration
+            } else {
                 statusMessage = "Could not save Auto model routing: thread not found."
                 return false
             }
-            let current = stored.effectiveRoutingConfiguration
             let requestedMode: AgentRoutingMode = enabled ? .auto : .manual
             guard current.mode != requestedMode else { return true }
 
@@ -5059,7 +5587,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 threadId: id,
                 expectedRevision: current.revision
             )
-            guard let persisted = try threadRepo.get(id: id) else {
+            var persisted: AgentThread
+            if let index = threads.firstIndex(where: { $0.id == id }) {
+                threads[index].routingConfiguration = updatedConfiguration
+                threads[index].updatedAt = updatedConfiguration.updatedAt
+                persisted = threads[index]
+            } else if var picker = try threadRepo.threadWithoutRouting(of: id) {
+                picker.routingConfiguration = updatedConfiguration
+                picker.updatedAt = updatedConfiguration.updatedAt
+                persisted = picker
+            } else {
                 statusMessage = "Could not restore the persisted routing configuration."
                 return false
             }
@@ -5067,15 +5604,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             rememberNewThreadDefaults()
             if !enabled {
                 restoreThreadConfiguration(from: persisted)
-            } else if let index = threads.firstIndex(where: { $0.id == id }) {
-                threads[index] = persisted
             }
             statusMessage = ""
             onThreadConfigPersisted?(persisted)
             return true
         } catch {
-            if let latest = try? threadRepo.get(id: id) {
-                restoreThreadConfiguration(from: latest)
+            let latestRouting = try? threadRepo.routingConfiguration(of: id) ?? nil
+            if let index = threads.firstIndex(where: { $0.id == id }) {
+                if let latestRouting {
+                    threads[index].routingConfiguration = latestRouting
+                }
+                restoreThreadConfiguration(from: threads[index])
+            } else if var picker = try? threadRepo.threadWithoutRouting(of: id) {
+                picker.routingConfiguration = latestRouting
+                restoreThreadConfiguration(from: picker)
             }
             statusMessage = "Could not save Auto model routing: \(error)"
             return false
@@ -5099,7 +5641,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    /// Select the macOS account that will execute provider processes (sudo -u).
+    /// Select the macOS account that will execute provider processes through the shared helper.
     /// Locked after the first real conversation message, same as provider source.
     public func setRunAsUser(_ user: AgentRunAsUser) {
         guard !providerLocked else { return }
@@ -5143,17 +5685,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// owned the card, not whichever thread is selected when the await returns.
     private func setPermissionMode(_ mode: AgentPermissionMode, for threadId: AgentThreadID) {
         do {
-            guard var thread = try threadRepo.get(id: threadId) else { return }
-            thread.permissionMode = mode
-            thread.updatedAt = Date()
-            try threadRepo.upsert(thread)
+            let now = Date()
+            // Permission chrome only. A leftover 26-column + routing `get` then
+            // full-row `upsert` hitchs session-grant persist and rewrites routing.
+            guard try threadRepo.setPermissionMode(of: threadId, permissionMode: mode, at: now) else { return }
             if let index = threads.firstIndex(where: { $0.id == threadId }) {
                 threads[index].permissionMode = mode
+                threads[index].updatedAt = now
+                onThreadConfigPersisted?(threads[index])
             }
             if selectedThreadId == threadId {
                 permissionMode = mode
             }
-            onThreadConfigPersisted?(thread)
         } catch {
             statusMessage = "Could not save permission mode: \(error)"
         }
@@ -5203,16 +5746,23 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @discardableResult
     public func persistThreadExecutionConfig() -> Bool {
         guard let id = selectedThreadId else { return false }
+        let branch = baseBranch.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextBranch = executionMode == .worktree ? (branch.isEmpty ? (gitBranch ?? "main") : branch) : nil
+        // Execution chrome only. A leftover 26-column + routing `get` then
+        // full-row `upsert` hitchs local↔worktree switches and rewrites routing.
         do {
-            guard var thread = try threadRepo.get(id: id) else { return false }
-            let branch = baseBranch.trimmingCharacters(in: .whitespacesAndNewlines)
-            thread.executionMode = executionMode
-            thread.baseBranch = executionMode == .worktree ? (branch.isEmpty ? (gitBranch ?? "main") : branch) : nil
-            if executionMode == .local { thread.worktreePath = nil }
-            thread.updatedAt = Date()
-            try threadRepo.upsert(thread)
+            let now = Date()
+            guard try threadRepo.setExecutionConfig(
+                of: id,
+                executionMode: executionMode,
+                baseBranch: nextBranch,
+                at: now
+            ) else { return false }
             if let i = threads.firstIndex(where: { $0.id == id }) {
-                threads[i] = thread
+                threads[i].executionMode = executionMode
+                threads[i].baseBranch = nextBranch
+                if executionMode == .local { threads[i].worktreePath = nil }
+                threads[i].updatedAt = now
             }
             return true
         } catch {
@@ -5395,36 +5945,36 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func renameThread(_ id: AgentThreadID, to newTitle: String) {
         let title = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty else { return }
-        let t: AgentThread
         do {
-            guard var stored = try threadRepo.get(id: id) else { return }
-            stored.title = title
-            stored.updatedAt = Date()
-            try threadRepo.upsert(stored)
-            t = stored
+            // Title only. A leftover 26-column + routing `get` then `upsert`
+            // hitchs macOS rename and clobbers concurrent persistThreadConfig /
+            // run-start writes (PERSISTENCE-DATA-002). RPC already uses this UPDATE.
+            try threadRepo.updateTitlePreservingActivity(id, title: title)
         } catch {
             statusMessage = "Could not rename thread: \(error)"
             return
         }
         reloadThreads()
-        onThreadLifecycle?(.updated(threads.first(where: { $0.id == id }) ?? t))
+        if let updated = threads.first(where: { $0.id == id }) {
+            onThreadLifecycle?(.updated(updated))
+        }
     }
 
     /// A2: set/clear a thread's swatch color (empty string clears).
     public func setThreadColor(_ id: AgentThreadID, _ color: String) {
-        let t: AgentThread
         do {
-            guard var stored = try threadRepo.get(id: id) else { return }
-            stored.color = color.isEmpty ? nil : color
-            stored.updatedAt = Date()
-            try threadRepo.upsert(stored)
-            t = stored
+            // Color only. A leftover 26-column + routing `get` after the
+            // targeted UPDATE hitchs the swatch click. Pin already reloads
+            // the rail instead of compiling the row for the lifecycle event.
+            try threadRepo.setColor(id: id, color: color.isEmpty ? nil : color)
         } catch {
             statusMessage = "Could not change thread color: \(error)"
             return
         }
         reloadThreads()
-        onThreadLifecycle?(.updated(threads.first(where: { $0.id == id }) ?? t))
+        if let updated = threads.first(where: { $0.id == id }) {
+            onThreadLifecycle?(.updated(updated))
+        }
     }
 
     public func setThreadPinned(_ id: AgentThreadID, _ pinned: Bool) {
@@ -5659,6 +6209,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         providerThreadSnapshotLastConfirmedAt = nil
         selectedThreadHasRecoverableContext = false
         liveBackgroundShellCount = 0
+        liveBackgroundTasks = []
         currentRunId = nil
         runStartedAt = nil
         stopScheduledLivePoll()
@@ -5667,10 +6218,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         transcriptHistoryRevealCount = 0
         planNotes = ""
         subagentActivity = .empty
-        tokenSaverFooterReloadTask?.cancel()
-        tokenSaverFooterReloadTask = nil
-        tokenSaverThreadSavedTokens = 0
-        tokenSaverThreadMeasuredTokens = 0
+        resetTokenSaverFooterSnapshot()
         reloadQueuedMessages()
         reloadCheckpoints()
     }
@@ -6215,7 +6763,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
     public func promptWasEdited() {
         promptHistoryCursor = nil
-        if let selectedThreadId { persistComposerDraft(for: selectedThreadId) }
+        if let selectedThreadId { scheduleComposerDraftPersistence(for: selectedThreadId) }
     }
     public func removeAttachment(_ attachment: AgentAttachment) {
         attachments.removeAll { $0 == attachment }
@@ -6259,19 +6807,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let threadId,
               let uuid = UUID(uuidString: threadId) else { return }
         let eventThreadId = AgentThreadID(uuid)
-        let eventWorkspaceID: WorkspaceID?
-        if let cachedWorkspaceID = threadWorkspaceCache[eventThreadId] {
-            eventWorkspaceID = cachedWorkspaceID
-        } else {
-            do {
-                eventWorkspaceID = try threadRepo.get(id: eventThreadId)?.workspaceId
-            } catch {
-                return
-            }
-            if eventWorkspaceID == workspaceID {
-                threadWorkspaceCache[eventThreadId] = eventWorkspaceID
-            }
-        }
+        let eventWorkspaceID = resolvedWorkspaceID(for: eventThreadId)
         guard eventWorkspaceID == workspaceID else { return }
         switch kind {
         case "agent.message.queue.failed":
@@ -6503,13 +7039,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     /// Applies one already-verified durable peer row without changing the
     /// selected thread, composer draft, or focus state.
+    /// Workspace membership uses the cache-first probe — never a 26-column get.
     public func applyPersistedBotPeerMessage(
         messageID: AgentMessageID,
         threadId: AgentThreadID,
         terminalStatus: AgentRunStatus? = nil
     ) {
-        guard let thread = try? threadRepo.get(id: threadId),
-              thread.workspaceId == workspaceID,
+        guard resolvedWorkspaceID(for: threadId) == workspaceID,
               let message = try? messageRepo.get(id: messageID),
               message.threadId == threadId,
               message.role == .assistant else { return }
@@ -6574,9 +7110,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             replacedWaitingRow = true
         }
         if replacedWaitingRow || awaitsTerminalThreadStatus,
-           let thread = try? threadRepo.get(id: threadID) {
-            let statusChanged = status != thread.status
-            status = thread.status
+           let durableStatus = try? threadRepo.status(of: threadID) {
+            let statusChanged = status != durableStatus
+            status = durableStatus
             if replacedWaitingRow || statusChanged {
                 scheduleReloadThreads(delayMilliseconds: 0)
             }
@@ -6650,14 +7186,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         guard selectedThreadId == threadId else {
             do {
-                guard var thread = try threadRepo.get(id: threadId) else {
+                guard let wrote = try threadRepo.markUnreadUpdatingActivity(of: threadId) else {
                     statusMessage = "The bot reply thread is no longer available."
                     return nil
                 }
-                if !thread.hasUnread {
-                    thread.hasUnread = true
-                    thread.updatedAt = Date()
-                    try threadRepo.upsert(thread)
+                if wrote {
                     scheduleReloadThreads(delayMilliseconds: 0)
                 }
             } catch {
@@ -6705,6 +7238,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return runStatus == .running || runStatus == .pending
     }
 
+    /// Send/queue only need routing. The painted rail already JOINs it —
+    /// do not full-get a 26-column row that is already in `threads`.
+    private func routingConfigurationForSend(threadId: AgentThreadID) -> AgentRoutingConfiguration {
+        if let painted = threads.first(where: { $0.id == threadId }) {
+            return painted.effectiveRoutingConfiguration
+        }
+        // Routing row only. A leftover 26-column `get` hitchs send/queue when
+        // the painted rail does not already hold the thread.
+        return (try? threadRepo.routingConfiguration(of: threadId))
+            ?? .legacyManual(selection: currentModelSelection, providerInstanceId: providerInstanceId)
+    }
+
+    func routingConfigurationForSendForTesting(threadId: AgentThreadID) -> AgentRoutingConfiguration {
+        routingConfigurationForSend(threadId: threadId)
+    }
+
     private func enqueuePromptWhileRunning(
         text: String,
         attached: [AgentAttachment],
@@ -6713,8 +7262,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let selectedThreadId, let queuedMessageRepo else { return false }
         let mode = interactionMode ?? self.interactionMode
         do {
-            let routing = (try? threadRepo.get(id: selectedThreadId))?.effectiveRoutingConfiguration
-                ?? .legacyManual(selection: currentModelSelection, providerInstanceId: providerInstanceId)
+            let routing = routingConfigurationForSend(threadId: selectedThreadId)
             if routing.mode == .auto {
                 _ = try orchestrationRuntime.route(
                     configuration: routing,
@@ -6806,9 +7354,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 threadId: threadId,
                 expectedRevision: configuration.revision
             )
-            if let persisted = try threadRepo.get(id: threadId),
-               let index = threads.firstIndex(where: { $0.id == threadId }) {
-                threads[index] = persisted
+            // Routing chrome only. A leftover 26-column `get` after CAS hitchs
+            // Auto send heal; the CAS result is already in `healed`.
+            if let index = threads.firstIndex(where: { $0.id == threadId }) {
+                threads[index].routingConfiguration = healed
+                threads[index].updatedAt = healed.updatedAt
             }
             routingMode = .auto
         }
@@ -6831,7 +7381,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     ) async -> AgentRunID? {
         let baseRouting = queuedRoutingSnapshot?.configuration
             ?? routingConfiguration
-            ?? selectedThreadId.flatMap { try? threadRepo.get(id: $0)?.effectiveRoutingConfiguration }
+            ?? selectedThreadId.map { routingConfigurationForSend(threadId: $0) }
             ?? .legacyManual(selection: currentModelSelection, providerInstanceId: providerInstanceId)
         let runProvider = provider
         let runProviderInstanceId = providerInstanceId
@@ -6927,6 +7477,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // never be left permanently loading.
         // Run identity is fixed at acceptance so Stop can cancel this generation.
         let runId = requestedRunId ?? AgentRunID()
+        // A prior run's last snapshot is not evidence for this run. Clear the
+        // holder projection at acceptance, before the new run becomes live, so
+        // an idle → new-run transition cannot resurrect old Stop-strip details.
+        if selectedThreadId == tid {
+            liveBackgroundShellCount = 0
+            liveBackgroundTasks = []
+        }
         // S5: accept surface-owned preparation generation before any Graphify work.
         // Capture the generation for this startProviderRun invocation — never
         // re-read state.generation after await (Stop + resend can advance it).
@@ -6949,7 +7506,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // B5: title a still-default thread from its first message.
         if let t = threads.first(where: { $0.id == tid }),
            AgentThreadTitle.isPlaceholder(t.title),
-           ((try? messageRepo.listRecent(threadId: tid, limit: 1))?.isEmpty ?? true) {
+           !((try? messageRepo.hasAny(threadId: tid)) ?? false) {
             renameThread(tid, to: Self.deriveTitle(from: text))
         }
         loadAllMessages(tid)
@@ -6960,7 +7517,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // The coordinator is the single writer of run messages — mirror
         // the user message in-memory only (no double-persist). Queue drain
         // passes the same UUID as runId, so the optimistic bubble is stable.
-        let durableUserMessageExists = (try? messageRepo.get(id: AgentMessageID(runId.value))) != nil
+        let durableUserMessageExists = (try? messageRepo.exists(id: AgentMessageID(runId.value))) == true
         if !resumeInterrupted && !durableUserMessageExists {
             presentOutgoingUserMessage(
                 threadId: tid,
@@ -7073,18 +7630,28 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             runAsUser: threadRunAsUser
         )
         do {
-            guard var pendingThread = try threadRepo.get(id: tid) else {
+            // Status + unread + updated_at only. A leftover 26-column + routing
+            // `get` then `upsert` hitchs every composer send and rewrites routing
+            // JSON. Coordinator.startRun stamps the same pending chrome; this
+            // hop only needs existence plus painted unread for the optimistic rail.
+            guard try threadRepo.status(of: tid) != nil else {
                 throw NSError(
                     domain: "RemoteCode.AgentAppViewModel",
                     code: 404,
                     userInfo: [NSLocalizedDescriptionKey: "Thread disappeared before provider start."]
                 )
             }
-            pendingThread.status = .pending
-            pendingThread.updatedAt = Date()
-            try threadRepo.upsert(pendingThread)
+            let pendingAt = Date()
+            let paintedUnread = threads.first(where: { $0.id == tid })?.hasUnread ?? false
+            try threadRepo.updateStatus(
+                id: tid,
+                status: .pending,
+                hasUnread: paintedUnread,
+                at: pendingAt
+            )
             if let index = threads.firstIndex(where: { $0.id == tid }) {
-                threads[index] = pendingThread
+                threads[index].status = .pending
+                threads[index].updatedAt = pendingAt
             }
             // Per-run mapping is always safe; selection-facing fields only if still selected.
             runThreads[runId] = tid
@@ -7106,12 +7673,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             )
             if !failed.suppressLateCallback {
                 surfacePreparationStates[tid] = failed.state
-                if var rolled = try? threadRepo.get(id: tid), rolled.status == .pending {
-                    rolled.status = .failed
-                    rolled.updatedAt = Date()
-                    try? threadRepo.upsert(rolled)
+                if let current = try? threadRepo.status(of: tid), current == .pending {
+                    let failedAt = Date()
+                    let paintedUnread = threads.first(where: { $0.id == tid })?.hasUnread ?? false
+                    try? threadRepo.updateStatus(
+                        id: tid,
+                        status: .failed,
+                        hasUnread: paintedUnread,
+                        at: failedAt
+                    )
                     if let index = threads.firstIndex(where: { $0.id == tid }) {
-                        threads[index] = rolled
+                        threads[index].status = .failed
+                        threads[index].updatedAt = failedAt
                     }
                 }
                 if selectedThreadId == tid {
@@ -7590,7 +8163,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // stop is always safer than clearing a projection that may be backing a
         // live run, so a throwing read counts as stoppable.
         do {
-            if try coordinator.durableActiveRun(threadId: threadId) != nil { return true }
+            if try coordinator.hasDurableActiveRun(threadId: threadId) { return true }
         } catch {
             return true
         }
@@ -7608,7 +8181,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             currentRunId = nil
             runStartedAt = nil
             isStopping = false
-            if let durableStatus = (try? threadRepo.get(id: threadId))?.status {
+            if let durableStatus = try? threadRepo.status(of: threadId) {
                 status = durableStatus
             }
             clearActivePlanFollowUpSuppressionIfSafe()
@@ -7723,7 +8296,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // Events can precede handle registration: startRun commits the run row as
         // `.pending` before the provider emits, so the durable row is the proof
         // that this run is the thread's current turn.
-        if let durable = try? coordinator.durableActiveRun(threadId: threadId), durable.id == run {
+        if let durable = try? coordinator.durableActiveRunChrome(threadId: threadId), durable.id == run {
             return true
         }
         // Deliberately NOT memoized into `terminalRunIds`: a run row written by
@@ -7779,6 +8352,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             status: status,
             lastErrorRecoverable: lastErrorRecoverable,
             liveBackgroundShellCount: liveBackgroundShellCount,
+            liveBackgroundTasks: liveBackgroundTasks,
             runsAllowedToMarkActive: allowedActiveRuns,
             entries: pending.map { StreamQuantumEntry(event: $0.0, run: $0.1, threadId: $0.2) }
         )
@@ -7844,12 +8418,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         var nextStatus = input.status
         var nextLastErrorRecoverable = input.lastErrorRecoverable
         var nextBackgroundShellCount = input.liveBackgroundShellCount
+        var nextBackgroundTasks = input.liveBackgroundTasks
         var suppress = input.suppressStaleActivePlanUpdates
         var appliedEvent = false
         var seedRunStartedAt = false
         var runThreadBindings: [AgentRunID: AgentThreadID] = [:]
         var hasProposedPlan = false
         var appliedEvents: [AssistantEvent] = []
+        var holderRunId = input.currentRunId
         appliedEvents.reserveCapacity(input.entries.count)
 
         for entry in input.entries {
@@ -7868,8 +8444,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             appliedEvent = true
             appliedEvents.append(entry.event)
-            if let count = backgroundShellCount(fromRuntimeEvent: entry.event) {
-                nextBackgroundShellCount = count
+            if case .turnStarted = entry.event, holderRunId != entry.run {
+                // A new run owns a fresh pending-task set. Do this before any
+                // snapshot from that run can repopulate the holder projection.
+                nextBackgroundShellCount = 0
+                nextBackgroundTasks = []
+                holderRunId = entry.run
+            }
+            if entry.run == holderRunId,
+               let tasks = backgroundTasks(fromRuntimeEvent: entry.event) {
+                nextBackgroundTasks = tasks
+                nextBackgroundShellCount = tasks.count
             }
             if input.runsAllowedToMarkActive.contains(entry.run) {
                 nextCurrentRunId = entry.run
@@ -7912,6 +8497,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             status: nextStatus,
             lastErrorRecoverable: nextLastErrorRecoverable,
             liveBackgroundShellCount: nextBackgroundShellCount,
+            liveBackgroundTasks: nextBackgroundTasks,
             suppressStaleActivePlanUpdates: suppress,
             seedRunStartedAt: seedRunStartedAt,
             runThreadBindings: runThreadBindings,
@@ -8016,6 +8602,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if liveBackgroundShellCount != reduced.liveBackgroundShellCount {
             liveBackgroundShellCount = reduced.liveBackgroundShellCount
         }
+        if liveBackgroundTasks != reduced.liveBackgroundTasks {
+            liveBackgroundTasks = reduced.liveBackgroundTasks
+        }
         timeline = reduced.timeline
         let budget = Self.aggregateBudgetDecision(
             force: reduced.forceAggregateBudget,
@@ -8050,13 +8639,23 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// report background tasks). Returning nil rather than 0 is deliberate: an
     /// unrelated event must not clear a live count. Pure, for unit testing.
     nonisolated static func backgroundShellCount(fromRuntimeEvent event: AssistantEvent) -> Int? {
+        backgroundTasks(fromRuntimeEvent: event)?.count
+    }
+
+    /// CLI background task ids from the adapter's `claude.session.snapshot`.
+    /// Timeline task rows carry the human type/description and are joined by
+    /// exact task id in `enrichingBackgroundTasks`. nil when the event is not
+    /// a snapshot that carries the producer's id field.
+    nonisolated static func backgroundTasks(fromRuntimeEvent event: AssistantEvent) -> [AgentBackgroundTask]? {
         guard case .providerRuntime(let runtime) = event,
               runtime.provider == .claude,
               runtime.method == "claude.session.snapshot",
               let data = runtime.payloadJSON.data(using: .utf8),
-              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let ids = payload["pendingBackgroundTaskIds"] as? [String] else { return nil }
-        return ids.count
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        guard let ids = payload["pendingBackgroundTaskIds"] as? [String] else { return nil }
+        return AgentBackgroundTask.placeholders(fromIds: ids)
     }
 
     /// Apply one event that the hot queue refused, without growing the queue.
@@ -8284,15 +8883,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             let finishedTid = threadId
             // Same workspace filter as didChangeStatus: multi-tab Agent Apps must
             // not pay MainActor work or promote unrelated workspaces on finish.
-            let threadWorkspace: WorkspaceID?
-            if let cached = self.threadWorkspaceCache[finishedTid] {
-                threadWorkspace = cached
-            } else {
-                threadWorkspace = try? self.threadRepo.get(id: finishedTid)?.workspaceId
-                if let wid = threadWorkspace {
-                    self.threadWorkspaceCache[finishedTid] = wid
-                }
-            }
+            let threadWorkspace = self.resolvedWorkspaceID(for: finishedTid)
             guard Self.shouldHandleRunFinishForWorkspace(
                 threadWorkspace: threadWorkspace,
                 surfaceWorkspace: self.workspaceID
@@ -8379,15 +8970,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             guard !self.isDisposed else { return }
             // PERF-MAC_AGENT-009: use the cache for the workspace filter; fall back to
             // DB only on a cache miss (first event for a thread not yet loaded here).
-            let threadWorkspace: WorkspaceID?
-            if let cached = self.threadWorkspaceCache[threadId] {
-                threadWorkspace = cached
-            } else {
-                threadWorkspace = try? self.threadRepo.get(id: threadId)?.workspaceId
-                if let wid = threadWorkspace {
-                    self.threadWorkspaceCache[threadId] = wid
-                }
-            }
+            let threadWorkspace = self.resolvedWorkspaceID(for: threadId)
             guard threadWorkspace == self.workspaceID else { return }
             // Coalesce N same-workspace Agent App tabs into one reload per surface.
             self.scheduleReloadThreads()
@@ -8699,6 +9282,7 @@ struct StreamQuantumReduceInput: Sendable {
     let status: AgentRunStatus
     let lastErrorRecoverable: Bool
     let liveBackgroundShellCount: Int
+    let liveBackgroundTasks: [AgentBackgroundTask]
     let runsAllowedToMarkActive: Set<AgentRunID>
     let entries: [StreamQuantumEntry]
 }
@@ -8711,6 +9295,7 @@ struct StreamQuantumReduceResult: Sendable {
     let status: AgentRunStatus
     let lastErrorRecoverable: Bool
     let liveBackgroundShellCount: Int
+    let liveBackgroundTasks: [AgentBackgroundTask]
     let suppressStaleActivePlanUpdates: Bool
     let seedRunStartedAt: Bool
     let runThreadBindings: [AgentRunID: AgentThreadID]
@@ -9706,14 +10291,43 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         }
     }
 
+    /// Live tool rows re-enter `body` (and TimelineView ticks) on the same JSON.
+    /// Parse once per body string; SwiftUI must not JSON-decode on every pass.
+    private final class ToolInputJSONBox {
+        let object: [String: Any]?
+        init(_ object: [String: Any]?) { self.object = object }
+    }
+
+    private static let toolInputCache: NSCache<NSString, ToolInputJSONBox> = {
+        let cache = NSCache<NSString, ToolInputJSONBox>()
+        cache.countLimit = 256
+        cache.totalCostLimit = 128 * 1_024
+        return cache
+    }()
+
+    #if DEBUG
+    nonisolated(unsafe) static var toolInputObjectComputeCountForTesting = 0
+    #endif
+
     static func toolInputObject(for item: AssistantItem) -> [String: Any]? {
         let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty,
-              let data = body.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
+        guard !body.isEmpty else { return nil }
+        let key = body as NSString
+        if let cached = toolInputCache.object(forKey: key) {
+            return cached.object
         }
-        return obj
+        #if DEBUG
+        toolInputObjectComputeCountForTesting &+= 1
+        #endif
+        let parsed: [String: Any]?
+        if let data = body.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            parsed = obj
+        } else {
+            parsed = nil
+        }
+        toolInputCache.setObject(ToolInputJSONBox(parsed), forKey: key, cost: max(1, body.utf8.count))
+        return parsed
     }
 
     static func intMillis(from value: Any?) -> Int? {
@@ -9931,9 +10545,11 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
 
 }
 
-public struct AgentImageViewPresentation: Equatable, Sendable {
+public struct AgentImageViewPresentation: Equatable, Sendable, Identifiable {
     public let displayName: String
     public let resourceURL: URL
+
+    public var id: String { resourceURL.path }
 
     public static func make(for item: AssistantItem) -> AgentImageViewPresentation? {
         guard item.type == .imageView else { return nil }
@@ -10075,7 +10691,7 @@ private struct AgentTranscriptImageThumbStrip: View {
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(alignment: .top, spacing: DS.Space.sm) {
-                ForEach(Array(presentations.enumerated()), id: \.offset) { index, presentation in
+                ForEach(Array(presentations.enumerated()), id: \.element.id) { index, presentation in
                     AgentTranscriptImageThumb(
                         url: presentation.resourceURL,
                         displayName: presentation.displayName,
@@ -13010,10 +13626,8 @@ public struct AgentAppView: View {
                             }
                             // B-1: one chip for the whole thread, after the newest
                             // finished answer — never N copies under every final.
-                            if !vm.selectedThreadRunIsStartingOrRunning {
-                                tokenSaverThreadFooter()
-                                    .id("agent.tokenSaver.footer")
-                            }
+                            tokenSaverThreadFooter()
+                                .id("agent.tokenSaver.footer")
                             if Self.shouldRenderActivePlan(
                                 plan: vm.activePlan,
                                 status: vm.status,
@@ -13034,6 +13648,7 @@ public struct AgentAppView: View {
                                     context: activeBotPeerReviewName.map {
                                         AgentChatWorkingContext.reviewing(peerName: $0)
                                     },
+                                    hold: vm.backgroundHoldSummary,
                                     onStop: { vm.stop() }
                                 )
                                 .id("agent.workingStatus")
@@ -13412,10 +14027,12 @@ public struct AgentAppView: View {
             switch request.kind {
             case .commandExecution, .exec:
                 HStack(alignment: .top, spacing: DS.Space.sm) {
-                    Text(detail)
-                        .font(DS.Font.mono)
-                        .foregroundColor(DS.Palette.text)
-                        .textSelection(.enabled)
+                    AgentSelectablePlainText(
+                        text: detail,
+                        fontSize: 12,
+                        monospaced: true,
+                        textColor: DS.NS.text
+                    )
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(DS.Space.sm)
                         .background(DS.Palette.surface)
@@ -13473,11 +14090,13 @@ public struct AgentAppView: View {
                     }
                 }
             default:
-                Text(detail)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(4)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: detail,
+                    fontSize: 11,
+                    monospaced: true,
+                    textColor: DS.NS.textTertiary,
+                    maximumNumberOfLines: 4
+                )
             }
         }
     }
@@ -13552,12 +14171,12 @@ public struct AgentAppView: View {
             } else if request.allowsMultipleSelection {
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     HStack(spacing: DS.Space.sm) {
-                        ForEach(request.options, id: \.self) { option in
-                            let selected = vm.userInputSelections[vm.userInputStateKey(request)]?.contains(option) == true
+                        ForEach(request.identifiedOptions) { row in
+                            let selected = vm.userInputSelections[vm.userInputStateKey(request)]?.contains(row.option) == true
                             Button {
-                                vm.toggleUserInputOption(option, for: request)
+                                vm.toggleUserInputOption(row.option, for: request)
                             } label: {
-                                Label(option, systemImage: selected ? "checkmark.square.fill" : "square")
+                                Label(row.option, systemImage: selected ? "checkmark.square.fill" : "square")
                             }
                         }
                     }
@@ -13572,8 +14191,8 @@ public struct AgentAppView: View {
                 }
             } else {
                 HStack(spacing: DS.Space.sm) {
-                    ForEach(request.options, id: \.self) { option in
-                        Button(option) { vm.answerPendingUserInput(request, answer: option) }
+                    ForEach(request.identifiedOptions) { row in
+                        Button(row.option) { vm.answerPendingUserInput(request, answer: row.option) }
                     }
                 }
                 .buttonStyle(.bordered)
@@ -13607,9 +14226,8 @@ public struct AgentAppView: View {
                         Text(question.prompt)
                             .font(DS.Font.bodyDense.weight(.semibold))
                             .foregroundColor(DS.Palette.text)
-                        // Index-keyed so duplicate option labels can't share SwiftUI identity.
-                        ForEach(Array(question.options.enumerated()), id: \.offset) { _, option in
-                            askUserQuestionOptionButton(option, question: question, request: request)
+                        ForEach(question.identifiedOptions) { row in
+                            askUserQuestionOptionButton(row.option, question: question, request: request)
                         }
                         AskUserQuestionOtherField(vm: vm, question: question, request: request)
                     }
@@ -13732,7 +14350,6 @@ public struct AgentAppView: View {
             cacheResults: cacheMarkdown
         )
             .foregroundColor(DS.Palette.text)
-            .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -13804,26 +14421,52 @@ public struct AgentAppView: View {
         return max(measured, breakdown.totalCredible)
     }
 
+    /// Pure seam: green savings, yellow on-zero problem, red off. Nil while a
+    /// thread-switch snapshot has not landed — that pending 0 is not off or a
+    /// problem chip.
+    public nonisolated static func tokenSaverThreadFooterPresentation(
+        enabled: Bool,
+        measuredTokens: Int = 0,
+        snapshotReady: Bool = true
+    ) -> AgentChatTokenSaverThreadFooterPresentation? {
+        guard snapshotReady else { return nil }
+        if !enabled { return .deactivated }
+        if measuredTokens <= 0 { return .problem }
+        return .savings
+    }
+
     /// Pure seam: footer copy.
     ///
-    /// - Requires `measuredTokens > 0` so estimates only **raise** a proven ledger
-    ///   figure — never invent a chip from assistant text alone.
+    /// - Off (and ready): always 0 tokens saved because Token Saver is deactivated.
+    /// - On with `measuredTokens == 0`: still present, yellow problem copy, not red.
+    /// - On with measured > 0: estimates may only **raise** the proven ledger figure.
     /// - Product copy: full stack in plain language (tool output, shorter answers,
     ///   multi-turn cache). Optional Auto note for cheaper models.
     public nonisolated static func tokenSaverThreadFooterText(
         displayTokens: Int,
         measuredTokens: Int,
         enabled: Bool,
-        autoRoutingActive: Bool = false
+        autoRoutingActive: Bool = false,
+        snapshotReady: Bool = true
     ) -> String? {
-        guard enabled, measuredTokens > 0, displayTokens > 0 else { return nil }
-        let amount = formatTokenCountForFooter(displayTokens)
-        // Keep the chip scannable: one number + short list of what is inside it.
-        let base = "Token Saver: \(amount) tokens saved (tool output, shorter answers, multi-turn cache)"
-        if autoRoutingActive {
-            return base + " · Auto picked cheaper models at the same quality"
+        guard let presentation = tokenSaverThreadFooterPresentation(
+            enabled: enabled,
+            measuredTokens: measuredTokens,
+            snapshotReady: snapshotReady
+        ) else { return nil }
+        switch presentation {
+        case .deactivated:
+            return "Token Saver: 0 tokens saved because Token Saver is deactivated"
+        case .problem:
+            return "Token Saver: 0 tokens saved because something went wrong"
+        case .savings:
+            let amount = formatTokenCountForFooter(displayTokens)
+            let base = "Token Saver: \(amount) tokens saved (tool output, shorter answers, multi-turn cache)"
+            if autoRoutingActive {
+                return base + " · Auto picked cheaper models at the same quality"
+            }
+            return base
         }
-        return base
     }
 
     /// Backward-compatible alias used by older tests — measured-only copy path.
@@ -13857,18 +14500,45 @@ public struct AgentAppView: View {
         return "\(n)"
     }
 
-    /// Soft success chip once under the newest finished answer (not every turn).
+    /// True only after the selected thread has finished a turn *and* the
+    /// shipped footer copy is non-nil. Live runs keep the working strip instead.
+    /// Empty threads with no finished turn stay chip-less.
+    public nonisolated static func shouldShowTokenSaverThreadFooter(
+        runIsLive: Bool,
+        footerText: String?,
+        hasFinishedTurn: Bool = true
+    ) -> Bool {
+        !runIsLive && hasFinishedTurn && footerText != nil
+    }
+
+    /// Shared Token Saver chip once under the newest finished answer (not every turn).
     @ViewBuilder
     private func tokenSaverThreadFooter() -> some View {
         // Auto routing is the product name for model-auto orchestration on a thread.
         let autoRouting = vm.routingMode == .auto
-        if let text = Self.tokenSaverThreadFooterText(
+        let text = Self.tokenSaverThreadFooterText(
             displayTokens: vm.tokenSaverThreadSavedTokens,
             measuredTokens: vm.tokenSaverThreadMeasuredTokens,
             enabled: vm.tokenSaverFooterEnabled,
-            autoRoutingActive: autoRouting
-        ) {
-            AgentChatTokenSaverThreadFooter(text: text, autoRouting: autoRouting)
+            autoRoutingActive: autoRouting,
+            snapshotReady: vm.tokenSaverFooterSnapshotReady
+        )
+        let presentation = Self.tokenSaverThreadFooterPresentation(
+            enabled: vm.tokenSaverFooterEnabled,
+            measuredTokens: vm.tokenSaverThreadMeasuredTokens,
+            snapshotReady: vm.tokenSaverFooterSnapshotReady
+        )
+        let hasFinishedTurn = vm.messages.contains(where: { $0.role == .assistant })
+        if Self.shouldShowTokenSaverThreadFooter(
+            runIsLive: vm.selectedThreadRunIsStartingOrRunning,
+            footerText: text,
+            hasFinishedTurn: hasFinishedTurn
+        ), let text, let presentation {
+            AgentChatTokenSaverThreadFooter(
+                text: text,
+                autoRouting: autoRouting,
+                presentation: presentation
+            )
         }
     }
 
@@ -14025,10 +14695,13 @@ public struct AgentAppView: View {
                     .font(.system(size: 11))
                     .foregroundColor(recoverable ? DS.Palette.warning : DS.Palette.danger)
                     .frame(width: 14, height: 14, alignment: .center)
-                Text(err)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(recoverable ? DS.Palette.warning : DS.Palette.danger)
-                    .lineSpacing(3).textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: err,
+                    fontSize: 11,
+                    monospaced: true,
+                    textColor: recoverable ? DS.NS.warning : DS.NS.danger,
+                    lineSpacing: 3
+                )
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Button { vm.dismissDisplayedError() } label: {
                     Image(systemName: "xmark")
@@ -14313,11 +14986,11 @@ public struct AgentAppView: View {
                 }
             }
         case .system:
-            Text(msg.content)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-                .italic()
-                .textSelection(.enabled)
+            AgentSelectablePlainText(
+                text: msg.content,
+                fontSize: 11,
+                textColor: DS.NS.textTertiary
+            )
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -14853,11 +15526,12 @@ public struct AgentAppView: View {
             .buttonStyle(.plain)
             .help(streaming ? "" : (text.isEmpty ? "" : (expanded ? "Hide reasoning" : "Show reasoning")))
             if expanded, !text.isEmpty {
-                Text(text)
-                    .font(DS.Font.bodyDense)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineSpacing(3)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: text,
+                    fontSize: 12,
+                    textColor: DS.NS.textTertiary,
+                    lineSpacing: 3
+                )
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -15078,11 +15752,13 @@ public struct AgentAppView: View {
             // UX-MAC_AGENT-OPEN-SPLIT: file/URL tools keep an open-in-split affordance.
             if let summary = commandSummary, !summary.isEmpty {
                 HStack(alignment: .top, spacing: DS.Space.xs) {
-                    Text(summary)
-                        .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
-                        .textSelection(.enabled)
-                        .lineLimit(expanded ? nil : 1)
-                        .truncationMode(.tail)
+                    AgentSelectablePlainText(
+                        text: summary,
+                        fontSize: 11,
+                        monospaced: true,
+                        textColor: DS.NS.textSecondary,
+                        maximumNumberOfLines: expanded ? nil : 1
+                    )
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .help(commandFull ?? summary)
                     if let full = commandFull, !full.isEmpty {
@@ -15150,10 +15826,12 @@ public struct AgentAppView: View {
 
             // Expanded: full command (when longer/different than the summary) + output.
             if expanded, let full = commandFull, fullDiffersFromSummary, !full.isEmpty {
-                Text(full)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: full,
+                    fontSize: 11,
+                    monospaced: true,
+                    textColor: DS.NS.textTertiary
+                )
                     .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface.opacity(0.7))
@@ -15165,9 +15843,12 @@ public struct AgentAppView: View {
             // the transcript. Skill tool output stays complete (source-aware exception).
             // Full text stays selectable.
             if expanded, let o = output, !o.isEmpty {
-                Text(AgentTimelineItemPresentation.cappedDetail(o, for: item))
-                    .font(DS.Font.mono).foregroundColor(DS.Palette.textSecondary)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: AgentTimelineItemPresentation.cappedDetail(o, for: item),
+                    fontSize: 12,
+                    monospaced: true,
+                    textColor: DS.NS.textSecondary
+                )
                     .padding(DS.Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface)
@@ -15423,10 +16104,11 @@ public struct AgentAppView: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(DS.Palette.danger)
                 .frame(width: 14, height: 14, alignment: .center)
-            Text(message)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.text)
-                .textSelection(.enabled)
+            AgentSelectablePlainText(
+                text: message,
+                fontSize: 11,
+                textColor: DS.NS.text
+            )
                 .frame(maxWidth: .infinity, alignment: .leading)
             if offersCopy {
                 Button("Copy") {
@@ -15472,10 +16154,11 @@ public struct AgentAppView: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(DS.Palette.textSecondary)
                 .frame(width: 14, height: 14, alignment: .center)
-            Text(message)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textSecondary)
-                .textSelection(.enabled)
+            AgentSelectablePlainText(
+                text: message,
+                fontSize: 11,
+                textColor: DS.NS.textSecondary
+            )
                 .frame(maxWidth: .infinity, alignment: .leading)
             Button(action: dismiss) {
                 Image(systemName: "xmark")
@@ -15791,10 +16474,11 @@ public struct AgentAppView: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(tone)
                 .frame(width: 14, height: 14, alignment: .center)
-            Text(item.message)
-                .font(DS.Font.caption)
-                .foregroundColor(item.severity == .info ? DS.Palette.textSecondary : DS.Palette.text)
-                .textSelection(.enabled)
+            AgentSelectablePlainText(
+                text: item.message,
+                fontSize: 11,
+                textColor: item.severity == .info ? DS.NS.textSecondary : DS.NS.text
+            )
                 .frame(maxWidth: .infinity, alignment: .leading)
             if item.offersCopy {
                 Button("Copy") {
@@ -15875,7 +16559,11 @@ public struct AgentAppView: View {
             guard let start = vm.runStartedAt else { return nil }
             return max(0, Int(vm.currentTime().timeIntervalSince(start)))
         }()
-        if let label = AgentWorkingStripPresentation.label(phase: phase, elapsedSeconds: elapsed) {
+        if let label = AgentWorkingStripPresentation.label(
+            phase: phase,
+            elapsedSeconds: elapsed,
+            hold: vm.backgroundHoldSummary
+        ) {
             let tone: DSPill.Tone = {
                 switch phase {
                 case .awaitingBackground: return .warning
@@ -15883,12 +16571,15 @@ public struct AgentAppView: View {
                 case .idle: return .neutral
                 }
             }()
+            let holdHelp = vm.backgroundHoldSummary.map {
+                $0.accessibilityLabel(elapsedSeconds: elapsed ?? 0)
+            }
             AgentChatWorkingPill(
                 label: label,
                 identifier: "agent.workingPhase",
                 tone: tone,
-                help: phase.accessibilityLabel,
-                accessibilityLabelText: phase.accessibilityLabel,
+                help: vm.backgroundHoldSummary?.helpText ?? phase.accessibilityLabel,
+                accessibilityLabelText: holdHelp ?? phase.accessibilityLabel,
                 padded: false
             )
         } else {
@@ -15966,7 +16657,7 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.execution.menu")
     }
 
-    /// macOS user capsule (sudo -u). Left of provider source + model.
+    /// macOS user capsule (shared helper). Left of provider source + model.
     private var runAsUserMenu: some View {
         let users = vm.availableRunAsUsers.isEmpty ? MacOSLocalUserCatalog.listEligibleUsers() : vm.availableRunAsUsers
         let selected = vm.runAsUser ?? AgentRunAsUser.current()
@@ -16550,10 +17241,12 @@ public struct AgentAppView: View {
                         }
                     }
                     ScrollView {
-                        Text(plan)
-                            .font(DS.Font.monoSmall)
-                            .foregroundColor(DS.Palette.text)
-                            .textSelection(.enabled)
+                        AgentSelectablePlainText(
+                            text: plan,
+                            fontSize: 11,
+                            monospaced: true,
+                            textColor: DS.NS.text
+                        )
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(maxHeight: proposedPlanExpanded ? 420 : 220)
@@ -16651,10 +17344,12 @@ public struct AgentAppView: View {
                         }
                     }
                     ScrollView {
-                        Text(vm.checkpointDiffPreview)
-                            .font(DS.Font.monoSmall)
-                            .foregroundColor(DS.Palette.text)
-                            .textSelection(.enabled)
+                        AgentSelectablePlainText(
+                            text: vm.checkpointDiffPreview,
+                            fontSize: 11,
+                            monospaced: true,
+                            textColor: DS.NS.text
+                        )
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(maxHeight: 220)
@@ -16799,7 +17494,6 @@ public struct AgentAppView: View {
                 Spacer(minLength: 0)
             }
             AgentMessageMarkdownView(text: markdown)
-                .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: DS.Space.xs) {
                 if plan.showsImplementationActions {

@@ -363,6 +363,57 @@ final class ProviderProcessSweeperTests: XCTestCase {
                       "managed | distill helper is mcp mode")
         XCTAssertFalse(ProviderProcessSweeper.isRemoteCodeDistillServerCommand(mcp),
                        "mcp helpers must not be swept by the single-server policy")
+        for mode in ["bot-self-config", "bot-web", "bot-browser", "bot-computer"] {
+            let command = "/App/RemoteCodeDistillService \(mode)"
+            XCTAssertTrue(
+                ProviderProcessSweeper.isRemoteCodeDistillMCPCommand(command),
+                "\(mode) is a per-run MCP sidecar and must be classified with mcp helpers"
+            )
+            XCTAssertFalse(
+                ProviderProcessSweeper.isRemoteCodeDistillServerCommand(command),
+                "\(mode) must not be treated as the singleton MLX HTTP server"
+            )
+        }
+    }
+
+    func test_orphanDistillMCPSidecars_reapDeadParentAndIgnoreLiveOwnerAndHTTPServer() {
+        // WHY: Claude/Codex/Grok spawn one Distill MCP per catalog server per
+        // run. When the provider exits, those children reparent to launchd and
+        // stack (60+ of each bot-* mode on the frozen host). Command text of
+        // OUR Mach-O plus a dead parent is enough to reap — never the HTTP server,
+        // never a sidecar whose provider parent is still alive.
+        let liveClaude = ProviderRuntimeProcess(
+            pid: 500, ppid: 1, pgid: 500, rssKB: 80,
+            command: "/opt/claude --print"
+        )
+        let liveOwned = ProviderRuntimeProcess(
+            pid: 501, ppid: 500, pgid: 500, rssKB: 20,
+            command: "/App/RemoteCodeDistillService bot-self-config"
+        )
+        let orphanBot = ProviderRuntimeProcess(
+            pid: 601, ppid: 1, pgid: 601, rssKB: 20,
+            command: "/App/RemoteCodeDistillService bot-web"
+        )
+        let orphanMCP = ProviderRuntimeProcess(
+            pid: 602, ppid: 1, pgid: 602, rssKB: 20,
+            command: "/App/RemoteCodeDistillService mcp"
+        )
+        let httpServer = ProviderRuntimeProcess(
+            pid: 700, ppid: 1, pgid: 700, rssKB: 4000,
+            command: "/App/RemoteCodeDistillService --auth-token ABC --host 127.0.0.1 --port 0"
+        )
+        let processes = [liveClaude, liveOwned, orphanBot, orphanMCP, httpServer]
+        let orphans = ProviderProcessSweeper.orphanDistillMCPPIDs(in: processes)
+        XCTAssertEqual(Set(orphans), [601, 602],
+                       "only Distill MCP sidecars whose parent is gone may be reaped")
+        var signalled: [Int32] = []
+        let terminated = ProviderProcessSweeper.reapOrphanDistillMCPSidecars(processes: processes) { pid in
+            signalled.append(pid)
+            return true
+        }
+        XCTAssertEqual(Set(terminated), [601, 602])
+        XCTAssertEqual(Set(signalled), [601, 602],
+                       "the shipped reap entry must drive terminate() only for orphan Distill MCP PIDs")
     }
 
     func test_managedScanRequiresExactOwnershipAndSeparatesProviderFromSidecar() {

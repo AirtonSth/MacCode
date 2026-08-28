@@ -32,6 +32,10 @@ enum ClaudeForkReconciliationError: Error, Equatable, CustomStringConvertible {
 }
 
 public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked Sendable {
+    // Pin stays on 0.3.157: the bridge launches the live `claude` binary via
+    // pathToClaudeCodeExecutable, so CLI-side protocol (init errors, drain,
+    // MCP wait) already follows the installed CLI. Bump only when a typed JS
+    // API field is proven required (CLAUDE-SDK-002).
     static let defaultSDKPackageSpec = "@anthropic-ai/claude-agent-sdk@0.3.157"
     static let bridgeProtocolVersion = 3
     static let defaultSDKVersion = "0.3.157"

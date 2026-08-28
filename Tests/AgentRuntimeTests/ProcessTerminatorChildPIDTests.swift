@@ -29,6 +29,17 @@ final class ProcessTerminatorChildPIDTests: XCTestCase {
         }
     }
 
+    func test_unreapedDescendants_dropsRootAndDeadPids() {
+        // WHY: Graphify's Python resource_tracker can outlive the CLI root.
+        // Timeout must recapture the tree and kill only still-alive children.
+        let leftover = ProcessTerminator.unreapedDescendants(
+            root: 10,
+            tree: [11, 10, 12, 0, -1],
+            isAlive: { pid in pid == 11 || pid == 10 }
+        )
+        XCTAssertEqual(leftover, [11])
+    }
+
     // Restore the real provider after each test so other suites are unaffected.
     override func tearDown() {
         super.tearDown()

@@ -482,11 +482,10 @@ public final class GrokACPClient: @unchecked Sendable {
         }
         let model = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard request.provider == .grok,
-              model == "grok-4.5",
               request.providerThreadId == nil,
               request.permissionMode == .autoAcceptEdits,
               let effort = request.reasoningEffort,
-              GrokRunner.grok45ReasoningEfforts.contains(effort) else {
+              Self.admitsSamGrokWorker(model: model, effort: effort) else {
             throw GrokACPError.unsupported(
                 "invalid sam-grok-worker Agent App runtime profile"
             )
@@ -663,13 +662,54 @@ public final class GrokACPClient: @unchecked Sendable {
         return home
     }
 
-    func newSession(cwd: String) async throws -> GrokACPSessionOpenResult {
+    /// Prefix-aware sam-grok-worker admission: grok-4.5 and grok-4.6 only,
+    /// with effort taken from `GrokReasoningPolicy.supportedEfforts(for:)`.
+    public static func admitsSamGrokWorker(model: String, effort: AgentReasoningEffort) -> Bool {
+        let id = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard id.hasPrefix("grok-4.5") || id.hasPrefix("grok-4.6") else { return false }
+        return GrokReasoningPolicy.supportedEfforts(for: model).contains(effort)
+    }
+
+    /// ACP `session/new` / `session/load` params. `yoloMode` is spawn-time
+    /// always-approve (grok-build `_meta.yoloMode`); `noReplay` is the existing
+    /// load-path skip. Both share one `_meta` object so neither replaces the other.
+    /// `autoMode` is intentionally omitted: RemoteCode autoAcceptEdits maps to
+    /// `set_mode acceptEdits`, not Grok auto.
+    static func sessionOpenParams(
+        cwd: String,
+        mcpServers: [Any],
+        sessionId: String? = nil,
+        yoloMode: Bool = false,
+        noReplay: Bool = false
+    ) -> JSONObject {
+        var params: JSONObject = [
+            "cwd": cwd,
+            "mcpServers": mcpServers,
+        ]
+        if let sessionId {
+            params["sessionId"] = sessionId
+        }
+        var meta: JSONObject = [:]
+        if yoloMode {
+            meta["yoloMode"] = true
+        }
+        if noReplay {
+            meta["noReplay"] = true
+        }
+        if !meta.isEmpty {
+            params["_meta"] = meta
+        }
+        return params
+    }
+
+    func newSession(cwd: String, yoloMode: Bool = false) async throws -> GrokACPSessionOpenResult {
         let result = try await requestJSONObject(
             method: "session/new",
-            params: [
-                "cwd": Self.resolvedSessionCwd(cwd),
-                "mcpServers": Self.sessionMCPServers(environment: mcpEnvironment),
-            ],
+            params: Self.sessionOpenParams(
+                cwd: Self.resolvedSessionCwd(cwd),
+                mcpServers: Self.sessionMCPServers(environment: mcpEnvironment),
+                yoloMode: yoloMode
+            ),
             timeout: 20
         )
         return try Self.openResult(result, fallbackSessionId: nil)
@@ -678,19 +718,21 @@ public final class GrokACPClient: @unchecked Sendable {
     /// When `noReplay` is true, params include `_meta.noReplay` (grok-build
     /// mvp_agent `parse_no_replay`) so the agent skips gateway history replay.
     /// Default false preserves full replay for recover/readThread paths.
+    /// When `yoloMode` is true, params also include `_meta.yoloMode` so cold
+    /// load re-stamps always-approve for the resident session.
     func loadSession(
         sessionId: String,
         cwd: String,
-        noReplay: Bool = false
+        noReplay: Bool = false,
+        yoloMode: Bool = false
     ) async throws -> GrokACPSessionOpenResult {
-        var params: JSONObject = [
-            "sessionId": sessionId,
-            "cwd": Self.resolvedSessionCwd(cwd),
-            "mcpServers": Self.sessionMCPServers(environment: mcpEnvironment),
-        ]
-        if noReplay {
-            params["_meta"] = ["noReplay": true]
-        }
+        let params = Self.sessionOpenParams(
+            cwd: Self.resolvedSessionCwd(cwd),
+            mcpServers: Self.sessionMCPServers(environment: mcpEnvironment),
+            sessionId: sessionId,
+            yoloMode: yoloMode,
+            noReplay: noReplay
+        )
         let result = try await requestJSONObject(
             method: "session/load",
             params: params,

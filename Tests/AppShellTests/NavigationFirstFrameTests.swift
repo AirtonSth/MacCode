@@ -85,6 +85,13 @@ final class SidebarViewTests: XCTestCase {
             sidebar.contains(".animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: vm.isBotsSelected)"),
             "the Workspaces/Bots boundary must not animate for 200ms"
         )
+        let bots = try source("Sources/AppShell/BotsWindow.swift")
+        XCTAssertFalse(
+            bots.contains(".animation(DS.Motion.micro, value: selected)"),
+            "the Workspaces/Bots switcher must not animate the selected segment"
+        )
+        XCTAssertTrue(bots.contains("publishedRoster"))
+        XCTAssertTrue(bots.contains("waitForCommittedFrame"))
     }
 }
 
@@ -106,6 +113,33 @@ final class WorkspaceRebuildSchedulingTests: XCTestCase {
         surfaces.forEach { SurfaceRegistry.shared.unregister($0.descriptor.id) }
         retainedControllers.removeAll()
         super.tearDown()
+    }
+
+    func test_presentBotsReusesHostingViewAcrossWorkspaceReturn() throws {
+        let directory = NSTemporaryDirectory() + "RC2BotsHostReuse-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let controller = MainWindowController(context: context, router: router)
+        router.windowController = controller
+        retainedControllers.append(controller)
+
+        controller.presentBotsInMainContent()
+        let first = controller.botsHostingViewForTesting
+        XCTAssertNotNil(first, "first Bots present must mount a host")
+        controller.presentWorkspaceContent()
+        XCTAssertTrue(
+            first === controller.botsHostingViewForTesting,
+            "leaving Bots must retain the host off-tree"
+        )
+        XCTAssertNil(first?.superview, "retained Bots host must not stay in workspaceContent")
+        controller.presentBotsInMainContent()
+        XCTAssertTrue(
+            first === controller.botsHostingViewForTesting,
+            "returning to Bots must reattach the same NSHostingView"
+        )
+        XCTAssertNotNil(first?.superview, "reattached Bots host must be in the window")
     }
 
     /// WHY: a refresh can win after the workspace return has queued its
@@ -386,7 +420,9 @@ extension BotsWindowTests {
             encoding: .utf8
         )
         XCTAssertTrue(source.contains("private func openDeskFromCache"))
-        XCTAssertTrue(source.contains("cachedConversation?.id == cachedConversationID"))
+        XCTAssertTrue(source.contains("cachedMessages(botID:"))
+        XCTAssertTrue(source.contains("applyStudioSupport(snapshot, prefetchRail: false)"))
+        XCTAssertTrue(source.contains("allowStoreLookup: false"))
         let guardStart = try XCTUnwrap(source.range(of: "private func navigationFreshnessIsCurrent("))
         let guardTail = source[guardStart.lowerBound...]
         let guardEnd = try XCTUnwrap(guardTail.range(of: "\n    private func performDeskFreshness"))
@@ -406,6 +442,8 @@ extension BotsWindowTests {
             encoding: .utf8
         )
         XCTAssertTrue(source.contains("deskWorkLog = []"))
+        XCTAssertTrue(source.contains("messagesByConversation"))
+        XCTAssertTrue(source.contains("allowStoreLookup: !navigationFirstFrameDeferral"))
         XCTAssertTrue(source.contains(".thread(botID: conversation.botID, conversationID: conversation.id)"))
         XCTAssertTrue(source.contains("selectedConversation?.id == conversationID"))
     }

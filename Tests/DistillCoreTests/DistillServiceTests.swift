@@ -938,6 +938,148 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertNotEqual(record.inputTokens, request.input.count, "characters must never be recorded as tokens")
     }
 
+    func test_httpServerSuccessHookAttributesThreadIdWithoutCompleteRecoveryScope() async throws {
+        // WHY: the Agent App chip keys token_saver_thread_totals by thread id.
+        // Complete recovery scope is store-before-loss only; a PATH wrapper that
+        // still has RC_TOKEN_SAVER_THREAD_ID must attribute delivered savings.
+        let configuration = try DistillServiceConfiguration(
+            authToken: "thread-only-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 2
+        )
+        let recorder = RecordingSuccessHandler()
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        ) { request, response, threadID in
+            await recorder.record(request: request, response: response, threadID: threadID)
+        }
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        // Precomputed-output skips store-before-loss, so missing workspace/project
+        // cannot rewrite this to verbatim. The only header under test is thread id.
+        let original = String(repeating: "same log line that repeats many times\n", count: 20) + "exit code: 0\n"
+        let delivered = "same log line that repeats many times\n… (x20)\nexit code: 0"
+        let distillRequest = DistillRequest(
+            mode: .commandOutput,
+            input: original,
+            provider: "grok",
+            recordSavings: true,
+            cacheState: "wave_prepass_A",
+            maxOutputCharacters: 4000,
+            precomputedOutput: delivered,
+            precomputedRouteStage: .llmMLX
+        )
+        let body = try JSONEncoder().encode(distillRequest)
+        var request = URLRequest(url: URL(string: ready.baseURL + "/v1/distill")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 3
+        request.setValue("Bearer thread-only-token", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("thread-only-savings", forHTTPHeaderField: "X-RemoteCode-Thread-ID")
+        request.httpBody = body
+
+        let (_, httpResponse) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(httpResponse as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 200)
+        let records = await recorder.allRecords()
+        let record = try XCTUnwrap(records.first)
+        XCTAssertEqual(record.threadID, "thread-only-savings")
+        XCTAssertGreaterThan(record.savedTokens, 0)
+        XCTAssertTrue(record.delivered)
+    }
+
+    func test_httpServerSuccessHookAttributesAlwaysOnSubagentThreadHeader() async throws {
+        // WHY: Claude/PATH wraps may only send the always-on parent thread.
+        let configuration = try DistillServiceConfiguration(
+            authToken: "subagent-thread-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 2
+        )
+        let recorder = RecordingSuccessHandler()
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        ) { request, response, threadID in
+            await recorder.record(request: request, response: response, threadID: threadID)
+        }
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let original = String(repeating: "same log line that repeats many times\n", count: 20) + "exit code: 0\n"
+        let delivered = "same log line that repeats many times\n… (x20)\nexit code: 0"
+        let distillRequest = DistillRequest(
+            mode: .commandOutput,
+            input: original,
+            provider: "claude",
+            recordSavings: true,
+            cacheState: "wave_prepass_A",
+            maxOutputCharacters: 4000,
+            precomputedOutput: delivered,
+            precomputedRouteStage: .llmMLX
+        )
+        let body = try JSONEncoder().encode(distillRequest)
+        var request = URLRequest(url: URL(string: ready.baseURL + "/v1/distill")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 3
+        request.setValue("Bearer subagent-thread-token", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", forHTTPHeaderField: "X-RemoteCode-Subagent-Thread-ID")
+        request.httpBody = body
+
+        let (_, httpResponse) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(httpResponse as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 200)
+        let records = await recorder.allRecords()
+        let record = try XCTUnwrap(records.first)
+        XCTAssertEqual(record.threadID, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        XCTAssertGreaterThan(record.savedTokens, 0)
+        XCTAssertTrue(record.delivered)
+    }
+
+    func test_clientSendsThreadIdHeaderWithoutCompleteRecoveryScope() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "partial-scope-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 2
+        )
+        let recorder = RecordingSuccessHandler()
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        ) { request, response, threadID in
+            await recorder.record(request: request, response: response, threadID: threadID)
+        }
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let client = try XCTUnwrap(DistillServiceClient(ready: ready, authToken: "partial-scope-token"))
+        let partial = TokenSaverRecoveryRequestContext(
+            workspaceID: "",
+            projectID: "",
+            threadID: "thread-client-only",
+            provider: "codex",
+            attemptID: "",
+            operationID: ""
+        )
+        XCTAssertFalse(partial.hasCompleteScope)
+        _ = try await client.distill(
+            DistillRequest(
+                mode: .commandOutput,
+                input: "alpha.html\nnotes.txt\nbeta.html\n",
+                question: "List existing HTML files, or NONE. Keep paths only.",
+                provider: "codex",
+                recordSavings: true,
+                maxOutputCharacters: 200
+            ),
+            recoveryContext: partial
+        )
+        let records = await recorder.allRecords()
+        let record = try XCTUnwrap(records.first)
+        XCTAssertEqual(record.threadID, "thread-client-only")
+    }
+
     func test_clientCompressesViaServerAndReportsMeasuredSavings() async throws {
         let configuration = try DistillServiceConfiguration(
             authToken: "client-token",

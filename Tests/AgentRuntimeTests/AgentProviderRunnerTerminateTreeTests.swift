@@ -76,14 +76,12 @@ final class AgentProviderRunnerTerminateTreeTests: XCTestCase {
                        "well before the 5s grace window, otherwise graceful shutdown was deferred too")
     }
 
-    func test_terminateTreeImmediately_routesForeignUserDescendantsThroughSudoBeforeKillingRoot() throws {
+    func test_terminateTreeImmediately_routesForeignUserDescendantsThroughHelperBeforeKillingRoot() throws {
         // WHY: a run-as-user provider's subtree carries the TARGET uid — direct
-        // SIGKILL EPERMs and sudo won't relay it, so the whole subtree is reaped
-        // via sudo-as-target-uid BEFORE the direct SIGKILL below. `root` is
-        // included: when `sudo` execs in place (use_pty off — default on bundled
-        // sudo < 1.9.14) root IS the target-uid provider, and excluding it
-        // orphaned the provider to launchd; when root is the invoker-uid `sudo`
-        // monitor the sudo-kill of root is a harmless EPERM no-op. Real signals
+        // SIGKILL EPERMs, so the whole subtree is reaped via the shared helper
+        // BEFORE the direct SIGKILL below. `root` is included because it may be
+        // the target-uid provider after the helper execs in place; excluding it
+        // could orphan the provider to launchd. Real signals
         // to the fake descendant pids are harmless: they don't exist (ESRCH).
         let proc = try spawnShell("sleep 5")
         defer { kill(proc.processIdentifier, SIGKILL) }
@@ -99,13 +97,13 @@ final class AgentProviderRunnerTerminateTreeTests: XCTestCase {
 
         ProcessTerminator.terminateTreeImmediately(proc, foreignUserUID: 502)
 
-        XCTAssertEqual(captured.count, 1, "foreign-user teardown must route exactly one sudo kill")
+        XCTAssertEqual(captured.count, 1, "foreign-user teardown must route exactly one helper signal")
         XCTAssertEqual(captured.first?.0, 502, "must reap AS the target uid")
         XCTAssertEqual(captured.first?.1, SIGKILL)
         XCTAssertEqual(captured.first?.2.sorted(), (fakeDescendants + [root]).sorted(),
-                       "the entire target-uid subtree — including root, which may be the exec-in-place provider — is sudo-routed")
+                       "the entire target-uid subtree — including root, which may be the exec-in-place provider — is helper-routed")
         XCTAssertTrue(captured.first?.2.contains(root) ?? false,
-                       "root must be sudo-routed too: excluding it orphaned an exec-in-place provider to launchd")
+                       "root must be helper-routed too: excluding it orphaned an exec-in-place provider to launchd")
     }
 
     func test_terminateTreeImmediatelyKillsTermIgnoringProviderBeforeAppCanExit() throws {

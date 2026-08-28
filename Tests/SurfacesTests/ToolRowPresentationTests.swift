@@ -12,6 +12,24 @@ final class ToolRowPresentationTests: XCTestCase {
         return timeline.turns[0].items[0]
     }
 
+    func test_toolInputObject_parsesIdenticalBodyOnce() {
+        // WHY: live tool rows re-enter body / TimelineView ticks and used to
+        // JSON-decode item.body on every pass (make + rawShell + preview + summary).
+        let command = "rc-cache-\(UUID().uuidString)"
+        let item = toolItem(body: #"{"command":"\#(command)"}"#)
+        let before = AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting
+        XCTAssertEqual(AgentTimelineItemPresentation.toolInputObject(for: item)?["command"] as? String, command)
+        _ = AgentTimelineItemPresentation.toolInputObject(for: item)
+        _ = AgentTimelineItemPresentation.rawShellCommand(for: item)
+        _ = AgentTimelineItemPresentation.toolCommandPreview(for: item)
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting - before,
+            1,
+            "identical tool JSON must parse once and reuse the cache"
+        )
+        XCTAssertEqual(AgentTimelineItemPresentation.rawShellCommand(for: item), command)
+    }
+
     func test_extractsBashCommandFromJSONBody() {
         let item = toolItem(body: #"{"command":"swift build && swift test","description":"build"}"#)
         XCTAssertEqual(AgentTimelineItemPresentation.toolCommandPreview(for: item), "swift build && swift test",

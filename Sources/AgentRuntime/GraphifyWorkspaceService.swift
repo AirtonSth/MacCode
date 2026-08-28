@@ -1587,6 +1587,15 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
                 }
             }
         }
+        if isGraphifyCLI {
+            let leftover = ProcessTerminator.unreapedDescendants(
+                root: trackedPID,
+                tree: ProcessTerminator.processTreePIDs(root: trackedPID)
+            )
+            for pid in leftover {
+                kill(pid, SIGKILL)
+            }
+        }
         // Unblock drains: close write ends so EOF can arrive.
         try? out.fileHandleForWriting.close()
         try? err.fileHandleForWriting.close()

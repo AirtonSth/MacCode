@@ -150,14 +150,14 @@ public enum ProcessSpawnTagger {
     /// written; availability never overrides complete crash-recovery ownership.
     ///
     /// `foreignUserLaunch` relaxes the child-metadata reads for a provider run as
-    /// another macOS user via `sudo` (see `RunAsUserProcessBootstrap`): the spawned
-    /// child is a root-owned `sudo`, whose `proc_pidinfo`/`proc_pidpath` are
+    /// another macOS user via `RunAsUserProcessBootstrap`: the spawned
+    /// child is a root-owned helper, whose `proc_pidinfo`/`proc_pidpath` are
     /// unreadable to this non-root parent (EPERM). We keep the row anchored on the
     /// always-readable OWNER identity (this app's own pid) plus the child pid, and
     /// tolerate a nil child start identity / exec path / process group. Live
-    /// teardown is handled separately: the `sudo` root (invoker uid) is signalled
-    /// directly and its target-uid descendants are reaped via `ProcessTerminator`'s
-    /// sudo-routed path (a non-root app cannot signal a different-uid `claude`
+    /// teardown is handled separately: the helper process is signalled directly
+    /// and its target-uid descendants are reaped via `ProcessTerminator`'s
+    /// helper-routed path (a non-root app cannot signal a different-uid `claude`
     /// directly). The cost is only crash-recovery reach: the sweep fail-safes such
     /// a row (never signals a PID it cannot identify), so a cross-user orphan
     /// surviving an app crash is retained, never mis-reaped. For a same-user launch
@@ -210,7 +210,7 @@ public enum ProcessSpawnTagger {
                 processGroup: Darwin.getpgid
             )
         } catch {
-            // A root `sudo` child's group cannot always be certified from a
+            // A helper-launched child's group cannot always be certified from a
             // non-root parent; leave the row owner-anchored without it. For a
             // same-user launch an uncertifiable group is still fail-closed.
             guard foreignUserLaunch else {
@@ -629,17 +629,12 @@ enum ProcessTerminator {
     // Grace window between SIGTERM and SIGKILL escalation.
     static let graceInterval: TimeInterval = 2.0
 
-    /// When `foreignUserUID` is set, `root` is EITHER the invoker-uid `sudo`
-    /// wrapper (use_pty on: a monitor parent whose target-uid children we reap)
-    /// OR, when `sudo` execs in place (use_pty off — the default on bundled
-    /// sudo < 1.9.14 and whenever an admin disables it), the target-uid provider
-    /// itself. This non-root app cannot `SIGKILL` a target-uid process directly
-    /// (EPERM) and `sudo` won't relay a `SIGKILL`, so the escalation reaps every
-    /// still-alive pid INCLUDING `root` via `sudo -u#<uid>`: in the monitor case
-    /// that sudo-kill of the invoker-uid root is a harmless EPERM no-op; in the
-    /// exec-in-place case it is the only way to reap the provider (excluding root
-    /// there orphaned it to launchd). NOTE: graceful SIGTERM for an exec-in-place
-    /// root and PID-reuse-proof identity gating remain follow-ups.
+    /// When `foreignUserUID` is set, `root` may be the helper-launched
+    /// target-uid provider itself. This non-root app cannot `SIGKILL` a
+    /// target-uid process directly (EPERM), so the escalation reaps every
+    /// still-alive PID, including `root`, through the installed helper. NOTE:
+    /// graceful SIGTERM for an exec-in-place root and PID-reuse-proof identity
+    /// gating remain follow-ups.
     static func terminateTree(_ process: Process, grace: TimeInterval = graceInterval, foreignUserUID: uid_t? = nil) {
         let root = process.processIdentifier
         // Enumerate the tree once (children first so leaves die before parents),
@@ -677,12 +672,10 @@ enum ProcessTerminator {
         for step in terminationPlan(pids: pids, isAlive: { _ in true }, graceElapsed: false) {
             kill(step.pid, step.signal)
         }
-        // Reap the target-uid subtree via sudo BEFORE the direct SIGKILL below:
-        // once a sudo monitor is killed it can neither relay signals nor reap its
-        // child. Include `root`: when sudo exec'd in place root IS the target-uid
-        // provider (excluding it orphaned the provider to launchd); when root is
-        // the invoker-uid monitor the sudo-kill is a harmless EPERM no-op. `-n`
-        // sudo is fast (no prompt) so this stays synchronous on app quit.
+        // Reap the target-uid subtree via the installed helper BEFORE the direct
+        // SIGKILL below. Include `root`: it may be the exec-in-place provider;
+        // excluding it could orphan the provider to launchd. The helper is
+        // non-interactive, so this stays synchronous on app quit.
         if let foreignUserUID {
             killAsUserProvider(foreignUserUID, SIGKILL, pids)
         }
@@ -691,27 +684,16 @@ enum ProcessTerminator {
         }
     }
 
-    /// The real sudo-routed reaper. Named so tests can restore it after swapping
+    /// The real helper-routed reaper. Named so tests can restore it after swapping
     /// in a capture double (mirrors `LibprocChildPIDProvider` for childPIDProvider).
     static let defaultKillAsUserProvider: (uid_t, Int32, [pid_t]) -> Void = { uid, signal, pids in
-        guard let plan = RunAsUserProcessBootstrap.sudoKillArguments(uid: uid, signal: signal, pids: pids) else { return }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: plan.executablePath)
-        process.arguments = plan.arguments
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            // Best-effort teardown; a failed reap leaves an orphan we could not
-            // have signalled directly anyway.
-        }
+        // Teardown must never install or authorize a helper while the app is
+        // exiting. `runPrivilegedSignal` fails closed when it is unavailable.
+        _ = RunAsUserProcessBootstrap.runPrivilegedSignal(uid: uid, signal: signal, pids: pids)
     }
 
-    /// Delivers `signal` to `pids` as the target uid via non-interactive `sudo`.
-    /// Injectable so tests can assert the routing without spawning `sudo`.
+    /// Delivers `signal` to `pids` as the target uid via the installed helper.
+    /// Injectable so tests can assert routing without spawning the helper.
     static var killAsUserProvider: (uid_t, Int32, [pid_t]) -> Void = defaultKillAsUserProvider
 
     // Pure helper: builds the signal plan for a set of pids.
@@ -743,6 +725,17 @@ enum ProcessTerminator {
     // `internal` (not `private`) so tests can call it directly to verify provider wiring.
     static func processTreePIDs(root: Int32) -> [Int32] {
         childPIDProvider.directChildren(of: root).flatMap(processTreePIDs(root:)) + [root]
+    }
+
+    /// After the root has been signalled, multiprocessing helpers (Graphify's
+    /// Python resource_tracker) can remain. Recapture the tree and keep only
+    /// still-alive non-root PIDs so a timeout cannot leak them.
+    static func unreapedDescendants(
+        root: Int32,
+        tree: [Int32],
+        isAlive: (Int32) -> Bool = { ProcessTerminator.isAlive($0) }
+    ) -> [Int32] {
+        tree.filter { pid in pid != root && pid > 0 && isAlive(pid) }
     }
 
     /// Tracks a provider tree across repeated teardown polls. `knownPIDs`

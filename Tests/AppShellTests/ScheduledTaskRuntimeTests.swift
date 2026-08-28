@@ -81,11 +81,12 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         )
     }
 
-    func test_crossUserRunnerIsTraversableButNotWritable_becauseSudoTargetMustExecuteWithoutReplacingIt() throws {
+    func test_crossUserScheduledLaunchUsesTheSharedHelper_becauseNoShellWrapperMayEscalate() throws {
         let source = try String(contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"), encoding: .utf8)
-        XCTAssertTrue(source.contains(".posixPermissions: 0o711"))
-        XCTAssertTrue(source.contains(".posixPermissions: 0o755"))
-        XCTAssertFalse(source.contains("--preserve-env"))
+        XCTAssertTrue(source.contains("RunAsUserProcessBootstrap.ensureHelperInstalled()"))
+        XCTAssertTrue(source.contains("runAsUser: runAsForProbe"))
+        XCTAssertFalse(source.contains("/usr/bin/sudo"))
+        XCTAssertFalse(source.contains("scheduled-task-runners"))
     }
 
     func test_runtimePreservesFrozenProviderAndReportsManualClaimFailures_becauseRunNowMustNotSilentlyChangeOrDrop() throws {
@@ -105,7 +106,7 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
             .missingWorkspace,
             .inaccessibleWorkspace("/tmp/ws"),
             .ineligibleUser("nobody"),
-            .sudoUnavailable("guest"),
+            .helperUnavailable("guest"),
             .providerUnavailable("Provider not signed in."),
             .unsupportedModel("gpt-x"),
             .unsupportedReasoning("High"),
@@ -262,17 +263,6 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertFalse(source.contains("try service.register()"))
     }
 
-    func test_crossUserAutoUsesOneRunnerPerProvider_becauseRoutesMustLaunchTheAdmittedCLI() {
-        let id = UUID()
-
-        let codex = ScheduledTaskExecutor.runnerFilename(taskID: id, providerInstanceID: "codex-primary")
-        let grok = ScheduledTaskExecutor.runnerFilename(taskID: id, providerInstanceID: "grok/primary")
-
-        XCTAssertNotEqual(codex, grok)
-        XCTAssertTrue(codex.hasSuffix("-codex-primary.sh"))
-        XCTAssertTrue(grok.hasSuffix("-grok-primary.sh"))
-    }
-
     func test_autoRoutingIsBoundToSavedProviderAccount_becauseScheduledRunsMustNotSubstituteSource() throws {
         let source = try String(contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"), encoding: .utf8)
 
@@ -285,7 +275,8 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
     func test_preflightProbesAuthenticationInSelectedUserContext_becauseAccountsMustNotLeakAcrossHomes() throws {
         let source = try String(contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"))
 
-        XCTAssertTrue(source.contains("ProviderCLIProbe.authenticated("))
+        XCTAssertTrue(source.contains("ProviderCLIProbe.authStatus("))
+        XCTAssertTrue(source.contains("runAsUser: runAsForProbe"))
         XCTAssertTrue(source.contains("probeEnvironment = user.name == NSUserName()"))
         XCTAssertTrue(source.contains("The selected provider is unavailable for system user"))
     }

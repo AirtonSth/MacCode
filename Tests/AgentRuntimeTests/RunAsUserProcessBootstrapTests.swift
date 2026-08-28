@@ -2,15 +2,16 @@ import XCTest
 @testable import AgentRuntime
 import CoreModel
 
-/// WHY: cross-user execution runs the provider as another macOS user via the
-/// system `sudo -u` (no helper install). It must no-op for the current uid,
-/// only wrap allowlisted absolute binaries, set the target HOME (`-H`) so the
-/// provider reads THAT user's ~/.claude account/MCP, and pick the auth mode
-/// (`-A` graphical askpass vs `-n` non-interactive) deterministically.
+/// WHY: foreign-user launches must reuse one root-owned helper instead of
+/// opening a graphical password dialog for every provider process.
 final class RunAsUserProcessBootstrapTests: XCTestCase {
 
     private func otherUser() -> AgentRunAsUser {
         AgentRunAsUser(generatedUID: "local-work-502", shortName: "work", uid: 502, gid: 20, homePath: "/Users/work")
+    }
+
+    private func helperLocator(_ path: String = "/tmp/RemoteCodeRunAsUserHelper") -> (String) -> String? {
+        { name in name == RunAsUserProcessBootstrap.helperExecutableNames[0] ? path : nil }
     }
 
     func test_currentUser_isPassthrough() throws {
@@ -21,48 +22,60 @@ final class RunAsUserProcessBootstrapTests: XCTestCase {
             environment: ["FOO": "1"],
             currentDirectory: "/tmp",
             runAsUser: current,
+            helperLocator: helperLocator(),
             currentUID: current.uid
         )
-        XCTAssertFalse(plan.usesHelper)
+        XCTAssertFalse(plan.usesHelper,
+                       "the current user must not cross the privileged boundary")
         XCTAssertEqual(plan.executablePath, "/usr/local/bin/codex")
         XCTAssertEqual(plan.arguments, ["exec", "hi"])
     }
 
-    func test_otherUser_rewritesToSudo_withAskpass() throws {
+    func test_otherUser_rewritesToInstalledHelper() throws {
         let plan = try RunAsUserProcessBootstrap.plan(
             executablePath: "/opt/homebrew/bin/claude",
             arguments: ["-p", "hello"],
-            environment: ["PATH": "/usr/bin"],
+            environment: [
+                "PATH": "/usr/bin",
+                "SUDO_ASKPASS": "/tmp/askpass.sh",
+                "REMOTE_CODE_AGENT_PROVIDER": "claude"
+            ],
             currentDirectory: "/Users/shared/project",
+            provider: .claude,
             runAsUser: otherUser(),
-            askpassPath: "/tmp/askpass.sh",
+            helperLocator: helperLocator(),
             currentUID: 501
         )
         XCTAssertTrue(plan.usesHelper)
-        XCTAssertEqual(plan.executablePath, "/usr/bin/sudo")
-        // sudo -A --preserve-env=PATH -u work -H -- /opt/homebrew/bin/claude -p hello
-        XCTAssertEqual(plan.arguments,
-                       ["-A", "--preserve-env=PATH", "-u", "work", "-H", "--", "/opt/homebrew/bin/claude", "-p", "hello"])
-        XCTAssertTrue(plan.arguments.contains("--preserve-env=PATH"),
-                      "PATH must survive sudo env_reset so the provider finds node/git/rg")
-        XCTAssertEqual(plan.environment["SUDO_ASKPASS"], "/tmp/askpass.sh",
-                       "askpass must be exported so `sudo -A` can prompt without a tty")
-        XCTAssertNil(plan.environment["HOME"], "-H sets the target HOME; we must not preset the caller's HOME")
+        XCTAssertEqual(plan.executablePath, "/tmp/RemoteCodeRunAsUserHelper")
+        XCTAssertEqual(
+            plan.arguments,
+            [
+                "exec", "--uid", "502", "--gid", "20", "--home", "/Users/work",
+                "--user", "work", "--cwd", "/Users/shared/project", "--",
+                "/opt/homebrew/bin/claude", "-p", "hello"
+            ],
+            "foreign-user providers must enter the installed helper once and then exec as the target"
+        )
+        XCTAssertEqual(plan.environment["REMOTE_CODE_AGENT_PROVIDER"], "claude",
+                       "provider identity must survive the helper boundary")
+        XCTAssertNil(plan.environment["SUDO_ASKPASS"],
+                     "an askpass path must never reach the target-user provider")
     }
 
-    func test_otherUser_withoutAskpass_usesNonInteractive() throws {
-        let plan = try RunAsUserProcessBootstrap.plan(
-            executablePath: "/opt/homebrew/bin/claude",
-            arguments: ["-p", "hi"],
-            environment: [:],
-            currentDirectory: "/Users/shared",
-            runAsUser: otherUser(),
-            askpassPath: nil,
-            currentUID: 501
+    func test_foreignUser_withoutInstalledHelper_failsWithoutPrompt() {
+        XCTAssertThrowsError(
+            try RunAsUserProcessBootstrap.plan(
+                executablePath: "/opt/homebrew/bin/claude",
+                arguments: [],
+                environment: [:],
+                currentDirectory: "/Users/shared",
+                runAsUser: otherUser(),
+                helperLocator: { _ in nil },
+                currentUID: 501
+            ),
+            "capability probes and unprepared launches must fail closed rather than prompt repeatedly"
         )
-        XCTAssertEqual(plan.arguments.first, "-n",
-                       "no askpass → -n so a missing credential fails loudly, never hangs on a tty")
-        XCTAssertNil(plan.environment["SUDO_ASKPASS"])
     }
 
     func test_rejectsRelativeBinaryAndUnknownBasename() {
@@ -74,10 +87,10 @@ final class RunAsUserProcessBootstrapTests: XCTestCase {
                     environment: [:],
                     currentDirectory: "/tmp",
                     runAsUser: otherUser(),
-                    askpassPath: "/tmp/a.sh",
+                    helperLocator: helperLocator(),
                     currentUID: 501
                 ),
-                "must reject \(bad): only allowlisted absolute provider binaries may be elevated"
+                "must reject \(bad): only allowlisted absolute provider binaries may cross the helper boundary"
             )
         }
     }
@@ -87,43 +100,113 @@ final class RunAsUserProcessBootstrapTests: XCTestCase {
         XCTAssertThrowsError(
             try RunAsUserProcessBootstrap.plan(
                 executablePath: "/usr/local/bin/claude",
-                arguments: [], environment: [:], currentDirectory: "/tmp",
-                runAsUser: root, currentUID: 501
+                arguments: [],
+                environment: [:],
+                currentDirectory: "/tmp",
+                runAsUser: root,
+                helperLocator: helperLocator(),
+                currentUID: 501
             ),
-            "must never elevate to root / non-interactive uids"
+            "the helper must never elevate to root or a system account"
         )
     }
 
-    func test_askpassScript_promptsAndNamesTarget() {
+    func test_helperInstallation_isIdempotentAndDoesNotPersistPassword() throws {
+        var installed = false
+        var installCount = 0
+        let install: (String, String, String?) -> Bool = { source, destination, askpass in
+            XCTAssertEqual(source, "/tmp/bundled-helper")
+            XCTAssertEqual(destination, "/tmp/installed-helper")
+            XCTAssertNil(askpass, "the fake installer must not receive or persist a password")
+            installCount += 1
+            installed = true
+            return true
+        }
+        let first = try RunAsUserProcessBootstrap.ensureHelperInstalled(
+            sourcePath: "/tmp/bundled-helper",
+            destinationPath: "/tmp/installed-helper",
+            isInstalled: { _ in installed },
+            sourceIsUsable: { _ in true },
+            install: install
+        )
+        let second = try RunAsUserProcessBootstrap.ensureHelperInstalled(
+            sourcePath: "/tmp/bundled-helper",
+            destinationPath: "/tmp/installed-helper",
+            isInstalled: { _ in installed },
+            sourceIsUsable: { _ in true },
+            install: install
+        )
+        XCTAssertEqual(first, "/tmp/installed-helper")
+        XCTAssertEqual(second, first)
+        XCTAssertEqual(installCount, 1,
+                       "once the root-owned helper is installed, later actions must not reauthorize")
+    }
+
+    func test_pmSetArguments_areFixedAndWatcherBound() throws {
+        let directory = URL(fileURLWithPath: "/tmp/RemoteCodeInsomnia-test")
+        let stop = directory.appendingPathComponent("disable")
+        XCTAssertEqual(
+            try RunAsUserProcessBootstrap.pmSetArguments(
+                disabled: true,
+                watchProcessID: 12345,
+                stopFile: stop,
+                sessionDirectory: directory
+            ),
+            [
+                "pmset", "--disablesleep", "1", "--watch-pid", "12345",
+                "--stop-file", stop.path, "--session-directory", directory.path
+            ],
+            "Insomnia may pass only the fixed pmset setting and its crash watcher"
+        )
+        XCTAssertEqual(
+            try RunAsUserProcessBootstrap.pmSetArguments(
+                disabled: false,
+                watchProcessID: nil,
+                stopFile: nil,
+                sessionDirectory: nil
+            ),
+            ["pmset", "--disablesleep", "0"]
+        )
+        XCTAssertThrowsError(
+            try RunAsUserProcessBootstrap.pmSetArguments(
+                disabled: false,
+                watchProcessID: 12345,
+                stopFile: stop,
+                sessionDirectory: directory
+            ),
+            "a reset must not be able to smuggle watcher or arbitrary command arguments"
+        )
+    }
+
+    func test_askpassScript_isMaskedAndStatesPasswordIsNotSaved() {
         let body = RunAsUserProcessBootstrap.askpassScriptBody(targetUser: "airtonempath")
         XCTAssertTrue(body.hasPrefix("#!/bin/sh"))
-        XCTAssertTrue(body.contains("osascript"), "must pop a graphical password dialog")
+        XCTAssertTrue(body.contains("osascript"), "the one-time installer must still provide a graphical password field")
         XCTAssertTrue(body.contains("hidden answer"), "password entry must be masked")
-        XCTAssertTrue(body.contains("airtonempath"), "dialog must name the target user")
-        XCTAssertTrue(body.contains("text returned of result"), "must print the entered password to stdout for sudo")
+        XCTAssertTrue(body.contains("airtonempath"), "the prompt must name the requested target user")
+        XCTAssertTrue(body.contains("password is not saved"), "the feature must save permission, never the password")
+        XCTAssertTrue(body.contains("text returned of result"), "sudo must receive only the entered answer")
     }
 
-    func test_sudoKillArguments_reentersTargetUidToSignal() throws {
-        // WHY: a run-as-user provider's real children carry the TARGET uid, so
-        // this non-root app gets EPERM signalling them directly. Reaping them
-        // requires re-entering that uid via non-interactive sudo.
+    func test_privilegedSignalArguments_targetsOnlyTheFixedHelperOperation() throws {
         let plan = try XCTUnwrap(
-            RunAsUserProcessBootstrap.sudoKillArguments(uid: 502, signal: SIGKILL, pids: [4242, 4243])
+            RunAsUserProcessBootstrap.privilegedSignalArguments(uid: 502, signal: SIGKILL, pids: [4242, 4243])
         )
-        XCTAssertEqual(plan.executablePath, "/usr/bin/sudo")
-        XCTAssertEqual(plan.arguments, ["-n", "-u#502", "--", "/bin/kill", "-9", "4242", "4243"],
-                       "must run kill AS the target uid, non-interactively, so teardown never prompts")
+        XCTAssertEqual(plan, ["signal", "--uid", "502", "--signal", "9", "--pid", "4242", "--pid", "4243"],
+                       "teardown must use the one installed helper and never show another password prompt")
     }
 
-    func test_sudoKillArguments_dropsInvalidPidsAndNilsWhenEmpty() {
-        XCTAssertNil(RunAsUserProcessBootstrap.sudoKillArguments(uid: 502, signal: SIGKILL, pids: []),
-                     "nothing to signal → no sudo invocation")
-        let plan = RunAsUserProcessBootstrap.sudoKillArguments(uid: 502, signal: SIGTERM, pids: [0, -1, 77])
-        XCTAssertEqual(plan?.arguments.last, "77")
-        XCTAssertFalse(plan?.arguments.contains("0") ?? true, "must never signal pid 0 (the caller's own group)")
+    func test_privilegedSignalArguments_rejectsInvalidInputsAndDropsInvalidPids() {
+        XCTAssertNil(RunAsUserProcessBootstrap.privilegedSignalArguments(uid: 502, signal: SIGKILL, pids: []),
+                     "nothing to signal must not invoke a privileged command")
+        let plan = RunAsUserProcessBootstrap.privilegedSignalArguments(uid: 502, signal: SIGTERM, pids: [0, -1, 77])
+        XCTAssertEqual(plan, ["signal", "--uid", "502", "--signal", "15", "--pid", "77"],
+                       "must never signal pid 0 or a negative pid")
+        XCTAssertNil(RunAsUserProcessBootstrap.privilegedSignalArguments(uid: 502, signal: SIGINT, pids: [77]),
+                     "the helper signal surface is limited to teardown TERM and KILL")
     }
 
-    func test_materializeAskpass_writesExecutableScript() throws {
+    func test_materializeAskpass_writesPrivateExecutableScript() throws {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc-askpass-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

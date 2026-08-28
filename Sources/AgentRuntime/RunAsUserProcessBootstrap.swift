@@ -1,11 +1,13 @@
 import Foundation
 import CoreModel
+import Darwin
 
 public enum RunAsUserProcessBootstrapError: Error, LocalizedError, Equatable {
     case helperUnavailable(String)
     case invalidTarget(String)
     case binaryNotAbsolute(String)
     case binaryNotAllowlisted(String)
+    case invalidPMSetRequest(String)
 
     public var errorDescription: String? {
         switch self {
@@ -17,21 +19,25 @@ public enum RunAsUserProcessBootstrapError: Error, LocalizedError, Equatable {
             return "Provider binary must be an absolute path for run-as-user: \(path)"
         case .binaryNotAllowlisted(let name):
             return "Executable is not allowlisted for run-as-user: \(name)"
+        case .invalidPMSetRequest(let detail):
+            return "Invalid Insomnia pmset request: \(detail)"
         }
     }
 }
 
-/// Rewrites a provider Process launch so it runs as another macOS user via the
-/// system `sudo -u` (already present on macOS — no helper install required).
-/// Stdio is preserved because `sudo` execs the provider in the same process
-/// tree. Becoming another user needs privilege, so `sudo` authenticates the
-/// CURRENT user; a graphical askpass (`-A` + `SUDO_ASKPASS`) supplies the
-/// password without a tty. Without an askpass we fall back to `-n`
-/// (non-interactive) which succeeds only on a cached sudo timestamp.
+/// Builds launches through the one-time installed root-owned helper. The
+/// helper is the only place where RemoteCode crosses a macOS user boundary or
+/// changes the system-wide clamshell sleep setting. Its installation may ask
+/// for the current user's password once; the password is never persisted.
 public enum RunAsUserProcessBootstrap {
     public static let sudoPath = "/usr/bin/sudo"
+    public static let installedHelperPath = "/Library/PrivilegedHelperTools/io.remotecode.RunAsUserHelper"
+    public static let helperVersion = 4
+    public static let helperExecutableNames = [
+        "RemoteCodeRunAsUserHelper",
+        "io.remotecode.RunAsUserHelper"
+    ]
 
-    /// Basenames allowed through the elevated launch.
     public static let allowlistedBasenames: Set<String> = [
         "codex",
         "claude",
@@ -39,6 +45,8 @@ public enum RunAsUserProcessBootstrap {
         "node",
         "npm"
     ]
+
+    private static let installationLock = NSLock()
 
     public struct LaunchPlan: Equatable, Sendable {
         public var executablePath: String
@@ -62,14 +70,10 @@ public enum RunAsUserProcessBootstrap {
         }
     }
 
-    /// Builds the launch plan. When `runAsUser` is nil or the current user, this
-    /// is a passthrough. Otherwise it rewrites to
-    /// `sudo [-A|-n] -u <shortName> -H -- <binary> <args>`:
-    /// `-H` sets HOME to the target's home so the provider reads THAT user's
-    /// config (e.g. `~/.claude` = the account/MCP/skills that user is logged in
-    /// with); `-A` uses the graphical askpass at `askpassPath`; without an
-    /// askpass we use `-n` so a missing credential fails loudly instead of
-    /// hanging on a tty prompt.
+    /// Builds a launch plan for a provider running as another interactive user.
+    /// The caller must install the helper first through `ensureHelperInstalled`.
+    /// Keeping this function side-effect free means capability probes can fail
+    /// closed without opening a password dialog.
     public static func plan(
         executablePath: String,
         arguments: [String],
@@ -77,8 +81,13 @@ public enum RunAsUserProcessBootstrap {
         currentDirectory: String,
         provider: AgentProvider? = nil,
         runAsUser: AgentRunAsUser?,
-        askpassPath: String? = nil,
-        sudoPathOverride: String? = nil,
+        helperLocator: (String) -> String? = { name in
+            guard name == RunAsUserProcessBootstrap.helperExecutableNames[0],
+                  RunAsUserProcessBootstrap.isUsableInstalledHelper(at: RunAsUserProcessBootstrap.installedHelperPath) else {
+                return nil
+            }
+            return RunAsUserProcessBootstrap.installedHelperPath
+        },
         currentUID: uid_t = getuid()
     ) throws -> LaunchPlan {
         guard let runAsUser, runAsUser.uid != currentUID else {
@@ -102,85 +111,214 @@ public enum RunAsUserProcessBootstrap {
             throw RunAsUserProcessBootstrapError.binaryNotAllowlisted(base)
         }
 
-        // Preserve PATH so providers can find node/git/rg after sudo's env_reset.
-        // Claude also needs the two positive thinking controls that the host
-        // configures. Effort stays on the explicit CLI/SDK payload, while
-        // inherited disabling controls remain absent. Never preserve the broad
-        // provider environment (it can carry credentials and routing secrets).
-        let preservedEnvironmentKeys = provider == .claude
-            ? ["PATH", "CLAUDE_CODE_DISABLE_THINKING", "MAX_THINKING_TOKENS"]
-            : ["PATH"]
-        let authFlag = (askpassPath?.isEmpty == false) ? "-A" : "-n"
-        var sudoArgs: [String] = [
-            authFlag,
-            "--preserve-env=\(preservedEnvironmentKeys.joined(separator: ","))",
-            "-u", runAsUser.shortName,
-            "-H",
+        guard let helper = helperExecutableNames.compactMap(helperLocator).first else {
+            throw RunAsUserProcessBootstrapError.helperUnavailable(
+                "install RemoteCodeRunAsUserHelper once before selecting another macOS user"
+            )
+        }
+
+        var helperArgs: [String] = [
+            "exec",
+            "--uid", "\(runAsUser.uid)",
+            "--gid", "\(runAsUser.gid)",
+            "--home", runAsUser.homePath,
+            "--user", runAsUser.shortName,
+            "--cwd", currentDirectory,
             "--",
             executablePath
         ]
-        sudoArgs.append(contentsOf: arguments)
+        helperArgs.append(contentsOf: arguments)
 
-        // SUDO_ASKPASS must be in the INVOKING environment (read before sudo
-        // resets env). `-H` handles the target HOME; do not preset HOME here.
-        var sudoEnv = environment
-        if let askpassPath, !askpassPath.isEmpty {
-            sudoEnv["SUDO_ASKPASS"] = askpassPath
-        }
+        // The helper rebuilds HOME/USER/LOGNAME after dropping privileges. Do
+        // not pass SUDO_ASKPASS through to the target user or retain a caller
+        // HOME that could make the provider read the wrong account.
+        var helperEnv = environment
+        helperEnv.removeValue(forKey: "SUDO_ASKPASS")
+        helperEnv["RC_RUN_AS_USER"] = runAsUser.shortName
+        helperEnv["RC_RUN_AS_UID"] = "\(runAsUser.uid)"
 
         return LaunchPlan(
-            executablePath: sudoPathOverride ?? sudoPath,
-            arguments: sudoArgs,
-            environment: sudoEnv,
+            executablePath: helper,
+            arguments: helperArgs,
+            environment: helperEnv,
             currentDirectory: currentDirectory,
             usesHelper: true
         )
     }
 
-    /// Builds the argv for a best-effort, non-interactive `sudo` that signals
-    /// `pids` AS the target uid. A run-as-user provider's real child (`claude`
-    /// and its descendants) carries the TARGET user's uid, so this non-root app
-    /// gets EPERM signalling them directly and `sudo` never relays `SIGKILL`;
-    /// reaping them requires re-entering the target uid via `sudo`. Uses `-n`
-    /// (never prompt) so teardown never pops a password dialog — it succeeds only
-    /// on the sudo credential cached by the spawn-time askpass and otherwise fails
-    /// silently, leaving the orphan we already could not signal. Returns nil when
-    /// there is nothing to signal.
-    public static func sudoKillArguments(
-        uid: uid_t,
-        signal: Int32,
-        pids: [pid_t],
-        killPath: String = "/bin/kill",
-        sudoPathOverride: String? = nil
-    ) -> (executablePath: String, arguments: [String])? {
-        let targets = pids.filter { $0 > 0 }
-        guard !targets.isEmpty else { return nil }
-        var arguments = ["-n", "-u#\(uid)", "--", killPath, "-\(signal)"]
-        arguments.append(contentsOf: targets.map(String.init))
-        return (sudoPathOverride ?? sudoPath, arguments)
+    /// Ensures the helper exists with root ownership and setuid-root mode.
+    /// `install` is injectable so the idempotence contract can be tested
+    /// without mutating `/Library` or asking for a real password.
+    @discardableResult
+    public static func ensureHelperInstalled(
+        askpassPath: String? = nil,
+        sourcePath: String? = nil,
+        destinationPath: String = installedHelperPath,
+        isInstalled: (String) -> Bool = { path in
+            RunAsUserProcessBootstrap.isUsableInstalledHelper(at: path)
+        },
+        sourceIsUsable: (String) -> Bool = { path in
+            FileManager.default.isExecutableFile(atPath: path)
+        },
+        install: (String, String, String?) -> Bool = { source, destination, askpass in
+            RunAsUserProcessBootstrap.installHelper(
+                sourcePath: source,
+                destinationPath: destination,
+                askpassPath: askpass
+            )
+        }
+    ) throws -> String {
+        installationLock.lock()
+        defer { installationLock.unlock() }
+
+        if isInstalled(destinationPath) { return destinationPath }
+        guard let source = sourcePath ?? bundledHelperPath(), sourceIsUsable(source) else {
+            throw RunAsUserProcessBootstrapError.helperUnavailable(
+                "the packaged RemoteCodeRunAsUserHelper binary is missing"
+            )
+        }
+        guard install(source, destinationPath, askpassPath), isInstalled(destinationPath) else {
+            throw RunAsUserProcessBootstrapError.helperUnavailable(
+                "one-time helper installation was cancelled or failed"
+            )
+        }
+        return destinationPath
     }
 
-    /// The graphical askpass script body. `sudo -A` runs this and reads the
-    /// password from stdout; a macOS dialog collects it (hidden answer). Cancel
-    /// prints nothing → sudo auth fails loudly. Contains no secret itself.
+    /// Builds the fixed signal invocation used to terminate a target-user
+    /// provider subtree. The helper validates ownership of every PID before
+    /// signalling it; no shell or arbitrary command crosses this boundary.
+    public static func privilegedSignalArguments(
+        uid: uid_t,
+        signal: Int32,
+        pids: [pid_t]
+    ) -> [String]? {
+        guard uid >= 501, signal == SIGTERM || signal == SIGKILL else { return nil }
+        let targets = pids.filter { $0 > 0 }
+        guard !targets.isEmpty else { return nil }
+        var arguments = ["signal", "--uid", "\(uid)", "--signal", "\(signal)"]
+        for pid in targets {
+            arguments.append(contentsOf: ["--pid", "\(pid)"])
+        }
+        return arguments
+    }
+
+    /// Signals a target-user provider subtree through the already-installed
+    /// helper. Teardown is deliberately fail-closed: it never installs the
+    /// helper and therefore never opens a password prompt while the app exits.
+    @discardableResult
+    public static func runPrivilegedSignal(
+        uid: uid_t,
+        signal: Int32,
+        pids: [pid_t]
+    ) -> Bool {
+        guard let arguments = privilegedSignalArguments(uid: uid, signal: signal, pids: pids),
+              isUsableInstalledHelper(at: installedHelperPath) else {
+            return false
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: installedHelperPath)
+        process.arguments = arguments
+        process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    /// Runs only the fixed privileged operation used by Insomnia. No shell or
+    /// arbitrary command is accepted by this boundary.
+    @discardableResult
+    public static func runPrivilegedPMSet(
+        disabled: Bool,
+        watchProcessID: Int32?,
+        stopFile: URL?,
+        sessionDirectory: URL?
+    ) -> Bool {
+        let arguments: [String]
+        do {
+            arguments = try pmSetArguments(
+                disabled: disabled,
+                watchProcessID: watchProcessID,
+                stopFile: stopFile,
+                sessionDirectory: sessionDirectory
+            )
+        } catch {
+            NSLog("RemoteCode Insomnia rejected privileged pmset request: %@", error.localizedDescription)
+            return false
+        }
+
+        do {
+            let helper = try ensureHelperInstalled()
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: helper)
+            process.arguments = arguments
+            process.environment = ["PATH": "/usr/bin:/bin"]
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            NSLog("RemoteCode Insomnia could not use the privileged helper: %@", error.localizedDescription)
+            return false
+        }
+    }
+
+    /// Pure argv construction for the helper's narrow pmset command.
+    public static func pmSetArguments(
+        disabled: Bool,
+        watchProcessID: Int32?,
+        stopFile: URL?,
+        sessionDirectory: URL?
+    ) throws -> [String] {
+        let watcherValuesPresent = watchProcessID != nil || stopFile != nil || sessionDirectory != nil
+        if disabled {
+            guard watcherValuesPresent,
+                  let watchProcessID, watchProcessID > 0,
+                  let stopFile, let sessionDirectory,
+                  stopFile.path.hasPrefix("/"), sessionDirectory.path.hasPrefix("/") else {
+                throw RunAsUserProcessBootstrapError.invalidPMSetRequest(
+                    "enable requires a positive process id and absolute session paths"
+                )
+            }
+            return [
+                "pmset", "--disablesleep", "1",
+                "--watch-pid", "\(watchProcessID)",
+                "--stop-file", stopFile.path,
+                "--session-directory", sessionDirectory.path
+            ]
+        }
+
+        guard !watcherValuesPresent else {
+            throw RunAsUserProcessBootstrapError.invalidPMSetRequest(
+                "disable cannot include watcher arguments"
+            )
+        }
+        return ["pmset", "--disablesleep", "0"]
+    }
+
+    /// The graphical askpass script is used only while installing the helper.
+    /// It contains no password and is removed from the temporary directory
+    /// after the installation attempt.
     public static func askpassScriptBody(targetUser: String) -> String {
-        // Sanitize the user name before it enters the osascript string literal —
-        // a macOS short name is `[A-Za-z0-9_.-]`, so anything else is dropped to
-        // block AppleScript/shell injection via a pathological account name.
         let safe = targetUser.filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." || $0 == "-" }
-        let who = safe.isEmpty ? "another user" : safe
+        let who = safe.isEmpty ? "the selected macOS user" : safe
         return """
         #!/bin/sh
         /usr/bin/osascript \
-          -e 'display dialog "RemoteCode needs your macOS password to run the agent as \(who)." with title "RemoteCode" default answer "" with hidden answer with icon caution' \
+          -e 'display dialog "RemoteCode needs your macOS password once to install its privileged helper for \(who). The password is not saved." with title "RemoteCode" default answer "" with hidden answer with icon caution' \
           -e 'text returned of result' 2>/dev/null
         """
     }
 
-    /// Writes the askpass script for `targetUser` to a user-scoped temp path
-    /// (mode 0700 dir, 0755 file), returning its absolute path. Rewritten each
-    /// call so the dialog names the current target. Returns nil on write
-    /// failure so the caller can fall back to `-n`.
     public static func materializeAskpass(
         targetUser: String,
         directory: URL = FileManager.default.temporaryDirectory
@@ -188,11 +326,125 @@ public enum RunAsUserProcessBootstrap {
         let path = directory.appendingPathComponent("remotecode-sudo-askpass.sh")
         do {
             try askpassScriptBody(targetUser: targetUser).write(to: path, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path.path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: path.path)
             return path.path
         } catch {
             return nil
         }
+    }
+
+    /// Builds a normal `sudo` installation request. It is the only sudo path
+    /// and runs once per machine/helper version, not once per provider action.
+    @usableFromInline
+    internal static func installHelper(
+        sourcePath: String,
+        destinationPath: String,
+        askpassPath: String?
+    ) -> Bool {
+        let temporaryAskpass: String?
+        if let askpassPath, !askpassPath.isEmpty {
+            temporaryAskpass = nil
+        } else {
+            temporaryAskpass = materializeInstallerAskpass()
+        }
+        let effectiveAskpass = askpassPath?.isEmpty == false ? askpassPath : temporaryAskpass
+        guard let effectiveAskpass else { return false }
+        defer {
+            if let temporaryAskpass {
+                try? FileManager.default.removeItem(at: URL(fileURLWithPath: temporaryAskpass))
+                try? FileManager.default.removeItem(at: URL(fileURLWithPath: temporaryAskpass).deletingLastPathComponent())
+            }
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: sudoPath)
+        process.arguments = [
+            "-A", "--", "/usr/bin/install",
+            "-o", "root", "-g", "wheel", "-m", "4755",
+            sourcePath, destinationPath
+        ]
+        process.environment = [
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "SUDO_ASKPASS": effectiveAskpass
+        ]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    private static func materializeInstallerAskpass() -> String? {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RemoteCodeAskpass-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        } catch {
+            return nil
+        }
+        return materializeAskpass(targetUser: "this Mac", directory: directory)
+    }
+
+    private static func bundledHelperPath() -> String? {
+        var candidates: [String] = [
+            Bundle.main.bundleURL
+                .appendingPathComponent("Contents/MacOS/RemoteCodeRunAsUserHelper").path
+        ]
+        if let executable = Bundle.main.executableURL {
+            candidates.append(executable.deletingLastPathComponent()
+                .appendingPathComponent("RemoteCodeRunAsUserHelper").path)
+        }
+        if let argument = CommandLine.arguments.first, argument.hasPrefix("/") {
+            candidates.append(URL(fileURLWithPath: argument).deletingLastPathComponent()
+                .appendingPathComponent("RemoteCodeRunAsUserHelper").path)
+        }
+        return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) })
+    }
+
+    @usableFromInline
+    internal static func isUsableInstalledHelper(at path: String) -> Bool {
+        isInstalledHelper(at: path) && helperVersionMatches(at: path)
+    }
+
+    @usableFromInline
+    internal static func isInstalledHelper(at path: String) -> Bool {
+        guard FileManager.default.isExecutableFile(atPath: path) else { return false }
+        var info = stat()
+        guard lstat(path, &info) == 0 else { return false }
+        return (info.st_mode & mode_t(0o170000)) == mode_t(0o100000)
+            && info.st_uid == 0
+            && (info.st_mode & mode_t(0o7777)) == mode_t(0o4755)
+    }
+
+    @usableFromInline
+    internal static func helperVersionMatches(at path: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["version"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return false
+        }
+        let version = String(
+            data: output.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return process.terminationStatus == 0
+            && version == "RemoteCodeRunAsUserHelper \(helperVersion)"
     }
 
     /// Applies a launch plan onto a Foundation Process.

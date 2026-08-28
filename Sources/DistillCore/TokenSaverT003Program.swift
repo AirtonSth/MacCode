@@ -560,7 +560,9 @@ public enum TokenSaverAdmissionPolicy {
         if snapshot.threadBytes > maxThreadBytes { return .init(allowed: false, reason: "thread_quota") }
         if snapshot.projectBytes > maxProjectBytes { return .init(allowed: false, reason: "project_quota") }
         if snapshot.globalBytes > maxGlobalBytes { return .init(allowed: false, reason: "global_quota") }
-        let diskFloor = max(minimumFreeDiskBytes, snapshot.totalDiskBytes / 10)
+        // Fixed 5 GiB — not a percent of volume size. 10% of a multi-TB disk
+        // forfeited every lossy Distill handle while tens of GiB were still free.
+        let diskFloor = minimumFreeDiskBytes
         if snapshot.freeDiskBytes < diskFloor || snapshot.objectBytes > snapshot.freeDiskBytes - diskFloor {
             return .init(allowed: false, reason: "free_disk_floor")
         }

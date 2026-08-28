@@ -159,7 +159,7 @@ final class AgentSurfaceThreadBindingTests: XCTestCase {
 
     // MARK: PERSISTENCE-DATA-002 — title repair must not bump updatedAt
 
-    func test_placeholderTitleRepair_preservesUpdatedAt() throws {
+    func test_placeholderTitleRepair_preservesUpdatedAt() async throws {
         let h = try makeHarness()
         // A placeholder-titled thread with a deliberately OLD activity time.
         let old = Date(timeIntervalSince1970: 1_000_000)
@@ -170,7 +170,8 @@ final class AgentSurfaceThreadBindingTests: XCTestCase {
         try h.messageRepoForTests.append(AgentMessage(threadId: t.id, role: .user, content: "Implement the parser"))
 
         let vm = h.vmFactory(nil)
-        vm.reloadThreads() // runs repairPlaceholderThreadTitles
+        vm.reloadThreads()
+        await vm.awaitTitleRepairForTesting()
 
         let repaired = try XCTUnwrap(try h.threadRepo.get(id: t.id))
         XCTAssertFalse(AgentThreadTitle.isPlaceholder(repaired.title),

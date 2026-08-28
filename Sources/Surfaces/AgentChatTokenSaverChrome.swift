@@ -73,17 +73,31 @@ public enum AgentChatTokenSaverDisplayMode: String, CaseIterable, Identifiable, 
         AgentAppView.showsTokenSaverOptimizedBadge(wasTokenSaverOptimized: wasTokenSaverOptimized)
     }
 
+    public static func footerPresentation(
+        enabled: Bool,
+        measuredTokens: Int = 0,
+        snapshotReady: Bool = true
+    ) -> AgentChatTokenSaverThreadFooterPresentation? {
+        AgentAppView.tokenSaverThreadFooterPresentation(
+            enabled: enabled,
+            measuredTokens: measuredTokens,
+            snapshotReady: snapshotReady
+        )
+    }
+
     public static func footerText(
         displayTokens: Int,
         measuredTokens: Int,
         enabled: Bool,
-        autoRoutingActive: Bool
+        autoRoutingActive: Bool,
+        snapshotReady: Bool = true
     ) -> String? {
         AgentAppView.tokenSaverThreadFooterText(
             displayTokens: displayTokens,
             measuredTokens: measuredTokens,
             enabled: enabled,
-            autoRoutingActive: autoRoutingActive
+            autoRoutingActive: autoRoutingActive,
+            snapshotReady: snapshotReady
         )
     }
 
@@ -184,10 +198,12 @@ public struct AgentChatTokenSaverOriginalContent: View {
                 Text("What was sent")
                     .font(DS.Font.caption2.weight(.semibold))
                     .foregroundColor(DS.Palette.textTertiary)
-                Text(request)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: request,
+                    fontSize: 12,
+                    monospaced: true,
+                    textColor: DS.NS.textSecondary
+                )
                     .fixedSize(horizontal: false, vertical: true)
                 Button("Copy what was sent") { onCopy(request) }
                     .buttonStyle(.plain)
@@ -197,10 +213,12 @@ public struct AgentChatTokenSaverOriginalContent: View {
             Text("Original provider response")
                 .font(DS.Font.caption2.weight(.semibold))
                 .foregroundColor(DS.Palette.textTertiary)
-            Text(original)
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundColor(DS.Palette.textSecondary)
-                .textSelection(.enabled)
+            AgentSelectablePlainText(
+                text: original,
+                fontSize: 12,
+                monospaced: true,
+                textColor: DS.NS.textSecondary
+            )
                 .fixedSize(horizontal: false, vertical: true)
             Button("Copy original provider response") { onCopy(original) }
                 .buttonStyle(.plain)
@@ -222,41 +240,72 @@ public struct AgentChatTokenSaverOriginalContent: View {
     }
 }
 
+/// Green savings, yellow on-zero problem, red off-state. Both surfaces
+/// consume this so Desk cannot stay green-only or hide the chip.
+public enum AgentChatTokenSaverThreadFooterPresentation: Equatable, Sendable {
+    case savings
+    case problem
+    case deactivated
+}
+
 public struct AgentChatTokenSaverThreadFooter: View {
     public let text: String
     public var autoRouting: Bool = false
+    public var presentation: AgentChatTokenSaverThreadFooterPresentation = .savings
 
-    public init(text: String, autoRouting: Bool = false) {
+    public init(
+        text: String,
+        autoRouting: Bool = false,
+        presentation: AgentChatTokenSaverThreadFooterPresentation = .savings
+    ) {
         self.text = text
         self.autoRouting = autoRouting
+        self.presentation = presentation
+    }
+
+    private var tint: Color {
+        switch presentation {
+        case .savings: return DS.Palette.success
+        case .problem: return DS.Palette.warning
+        case .deactivated: return DS.Palette.danger
+        }
     }
 
     public var body: some View {
         HStack(spacing: DS.Space.xs) {
             Image(systemName: "leaf.fill")
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundColor(DS.Palette.success)
+                .foregroundColor(tint)
                 .accessibilityHidden(true)
             Text(text)
                 .font(DS.Font.caption2.weight(.medium))
-                .foregroundColor(DS.Palette.success)
+                .foregroundColor(tint)
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, DS.Space.sm)
         .padding(.vertical, 5)
-        .background(DS.Palette.success.opacity(0.12))
+        .background(tint.opacity(0.12))
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
         .accessibilityElement(children: .combine)
         .accessibilityLabel(text)
         .accessibilityIdentifier("agent.tokenSaver.threadFooter")
-        .help(
-            autoRouting
+        .help(helpText)
+        .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    private var helpText: String {
+        switch presentation {
+        case .deactivated:
+            return "Token Saver is off, so this thread saved 0 tokens"
+        case .problem:
+            return "Token Saver is on, but this thread recorded 0 saved tokens"
+        case .savings:
+            return autoRouting
                 ? "Measured tool/command-output savings from the local Token Saver ledger (not full provider usage), plus Auto routing to cheaper models"
                 : "Measured tool/command-output savings from the local Token Saver ledger only — not total provider or context tokens"
-        )
-        .transition(.opacity.combined(with: .move(edge: .top)))
+        }
     }
 }
 
@@ -308,15 +357,20 @@ public enum TokenSaverThreadFooterReload {
         measuredDelivered: Int,
         eligible: Bool,
         graphifyActive: Bool,
-        observation: Observation
+        observation: Observation,
+        deliveredRuns: Int = 0
     ) -> Snapshot {
+        // Permanent `runs` is the same extra-turn floor the day/week card uses.
+        // Cache-first timeline paint can be 0–1 turns and would otherwise drop
+        // the chip from measured×(runs−1) down to bare measured.
+        let turnCount = max(observation.turnCount, max(0, deliveredRuns))
         let display = AgentAppView.tokenSaverThreadFooterDisplayTokens(
             measuredDelivered: measuredDelivered,
             assistantChars: observation.assistantChars,
             tokenSaverEnabled: eligible,
             graphifyActive: graphifyActive,
             graphifySignalCount: observation.graphifySignalCount,
-            turnCount: observation.turnCount,
+            turnCount: turnCount,
             cacheReadInputTokens: observation.cacheReadInputTokens,
             providerRawTokens: observation.providerRawTokens,
             providerBilledTokenUnits: observation.providerBilledTokenUnits,
@@ -343,15 +397,48 @@ public enum TokenSaverThreadFooterReload {
         )
     }
 
+    public struct DeliveredTotal: Equatable, Sendable {
+        public var savedTokens: Int
+        public var runs: Int
+
+        public init(savedTokens: Int, runs: Int) {
+            self.savedTokens = max(0, savedTokens)
+            self.runs = max(0, runs)
+        }
+    }
+
+    public static func loadDeliveredTotal(
+        eligible: Bool,
+        threadId: AgentThreadID?,
+        repo: TokenSaverSavingsRepository?
+    ) async -> DeliveredTotal? {
+        guard eligible, let threadId, let repo else {
+            return DeliveredTotal(savedTokens: 0, runs: 0)
+        }
+        let id = threadId.value.uuidString
+        return await Task.detached(priority: .utility) {
+            guard let total = try? repo.deliveredTotal(forThreadID: id) else { return nil }
+            return DeliveredTotal(savedTokens: total.savedTokens, runs: total.runs)
+        }.value
+    }
+
     public static func loadMeasured(
         eligible: Bool,
         threadId: AgentThreadID?,
         repo: TokenSaverSavingsRepository?
-    ) async -> Int {
-        guard eligible, let threadId, let repo else { return 0 }
-        let id = threadId.value.uuidString
-        return await Task.detached(priority: .utility) {
-            (try? repo.savedTokens(forThreadID: id)) ?? 0
-        }.value
+    ) async -> Int? {
+        await loadDeliveredTotal(eligible: eligible, threadId: threadId, repo: repo)?
+            .savedTokens
+    }
+
+    public static func currentDayGraphifySignalCount(
+        repo: GraphifyUsageRepository,
+        now: Date = Date()
+    ) -> Int {
+        let calendar = Calendar.current
+        let start = calendar.startOfDay(for: now)
+        let fromMs = Int64(start.timeIntervalSince1970 * 1_000)
+        let toMs = Int64(calendar.date(byAdding: .day, value: 1, to: start)!.timeIntervalSince1970 * 1_000)
+        return (try? repo.signalCount(fromMs: fromMs, toMsExclusive: toMs)) ?? 0
     }
 }

@@ -49,9 +49,9 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let stdoutPipe: Pipe
         let stderrPipe: Pipe
         var model: String
-        /// Set when the provider was launched via `sudo -u` as another macOS
-        /// user; its child processes carry this uid and can only be reaped by
-        /// re-entering that uid via sudo during teardown.
+        /// Set when the provider was launched through the shared helper as
+        /// another macOS user; its child processes carry this uid and can only
+        /// be reaped by re-entering that uid through the helper during teardown.
         let foreignUserUID: uid_t?
         let parser = ClaudeParser()
         let lineBuffer = LineBuffer()
@@ -256,10 +256,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         do {
             if let acceptancePermit = request.acceptancePermit {
                 try acceptancePermit.withAcceptance {
-                    try sendPrompt(request.providerPrompt, to: session)
+                    try sendPrompt(request.providerPrompt, to: session, attachments: request.attachments)
                 }
             } else {
-                try sendPrompt(request.providerPrompt, to: session)
+                try sendPrompt(request.providerPrompt, to: session, attachments: request.attachments)
             }
         } catch {
             lock.lock()
@@ -322,6 +322,51 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     /// No I/O, no actor isolation. Extracted for unit testing.
     nonisolated static func needsSessionResume(afterInterrupt: Bool, hasPersistentSession: Bool) -> Bool {
         afterInterrupt && hasPersistentSession
+    }
+
+    /// Builds the stream-json user message object for CLI stdin.
+    /// Empty attachments stay a single text block. Images become base64
+    /// content blocks; other files become text path mentions — same shape as
+    /// ClaudeAgentSDKBridge.mjs attachmentBlock (CLAUDE-CLI-009).
+    nonisolated static func userPromptPayload(text: String, attachments: [AgentAttachment] = []) throws -> [String: Any] {
+        try ClaudeAgentSDKBridgeAdapter.validateAttachments(attachments)
+        var content: [[String: Any]] = [["type": "text", "text": text]]
+        for attachment in attachments {
+            content.append(try attachmentContentBlock(attachment))
+        }
+        return [
+            "type": "user",
+            "message": [
+                "role": "user",
+                "content": content
+            ]
+        ]
+    }
+
+    nonisolated static func attachmentContentBlock(_ attachment: AgentAttachment) throws -> [String: Any] {
+        let mimeType = attachment.mimeType ?? ""
+        let isImage = attachment.kind == .image || mimeType.hasPrefix("image/")
+        if isImage {
+            let supported = ["image/jpeg", "image/png", "image/gif", "image/webp"]
+            guard supported.contains(mimeType) else {
+                throw AgentProviderAdapterError.unsupported(
+                    "Unsupported Claude image attachment type: \(mimeType.isEmpty ? "unknown" : mimeType)"
+                )
+            }
+            let data = try Data(contentsOf: URL(fileURLWithPath: attachment.path))
+            return [
+                "type": "image",
+                "source": [
+                    "type": "base64",
+                    "media_type": mimeType,
+                    "data": data.base64EncodedString()
+                ]
+            ]
+        }
+        return [
+            "type": "text",
+            "text": "[Attachment: \(attachment.displayName)]\n\(attachment.path)"
+        ]
     }
 
     /// Builds the newline-terminated stream-json control interrupt payload.
@@ -600,7 +645,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
-        // Route through `sudo -u` when a different macOS user is selected so the
+        // Route through the shared helper when a different macOS user is selected so the
         // provider reads that user's ~/.claude (their logged-in account + MCP).
         let thinkingEnvironment = ClaudeRunner.thinkingEnvironment(request.environment)
         let baseEnv = CodexRunner.processEnvironment(overrides: thinkingEnvironment, purpose: .agentTurn(.claude))
@@ -664,7 +709,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
 
         do {
             try process.run()
-            // A run-as-user launch spawns a root `sudo` child whose kernel
+            // A run-as-user launch spawns a helper child whose kernel
             // metadata this non-root app cannot read; tag it owner-anchored so
             // the spawn is not rejected by an unreadable child identity.
             try ProcessSpawnTagger.tagProcess(process, provider: .claude, foreignUserLaunch: foreignUserUID != nil)
@@ -685,14 +730,8 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             && session.interactionMode == request.interactionMode
     }
 
-    private func sendPrompt(_ text: String, to session: Session) throws {
-        let payload: [String: Any] = [
-            "type": "user",
-            "message": [
-                "role": "user",
-                "content": [["type": "text", "text": text]]
-            ]
-        ]
+    private func sendPrompt(_ text: String, to session: Session, attachments: [AgentAttachment] = []) throws {
+        let payload = try Self.userPromptPayload(text: text, attachments: attachments)
         let data = try JSONSerialization.data(withJSONObject: payload)
         var line = data
         line.append(0x0A)
@@ -1334,7 +1373,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                     ]) ?? "{}",
                     receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
                 ))))
-                try sendPrompt(prompt, to: newSession)
+                try sendPrompt(prompt, to: newSession, attachments: spawnRequest.attachments)
                 onEvent(.status(.running))
                 return
             } catch {

@@ -170,7 +170,8 @@ public enum AgentWorkingStripPresentation {
 
     public static func label(
         phase: AgentWorkingPhase,
-        elapsedSeconds: Int?
+        elapsedSeconds: Int?,
+        hold: AgentBackgroundHoldSummary? = nil
     ) -> String? {
         let base: String
         switch phase {
@@ -181,7 +182,13 @@ public enum AgentWorkingStripPresentation {
         case .tools:
             base = "Tools"
         case .awaitingBackground:
-            base = "Awaiting"
+            // Prefer the CLI's own noun ("1 shell — Wait for CI") over a
+            // generic "Awaiting" that hides what is holding Stop.
+            if let hold, !hold.isEmpty {
+                base = hold.pillBase
+            } else {
+                base = "Awaiting"
+            }
         case .subagents(let n):
             base = n == 1 ? "1 subagent" : "\(n) subagents"
         }
@@ -198,6 +205,82 @@ public enum AgentWorkingStripPresentation {
         let h = m / 60
         let rm = m % 60
         return rm == 0 ? "\(h)h" : "\(h)h \(rm)m"
+    }
+}
+
+/// Named background work holding a live run (shells / async agents).
+///
+/// One line for the header pill and Stop strip; extra descriptions go to
+/// help / a caption so the composer does not grow with every task.
+public struct AgentBackgroundHoldSummary: Sendable, Equatable {
+    public let tasks: [AgentBackgroundTask]
+
+    public init(tasks: [AgentBackgroundTask]) {
+        self.tasks = tasks
+    }
+
+    public var isEmpty: Bool { tasks.isEmpty }
+
+    /// Unknown kinds use shell wording so older id-only snapshots still match
+    /// the Claude CLI's `1 shell` status line.
+    public var shellCount: Int { tasks.filter { $0.kind != .agent }.count }
+    public var agentCount: Int { tasks.filter { $0.kind == .agent }.count }
+
+    public var nounLabel: String {
+        var parts: [String] = []
+        if shellCount > 0 { parts.append(Self.countNoun(shellCount, singular: "shell", plural: "shells")) }
+        if agentCount > 0 { parts.append(Self.countNoun(agentCount, singular: "agent", plural: "agents")) }
+        if parts.isEmpty { return Self.countNoun(max(tasks.count, 1), singular: "shell", plural: "shells") }
+        return parts.joined(separator: " · ")
+    }
+
+    public var descriptions: [String] {
+        tasks.compactMap(\.description)
+    }
+
+    /// Only when exactly one task has a description — otherwise the pill would
+    /// imply the other jobs are that one title.
+    public var primaryDescription: String? {
+        tasks.count == 1 && descriptions.count == 1 ? descriptions[0] : nil
+    }
+
+    public var pillBase: String {
+        if let primaryDescription { return "\(nounLabel) — \(primaryDescription)" }
+        return nounLabel
+    }
+
+    public var holdingHeadline: String {
+        if let primaryDescription { return "Holding: \(nounLabel) — \(primaryDescription)" }
+        return "Holding: \(nounLabel)"
+    }
+
+    public var extraDescriptionsLine: String? {
+        guard descriptions.count > 1 else { return nil }
+        return descriptions.joined(separator: " · ")
+    }
+
+    public var helpText: String {
+        if tasks.isEmpty { return "Waiting on background work" }
+        let lines = tasks.map { task -> String in
+            let kind = task.kind == .agent ? "Agent" : "Shell"
+            if let description = task.description { return "\(kind): \(description)" }
+            return kind
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    public func statusLine(elapsedSeconds: Int) -> String {
+        "\(holdingHeadline) · \(AgentWorkingStripPresentation.formatElapsed(elapsedSeconds))"
+    }
+
+    public func accessibilityLabel(elapsedSeconds: Int) -> String {
+        var parts = [statusLine(elapsedSeconds: elapsedSeconds)]
+        if let extraDescriptionsLine { parts.append(extraDescriptionsLine) }
+        return parts.joined(separator: ". ")
+    }
+
+    public static func countNoun(_ count: Int, singular: String, plural: String) -> String {
+        count == 1 ? "1 \(singular)" : "\(count) \(plural)"
     }
 }
 
@@ -243,8 +326,12 @@ public enum AgentChatWorkingCopy {
     public static func statusLabel(
         context: AgentChatWorkingContext?,
         elapsedSeconds: Int,
-        seed: UInt64 = 0
+        seed: UInt64 = 0,
+        hold: AgentBackgroundHoldSummary? = nil
     ) -> String {
+        if let hold, !hold.isEmpty {
+            return hold.statusLine(elapsedSeconds: elapsedSeconds)
+        }
         let elapsed = AgentWorkingStripPresentation.formatElapsed(elapsedSeconds)
         switch context {
         case .agent(let name):
@@ -258,8 +345,12 @@ public enum AgentChatWorkingCopy {
 
     public static func accessibilityLabel(
         context: AgentChatWorkingContext?,
-        elapsedSeconds: Int
+        elapsedSeconds: Int,
+        hold: AgentBackgroundHoldSummary? = nil
     ) -> String {
+        if let hold, !hold.isEmpty {
+            return hold.accessibilityLabel(elapsedSeconds: elapsedSeconds)
+        }
         switch context {
         case .agent, .reviewing:
             return statusLabel(context: context, elapsedSeconds: elapsedSeconds)
