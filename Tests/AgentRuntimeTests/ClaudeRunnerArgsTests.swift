@@ -318,9 +318,66 @@ final class ClaudeRunnerArgsTests: XCTestCase {
             let a = ClaudeRunner.buildArgs(req(p))
             return a[a.index(after: a.firstIndex(of: "--permission-mode")!)]
         }
-        XCTAssertEqual(mode(.supervised), "default")
+        XCTAssertEqual(mode(.supervised), "manual")
         XCTAssertEqual(mode(.autoAcceptEdits), "acceptEdits")
         XCTAssertEqual(mode(.fullAccess), "bypassPermissions")
+    }
+
+    func test_streamingPermissionMapping_usesManualForSupervised() {
+        let a = ClaudeRunner.buildStreamingArgs(req(.supervised))
+        let mode = a[a.index(after: a.firstIndex(of: "--permission-mode")!)]
+        XCTAssertEqual(mode, "manual",
+                       "CLI 2.1.250+ advertises manual; default remains an alias but argv should match help")
+    }
+
+    func test_streamingAddsAddDirForNonImageAttachmentsOutsideCwd() {
+        let cwd = "/tmp/rc-claude-cwd-\(UUID().uuidString)"
+        let outside = "/tmp/rc-claude-outside-\(UUID().uuidString)"
+        defer {
+            try? FileManager.default.removeItem(atPath: cwd)
+            try? FileManager.default.removeItem(atPath: outside)
+        }
+        try? FileManager.default.createDirectory(atPath: cwd, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(atPath: outside, withIntermediateDirectories: true)
+        let outsideFile = (outside as NSString).appendingPathComponent("notes.pdf")
+        FileManager.default.createFile(atPath: outsideFile, contents: Data("x".utf8))
+        let insideFile = (cwd as NSString).appendingPathComponent("local.pdf")
+        FileManager.default.createFile(atPath: insideFile, contents: Data("y".utf8))
+
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .claude,
+            model: "claude-opus-4-7",
+            cwd: cwd,
+            prompt: "hello",
+            attachments: [
+                AgentAttachment(path: outsideFile, kind: .file, mimeType: "application/pdf"),
+                AgentAttachment(path: insideFile, kind: .file, mimeType: "application/pdf"),
+            ],
+            permissionMode: .supervised
+        )
+        let args = ClaudeRunner.buildStreamingArgs(request)
+        var addDirs: [String] = []
+        var i = args.startIndex
+        while let idx = args[i...].firstIndex(of: "--add-dir") {
+            let valueIdx = args.index(after: idx)
+            XCTAssertLessThan(valueIdx, args.endIndex)
+            addDirs.append(args[valueIdx])
+            i = args.index(after: valueIdx)
+        }
+        let expectedOutside = URL(fileURLWithPath: outside).resolvingSymlinksInPath().standardizedFileURL.path
+        XCTAssertEqual(addDirs, [expectedOutside],
+                       "only parents outside cwd must be passed via --add-dir (CLAUDE-CLI-014)")
+    }
+
+    func test_extraAddDirs_skipsImages() {
+        let dirs = ClaudeRunner.extraAddDirs(
+            cwd: "/tmp/workspace",
+            attachments: [
+                AgentAttachment(path: "/tmp/other/photo.png", kind: .image, mimeType: "image/png")
+            ]
+        )
+        XCTAssertTrue(dirs.isEmpty, "image attachments use base64 blocks, not --add-dir")
     }
 
     func test_resumePassesProviderThreadId() {

@@ -18,11 +18,12 @@ import Foundation
 /// holds no secrets (server names, unix-ms timestamps, opaque `mcpsrv_` ids) and
 /// the CLI regenerates it on demand, so removing it is safe and self-healing.
 ///
-/// Scope: the CLI streaming adapter only. Codex (`~/.codex` config + oauth-locks)
-/// and Grok (`~/.grok/*.json` tokens, ACP passes an empty MCP override) read their
-/// MCP config live in both terminal and headless, so they have no equivalent gate.
-/// The opt-in Claude Agent SDK bridge is intentionally excluded — the gate was not
-/// reproduced there.
+/// Scope: Claude headless engines that launch the live `claude` binary —
+/// `ClaudeStreamingCLIAdapter` (default) and `ClaudeAgentSDKBridgeAdapter`
+/// (opt-in; same cache gate via `pathToClaudeCodeExecutable`). Codex
+/// (`~/.codex` config + oauth-locks) and Grok (`~/.grok/*.json` tokens, ACP
+/// passes an empty MCP override) read their MCP config live in both terminal
+/// and headless, so they have no equivalent gate.
 ///
 /// Safeguards (from the sam-codex-advisor review):
 /// - Kill switch: `RC_CLAUDE_MCP_AUTH_CACHE_RESET=0` disables it wholesale.
