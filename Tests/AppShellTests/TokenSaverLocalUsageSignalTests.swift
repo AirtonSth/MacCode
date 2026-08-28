@@ -475,6 +475,84 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         )
     }
 
+    /// WHY: live sample spent the ACP parse queue in detect() on a growing
+    /// unmatched body. Negative scans must not repeat at stream rate, and a
+    /// later graphify command on a new item must still record.
+    func test_graphifyDetect_skipsGrowingUnmatchedBodyThenStillRecordsMatch() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyNegativeSkip-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        context.graphifyDetectCountForTesting = 0
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "prose-1",
+            bodyAppend: String(repeating: "assistant token ", count: 200),
+            outputAppend: nil,
+            summary: "assistant",
+            threadId: threadId,
+            runId: runId
+        )
+        let afterProse = context.graphifyDetectCountForTesting
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "prose-1",
+            bodyAppend: String(repeating: "more ", count: 400),
+            outputAppend: nil,
+            summary: "assistant",
+            threadId: threadId,
+            runId: runId
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "prose-1",
+            bodyAppend: String(repeating: "x", count: GraphifyUsageDetector.maxHaystackUTF8Bytes),
+            outputAppend: nil,
+            summary: "assistant",
+            threadId: threadId,
+            runId: runId
+        )
+        let afterFill = context.graphifyDetectCountForTesting
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "prose-1",
+            bodyAppend: String(repeating: "y", count: 2048),
+            outputAppend: nil,
+            summary: "assistant",
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertEqual(
+            context.graphifyDetectCountForTesting,
+            afterFill,
+            "after the detect window fills without graphify, later deltas must not re-detect"
+        )
+        XCTAssertLessThanOrEqual(afterProse, 1)
+        XCTAssertLessThanOrEqual(afterFill, 2)
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "bash-2",
+            bodyAppend: "cd repo && graphi",
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "bash-2",
+            bodyAppend: "fy query where is X",
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertGreaterThan(
+            context.graphifyDetectCountForTesting,
+            afterFill,
+            "a later item whose command completes as graphify query must still detect"
+        )
+    }
+
     private func makeViewModel() throws -> (AppContext, SidebarViewModel, URL) {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2TokenSaverLocalSignal-\(UUID().uuidString)", isDirectory: true)

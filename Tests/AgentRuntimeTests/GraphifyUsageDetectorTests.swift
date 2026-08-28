@@ -60,6 +60,29 @@ final class GraphifyUsageDetectorTests: XCTestCase {
         XCTAssertEqual(GraphifyUsageDetector.tokensFromUTF8Count(400), 100)
     }
 
+    func test_cappedHaystack_rejectsHugeProseWithoutSplitting() {
+        // WHY: live Grok ACP parse spent 100% CPU in components(separatedBy:)
+        // on a multi-MB itemDelta body that never contained graphify.
+        let huge = String(repeating: "lorem ipsum dolor sit amet\n", count: 20_000)
+        XCTAssertGreaterThan(huge.utf8.count, GraphifyUsageDetector.maxHaystackUTF8Bytes)
+        XCTAssertFalse(GraphifyUsageDetector.mentionsGraphify(huge))
+        XCTAssertTrue(GraphifyUsageDetector.detect(summary: nil, body: huge).isEmpty)
+        let capped = GraphifyUsageDetector.cappedHaystack(huge)
+        XCTAssertLessThanOrEqual(capped.utf8.count, GraphifyUsageDetector.maxHaystackUTF8Bytes)
+        let grown = GraphifyUsageDetector.appendCapped(capped, String(repeating: "x", count: 4096))
+        XCTAssertEqual(grown, capped)
+    }
+
+    func test_detect_stillMatchesGraphifyInCappedWindow() {
+        // Split is on newline/;/|&, so a real invocation must start a segment.
+        let prefix = String(repeating: "noise\n", count: 40)
+        let body = prefix + "graphify query where is X"
+        XCTAssertEqual(
+            GraphifyUsageDetector.detect(summary: "Bash", body: body).map(\.subcommand),
+            ["query"]
+        )
+    }
+
     func test_looksLikeFailure_highConfidenceOnly() {
         // WHY: legit graphify/code output often contains "error:" / "fatal:" / "not found".
         XCTAssertTrue(GraphifyUsageDetector.looksLikeFailure(output: "graphify: command not found"))

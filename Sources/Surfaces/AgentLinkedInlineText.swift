@@ -313,8 +313,10 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
             tv.textColor = textColor
         }
         if plan.heightDirty {
-            tv.invalidateIntrinsicContentSize()
-            tv.needsLayout = true
+            // Drop the fitted-size cache so the next sizeThatFits remeasures.
+            // Do not call invalidateIntrinsicContentSize: that retriggers
+            // LazyVStack placement (live hang: 100% main thread, 18 GB RSS).
+            tv.resetFittedSizeCache()
         }
         context.coordinator.applied = next
     }
@@ -401,10 +403,15 @@ final class IntrinsicHeightTextView: NSTextView {
     private var lastFittedSize: CGSize = .zero
 
     override func invalidateIntrinsicContentSize() {
-        lastFittedWidth = 0
-        lastFittedSize = .zero
+        resetFittedSizeCache()
         intrinsicInvalidationCountForTesting += 1
         super.invalidateIntrinsicContentSize()
+    }
+
+    /// Clear wrap-height cache without asking SwiftUI to relayout the graph.
+    func resetFittedSizeCache() {
+        lastFittedWidth = 0
+        lastFittedSize = .zero
     }
 
     override var intrinsicContentSize: NSSize {

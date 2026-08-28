@@ -889,6 +889,13 @@ final class AgentAppUXGapsTests: XCTestCase {
             AgentAppView.usesLazyTranscriptHistoryLayout(entryCount: 8),
             AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: 8)
         )
+        XCTAssertFalse(
+            AgentAppView.usesLazyTranscriptHistoryLayout(entryCount: 40, liveTurnActive: true),
+            "history must stay eager while a turn is live so LazyVStack does not re-place NSTextView rows on each token"
+        )
+        XCTAssertFalse(
+            AgentChatTimelineHistoryLayout.usesLazyLayout(entryCount: 40, liveTurnActive: true)
+        )
     }
 
     /// WHY: provider item IDs can repeat across turns. A row may use a legacy

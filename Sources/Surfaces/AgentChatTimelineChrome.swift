@@ -9,8 +9,9 @@ import SwiftUI
 public enum AgentChatTimelineHistoryLayout {
     public static let eagerEntryLimit = 8
 
-    public static func usesLazyLayout(entryCount: Int) -> Bool {
-        entryCount > eagerEntryLimit
+    public static func usesLazyLayout(entryCount: Int, liveTurnActive: Bool = false) -> Bool {
+        if liveTurnActive { return false }
+        return entryCount > eagerEntryLimit
     }
 }
 
