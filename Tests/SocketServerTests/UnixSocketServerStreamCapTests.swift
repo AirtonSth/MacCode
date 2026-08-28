@@ -12,11 +12,18 @@ final class UnixSocketServerStreamCapTests: XCTestCase {
         XCTAssertEqual(UnixSocketServer.maxStreamQueuedBytes, 512 * 1024)
     }
 
-    func test_retentionEstimate_1MiBTo512KiB() {
+    func test_maxClientLineBytes_stays1MiB_forLegacyFullBodyRPCs() {
+        // WHY: plan-notes and other host-catalog RPCs still use full-body lines
+        // up to 1 MiB; a shared 512 KiB ceiling would EOF those clients.
+        XCTAssertEqual(UnixSocketServer.maxClientLineBytes, 1024 * 1024)
+    }
+
+    func test_retentionEstimate_streamQueue_1MiBTo512KiB() {
         let prior = 1024 * 1024
         let streamLimit = UnixSocketServer.maxStreamQueuedBytes
         XCTAssertEqual(streamLimit, 512 * 1024)
         let reduction = Double(prior - streamLimit) / Double(prior)
         XCTAssertEqual(reduction, 0.5, accuracy: 0.001)
+        XCTAssertEqual(UnixSocketServer.maxClientLineBytes, 1024 * 1024)
     }
 }

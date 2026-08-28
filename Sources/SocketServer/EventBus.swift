@@ -690,6 +690,33 @@ public final class EventBus: @unchecked Sendable {
         return count
     }
 
+    /// Byte cost of a success `JSONRPCResponse` (jsonrpc + optional id + result)
+    /// without allocating encoder `Data`. Length-equal to default `JSONEncoder`
+    /// (key order does not change size). Used by agent.message list/get fit.
+    nonisolated static func jsonRPCResponseByteCount(id: JSONRPCID?, result: JSONValue) -> Int {
+        var count = 2 // {}
+        count += 10 // "jsonrpc":
+        count += 5 // "2.0"
+        if let id {
+            count += 1 // ,
+            count += 5 // "id":
+            count += jsonRPCIDByteCount(id)
+        }
+        count += 1 // ,
+        count += 9 // "result":
+        count += jsonValueByteCount(result)
+        return count
+    }
+
+    nonisolated static func jsonRPCIDByteCount(_ id: JSONRPCID) -> Int {
+        switch id {
+        case .string(let string):
+            return jsonStringByteCount(string)
+        case .number(let number):
+            return jsonInt64ByteCount(Int64(number))
+        }
+    }
+
     nonisolated static func jsonValueByteCount(_ value: JSONValue) -> Int {
         switch value {
         case .null:

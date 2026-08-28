@@ -3947,8 +3947,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         timeline: AssistantTimelineState
     ) -> [AgentBackgroundTask] {
         var latestItemsByID: [String: AssistantItem] = [:]
-        for item in timeline.turns.flatMap(\.items).reversed() where latestItemsByID[item.id] == nil {
-            latestItemsByID[item.id] = item
+        for turn in timeline.turns.reversed() {
+            for item in turn.items.reversed() where latestItemsByID[item.id] == nil {
+                latestItemsByID[item.id] = item
+            }
         }
         return tasks.map { task in
             guard task.description == nil, let item = latestItemsByID[task.id] else { return task }
@@ -13713,7 +13715,12 @@ public struct AgentAppView: View {
     }
 
     private func pruneExpandedItemIds() {
-        let liveItemIds = Set(vm.timeline.turns.flatMap { $0.items.map(\.id) })
+        var liveItemIds = Set<String>()
+        for turn in vm.timeline.turns {
+            for item in turn.items {
+                liveItemIds.insert(item.id)
+            }
+        }
         if !expandedTools.isEmpty { expandedTools.formIntersection(liveItemIds) }
         // A tool group is keyed by its first item's id, so it lives in the same id space.
         if !expandedToolGroups.isEmpty { expandedToolGroups.formIntersection(liveItemIds) }
