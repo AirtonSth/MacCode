@@ -299,6 +299,8 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             "--verbose",
             "--include-partial-messages",
             "--replay-user-messages",
+            "--forward-subagent-text",
+            "--include-hook-events",
             // Load the SAME filesystem settings an interactive `claude` session
             // does: user + project + local. Without this, `--print` mode ignores
             // ~/.claude and ./.claude entirely, so project/user SKILLS and custom

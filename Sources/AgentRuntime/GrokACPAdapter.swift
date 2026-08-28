@@ -745,10 +745,14 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 opened = try await client.loadSession(
                     sessionId: providerThreadId,
                     cwd: request.cwd,
-                    noReplay: shouldStartPrompt
+                    noReplay: shouldStartPrompt,
+                    yoloMode: request.permissionMode == .fullAccess
                 )
             } else {
-                opened = try await client.newSession(cwd: request.cwd)
+                opened = try await client.newSession(
+                    cwd: request.cwd,
+                    yoloMode: request.permissionMode == .fullAccess
+                )
             }
             let mapper = GrokACPEventMapper(sessionId: opened.sessionId)
             // Seed mode so plan session updates can tell live progress from Plan review.

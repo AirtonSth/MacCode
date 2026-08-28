@@ -88,7 +88,20 @@ public struct BotDeskRouting: Equatable, Codable {
     /// user's thread route; delegated calls freeze the exact provider/model
     /// selected for the active caller run so Auto cannot choose a new one.
     public init(thread: AgentThread, activeRun: AgentRun? = nil) {
-        let run = activeRun?.threadId == thread.id ? activeRun : nil
+        let route: AgentRunRepository.RouteChrome? = {
+            guard let run = activeRun, run.threadId == thread.id else { return nil }
+            return AgentRunRepository.RouteChrome(
+                threadId: run.threadId,
+                provider: run.provider,
+                providerInstanceId: run.providerInstanceId ?? run.provider.rawValue,
+                model: run.model
+            )
+        }()
+        self.init(thread: thread, activeRunRoute: route)
+    }
+
+    public init(thread: AgentThread, activeRunRoute: AgentRunRepository.RouteChrome?) {
+        let run = activeRunRoute?.threadId == thread.id ? activeRunRoute : nil
         let provider = run?.provider ?? thread.provider
         self.init(
             provider: provider,
@@ -101,6 +114,22 @@ public struct BotDeskRouting: Equatable, Codable {
             reasoningEffort: thread.reasoningEffort,
             serviceTier: thread.serviceTier,
             runAsUser: thread.runAsUser
+        )
+    }
+
+    public init(
+        route: AgentRunRepository.RouteChrome,
+        policy: AgentThreadRepository.DeskPolicyChrome
+    ) {
+        self.init(
+            provider: route.provider,
+            providerInstanceID: route.providerInstanceId,
+            model: route.model,
+            routingMode: .manual,
+            permissionMode: policy.permissionMode,
+            reasoningEffort: policy.reasoningEffort,
+            serviceTier: policy.serviceTier,
+            runAsUser: policy.runAsUser
         )
     }
 
@@ -888,13 +917,13 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             return nil
         }
 
-        let activeCallerRun: AgentRun?
+        let activeCallerRoute: AgentRunRepository.RouteChrome?
         if let hostRunID,
-           let run = try? runRepo.get(id: hostRunID),
-           run.threadId == originThread.id {
-            activeCallerRun = run
+           let route = try? runRepo.route(of: hostRunID),
+           route.threadId == originThread.id {
+            activeCallerRoute = route
         } else {
-            activeCallerRun = nil
+            activeCallerRoute = nil
         }
         var conversation = BotConversation(
             botID: peer.id,
@@ -920,7 +949,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                     botID: peer.id,
                     title: Self.titleFromFirstMessage(peerDisplay)
                 )
-                routing = BotDeskRouting(thread: originThread, activeRun: activeCallerRun)
+                routing = BotDeskRouting(thread: originThread, activeRunRoute: activeCallerRoute)
                 var peerInheritanceContext = originThread
                 peerInheritanceContext.workspaceId = nil
                 try botStore.upsertConversation(conversation)
@@ -1911,20 +1940,22 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                   stored.threadId == threadID,
                   stored.role == .assistant,
                   stored.content == content else { return false }
-            if var thread = try threadRepo.get(id: threadID) {
-                var changed = false
-                if let terminalStatus, thread.status != terminalStatus {
-                    thread.status = terminalStatus
-                    changed = true
+            let markUnread = router?.agentAppThreadIsSelected(threadID) != true
+            if let terminalStatus {
+                if markUnread {
+                    try threadRepo.updateStatus(
+                        id: threadID,
+                        status: terminalStatus,
+                        hasUnread: true
+                    )
+                } else {
+                    try threadRepo.updateStatusPreservingUnread(
+                        id: threadID,
+                        status: terminalStatus
+                    )
                 }
-                if router?.agentAppThreadIsSelected(threadID) != true, !thread.hasUnread {
-                    thread.hasUnread = true
-                    changed = true
-                }
-                if changed {
-                    thread.updatedAt = Date()
-                    try threadRepo.upsert(thread)
-                }
+            } else if markUnread {
+                _ = try threadRepo.markUnreadUpdatingActivity(of: threadID)
             }
             router?.projectAgentAppPeerMessage(
                 threadID: threadID,
@@ -5301,7 +5332,7 @@ public final class BotsViewModel: ObservableObject {
                 ids.append(threadID)
                 continue
             }
-            if try context.coordinator.durableActiveRun(threadId: threadID) != nil {
+            if try context.coordinator.hasDurableActiveRun(threadId: threadID) {
                 ids.append(threadID)
             }
         }
@@ -8085,7 +8116,7 @@ public final class BotsViewModel: ObservableObject {
             text: humanText,
             attachments: attachments
         )
-        if try context.messageRepo.get(id: messageID) == nil {
+        if try context.messageRepo.exists(id: messageID) == false {
             try context.messageRepo.append(AgentMessage(
                 id: messageID,
                 threadId: threadID,
@@ -11048,11 +11079,13 @@ public struct BotsRootView: View {
             Text("Revision \(receipt.revisionNumber) · \(vm.providerChipTitle(receipt.provider)) · \(receipt.model.isEmpty ? "model unset" : receipt.model) · \(receipt.permissionMode.rawValue)")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textSecondary)
-            Text("payload \(receipt.payloadDigest)")
-                .font(.system(.caption, design: .monospaced))
-                .foregroundColor(DS.Palette.textTertiary)
-                .textSelection(.enabled)
-                .accessibilityIdentifier("bots.brain.digest")
+            AgentSelectablePlainText(
+                text: "payload \(receipt.payloadDigest)",
+                fontSize: 11,
+                monospaced: true,
+                textColor: DS.NS.textTertiary
+            )
+            .accessibilityIdentifier("bots.brain.digest")
             if !compact {
                 Text("compiler \(receipt.compilerVersion) · no opaque RemoteCode layer")
                     .font(DS.Font.caption)
@@ -11073,11 +11106,12 @@ public struct BotsRootView: View {
                             .foregroundColor(DS.Palette.text)
                     }
                     if !layer.text.isEmpty {
-                        Text(layer.text)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
+                        AgentSelectablePlainText(
+                            text: layer.text,
+                            fontSize: 11,
+                            textColor: DS.NS.textSecondary
+                        )
+                        .fixedSize(horizontal: false, vertical: true)
                     }
                     Text(layer.reason)
                         .font(DS.Font.caption)
@@ -11091,11 +11125,13 @@ public struct BotsRootView: View {
     }
 
     private func brainEffective(_ receipt: ContextAssemblyReceipt) -> some View {
-        Text(receipt.compiledPayload.isEmpty ? "(empty payload)" : receipt.compiledPayload)
-            .font(.system(.caption, design: .monospaced))
-            .foregroundColor(DS.Palette.text)
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        AgentSelectablePlainText(
+            text: receipt.compiledPayload.isEmpty ? "(empty payload)" : receipt.compiledPayload,
+            fontSize: 11,
+            monospaced: true,
+            textColor: DS.NS.text
+        )
+        .frame(maxWidth: .infinity, alignment: .leading)
             .padding(DS.Space.md)
             .background(DS.Palette.surfaceRaised)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
@@ -11114,10 +11150,11 @@ public struct BotsRootView: View {
             } else {
                 ForEach(receipt.memoryLayers) { layer in
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(layer.text.isEmpty ? "(empty fact)" : layer.text)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .textSelection(.enabled)
+                        AgentSelectablePlainText(
+                            text: layer.text.isEmpty ? "(empty fact)" : layer.text,
+                            fontSize: 11,
+                            textColor: DS.NS.textSecondary
+                        )
                         Text(layer.reason)
                             .font(DS.Font.caption)
                             .foregroundColor(DS.Palette.textTertiary)
@@ -11467,7 +11504,6 @@ public struct BotsRootView: View {
                     }
                     AgentMessageMarkdownView(text: message.text)
                         .foregroundColor(DS.Palette.text)
-                        .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 if let messageId, let original,

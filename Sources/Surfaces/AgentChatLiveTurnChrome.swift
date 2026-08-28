@@ -331,11 +331,12 @@ public struct AgentChatReasoningRow: View {
             .buttonStyle(.plain)
             .help(streaming ? "" : (text.isEmpty ? "" : (expanded ? "Hide reasoning" : "Show reasoning")))
             if expanded, !text.isEmpty {
-                Text(text)
-                    .font(DS.Font.bodyDense)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineSpacing(3)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: text,
+                    fontSize: 12,
+                    textColor: DS.NS.textTertiary,
+                    lineSpacing: 3
+                )
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -438,12 +439,14 @@ public struct AgentChatLiveToolRow: View {
 
             if let summary = commandSummary, !summary.isEmpty {
                 HStack(alignment: .top, spacing: DS.Space.xs) {
-                    Text(summary)
-                        .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
-                        .textSelection(.enabled)
-                        .lineLimit(expanded ? nil : 1)
-                        .truncationMode(.tail)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    AgentSelectablePlainText(
+                        text: summary,
+                        fontSize: 11,
+                        monospaced: true,
+                        textColor: DS.NS.textSecondary,
+                        maximumNumberOfLines: expanded ? nil : 1
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     if let full = commandFull, !full.isEmpty {
                         Button {
                             AgentChatTranscriptChrome.copyToPasteboard(full)
@@ -483,10 +486,12 @@ public struct AgentChatLiveToolRow: View {
             }
 
             if expanded, let full = commandFull, fullDiffersFromSummary, !full.isEmpty {
-                Text(full)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: full,
+                    fontSize: 11,
+                    monospaced: true,
+                    textColor: DS.NS.textTertiary
+                )
                     .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface.opacity(0.7))
@@ -495,9 +500,12 @@ public struct AgentChatLiveToolRow: View {
             }
 
             if expanded, let o = output, !o.isEmpty {
-                Text(AgentTimelineItemPresentation.cappedDetail(o, for: item))
-                    .font(DS.Font.mono).foregroundColor(DS.Palette.textSecondary)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: AgentTimelineItemPresentation.cappedDetail(o, for: item),
+                    fontSize: 12,
+                    monospaced: true,
+                    textColor: DS.NS.textSecondary
+                )
                     .padding(DS.Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface)
@@ -710,7 +718,6 @@ public struct AgentChatLiveItemRow: View {
                     .foregroundColor(DS.Palette.accent)
                 AgentMessageMarkdownView(text: item.body)
                     .foregroundColor(DS.Palette.text)
-                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         case .tool, .commandExecution, .fileChange, .mcpToolCall, .dynamicToolCall,

@@ -417,7 +417,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// blue badge and Live Activity never learn about live agent runs that
     /// only surface as coordinator-owned work on the Mac pet.
     private func agentThreadPayload(_ thread: AgentThread) -> JSONValue {
-        let locked = !((try? listAgentMessages(thread: thread.id, limit: 1)) ?? []).isEmpty
+        let locked = (try? context?.messageRepo.hasAny(threadId: thread.id)) ?? false
         var payload: [String: JSONValue] = [
             "id": .string(thread.id.value.uuidString),
             "thread_id": .string(thread.id.value.uuidString),
@@ -2856,16 +2856,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     ) async throws -> JSONValue {
         guard let ctx = context,
               let botsViewModel,
-              let thread = try ctx.threadRepo.get(id: callerThread),
-              let run = try ctx.runRepo.get(id: callerRun),
-              run.threadId == thread.id else {
+              let route = try ctx.runRepo.route(of: callerRun),
+              route.threadId == callerThread,
+              let policy = try ctx.threadRepo.deskPolicy(of: callerThread) else {
             throw JSONRPCError(code: -32045, message: "RemoteCode Bot runtime is unavailable.")
         }
         return try botsViewModel.enqueueHostMessage(
             botID: botID,
             text: text,
             conversationID: conversationID,
-            routing: BotDeskRouting(thread: thread, activeRun: run)
+            routing: BotDeskRouting(route: route, policy: policy)
         )
     }
 
@@ -3622,14 +3622,25 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, runAsUser: AgentRunAsUser? = nil) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
-        let started = !((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty
+        guard var t = try ctx.threadRepo.threadWithoutRouting(of: thread) else { throw LayoutError.workspaceNotFound }
+        let before = t
+        // Started lock is only for provider/instance/run-as-user mutations.
+        // Typical send still calls configure with matching picker values; a
+        // leftover `listRecent` hitchs MainActor SQLite (full latest body +
+        // attachments JSON) on every no-op. Existence is `hasAny`.
+        var startedMemo: Bool?
+        func threadHasStarted() -> Bool {
+            if let startedMemo { return startedMemo }
+            let value = (try? ctx.messageRepo.hasAny(threadId: thread)) ?? false
+            startedMemo = value
+            return value
+        }
         if let provider, provider != t.provider {
             // A1 (iOS+macOS parity): the provider is fixed once the
             // thread has a conversation. Only model/effort stay
             // changeable after that. Enforced host-side so no client
             // can bypass the UI lock.
-            guard !started else {
+            guard !threadHasStarted() else {
                 throw JSONRPCError(code: -32010,
                     message: "Provider is locked once the thread has started; only model and effort can change.")
             }
@@ -3639,7 +3650,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         } else if let providerInstanceId {
             let normalized = normalizedProviderInstanceId(provider: t.provider, requested: providerInstanceId)
             if normalized != t.providerInstanceId {
-                guard !started else {
+                guard !threadHasStarted() else {
                     throw JSONRPCError(code: -32013,
                         message: "Provider instance is locked once the thread has started.")
                 }
@@ -3650,7 +3661,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if let runAsUser {
             let resolved = resolveRunAsUser(runAsUser)
             if resolved?.uid != t.runAsUser?.uid || resolved?.shortName != t.runAsUser?.shortName {
-                guard !started else {
+                guard !threadHasStarted() else {
                     throw JSONRPCError(code: -32014,
                         message: "macOS run-as user is locked once the thread has started.")
                 }
@@ -3681,8 +3692,39 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             reasoningEffort: t.reasoningEffort,
             serviceTier: t.serviceTier
         )
-        t.updatedAt = Date()
-        try ctx.threadRepo.upsert(t)
+        // Picker/permission/run-as-user only. A leftover full-row `upsert`
+        // hitchs every send and rewrites routing JSON even when nothing
+        // changed except `updatedAt`.
+        if Self.threadConfigUnchanged(before, t) {
+            return before
+        }
+        // Picker chrome only. A leftover 26-column upsert hitchs iOS/macOS
+        // picker mutations and rewrites title/status/unread/color/pin/routing.
+        let now = Date()
+        guard try ctx.threadRepo.setPickerConfig(
+            of: thread,
+            provider: t.provider,
+            providerInstanceId: t.providerInstanceId ?? t.provider.rawValue,
+            runAsUser: t.runAsUser,
+            model: t.model,
+            permissionMode: t.permissionMode,
+            reasoningEffort: t.reasoningEffort,
+            serviceTier: t.serviceTier,
+            modelSelection: t.modelSelection,
+            interactionMode: t.effectiveInteractionMode,
+            at: now
+        ) else {
+            throw LayoutError.workspaceNotFound
+        }
+        if before.providerThreadId != t.providerThreadId {
+            try ctx.threadRepo.updateProviderThreadId(
+                id: thread,
+                providerThreadId: t.providerThreadId,
+                at: now
+            )
+        }
+        t.updatedAt = now
+        t.routingConfiguration = try ctx.threadRepo.routingConfiguration(of: thread)
         for s in SurfaceRegistry.shared.all() {
             guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
             if agent.viewModel.selectedThreadId == thread {
@@ -3701,15 +3743,28 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return t
     }
 
+    nonisolated static func threadConfigUnchanged(_ before: AgentThread, _ after: AgentThread) -> Bool {
+        before.provider == after.provider
+            && before.providerInstanceId == after.providerInstanceId
+            && before.providerThreadId == after.providerThreadId
+            && before.model == after.model
+            && before.permissionMode == after.permissionMode
+            && before.reasoningEffort == after.reasoningEffort
+            && before.serviceTier == after.serviceTier
+            && before.modelSelection == after.modelSelection
+            && before.runAsUser == after.runAsUser
+    }
+
     public func configureAgentThreadRouting(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, routing: AgentRoutingRequest?) async throws -> AgentThread {
-        guard let ctx = context, let currentThread = try ctx.threadRepo.get(id: thread) else {
-            throw LayoutError.workspaceNotFound
-        }
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        // Routing chrome only. A leftover 26-column `get` before configure
+        // and another `get` after CAS hitch Auto toggle / iOS routing RPC.
+        let storedRouting = try ctx.threadRepo.routingConfiguration(of: thread)
         guard let routing else {
-            guard currentThread.routingConfiguration == nil else {
+            guard storedRouting == nil else {
                 throw AgentRoutingRevisionError.conflict(
                     expected: 0,
-                    actual: currentThread.effectiveRoutingConfiguration.revision
+                    actual: storedRouting?.revision ?? 0
                 )
             }
             return try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser)
@@ -3717,18 +3772,26 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let manualSelection = routing.manualSelection else {
             throw JSONRPCError.invalidParams
         }
+        let currentEffective: AgentRoutingConfiguration
+        if let storedRouting {
+            currentEffective = storedRouting
+        } else {
+            guard let picker = try ctx.threadRepo.threadWithoutRouting(of: thread) else {
+                throw LayoutError.workspaceNotFound
+            }
+            currentEffective = picker.effectiveRoutingConfiguration
+        }
         let manualInstance = normalizedProviderInstanceId(
             provider: manualSelection.provider,
-            requested: providerInstanceId
-                ?? currentThread.effectiveRoutingConfiguration.manualProviderInstanceId
+            requested: providerInstanceId ?? currentEffective.manualProviderInstanceId
         )
         let resolvedRouting = try await resolveAgentRouting(
             routing,
-            current: currentThread.effectiveRoutingConfiguration,
+            current: currentEffective,
             manualSelection: manualSelection,
             manualProviderInstanceId: manualInstance
         )
-        _ = try configureAgentThread(
+        var updated = try configureAgentThread(
             thread: thread,
             provider: manualSelection.provider,
             model: manualSelection.effectiveModel,
@@ -3744,33 +3807,50 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             threadId: thread,
             expectedRevision: routing.expectedRevision
         )
-        guard let updated = try ctx.threadRepo.get(id: thread) else {
-            throw LayoutError.workspaceNotFound
-        }
+        updated.routingConfiguration = resolvedRouting
+        updated.updatedAt = resolvedRouting.updatedAt
         refreshAgentSurfaces(thread: thread, workspace: updated.workspaceId)
         return updated
     }
 
     public func configureAgentThreadExecution(thread: AgentThreadID, executionMode: AgentExecutionMode, baseBranch: String?) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
-        let started = !((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty
+        // Execution chrome only. A leftover 26-column + routing `get` then
+        // full-row `upsert` hitchs iOS/macOS mode switches and rewrites routing.
+        guard var t = try ctx.threadRepo.threadWithoutRouting(of: thread) else { throw LayoutError.workspaceNotFound }
+        let started = (try? ctx.messageRepo.hasAny(threadId: thread)) ?? false
         guard !started else {
             throw JSONRPCError(code: -32011, message: "Execution mode is locked once the thread has started.")
         }
+        let nextBranch: String?
         if executionMode == .worktree {
             let branch = baseBranch?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard !branch.isEmpty else {
                 throw JSONRPCError(code: -32012, message: "Worktree mode requires a base branch before the first agent prompt.")
             }
-            t.baseBranch = branch
+            nextBranch = branch
         } else {
-            t.baseBranch = nil
-            t.worktreePath = nil
+            nextBranch = nil
+        }
+        let nextPath = executionMode == .local ? nil : t.worktreePath
+        if t.executionMode == executionMode, t.baseBranch == nextBranch, t.worktreePath == nextPath {
+            t.routingConfiguration = try ctx.threadRepo.routingConfiguration(of: thread)
+            return t
+        }
+        let now = Date()
+        guard try ctx.threadRepo.setExecutionConfig(
+            of: thread,
+            executionMode: executionMode,
+            baseBranch: nextBranch,
+            at: now
+        ) else {
+            throw LayoutError.workspaceNotFound
         }
         t.executionMode = executionMode
-        t.updatedAt = Date()
-        try ctx.threadRepo.upsert(t)
+        t.baseBranch = nextBranch
+        t.worktreePath = nextPath
+        t.updatedAt = now
+        t.routingConfiguration = try ctx.threadRepo.routingConfiguration(of: thread)
         if let wid = t.workspaceId {
             AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: wid)
         }
@@ -3863,6 +3943,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func listAgentMessagesOffMain(thread: AgentThreadID, limit: Int) async throws -> [AgentMessage] {
         try await agentAppReadGateway.listMessages(threadId: thread, limit: limit)
+    }
+
+    public func agentThreadHasMessages(thread: AgentThreadID) throws -> Bool {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        return try ctx.messageRepo.hasAny(threadId: thread)
     }
 
     public func threadIdsWithMessages() throws -> Set<AgentThreadID> {
@@ -3964,15 +4049,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) async throws -> AgentQueuedMessage {
         guard let ctx = context,
               let queued = try ctx.queuedMessageRepo.get(id: id),
-              let thread = try ctx.threadRepo.get(id: queued.threadId) else {
+              let admission = try ctx.threadRepo.sendAdmission(of: queued.threadId) else {
             throw JSONRPCError.invalidParams
         }
         let resolved = try resolveInboundAgentAttachments(attachments)
         try await preflightAgentRun(
-            thread: thread,
+            fallbackProvider: admission.provider,
+            fallbackProviderInstanceId: admission.providerInstanceId,
             provider: nil,
             providerInstanceId: nil,
-            permissionMode: thread.permissionMode,
+            permissionMode: admission.permissionMode,
             interactionMode: queued.interactionMode,
             attachments: resolved
         )
@@ -4285,25 +4371,31 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func sendAgentMessageRouting(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], routing: AgentRoutingRequest?, nestedRunContext: AgentNestedRunContext? = nil) async throws -> AgentMessageSendResult {
-        guard let ctx = context, let currentThread = try ctx.threadRepo.get(id: thread) else {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        // Existence + routing row only. A leftover 26-column `get` hitchs every
+        // `agent.message.send` just to check revision/mode before sendAgentMessage
+        // loads the row again for mutate.
+        guard try ctx.threadRepo.status(of: thread) != nil else {
             throw LayoutError.workspaceNotFound
         }
-        let currentRouting = currentThread.effectiveRoutingConfiguration
+        let storedRouting = try ctx.threadRepo.routingConfiguration(of: thread)
         if let routing {
-            guard routing.expectedRevision == currentRouting.revision else {
+            let currentRevision = storedRouting?.revision ?? 0
+            let currentMode = storedRouting?.mode ?? .manual
+            guard routing.expectedRevision == currentRevision else {
                 throw AgentRoutingRevisionError.conflict(
                     expected: routing.expectedRevision,
-                    actual: currentRouting.revision
+                    actual: currentRevision
                 )
             }
-            guard routing.mode == currentRouting.mode else {
+            guard routing.mode == currentMode else {
                 throw JSONRPCError(
                     code: -32020,
                     message: "Model routing mode changed on the host. Refresh the thread and try again.",
                     data: .object(["domain": .string("routing"), "kind": .string("mode_conflict")])
                 )
             }
-        } else if currentRouting.mode == .auto {
+        } else if storedRouting?.mode == .auto {
             throw JSONRPCError(
                 code: -32020,
                 message: "This thread requires an Auto routing revision. Refresh the thread and try again.",
@@ -4323,13 +4415,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             providerInstanceId: providerInstanceId,
             attachments: attachments,
             queueMessageId: nil,
-            routingConfiguration: currentThread.routingConfiguration,
+            routingConfiguration: storedRouting,
             nestedRunContext: nestedRunContext
         )
     }
 
     private func preflightAgentRun(
-        thread: AgentThread,
+        fallbackProvider: AgentProvider,
+        fallbackProviderInstanceId: String?,
         provider: AgentProvider?,
         providerInstanceId: String?,
         permissionMode: AgentPermissionMode,
@@ -4337,9 +4430,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         attachments: [AgentAttachment],
         allowProviderCatalogListing: Bool = true
     ) async throws {
-        let desiredProvider = provider ?? thread.provider
+        let desiredProvider = provider ?? fallbackProvider
         let desiredInstance = providerInstanceId
-            ?? (desiredProvider == thread.provider ? thread.providerInstanceId : nil)
+            ?? (desiredProvider == fallbackProvider ? fallbackProviderInstanceId : nil)
         // Agent App send uses the dest catalog already in memory. Desk used
         // to re-list every provider (Grok ACP + Anthropic + Codex) here and
         // wait on that before startRun.
@@ -4374,20 +4467,30 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        guard let existing = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
-        let effectiveRouting = orchestrationRoutingSnapshot?.configuration
+        // Status + permission + provider identity only. A leftover 26-column
+        // + routing `get` hitchs every send before configureAgentThread loads
+        // the row again for mutate.
+        guard let admission = try ctx.threadRepo.sendAdmission(of: thread) else {
+            throw LayoutError.workspaceNotFound
+        }
+        let effectiveRouting: AgentRoutingConfiguration?
+        if let passed = orchestrationRoutingSnapshot?.configuration
             ?? routingSnapshot?.configuration
-            ?? routingConfiguration
-            ?? existing.routingConfiguration
+            ?? routingConfiguration {
+            effectiveRouting = passed
+        } else {
+            effectiveRouting = try ctx.threadRepo.routingConfiguration(of: thread)
+        }
         let autoRoutingActive = effectiveRouting?.mode == .auto
         let resolvedAttachments = try resolveInboundAgentAttachments(attachments)
         sendAgentMessageResolvedAttachmentsProbeForTesting?(resolvedAttachments)
         if !autoRoutingActive {
             try await preflightAgentRun(
-                thread: existing,
+                fallbackProvider: admission.provider,
+                fallbackProviderInstanceId: admission.providerInstanceId,
                 provider: modelSelection?.provider ?? provider,
                 providerInstanceId: providerInstanceId,
-                permissionMode: permissionMode ?? existing.permissionMode,
+                permissionMode: permissionMode ?? admission.permissionMode,
                 interactionMode: interactionMode ?? .default,
                 attachments: resolvedAttachments,
                 allowProviderCatalogListing: allowProviderCatalogListingDuringPreflight
@@ -4399,7 +4502,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if Task.isCancelled {
             throw CancellationError()
         }
-        if existing.status == .running
+        if admission.status == .running
             || ctx.coordinator.hasPendingProviderStart(threadId: thread)
             || ctx.coordinator.hasProviderSession(threadId: thread) {
             if queueMessageId != nil {
@@ -4412,8 +4515,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 attachments: resolvedAttachments,
                 interactionMode: interactionMode ?? .default,
                 routingSnapshot: routingSnapshot ?? AgentQueuedMessageRoutingSnapshot(
-                    configuration: effectiveRouting ?? existing.effectiveRoutingConfiguration,
-                    permissionMode: permissionMode ?? existing.permissionMode
+                    configuration: effectiveRouting ?? admission.legacyEffectiveRouting,
+                    permissionMode: permissionMode ?? admission.permissionMode
                 )
             )
             publishQueuedMessage(kind: "agent.message.queued", queued)
@@ -4431,7 +4534,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // genuine provider mismatch stays a loud -32010 rather than silently mutating
         // model/session state. The explicit agent.thread.configure RPC keeps enforcing
         // both locks for the UI's change-provider gesture.
-        let alreadyStarted = !((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty
+        let alreadyStarted = (try? ctx.messageRepo.hasAny(threadId: thread)) ?? false
         var t = try configureAgentThread(
             thread: thread,
             provider: autoRoutingActive ? nil : provider,
@@ -4443,10 +4546,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             providerInstanceId: autoRoutingActive || alreadyStarted ? nil : providerInstanceId
         )
         if AgentThreadTitle.isPlaceholder(t.title),
-           ((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty {
+           !alreadyStarted {
             t.title = AgentThreadTitle.titleFromFirstMessage(text)
-            t.updatedAt = Date()
-            try ctx.threadRepo.upsert(t)
+            try ctx.threadRepo.updateTitlePreservingActivity(thread, title: t.title)
             EventBus.shared.publish(kind: "agent.thread.renamed", payload: .object([
                 "thread_id": .string(t.id.value.uuidString),
                 "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
@@ -4501,9 +4603,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if let runtimeProfile = nestedRunContext?.runtimeProfile {
             guard runtimeProfile == .samGrokWorkerV1,
                   prov == .grok,
-                  m == "grok-4.5",
+                  GrokACPClient.admitsSamGrokWorker(model: m, effort: t.reasoningEffort),
                   t.permissionMode == .autoAcceptEdits,
-                  [.low, .medium, .high, .xhigh, .max].contains(t.reasoningEffort),
                   t.providerThreadId == nil else {
                 throw JSONRPCError.invalidParams
             }
@@ -5161,9 +5262,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard result.ok || FileManager.default.fileExists(atPath: path) else {
             throw JSONRPCError(code: -32013, message: result.message.isEmpty ? "Failed to create agent worktree." : result.message)
         }
+        // Path chrome only. A leftover 26-column upsert hitchs the first
+        // worktree-mode send and rewrites title/status/unread/color/pin/routing.
+        let now = Date()
+        guard try ctx.threadRepo.setWorktreePath(of: thread.id, path: path, at: now) else {
+            throw LayoutError.workspaceNotFound
+        }
         thread.worktreePath = path
-        thread.updatedAt = Date()
-        try ctx.threadRepo.upsert(thread)
+        thread.updatedAt = now
         return path
     }
 
@@ -5628,7 +5734,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let startedAt = (try? ctx.coordinator.runStartedAt(runId: runId)) ?? Date()
             return AgentActiveRunSnapshot(runId: runId, startedAt: startedAt)
         }
-        if let durable = try ctx.coordinator.durableActiveRun(threadId: thread) {
+        if let durable = try ctx.coordinator.durableActiveRunChrome(threadId: thread) {
             return AgentActiveRunSnapshot(runId: durable.id, startedAt: durable.startedAt)
         }
         return nil
@@ -5692,10 +5798,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw JSONRPCError.invalidParams }
-        guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
-        t.title = trimmed
-        t.updatedAt = Date()
-        try ctx.threadRepo.upsert(t)
+        // Title only. A leftover 26-column + routing `get` then `upsert`
+        // hitchs the rename RPC and clobbers concurrent persistThreadConfig /
+        // run-start writes (PERSISTENCE-DATA-002).
+        try ctx.threadRepo.updateTitlePreservingActivity(thread, title: trimmed)
+        guard let t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
         return t
     }
 
@@ -5712,10 +5819,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func setAgentThreadColor(thread: AgentThreadID, color: String) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
-        t.color = color.isEmpty ? nil : color
-        t.updatedAt = Date()
-        try ctx.threadRepo.upsert(t)
+        try ctx.threadRepo.setColor(id: thread, color: color.isEmpty ? nil : color)
+        guard let t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
         if let wid = t.workspaceId {
             AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: wid)
         }
@@ -5737,32 +5842,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func markAgentThreadRead(thread: AgentThreadID) throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
-        let didMarkRead = t.hasUnread
-        if didMarkRead {
-            // Cosmetic open/select must not rewrite activity time — rail "now"
-            // was jumping when mark-read upserts touched updatedAt.
-            let preservedUpdatedAt = t.updatedAt
-            t = AgentAppViewModel.applyingMarkReadPreservingActivity(t)
-            t.updatedAt = preservedUpdatedAt
-            try ctx.threadRepo.upsert(t)
+        // Unread + workspace only. A leftover 26-column + routing `get` then
+        // `upsert` hitchs every open/select and rewrites routing JSON just to
+        // clear has_unread. Cosmetic open must not rewrite activity time.
+        guard let result = try ctx.threadRepo.markReadPreservingActivity(of: thread) else {
+            throw LayoutError.workspaceNotFound
+        }
+        if result.cleared {
             NSLog(
                 "[AgentOpen] mark_read wrote unread=false thread=%@ preservedUpdatedAt=%.0f",
                 String(thread.value.uuidString.prefix(8)),
-                preservedUpdatedAt.timeIntervalSince1970
+                result.updatedAt.timeIntervalSince1970
             )
-        }
-        // Marking a thread read must NOT select it. Previously this called
-        // selectAgentThread, so an iOS client opening an old thread (which
-        // auto-marks it read) force-switched every macOS agent tab to that
-        // thread (the "iOS bugs macOS" report). Just refresh the rails so the
-        // unread badge clears everywhere; selection stays per-surface.
-        // Only reload when unread actually changed — otherwise every soft
-        // reselect fan-out churned the rail for no reason.
-        if didMarkRead, let wid = t.workspaceId {
-            AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: wid)
-        }
-        if didMarkRead {
+            if let wid = result.workspaceId {
+                AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(workspaceID: wid)
+            }
             publishAgentThreadRead(thread)
         }
     }

@@ -80,6 +80,16 @@ public final class ClaudeParser {
             if event["session_id"] == nil, let sid = obj["session_id"] {
                 event["session_id"] = sid
             }
+            // CLAUDE-CLI-011: --forward-subagent-text sets parent_tool_use_id on
+            // the stream_event envelope. Nested message_start / content_block_*
+            // omit it; copy so nested text does not join the parent assembled body.
+            let nestedParent = event["parent_tool_use_id"]
+            let nestedMissing = nestedParent == nil
+                || nestedParent is NSNull
+                || ((nestedParent as? String)?.isEmpty ?? false)
+            if nestedMissing, let parent = obj["parent_tool_use_id"] {
+                event["parent_tool_use_id"] = parent
+            }
             guard let eventType = event["type"] as? String else { return [] }
             return parseDecodedObject(event, type: eventType, now: now)
         }
@@ -140,11 +150,20 @@ public final class ClaudeParser {
             case "tool_use": itemType = .tool
             default: itemType = .assistantMessage
             }
-            let itemId = (block["id"] as? String) ?? UUID().uuidString
+            let rawItemId = (block["id"] as? String) ?? UUID().uuidString
+            let parentToolUseId = nestedParentToolUseId(from: obj)
+            let itemId = itemType == .tool ? rawItemId : namespacedItemId(rawItemId, parentToolUseId: parentToolUseId)
             indexToItemId[index] = itemId
             indexToType[index] = itemType
             let turnId = currentTurnId ?? ""
-            let summary = itemType == .tool ? (block["name"] as? String) : nil
+            let summary: String?
+            if itemType == .tool {
+                summary = block["name"] as? String
+            } else if let parentToolUseId {
+                summary = "subagent \(parentToolUseId)"
+            } else {
+                summary = nil
+            }
             if itemType == .tool {
                 indexToToolName[index] = summary
                 if Self.isExitPlanMode(summary) { exitPlanToolIds.insert(itemId) }
@@ -169,7 +188,11 @@ public final class ClaudeParser {
                 // When both shapes arrive (--include-partial-messages), the whole-
                 // message replay of a streamed message is skipped upstream via
                 // streamedMessageIds (CLAUDE-PARTIAL-REPLAY) and never consults them.
-                if let text { assembledAssistantBody += text }
+                // Nested forwarded text (parent_tool_use_id) must not join the
+                // parent assembled body — empty `result` falls back to it.
+                if let text, nestedParentToolUseId(from: obj) == nil {
+                    assembledAssistantBody += text
+                }
                 if let text, indexToType[index] == .assistantMessage {
                     indexToAssistantBody[index, default: ""] += text
                 }
@@ -249,17 +272,25 @@ public final class ClaudeParser {
                     let text = block["text"] as? String ?? ""
                     if text.isEmpty { break }
                     if assembledAssistantBodyMatches(text) || hasEmittedAssistantBody(text) { break }
-                    recordEmittedAssistantBody(text)
-                    appendAssembledAssistantBody(text)
-                    out.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .assistantMessage, state: .streaming, summary: nil, body: "", startedAtMs: now)))
-                    out.append(.itemDelta(itemId: itemId, bodyAppend: text, outputAppend: nil, summary: nil))
-                    out.append(.itemCompleted(itemId: itemId, finalState: .completed))
+                    let parentToolUseId = nestedParentToolUseId(from: obj)
+                    let nestedItemId = namespacedItemId(itemId, parentToolUseId: parentToolUseId)
+                    if parentToolUseId == nil {
+                        recordEmittedAssistantBody(text)
+                        appendAssembledAssistantBody(text)
+                    }
+                    let summary = parentToolUseId.map { "subagent \($0)" }
+                    out.append(.itemStarted(item: AssistantItem(id: nestedItemId, turnId: turnId, type: .assistantMessage, state: .streaming, summary: summary, body: "", startedAtMs: now)))
+                    out.append(.itemDelta(itemId: nestedItemId, bodyAppend: text, outputAppend: nil, summary: nil))
+                    out.append(.itemCompleted(itemId: nestedItemId, finalState: .completed))
                 case "thinking":
                     if isUserMessage || isStreamedMessageReplay { break }
                     let text = block["thinking"] as? String ?? ""
-                    out.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .reasoning, state: .streaming, summary: nil, body: "", startedAtMs: now)))
-                    out.append(.itemDelta(itemId: itemId, bodyAppend: text, outputAppend: nil, summary: nil))
-                    out.append(.itemCompleted(itemId: itemId, finalState: .completed))
+                    let parentToolUseId = nestedParentToolUseId(from: obj)
+                    let nestedItemId = namespacedItemId(itemId, parentToolUseId: parentToolUseId)
+                    let summary = parentToolUseId.map { "subagent \($0)" }
+                    out.append(.itemStarted(item: AssistantItem(id: nestedItemId, turnId: turnId, type: .reasoning, state: .streaming, summary: summary, body: "", startedAtMs: now)))
+                    out.append(.itemDelta(itemId: nestedItemId, bodyAppend: text, outputAppend: nil, summary: nil))
+                    out.append(.itemCompleted(itemId: nestedItemId, finalState: .completed))
                 case "tool_use":
                     let name = block["name"] as? String
                     if Self.isExitPlanMode(name) { exitPlanToolIds.insert(itemId) }
@@ -467,6 +498,7 @@ public final class ClaudeParser {
             if let usage = tokenUsage(from: obj) {
                 out.append(.tokenUsage(usage))
             }
+            out.append(contentsOf: initLoadErrorEvents(from: obj, now: now))
             return out
         case "rc_bridge_ready":
             return [.providerRuntime(ProviderRuntimeEvent(
@@ -1061,6 +1093,48 @@ public final class ClaudeParser {
             return nil
         }
         return String(data: data, encoding: .utf8)
+    }
+
+    private func nestedParentToolUseId(from obj: [String: Any]) -> String? {
+        guard let value = stringValue(obj["parent_tool_use_id"]), !value.isEmpty else { return nil }
+        return value
+    }
+
+    private func namespacedItemId(_ itemId: String, parentToolUseId: String?) -> String {
+        guard let parentToolUseId else { return itemId }
+        return "\(parentToolUseId):\(itemId)"
+    }
+
+    /// CLAUDE-CLI-010: captured stderr hides CLI skip warnings; stream-json
+    /// init carries mcp_server_errors / plugin_errors instead.
+    private func initLoadErrorEvents(from obj: [String: Any], now: Int64) -> [AssistantEvent] {
+        func rows(forKey key: String) -> [[String: Any]] {
+            if let dicts = obj[key] as? [[String: Any]] { return dicts }
+            if let strings = obj[key] as? [String] {
+                return strings.map { ["message": $0] }
+            }
+            return []
+        }
+        var out: [AssistantEvent] = []
+        for row in rows(forKey: "mcp_server_errors") {
+            out.append(.providerRuntime(ProviderRuntimeEvent(
+                provider: .claude,
+                source: "claude.stream-json.init",
+                method: "claude.init.mcp_server_error",
+                payloadJSON: jsonString(row) ?? "{}",
+                receivedAtMs: now
+            )))
+        }
+        for row in rows(forKey: "plugin_errors") {
+            out.append(.providerRuntime(ProviderRuntimeEvent(
+                provider: .claude,
+                source: "claude.stream-json.init",
+                method: "claude.init.plugin_error",
+                payloadJSON: jsonString(row) ?? "{}",
+                receivedAtMs: now
+            )))
+        }
+        return out
     }
 
     /// True iff `text` duplicates an already-emitted assistant body, by

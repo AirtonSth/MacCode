@@ -813,6 +813,10 @@ function ensureQuery() {
       // the later whole assistant message, so partial delivery does not duplicate it.
       includePartialMessages: true,
       includeHookEvents: true,
+      // Match CLI `--forward-subagent-text` so nested Agent/Task prose is
+      // emitted with parent_tool_use_id. ClaudeParser isolates that text from
+      // the parent assembled body.
+      forwardSubagentText: true,
       canUseTool: async (toolName, input, options) => {
         const requestId = options.toolUseID || `permission-${Date.now()}`;
         // AskUserQuestion is an interactive question, not a permission gate: route

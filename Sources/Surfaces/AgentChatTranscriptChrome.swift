@@ -330,11 +330,7 @@ public struct AgentChatUserBubble: View {
     }
 
     private var bubbleLabel: some View {
-        Text(text)
-            .font(.system(size: 13))
-            .foregroundColor(DS.Palette.text)
-            .multilineTextAlignment(.leading)
-            .textSelection(.enabled)
+        AgentSelectablePlainText(text: text, fontSize: 13, textColor: DS.NS.text)
             .padding(.horizontal, DS.Space.xl)
             .padding(.vertical, DS.Space.lg)
             .background(DS.Palette.surface)
@@ -368,7 +364,6 @@ public struct AgentChatAssistantReply: View {
             } else {
                 AgentMessageMarkdownView(text: text)
                     .foregroundColor(DS.Palette.text)
-                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .accessibilityIdentifier(roleIdentifier)
                     .accessibilityLabel(text)

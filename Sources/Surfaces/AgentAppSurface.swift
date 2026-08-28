@@ -1555,7 +1555,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             let keep: Set<AgentRunID> = await Task.detached(priority: .utility) {
                 var keep = Set<AgentRunID>()
                 for (runId, threadId) in stillMaybeLive {
-                    if let durable = try? coordinator.durableActiveRun(threadId: threadId),
+                    if let durable = try? coordinator.durableActiveRunChrome(threadId: threadId),
                        durable.id == runId {
                         keep.insert(runId)
                     }
@@ -2606,7 +2606,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 // builds that mirrored queued text into the transcript. Only
                 // drop when not yet durable under that id (drain/start persist).
                 let mirrorId = AgentMessageID(cancelled.id.value)
-                if (try? messageRepo.get(id: mirrorId)) == nil,
+                if (try? messageRepo.exists(id: mirrorId)) != true,
                    let idx = messages.firstIndex(where: { $0.id == mirrorId }) {
                     messages.remove(at: idx)
                 }
@@ -5270,7 +5270,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     /// Seed Working-for clock + run id from durable agent_runs and start live poll.
     private func bindScheduledOwnedRun(threadId: AgentThreadID) {
-        let durable = try? coordinator.durableActiveRun(threadId: threadId)
+        let durable = try? coordinator.durableActiveRunChrome(threadId: threadId)
         runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
             current: runStartedAt,
             persisted: durable?.startedAt ?? (try? coordinator.runStartedAt(threadId: threadId))
@@ -5341,7 +5341,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
             scheduleTimelineUpdateTick()
         }
-        if let durable = try? coordinator.durableActiveRun(threadId: id) {
+        if let durable = try? coordinator.durableActiveRunChrome(threadId: id) {
             runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
                 current: runStartedAt,
                 persisted: durable.startedAt
@@ -5419,44 +5419,125 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         normalizeSelectedModelOptions()
         rememberNewThreadDefaults()
         guard let id = selectedThreadId else { return false }
+        // Painted rail already holds the config persist would write. A leftover
+        // 26-column + routing `get` then `upsert` hitchs every composer send
+        // and bumps routing revision even when picker/permission/run-as-user
+        // did not change.
+        if let painted = threads.first(where: { $0.id == id }),
+           Self.paintedThreadMatchesPersistedConfig(
+                painted,
+                provider: provider,
+                providerInstanceId: providerInstanceId,
+                runAsUser: runAsUser,
+                model: model,
+                permissionMode: permissionMode,
+                reasoningEffort: reasoningEffort,
+                serviceTier: serviceTier,
+                modelSelection: currentModelSelection,
+                interactionMode: interactionMode
+           ) {
+            persistComposerDraft(for: id)
+            return true
+        }
         do {
-            guard let stored = try threadRepo.get(id: id) else {
+            let now = Date()
+            let painted = threads.first(where: { $0.id == id })
+            let routingBase: AgentRoutingConfiguration
+            if let painted {
+                routingBase = painted.effectiveRoutingConfiguration
+            } else if let stored = try threadRepo.routingConfiguration(of: id) {
+                routingBase = stored
+            } else {
+                routingBase = .legacyManual(
+                    selection: currentModelSelection,
+                    providerInstanceId: providerInstanceId,
+                    updatedAt: now
+                )
+            }
+            let nextRouting = try routingBase.replacing(
+                expectedRevision: routingBase.revision,
+                mode: routingBase.mode,
+                manualSelection: currentModelSelection,
+                manualProviderInstanceId: providerInstanceId,
+                eligibleProviders: routingBase.eligibleProviders,
+                policyDigest: routingBase.policyDigest,
+                updatedAt: now
+            )
+            // Picker chrome + routing CAS only. A leftover 26-column `get`
+            // then full-row `upsert` hitchs model/permission changes and
+            // rewrites title/status/unread/color/pin/execution.
+            guard try threadRepo.setPickerConfig(
+                of: id,
+                provider: provider,
+                providerInstanceId: providerInstanceId,
+                runAsUser: runAsUser,
+                model: model,
+                permissionMode: permissionMode,
+                reasoningEffort: reasoningEffort,
+                serviceTier: serviceTier,
+                modelSelection: currentModelSelection,
+                interactionMode: interactionMode,
+                at: now
+            ) else {
                 statusMessage = "Could not save thread configuration: thread not found."
                 return false
             }
-            var updated = stored
-            updated.provider = provider
-            updated.providerInstanceId = providerInstanceId
-            updated.runAsUser = runAsUser
-            updated.model = model
-            updated.permissionMode = permissionMode
-            updated.reasoningEffort = reasoningEffort
-            updated.serviceTier = serviceTier
-            updated.modelSelection = currentModelSelection
-            updated.interactionMode = interactionMode
-            updated.updatedAt = Date()
-            let routing = stored.effectiveRoutingConfiguration
-            updated.routingConfiguration = try routing.replacing(
-                expectedRevision: routing.revision,
-                mode: routing.mode,
-                manualSelection: currentModelSelection,
-                manualProviderInstanceId: providerInstanceId,
-                eligibleProviders: routing.eligibleProviders,
-                policyDigest: routing.policyDigest,
-                updatedAt: updated.updatedAt
+            try threadRepo.setRoutingConfiguration(
+                nextRouting,
+                threadId: id,
+                expectedRevision: routingBase.revision
             )
-            try threadRepo.upsert(updated)
             if let i = threads.firstIndex(where: { $0.id == id }) {
-                threads[i] = updated
+                threads[i].provider = provider
+                threads[i].providerInstanceId = providerInstanceId
+                threads[i].runAsUser = runAsUser
+                threads[i].model = model
+                threads[i].permissionMode = permissionMode
+                threads[i].reasoningEffort = reasoningEffort
+                threads[i].serviceTier = serviceTier
+                threads[i].modelSelection = currentModelSelection
+                threads[i].interactionMode = interactionMode
+                threads[i].updatedAt = now
+                threads[i].routingConfiguration = nextRouting
+                persistComposerDraft(for: id)
+                onThreadConfigPersisted?(threads[i])
+            } else {
+                persistComposerDraft(for: id)
             }
-            persistComposerDraft(for: id)
-            onThreadConfigPersisted?(updated)
             return true
         } catch {
             if let stored = try? threadRepo.get(id: id) { restoreThreadConfiguration(from: stored) }
             statusMessage = "Could not save thread configuration: \(error)"
             return false
         }
+    }
+
+    /// Config persist would only copy picker/permission/run-as-user onto the
+    /// painted row. Matching means SQLite already has that chrome.
+    nonisolated static func paintedThreadMatchesPersistedConfig(
+        _ painted: AgentThread,
+        provider: AgentProvider,
+        providerInstanceId: String,
+        runAsUser: AgentRunAsUser?,
+        model: String,
+        permissionMode: AgentPermissionMode,
+        reasoningEffort: AgentReasoningEffort,
+        serviceTier: AgentServiceTier,
+        modelSelection: AgentModelSelection,
+        interactionMode: AgentInteractionMode
+    ) -> Bool {
+        let routing = painted.effectiveRoutingConfiguration
+        return painted.provider == provider
+            && (painted.providerInstanceId ?? painted.provider.rawValue) == providerInstanceId
+            && painted.runAsUser == runAsUser
+            && painted.model == model
+            && painted.permissionMode == permissionMode
+            && painted.reasoningEffort == reasoningEffort
+            && painted.serviceTier == serviceTier
+            && painted.modelSelection == modelSelection
+            && painted.effectiveInteractionMode == interactionMode
+            && routing.manualSelection == modelSelection
+            && (routing.manualProviderInstanceId ?? painted.provider.rawValue) == providerInstanceId
     }
 
     /// Changes the thread-owned routing mode with optimistic revision protection.
@@ -5471,11 +5552,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return true
         }
         do {
-            guard let stored = try threadRepo.get(id: id) else {
+            // Routing chrome only. A leftover 26-column `get` before Auto
+            // toggle and another `get` after CAS hitchs the composer switch.
+            let storedRouting = try threadRepo.routingConfiguration(of: id)
+            let current: AgentRoutingConfiguration
+            if let storedRouting {
+                current = storedRouting
+            } else if let picker = try threadRepo.threadWithoutRouting(of: id) {
+                current = picker.effectiveRoutingConfiguration
+            } else {
                 statusMessage = "Could not save Auto model routing: thread not found."
                 return false
             }
-            let current = stored.effectiveRoutingConfiguration
             let requestedMode: AgentRoutingMode = enabled ? .auto : .manual
             guard current.mode != requestedMode else { return true }
 
@@ -5499,15 +5587,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 threadId: id,
                 expectedRevision: current.revision
             )
-            guard let persisted = try threadRepo.get(id: id) else {
+            var persisted: AgentThread
+            if let index = threads.firstIndex(where: { $0.id == id }) {
+                threads[index].routingConfiguration = updatedConfiguration
+                threads[index].updatedAt = updatedConfiguration.updatedAt
+                persisted = threads[index]
+            } else if var picker = try threadRepo.threadWithoutRouting(of: id) {
+                picker.routingConfiguration = updatedConfiguration
+                picker.updatedAt = updatedConfiguration.updatedAt
+                persisted = picker
+            } else {
                 statusMessage = "Could not restore the persisted routing configuration."
                 return false
             }
             routingMode = updatedConfiguration.mode
             rememberNewThreadDefaults()
-            if let index = threads.firstIndex(where: { $0.id == id }) {
-                threads[index] = persisted
-            }
             if !enabled {
                 restoreThreadConfiguration(from: persisted)
             }
@@ -5515,8 +5609,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             onThreadConfigPersisted?(persisted)
             return true
         } catch {
-            if let latest = try? threadRepo.get(id: id) {
-                restoreThreadConfiguration(from: latest)
+            let latestRouting = try? threadRepo.routingConfiguration(of: id) ?? nil
+            if let index = threads.firstIndex(where: { $0.id == id }) {
+                if let latestRouting {
+                    threads[index].routingConfiguration = latestRouting
+                }
+                restoreThreadConfiguration(from: threads[index])
+            } else if var picker = try? threadRepo.threadWithoutRouting(of: id) {
+                picker.routingConfiguration = latestRouting
+                restoreThreadConfiguration(from: picker)
             }
             statusMessage = "Could not save Auto model routing: \(error)"
             return false
@@ -5584,17 +5685,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// owned the card, not whichever thread is selected when the await returns.
     private func setPermissionMode(_ mode: AgentPermissionMode, for threadId: AgentThreadID) {
         do {
-            guard var thread = try threadRepo.get(id: threadId) else { return }
-            thread.permissionMode = mode
-            thread.updatedAt = Date()
-            try threadRepo.upsert(thread)
+            let now = Date()
+            // Permission chrome only. A leftover 26-column + routing `get` then
+            // full-row `upsert` hitchs session-grant persist and rewrites routing.
+            guard try threadRepo.setPermissionMode(of: threadId, permissionMode: mode, at: now) else { return }
             if let index = threads.firstIndex(where: { $0.id == threadId }) {
                 threads[index].permissionMode = mode
+                threads[index].updatedAt = now
+                onThreadConfigPersisted?(threads[index])
             }
             if selectedThreadId == threadId {
                 permissionMode = mode
             }
-            onThreadConfigPersisted?(thread)
         } catch {
             statusMessage = "Could not save permission mode: \(error)"
         }
@@ -5644,16 +5746,23 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @discardableResult
     public func persistThreadExecutionConfig() -> Bool {
         guard let id = selectedThreadId else { return false }
+        let branch = baseBranch.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextBranch = executionMode == .worktree ? (branch.isEmpty ? (gitBranch ?? "main") : branch) : nil
+        // Execution chrome only. A leftover 26-column + routing `get` then
+        // full-row `upsert` hitchs local↔worktree switches and rewrites routing.
         do {
-            guard var thread = try threadRepo.get(id: id) else { return false }
-            let branch = baseBranch.trimmingCharacters(in: .whitespacesAndNewlines)
-            thread.executionMode = executionMode
-            thread.baseBranch = executionMode == .worktree ? (branch.isEmpty ? (gitBranch ?? "main") : branch) : nil
-            if executionMode == .local { thread.worktreePath = nil }
-            thread.updatedAt = Date()
-            try threadRepo.upsert(thread)
+            let now = Date()
+            guard try threadRepo.setExecutionConfig(
+                of: id,
+                executionMode: executionMode,
+                baseBranch: nextBranch,
+                at: now
+            ) else { return false }
             if let i = threads.firstIndex(where: { $0.id == id }) {
-                threads[i] = thread
+                threads[i].executionMode = executionMode
+                threads[i].baseBranch = nextBranch
+                if executionMode == .local { threads[i].worktreePath = nil }
+                threads[i].updatedAt = now
             }
             return true
         } catch {
@@ -5836,36 +5945,36 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func renameThread(_ id: AgentThreadID, to newTitle: String) {
         let title = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty else { return }
-        let t: AgentThread
         do {
-            guard var stored = try threadRepo.get(id: id) else { return }
-            stored.title = title
-            stored.updatedAt = Date()
-            try threadRepo.upsert(stored)
-            t = stored
+            // Title only. A leftover 26-column + routing `get` then `upsert`
+            // hitchs macOS rename and clobbers concurrent persistThreadConfig /
+            // run-start writes (PERSISTENCE-DATA-002). RPC already uses this UPDATE.
+            try threadRepo.updateTitlePreservingActivity(id, title: title)
         } catch {
             statusMessage = "Could not rename thread: \(error)"
             return
         }
         reloadThreads()
-        onThreadLifecycle?(.updated(threads.first(where: { $0.id == id }) ?? t))
+        if let updated = threads.first(where: { $0.id == id }) {
+            onThreadLifecycle?(.updated(updated))
+        }
     }
 
     /// A2: set/clear a thread's swatch color (empty string clears).
     public func setThreadColor(_ id: AgentThreadID, _ color: String) {
-        let t: AgentThread
         do {
-            guard var stored = try threadRepo.get(id: id) else { return }
-            stored.color = color.isEmpty ? nil : color
-            stored.updatedAt = Date()
-            try threadRepo.upsert(stored)
-            t = stored
+            // Color only. A leftover 26-column + routing `get` after the
+            // targeted UPDATE hitchs the swatch click. Pin already reloads
+            // the rail instead of compiling the row for the lifecycle event.
+            try threadRepo.setColor(id: id, color: color.isEmpty ? nil : color)
         } catch {
             statusMessage = "Could not change thread color: \(error)"
             return
         }
         reloadThreads()
-        onThreadLifecycle?(.updated(threads.first(where: { $0.id == id }) ?? t))
+        if let updated = threads.first(where: { $0.id == id }) {
+            onThreadLifecycle?(.updated(updated))
+        }
     }
 
     public func setThreadPinned(_ id: AgentThreadID, _ pinned: Bool) {
@@ -7077,14 +7186,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         guard selectedThreadId == threadId else {
             do {
-                guard var thread = try threadRepo.get(id: threadId) else {
+                guard let wrote = try threadRepo.markUnreadUpdatingActivity(of: threadId) else {
                     statusMessage = "The bot reply thread is no longer available."
                     return nil
                 }
-                if !thread.hasUnread {
-                    thread.hasUnread = true
-                    thread.updatedAt = Date()
-                    try threadRepo.upsert(thread)
+                if wrote {
                     scheduleReloadThreads(delayMilliseconds: 0)
                 }
             } catch {
@@ -7248,9 +7354,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 threadId: threadId,
                 expectedRevision: configuration.revision
             )
-            if let persisted = try threadRepo.get(id: threadId),
-               let index = threads.firstIndex(where: { $0.id == threadId }) {
-                threads[index] = persisted
+            // Routing chrome only. A leftover 26-column `get` after CAS hitchs
+            // Auto send heal; the CAS result is already in `healed`.
+            if let index = threads.firstIndex(where: { $0.id == threadId }) {
+                threads[index].routingConfiguration = healed
+                threads[index].updatedAt = healed.updatedAt
             }
             routingMode = .auto
         }
@@ -7398,7 +7506,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // B5: title a still-default thread from its first message.
         if let t = threads.first(where: { $0.id == tid }),
            AgentThreadTitle.isPlaceholder(t.title),
-           ((try? messageRepo.listRecent(threadId: tid, limit: 1))?.isEmpty ?? true) {
+           !((try? messageRepo.hasAny(threadId: tid)) ?? false) {
             renameThread(tid, to: Self.deriveTitle(from: text))
         }
         loadAllMessages(tid)
@@ -7409,7 +7517,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // The coordinator is the single writer of run messages — mirror
         // the user message in-memory only (no double-persist). Queue drain
         // passes the same UUID as runId, so the optimistic bubble is stable.
-        let durableUserMessageExists = (try? messageRepo.get(id: AgentMessageID(runId.value))) != nil
+        let durableUserMessageExists = (try? messageRepo.exists(id: AgentMessageID(runId.value))) == true
         if !resumeInterrupted && !durableUserMessageExists {
             presentOutgoingUserMessage(
                 threadId: tid,
@@ -7522,18 +7630,28 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             runAsUser: threadRunAsUser
         )
         do {
-            guard var pendingThread = try threadRepo.get(id: tid) else {
+            // Status + unread + updated_at only. A leftover 26-column + routing
+            // `get` then `upsert` hitchs every composer send and rewrites routing
+            // JSON. Coordinator.startRun stamps the same pending chrome; this
+            // hop only needs existence plus painted unread for the optimistic rail.
+            guard try threadRepo.status(of: tid) != nil else {
                 throw NSError(
                     domain: "RemoteCode.AgentAppViewModel",
                     code: 404,
                     userInfo: [NSLocalizedDescriptionKey: "Thread disappeared before provider start."]
                 )
             }
-            pendingThread.status = .pending
-            pendingThread.updatedAt = Date()
-            try threadRepo.upsert(pendingThread)
+            let pendingAt = Date()
+            let paintedUnread = threads.first(where: { $0.id == tid })?.hasUnread ?? false
+            try threadRepo.updateStatus(
+                id: tid,
+                status: .pending,
+                hasUnread: paintedUnread,
+                at: pendingAt
+            )
             if let index = threads.firstIndex(where: { $0.id == tid }) {
-                threads[index] = pendingThread
+                threads[index].status = .pending
+                threads[index].updatedAt = pendingAt
             }
             // Per-run mapping is always safe; selection-facing fields only if still selected.
             runThreads[runId] = tid
@@ -7555,12 +7673,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             )
             if !failed.suppressLateCallback {
                 surfacePreparationStates[tid] = failed.state
-                if var rolled = try? threadRepo.get(id: tid), rolled.status == .pending {
-                    rolled.status = .failed
-                    rolled.updatedAt = Date()
-                    try? threadRepo.upsert(rolled)
+                if let current = try? threadRepo.status(of: tid), current == .pending {
+                    let failedAt = Date()
+                    let paintedUnread = threads.first(where: { $0.id == tid })?.hasUnread ?? false
+                    try? threadRepo.updateStatus(
+                        id: tid,
+                        status: .failed,
+                        hasUnread: paintedUnread,
+                        at: failedAt
+                    )
                     if let index = threads.firstIndex(where: { $0.id == tid }) {
-                        threads[index] = rolled
+                        threads[index].status = .failed
+                        threads[index].updatedAt = failedAt
                     }
                 }
                 if selectedThreadId == tid {
@@ -8039,7 +8163,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // stop is always safer than clearing a projection that may be backing a
         // live run, so a throwing read counts as stoppable.
         do {
-            if try coordinator.durableActiveRun(threadId: threadId) != nil { return true }
+            if try coordinator.hasDurableActiveRun(threadId: threadId) { return true }
         } catch {
             return true
         }
@@ -8172,7 +8296,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // Events can precede handle registration: startRun commits the run row as
         // `.pending` before the provider emits, so the durable row is the proof
         // that this run is the thread's current turn.
-        if let durable = try? coordinator.durableActiveRun(threadId: threadId), durable.id == run {
+        if let durable = try? coordinator.durableActiveRunChrome(threadId: threadId), durable.id == run {
             return true
         }
         // Deliberately NOT memoized into `terminalRunIds`: a run row written by
@@ -13903,10 +14027,12 @@ public struct AgentAppView: View {
             switch request.kind {
             case .commandExecution, .exec:
                 HStack(alignment: .top, spacing: DS.Space.sm) {
-                    Text(detail)
-                        .font(DS.Font.mono)
-                        .foregroundColor(DS.Palette.text)
-                        .textSelection(.enabled)
+                    AgentSelectablePlainText(
+                        text: detail,
+                        fontSize: 12,
+                        monospaced: true,
+                        textColor: DS.NS.text
+                    )
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(DS.Space.sm)
                         .background(DS.Palette.surface)
@@ -13964,11 +14090,13 @@ public struct AgentAppView: View {
                     }
                 }
             default:
-                Text(detail)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(4)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: detail,
+                    fontSize: 11,
+                    monospaced: true,
+                    textColor: DS.NS.textTertiary,
+                    maximumNumberOfLines: 4
+                )
             }
         }
     }
@@ -14222,7 +14350,6 @@ public struct AgentAppView: View {
             cacheResults: cacheMarkdown
         )
             .foregroundColor(DS.Palette.text)
-            .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -14568,10 +14695,13 @@ public struct AgentAppView: View {
                     .font(.system(size: 11))
                     .foregroundColor(recoverable ? DS.Palette.warning : DS.Palette.danger)
                     .frame(width: 14, height: 14, alignment: .center)
-                Text(err)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(recoverable ? DS.Palette.warning : DS.Palette.danger)
-                    .lineSpacing(3).textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: err,
+                    fontSize: 11,
+                    monospaced: true,
+                    textColor: recoverable ? DS.NS.warning : DS.NS.danger,
+                    lineSpacing: 3
+                )
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Button { vm.dismissDisplayedError() } label: {
                     Image(systemName: "xmark")
@@ -14856,11 +14986,11 @@ public struct AgentAppView: View {
                 }
             }
         case .system:
-            Text(msg.content)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-                .italic()
-                .textSelection(.enabled)
+            AgentSelectablePlainText(
+                text: msg.content,
+                fontSize: 11,
+                textColor: DS.NS.textTertiary
+            )
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -15396,11 +15526,12 @@ public struct AgentAppView: View {
             .buttonStyle(.plain)
             .help(streaming ? "" : (text.isEmpty ? "" : (expanded ? "Hide reasoning" : "Show reasoning")))
             if expanded, !text.isEmpty {
-                Text(text)
-                    .font(DS.Font.bodyDense)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineSpacing(3)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: text,
+                    fontSize: 12,
+                    textColor: DS.NS.textTertiary,
+                    lineSpacing: 3
+                )
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -15621,11 +15752,13 @@ public struct AgentAppView: View {
             // UX-MAC_AGENT-OPEN-SPLIT: file/URL tools keep an open-in-split affordance.
             if let summary = commandSummary, !summary.isEmpty {
                 HStack(alignment: .top, spacing: DS.Space.xs) {
-                    Text(summary)
-                        .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
-                        .textSelection(.enabled)
-                        .lineLimit(expanded ? nil : 1)
-                        .truncationMode(.tail)
+                    AgentSelectablePlainText(
+                        text: summary,
+                        fontSize: 11,
+                        monospaced: true,
+                        textColor: DS.NS.textSecondary,
+                        maximumNumberOfLines: expanded ? nil : 1
+                    )
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .help(commandFull ?? summary)
                     if let full = commandFull, !full.isEmpty {
@@ -15693,10 +15826,12 @@ public struct AgentAppView: View {
 
             // Expanded: full command (when longer/different than the summary) + output.
             if expanded, let full = commandFull, fullDiffersFromSummary, !full.isEmpty {
-                Text(full)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: full,
+                    fontSize: 11,
+                    monospaced: true,
+                    textColor: DS.NS.textTertiary
+                )
                     .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface.opacity(0.7))
@@ -15708,9 +15843,12 @@ public struct AgentAppView: View {
             // the transcript. Skill tool output stays complete (source-aware exception).
             // Full text stays selectable.
             if expanded, let o = output, !o.isEmpty {
-                Text(AgentTimelineItemPresentation.cappedDetail(o, for: item))
-                    .font(DS.Font.mono).foregroundColor(DS.Palette.textSecondary)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: AgentTimelineItemPresentation.cappedDetail(o, for: item),
+                    fontSize: 12,
+                    monospaced: true,
+                    textColor: DS.NS.textSecondary
+                )
                     .padding(DS.Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface)
@@ -15966,10 +16104,11 @@ public struct AgentAppView: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(DS.Palette.danger)
                 .frame(width: 14, height: 14, alignment: .center)
-            Text(message)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.text)
-                .textSelection(.enabled)
+            AgentSelectablePlainText(
+                text: message,
+                fontSize: 11,
+                textColor: DS.NS.text
+            )
                 .frame(maxWidth: .infinity, alignment: .leading)
             if offersCopy {
                 Button("Copy") {
@@ -16015,10 +16154,11 @@ public struct AgentAppView: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(DS.Palette.textSecondary)
                 .frame(width: 14, height: 14, alignment: .center)
-            Text(message)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textSecondary)
-                .textSelection(.enabled)
+            AgentSelectablePlainText(
+                text: message,
+                fontSize: 11,
+                textColor: DS.NS.textSecondary
+            )
                 .frame(maxWidth: .infinity, alignment: .leading)
             Button(action: dismiss) {
                 Image(systemName: "xmark")
@@ -16334,10 +16474,11 @@ public struct AgentAppView: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(tone)
                 .frame(width: 14, height: 14, alignment: .center)
-            Text(item.message)
-                .font(DS.Font.caption)
-                .foregroundColor(item.severity == .info ? DS.Palette.textSecondary : DS.Palette.text)
-                .textSelection(.enabled)
+            AgentSelectablePlainText(
+                text: item.message,
+                fontSize: 11,
+                textColor: item.severity == .info ? DS.NS.textSecondary : DS.NS.text
+            )
                 .frame(maxWidth: .infinity, alignment: .leading)
             if item.offersCopy {
                 Button("Copy") {
@@ -17100,10 +17241,12 @@ public struct AgentAppView: View {
                         }
                     }
                     ScrollView {
-                        Text(plan)
-                            .font(DS.Font.monoSmall)
-                            .foregroundColor(DS.Palette.text)
-                            .textSelection(.enabled)
+                        AgentSelectablePlainText(
+                            text: plan,
+                            fontSize: 11,
+                            monospaced: true,
+                            textColor: DS.NS.text
+                        )
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(maxHeight: proposedPlanExpanded ? 420 : 220)
@@ -17201,10 +17344,12 @@ public struct AgentAppView: View {
                         }
                     }
                     ScrollView {
-                        Text(vm.checkpointDiffPreview)
-                            .font(DS.Font.monoSmall)
-                            .foregroundColor(DS.Palette.text)
-                            .textSelection(.enabled)
+                        AgentSelectablePlainText(
+                            text: vm.checkpointDiffPreview,
+                            fontSize: 11,
+                            monospaced: true,
+                            textColor: DS.NS.text
+                        )
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(maxHeight: 220)
@@ -17349,7 +17494,6 @@ public struct AgentAppView: View {
                 Spacer(minLength: 0)
             }
             AgentMessageMarkdownView(text: markdown)
-                .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: DS.Space.xs) {
                 if plan.showsImplementationActions {

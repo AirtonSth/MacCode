@@ -343,6 +343,23 @@ final class AgentLinkedInlineTextTests: XCTestCase {
         )
     }
 
+    /// WHY: AgentSelectablePlainText is the AppKit replacement for SwiftUI
+    /// `.textSelection(.enabled)`. Callers (BotsWindow compiled payload) pass
+    /// `monospaced: true`; that flag must map to the same NSFont as AppKit's
+    /// monospaced system face, not a proportional system font.
+    func test_nsFont_monospacedTrue_equalsMonospacedSystemFont() {
+        let size: CGFloat = 11
+        let weight = NSFont.Weight.regular
+        XCTAssertEqual(
+            AgentLinkedInlineText.nsFont(size: size, weight: weight, monospaced: true),
+            NSFont.monospacedSystemFont(ofSize: size, weight: weight)
+        )
+        XCTAssertEqual(
+            AgentLinkedInlineText.nsFont(size: size, weight: weight, monospaced: false),
+            NSFont.systemFont(ofSize: size, weight: weight)
+        )
+    }
+
     func test_sizeThatFits_sameWidthDoesNotInvalidateIntrinsicSize() {
         let tv = IntrinsicHeightTextView(usingTextLayoutManager: false)
         tv.string = String(repeating: "word ", count: 80)

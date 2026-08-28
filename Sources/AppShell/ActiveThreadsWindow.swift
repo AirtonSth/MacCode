@@ -122,7 +122,7 @@ public final class ActiveThreadsViewModel: ObservableObject {
         for threadID in missingStartedAt {
             if let runId = runIdByThread[threadID], let startedAt = stamps[runId] {
                 startedAtByThread[threadID] = startedAt
-            } else if let durable = try? context.coordinator.durableActiveRun(threadId: threadID) {
+            } else if let durable = try? context.coordinator.durableActiveRunChrome(threadId: threadID) {
                 startedAtByThread[threadID] = durable.startedAt
             } else {
                 startedAtByThread[threadID] = Date()

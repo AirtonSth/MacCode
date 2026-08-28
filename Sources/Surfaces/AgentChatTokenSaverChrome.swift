@@ -198,10 +198,12 @@ public struct AgentChatTokenSaverOriginalContent: View {
                 Text("What was sent")
                     .font(DS.Font.caption2.weight(.semibold))
                     .foregroundColor(DS.Palette.textTertiary)
-                Text(request)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .textSelection(.enabled)
+                AgentSelectablePlainText(
+                    text: request,
+                    fontSize: 12,
+                    monospaced: true,
+                    textColor: DS.NS.textSecondary
+                )
                     .fixedSize(horizontal: false, vertical: true)
                 Button("Copy what was sent") { onCopy(request) }
                     .buttonStyle(.plain)
@@ -211,10 +213,12 @@ public struct AgentChatTokenSaverOriginalContent: View {
             Text("Original provider response")
                 .font(DS.Font.caption2.weight(.semibold))
                 .foregroundColor(DS.Palette.textTertiary)
-            Text(original)
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundColor(DS.Palette.textSecondary)
-                .textSelection(.enabled)
+            AgentSelectablePlainText(
+                text: original,
+                fontSize: 12,
+                monospaced: true,
+                textColor: DS.NS.textSecondary
+            )
                 .fixedSize(horizontal: false, vertical: true)
             Button("Copy original provider response") { onCopy(original) }
                 .buttonStyle(.plain)
