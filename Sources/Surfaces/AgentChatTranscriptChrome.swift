@@ -20,6 +20,24 @@ public enum AgentChatTranscriptChrome {
         return min(userMessageBubbleMaxWidth, max(userMessageBubbleMinWidth, usable))
     }
 
+    /// Width of the selectable prompt inside the padded user bubble.
+    ///
+    /// Hugs short messages and caps long ones. Must stay well above a
+    /// 2-glyph column — that is the broken "Go / Gr" screenshot.
+    public static func userMessageBubbleContentWidth(
+        text: String,
+        columnWidth: CGFloat,
+        fontSize: CGFloat = 13
+    ) -> CGFloat {
+        let bubbleMax = userMessageBubbleWidthCap(columnWidth: columnWidth)
+        let textMax = max(1, bubbleMax - DS.Space.xl * 2)
+        let hug = IntrinsicHeightTextView.idealSize(
+            string: text,
+            font: NSFont.systemFont(ofSize: fontSize)
+        ).width
+        return min(max(hug + 2, 1), textMax)
+    }
+
     public static func composerPlaceholder(providerDisplayName: String) -> String {
         "Ask \(providerDisplayName) for changes…"
     }
@@ -277,22 +295,19 @@ public struct AgentChatUserBubble: View {
 
     public var body: some View {
         let bubbleMax = AgentChatTranscriptChrome.userMessageBubbleWidthCap(columnWidth: columnWidth)
-        let textMax = max(0, bubbleMax - (DS.Space.xl * 2))
+        let textWidth = AgentChatTranscriptChrome.userMessageBubbleContentWidth(
+            text: text,
+            columnWidth: columnWidth
+        )
         HStack(alignment: .top, spacing: 0) {
             Spacer(minLength: AgentChatTranscriptChrome.userMessageBubbleLeadingGutter)
             VStack(alignment: .trailing, spacing: DS.Space.xs) {
                 if let header {
                     header
                 }
-                ViewThatFits(in: .horizontal) {
-                    bubbleLabel
-                        .fixedSize(horizontal: true, vertical: true)
-                    bubbleLabel
-                        .frame(maxWidth: textMax, alignment: .leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: bubbleMax, alignment: .trailing)
-                .accessibilityIdentifier(accessibilityIdentifier)
+                bubbleLabel(textWidth: textWidth)
+                    .frame(maxWidth: bubbleMax, alignment: .trailing)
+                    .accessibilityIdentifier(accessibilityIdentifier)
                 if let belowBubble {
                     belowBubble
                         .frame(maxWidth: bubbleMax, alignment: .trailing)
@@ -329,8 +344,10 @@ public struct AgentChatUserBubble: View {
         .frame(maxWidth: .infinity, alignment: .trailing)
     }
 
-    private var bubbleLabel: some View {
+    private func bubbleLabel(textWidth: CGFloat) -> some View {
         AgentSelectablePlainText(text: text, fontSize: 13, textColor: DS.NS.text)
+            .frame(width: textWidth, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, DS.Space.xl)
             .padding(.vertical, DS.Space.lg)
             .background(DS.Palette.surface)

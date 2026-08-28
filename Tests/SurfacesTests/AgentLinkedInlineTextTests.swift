@@ -360,6 +360,74 @@ final class AgentLinkedInlineTextTests: XCTestCase {
         )
     }
 
+    /// WHY: AgentChatUserBubble hugs short prompts. After SelectionOverlay,
+    /// `sizeThatFits` treated unspecified / 0 / infinite proposals as width 0,
+    /// so "Go to my linear" painted as a 2-glyph column ("Go" / "Gr").
+    func test_sizeThatFitsProposal_unspecifiedHugsInsteadOfCollapsingToZero() {
+        let tv = IntrinsicHeightTextView(usingTextLayoutManager: false)
+        tv.string = "Go to my linear"
+        tv.font = NSFont.systemFont(ofSize: 13)
+        tv.textContainer?.lineFragmentPadding = 0
+        tv.textContainerInset = .zero
+        tv.frame = .zero
+        let ideal = tv.sizeThatFitsIdeal()
+        XCTAssertGreaterThan(
+            ideal.width,
+            80,
+            "hug width must fit the prompt on one line, not a 2-glyph column"
+        )
+        XCTAssertLessThan(ideal.width, 240)
+        XCTAssertEqual(tv.sizeThatFitsProposal(width: nil).width, ideal.width, accuracy: 0.5)
+        XCTAssertEqual(tv.sizeThatFitsProposal(width: 0).width, ideal.width, accuracy: 0.5)
+        XCTAssertEqual(
+            tv.sizeThatFitsProposal(width: CGFloat.infinity).width,
+            ideal.width,
+            accuracy: 0.5
+        )
+        XCTAssertEqual(
+            IntrinsicHeightTextView.idealSize(
+                string: "Go to my linear",
+                font: NSFont.systemFont(ofSize: 13)
+            ).width,
+            ideal.width,
+            accuracy: 1.5,
+            "static measurer must match the live NSTextView hug"
+        )
+    }
+
+    func test_sizeThatFitsIdeal_doesNotPoisonWrapCache() {
+        let tv = IntrinsicHeightTextView(usingTextLayoutManager: false)
+        tv.string = String(repeating: "wrapping word ", count: 60)
+        tv.font = NSFont.systemFont(ofSize: 13)
+        tv.frame = NSRect(x: 0, y: 0, width: 240, height: 40)
+        let wrap = tv.sizeThatFitsWidth(240)
+        let invalidations = tv.intrinsicInvalidationCountForTesting
+        let ideal = tv.sizeThatFitsIdeal()
+        XCTAssertLessThan(
+            ideal.width,
+            10_000,
+            "hug must be glyph width, not the 10_000pt probe or extra line fragment"
+        )
+        XCTAssertGreaterThan(ideal.width, 1_000)
+        XCTAssertGreaterThan(
+            ideal.width,
+            wrap.width,
+            "unwrapped hug must be wider than the 240pt column wrap"
+        )
+        XCTAssertLessThan(ideal.height, wrap.height)
+        XCTAssertEqual(
+            tv.sizeThatFitsWidth(240).height,
+            wrap.height,
+            accuracy: 0.5,
+            "hug measurement must not replace the wrap cache with the 10_000pt probe"
+        )
+        XCTAssertEqual(
+            tv.intrinsicInvalidationCountForTesting,
+            invalidations,
+            "hug measurement must not invalidate intrinsic size"
+        )
+    }
+
     func test_sizeThatFits_sameWidthDoesNotInvalidateIntrinsicSize() {
         let tv = IntrinsicHeightTextView(usingTextLayoutManager: false)
         tv.string = String(repeating: "word ", count: 80)
