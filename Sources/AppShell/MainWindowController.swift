@@ -1358,12 +1358,18 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         }
     }
 
+    private static func waitForCommittedFrame() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
     private func scheduleWorkspaceRebuild() {
         workspaceRebuildTask?.cancel()
         workspaceRebuildGeneration &+= 1
         let generation = workspaceRebuildGeneration
         workspaceRebuildTask = Task { @MainActor [weak self] in
-            await Task.yield()
+            await Self.waitForCommittedFrame()
             guard let self else { return }
             defer {
                 if self.workspaceRebuildGeneration == generation {
@@ -1772,7 +1778,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         }
         destinationPersistenceTask?.cancel()
         destinationPersistenceTask = Task { @MainActor [weak self] in
-            await Task.yield()
+            await Self.waitForCommittedFrame()
             guard let self, !Task.isCancelled else { return }
             try? self.context?.settingsRepo.set(Self.botsShellSettingsKey, value)
             self.destinationPersistenceTask = nil

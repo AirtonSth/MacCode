@@ -2,7 +2,8 @@ import XCTest
 @testable import AppShell
 
 // PERF-SSH-001: "Connecting..." label must paint before keychain read + forkpty stall.
-// The fix defers performConnect behind Task.yield() so SwiftUI commits one frame first.
+// The fix defers performConnect behind waitForCommittedFrame (DispatchQueue.main.async)
+// so the CATransaction commits before the stall (Task.yield() is only an executor hop).
 // These tests verify the pure SSHConnectPhase state machine that encodes the ordering
 // invariant — if a transition skips .painting or allows back-edges, the label may not
 // paint before the stall.
@@ -100,5 +101,24 @@ final class SSHConnectPhaseTests: XCTestCase {
             visited.firstIndex(of: .connecting)!,
             visited.firstIndex(of: .failed)!,
             "connecting must precede failed")
+    }
+
+    func test_enqueueConnectionUsesCommittedFrameBarrier() throws {
+        let ssh = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/AppShell/SSHSurface.swift"),
+            encoding: .utf8
+        )
+        let start = try XCTUnwrap(ssh.range(of: "private func enqueueConnection"))
+        let tail = ssh[start.lowerBound...]
+        let end = tail.range(of: "\n    private func drainConnectionRequests")?.lowerBound ?? tail.endIndex
+        let body = String(tail[..<end])
+        XCTAssertTrue(body.contains("waitForCommittedFrame"),
+                      "enqueueConnection must use waitForCommittedFrame (committed CATransaction), not Task.yield() — only committed-frame proves the \"Connecting…\" label painted before forkpty (AGENTS.md)")
+        XCTAssertFalse(body.contains("await Task.yield()"),
+                       "Task.yield() is only an executor hop, not proof that SwiftUI committed the \"Connecting…\" frame")
     }
 }
