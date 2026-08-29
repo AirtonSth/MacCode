@@ -14769,6 +14769,12 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(liveChrome.contains("Thinking…"))
         XCTAssertTrue(liveChrome.contains("Work so far"))
         XCTAssertTrue(bots.contains("onAttach"))
+        XCTAssertTrue(
+            bots.contains("onFileDrop: { vm.insertDroppedFilePaths($0) }"),
+            "Desk composer must insert dropped file/folder paths into the prompt "
+                + "text exactly like Agent App — without onFileDrop the drop falls "
+                + "back to onAttach, which stages attachments and rejects folders"
+        )
         XCTAssertTrue(bots.contains("stopDeskRun"))
         XCTAssertTrue(bots.contains("attachments: attached") || bots.contains("attachments: attached,"))
         XCTAssertTrue(bots.contains("attachmentStore().stage"))

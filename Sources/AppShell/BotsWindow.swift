@@ -5291,6 +5291,13 @@ public final class BotsViewModel: ObservableObject {
         attachments.removeAll { $0 == attachment }
     }
 
+    /// Dropping files/folders on the Desk composer inserts their paths into
+    /// the prompt text — same behavior as Agent App's composer.
+    public func insertDroppedFilePaths(_ paths: [String]) {
+        let insertion = DroppedFilePaths.composerInputText(for: paths)
+        composerText = DroppedFilePaths.appending(insertion, to: composerText)
+    }
+
     public func removeQueuedFollowUp(_ item: BotQueuedFollowUp) {
         guard let botID = selectedBotID else { return }
         queuedFollowUpsByBot[botID]?.removeAll { $0.id == item.id }
@@ -11811,7 +11818,8 @@ public struct BotsRootView: View {
                 suggestions: vm.composerSuggestions,
                 onApplySuggestion: { vm.applyComposerSuggestion($0) },
                 onCursorMoved: { vm.composerCursorOffset = $0 },
-                suggestionIdentifier: "bots.desk.suggestion.popup"
+                suggestionIdentifier: "bots.desk.suggestion.popup",
+                onFileDrop: { vm.insertDroppedFilePaths($0) }
             )
         }
     }

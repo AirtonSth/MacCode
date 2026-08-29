@@ -386,6 +386,37 @@ final class AgentLinkedInlineTextTests: XCTestCase {
             chunk.contains("clipsToBounds = true"),
             "apply() must keep clipsToBounds on so stale height cannot paint over Working for"
         )
+        XCTAssertTrue(
+            chunk.contains("scheduleIntrinsicInvalidationAfterContentChange()"),
+            "apply() must schedule a deferred remeasure on height changes — "
+                + "without it SwiftUI keeps the first-token frame and later rows "
+                + "(Bots Desk working strip) land mid-paragraph over streaming text"
+        )
+    }
+
+    /// WHY: streaming text changes must make SwiftUI re-run sizeThatFits, or
+    /// the row keeps its stale height while glyphs paint past the frame. The
+    /// invalidation must fire outside the SwiftUI transaction (async) and
+    /// coalesce token bursts so one frame never pays N invalidations.
+    func test_scheduleIntrinsicInvalidation_firesOnceAsyncPerBurst() {
+        let tv = IntrinsicHeightTextView(usingTextLayoutManager: false)
+        let before = tv.intrinsicInvalidationCountForTesting
+        tv.scheduleIntrinsicInvalidationAfterContentChange()
+        tv.scheduleIntrinsicInvalidationAfterContentChange()
+        tv.scheduleIntrinsicInvalidationAfterContentChange()
+        XCTAssertEqual(
+            tv.intrinsicInvalidationCountForTesting,
+            before,
+            "invalidation must not run synchronously inside the caller's transaction"
+        )
+        let fired = expectation(description: "deferred invalidation ran")
+        DispatchQueue.main.async { fired.fulfill() }
+        wait(for: [fired], timeout: 2)
+        XCTAssertEqual(
+            tv.intrinsicInvalidationCountForTesting,
+            before + 1,
+            "a burst of content changes must coalesce into exactly one invalidation"
+        )
     }
 
     func test_nsFont_monospacedTrue_equalsMonospacedSystemFont() {

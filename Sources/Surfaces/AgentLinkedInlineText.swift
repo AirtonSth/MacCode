@@ -323,9 +323,16 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
         }
         if plan.heightDirty {
             // Drop the fitted-size cache so the next sizeThatFits remeasures.
-            // Do not call invalidateIntrinsicContentSize: that retriggers
-            // LazyVStack placement (live hang: 100% main thread, 18 GB RSS).
+            // Cache reset alone is not enough: SwiftUI does not re-run
+            // sizeThatFits just because updateNSView rewrote the storage, so a
+            // streaming row kept its first-token frame while new glyphs
+            // painted past it (Bots Desk: the working strip landed
+            // mid-paragraph over the live Thinking text). Ask SwiftUI to
+            // remeasure via a deferred, coalesced intrinsic-size invalidation
+            // — never synchronously here: that was the pid 62995 LazyVStack
+            // placement hang (100% main thread, 18 GB RSS).
             tv.resetFittedSizeCache()
+            tv.scheduleIntrinsicInvalidationAfterContentChange()
         }
         context.coordinator.applied = next
     }
@@ -410,6 +417,28 @@ final class IntrinsicHeightTextView: NSTextView {
     private var measuringProposedWidth = false
     private var lastFittedWidth: CGFloat = 0
     private var lastFittedSize: CGSize = .zero
+    private var pendingContentChangeInvalidation = false
+
+    /// Ask SwiftUI to re-run `sizeThatFits` after a content change, outside
+    /// the current SwiftUI transaction.
+    ///
+    /// WHY: updating the text storage repaints the NSTextView but SwiftUI
+    /// keeps the frame from the last measure — a live streaming row stayed one
+    /// line tall while its glyphs painted far past the frame, so the rows laid
+    /// out after it (Bots Desk working strip) landed mid-paragraph. A
+    /// synchronous invalidate inside apply()/updateNSView is forbidden — that
+    /// re-entered LazyVStack placement (pid 62995 hang) — so defer to the next
+    /// runloop turn and coalesce bursts of streaming tokens into one
+    /// invalidation.
+    func scheduleIntrinsicInvalidationAfterContentChange() {
+        guard !pendingContentChangeInvalidation else { return }
+        pendingContentChangeInvalidation = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.pendingContentChangeInvalidation = false
+            self.invalidateIntrinsicContentSize()
+        }
+    }
 
     override func invalidateIntrinsicContentSize() {
         resetFittedSizeCache()

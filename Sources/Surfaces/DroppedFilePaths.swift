@@ -1,7 +1,7 @@
 import AppKit
 import Foundation
 
-enum DroppedFilePaths {
+public enum DroppedFilePaths {
     private static let fileNamesType = NSPasteboard.PasteboardType("NSFilenamesPboardType")
 
     static let pasteboardTypes: [NSPasteboard.PasteboardType] = [
@@ -45,11 +45,11 @@ enum DroppedFilePaths {
         paths.map(shellEscaped).joined(separator: " ")
     }
 
-    static func composerInputText(for paths: [String]) -> String {
+    public static func composerInputText(for paths: [String]) -> String {
         paths.joined(separator: " ")
     }
 
-    static func appending(_ insertion: String, to text: String) -> String {
+    public static func appending(_ insertion: String, to text: String) -> String {
         guard !insertion.isEmpty else { return text }
         guard !text.isEmpty else { return insertion }
         return text.last?.isWhitespace == true ? text + insertion : text + " " + insertion
