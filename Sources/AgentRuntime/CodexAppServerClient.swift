@@ -148,7 +148,9 @@ public enum CodexAppServerModelDiscovery {
 public final class CodexAppServerClient: @unchecked Sendable {
     public typealias JSONObject = [String: Any]
     public typealias NotificationHandler = @Sendable (_ method: String, _ params: Any?) -> Void
-    public typealias ServerRequestHandler = @Sendable (_ method: String, _ params: Any?) async throws -> Any?
+    /// `requestId` is the JSON-RPC request id as a stable string (`"42"` for int 42).
+    /// Pending approvals must key on this value so `serverRequest/resolved` can settle them.
+    public typealias ServerRequestHandler = @Sendable (_ requestId: String, _ method: String, _ params: Any?) async throws -> Any?
 
     private struct Pending {
         let resume: @Sendable (Result<Any?, Error>) -> Void
@@ -161,6 +163,12 @@ public final class CodexAppServerClient: @unchecked Sendable {
         init?(_ value: Any?) {
             if let int = value as? Int {
                 self = .int(int)
+            } else if let int64 = value as? Int64 {
+                self = .int(Int(int64))
+            } else if let number = value as? NSNumber {
+                let objCType = String(cString: number.objCType)
+                if objCType == "c" || objCType == "B" { return nil }
+                self = .int(number.intValue)
             } else if let string = value as? String, !string.isEmpty {
                 self = .string(string)
             } else {
@@ -171,6 +179,14 @@ public final class CodexAppServerClient: @unchecked Sendable {
         var jsonValue: Any {
             switch self {
             case .int(let value): return value
+            case .string(let value): return value
+            }
+        }
+
+        /// Stable string form used as the Agent App pending-request key.
+        var wireString: String {
+            switch self {
+            case .int(let value): return String(value)
             case .string(let value): return value
             }
         }
@@ -645,7 +661,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
 
     private func handleServerRequest(id: ServerRequestID, method: String, params: Any?) async {
         do {
-            let result = try await serverRequestHandler?(method, params)
+            let result = try await serverRequestHandler?(id.wireString, method, params)
             try write(["id": id.jsonValue, "result": result ?? NSNull()])
         } catch {
             try? write([

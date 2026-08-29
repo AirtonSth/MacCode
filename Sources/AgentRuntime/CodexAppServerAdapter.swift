@@ -774,7 +774,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             let maintenanceClient = try clientFactory(
                 maintenanceRequest,
                 { _, _ in },
-                { method, _ in
+                { _, method, _ in
                     throw AgentProviderAdapterError.unsupported(
                         "unexpected Codex maintenance callback during \(method)"
                     )
@@ -928,11 +928,16 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             { [weak self] method, params in
                 self?.handleNotification(method: method, params: params, threadId: request.threadId)
             },
-            { [weak self] method, params in
+            { [weak self] requestId, method, params in
                 guard let self else {
                     throw AgentProviderAdapterError.unsupported("Codex app-server adapter was released")
                 }
-                return try await self.handleServerRequest(method: method, params: params, threadId: request.threadId)
+                return try await self.handleServerRequest(
+                    requestId: requestId,
+                    method: method,
+                    params: params,
+                    threadId: request.threadId
+                )
             }
         )
     }
@@ -1169,23 +1174,69 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
     }
 
-    private func handleServerRequest(method: String, params: Any?, threadId: AgentThreadID) async throws -> Any? {
+    private func handleServerRequest(
+        requestId: String,
+        method: String,
+        params: Any?,
+        threadId: AgentThreadID
+    ) async throws -> Any? {
         let payload = params as? [String: Any] ?? [:]
         switch method {
         case "item/commandExecution/requestApproval", "item.commandExecution.requestApproval":
-            return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .commandExecution)
+            return try await awaitApproval(
+                requestId: requestId,
+                method: method,
+                payload: payload,
+                threadId: threadId,
+                kind: .commandExecution
+            )
         case "item/fileRead/requestApproval", "item.fileRead.requestApproval":
-            return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .fileRead)
+            return try await awaitApproval(
+                requestId: requestId,
+                method: method,
+                payload: payload,
+                threadId: threadId,
+                kind: .fileRead
+            )
         case "item/fileChange/requestApproval", "item.fileChange.requestApproval":
-            return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .fileChange)
+            return try await awaitApproval(
+                requestId: requestId,
+                method: method,
+                payload: payload,
+                threadId: threadId,
+                kind: .fileChange
+            )
         case "item/permissions/requestApproval", "item.permissions.requestApproval":
-            return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .dynamic)
+            return try await awaitApproval(
+                requestId: requestId,
+                method: method,
+                payload: payload,
+                threadId: threadId,
+                kind: .dynamic
+            )
         case "applyPatchApproval":
-            return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .applyPatch)
+            return try await awaitApproval(
+                requestId: requestId,
+                method: method,
+                payload: payload,
+                threadId: threadId,
+                kind: .applyPatch
+            )
         case "execCommandApproval":
-            return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .exec)
+            return try await awaitApproval(
+                requestId: requestId,
+                method: method,
+                payload: payload,
+                threadId: threadId,
+                kind: .exec
+            )
         case "item/tool/requestUserInput", "item.tool.requestUserInput", "mcpServer/elicitation/request":
-            return try await awaitUserInput(method: method, payload: payload, threadId: threadId)
+            return try await awaitUserInput(
+                requestId: requestId,
+                method: method,
+                payload: payload,
+                threadId: threadId
+            )
         case "item/tool/call", "account/chatgptAuthTokens/refresh", "attestation/generate":
             emit([runtimeEvent(method: method, payload: payload)], threadId: threadId)
             throw AgentProviderAdapterError.unsupported("Recognized Codex app-server request is not supported by this client: \(method)")
@@ -1199,7 +1250,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
     }
 
-    private func awaitApproval(method: String, payload: [String: Any], threadId: AgentThreadID, kind: AssistantRequestKind) async throws -> Any? {
+    private func awaitApproval(
+        requestId: String,
+        method: String,
+        payload: [String: Any],
+        threadId: AgentThreadID,
+        kind: AssistantRequestKind
+    ) async throws -> Any? {
         let isPermissionsRequest = method == "item/permissions/requestApproval"
             || method == "item.permissions.requestApproval"
         let requestedPermissions = payload["permissions"] as? [String: Any]
@@ -1217,7 +1274,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             // (accept* vs ReviewDecision) or Codex 0.146 rejects the response.
             return ["decision": Self.sessionAutoApproveDecision(for: kind)]
         }
-        let requestId = UUID().uuidString
+        // Key by the JSON-RPC request id so serverRequest/resolved can settle
+        // the card when Codex clears it (interrupt / next turn / turn complete).
         let turnId = string(payload, "turnId")
             ?? string(payload, "turn_id")
             ?? Self.nestedString(payload, objectKey: "turn", field: "id")
@@ -1257,10 +1315,14 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         try await snapshot.client.updateThreadSettings(providerThreadId: snapshot.providerThreadId, permissionMode: mode)
     }
 
-    private func awaitUserInput(method: String, payload: [String: Any], threadId: AgentThreadID) async throws -> Any? {
+    private func awaitUserInput(
+        requestId: String,
+        method: String,
+        payload: [String: Any],
+        threadId: AgentThreadID
+    ) async throws -> Any? {
         let isMcpElicitation = method == "mcpServer/elicitation/request"
         let requestedSchema = payload["requestedSchema"] as? [String: Any]
-        let requestId = UUID().uuidString
         let turnId = string(payload, "turnId")
             ?? string(payload, "turn_id")
             ?? Self.nestedString(payload, objectKey: "turn", field: "id")
@@ -1657,8 +1719,15 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 events.append(.itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: diff, summary: "Turn diff updated"))
             }
         case "serverRequest/resolved", "serverRequest.resolved":
-            if let requestId = string(payload, "requestId") ?? string(payload, "request_id") {
-                events.append(.requestResolved(requestId: requestId, state: .resolved))
+            // Codex clears unanswered server→client requests with the JSON-RPC
+            // request id (string or int64). Settle the pending card/continuation;
+            // do not leave Agent App spinning after interrupt / next turn.
+            if let requestId = Self.wireRequestId(from: payload["requestId"] ?? payload["request_id"]) {
+                let settled = settlePendingRequest(threadId: threadId, requestId: requestId)
+                    || settlePendingUserInput(threadId: threadId, requestId: requestId)
+                if !settled {
+                    events.append(.requestResolved(requestId: requestId, state: .resolved))
+                }
             }
         case "thread/tokenUsage/updated", "thread.token-usage.updated":
             if let usage = Self.tokenUsage(from: payload) {
@@ -1994,6 +2063,66 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 pending.continuation.resume(returning: ["action": "cancel"])
             }
         }
+    }
+
+    /// Settle one pending approval cleared by `serverRequest/resolved`.
+    @discardableResult
+    private func settlePendingRequest(threadId: AgentThreadID, requestId: String) -> Bool {
+        guard let pending = removePendingApproval(threadId: threadId, requestId: requestId) else {
+            return false
+        }
+        emit([.requestResolved(requestId: requestId, state: .cancelled)], threadId: threadId)
+        switch pending.responseKind {
+        case .legacyDecision:
+            pending.continuation.resume(returning: ["decision": "cancel"])
+        case .permissions:
+            pending.continuation.resume(returning: [
+                "permissions": [String: Any](),
+                "scope": "turn"
+            ])
+        }
+        return true
+    }
+
+    /// Settle one pending user-input / elicitation cleared by `serverRequest/resolved`.
+    @discardableResult
+    private func settlePendingUserInput(threadId: AgentThreadID, requestId: String) -> Bool {
+        guard let pending = removePendingUserInput(threadId: threadId, requestId: requestId) else {
+            return false
+        }
+        emit([.userInputResolved(requestId: requestId, answer: nil)], threadId: threadId)
+        switch pending.responseKind {
+        case .toolRequest:
+            pending.continuation.resume(returning: ["answers": Self.codexAnswers(
+                questionIds: pending.questionIds,
+                questionPromptsById: pending.questionPromptsById,
+                multiSelectQuestionIds: pending.multiSelectQuestionIds,
+                text: ""
+            )])
+        case .mcpElicitation:
+            pending.continuation.resume(returning: ["action": "cancel"])
+        }
+        return true
+    }
+
+    /// Normalize `serverRequest/resolved.requestId` (string | int64) to the pending-map key.
+    private static func wireRequestId(from value: Any?) -> String? {
+        if let string = value as? String, !string.isEmpty {
+            return string
+        }
+        if let int = value as? Int {
+            return String(int)
+        }
+        if let int64 = value as? Int64 {
+            return String(int64)
+        }
+        if let number = value as? NSNumber {
+            // Avoid treating bool NSNumber as 0/1 request ids.
+            let objCType = String(cString: number.objCType)
+            if objCType == "c" || objCType == "B" { return nil }
+            return number.stringValue
+        }
+        return nil
     }
 
     private func cancel(threadId: AgentThreadID) {

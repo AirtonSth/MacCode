@@ -225,7 +225,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                 let itemId = (params as? [String: Any])?["itemId"] as? String ?? ""
                 notifications.append((method, itemId))
             },
-            serverRequestHandler: { method, params in
+            serverRequestHandler: { _, method, params in
                 let itemId = (params as? [String: Any])?["itemId"] as? String ?? ""
                 requests.append((method, itemId))
                 return [
@@ -273,7 +273,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             binary: script,
             arguments: [],
             cwd: FileManager.default.temporaryDirectory.path,
-            serverRequestHandler: { method, params in
+            serverRequestHandler: { _, method, params in
                 let itemId = (params as? [String: Any])?["itemId"] as? String ?? ""
                 requests.append((method, itemId))
                 return ["answers": ["question-1": ["answers": ["continue"]]]]

@@ -75,7 +75,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )) { _ in }
 
         let before = Int64(Date().timeIntervalSince1970)
-        let raw = try await client.serverRequestHandler?("currentTime/read", [
+        let raw = try await client.serverRequestHandler?("rpc-1", "currentTime/read", [
             "threadId": "codex-thread-1"
         ])
         let after = Int64(Date().timeIntervalSince1970)
@@ -1478,7 +1478,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
 
         let responseTask = Task {
-            try await client.serverRequestHandler?("item/commandExecution/requestApproval", [
+            try await client.serverRequestHandler?("rpc-2", "item/commandExecution/requestApproval", [
                 "threadId": "codex-thread-1",
                 "turnId": "turn-app-server-1",
                 "itemId": "cmd-1",
@@ -1497,7 +1497,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                                    "Approve Session must update the live Codex thread settings so later approvals in the same turn are auto-approved")
         XCTAssertEqual(update.providerThreadId, "codex-thread-1")
         XCTAssertEqual(update.permissionMode, .fullAccess)
-        let autoResponse = try await client.serverRequestHandler?("item/commandExecution/requestApproval", [
+        let autoResponse = try await client.serverRequestHandler?("rpc-3", "item/commandExecution/requestApproval", [
             "threadId": "codex-thread-1",
             "turnId": "turn-app-server-1",
             "itemId": "cmd-2",
@@ -1539,7 +1539,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             itemId: String
         ) async throws -> [String: Any] {
             let responseTask = Task {
-                try await client.serverRequestHandler?(method, [
+                try await client.serverRequestHandler?("rpc-4", method, [
                     "threadId": "codex-thread-1",
                     "turnId": "turn-app-server-1",
                     "itemId": itemId,
@@ -1600,7 +1600,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(approvedSession["decision"] as? String, "approved_for_session")
 
         // After Approve Session, fullAccess auto-approve must also use ReviewDecision.
-        let autoPatch = try await client.serverRequestHandler?("applyPatchApproval", [
+        let autoPatch = try await client.serverRequestHandler?("rpc-5", "applyPatchApproval", [
             "threadId": "codex-thread-1",
             "turnId": "turn-app-server-1",
             "itemId": "patch-auto",
@@ -1610,7 +1610,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(autoPatchDecision["decision"] as? String, "approved_for_session",
                        "fullAccess auto-approve for applyPatch must use approved_for_session, not acceptForSession")
 
-        let autoExec = try await client.serverRequestHandler?("execCommandApproval", [
+        let autoExec = try await client.serverRequestHandler?("rpc-6", "execCommandApproval", [
             "threadId": "codex-thread-1",
             "turnId": "turn-app-server-1",
             "itemId": "exec-auto",
@@ -1637,7 +1637,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )) { event in Task { await sink.record(event) } }
 
         let responseTask = Task {
-            try await client.serverRequestHandler?("item/commandExecution/requestApproval", [
+            try await client.serverRequestHandler?("rpc-7", "item/commandExecution/requestApproval", [
                 "threadId": "codex-thread-1",
                 "turnId": "turn-app-server-1",
                 "itemId": "cmd-accept",
@@ -1669,7 +1669,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )) { event in Task { await sink.record(event) } }
 
         let responseTask = Task {
-            try await client.serverRequestHandler?("item/commandExecution/requestApproval", [
+            try await client.serverRequestHandler?("rpc-8", "item/commandExecution/requestApproval", [
                 "turnId": "turn-app-server-1", "itemId": "cmd-settings", "command": "swift test"
             ])
         }
@@ -1700,7 +1700,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )) { event in Task { await sink.record(event) } }
 
         let responseTask = Task {
-            try await client.serverRequestHandler?("item/permissions/requestApproval", [
+            try await client.serverRequestHandler?("rpc-9", "item/permissions/requestApproval", [
                 "turnId": "turn-app-server-1",
                 "itemId": "permission-1",
                 "reason": "Use network",
@@ -1737,7 +1737,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             "fileSystem": ["write": ["/tmp/fixture"]]
         ]
         let responseTask = Task {
-            try await client.serverRequestHandler?("item/permissions/requestApproval", [
+            try await client.serverRequestHandler?("rpc-10", "item/permissions/requestApproval", [
                 "threadId": "codex-thread-1",
                 "turnId": "turn-app-server-1",
                 "itemId": "permission-session",
@@ -1780,7 +1780,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )) { event in Task { await sink.record(event) } }
 
         let responseTask = Task {
-            try await client.serverRequestHandler?("mcpServer/elicitation/request", [
+            try await client.serverRequestHandler?("rpc-11", "mcpServer/elicitation/request", [
                 "message": "Configure deployment",
                 "mode": "form",
                 "requestedSchema": [
@@ -1827,7 +1827,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             cwd: "/tmp/remotecode-app-server-adapter", prompt: "cancel elicitation"
         )) { event in Task { await sink.record(event) } }
         let responseTask = Task {
-            try await client.serverRequestHandler?("mcpServer/elicitation/request", [
+            try await client.serverRequestHandler?("rpc-12", "mcpServer/elicitation/request", [
                 "message": "Enter value",
                 "mode": "form",
                 "requestedSchema": [
@@ -1865,7 +1865,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
 
         let responseTask = Task {
-            try await client.serverRequestHandler?("item.tool.requestUserInput", [
+            try await client.serverRequestHandler?("rpc-13", "item.tool.requestUserInput", [
                 "threadId": "codex-thread-1",
                 "turnId": "turn-app-server-1",
                 "itemId": "question-1",
@@ -1903,7 +1903,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )) { event in Task { await sink.record(event) } }
 
         let responseTask = Task {
-            try await client.serverRequestHandler?("item/tool/requestUserInput", [
+            try await client.serverRequestHandler?("rpc-14", "item/tool/requestUserInput", [
                 "threadId": "codex-thread-1",
                 "turnId": "turn-app-server-1",
                 "itemId": "question-cancel",
@@ -1952,7 +1952,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
 
         let responseTask = Task {
-            try await client.serverRequestHandler?("item/commandExecution/requestApproval", [
+            try await client.serverRequestHandler?("rpc-15", "item/commandExecution/requestApproval", [
                 "thread": ["id": "codex-thread-1"],
                 "turn": ["id": "turn-app-server-1"],
                 "item": ["id": "cmd-1"],
@@ -1999,7 +1999,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
 
         let responseTask = Task {
-            try await client.serverRequestHandler?("item/fileRead/requestApproval", [
+            try await client.serverRequestHandler?("rpc-16", "item/fileRead/requestApproval", [
                 "turn": ["id": "turn-app-server-1"],
                 "item": ["id": "read-1"],
                 "request": [
@@ -2041,7 +2041,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
 
         let responseTask = Task {
-            try await client.serverRequestHandler?("item/tool/requestUserInput", [
+            try await client.serverRequestHandler?("rpc-17", "item/tool/requestUserInput", [
                 "threadId": "codex-thread-1",
                 "turnId": "turn-app-server-1",
                 "itemId": "question-item-1",
@@ -2090,7 +2090,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
 
         let responseTask = Task {
-            try await client.serverRequestHandler?("item/tool/requestUserInput", [
+            try await client.serverRequestHandler?("rpc-18", "item/tool/requestUserInput", [
                 "threadId": "codex-thread-1",
                 "turnId": "turn-app-server-1",
                 "itemId": "question-item-1",
@@ -2155,7 +2155,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
 
         let responseTask = Task {
-            try await client.serverRequestHandler?("item/tool/requestUserInput", [
+            try await client.serverRequestHandler?("rpc-19", "item/tool/requestUserInput", [
                 "thread": ["id": "codex-thread-1"],
                 "turn": ["id": "turn-app-server-1"],
                 "item": ["id": "question-item-1"],
@@ -2209,7 +2209,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
 
         let responseTask = Task {
-            try await client.serverRequestHandler?("item/tool/requestUserInput", [
+            try await client.serverRequestHandler?("rpc-20", "item/tool/requestUserInput", [
                 "turnId": "turn-app-server-1",
                 "questions": [[
                     "id": "token",
@@ -2249,7 +2249,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
 
         let approvalTask = Task {
-            try await client.serverRequestHandler?("item/commandExecution/requestApproval", [
+            try await client.serverRequestHandler?("rpc-21", "item/commandExecution/requestApproval", [
                 "threadId": "codex-thread-1",
                 "turnId": "turn-app-server-1",
                 "itemId": "cmd-1",
@@ -2257,7 +2257,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             ])
         }
         let userInputTask = Task {
-            try await client.serverRequestHandler?("item/tool/requestUserInput", [
+            try await client.serverRequestHandler?("rpc-22", "item/tool/requestUserInput", [
                 "threadId": "codex-thread-1",
                 "turnId": "turn-app-server-1",
                 "itemId": "question-1",
@@ -2312,7 +2312,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
 
         do {
-            _ = try await client.serverRequestHandler?("item/newProviderCallback/requestReview", [
+            _ = try await client.serverRequestHandler?("rpc-23", "item/newProviderCallback/requestReview", [
                 "turnId": "turn-app-server-1",
                 "requestId": "provider-request-1",
                 "payload": ["kind": "future"]
@@ -3625,6 +3625,103 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                 return false
             },
             "item/completed with status=declined must emit finalState .cancelled, not remain streaming"
+        )
+    }
+
+    func test_serverRequestResolvedSettlesPendingApprovalForStringAndIntIds() async throws {
+        // WHY: openai/codex clears unanswered approvals via serverRequest/resolved with the
+        // JSON-RPC request id (string | int64). RemoteCode used to invent a UUID for the
+        // pending card and only string-parse resolved ids, so interrupt/next-turn left a
+        // live approval card and hung awaitApproval continuation (CODEX-APP-005).
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "needs approval then resolve"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        let stringId = "rpc-resolved-string"
+        let responseTask = Task {
+            try await client.serverRequestHandler?(stringId, "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-resolve-1",
+                "command": "echo hi"
+            ])
+        }
+        let opened = try await waitForApproval(in: sink)
+        XCTAssertEqual(opened.id, stringId, "pending card id must be the wire JSON-RPC request id")
+
+        client.notificationHandler?("serverRequest/resolved", [
+            "threadId": "codex-thread-1",
+            "requestId": stringId
+        ])
+        let stringResponse = try await responseTask.value
+        let stringDecision = try XCTUnwrap(stringResponse as? [String: Any])
+        XCTAssertEqual(stringDecision["decision"] as? String, "cancel")
+
+        let afterString = await sink.snapshot()
+        XCTAssertTrue(
+            afterString.contains {
+                if case .requestResolved(let id, let state) = $0 {
+                    return id == stringId && state == .cancelled
+                }
+                return false
+            },
+            "string requestId resolved must cancel the pending approval card"
+        )
+
+        let intWireId = "99"
+        let intResponseTask = Task {
+            try await client.serverRequestHandler?(intWireId, "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-resolve-2",
+                "command": "echo again"
+            ])
+        }
+        let intOpenEvents = try await waitForEvents(in: sink) { events in
+            events.contains {
+                if case .requestOpened(let request) = $0 { return request.id == intWireId }
+                return false
+            }
+        }
+        let openedInt = intOpenEvents.compactMap {
+            if case .requestOpened(let request) = $0, request.id == intWireId { return request }
+            return nil
+        }.first
+        XCTAssertEqual(try XCTUnwrap(openedInt).id, intWireId)
+
+        // Schema allows int64 requestId; normalize to the same pending key.
+        client.notificationHandler?("serverRequest/resolved", [
+            "threadId": "codex-thread-1",
+            "requestId": 99
+        ])
+        let intResponse = try await intResponseTask.value
+        let intDecision = try XCTUnwrap(intResponse as? [String: Any])
+        XCTAssertEqual(intDecision["decision"] as? String, "cancel")
+
+        let afterInt = await sink.snapshot()
+        XCTAssertTrue(
+            afterInt.contains {
+                if case .requestResolved(let id, let state) = $0 {
+                    return id == intWireId && state == .cancelled
+                }
+                return false
+            },
+            "int requestId resolved must match pending key String(99)"
         )
     }
 
