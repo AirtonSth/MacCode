@@ -6604,6 +6604,48 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(vm.interactionMode, .default)
     }
 
+    // PERF-IMPROVE-28: a warm in-session draft cache must serve thread-switch
+    // restore without a synchronous MainActor SQLite read; the durable row is
+    // consulted only on a cache miss (fresh VM, relaunch).
+    func test_warmCacheThreadSwitchRestoresDraftWithoutDurableRead() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "A")
+        let threadA = vm.selectedThreadId!
+        vm.createThread(title: "B")
+        let threadB = vm.selectedThreadId!
+
+        vm.selectThread(threadA)
+        vm.prompt = "hello-a"
+        vm.promptWasEdited()
+        // promptWasEdited caches the draft synchronously; only the durable
+        // write is debounced, so the next restore for A must come from memory.
+        vm.selectThread(threadB)
+        XCTAssertEqual(vm.prompt, "", "thread B must not inherit thread A's draft")
+        let readsBeforeWarmRestore = vm.durableComposerDraftReadCountForTesting
+        vm.selectThread(threadA)
+        XCTAssertEqual(vm.prompt, "hello-a",
+                       "the warm cache must restore the draft exactly as before")
+        XCTAssertEqual(vm.durableComposerDraftReadCountForTesting, readsBeforeWarmRestore,
+                       "a warm-cache restore must not issue a durable SQLite read")
+    }
+
+    // PERF-IMPROVE-28: the debounced background save now writes off the
+    // MainActor; the durable row must still land (exactly once, no failure
+    // copy) after the debounce window.
+    func test_debouncedDraftSavePersistsDurableRowOffMain() async throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "debounce")
+        let tid = vm.selectedThreadId!
+        vm.prompt = "typed draft"
+        vm.promptWasEdited()
+        try await Task.sleep(nanoseconds: 600_000_000) // > 250 ms debounce window
+        let durable = try vm.draftRepo?.get(threadId: tid, providerInstanceId: vm.providerInstanceId)
+        XCTAssertEqual(durable?.text, "typed draft",
+                       "the off-main debounced save must still persist the typed draft")
+        XCTAssertFalse(vm.statusMessage.contains("Draft save failed"),
+                       "a successful off-main save must not surface a failure")
+    }
+
     func test_send_persistsExactlyOneUserAndOneAssistantMessage() async throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "convo")

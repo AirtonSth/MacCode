@@ -1720,6 +1720,25 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Debounced background saves must not block the MainActor behind the
+    /// shared SQLite queue while the user keeps typing. Explicit saves
+    /// (thread switch, tab close, config change) stay synchronous as the
+    /// durability anchor.
+    private func persistComposerDraftOffMain(_ draft: AgentThreadDraft) {
+        let repo = draftRepo
+        Task.detached(priority: .utility) { [weak self] in
+            do {
+                try repo?.upsert(draft)
+            } catch {
+                await self?.reportComposerDraftSaveFailure(error)
+            }
+        }
+    }
+
+    private func reportComposerDraftSaveFailure(_ error: Error) {
+        statusMessage = "Draft save failed: \(error)"
+    }
+
     private func cancelPendingComposerDraftPersistence() {
         composerDraftPersistenceTask?.cancel()
         composerDraftPersistenceTask = nil
@@ -1765,7 +1784,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             self.composerDraftPersistenceTask = nil
             self.pendingComposerDraftPersistenceThreadID = nil
             self.pendingComposerDraftPersistenceProviderInstanceID = nil
-            self.persistComposerDraftToRepository(draft)
+            self.persistComposerDraftOffMain(draft)
         }
     }
 
@@ -1782,8 +1801,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         providerInstanceId: String,
         fallbackInteractionMode: AgentInteractionMode
     ) {
-        let durable = try? draftRepo?.get(threadId: threadId, providerInstanceId: providerInstanceId)
-        let draft = composerDraftsByThread[threadId]?[providerInstanceId] ?? durable ?? nil
+        // Cache-first: a warm in-session draft must not pay a synchronous
+        // MainActor SQLite read + attachment decode on every switch. The
+        // durable row is consulted only on a cache miss (fresh VM, relaunch).
+        let draft: AgentThreadDraft?
+        if let cached = composerDraftsByThread[threadId]?[providerInstanceId] {
+            draft = cached
+        } else {
+            durableComposerDraftReadCountForTesting += 1
+            let durable = try? draftRepo?.get(threadId: threadId, providerInstanceId: providerInstanceId)
+            draft = durable ?? nil
+        }
         prompt = draft?.text ?? ""
         attachments = draft?.attachments ?? []
         interactionMode = draft?.interactionMode ?? fallbackInteractionMode
@@ -1993,6 +2021,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private(set) var durableThreadSelectionLookupCountForTesting = 0
     /// Count of cheap workspace-id probes used to reject stale rail rows.
     private(set) var durableThreadExistenceProbeCountForTesting = 0
+    /// Durable (SQLite) draft reads issued by restoreComposerDraft. A warm
+    /// in-session cache must serve restore without touching the repo.
+    private(set) var durableComposerDraftReadCountForTesting = 0
 
     /// Cache-first thread row for selection. A rail click must not wait on
     /// `threadRepo.get` — that path compiles two statements off the DB queue

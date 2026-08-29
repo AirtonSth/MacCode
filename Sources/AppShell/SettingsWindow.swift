@@ -464,7 +464,8 @@ public final class SettingsViewModel: ObservableObject {
         context: AppContext,
         privateAccountAPI: PrivateAccountAPI = URLSessionPrivateAccountAPI(),
         openURL: @escaping @MainActor (URL) -> Void = { NSWorkspace.shared.open($0) },
-        updater: AppUpdateChecking? = nil
+        updater: AppUpdateChecking? = nil,
+        loadImmediately: Bool = true
     ) {
         self.context = context
         self.privateAccountAPI = privateAccountAPI
@@ -480,7 +481,12 @@ public final class SettingsViewModel: ObservableObject {
         )
         self.privateAccountStore = PrivateAccountSessionStore(repo: context.settingsRepo)
         self.updateAvailability = updater?.availability ?? .unknown
-        reload()
+        // First-frame deferral (mirrors BotsViewModel.loadImmediately): callers
+        // that present right away hydrate via the post-commit freshness pass
+        // instead of stalling the click turn on SQLite/disk reads.
+        if loadImmediately {
+            reload()
+        }
         // P2-Settings-5: surface toggle write failures instead of silently
         // swallowing them. Assigned after stored-property init so the closure may
         // capture self. Called on the calling thread (MainActor for all callers).
@@ -621,7 +627,15 @@ public final class SettingsViewModel: ObservableObject {
         changeObservers.forEach(NotificationCenter.default.removeObserver)
     }
 
+#if DEBUG
+    /// Test seam: counts full freshness passes (Settings/Account first-frame).
+    private(set) var reloadCountForTesting = 0
+#endif
+
     public func reload() {
+        #if DEBUG
+        reloadCountForTesting += 1
+        #endif
         remoteAccessEnabled = (try? settingsRepo.get("remote_access_enabled")) == "1"
         // Refresh the general startup-failure list from AppDelegate on every reload
         // (Settings open, account/remote-access notification-driven reload).
@@ -3133,9 +3147,11 @@ public final class SettingsWindowController: NSObject {
     public let viewModel: SettingsViewModel
     private let routeRegistry: SettingsRouteRegistry
     private var presentedRoute: PetSettingsRoute?
+    private var freshnessTask: Task<Void, Never>?
+    private var freshnessGeneration: UInt64 = 0
 
-    public init(context: AppContext, updater: AppUpdateChecking? = nil) {
-        self.viewModel = SettingsViewModel(context: context, updater: updater)
+    public init(context: AppContext, updater: AppUpdateChecking? = nil, loadImmediately: Bool = true) {
+        self.viewModel = SettingsViewModel(context: context, updater: updater, loadImmediately: loadImmediately)
         let routeRegistry = SettingsRouteRegistry()
         self.routeRegistry = routeRegistry
         let host = NSHostingController(rootView: SettingsView(
@@ -3171,21 +3187,42 @@ public final class SettingsWindowController: NSObject {
     }
 
     public func show() {
-        viewModel.reload()
-        Task { await viewModel.refreshNotificationStatus() }
         if let parent = NSApp.keyWindow ?? NSApp.mainWindow {
             show(attachedTo: parent)
-        } else {
-            window.makeKeyAndOrderFront(nil)
+            return
         }
+        window.makeKeyAndOrderFront(nil)
+        scheduleFreshnessPass()
     }
 
     public func show(attachedTo parent: NSWindow) {
-        viewModel.reload()
-        Task { await viewModel.refreshNotificationStatus() }
+        scheduleFreshnessPass()
         if parent.attachedSheet === window { return }
         if window.sheetParent != nil { window.sheetParent?.endSheet(window) }
         parent.beginSheet(window)
+    }
+
+    /// Present first; run the settings freshness pass after the first frame
+    /// commits (AGENTS.md loading rule). The VM holds the state from init, so
+    /// the window paints cached values before the SQLite/disk re-read.
+    /// Latest-wins: rapid show() calls coalesce into one reload.
+    private func scheduleFreshnessPass() {
+        freshnessTask?.cancel()
+        freshnessGeneration &+= 1
+        let generation = freshnessGeneration
+        freshnessTask = Task { @MainActor [weak self] in
+            await Self.waitForCommittedFrame()
+            guard let self, !Task.isCancelled, self.freshnessGeneration == generation else { return }
+            self.freshnessTask = nil
+            self.viewModel.reload()
+            await self.viewModel.refreshNotificationStatus()
+        }
+    }
+
+    private static func waitForCommittedFrame() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async { continuation.resume() }
+        }
     }
 
     @discardableResult
@@ -3201,6 +3238,8 @@ public final class SettingsWindowController: NSObject {
     }
 
     public func close() {
+        freshnessTask?.cancel()
+        freshnessTask = nil
         if let parent = window.sheetParent {
             parent.endSheet(window)
         } else {
@@ -3259,9 +3298,11 @@ private struct PairingQRView: View {
 public final class AccountWindowController: NSObject {
     public let window: NSWindow
     public let viewModel: SettingsViewModel
+    private var freshnessTask: Task<Void, Never>?
+    private var freshnessGeneration: UInt64 = 0
 
-    public init(context: AppContext) {
-        self.viewModel = SettingsViewModel(context: context)
+    public init(context: AppContext, loadImmediately: Bool = true) {
+        self.viewModel = SettingsViewModel(context: context, loadImmediately: loadImmediately)
         let host = NSHostingController(rootView: AccountView(vm: viewModel))
         let win = NSWindow(contentViewController: host)
         win.title = "RemoteCode Account"
@@ -3280,22 +3321,44 @@ public final class AccountWindowController: NSObject {
     }
 
     public func show() {
-        viewModel.reload()
         if let parent = NSApp.keyWindow ?? NSApp.mainWindow {
             show(attachedTo: parent)
-        } else {
-            window.makeKeyAndOrderFront(nil)
+            return
         }
+        window.makeKeyAndOrderFront(nil)
+        scheduleFreshnessPass()
     }
 
     public func show(attachedTo parent: NSWindow) {
-        viewModel.reload()
+        scheduleFreshnessPass()
         if parent.attachedSheet === window { return }
         if window.sheetParent != nil { window.sheetParent?.endSheet(window) }
         parent.beginSheet(window)
     }
 
+    /// Present first; reload after the first frame commits (AGENTS.md loading
+    /// rule). Latest-wins: rapid show() calls coalesce into one reload.
+    private func scheduleFreshnessPass() {
+        freshnessTask?.cancel()
+        freshnessGeneration &+= 1
+        let generation = freshnessGeneration
+        freshnessTask = Task { @MainActor [weak self] in
+            await Self.waitForCommittedFrame()
+            guard let self, !Task.isCancelled, self.freshnessGeneration == generation else { return }
+            self.freshnessTask = nil
+            self.viewModel.reload()
+        }
+    }
+
+    private static func waitForCommittedFrame() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
     public func close() {
+        freshnessTask?.cancel()
+        freshnessTask = nil
         if let parent = window.sheetParent {
             parent.endSheet(window)
         } else {
