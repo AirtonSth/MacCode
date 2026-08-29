@@ -240,11 +240,8 @@ public enum AgentCheckpointListContract: Sendable {
     }
 
     public static func acceptsResponseID(_ responseID: JSONRPCID?) -> Bool {
-        guard let responseID,
-              let encoded = try? encodeForSizeCheck(responseID) else {
-            return responseID == nil
-        }
-        return encoded.count <= maxEncodedResponseIDBytes
+        guard let responseID else { return true }
+        return EventBus.jsonRPCIDByteCount(responseID) <= maxEncodedResponseIDBytes
     }
 
     public static func preflightEncodedRequest(_ request: JSONRPCRequest) throws {
@@ -289,8 +286,9 @@ public enum AgentCheckpointListContract: Sendable {
         result: JSONValue
     ) -> JSONRPCResponse {
         let response = JSONRPCResponse(id: id, result: result)
-        if let encoded = try? encodeForSizeCheck(response),
-           encoded.count <= maxEncodedResponseBytes {
+        // PERF: structural success-envelope size (no Data) — length-equal to
+        // default JSONEncoder.encode(response).count.
+        if EventBus.jsonRPCResponseByteCount(id: id, result: result) <= maxEncodedResponseBytes {
             return response
         }
         return encodeBoundedErrorResponse(
@@ -673,11 +671,11 @@ public enum AgentCheckpointListContract: Sendable {
             "next_before": nextBeforeValue,
             "catalog_revision": .number(Double(catalogRevision)),
         ])
-        // Final encode-once verification against the real wrapper.
-        let response = JSONRPCResponse(id: responseID, result: payload)
+        // Final structural verification against the real wrapper (no Data).
+        // Counter retained for DispatcherTests which assert one measure per pack.
         packFinalEnvelopeEncodeCountForTesting += 1
-        guard let finalBytes = try? encoder.encode(response),
-              finalBytes.count <= maxEncodedResponseBytes else {
+        let finalBytes = EventBus.jsonRPCResponseByteCount(id: responseID, result: payload)
+        guard finalBytes <= maxEncodedResponseBytes else {
             throw JSONRPCError.internalError
         }
         return payload

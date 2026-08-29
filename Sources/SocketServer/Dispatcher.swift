@@ -4763,9 +4763,10 @@ public final class JSONRPCDispatcher {
     }
 
     /// Full JSON-RPC response UTF-8 size (keys, separators, escaping, id).
+    /// PERF: agent.thread.read boundToEnvelope measures ~log2(N) times per read.
+    /// Structural count matches default JSONEncoder length without allocating Data.
     private func envelopeUTF8ByteCount(id: JSONRPCID?, result: JSONValue) -> Int {
-        let response = JSONRPCResponse(id: id, result: result)
-        return (try? _encoder.encode(response))?.count ?? Int.max
+        EventBus.jsonRPCResponseByteCount(id: id, result: result)
     }
 
     private func workspaceID(from params: [String: JSONValue]) throws -> WorkspaceID {
