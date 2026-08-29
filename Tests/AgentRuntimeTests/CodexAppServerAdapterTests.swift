@@ -28,18 +28,18 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                        "a Codex release without threadSource cannot reconcile a lost fork response and must fail closed")
     }
 
-    func test_currentServerRequestInventoryMatchesGeneratedCodexSchema_0_146_0() throws {
+    func test_currentServerRequestInventoryMatchesGeneratedCodexSchema_0_150_1() throws {
         // WHY: a hand-copied expectation can drift in lockstep with the switch.
         // Read the checked-in projection generated from ServerRequest.json so a
         // schema upgrade introduces a failing ownership decision by default.
-        // 0.146 drops currentTime/read from ServerRequest; inventory must not list it.
+        // 0.150 restored currentTime/read; inventory must own that callback.
         let fixture = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
-            .appendingPathComponent("Fixtures/CodexAppServer/ServerRequestMethods-0.146.0.json")
+            .appendingPathComponent("Fixtures/CodexAppServer/ServerRequestMethods-0.150.1.json")
         let data = try Data(contentsOf: fixture)
         let schema = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(schema["generatedBy"] as? String,
-                       "codex-cli 0.146.0 app-server generate-json-schema --experimental")
+                       "codex-cli 0.150.1 app-server generate-json-schema --experimental")
         let variants = try XCTUnwrap(schema["oneOf"] as? [[String: Any]])
         let schemaMethods = Set(variants.compactMap { variant -> String? in
             let properties = variant["properties"] as? [String: Any]
@@ -49,10 +49,50 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
 
         XCTAssertEqual(schemaMethods.count, variants.count,
                        "every generated ServerRequest variant must expose exactly one method discriminator")
-        XCTAssertFalse(schemaMethods.contains("currentTime/read"),
-                       "0.146 ServerRequest no longer includes currentTime/read")
+        XCTAssertTrue(schemaMethods.contains("currentTime/read"),
+                      "0.150 ServerRequest includes currentTime/read")
         XCTAssertEqual(CodexAppServerAdapter.currentServerRequestMethods, schemaMethods,
                        "upgrading the Codex app-server schema must force an explicit ownership decision for every server request")
+    }
+
+    func test_currentTimeReadReturnsCurrentTimeAtWholeUnixSeconds() async throws {
+        // WHY: Codex 0.150 restored currentTime/read. The default branch used to
+        // throw Unhandled, which fails the tool/turn. Schema requires
+        // { currentTimeAt: int64 } as whole Unix seconds, not milliseconds.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "what time is it"
+        )) { _ in }
+
+        let before = Int64(Date().timeIntervalSince1970)
+        let raw = try await client.serverRequestHandler?("currentTime/read", [
+            "threadId": "codex-thread-1"
+        ])
+        let after = Int64(Date().timeIntervalSince1970)
+        let response = try XCTUnwrap(raw as? [String: Any])
+        let seconds: Int64
+        if let value = response["currentTimeAt"] as? Int64 {
+            seconds = value
+        } else if let value = response["currentTimeAt"] as? Int {
+            seconds = Int64(value)
+        } else {
+            XCTFail("currentTimeAt must be a whole integer, got \(String(describing: response["currentTimeAt"]))")
+            return
+        }
+        XCTAssertGreaterThanOrEqual(seconds, before)
+        XCTAssertLessThanOrEqual(seconds, after)
+        XCTAssertLessThan(seconds, 10_000_000_000,
+                          "currentTimeAt must be Unix seconds, not milliseconds")
     }
 
     func test_installedCodexServerRequestSchemaMatchesExplicitAdapterInventory() throws {
@@ -69,7 +109,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
 
         let version = try runCodex(codex, arguments: ["--version"])
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        XCTAssertEqual(version, "codex-cli 0.146.0",
+        XCTAssertEqual(version, "codex-cli 0.150.1",
                        "the checked-in projection must be regenerated deliberately when the release Codex version changes")
         _ = try runCodex(codex, arguments: [
             "app-server", "generate-json-schema", "--experimental", "--out", output.path

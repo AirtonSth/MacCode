@@ -171,7 +171,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case mcpElicitation(requestedSchema: [String: Any]?)
     }
 
-    /// Server-to-client methods in the Codex 0.146.0 app-server schema. Keep the
+    /// Server-to-client methods in the Codex 0.150.1 app-server schema. Keep the
     /// inventory explicit so a protocol upgrade cannot silently fall through as
     /// an unknown callback with no ownership decision.
     static let currentServerRequestMethods: Set<String> = [
@@ -183,6 +183,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         "item/tool/call",
         "account/chatgptAuthTokens/refresh",
         "attestation/generate",
+        "currentTime/read",
         "applyPatchApproval",
         "execCommandApproval"
     ]
@@ -1188,6 +1189,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case "item/tool/call", "account/chatgptAuthTokens/refresh", "attestation/generate":
             emit([runtimeEvent(method: method, payload: payload)], threadId: threadId)
             throw AgentProviderAdapterError.unsupported("Recognized Codex app-server request is not supported by this client: \(method)")
+        case "currentTime/read":
+            // Codex 0.150 restored this client-owned clock callback. Whole Unix
+            // seconds; throwing unsupported fails the tool/turn that asked.
+            return ["currentTimeAt": Int64(Date().timeIntervalSince1970)]
         default:
             emit([runtimeEvent(method: method, payload: payload)], threadId: threadId)
             throw AgentProviderAdapterError.unsupported("Unhandled Codex app-server request: \(method)")

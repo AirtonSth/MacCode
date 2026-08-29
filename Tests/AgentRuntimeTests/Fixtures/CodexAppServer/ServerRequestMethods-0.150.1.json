@@ -1,0 +1,106 @@
+{
+  "generatedBy": "codex-cli 0.150.1 app-server generate-json-schema --experimental",
+  "sourceFile": "ServerRequest.json",
+  "sourceSHA256": "5f0d59338bd620480c52e112a1b3edc3f24f2dc74172b3f4e166732c867e1fc1",
+  "oneOf": [
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "item/commandExecution/requestApproval"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "item/fileChange/requestApproval"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "item/tool/requestUserInput"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "mcpServer/elicitation/request"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "item/permissions/requestApproval"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "item/tool/call"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "account/chatgptAuthTokens/refresh"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "attestation/generate"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "currentTime/read"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "applyPatchApproval"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "execCommandApproval"
+          ]
+        }
+      }
+    }
+  ]
+}
