@@ -5688,7 +5688,11 @@ public final class SidebarView: NSObject {
 
     @objc private func showSettings() {
         guard let context else { return }
-        let controller = settingsController ?? SettingsWindowController(context: context, updater: updater)
+        // Defer hydration to the post-commit freshness pass so the first
+        // click paints the window immediately (AGENTS.md loading rule).
+        let controller = settingsController ?? SettingsWindowController(
+            context: context, updater: updater, loadImmediately: false
+        )
         settingsController = controller
         if let window = view.window {
             controller.show(attachedTo: window)
@@ -5699,7 +5703,9 @@ public final class SidebarView: NSObject {
 
     @objc private func showAccount() {
         guard let context else { return }
-        let controller = accountController ?? AccountWindowController(context: context)
+        let controller = accountController ?? AccountWindowController(
+            context: context, loadImmediately: false
+        )
         accountController = controller
         if let window = view.window {
             controller.show(attachedTo: window)

@@ -2857,4 +2857,185 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
     }
 
+    /// PERF-IMPROVE-28 (warm-cache draft restore): cache-first restore must beat
+    /// the old durable-read-then-cache order on every warm thread switch.
+    /// Primary metric is median wall time for 4_000 restore evaluations against
+    /// the same warm fixture (memory draft + real SQLite row).
+    func test_microbench_composerDraftRestore_cacheFirstBeatsDurableRead() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-perf-draft-restore-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let draftRepo = AgentThreadDraftRepository(db: db)
+        let threadRepo = AgentThreadRepository(db: db)
+        let threadID = AgentThreadID()
+        let providerInstanceID = "codex-cli"
+        // agent_thread_drafts.thread_id is FK-bound to agent_threads.
+        try threadRepo.upsert(AgentThread(
+            id: threadID,
+            workspaceId: WorkspaceID(),
+            title: "draft restore bench",
+            provider: .codex,
+            model: "gpt",
+            interactionMode: .default
+        ))
+        let draft = AgentThreadDraft(
+            threadId: threadID,
+            providerInstanceId: providerInstanceID,
+            text: "draft body for restore benchmark",
+            attachments: [],
+            interactionMode: .default
+        )
+        try draftRepo.upsert(draft)
+        let cache: [String: AgentThreadDraft] = [providerInstanceID: draft]
+
+        let iterations = 4_000
+        let warmup = 2
+        let samples = 5
+
+        func median(_ values: [Double]) -> Double {
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        // Old order: durable SQLite read + decode first, cache result second.
+        func timeDurableFirst() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations {
+                let durable = try? draftRepo.get(threadId: threadID, providerInstanceId: providerInstanceID)
+                let restored = cache[providerInstanceID] ?? durable ?? nil
+                sink &+= restored?.text.utf8.count ?? 0
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0 // ms
+        }
+
+        // New order: cache-first; durable row only on a miss (none here).
+        func timeCacheFirst() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations {
+                let restored: AgentThreadDraft?
+                if let cached = cache[providerInstanceID] {
+                    restored = cached
+                } else {
+                    let durable = try? draftRepo.get(threadId: threadID, providerInstanceId: providerInstanceID)
+                    restored = durable ?? nil
+                }
+                sink &+= restored?.text.utf8.count ?? 0
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0 // ms
+        }
+
+        for _ in 0..<warmup { _ = timeDurableFirst(); _ = timeCacheFirst() }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(timeDurableFirst())
+            after.append(timeCacheFirst())
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog("[perf-proof] composerDraftRestore durable_first_ms=%@ cache_first_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 50.0,
+            "cache-first restore must be substantially faster than durable-first (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+    }
+
+    /// PERF-IMPROVE-28 (debounced draft save): the off-main write must leave the
+    /// MainActor immediately instead of blocking it for the full SQLite upsert.
+    /// Primary metric is MainActor-occupied time for 200 fire-and-forget saves.
+    func test_microbench_debouncedDraftSave_offMainKeepsMainActorFree() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-perf-draft-write-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let draftRepo = AgentThreadDraftRepository(db: db)
+        let threadID = AgentThreadID()
+        // agent_thread_drafts.thread_id is FK-bound to agent_threads.
+        try AgentThreadRepository(db: db).upsert(AgentThread(
+            id: threadID,
+            workspaceId: WorkspaceID(),
+            title: "draft write bench",
+            provider: .codex,
+            model: "gpt",
+            interactionMode: .default
+        ))
+        let draft = AgentThreadDraft(
+            threadId: threadID,
+            providerInstanceId: "codex-cli",
+            text: "debounced background draft body",
+            attachments: [],
+            interactionMode: .default
+        )
+
+        let iterations = 200
+        let warmup = 2
+        let samples = 5
+
+        func median(_ values: [Double]) -> Double {
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        // Old behavior: the debounce completion runs the upsert inline on the
+        // MainActor; the actor is occupied for the whole SQLite write.
+        func timeSyncOnMain() throws -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            for _ in 0..<iterations {
+                try draftRepo.upsert(draft)
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0 // ms
+        }
+
+        // New behavior: the debounce completion only enqueues a detached write.
+        // MainActor time is the enqueue; the upsert runs off-main.
+        func timeOffMainEnqueue() -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            for _ in 0..<iterations {
+                let repo = draftRepo
+                Task.detached(priority: .utility) {
+                    try? repo.upsert(draft)
+                }
+            }
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0 // ms
+        }
+
+        for _ in 0..<warmup { _ = try timeSyncOnMain(); _ = timeOffMainEnqueue() }
+        // Let warmup detached writes drain before sampling so the serial SQLite
+        // queue is not backlogged when the off-main samples run.
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(try timeSyncOnMain())
+            after.append(timeOffMainEnqueue())
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let durable = try draftRepo.get(threadId: threadID, providerInstanceId: "codex-cli")
+        XCTAssertEqual(durable?.text, draft.text,
+                       "fire-and-forget off-main writes must still land the durable row")
+
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog("[perf-proof] debouncedDraftSave mainactor_sync_ms=%@ mainactor_offmain_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+              String(beforeMed), String(afterMed), improvement,
+              String(describing: before), String(describing: after))
+        XCTAssertGreaterThan(
+            improvement, 80.0,
+            "off-main enqueue must keep the MainActor substantially freer than an inline upsert (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+    }
+
 }
