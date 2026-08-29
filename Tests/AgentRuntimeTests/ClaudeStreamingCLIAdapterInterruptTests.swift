@@ -42,6 +42,9 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
     func test_userPromptPayload_textOnlyWhenAttachmentsEmpty() throws {
         let payload = try ClaudeStreamingCLIAdapter.userPromptPayload(text: "hello", attachments: [])
         XCTAssertEqual(payload["type"] as? String, "user")
+        // CLAUDE-CLI-015: SDKUserMessage requires parent_tool_use_id (null for host turns).
+        XCTAssertTrue(payload["parent_tool_use_id"] is NSNull,
+                      "CLI stdin user lines must include parent_tool_use_id: null like the bridge")
         let message = try XCTUnwrap(payload["message"] as? [String: Any])
         let content = try XCTUnwrap(message["content"] as? [[String: Any]])
         XCTAssertEqual(content.count, 1, "empty attachments must stay a single text block")
@@ -101,7 +104,8 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
     func test_controlPermissionResponseLine_approveIsOneShotAllow() throws {
         let data = try ClaudeStreamingCLIAdapter.controlPermissionResponseLine(
             requestId: "req-allow-1",
-            response: .approve
+            response: .approve,
+            updatedInput: ["command": "ls"]
         )
         XCTAssertEqual(data.last, 0x0A)
         let object = try XCTUnwrap(
@@ -116,6 +120,9 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         XCTAssertNil(result["message"])
         XCTAssertNil(result["updatedPermissions"],
                      "one-shot approve must not persist session rules")
+        // CLAUDE-CLI-017: allow must echo updatedInput (bridge parity).
+        let updated = try XCTUnwrap(result["updatedInput"] as? [String: Any])
+        XCTAssertEqual(updated["command"] as? String, "ls")
     }
 
     /// CLAUDE-CLI-006: Approve for session must carry updatedPermissions so the CLI
@@ -250,6 +257,35 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
                 .flatMap { ($0["response"] as? [String: Any])?["response"] as? [String: Any] }
         )
         XCTAssertEqual(cancelBody["action"] as? String, "cancel")
+    }
+
+    /// CLAUDE-CLI-016: request_user_dialog must complete via control_response.
+    func test_controlUserInputResponseLine_userDialogAcceptAndCancel() throws {
+        let accept = try ClaudeStreamingCLIAdapter.controlUserInputResponseLine(
+            requestId: "req-dialog-1",
+            kind: .userDialog(dialogKind: "computer_use_approval"),
+            text: #"{"approved":true}"#,
+            decision: .accept
+        )
+        let acceptBody = try XCTUnwrap(
+            (try JSONSerialization.jsonObject(with: Data(accept.dropLast())) as? [String: Any])
+                .flatMap { ($0["response"] as? [String: Any])?["response"] as? [String: Any] }
+        )
+        XCTAssertEqual(acceptBody["approved"] as? Bool, true)
+        XCTAssertEqual(acceptBody["dialog_kind"] as? String, "computer_use_approval")
+
+        let cancel = try ClaudeStreamingCLIAdapter.controlUserInputResponseLine(
+            requestId: "req-dialog-2",
+            kind: .userDialog(dialogKind: "computer_use_approval"),
+            text: nil,
+            decision: .cancel
+        )
+        let cancelBody = try XCTUnwrap(
+            (try JSONSerialization.jsonObject(with: Data(cancel.dropLast())) as? [String: Any])
+                .flatMap { ($0["response"] as? [String: Any])?["response"] as? [String: Any] }
+        )
+        XCTAssertEqual(cancelBody["cancelled"] as? Bool, true)
+        XCTAssertEqual(cancelBody["dialog_kind"] as? String, "computer_use_approval")
     }
 
     // MARK: - needsSessionResume pure seam tests

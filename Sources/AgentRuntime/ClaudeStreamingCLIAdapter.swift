@@ -12,10 +12,12 @@ struct ClaudeCLIUnavailableError: Error, CustomStringConvertible {
     var description: String { message }
 }
 
-/// Wire kind for control-channel user-input replies (AskUserQuestion vs elicitation).
+/// Wire kind for control-channel user-input replies (AskUserQuestion vs elicitation vs dialog).
 enum ClaudeControlUserInputKind: Sendable, Equatable {
     case askUserQuestion(toolUseID: String?)
     case elicitation
+    /// CLAUDE-CLI-016: tool-driven blocking dialogs (`request_user_dialog`).
+    case userDialog(dialogKind: String)
 }
 
 /// Captured at can_use_tool open so approveForSession can echo suggestions / tool name.
@@ -24,6 +26,8 @@ struct ClaudePendingPermissionMeta: Sendable, Equatable {
     /// Raw JSON array of PermissionUpdate suggestions from the CLI, if any.
     var suggestionsJSON: String?
     var toolUseID: String?
+    /// CLAUDE-CLI-017: tool `input` echoed as PermissionResult.updatedInput on allow.
+    var inputJSON: String?
 }
 
 // Typealiases keep Session field types short without exporting the names.
@@ -334,12 +338,15 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         for attachment in attachments {
             content.append(try attachmentContentBlock(attachment))
         }
+        // CLAUDE-CLI-015: SDKUserMessage requires parent_tool_use_id (null for
+        // top-level host turns). Bridge always sets it; CLI stdin must match.
         return [
             "type": "user",
             "message": [
                 "role": "user",
                 "content": content
-            ]
+            ],
+            "parent_tool_use_id": NSNull()
         ]
     }
 
@@ -1474,7 +1481,8 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         requestId: String,
         response: AgentProviderRequestResponse,
         toolName: String? = nil,
-        permissionSuggestionsJSON: String? = nil
+        permissionSuggestionsJSON: String? = nil,
+        updatedInput: [String: Any]? = nil
     ) throws -> Data {
         let behavior: String
         let denyMessage: String?
@@ -1497,6 +1505,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         var permissionResult: [String: Any] = ["behavior": behavior]
         if let denyMessage {
             permissionResult["message"] = denyMessage
+        }
+        // CLAUDE-CLI-017: bridge always echoes pending.input as updatedInput on allow.
+        if behavior == "allow" {
+            permissionResult["updatedInput"] = updatedInput ?? [String: Any]()
         }
         if includeSessionPermissions {
             if let updated = Self.updatedPermissionsForSessionAllow(
@@ -1585,6 +1597,21 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             case .decline:
                 body = ["action": "decline"]
             }
+        case .userDialog(let dialogKind):
+            // CLAUDE-CLI-016: opaque dialog result Record; prefer parsed JSON.
+            switch decision {
+            case .accept:
+                var result = Self.elicitationContent(from: text ?? "")
+                if result["dialog_kind"] == nil {
+                    result["dialog_kind"] = dialogKind
+                }
+                body = result
+            case .cancel, .decline:
+                body = [
+                    "cancelled": true,
+                    "dialog_kind": dialogKind
+                ]
+            }
         }
         let payload: [String: Any] = [
             "type": "control_response",
@@ -1635,6 +1662,16 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         return ["answer": text]
     }
 
+    /// CLAUDE-CLI-017: decode captured tool input JSON for PermissionResult.updatedInput.
+    nonisolated static func updatedInputObject(fromJSON json: String?) -> [String: Any] {
+        guard let json,
+              let data = json.data(using: .utf8),
+              let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
+        }
+        return parsed
+    }
+
     private func sendPermissionResponse(
         requestId: String,
         response: AgentProviderRequestResponse,
@@ -1645,11 +1682,13 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         // allow:  {"type":"control_response","response":{"subtype":"success","request_id":"…","response":{"behavior":"allow"}}}
         // deny:   same envelope with behavior "deny" + required message string
         // session: allow + updatedPermissions (suggestions or synthesized addRules)
+        let updatedInput = Self.updatedInputObject(fromJSON: permissionMeta?.inputJSON)
         let line = try Self.controlPermissionResponseLine(
             requestId: requestId,
             response: response,
             toolName: permissionMeta?.toolName,
-            permissionSuggestionsJSON: permissionMeta?.suggestionsJSON
+            permissionSuggestionsJSON: permissionMeta?.suggestionsJSON,
+            updatedInput: updatedInput
         )
         try session.writeQueue.sync {
             try GuardedStdinWrite.write(line,
@@ -1721,17 +1760,33 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                        let s = String(data: data, encoding: .utf8) {
                         suggestionsJSON = s
                     }
+                    var inputJSON: String?
+                    if let input = request["input"],
+                       JSONSerialization.isValidJSONObject(input),
+                       let data = try? JSONSerialization.data(withJSONObject: input),
+                       let s = String(data: data, encoding: .utf8) {
+                        inputJSON = s
+                    }
                     lock.lock()
                     session.pendingPermissionMeta[requestId] = PendingPermissionMeta(
                         toolName: toolName,
                         suggestionsJSON: suggestionsJSON,
-                        toolUseID: toolUseID
+                        toolUseID: toolUseID,
+                        inputJSON: inputJSON
                     )
                     lock.unlock()
                 }
             } else if subtype == "elicitation" {
                 lock.lock()
                 session.pendingControlUserInputs[requestId] = .elicitation
+                lock.unlock()
+            } else if subtype == "request_user_dialog" {
+                // CLAUDE-CLI-016: must answer with control_response, not freeform stdin.
+                let kind = (request["dialog_kind"] as? String)
+                    ?? (request["dialogKind"] as? String)
+                    ?? "dialog"
+                lock.lock()
+                session.pendingControlUserInputs[requestId] = .userDialog(dialogKind: kind)
                 lock.unlock()
             }
             return
