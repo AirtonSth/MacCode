@@ -30,7 +30,9 @@ final class TokenSaverThreadFooterTests: XCTestCase {
 
     func test_footerText_zeroSaved_stillPresentNotDeactivated() {
         // WHY: Token Saver on with a proven zero is a problem chip — yellow,
-        // still present, never the red deactivated copy.
+        // still present, never the red deactivated copy. The copy must stay
+        // factual: a thread with no compressible tool output measures 0
+        // legitimately, so it must not claim "something went wrong".
         let text = AgentAppView.tokenSaverThreadFooterText(
             displayTokens: 0,
             measuredTokens: 0,
@@ -38,8 +40,9 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertEqual(
             text,
-            "Token Saver: 0 tokens saved because something went wrong"
+            "Token Saver: 0 tokens saved in this thread so far"
         )
+        XCTAssertFalse(text?.localizedCaseInsensitiveContains("went wrong") == true)
         XCTAssertEqual(
             AgentAppView.tokenSaverThreadFooterPresentation(
                 enabled: true,
@@ -60,7 +63,7 @@ final class TokenSaverThreadFooterTests: XCTestCase {
         )
         XCTAssertEqual(
             text,
-            "Token Saver: 0 tokens saved because something went wrong"
+            "Token Saver: 0 tokens saved in this thread so far"
         )
         XCTAssertFalse(text?.contains("12K") == true)
         XCTAssertEqual(

@@ -3,20 +3,27 @@ import Foundation
 public struct ManagedBotComputerMCP: Sendable {
     public static let serverName = BotComputerCatalog.serverName
 
+    /// Optional Token Saver seam: given (toolName, resultText) returns the
+    /// compressed replacement text, or nil to keep the original (fail-open).
+    public typealias ToolResultDistiller = @Sendable (String, String) async -> String?
+
     private let environment: [String: String]
     private let storeFactory: @Sendable ([String: String]) throws -> BotComputerStore
+    private let distillToolResult: ToolResultDistiller?
 
     public init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         storeFactory: @escaping @Sendable ([String: String]) throws -> BotComputerStore = {
             try BotComputerStore.open(environment: $0)
-        }
+        },
+        distillToolResult: ToolResultDistiller? = nil
     ) {
         self.environment = environment
         self.storeFactory = storeFactory
+        self.distillToolResult = distillToolResult
     }
 
-    public func handle(_ line: String) -> String? {
+    public func handle(_ line: String) async -> String? {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               let data = trimmed.data(using: .utf8),
@@ -53,8 +60,17 @@ public struct ManagedBotComputerMCP: Sendable {
                 }
                 let service = try BotComputerService.make(environment: env, store: store)
                 let object = try service.call(name: name, arguments: arguments)
+                var text = encodeJSON(object) ?? "{}"
+                // Screenshot payloads are delivered as an image block; their JSON
+                // envelope must stay verbatim, so only image-free results distill.
+                if let distillToolResult,
+                   BotComputerCatalog.distillableToolNames.contains(name),
+                   (object["png_base64"] as? String ?? "").isEmpty,
+                   let compressed = await distillToolResult(name, text) {
+                    text = compressed
+                }
                 var content: [[String: Any]] = [
-                    ["type": "text", "text": encodeJSON(object) ?? "{}"]
+                    ["type": "text", "text": text]
                 ]
                 if let b64 = object["png_base64"] as? String, !b64.isEmpty {
                     content.insert(

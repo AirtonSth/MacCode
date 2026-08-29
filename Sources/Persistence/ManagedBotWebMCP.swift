@@ -3,20 +3,27 @@ import Foundation
 public struct ManagedBotWebMCP: Sendable {
     public static let serverName = BotWebCatalog.serverName
 
+    /// Optional Token Saver seam: given (toolName, resultText) returns the
+    /// compressed replacement text, or nil to keep the original (fail-open).
+    public typealias ToolResultDistiller = @Sendable (String, String) async -> String?
+
     private let environment: [String: String]
     private let serviceFactory: @Sendable ([String: String]) throws -> BotWebService
+    private let distillToolResult: ToolResultDistiller?
 
     public init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         serviceFactory: @escaping @Sendable ([String: String]) throws -> BotWebService = {
             try BotWebService.make(environment: $0)
-        }
+        },
+        distillToolResult: ToolResultDistiller? = nil
     ) {
         self.environment = environment
         self.serviceFactory = serviceFactory
+        self.distillToolResult = distillToolResult
     }
 
-    public func handle(_ line: String) -> String? {
+    public func handle(_ line: String) async -> String? {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               let data = trimmed.data(using: .utf8),
@@ -48,8 +55,14 @@ public struct ManagedBotWebMCP: Sendable {
             do {
                 let service = try serviceFactory(environment)
                 let object = try service.call(name: name, arguments: arguments)
+                var text = encodeJSON(object) ?? "{}"
+                if let distillToolResult,
+                   BotWebCatalog.distillableToolNames.contains(name),
+                   let compressed = await distillToolResult(name, text) {
+                    text = compressed
+                }
                 return reply(id: id, result: [
-                    "content": [["type": "text", "text": encodeJSON(object) ?? "{}"]],
+                    "content": [["type": "text", "text": text]],
                     "isError": false,
                 ])
             } catch {

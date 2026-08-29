@@ -28,6 +28,11 @@ public enum BotWebCatalog: Sendable {
 
     public static var toolNames: [String] { [search, fetch] }
 
+    /// Read-only content tools whose (large) results are safe to route through
+    /// the Token Saver distill lane: nothing in them is an action reference the
+    /// bot must echo back verbatim on a later call.
+    public static var distillableToolNames: Set<String> { [search, fetch] }
+
     public static func toolCatalog() -> [[String: Any]] {
         toolNames.map { name in
             [

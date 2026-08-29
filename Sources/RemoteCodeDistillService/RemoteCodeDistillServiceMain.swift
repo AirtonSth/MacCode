@@ -236,12 +236,12 @@ struct RemoteCodeDistillServiceMain {
         }
         if programName == "rc-bot-web"
             || rawArgs.dropFirst().first == BotWebCatalog.cliArgument {
-            runBotWebMCP()
+            await runBotWebMCP()
             return
         }
         if programName == "rc-bot-computer"
             || rawArgs.dropFirst().first == BotComputerCatalog.cliArgument {
-            runBotComputerMCP()
+            await runBotComputerMCP()
             return
         }
         // Nested provider PATH controller: invoked via managed symlinks
@@ -822,21 +822,88 @@ struct RemoteCodeDistillServiceMain {
         }
     }
 
-    private static func runBotWebMCP() {
-        let server = ManagedBotWebMCP()
+    private static func runBotWebMCP() async {
+        let server = ManagedBotWebMCP(distillToolResult: makeMCPToolResultDistiller())
         while let line = readLine(strippingNewline: true) {
-            if let response = server.handle(line) {
+            if let response = await server.handle(line) {
                 FileHandle.standardOutput.write(Data((response + "\n").utf8))
             }
         }
     }
 
-    private static func runBotComputerMCP() {
-        let server = ManagedBotComputerMCP()
+    private static func runBotComputerMCP() async {
+        let server = ManagedBotComputerMCP(distillToolResult: makeMCPToolResultDistiller())
         while let line = readLine(strippingNewline: true) {
-            if let response = server.handle(line) {
+            if let response = await server.handle(line) {
                 FileHandle.standardOutput.write(Data((response + "\n").utf8))
             }
+        }
+    }
+
+    /// Token Saver lane for bot MCP tool results: same admission, transport,
+    /// and faithfulness rules as the PATH command wrappers (`runWrap`), so a
+    /// bot's web/exec tool output measures savings on every provider — the
+    /// Claude-only PostToolUse hook is no longer the sole MCP coverage.
+    /// Fail-open: any gate or transport failure keeps the original text.
+    private static func makeMCPToolResultDistiller() -> @Sendable (String, String) async -> String? {
+        let session = createConfiguredURLSession()
+        return { _, text in
+            let env = ProcessInfo.processInfo.environment
+            let raw = Data(text.utf8)
+            guard raw.count > CommandWrapPolicy.minBytes(environment: env) else { return nil }
+            let loadedState = loadCLIStateSnapshot()
+            let admission = LiveTokenSaverDistillAdmission(
+                state: loadedState?.state,
+                statePath: loadedState?.path
+            )
+            guard admission?.isAdmitted() == true else { return nil }
+            let recoveryContext = ManagedDistillCLI.recoveryContext(environment: env)
+            let provider = ManagedDistillCLI.resolveProvider(
+                explicit: env["REMOTE_CODE_AGENT_PROVIDER"],
+                recoveryProvider: recoveryContext?.provider
+            )
+            let maxChars = Int(env["REMOTE_CODE_DISTILL_MAX_OUTPUT_CHARS"] ?? "") ?? 4_000
+            // Same neutral extractive query the command wrappers send, so the
+            // sidecar routes identically for MCP output and wrapped commands.
+            let query = CommandWrapPolicy.extractionQuery(forCommand: "")
+            let cli = ManagedDistillCLI(
+                arguments: query.map { [$0] } ?? [],
+                stdin: raw,
+                state: loadedState?.state,
+                rootRunID: env["RC_TOKEN_SAVER_ROOT_RUN_ID"],
+                provider: provider,
+                recoveryContext: recoveryContext,
+                maxOutputCharacters: maxChars,
+                reversibleStoreMinBytes: CommandWrapPolicy.reversibleStoreFloorBytes,
+                distillAdmission: { admission?.isAdmitted() == true }
+            ) { request in
+                guard admission?.isAdmitted() == true else { return nil }
+                do {
+                    var scopedRequest = request
+                    applyRecoveryHeaders(to: &scopedRequest, environment: env)
+                    let (data, response) = try await session.data(for: scopedRequest)
+                    return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+                } catch {
+                    return nil
+                }
+            }
+            let result = await cli.runResult()
+            // The CLI fail-opens to the raw bytes; replacing text with itself
+            // would be a no-op claim, so only a genuinely different result lands.
+            guard result.exitCode == 0,
+                  result.stdout != raw,
+                  let compressed = String(data: result.stdout, encoding: .utf8),
+                  CommandWrapPolicy.isFaithfulCompression(
+                      rawByteCount: raw.count,
+                      compressedContentByteCount: CommandWrapPolicy.compressedContentByteCount(compressed)
+                  )
+            else { return nil }
+            // Best-effort ledger side effect must not delay the tool response;
+            // the MCP server process is long-lived, so a detached task suffices.
+            if let deferred = result.deferredSideEffect {
+                Task { await deferred() }
+            }
+            return compressed
         }
     }
 

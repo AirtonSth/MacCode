@@ -14457,7 +14457,11 @@ public struct AgentAppView: View {
         case .deactivated:
             return "Token Saver: 0 tokens saved because Token Saver is deactivated"
         case .problem:
-            return "Token Saver: 0 tokens saved because something went wrong"
+            // "went wrong" was a lie for the common case: a thread whose turns
+            // produced no compressible tool output (MCP-only / chat-only work)
+            // legitimately measures 0. Stay factual; the yellow chip already
+            // flags that no savings landed.
+            return "Token Saver: 0 tokens saved in this thread so far"
         case .savings:
             let amount = formatTokenCountForFooter(displayTokens)
             let base = "Token Saver: \(amount) tokens saved (tool output, shorter answers, multi-turn cache)"

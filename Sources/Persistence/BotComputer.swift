@@ -32,6 +32,11 @@ public enum BotComputerCatalog: Sendable {
     public static let rebuild = BotStandingInstructions.computerRebuildTool
     public static var toolNames: [String] { [observe, act, exec, rebuild] }
 
+    /// Read-only content tools whose (large) results are safe to route through
+    /// the Token Saver distill lane. `observe`/`act` results carry coordinates
+    /// and screen state the bot acts on verbatim — never compressed.
+    public static var distillableToolNames: Set<String> { [exec] }
+
     public static func toolCatalog() -> [[String: Any]] {
         toolNames.map { name in
             [
