@@ -29,9 +29,13 @@ build_slice() {
   mkdir -p "$slice_dir/Headers"
   sdk_path=$(xcrun --sdk "$sdk" --show-sdk-path)
   cc=$(xcrun --sdk "$sdk" --find clang)
+  goos=darwin
+  if [ "$sdk" != "macosx" ]; then
+    goos=ios
+  fi
   (
     cd "$WORK_DIR/bridge-smoke"
-    env CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 CC="$cc" \
+    env CGO_ENABLED=1 GOOS="$goos" GOARCH=arm64 CC="$cc" \
       CGO_CFLAGS="-isysroot $sdk_path $min_flag -arch arm64" \
       CGO_LDFLAGS="-isysroot $sdk_path $min_flag -arch arm64" \
       "$GO_BIN" build -trimpath -buildmode=c-archive -ldflags=-buildid= \
