@@ -85,6 +85,7 @@ public enum HostMutationContract {
     browser.back
     browser.forward
     browser.reload
+    browser.stop
     browser.click
     browser.fill
     browser.type
@@ -418,7 +419,7 @@ public enum HostMutationContract {
         case "git.create_branch": return [.uuid("workspace_id"), .string("name")]
         case "git.deliver", "git.push", "project.open_in_editor": return [.uuid("workspace_id")]
         case "browser.navigate": return [.uuid("id"), .string("url")]
-        case "browser.back", "browser.forward", "browser.reload", "browser.mirror_url.get", "browser.screenshot": return [.uuid("id")]
+        case "browser.back", "browser.forward", "browser.reload", "browser.stop", "browser.mirror_url.get", "browser.screenshot": return [.uuid("id")]
         case "browser.click", "browser.fill", "browser.type", "browser.focus", "browser.hover", "browser.check", "browser.uncheck", "browser.select": return [.uuid("id"), .string("ref")]
         case "browser.eval": return [.uuid("id"), .string("script")]
         case "ssh.connect": return [.uuid("workspace_id"), .optionalSSHProfile]

@@ -126,6 +126,7 @@
     {"method": "browser.back", "family": "browser", "risk": "lowMutation", "eventKinds": ["surface.browser"], "readbackMethods": ["browser.url.get"]},
     {"method": "browser.forward", "family": "browser", "risk": "lowMutation", "eventKinds": ["surface.browser"], "readbackMethods": ["browser.url.get"]},
     {"method": "browser.reload", "family": "browser", "risk": "lowMutation", "eventKinds": ["surface.browser"], "readbackMethods": ["browser.url.get"]},
+    {"method": "browser.stop", "family": "browser", "risk": "lowMutation", "eventKinds": ["surface.browser"], "readbackMethods": ["browser.url.get"]},
     {"method": "browser.click", "family": "browser", "risk": "lowMutation", "eventKinds": ["surface.browser"], "readbackMethods": ["browser.snapshot"]},
     {"method": "browser.fill", "family": "browser", "risk": "lowMutation", "eventKinds": ["surface.browser"], "readbackMethods": ["browser.snapshot"]},
     {"method": "browser.type", "family": "browser", "risk": "lowMutation", "eventKinds": ["surface.browser"], "readbackMethods": ["browser.snapshot"]},

@@ -7591,6 +7591,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func browserBack(surface: SurfaceID) throws { try browserSurface(surface).goBackAction() }
     public func browserForward(surface: SurfaceID) throws { try browserSurface(surface).goForwardAction() }
     public func browserReload(surface: SurfaceID) throws { try browserSurface(surface).reloadAction() }
+    public func browserStop(surface: SurfaceID) throws { try browserSurface(surface).stopLoadingAction() }
     public func browserURL(surface: SurfaceID) throws -> String { try browserSurface(surface).currentURL() }
     public func browserMirrorURL(surface: SurfaceID) throws -> [String: JSONValue] {
         let raw = try browserSurface(surface).currentURL()

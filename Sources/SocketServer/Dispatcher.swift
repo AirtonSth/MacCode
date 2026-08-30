@@ -292,6 +292,7 @@ public protocol CommandRouting: AnyObject {
     func browserBack(surface: SurfaceID) throws
     func browserForward(surface: SurfaceID) throws
     func browserReload(surface: SurfaceID) throws
+    func browserStop(surface: SurfaceID) throws
     func browserURL(surface: SurfaceID) throws -> String
     func browserMirrorURL(surface: SurfaceID) throws -> [String: JSONValue]
     func browserEval(surface: SurfaceID, script: String) async throws -> String
@@ -866,6 +867,7 @@ public final class JSONRPCDispatcher {
         "browser.back",
         "browser.forward",
         "browser.reload",
+        "browser.stop",
         "browser.click",
         "browser.fill",
         "browser.type",
@@ -4117,6 +4119,14 @@ public final class JSONRPCDispatcher {
                 EventBus.shared.publish(kind: .surfaceBrowser, payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "action": .string("reload")
+                ]))
+                return .init(id: id, result: .bool(true))
+            case "browser.stop":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                try router.browserStop(surface: sid)
+                EventBus.shared.publish(kind: .surfaceBrowser, payload: .object([
+                    "surface_id": .string(sid.value.uuidString),
+                    "action": .string("stop")
                 ]))
                 return .init(id: id, result: .bool(true))
             case "browser.url.get":

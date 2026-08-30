@@ -665,6 +665,10 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         synchronousBatchEffectCallCount += 1
     }
 
+    override func browserStop(surface: SurfaceID) throws {
+        synchronousBatchEffectCallCount += 1
+    }
+
     override func browserMirrorURL(surface: SurfaceID) throws -> [String: JSONValue] {
         synchronousBatchEffectCallCount += 1
         return ["url": .string("file:///secret/path/index.html"), "is_file": .bool(true)]
@@ -1182,7 +1186,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
     func test_canonicalManifestExactlyMatchesDispatcherMutationCatalog() throws {
         let canonical = try canonicalMutationMethods()
 
-        XCTAssertEqual(canonical.count, 142)
+        XCTAssertEqual(canonical.count, 143)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }
@@ -2359,6 +2363,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             ("browser.back", ["id": surfaceID], ["surface.browser"]),
             ("browser.forward", ["id": surfaceID], ["surface.browser"]),
             ("browser.reload", ["id": surfaceID], ["surface.browser"]),
+            ("browser.stop", ["id": surfaceID], ["surface.browser"]),
             ("browser.click", ["id": surfaceID, "ref": "button"], ["surface.browser"]),
             ("browser.fill", ["id": surfaceID, "ref": "input", "value": "secret-browser-value"], ["surface.browser"]),
             ("browser.type", ["id": surfaceID, "ref": "input", "value": "secret-browser-value"], ["surface.browser"]),
