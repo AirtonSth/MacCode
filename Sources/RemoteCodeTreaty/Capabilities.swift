@@ -112,4 +112,22 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
         case browserAutomation = "browser_automation"
         case featureFlags = "feature_flags"
     }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        surfaceTypes = try container.decode([String].self, forKey: .surfaceTypes)
+        agent = try container.decode(Agent.self, forKey: .agent)
+        git = try container.decodeIfPresent(Git.self, forKey: .git)
+            ?? Git(readOnly: true)
+        featureFlags = try container.decodeIfPresent(
+            FeatureFlags.self,
+            forKey: .featureFlags
+        ) ?? FeatureFlags(remoteAccessEnabled: false)
+        ssh = try container.decodeIfPresent(RemoteCodeJSONValue.self, forKey: .ssh)
+        browserAutomation = try container.decodeIfPresent(
+            RemoteCodeJSONValue.self,
+            forKey: .browserAutomation
+        )
+        files = try container.decodeIfPresent(RemoteCodeJSONValue.self, forKey: .files)
+    }
 }
