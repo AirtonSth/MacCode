@@ -62,12 +62,13 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     public var onRebuildGuest: ((BotID, String, [String: Any]) -> Void)?
     public var onGuestInput: ((BotID, [String: Any], String, [String: Any]) throws -> Void)?
     public var onDockerClear: ((BotID) throws -> Void)?
-    public var onSend: ((BotID, String, BotConversationID?, [String: Any]) throws -> [String: Any])?
+    public var onSend: ((BotID, String, BotConversationID?, [AgentAttachment], [String: Any]) throws -> [String: Any])?
     public var onDelegatedAttentionSnapshot: (() throws -> [[String: Any]])?
     public var onOpenFile: ((BotID, String, Bool, String) throws -> Void)?
     public var notifyBrowserPendingOpen: ((Notification.Name) throws -> Void)?
 
     private var receipts: [String: [String: Any]] = [:]
+    private var receiptClaims: [String: [String: String]] = [:]
     private var unpublished: Set<String> = []
     private var attachments: [String: [String: Any]] = [:]
     private var files: [String: [String: Any]] = [:]
@@ -531,7 +532,14 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func mutate(name: String, params: [String: Any], now: Date) throws -> [String: Any] {
         let requestID = string(params, "client_request_id")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !requestID.isEmpty else { throw Error.missingRequest }
+        let claim = try receiptClaim(name: name, params: params)
         if let existing = receipts[requestID] {
+            guard let existingClaim = receiptClaims[requestID] else {
+                throw Error(code: -32092, message: "Legacy receipt cannot be verified for idempotent replay.")
+            }
+            guard existingClaim == claim else {
+                throw Error(code: -32093, message: "client_request_id was reused with different mutation parameters.")
+            }
             return existing
         }
         let result: [String: Any]
@@ -545,12 +553,26 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 readback: ["error": error.message]
             )
             receipts[requestID] = failed
+            receiptClaims[requestID] = claim
             persistSidecar()
             throw error
         }
         receipts[requestID] = result
+        receiptClaims[requestID] = claim
         persistSidecar()
         return result
+    }
+
+    private func receiptClaim(name: String, params: [String: Any]) throws -> [String: String] {
+        var business = params
+        business.removeValue(forKey: "client_request_id")
+        guard JSONSerialization.isValidJSONObject(business) else { throw Error.invalidParams }
+        let data = try JSONSerialization.data(
+            withJSONObject: business,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+        guard let canonical = String(data: data, encoding: .utf8) else { throw Error.invalidParams }
+        return ["method": name, "params": canonical]
     }
 
     private func perform(name: String, params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
@@ -893,6 +915,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let botID = id(bot)
         let hostID = string(params, "host_id") ?? ""
         let requestedConversationID = string(params, "conversation_id")
+        let targetConversationID = requestedConversationID ?? selectedConversation[botID]
         let conversation: BotConversationID?
         if let requestedConversationID, !requestedConversationID.isEmpty {
             guard let uuid = UUID(uuidString: requestedConversationID),
@@ -909,17 +932,35 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             params: params
         )
         let attachmentIDs = stringArray(params, "attachment_ids")
-        var bound: [[String: Any]] = []
+        guard Set(attachmentIDs).count == attachmentIDs.count else { throw Error.invalidParams }
+        var boundGrants: [[String: Any]] = []
+        var boundAttachments: [AgentAttachment] = []
         for attachmentID in attachmentIDs {
             guard let grant = attachments[attachmentID],
                   grant["bot_id"] as? String == botID,
+                  let conversationID = targetConversationID,
+                  grant["conversation_id"] as? String == conversationID,
+                  let referenceID = grant["attachment_id"] as? String,
+                  !referenceID.isEmpty,
+                  let filename = grant["filename"] as? String,
+                  !filename.isEmpty,
+                  let rawKind = grant["kind"] as? String,
+                  let kind = AgentAttachmentKind(rawValue: rawKind),
+                  let digest = grant["digest"] as? String,
+                  let size = grant["size"] as? Int,
                   (grant["consumed"] as? Bool) != true else {
                 throw Error.crossTarget
             }
-            var next = grant
-            next["consumed"] = true
-            attachments[attachmentID] = next
-            bound.append(next)
+            boundGrants.append(grant)
+            boundAttachments.append(AgentAttachment(
+                id: referenceID,
+                path: "",
+                displayName: filename,
+                kind: kind,
+                mimeType: grant["mime_type"] as? String,
+                sha256: digest,
+                sizeBytes: size
+            ))
         }
         let live = onHasLiveRun?(bot.id) ?? (liveRuns[botID] != nil)
         // Production delegates live-run queueing to BotsViewModel so the
@@ -927,7 +968,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         // standalone path remains for persistence-level callers without a UI
         // runtime hook.
         if live, onSend == nil {
-            var payload: [String: Any] = ["attachments": bound]
+            var payload: [String: Any] = ["attachments": boundGrants]
             if let conversationID = requestedConversationID ?? selectedConversation[botID] {
                 payload["conversation_id"] = conversationID
             }
@@ -942,6 +983,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                     createdAt: now
                 )
             )
+            consumeAttachments(attachmentIDs)
             if let routingReceiptID = routing["routing_receipt_id"] as? String {
                 consumedRoutingReceipts.insert(routingReceiptID)
             }
@@ -964,7 +1006,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
         let authoritativeSend: [String: Any]
         if let onSend {
-            authoritativeSend = try onSend(bot.id, text, conversation, routing)
+            authoritativeSend = try onSend(bot.id, text, conversation, boundAttachments, routing)
             guard authoritativeSend["bot_id"] as? String == botID,
                   let admittedConversationID = authoritativeSend["conversation_id"] as? String,
                   let admittedConversationUUID = UUID(uuidString: admittedConversationID),
@@ -988,6 +1030,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 "enqueued": false,
             ]
         }
+        consumeAttachments(attachmentIDs)
         let runID = authoritativeSend["run_id"] as? String
             ?? UUID().uuidString.lowercased()
         let conversationID = authoritativeSend["conversation_id"] as? String
@@ -1146,9 +1189,13 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func conversationSelect(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
         let conversationID = string(params, "conversation_id") ?? ""
-        selectedConversation[id(bot)] = conversationID
+        guard let uuid = UUID(uuidString: conversationID),
+              let conversation = try store.conversation(id: BotConversationID(uuid)),
+              conversation.botID == bot.id else { throw Error.crossTarget }
+        let normalizedID = conversation.id.value.uuidString.lowercased()
+        selectedConversation[id(bot)] = normalizedID
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
-            "selected_id": conversationID,
+            "selected_id": normalizedID,
         ])
     }
 
@@ -1166,6 +1213,11 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let bot = try requireBot(params)
         let specJSON = string(params, "schedule_spec_json") ?? ""
         let existingID = string(params, "routine_id").flatMap(UUID.init).map(BotRoutineID.init)
+        if let existingID {
+            guard try store.listRoutines(botID: bot.id).contains(where: {
+                $0.definition.id == existingID
+            }) else { throw Error.crossTarget }
+        }
         let definition = BotRoutineDefinition(
             id: existingID ?? BotRoutineID(),
             botID: bot.id,
@@ -1197,8 +1249,11 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func routineEnable(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
         let bot = try requireBot(params)
         guard let raw = string(params, "routine_id"), let uuid = UUID(uuidString: raw) else { throw Error.invalidParams }
+        guard try store.listRoutines(botID: bot.id).contains(where: {
+            $0.definition.id == BotRoutineID(uuid)
+        }) else { throw Error.crossTarget }
         let enabled = bool(params, "enabled") ?? false
-        try store.setRoutineEnabled(id: BotRoutineID(uuid), enabled: enabled)
+        try store.setRoutineEnabled(id: BotRoutineID(uuid), botID: bot.id, enabled: enabled)
         let stored = try store.listRoutines(botID: bot.id).first {
             $0.definition.id == BotRoutineID(uuid)
         }
@@ -1217,7 +1272,11 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func routineRun(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
         let bot = try requireBot(params)
-        let routineID = string(params, "routine_id") ?? UUID().uuidString
+        guard let routineID = string(params, "routine_id"),
+              let routineUUID = UUID(uuidString: routineID),
+              try store.listRoutines(botID: bot.id).contains(where: {
+                  $0.definition.id == BotRoutineID(routineUUID)
+              }) else { throw Error.crossTarget }
         let run: [String: Any] = [
             "run_id": UUID().uuidString.lowercased(),
             "routine_id": routineID,
@@ -1260,7 +1319,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func routineDelete(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
         guard let raw = string(params, "routine_id"), let uuid = UUID(uuidString: raw) else { throw Error.invalidParams }
-        try store.deleteRoutine(id: BotRoutineID(uuid))
+        guard try store.listRoutines(botID: bot.id).contains(where: {
+            $0.definition.id == BotRoutineID(uuid)
+        }) else { throw Error.crossTarget }
+        try store.deleteRoutine(id: BotRoutineID(uuid), botID: bot.id)
         routineRuntime.removeValue(forKey: raw.lowercased())
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: ["deleted": true])
     }
@@ -1335,24 +1397,62 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func attachmentStage(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
-        let digest = string(params, "digest") ?? UUID().uuidString
+        guard let conversationRaw = string(params, "conversation_id"),
+              let conversationUUID = UUID(uuidString: conversationRaw),
+              let conversation = try store.conversation(id: BotConversationID(conversationUUID)),
+              conversation.botID == bot.id,
+              let attachmentID = string(params, "attachment_id"), !attachmentID.isEmpty,
+              let filename = string(params, "filename"), !filename.isEmpty,
+              let rawKind = string(params, "kind"), AgentAttachmentKind(rawValue: rawKind) != nil,
+              let digest = string(params, "digest")?.lowercased(),
+              digest.count == 64, digest.allSatisfy(\.isHexDigit),
+              let size = int(params, "size"), size > 0,
+              size <= AgentAttachmentStore.maximumSizeBytes else { throw Error.crossTarget }
+        let conversationID = conversation.id.value.uuidString.lowercased()
         let grantID = UUID().uuidString.lowercased()
-        let grant: [String: Any] = [
+        var grant: [String: Any] = [
             "id": grantID,
             "bot_id": id(bot),
-            "conversation_id": string(params, "conversation_id") as Any,
+            "conversation_id": conversationID,
+            "attachment_id": attachmentID,
+            "filename": filename,
+            "kind": rawKind,
             "digest": digest,
-            "size": params["size"] as? Int ?? 0,
+            "size": size,
             "consumed": false,
         ]
+        if let mimeType = string(params, "mime_type") { grant["mime_type"] = mimeType }
         attachments[grantID] = grant
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: grant)
     }
 
     private func attachmentRemove(params: [String: Any], requestID: String) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        guard let conversationRaw = string(params, "conversation_id"),
+              let conversationUUID = UUID(uuidString: conversationRaw),
+              let conversation = try store.conversation(id: BotConversationID(conversationUUID)),
+              conversation.botID == bot.id else { throw Error.crossTarget }
+        let conversationID = conversation.id.value.uuidString.lowercased()
         let grantID = string(params, "id") ?? ""
-        attachments[grantID] = nil
-        return receipt(requestID: requestID, status: .completed, botID: string(params, "bot_id"), readback: ["removed": true])
+        guard let grant = attachments[grantID],
+              grant["bot_id"] as? String == id(bot),
+              grant["conversation_id"] as? String == conversationID,
+              grant["consumed"] as? Bool == false else { throw Error.crossTarget }
+        attachments.removeValue(forKey: grantID)
+        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
+            "removed": true,
+            "id": grantID,
+            "bot_id": id(bot),
+            "conversation_id": conversationID,
+        ])
+    }
+
+    private func consumeAttachments(_ ids: [String]) {
+        for id in ids {
+            guard var grant = attachments[id] else { continue }
+            grant["consumed"] = true
+            attachments[id] = grant
+        }
     }
 
     private func filesMutate(params: [String: Any], requestID: String) throws -> [String: Any] {
@@ -2948,6 +3048,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
             receipts = decoded
         }
+        if let data = loadData("bot.remote.receipt_claims"),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: String]] {
+            receiptClaims = decoded
+        }
         if let data = loadData("bot.remote.files_location"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
             filesLocation = decoded
@@ -3100,6 +3204,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
         save("bot.remote.unpublished", Array(unpublished).sorted())
         save("bot.remote.receipts", persistentReceiptSnapshot())
+        save("bot.remote.receipt_claims", receiptClaims)
         save("bot.remote.files_location", filesLocation)
         save("bot.remote.file_grants", files)
         save("bot.remote.file_generations", fileGenerations)

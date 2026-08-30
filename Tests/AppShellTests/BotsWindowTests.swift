@@ -96,6 +96,74 @@ final class BotsWindowTests: XCTestCase {
         router.sendAgentMessageResolvedAttachmentsProbeForTesting = nil
     }
 
+    func test_pairedBotSendResolvesOpaqueUploadAndDeliversAttachmentToAgentRun() async throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        let botID = bot.id.value.uuidString.lowercased()
+        let conversation = try await router.dispatchPairedBotRemote(
+            method: "bot.conversation.create",
+            params: [
+                "client_request_id": .string("paired-attachment-conversation"),
+                "bot_id": .string(botID),
+                "title": .string("Uploaded file"),
+            ]
+        )
+        let conversationID = try XCTUnwrap(
+            conversation.objectValue?["readback"]?.objectValue?["conversation_id"]?.stringValue
+        )
+        let attachmentStore = AgentAttachmentStore(
+            root: context.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)
+        )
+        let uploaded = try attachmentStore.stage(
+            data: Data("remote bytes".utf8),
+            displayName: "remote.txt",
+            kind: .file,
+            mimeType: "text/plain"
+        )
+        let reference = try XCTUnwrap(AgentAttachmentReference(uploaded))
+        let staged = try await router.dispatchPairedBotRemote(
+            method: "bot.attachment.stage",
+            params: [
+                "client_request_id": .string("paired-attachment-stage"),
+                "bot_id": .string(botID),
+                "conversation_id": .string(conversationID),
+                "attachment_id": .string(reference.id),
+                "filename": .string(reference.displayName),
+                "kind": .string(reference.kind.rawValue),
+                "mime_type": .string(reference.mimeType ?? "application/octet-stream"),
+                "digest": .string(reference.sha256),
+                "size": .number(Double(reference.sizeBytes)),
+            ]
+        )
+        let grantID = try XCTUnwrap(staged.objectValue?["readback"]?.objectValue?["id"]?.stringValue)
+        let delivered = expectation(description: "paired attachment reached agent run")
+        var resolved: [AgentAttachment] = []
+        router.sendAgentMessageResolvedAttachmentsProbeForTesting = { attachments in
+            resolved = attachments
+            delivered.fulfill()
+        }
+        let sent = try await router.dispatchPairedBotRemote(method: "bot.send", params: [
+            "client_request_id": .string("paired-attachment-send"),
+            "host_id": .string("paired-host"),
+            "bot_id": .string(botID),
+            "conversation_id": .string(conversationID),
+            "text": .string("Read the upload"),
+            "attachment_ids": .array([.string(grantID)]),
+        ])
+        XCTAssertNotEqual(sent.objectValue?["status"]?.stringValue, "failed")
+        await fulfillment(of: [delivered], timeout: 3)
+        let attachment = try XCTUnwrap(resolved.first)
+        XCTAssertEqual(attachment.id, reference.id)
+        XCTAssertEqual(attachment.sha256, reference.sha256)
+        XCTAssertEqual(attachment.sizeBytes, reference.sizeBytes)
+        XCTAssertTrue(attachment.path.hasPrefix(attachmentStore.root.path + "/"))
+        router.sendAgentMessageResolvedAttachmentsProbeForTesting = nil
+    }
+
     func test_deskSendWithImageShowsLiteralImageMarker_becauseBotsMustMatchAgentApp() async throws {
         // WHY: a one-image Desk turn must paint `[Image #1]` through the same
         // displayUserLine Agent App uses — not a 📎 filename.

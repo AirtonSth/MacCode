@@ -5541,6 +5541,7 @@ public final class BotsViewModel: ObservableObject {
         botID: BotID,
         text: String,
         conversationID: BotConversationID?,
+        attachments: [AgentAttachment] = [],
         routing: BotDeskRouting
     ) throws -> JSONValue {
         guard let bot = try botStore.get(id: botID), bot.deletedAt == nil else {
@@ -5562,6 +5563,7 @@ public final class BotsViewModel: ObservableObject {
                let activeRunID = context.coordinator.activeRunId(threadId: threadID) {
                 let followUp = BotQueuedFollowUp(
                     text: message,
+                    attachments: attachments,
                     conversationID: existing.id,
                     routing: routing
                 )
@@ -5578,7 +5580,7 @@ public final class BotsViewModel: ObservableObject {
             }
         }
 
-        let display = AgentChatTranscriptChrome.displayUserLine(text: message, attachments: [])
+        let display = AgentChatTranscriptChrome.displayUserLine(text: message, attachments: attachments)
         let conversation = try persistUserMessage(
             bot: bot,
             text: display,
@@ -5595,7 +5597,7 @@ public final class BotsViewModel: ObservableObject {
             bot: bot,
             conversation: conversation,
             userText: message,
-            attachments: [],
+            attachments: attachments,
             routingOverride: routing
         ) else {
             throw BotStoreError.invalidRow("Bot runtime is unavailable")

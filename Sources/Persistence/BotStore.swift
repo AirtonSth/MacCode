@@ -1286,6 +1286,32 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    public func setRoutineEnabled(
+        id: BotRoutineID,
+        botID: BotID,
+        enabled: Bool,
+        now: Date = Date()
+    ) throws {
+        try db.performSync { database in
+            let statement = try database.prepare("""
+                UPDATE bot_routine_activations
+                SET is_enabled = ?, updated_at = ?
+                WHERE routine_id = ? AND bot_id = ?;
+                """)
+            defer { statement.reset() }
+            try statement.bind(1, enabled)
+            try statement.bind(2, string(now))
+            try statement.bind(3, id.value.uuidString.lowercased())
+            try statement.bind(4, botID.value.uuidString.lowercased())
+            _ = try statement.step()
+            let changes = try database.prepare("SELECT changes();")
+            defer { changes.reset() }
+            guard try changes.step(), changes.columnInt64(0) == 1 else {
+                throw BotStoreError.notFound
+            }
+        }
+    }
+
     public func deleteRoutine(id: BotRoutineID) throws {
         try db.transaction {
             let key = id.value.uuidString.lowercased()
@@ -1297,6 +1323,32 @@ public final class BotStore: @unchecked Sendable {
             defer { definition.reset() }
             try definition.bind(1, key)
             _ = try definition.step()
+        }
+    }
+
+    public func deleteRoutine(id: BotRoutineID, botID: BotID) throws {
+        try db.transaction {
+            let key = id.value.uuidString.lowercased()
+            let botKey = botID.value.uuidString.lowercased()
+            let activation = try db.prepare(
+                "DELETE FROM bot_routine_activations WHERE routine_id = ? AND bot_id = ?;"
+            )
+            defer { activation.reset() }
+            try activation.bind(1, key)
+            try activation.bind(2, botKey)
+            _ = try activation.step()
+            let definition = try db.prepare(
+                "DELETE FROM bot_routine_definitions WHERE id = ? AND bot_id = ?;"
+            )
+            defer { definition.reset() }
+            try definition.bind(1, key)
+            try definition.bind(2, botKey)
+            _ = try definition.step()
+            let changes = try db.prepare("SELECT changes();")
+            defer { changes.reset() }
+            guard try changes.step(), changes.columnInt64(0) == 1 else {
+                throw BotStoreError.notFound
+            }
         }
     }
 

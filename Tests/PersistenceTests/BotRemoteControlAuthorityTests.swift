@@ -134,6 +134,41 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         return (botID, conversationID, runID)
     }
 
+    private func createBotConversation(prefix: String) throws -> (botID: String, conversationID: String) {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "\(prefix)-create",
+            "name": prefix,
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let conversation = try authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "\(prefix)-conversation",
+            "bot_id": botID,
+            "title": prefix,
+        ])
+        return (
+            botID,
+            try XCTUnwrap((conversation["readback"] as? [String: Any])?["conversation_id"] as? String)
+        )
+    }
+
+    private func stageAttachment(
+        prefix: String,
+        botID: String,
+        conversationID: String
+    ) throws -> String {
+        let staged = try authority.dispatch(method: "bot.attachment.stage", params: [
+            "client_request_id": "\(prefix)-stage",
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "attachment_id": "rcatt1_\(String(repeating: "a", count: 32))",
+            "filename": "\(prefix).txt",
+            "kind": "file",
+            "digest": String(repeating: "b", count: 64),
+            "size": 4,
+        ])
+        return try XCTUnwrap((staged["readback"] as? [String: Any])?["id"] as? String)
+    }
+
     func test_settingsSet_failsWithoutRequestId_becauseSilentLocalSuccessIsForbidden() {
         XCTAssertThrowsError(
             try authority.dispatch(method: "bot.settings.set", params: [
@@ -375,7 +410,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let runID = UUID().uuidString.lowercased()
         let threadID = UUID().uuidString.lowercased()
         var sendCalls = 0
-        authority.onSend = { callbackBotID, _, callbackConversationID, _ in
+        authority.onSend = { callbackBotID, _, callbackConversationID, _, _ in
             sendCalls += 1
             XCTAssertEqual(callbackBotID.value.uuidString.lowercased(), botID)
             XCTAssertEqual(callbackConversationID?.value.uuidString.lowercased(), conversationID)
@@ -506,7 +541,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         )
         let threadID = UUID()
         let runID = UUID()
-        authority.onSend = { callbackBotID, _, callbackConversationID, _ in
+        authority.onSend = { callbackBotID, _, callbackConversationID, _, _ in
             XCTAssertEqual(callbackBotID, bot)
             XCTAssertEqual(callbackConversationID?.value.uuidString.lowercased(), conversationID)
             return [
@@ -817,7 +852,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let expectedRunID = UUID().uuidString.lowercased()
         let expectedThreadID = UUID().uuidString.lowercased()
         authority.onHasLiveRun = { _ in true }
-        authority.onSend = { callbackBotID, callbackText, callbackConversationID, callbackRouting in
+        authority.onSend = { callbackBotID, callbackText, callbackConversationID, _, callbackRouting in
             XCTAssertEqual(callbackBotID.value.uuidString.lowercased(), botID)
             XCTAssertEqual(callbackText, "Use this exact route")
             XCTAssertNil(callbackConversationID,
@@ -878,10 +913,22 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let b = try authority.dispatch(method: "bot.create", params: ["client_request_id": "cb", "name": "B"])
         let aID = try XCTUnwrap(a["bot_id"] as? String)
         let bID = try XCTUnwrap(b["bot_id"] as? String)
+        let conversation = try authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "att-conversation",
+            "bot_id": aID,
+            "title": "Attachments",
+        ])
+        let conversationID = try XCTUnwrap(
+            (conversation["readback"] as? [String: Any])?["conversation_id"] as? String
+        )
         let staged = try authority.dispatch(method: "bot.attachment.stage", params: [
             "client_request_id": "att1",
             "bot_id": aID,
-            "digest": "deadbeef",
+            "conversation_id": conversationID,
+            "attachment_id": "rcatt1_abcdefghijklmnopqrstuvwxyz234567",
+            "filename": "note.txt",
+            "kind": "file",
+            "digest": String(repeating: "a", count: 64),
             "size": 4,
         ])
         let grantID = try XCTUnwrap((staged["readback"] as? [String: Any])?["id"] as? String)
@@ -889,11 +936,187 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             try authority.dispatch(method: "bot.send", params: [
                 "client_request_id": "steal",
                 "bot_id": bID,
+                "conversation_id": conversationID,
                 "text": "use stolen grant",
                 "attachment_ids": [grantID],
             ])
         ) { error in
             XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .crossTarget)
+        }
+    }
+
+    func test_attachmentBatchValidationIsAtomicAndRejectsDuplicateGrantIDs() throws {
+        let target = try createBotConversation(prefix: "atomic-attachment")
+        let grantID = try stageAttachment(
+            prefix: "atomic-attachment",
+            botID: target.botID,
+            conversationID: target.conversationID
+        )
+        var sendCalls = 0
+        authority.onSend = { _, _, _, attachments, _ in
+            sendCalls += 1
+            XCTAssertEqual(attachments.map(\.id), ["rcatt1_\(String(repeating: "a", count: 32))"])
+            return [
+                "bot_id": target.botID,
+                "conversation_id": target.conversationID,
+                "thread_id": UUID().uuidString.lowercased(),
+                "run_id": UUID().uuidString.lowercased(),
+                "queued_follow_up": false,
+            ]
+        }
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "atomic-invalid-batch",
+            "bot_id": target.botID,
+            "conversation_id": target.conversationID,
+            "text": "invalid batch",
+            "attachment_ids": [grantID, "missing-grant"],
+        ]))
+        XCTAssertEqual(sendCalls, 0)
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "atomic-duplicate-batch",
+            "bot_id": target.botID,
+            "conversation_id": target.conversationID,
+            "text": "duplicate batch",
+            "attachment_ids": [grantID, grantID],
+        ]))
+        XCTAssertEqual(sendCalls, 0)
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "atomic-valid-batch",
+            "bot_id": target.botID,
+            "conversation_id": target.conversationID,
+            "text": "valid batch",
+            "attachment_ids": [grantID],
+        ])
+        XCTAssertEqual(sendCalls, 1, "failed batch validation must leave every grant intact")
+    }
+
+    func test_attachmentAdmissionFailureLeavesGrantRetryableAndSuccessfulAdmissionConsumesIt() throws {
+        let target = try createBotConversation(prefix: "admission-attachment")
+        let grantID = try stageAttachment(
+            prefix: "admission-attachment",
+            botID: target.botID,
+            conversationID: target.conversationID
+        )
+        authority.onSend = { _, _, _, _, _ in throw BotRemoteControlAuthority.Error.invalidParams }
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "admission-fails",
+            "bot_id": target.botID,
+            "conversation_id": target.conversationID,
+            "text": "first",
+            "attachment_ids": [grantID],
+        ]))
+        authority.onSend = { _, _, _, _, _ in [
+            "bot_id": target.botID,
+            "conversation_id": target.conversationID,
+            "thread_id": UUID().uuidString.lowercased(),
+            "run_id": UUID().uuidString.lowercased(),
+            "queued_follow_up": false,
+        ] }
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "admission-retry",
+            "bot_id": target.botID,
+            "conversation_id": target.conversationID,
+            "text": "retry",
+            "attachment_ids": [grantID],
+        ])
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "admission-consumed",
+            "bot_id": target.botID,
+            "conversation_id": target.conversationID,
+            "text": "reuse",
+            "attachment_ids": [grantID],
+        ]))
+    }
+
+    func test_attachmentStageAndRemoveRequireExactBotConversationOwner() throws {
+        let a = try createBotConversation(prefix: "attachment-owner-a")
+        let b = try createBotConversation(prefix: "attachment-owner-b")
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.attachment.stage", params: [
+            "client_request_id": "attachment-owner-cross-stage",
+            "bot_id": a.botID,
+            "conversation_id": b.conversationID,
+            "attachment_id": "rcatt1_\(String(repeating: "c", count: 32))",
+            "filename": "wrong.txt",
+            "kind": "file",
+            "digest": String(repeating: "d", count: 64),
+            "size": 4,
+        ]))
+        let grantID = try stageAttachment(
+            prefix: "attachment-owner",
+            botID: a.botID,
+            conversationID: a.conversationID
+        )
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.attachment.remove", params: [
+            "client_request_id": "attachment-owner-cross-remove",
+            "bot_id": b.botID,
+            "conversation_id": b.conversationID,
+            "id": grantID,
+        ]))
+        let removed = try authority.dispatch(method: "bot.attachment.remove", params: [
+            "client_request_id": "attachment-owner-remove",
+            "bot_id": a.botID,
+            "conversation_id": a.conversationID,
+            "id": grantID,
+        ])
+        XCTAssertEqual((removed["readback"] as? [String: Any])?["id"] as? String, grantID)
+    }
+
+    func test_conversationSelectionAndRoutineMutationsRejectCrossBotOwnership() throws {
+        let a = try createBotConversation(prefix: "owner-a")
+        let b = try createBotConversation(prefix: "owner-b")
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.conversation.select", params: [
+            "client_request_id": "select-cross",
+            "bot_id": a.botID,
+            "conversation_id": b.conversationID,
+        ]))
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.conversation.select", params: [
+            "client_request_id": "select-missing",
+            "bot_id": a.botID,
+            "conversation_id": UUID().uuidString.lowercased(),
+        ]))
+        let routine = try authority.dispatch(method: "bot.routine.create", params: [
+            "client_request_id": "routine-owner-create",
+            "bot_id": a.botID,
+            "name": "Owned",
+            "prompt": "Only A",
+            "schedule_spec_json": "{}",
+        ])
+        let routineID = try XCTUnwrap((routine["readback"] as? [String: Any])?["routine_id"] as? String)
+        for (suffix, method, extra) in [
+            ("update", "bot.routine.update", ["name": "Stolen", "prompt": "No", "schedule_spec_json": "{}"]),
+            ("enable", "bot.routine.enable", ["enabled": true]),
+            ("run", "bot.routine.run", [:]),
+            ("delete", "bot.routine.delete", [:]),
+        ] as [(String, String, [String: Any])] {
+            var params: [String: Any] = [
+                "client_request_id": "routine-owner-\(suffix)",
+                "bot_id": b.botID,
+                "routine_id": routineID,
+            ]
+            params.merge(extra) { _, new in new }
+            XCTAssertThrowsError(try authority.dispatch(method: method, params: params), method)
+        }
+        let listed = try authority.dispatch(method: "bot.routine.list", params: ["bot_id": a.botID])
+        XCTAssertEqual((listed["routines"] as? [[String: Any]])?.count, 1)
+    }
+
+    func test_mutationReceiptReplayRejectsChangedMethodOrSemanticParams() throws {
+        let params: [String: Any] = ["client_request_id": "semantic-replay", "name": "Original"]
+        let first = try authority.dispatch(method: "bot.create", params: params)
+        let replay = try authority.dispatch(method: "bot.create", params: params)
+        XCTAssertEqual(first as NSDictionary, replay as NSDictionary)
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "semantic-replay",
+            "name": "Changed",
+        ])) { error in
+            XCTAssertEqual((error as? BotRemoteControlAuthority.Error)?.code, -32093)
+        }
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.settings.set", params: [
+            "client_request_id": "semantic-replay",
+            "key": "memory",
+            "value": true,
+        ])) { error in
+            XCTAssertEqual((error as? BotRemoteControlAuthority.Error)?.code, -32093)
         }
     }
 
@@ -1077,7 +1300,12 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let runID = try XCTUnwrap(run["run_id"] as? String)
         XCTAssertEqual(run["routine_id"] as? String, routineID)
         XCTAssertEqual(run["result"] as? String, "completed")
-        XCTAssertEqual(run["schedule_spec_json"] as? String, spec.encodedJSON())
+        let actualSpec = try XCTUnwrap((run["schedule_spec_json"] as? String)?.data(using: .utf8))
+        let expectedSpec = try XCTUnwrap(spec.encodedJSON().data(using: .utf8))
+        XCTAssertEqual(
+            try JSONSerialization.jsonObject(with: actualSpec) as? NSDictionary,
+            try JSONSerialization.jsonObject(with: expectedSpec) as? NSDictionary
+        )
         let notification = try XCTUnwrap(
             (firedReadback["notifications"] as? [[String: Any]])?.first
         )

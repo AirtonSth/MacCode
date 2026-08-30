@@ -3086,18 +3086,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             try service.removeGuestRuntime(botID: id)
         }
-        created.onSend = { [weak self] id, text, conversationID, routingValues in
-            guard let vm = self?.botsViewModel else {
+        created.onSend = { [weak self] id, text, conversationID, attachmentReferences, routingValues in
+            guard let self, let vm = self.botsViewModel else {
                 throw BotRemoteControlAuthority.Error(
                     code: -32091,
                     message: "Bot runtime is unavailable."
                 )
             }
             let routing = try Self.pairedBotDeskRouting(routingValues)
+            let attachments = try self.resolveInboundAgentAttachments(attachmentReferences)
             let result = try vm.enqueueHostMessage(
                 botID: id,
                 text: text,
                 conversationID: conversationID,
+                attachments: attachments,
                 routing: routing
             )
             return Self.foundationObject(result.objectValue ?? [:])
