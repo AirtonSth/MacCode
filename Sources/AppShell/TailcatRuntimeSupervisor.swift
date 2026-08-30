@@ -205,12 +205,10 @@ actor TailcatRuntimeSupervisor {
 
     private func validate(_ snapshot: TailcatAllowlistSnapshot, accountID: String) throws {
         guard let stored = try secureStore.load(), stored.accountID == accountID else { return }
-        if snapshot.epoch < stored.allowlistEpoch { throw TailcatCatalogError.invalidResponse }
-        if snapshot.epoch == stored.allowlistEpoch {
-            if snapshot.revision < stored.revision { throw TailcatCatalogError.invalidResponse }
-            if snapshot.revision == stored.revision, snapshot.hash != stored.snapshotHash {
-                throw TailcatCatalogError.invalidResponse
-            }
+        guard snapshot.epoch == stored.allowlistEpoch else { return }
+        if snapshot.revision < stored.revision { throw TailcatCatalogError.invalidResponse }
+        if snapshot.revision == stored.revision, snapshot.hash != stored.snapshotHash {
+            throw TailcatCatalogError.invalidResponse
         }
     }
 

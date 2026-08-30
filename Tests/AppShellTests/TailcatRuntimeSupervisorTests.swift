@@ -54,7 +54,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
     }
 
     func testAdmittedSnapshotStartsDistinctServersPublishesBothAndDisableStopsThem() async throws {
-        let snapshot = makeSnapshot(epoch: 4, revision: 7, peers: [peer(0xaa)])
+        let snapshot = makeSnapshot(epoch: "epoch-4", revision: 7, peers: [peer(0xaa)])
         let catalog = FakeTailcatCatalog(snapshot: snapshot)
         let bridge = FakeTailcatBridge()
         let store = FakeTailcatStore()
@@ -88,7 +88,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
     }
 
     func testEmptyAllowlistIsDurablyRevokedAndNeverStartedOrPublished() async {
-        let snapshot = makeSnapshot(epoch: 8, revision: 2, peers: [])
+        let snapshot = makeSnapshot(epoch: "epoch-8", revision: 2, peers: [])
         let catalog = FakeTailcatCatalog(snapshot: snapshot)
         let bridge = FakeTailcatBridge()
         let store = FakeTailcatStore()
@@ -108,7 +108,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
     }
 
     func testPartialServerStartIsClosedAndNotPublished() async {
-        let snapshot = makeSnapshot(epoch: 2, revision: 3, peers: [peer(0xbb)])
+        let snapshot = makeSnapshot(epoch: "epoch-2", revision: 3, peers: [peer(0xbb)])
         let catalog = FakeTailcatCatalog(snapshot: snapshot)
         let bridge = FakeTailcatBridge(failingRelay: .publicFallback)
         let store = FakeTailcatStore()
@@ -127,7 +127,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
     }
 
     func testPublishingCrashRecoveryRotatesAwayFromOldAndPendingKeys() async {
-        let snapshot = makeSnapshot(epoch: 3, revision: 9, peers: [peer(0xdd)])
+        let snapshot = makeSnapshot(epoch: "epoch-3", revision: 9, peers: [peer(0xdd)])
         let staleActive = TailcatKeyVersion(
             primary: .init(privateKey: "old-primary", publicKey: "old-primary-public"),
             fallback: .init(privateKey: "old-fallback", publicKey: "old-fallback-public")
@@ -162,7 +162,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
     }
 
     func testRevokedRecordNeverResurrectsRetainedActiveKeys() async {
-        let snapshot = makeSnapshot(epoch: 5, revision: 6, peers: [peer(0xee)])
+        let snapshot = makeSnapshot(epoch: "epoch-5", revision: 6, peers: [peer(0xee)])
         let revokedKeys = TailcatKeyVersion(
             primary: .init(privateKey: "revoked-primary", publicKey: "revoked-primary-public"),
             fallback: .init(privateKey: "revoked-fallback", publicKey: "revoked-fallback-public")
@@ -189,9 +189,73 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertNotEqual(store.state?.active, revokedKeys)
     }
 
+    func testEpochChangeRotatesEvenWhenRevisionResets() async {
+        let oldSnapshot = makeSnapshot(epoch: "epoch-old", revision: 99, peers: [peer(0xab)])
+        let newSnapshot = makeSnapshot(epoch: "epoch-new", revision: 1, peers: [peer(0xab)])
+        let oldKeys = TailcatKeyVersion(
+            primary: .init(privateKey: "old-primary", publicKey: "old-primary-public"),
+            fallback: .init(privateKey: "old-fallback", publicKey: "old-fallback-public")
+        )
+        let store = FakeTailcatStore(TailcatSecureState(
+            phase: .active,
+            accountID: "account-1",
+            allowlistEpoch: oldSnapshot.epoch,
+            revision: oldSnapshot.revision,
+            snapshotHash: oldSnapshot.hash,
+            eTag: "\"1\"",
+            active: oldKeys,
+            pending: nil
+        ))
+        let bridge = FakeTailcatBridge()
+        let supervisor = makeSupervisor(
+            bridge: bridge,
+            catalog: FakeTailcatCatalog(snapshot: newSnapshot),
+            store: store
+        )
+
+        await supervisor.setEnabled(true)
+        await supervisor.reconcileNowForTesting()
+
+        XCTAssertEqual(bridge.startCalls.count, 2)
+        XCTAssertEqual(store.state?.allowlistEpoch, "epoch-new")
+        XCTAssertEqual(store.state?.revision, 1)
+        XCTAssertEqual(store.state?.phase, .active)
+    }
+
+    func testSameEpochRejectsLowerRevision() async {
+        let storedSnapshot = makeSnapshot(epoch: "epoch-stable", revision: 10, peers: [peer(0xbc)])
+        let staleSnapshot = makeSnapshot(epoch: "epoch-stable", revision: 9, peers: [peer(0xbc)])
+        let store = FakeTailcatStore(TailcatSecureState(
+            phase: .active,
+            accountID: "account-1",
+            allowlistEpoch: storedSnapshot.epoch,
+            revision: storedSnapshot.revision,
+            snapshotHash: storedSnapshot.hash,
+            eTag: "\"1\"",
+            active: TailcatKeyVersion(
+                primary: .init(privateKey: "active-primary", publicKey: "active-primary-public"),
+                fallback: .init(privateKey: "active-fallback", publicKey: "active-fallback-public")
+            ),
+            pending: nil
+        ))
+        let bridge = FakeTailcatBridge()
+        let supervisor = makeSupervisor(
+            bridge: bridge,
+            catalog: FakeTailcatCatalog(snapshot: staleSnapshot),
+            store: store
+        )
+
+        await supervisor.setEnabled(true)
+        await supervisor.reconcileNowForTesting()
+
+        XCTAssertTrue(bridge.startCalls.isEmpty)
+        XCTAssertEqual(store.state?.revision, 10)
+        XCTAssertEqual(store.state?.allowlistEpoch, "epoch-stable")
+    }
+
     func testBackendOutageKeepsRuntimeUntilHostLeaseThenFailsClosed() async {
         let clock = FakeTailcatClock(Date(timeIntervalSince1970: 10_000))
-        let snapshot = makeSnapshot(epoch: 1, revision: 1, peers: [peer(0xcc)])
+        let snapshot = makeSnapshot(epoch: "epoch-1", revision: 1, peers: [peer(0xcc)])
         let catalog = FakeTailcatCatalog(snapshot: snapshot)
         let bridge = FakeTailcatBridge()
         let store = FakeTailcatStore()
@@ -255,7 +319,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         "nodekey:" + String(repeating: String(format: "%02x", byte), count: 32)
     }
 
-    private func makeSnapshot(epoch: Int64, revision: Int64, peers: [String]) -> TailcatAllowlistSnapshot {
+    private func makeSnapshot(epoch: String, revision: Int64, peers: [String]) -> TailcatAllowlistSnapshot {
         TailcatAllowlistSnapshot(
             epoch: epoch,
             revision: revision,
@@ -452,7 +516,7 @@ private final class TailcatCatalogURLProtocol: URLProtocol, @unchecked Sendable 
         """
         let body = method == "PUT"
             ? "{\"host\":\(host)}"
-            : "{\"host\":null,\"snapshot\":{\"epoch\":1,\"revision\":1,\"clients\":[]}}"
+            : "{\"host\":null,\"snapshot\":{\"epoch\":\"epoch-1\",\"revision\":1,\"clients\":[]}}"
         let headers = method == "PUT" ? ["ETag": "\"2\""] : [:]
         let response = HTTPURLResponse(
             url: request.url!,

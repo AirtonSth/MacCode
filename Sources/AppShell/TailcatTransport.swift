@@ -39,7 +39,7 @@ struct TailcatCatalogClient: Codable, Equatable, Sendable {
 }
 
 struct TailcatAllowlistSnapshot: Codable, Equatable, Sendable {
-    let epoch: Int64
+    let epoch: String
     let revision: Int64
     let clients: [TailcatCatalogClient]
 
@@ -388,7 +388,7 @@ struct TailcatKeyVersion: Codable, Equatable, Sendable {
 struct TailcatSecureState: Codable, Equatable, Sendable {
     var phase: TailcatPersistentPhase
     var accountID: String
-    var allowlistEpoch: Int64
+    var allowlistEpoch: String
     var revision: Int64
     var snapshotHash: String
     var eTag: String?
