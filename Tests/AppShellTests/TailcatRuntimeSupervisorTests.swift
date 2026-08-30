@@ -195,6 +195,25 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertFalse(activeAfterDisable)
     }
 
+    func testPublishedRuntimeReconcilesTwiceWithOneSecureStoreLoad() async throws {
+        let snapshot = makeSnapshot(epoch: "epoch-cached", revision: 1, peers: [peer(0xad)])
+        let catalog = FakeTailcatCatalog(snapshot: snapshot)
+        let bridge = FakeTailcatBridge()
+        let store = FakeTailcatStore(failAfterLoadCount: 1)
+        let supervisor = makeSupervisor(bridge: bridge, catalog: catalog, store: store)
+
+        await supervisor.setEnabled(true)
+        await supervisor.reconcileNowForTesting()
+        await supervisor.reconcileNowForTesting()
+
+        XCTAssertEqual(store.loadCount, 1)
+        XCTAssertEqual(bridge.startCalls.count, 2)
+        XCTAssertEqual(store.state?.phase, .active)
+        let hasActiveRuntime = await supervisor.hasActiveRuntimeForTesting
+        XCTAssertTrue(hasActiveRuntime)
+        await supervisor.setEnabled(false)
+    }
+
     func testEmptyAllowlistIsDurablyRevokedAndNeverStartedOrPublished() async {
         let snapshot = makeSnapshot(epoch: "epoch-8", revision: 2, peers: [])
         let catalog = FakeTailcatCatalog(snapshot: snapshot)
@@ -598,11 +617,25 @@ private final class FakeTailcatClock: @unchecked Sendable {
 private final class FakeTailcatStore: TailcatSecureStateStoring, @unchecked Sendable {
     private let lock = NSLock()
     private var stored: TailcatSecureState?
+    private var loads = 0
+    private let failAfterLoadCount: Int?
 
-    init(_ stored: TailcatSecureState? = nil) { self.stored = stored }
+    init(_ stored: TailcatSecureState? = nil, failAfterLoadCount: Int? = nil) {
+        self.stored = stored
+        self.failAfterLoadCount = failAfterLoadCount
+    }
 
     var state: TailcatSecureState? { lock.withLock { stored } }
-    func load() throws -> TailcatSecureState? { state }
+    var loadCount: Int { lock.withLock { loads } }
+    func load() throws -> TailcatSecureState? {
+        try lock.withLock {
+            loads += 1
+            if let failAfterLoadCount, loads > failAfterLoadCount {
+                throw TailcatSecureStateError.encoding
+            }
+            return stored
+        }
+    }
     func save(_ state: TailcatSecureState) throws { lock.withLock { stored = state } }
     func clear() throws { lock.withLock { stored = nil } }
 }

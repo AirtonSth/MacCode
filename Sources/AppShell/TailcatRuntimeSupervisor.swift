@@ -52,6 +52,8 @@ actor TailcatRuntimeSupervisor {
     private var lastAccessToken: String?
     private var reconcilePending = false
     private var reconciling = false
+    private var secureStateLoaded = false
+    private var cachedSecureState: TailcatSecureState?
 
     init(
         serverID: String,
@@ -182,8 +184,7 @@ actor TailcatRuntimeSupervisor {
                 )
                 return
             }
-
-            let stored = try secureStore.load()
+            let stored = try loadSecureState()
             let needsRotation = stored?.accountID != session.user.id
                 || stored?.allowlistEpoch != response.snapshot.epoch
                 || stored?.revision != response.snapshot.revision
@@ -217,7 +218,7 @@ actor TailcatRuntimeSupervisor {
     }
 
     private func validate(_ snapshot: TailcatAllowlistSnapshot, accountID: String) throws {
-        guard let stored = try secureStore.load(), stored.accountID == accountID else { return }
+        guard let stored = try loadSecureState(), stored.accountID == accountID else { return }
         guard snapshot.epoch == stored.allowlistEpoch else { return }
         if snapshot.revision < stored.revision { throw TailcatCatalogError.invalidResponse }
         if snapshot.revision == stored.revision, snapshot.hash != stored.snapshotHash {
@@ -234,7 +235,7 @@ actor TailcatRuntimeSupervisor {
         await stopRuntime()
         statusHandler(.checking)
         do {
-            let stored = try secureStore.load()
+            let stored = try loadSecureState()
             // A crash may leave an old active key next to a publishing or
             // revoked phase. Only an explicitly active record may carry that
             // key forward while a replacement is published; fail-closed
@@ -246,7 +247,7 @@ actor TailcatRuntimeSupervisor {
                 throw TailcatBridgeError.rejected("server_key_collision")
             }
             let keys = TailcatKeyVersion(primary: primaryKey, fallback: fallbackKey)
-            try secureStore.save(TailcatSecureState(
+            try saveSecureState(TailcatSecureState(
                 phase: .publishing,
                 accountID: session.user.id,
                 allowlistEpoch: snapshot.epoch,
@@ -335,7 +336,7 @@ actor TailcatRuntimeSupervisor {
             lastBackendSuccess = now()
             lastRenewal = now()
             currentETag = published.eTag
-            try secureStore.save(TailcatSecureState(
+            try saveSecureState(TailcatSecureState(
                 phase: .active,
                 accountID: session.user.id,
                 allowlistEpoch: snapshot.epoch,
@@ -365,9 +366,9 @@ actor TailcatRuntimeSupervisor {
             lastBackendSuccess = now()
             lastRenewal = now()
             currentETag = published.eTag
-            if var stored = try secureStore.load() {
+            if var stored = try loadSecureState() {
                 stored.eTag = published.eTag
-                try secureStore.save(stored)
+                try saveSecureState(stored)
             }
             statusHandler(.active)
         } catch let error as TailcatCatalogError where error.deniesSubscription {
@@ -393,7 +394,7 @@ actor TailcatRuntimeSupervisor {
         await stopRuntime()
         if clearKeys {
             if let snapshot, let accountID {
-                try? secureStore.save(TailcatSecureState(
+                try? saveSecureState(TailcatSecureState(
                     phase: .revoked,
                     accountID: accountID,
                     allowlistEpoch: snapshot.epoch,
@@ -404,14 +405,14 @@ actor TailcatRuntimeSupervisor {
                     pending: nil
                 ))
             } else {
-                try? secureStore.clear()
+                try? clearSecureState()
             }
         } else {
             do {
-                if var stored = try secureStore.load() {
+                if var stored = try loadSecureState() {
                     stored.phase = .revoked
                     stored.pending = nil
-                    try secureStore.save(stored)
+                    try saveSecureState(stored)
                 }
             } catch {
                 // A failed durable revoke is fail-closed because the runtime and
@@ -419,6 +420,26 @@ actor TailcatRuntimeSupervisor {
             }
         }
         statusHandler(status)
+    }
+
+    private func loadSecureState() throws -> TailcatSecureState? {
+        if secureStateLoaded { return cachedSecureState }
+        let state = try secureStore.load()
+        cachedSecureState = state
+        secureStateLoaded = true
+        return state
+    }
+
+    private func saveSecureState(_ state: TailcatSecureState) throws {
+        try secureStore.save(state)
+        cachedSecureState = state
+        secureStateLoaded = true
+    }
+
+    private func clearSecureState() throws {
+        try secureStore.clear()
+        cachedSecureState = nil
+        secureStateLoaded = true
     }
 
     private func stopRuntime() async {
