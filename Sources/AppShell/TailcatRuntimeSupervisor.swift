@@ -86,9 +86,9 @@ actor TailcatRuntimeSupervisor {
             let accessToken = sessionProvider()?.accessToken ?? lastAccessToken
             loopTask?.cancel()
             loopTask = nil
+            await deletePublishedHost(accessToken: accessToken)
             await stopRuntime()
             statusHandler(.off)
-            await deletePublishedHost(accessToken: accessToken)
             lastAccessToken = nil
             return
         }

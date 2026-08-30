@@ -98,6 +98,43 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertEqual(applied, [false])
     }
 
+    @MainActor
+    func testSettingsWindowDisableDeletesBeforeBlockedRuntimeTeardown() async throws {
+        let directory = NSTemporaryDirectory() + "RCTailcatSettingsWindow-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        try context.settingsRepo.set("tailcat_access_enabled", "1")
+        let snapshot = makeSnapshot(epoch: "epoch-live-disable", revision: 1, peers: [peer(0xda)])
+        let catalog = FakeTailcatCatalog(snapshot: snapshot)
+        let bridge = FakeTailcatBridge(blockCloses: true)
+        let supervisor = makeSupervisor(bridge: bridge, catalog: catalog, store: FakeTailcatStore())
+        await supervisor.setEnabled(true)
+        await supervisor.reconcileNowForTesting()
+        context.onTailcatAccessSettingChanged = { requested in
+            Task { await supervisor.setEnabled(requested) }
+        }
+        let settings = SettingsWindowController(context: context, loadImmediately: false)
+        settings.viewModel.tailcatAccessEnabled = true
+
+        settings.viewModel.setTailcatAccess(false)
+
+        for _ in 0..<100 where !bridge.hasStartedClose {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(bridge.hasStartedClose, "the real Settings window must reach runtime teardown")
+        let deletesBeforeTeardownRelease = await catalog.deleteAccessTokens
+        bridge.releaseBlockedCloses()
+        XCTAssertEqual(
+            deletesBeforeTeardownRelease,
+            ["access-token"],
+            "catalog removal must not wait behind a potentially blocking live Tailcat teardown"
+        )
+        for _ in 0..<50 where bridge.closedHandles.count < 2 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(Set(bridge.closedHandles), [101, 202])
+    }
+
     func testAdmittedSnapshotStartsDistinctServersPublishesBothAndDisableStopsThem() async throws {
         let snapshot = makeSnapshot(epoch: "epoch-4", revision: 7, peers: [peer(0xaa)])
         let catalog = FakeTailcatCatalog(snapshot: snapshot)
@@ -558,16 +595,21 @@ private final class FakeTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable
     private var keyCounter = 0
     private var starts: [StartCall] = []
     private var closes: [UInt64] = []
+    private var closeStartCount = 0
     private let failingRelay: TailcatRelay?
     private let failAll: Bool
+    private let blockCloses: Bool
+    private let closeGate = DispatchSemaphore(value: 0)
 
-    init(failingRelay: TailcatRelay? = nil, failAll: Bool = false) {
+    init(failingRelay: TailcatRelay? = nil, failAll: Bool = false, blockCloses: Bool = false) {
         self.failingRelay = failingRelay
         self.failAll = failAll
+        self.blockCloses = blockCloses
     }
 
     var startCalls: [StartCall] { lock.withLock { starts } }
     var closedHandles: [UInt64] { lock.withLock { closes } }
+    var hasStartedClose: Bool { lock.withLock { closeStartCount > 0 } }
     func buildID() throws -> String { TailcatTransportContract.buildID }
 
     func generateKey() throws -> TailcatBridgeKey {
@@ -603,7 +645,18 @@ private final class FakeTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable
         }
     }
 
-    func closeServer(handle: UInt64) throws { lock.withLock { closes.append(handle) } }
+    func closeServer(handle: UInt64) throws {
+        if blockCloses {
+            lock.withLock { closeStartCount += 1 }
+            closeGate.wait()
+        }
+        lock.withLock { closes.append(handle) }
+    }
+
+    func releaseBlockedCloses() {
+        closeGate.signal()
+        closeGate.signal()
+    }
 
     private func matches(_ lhs: TailcatRelay, _ rhs: TailcatRelay?) -> Bool {
         guard let rhs else { return false }
