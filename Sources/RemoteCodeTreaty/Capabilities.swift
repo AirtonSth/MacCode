@@ -80,6 +80,18 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
         }
     }
 
+    public struct Bot: Codable, Equatable, Sendable {
+        public let queueControls: [String]
+
+        public init(queueControls: [String]) {
+            self.queueControls = queueControls
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case queueControls = "queue_controls"
+        }
+    }
+
     public let surfaceTypes: [String]
     public let agent: Agent
     public let git: Git
@@ -87,6 +99,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
     public let ssh: RemoteCodeJSONValue?
     public let browserAutomation: RemoteCodeJSONValue?
     public let files: RemoteCodeJSONValue?
+    public let bot: Bot?
 
     public init(
         surfaceTypes: [String],
@@ -95,7 +108,8 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
         featureFlags: FeatureFlags,
         ssh: RemoteCodeJSONValue? = nil,
         browserAutomation: RemoteCodeJSONValue? = nil,
-        files: RemoteCodeJSONValue? = nil
+        files: RemoteCodeJSONValue? = nil,
+        bot: Bot? = nil
     ) {
         self.surfaceTypes = surfaceTypes
         self.agent = agent
@@ -104,11 +118,12 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
         self.ssh = ssh
         self.browserAutomation = browserAutomation
         self.files = files
+        self.bot = bot
     }
 
     private enum CodingKeys: String, CodingKey {
         case surfaceTypes = "surface_types"
-        case agent, git, ssh, files
+        case agent, git, ssh, files, bot
         case browserAutomation = "browser_automation"
         case featureFlags = "feature_flags"
     }
@@ -129,5 +144,6 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             forKey: .browserAutomation
         )
         files = try container.decodeIfPresent(RemoteCodeJSONValue.self, forKey: .files)
+        bot = try container.decodeIfPresent(Bot.self, forKey: .bot)
     }
 }

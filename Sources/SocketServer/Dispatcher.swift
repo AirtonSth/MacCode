@@ -819,6 +819,9 @@ public final class JSONRPCDispatcher {
         "bot.force_stop",
         "bot.settings.set",
         "bot.queue.remove",
+        "bot.queue.update",
+        "bot.queue.reorder",
+        "bot.queue.force_now",
         "bot.conversation.create",
         "bot.conversation.select",
         "bot.conversation.clear_all",
@@ -1361,7 +1364,8 @@ public final class JSONRPCDispatcher {
                 }
                 kind = .botRunStopRequested
                 botTerminalPayload = terminal
-            case "bot.queue.remove": kind = .botQueueUpdated
+            case "bot.queue.remove", "bot.queue.update", "bot.queue.reorder", "bot.queue.force_now":
+                kind = .botQueueUpdated
             case "bot.conversation.select": kind = .botConversationSelected
             case "bot.conversation.create", "bot.conversation.clear_all":
                 kind = .botConversationUpdated

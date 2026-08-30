@@ -63,6 +63,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     public var onGuestInput: ((BotID, [String: Any], String, [String: Any]) throws -> Void)?
     public var onDockerClear: ((BotID) throws -> Void)?
     public var onSend: ((BotID, String, BotConversationID?, [AgentAttachment], [String: Any]) throws -> [String: Any])?
+    public var onForceQueuedFollowUp: ((BotID, String) throws -> [String: Any])?
     public var onDelegatedAttentionSnapshot: (() throws -> [[String: Any]])?
     public var onOpenFile: ((BotID, String, Bool, String) throws -> Void)?
     public var notifyBrowserPendingOpen: ((Notification.Name) throws -> Void)?
@@ -597,6 +598,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try send(params: params, requestID: requestID, now: now)
         case "queue.remove":
             return try queueRemove(params: params, requestID: requestID)
+        case "queue.update":
+            return try queueUpdate(params: params, requestID: requestID)
+        case "queue.reorder":
+            return try queueReorder(params: params, requestID: requestID)
+        case "queue.force_now":
+            return try queueForceNow(params: params, requestID: requestID)
         case "stop", "force_stop":
             return try stop(params: params, requestID: requestID, force: name == "force_stop", now: now)
         case "conversation.create":
@@ -1107,8 +1114,62 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func queueRemove(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
         let itemID = string(params, "id") ?? ""
+        let rows = try store.listQueuedFollowUps(botID: bot.id)
+        guard rows.contains(where: { $0.id == itemID }) else { throw Error.invalidParams }
         try store.removeQueuedFollowUp(botID: bot.id, id: itemID)
-        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
+        return try queueReceipt(bot: bot, requestID: requestID)
+    }
+
+    private func queueUpdate(params: [String: Any], requestID: String) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        let itemID = string(params, "id") ?? ""
+        let text = string(params, "text")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !text.isEmpty else { throw Error.invalidParams }
+        var rows = try store.listQueuedFollowUps(botID: bot.id)
+        guard let index = rows.firstIndex(where: { $0.id == itemID }) else { throw Error.invalidParams }
+        rows[index].text = text
+        try store.replaceQueuedFollowUps(botID: bot.id, items: rows)
+        return try queueReceipt(bot: bot, requestID: requestID)
+    }
+
+    private func queueReorder(params: [String: Any], requestID: String) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        let itemID = string(params, "id") ?? ""
+        guard let requestedPosition = int(params, "position"), requestedPosition >= 0 else {
+            throw Error.invalidParams
+        }
+        var rows = try store.listQueuedFollowUps(botID: bot.id)
+        guard let source = rows.firstIndex(where: { $0.id == itemID }) else { throw Error.invalidParams }
+        let row = rows.remove(at: source)
+        rows.insert(row, at: min(requestedPosition, rows.count))
+        try store.replaceQueuedFollowUps(botID: bot.id, items: rows)
+        return try queueReceipt(bot: bot, requestID: requestID)
+    }
+
+    private func queueForceNow(params: [String: Any], requestID: String) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        let itemID = string(params, "id") ?? ""
+        var rows = try store.listQueuedFollowUps(botID: bot.id)
+        guard let source = rows.firstIndex(where: { $0.id == itemID }) else { throw Error.invalidParams }
+        let originalRows = rows
+        let row = rows.remove(at: source)
+        rows.insert(row, at: 0)
+        try store.replaceQueuedFollowUps(botID: bot.id, items: rows)
+        let runtimeReadback: [String: Any]
+        do {
+            runtimeReadback = try onForceQueuedFollowUp?(bot.id, itemID)
+                ?? ["force_status": "queued"]
+        } catch {
+            try? store.replaceQueuedFollowUps(botID: bot.id, items: originalRows)
+            throw error
+        }
+        var extra = runtimeReadback
+        extra["queue"] = encodeQueue(try store.listQueuedFollowUps(botID: bot.id))
+        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: extra)
+    }
+
+    private func queueReceipt(bot: BotDefinition, requestID: String) throws -> [String: Any] {
+        receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
             "queue": encodeQueue(try store.listQueuedFollowUps(botID: bot.id)),
         ])
     }

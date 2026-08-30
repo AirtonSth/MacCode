@@ -1272,6 +1272,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             "files": [
                 "methods": ["fs.mkdir", "fs.workspace.list", "fs.workspace.read", "fs.workspace.preview_url", "fs.workspace.create_file", "fs.workspace.rename", "fs.workspace.delete", "files.tab.open", "files.tab.split", "files.state.get", "files.state.update", "files.edit.session", "files.edit.open", "files.edit.apply_patch", "files.edit.save", "files.edit.discard", "files.edit.close"]
             ],
+            "bot": [
+                "queue_controls": ["remove", "update", "reorder", "force_now"]
+            ],
             "git": [
                 "read_only": false,
                 "methods": ["git.status", "git.branches", "git.checkout", "git.create_branch", "git.commit", "git.log", "git.diff", "git.fetch", "git.pull", "git.push", "git.pull_request_url", "git.delivery_plan", "git.deliver"],

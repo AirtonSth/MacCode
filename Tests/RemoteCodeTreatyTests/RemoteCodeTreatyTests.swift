@@ -180,7 +180,8 @@ final class RemoteCodeTreatyTests: XCTestCase {
           "treaty":{"current":{"major":1,"minor":0},"supported_majors":[0,1]},
           "capabilities":{"surface_types":["terminal","agentApp"],
             "agent":{"providers":["codex"],"supports_stream_events":true,"supports_resume":true},
-            "git":{"read_only":false},"feature_flags":{"remote_access_enabled":true}}
+            "git":{"read_only":false},"feature_flags":{"remote_access_enabled":true},
+            "bot":{"queue_controls":["remove","update","reorder","force_now"]}}
         }
         """#.utf8)
 
@@ -191,6 +192,10 @@ final class RemoteCodeTreatyTests: XCTestCase {
         XCTAssertEqual(envelope.treaty?.current, TreatyVersion(major: 1, minor: 0))
         XCTAssertEqual(envelope.capabilities.surfaceTypes, ["terminal", "agentApp"])
         XCTAssertEqual(envelope.capabilities.agent.providers, ["codex"])
+        XCTAssertEqual(
+            envelope.capabilities.bot?.queueControls,
+            ["remove", "update", "reorder", "force_now"]
+        )
     }
 
     func testCompatibilityAcceptsLegacyV0V1AndFutureMinorButRejectsIncompatibleMajor() {

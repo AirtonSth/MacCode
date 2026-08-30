@@ -120,6 +120,9 @@ public enum HostMutationContract {
     bot.settings.set
     bot.send
     bot.queue.remove
+    bot.queue.update
+    bot.queue.reorder
+    bot.queue.force_now
     bot.stop
     bot.force_stop
     bot.conversation.create
@@ -324,6 +327,12 @@ public enum HostMutationContract {
                 return []
             case "bot.settings.set":
                 return [.string("key")]
+            case "bot.queue.remove", "bot.queue.force_now":
+                return [.uuid("bot_id"), .uuid("id")]
+            case "bot.queue.update":
+                return [.uuid("bot_id"), .uuid("id"), .string("text", nonempty: true)]
+            case "bot.queue.reorder":
+                return [.uuid("bot_id"), .uuid("id"), .int("position")]
             case "bot.peer.ask":
                 return [
                     .uuid("thread_id"), .uuid("run_id"), .string("handle"), .string("prompt"),

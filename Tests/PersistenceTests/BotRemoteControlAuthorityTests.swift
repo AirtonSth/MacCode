@@ -390,6 +390,85 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertNotNil(items.first?["id"] as? String)
     }
 
+    func test_queueControlsPreserveOwnershipOrderAndIdempotentForce() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "queue-create",
+            "name": "Queue Bot",
+        ])
+        let other = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "queue-other",
+            "name": "Other Bot",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let otherID = try XCTUnwrap(other["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "queue-live",
+            "bot_id": botID,
+            "text": "live",
+        ])
+        let first = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "queue-first",
+            "bot_id": botID,
+            "text": "first",
+        ])
+        let second = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "queue-second",
+            "bot_id": botID,
+            "text": "second",
+        ])
+        let firstID = try XCTUnwrap((first["readback"] as? [String: Any])?["id"] as? String)
+        let secondID = try XCTUnwrap((second["readback"] as? [String: Any])?["id"] as? String)
+
+        _ = try authority.dispatch(method: "bot.queue.update", params: [
+            "client_request_id": "queue-update",
+            "bot_id": botID,
+            "id": secondID,
+            "text": "edited second",
+        ])
+        let reordered = try authority.dispatch(method: "bot.queue.reorder", params: [
+            "client_request_id": "queue-reorder",
+            "bot_id": botID,
+            "id": secondID,
+            "position": 0,
+        ])
+        var rows = try XCTUnwrap((reordered["readback"] as? [String: Any])?["queue"] as? [[String: Any]])
+        XCTAssertEqual(rows.map { $0["id"] as? String }, [secondID, firstID])
+        XCTAssertEqual(rows.first?["text"] as? String, "edited second")
+
+        var forceCalls = 0
+        authority.onForceQueuedFollowUp = { callbackBotID, callbackItemID in
+            forceCalls += 1
+            XCTAssertEqual(callbackBotID.value.uuidString.lowercased(), botID)
+            XCTAssertEqual(callbackItemID, firstID)
+            return ["force_status": "queued"]
+        }
+        let forcedParams: [String: Any] = [
+            "client_request_id": "queue-force",
+            "bot_id": botID,
+            "id": firstID,
+        ]
+        let forced = try authority.dispatch(method: "bot.queue.force_now", params: forcedParams)
+        rows = try XCTUnwrap((forced["readback"] as? [String: Any])?["queue"] as? [[String: Any]])
+        XCTAssertEqual(rows.map { $0["id"] as? String }, [firstID, secondID])
+        _ = try authority.dispatch(method: "bot.queue.force_now", params: forcedParams)
+        XCTAssertEqual(forceCalls, 1, "receipt replay must not force the same row twice")
+
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.queue.remove", params: [
+            "client_request_id": "queue-cross-owner",
+            "bot_id": otherID,
+            "id": firstID,
+        ])) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .invalidParams)
+        }
+        _ = try authority.dispatch(method: "bot.queue.remove", params: [
+            "client_request_id": "queue-remove",
+            "bot_id": botID,
+            "id": firstID,
+        ])
+        let listed = try authority.dispatch(method: "bot.queue.list", params: ["bot_id": botID])
+        XCTAssertEqual((listed["items"] as? [[String: Any]])?.compactMap { $0["id"] as? String }, [secondID])
+    }
+
     /// WHY: iOS may only adopt a Bot turn when response, receipt status, and
     /// later stream frames share one exact authenticated execution tuple.
     func test_sendReceiptBindsStartedAndQueuedRuntimeEvidenceWithoutReplay() throws {

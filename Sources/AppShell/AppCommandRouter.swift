@@ -3115,6 +3115,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             )
             return Self.foundationObject(result.objectValue ?? [:])
         }
+        created.onForceQueuedFollowUp = { [weak self] id, itemID in
+            guard let vm = self?.botsViewModel else {
+                throw BotRemoteControlAuthority.Error(
+                    code: -32091,
+                    message: "Bot runtime is unavailable."
+                )
+            }
+            return try vm.forceQueuedFollowUpFromStore(botID: id, id: itemID)
+        }
         created.onDelegatedAttentionSnapshot = { [weak self] in
             self?.context?.botPeerHandoffAuthority.remoteAttentionOwnershipSnapshots() ?? []
         }

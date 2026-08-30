@@ -5480,6 +5480,42 @@ public final class BotsViewModel: ObservableObject {
         syncQueuedFollowUps()
     }
 
+    /// Promote an exact persisted remote queue row and either interrupt its
+    /// current conversation or start it immediately when that conversation is
+    /// idle. The authority has already moved the row to the front transactionally.
+    public func forceQueuedFollowUpFromStore(botID: BotID, id: String) throws -> [String: Any] {
+        reloadQueuedFollowUpsFromStore()
+        guard let itemID = UUID(uuidString: id),
+              let bot = try botStore.get(id: botID), bot.deletedAt == nil,
+              let item = queuedFollowUpsByBot[botID]?.first,
+              item.id == itemID,
+              let conversationID = item.conversationID,
+              let conversation = try botStore.conversation(id: conversationID),
+              conversation.botID == botID,
+              let threadID = conversation.linkedAgentThreadID else {
+            throw BotStoreError.invalidRow("queued follow-up authority is stale")
+        }
+        if try liveThreadIDs(for: botID).contains(threadID) {
+            stopDeskThread(conversationID)
+            return [
+                "force_status": "queued",
+                "conversation_id": conversationID.value.uuidString.lowercased(),
+                "thread_id": threadID.value.uuidString.lowercased(),
+            ]
+        }
+        drainHostQueuedFollowUp(bot: bot, conversation: conversation)
+        guard queuedFollowUpsByBot[botID]?.contains(where: { $0.id == itemID }) != true,
+              let runID = context.coordinator.activeRunId(threadId: threadID) else {
+            throw BotStoreError.invalidRow("queued follow-up did not start")
+        }
+        return [
+            "force_status": "started",
+            "conversation_id": conversationID.value.uuidString.lowercased(),
+            "thread_id": threadID.value.uuidString.lowercased(),
+            "run_id": runID.value.uuidString.lowercased(),
+        ]
+    }
+
     public func stopDeskRun() {
         guard let id = selectedConversation?.id else { return }
         stopDeskThread(id)
