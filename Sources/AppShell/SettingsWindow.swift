@@ -16,6 +16,8 @@ import os
 extension Notification.Name {
     static let rc2RemoteAccessSettingChanged = Notification.Name("rc2RemoteAccessSettingChanged")
     static let rc2PrivateAccountChanged = Notification.Name("rc2PrivateAccountChanged")
+    static let rc2TailcatSettingChanged = Notification.Name("rc2TailcatSettingChanged")
+    static let rc2TailcatRuntimeStatusChanged = Notification.Name("rc2TailcatRuntimeStatusChanged")
 }
 
 /// Pure enumeration of every user-tunable AppSettings field key.
@@ -324,6 +326,8 @@ public final class SettingsViewModel: ObservableObject {
     private var changeObservers: [NSObjectProtocol] = []
 
     @Published public var remoteAccessEnabled: Bool = false
+    @Published public var tailcatAccessEnabled: Bool = false
+    @Published public var tailcatAccessStatus: String = TailcatRuntimeStatus.off.displayText
     /// Non-nil when the HTTP listener failed to bind after the last remote-access
     /// toggle-on. The toggle is reverted to off and the preference rolled back so
     /// the stored value matches the actual listener state.
@@ -522,6 +526,17 @@ public final class SettingsViewModel: ObservableObject {
             }
         })
         changeObservers.append(NotificationCenter.default.addObserver(
+            forName: .rc2TailcatSettingChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.reload() }
+        })
+        changeObservers.append(NotificationCenter.default.addObserver(
+            forName: .rc2TailcatRuntimeStatusChanged, object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let status = notification.userInfo?["status"] as? String else { return }
+            Task { @MainActor [weak self] in self?.tailcatAccessStatus = status }
+        })
+        changeObservers.append(NotificationCenter.default.addObserver(
             forName: .petSettingsDidChange, object: nil, queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in self?.reload() }
@@ -637,6 +652,7 @@ public final class SettingsViewModel: ObservableObject {
         reloadCountForTesting += 1
         #endif
         remoteAccessEnabled = (try? settingsRepo.get("remote_access_enabled")) == "1"
+        tailcatAccessEnabled = (try? settingsRepo.get("tailcat_access_enabled")) == "1"
         // Refresh the general startup-failure list from AppDelegate on every reload
         // (Settings open, account/remote-access notification-driven reload).
         // Reading the shared array is idempotent and does not interfere with the
@@ -715,6 +731,22 @@ public final class SettingsViewModel: ObservableObject {
             }
         } else {
             _pendingRemoteAccessToggle = false
+        }
+    }
+
+    public func setTailcatAccess(_ on: Bool) {
+        guard !on || privateAccountUser?.subscribed == true else {
+            tailcatAccessEnabled = false
+            tailcatAccessStatus = TailcatRuntimeStatus.requiresSubscription.displayText
+            return
+        }
+        do {
+            try settingsRepo.set("tailcat_access_enabled", on ? "1" : "0")
+            tailcatAccessEnabled = on
+            tailcatAccessStatus = on ? TailcatRuntimeStatus.checking.displayText : TailcatRuntimeStatus.off.displayText
+            NotificationCenter.default.post(name: .rc2TailcatSettingChanged, object: nil)
+        } catch {
+            recordSettingsWriteError(error)
         }
     }
 
@@ -1677,6 +1709,21 @@ public struct SettingsView: View {
                 .labelsHidden()
                 .accessibilityIdentifier("settings.remoteAccess.toggle")
             }
+            settingRow("Connect from anywhere") {
+                Toggle("", isOn: Binding(
+                    get: { vm.tailcatAccessEnabled },
+                    set: { vm.setTailcatAccess($0) }
+                ))
+                .labelsHidden()
+                .disabled(vm.privateAccountUser?.subscribed != true)
+                .accessibilityIdentifier("settings.tailcatAccess.toggle")
+            }
+            Text(vm.tailcatAccessStatus)
+                .font(DS.Font.caption)
+                .foregroundColor(vm.tailcatAccessStatus == TailcatRuntimeStatus.active.displayText
+                    ? DS.Palette.success
+                    : DS.Palette.textTertiary)
+                .accessibilityIdentifier("settings.tailcatAccess.status")
             if let reason = vm.remoteAccessBindFailedReason {
                 Text("Remote access could not start: \(reason). The toggle has been turned off.")
                     .font(DS.Font.caption)

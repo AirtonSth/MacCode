@@ -40,6 +40,10 @@ let package = Package(
             name: "GhosttyKit",
             path: "Vendor/GhosttyKit.xcframework"
         ),
+        .binaryTarget(
+            name: "RCTailcat",
+            path: "Vendor/TailcatBridge/Artifacts/RCTailcat.xcframework"
+        ),
         .target(
             name: "RemoteCodeCSystem",
             path: "Sources/CSystem",
@@ -148,6 +152,7 @@ let package = Package(
                 "Surfaces",
                 "AppLifecycleSupport",
                 "DesignSystemKit",
+                "RCTailcat",
                 .product(name: "Sparkle", package: "Sparkle")
             ],
             path: "Sources/AppShell",

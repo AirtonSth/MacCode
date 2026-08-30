@@ -97,6 +97,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var bonjourPublicationGeneration = UUID()
     public private(set) var bonjourPublicationState: BonjourPublicationState = .stopped
     private var directAccessSupervisor: DirectAccessLifecycleSupervisor?
+    private let tailcatAuthenticator = TailcatRemoteConnectionAuthenticator()
+    private var tailcatSupervisor: TailcatRuntimeSupervisor?
     public var palette: CommandPalette?
     public var settings: SettingsWindowController?
     public private(set) var petController: PetController?
@@ -301,6 +303,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
         NotificationCenter.default.addObserver(self, selector: #selector(remoteAccessSettingChanged),
                                                name: .rc2RemoteAccessSettingChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(tailcatAccessSettingChanged),
+                                               name: .rc2TailcatSettingChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(tailcatAccountChanged),
+                                               name: .rc2PrivateAccountChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(keybindingsReloaded),
                                                name: .rc2KeybindingsReloaded, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -316,6 +322,23 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             object: nil
         )
         configureDirectAccess()
+        let tailcatAccountStore = PrivateAccountSessionStore(repo: context.settingsRepo)
+        tailcatSupervisor = TailcatRuntimeSupervisor(
+            serverID: context.liveActivityHostIdentity.serverId,
+            displayName: Host.current().localizedName ?? "RemoteCode Mac",
+            sessionProvider: { tailcatAccountStore.load() },
+            authenticator: tailcatAuthenticator,
+            statusHandler: { status in
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(
+                        name: .rc2TailcatRuntimeStatusChanged,
+                        object: nil,
+                        userInfo: ["status": status.displayText]
+                    )
+                }
+            }
+        )
+        configureTailcatAccess()
 
         palette = CommandPalette(router: router)
         SystemNotifier.shared.bootstrap()
@@ -581,6 +604,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         socketServer?.stop()
         directAccessSupervisor?.shutdown()
         directAccessSupervisor = nil
+        let tailcat = tailcatSupervisor
+        tailcatSupervisor = nil
+        Task { await tailcat?.shutdown() }
         providerSessionReaperTimer?.invalidate()
         ccrRetentionTimer?.invalidate()
         diagnosticsHeartbeatTimer?.invalidate()
@@ -997,10 +1023,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         configureDirectAccess()
     }
 
+    @objc private func tailcatAccessSettingChanged() {
+        configureTailcatAccess()
+    }
+
+    @objc private func tailcatAccountChanged() {
+        Task { await tailcatSupervisor?.accountChanged() }
+    }
+
     @objc private func workspaceWillSleep() {
         hangWatchdogAwakeState.value = .displaySleep
         lifecycleRecorder?.record("hang_watchdog_awake state=displaySleep")
         directAccessSupervisor?.suspend()
+        Task { await tailcatSupervisor?.shutdown() }
     }
 
     @objc private func workspaceDidWake() {
@@ -1010,6 +1045,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let remoteEnabled = ((try? context.settingsRepo.get("remote_access_enabled")) ?? "0") == "1"
         do {
             try directAccessSupervisor?.resume(remoteEnabled: remoteEnabled)
+            configureTailcatAccess()
         } catch {
             NSLog("Failed to restart HTTP server after wake: \(error)")
             recordServerStartupFailure("HTTP server", reason: error.localizedDescription)
@@ -1129,6 +1165,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
     }
 
+    private func configureTailcatAccess() {
+        guard let context, let tailcatSupervisor else { return }
+        let requested = ((try? context.settingsRepo.get("tailcat_access_enabled")) ?? "0") == "1"
+        let listenerReady = httpServer != nil
+        Task { await tailcatSupervisor.setEnabled(requested && listenerReady) }
+        if requested && !listenerReady {
+            NotificationCenter.default.post(
+                name: .rc2TailcatRuntimeStatusChanged,
+                object: nil,
+                userInfo: ["status": TailcatRuntimeStatus.unavailable.displayText]
+            )
+        }
+    }
+
     private func startDirectHTTPServer(remoteEnabled: Bool, serverId: String, port: UInt16) throws {
         guard let context, let router, let auth = localAuth else { return }
         let loopbackOnly = !remoteEnabled
@@ -1160,10 +1210,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             bootEpoch: context.liveActivityHostIdentity.bootEpoch,
             clientReceiveTimeoutSeconds: keepAliveSeconds,
             attachmentUploadV2Store: attachmentUploadV2Store,
-            attachmentUploadV3Store: attachmentUploadV3Store
+            attachmentUploadV3Store: attachmentUploadV3Store,
+            tailcatAuthenticator: tailcatAuthenticator
         )
         try http.start()
         httpServer = http
+        configureTailcatAccess()
         try? Self.resolvePetServerFailure(
             server: "HTTP server",
             repository: NotificationRepository(db: context.db)

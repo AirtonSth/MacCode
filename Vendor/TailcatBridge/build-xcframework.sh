@@ -19,7 +19,12 @@ mkdir -p "$WORK_DIR/src" "$WORK_DIR/bridge-smoke" "$WORK_DIR/build"
 git clone --quiet https://github.com/tailscale/tailcat.git "$WORK_DIR/src/tailcat"
 git -C "$WORK_DIR/src/tailcat" checkout --quiet --detach "$TAILCAT_SHA"
 git -C "$WORK_DIR/src/tailcat" apply "$SCRIPT_DIR/patches/tailcat-88929418-rcpatch1.patch"
-cp "$SCRIPT_DIR/Bridge/main.go" "$SCRIPT_DIR/Bridge/go.mod" "$SCRIPT_DIR/Bridge/go.sum" "$WORK_DIR/bridge-smoke/"
+cp "$SCRIPT_DIR/Bridge/main.go" "$SCRIPT_DIR/Bridge/main_test.go" "$SCRIPT_DIR/Bridge/go.mod" "$SCRIPT_DIR/Bridge/go.sum" "$WORK_DIR/bridge-smoke/"
+
+(
+  cd "$WORK_DIR/bridge-smoke"
+  "$GO_BIN" test ./...
+)
 
 build_slice() {
   name=$1

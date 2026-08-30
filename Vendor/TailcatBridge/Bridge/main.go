@@ -17,12 +17,14 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
 	"github.com/tailscale/tailcat"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
@@ -110,6 +112,29 @@ func parsePublic(value string) (key.NodePublic, error) {
 		return key.NodePublic{}, errors.New("invalid_public_key")
 	}
 	return public, nil
+}
+
+func parseAllowed(value string) ([]key.NodePublic, error) {
+	var encoded []string
+	if strings.HasPrefix(strings.TrimSpace(value), "[") {
+		if err := json.Unmarshal([]byte(value), &encoded); err != nil {
+			return nil, errors.New("invalid_allowlist")
+		}
+	} else {
+		encoded = []string{value}
+	}
+	if len(encoded) == 0 {
+		return nil, errors.New("allowlist_required")
+	}
+	allowed := make([]key.NodePublic, 0, len(encoded))
+	for _, item := range encoded {
+		public, err := parsePublic(item)
+		if err != nil {
+			return nil, errors.New("invalid_allowlist")
+		}
+		allowed = append(allowed, public)
+	}
+	return allowed, nil
 }
 
 func marshalText(value interface{ MarshalText() ([]byte, error) }) (string, error) {
@@ -297,30 +322,37 @@ func RCTailcatPublicKey(privateValue *C.char) *C.char {
 	return cResult(result{NodePublic: publicText})
 }
 
-//export RCTailcatServerStart
-func RCTailcatServerStart(privateValue, allowedValue, secretValue, listenerValue, serverIDValue *C.char, loopbackPort C.ushort) *C.char {
+func serverStart(privateValue, allowedValue, secretValue, listenerValue, serverIDValue *C.char, loopbackPort C.ushort, region *tailcfg.DERPRegion, regionID int) *C.char {
 	private, err := parsePrivate(C.GoString(privateValue))
 	if err != nil {
 		return cResult(result{Error: err.Error()})
 	}
-	allowed, err := parsePublic(C.GoString(allowedValue))
+	allowed, err := parseAllowed(C.GoString(allowedValue))
 	if err != nil {
-		return cResult(result{Error: "allowlist_required"})
+		return cResult(result{Error: err.Error()})
 	}
 	secret, err := hex.DecodeString(C.GoString(secretValue))
 	if err != nil || len(secret) != 32 {
 		return cResult(result{Error: "invalid_listener_secret"})
 	}
+	defer clear(secret)
 	listenerID, err := hex.DecodeString(C.GoString(listenerValue))
 	if err != nil || len(listenerID) != 16 {
 		return cResult(result{Error: "invalid_listener_id"})
 	}
-	runtime := &serverRuntime{port: uint16(loopbackPort), serverID: sha256.Sum256([]byte(C.GoString(serverIDValue)))}
+	defer clear(listenerID)
+	serverID := C.GoString(serverIDValue)
+	if serverID == "" || loopbackPort == 0 {
+		return cResult(result{Error: "invalid_server_configuration"})
+	}
+	runtime := &serverRuntime{port: uint16(loopbackPort), serverID: sha256.Sum256([]byte(serverID))}
 	copy(runtime.secret[:], secret)
 	copy(runtime.listener[:], listenerID)
 	server := &tailcat.Server{
 		Key:            private,
-		AllowedClients: []key.NodePublic{allowed},
+		AllowedClients: allowed,
+		Region:         region,
+		RegionID:       regionID,
 		Logf:           func(string, ...any) {},
 	}
 	server.OnTCPWithPeer = func(peer key.NodePublic, port uint16) func(net.Conn) {
@@ -349,6 +381,43 @@ func RCTailcatServerStart(privateValue, allowedValue, secretValue, listenerValue
 	return cResult(result{Handle: handle, ConnBlob: string(server.ConnBlob()), NodePublic: publicText})
 }
 
+//export RCTailcatServerStart
+func RCTailcatServerStart(privateValue, allowedValue, secretValue, listenerValue, serverIDValue *C.char, loopbackPort C.ushort) *C.char {
+	return serverStart(privateValue, allowedValue, secretValue, listenerValue, serverIDValue, loopbackPort, nil, 301)
+}
+
+//export RCTailcatServerStartWithDERP
+func RCTailcatServerStartWithDERP(privateValue, allowedValue, secretValue, listenerValue, serverIDValue, derpHostValue, derpIPv4Value *C.char, loopbackPort, derpPort, stunPort C.ushort, regionID C.uint) *C.char {
+	host := C.GoString(derpHostValue)
+	ipv4 := C.GoString(derpIPv4Value)
+	region, err := customDERPRegion(host, ipv4, uint16(derpPort), uint16(stunPort), uint32(regionID))
+	if err != nil {
+		return cResult(result{Error: "invalid_derp_configuration"})
+	}
+	return serverStart(privateValue, allowedValue, secretValue, listenerValue, serverIDValue, loopbackPort, region, int(regionID))
+}
+
+func customDERPRegion(host, ipv4 string, derpPort, stunPort uint16, regionID uint32) (*tailcfg.DERPRegion, error) {
+	parsedIPv4 := net.ParseIP(ipv4)
+	if host == "" || strings.ContainsAny(host, "/: \t\r\n") || parsedIPv4 == nil || parsedIPv4.To4() == nil || regionID != 1 || derpPort == 0 || stunPort == 0 {
+		return nil, errors.New("invalid_derp_configuration")
+	}
+	region := &tailcfg.DERPRegion{
+		RegionID:   int(regionID),
+		RegionCode: "rc",
+		RegionName: "RemoteCode",
+		Nodes: []*tailcfg.DERPNode{{
+			Name:     "remotecode-1",
+			RegionID: int(regionID),
+			HostName: host,
+			IPv4:     ipv4,
+			DERPPort: int(derpPort),
+			STUNPort: int(stunPort),
+		}},
+	}
+	return region, nil
+}
+
 //export RCTailcatServerClose
 func RCTailcatServerClose(handle C.ulonglong) *C.char {
 	runtimes.Lock()
@@ -360,6 +429,9 @@ func RCTailcatServerClose(handle C.ulonglong) *C.char {
 	}
 	_ = runtime.server.Close()
 	runtime.wg.Wait()
+	clear(runtime.secret[:])
+	clear(runtime.listener[:])
+	clear(runtime.serverID[:])
 	return cResult(result{})
 }
 

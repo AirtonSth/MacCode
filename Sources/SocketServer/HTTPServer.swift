@@ -1123,8 +1123,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// bearer token. Mirrors the HTTP `/v1/*` auth gate: loopback-only binds are
     /// trusted (open), and a missing auth provider means auth is disabled.
     /// Extracted so the gate decision is unit-testable without a live socket.
-    nonisolated static func wsUpgradeRequiresToken(loopbackOnly: Bool, hasAuthProvider: Bool) -> Bool {
-        !loopbackOnly && hasAuthProvider
+    nonisolated static func wsUpgradeRequiresToken(
+        loopbackOnly: Bool,
+        hasAuthProvider: Bool,
+        remoteAuthenticated: Bool = false
+    ) -> Bool {
+        (!loopbackOnly || remoteAuthenticated) && hasAuthProvider
     }
 
     /// Pre-token `/v1/*` paths that must stay open even on a non-loopback bind
@@ -1145,11 +1149,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// trip. Extracted so the auth decision is unit-testable without a live
     /// socket (a loopback test client is always treated as trusted for other
     /// routes, so a real socket cannot exercise the non-loopback gate).
-    nonisolated static func httpAuthGateRequiresToken(loopbackOnly: Bool, path: String, hasAuthProvider: Bool) -> Bool {
+    nonisolated static func httpAuthGateRequiresToken(
+        loopbackOnly: Bool,
+        path: String,
+        hasAuthProvider: Bool,
+        remoteAuthenticated: Bool = false
+    ) -> Bool {
         guard hasAuthProvider, path.hasPrefix("/v1") else { return false }
         // Always-gated: identity proof for cold connect; not loopback-trusted.
         if path == "/v1/capabilities/authenticated" { return true }
-        return !loopbackOnly && !authExemptV1Paths.contains(path)
+        return (!loopbackOnly || remoteAuthenticated) && !authExemptV1Paths.contains(path)
     }
 
     /// Shared capabilities object for public `GET /v1/capabilities` and the
@@ -1336,6 +1345,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     public let attachmentUploadV2Store: AttachmentUploadV2Store?
     public let attachmentUploadV3Store: AttachmentUploadV3Store?
     public weak var auth: DirectAuthProvider?
+    public let tailcatAuthenticator: TailcatRemoteConnectionAuthenticator?
     /// Stable, persisted **logical** host identity. iOS pins this (RCA-022); it must
     /// survive process restarts or every relaunch looks like a different
     /// Mac and forces a re-pair (GAP-2).
@@ -1410,7 +1420,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
         clientReceiveTimeoutSeconds: Int = DirectHTTPServer.httpKeepAliveIdleTimeoutSeconds,
         webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes,
         attachmentUploadV2Store: AttachmentUploadV2Store? = nil,
-        attachmentUploadV3Store: AttachmentUploadV3Store? = nil
+        attachmentUploadV3Store: AttachmentUploadV3Store? = nil,
+        tailcatAuthenticator: TailcatRemoteConnectionAuthenticator? = nil
     ) {
         self.port = port
         self.bindLoopbackOnly = loopbackOnly
@@ -1419,6 +1430,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         self.attachmentUploadV2Store = attachmentUploadV2Store
         self.attachmentUploadV3Store = attachmentUploadV3Store
         self.auth = auth
+        self.tailcatAuthenticator = tailcatAuthenticator
         self.serverId = serverId
         self.bootEpoch = bootEpoch
         self.receiveTimeoutSeconds = max(1, clientReceiveTimeoutSeconds)
@@ -1854,7 +1866,30 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     private func handle(fd: Int32, peer: String) {
         // C-07: entry owns close; RPC handoff re-enters via `serveHTTPSession`.
-        serveHTTPSession(fd: fd, peer: peer, initialBuffer: Data(), ownsClose: true)
+        let classification = tailcatAuthenticator?.classify(
+            fd: fd,
+            ordinaryReadTimeout: TimeInterval(receiveTimeoutSeconds)
+        ) ?? .ordinary(initialBytes: Data())
+        switch classification {
+        case .ordinary(let initialBytes):
+            serveHTTPSession(
+                fd: fd,
+                peer: peer,
+                initialBuffer: initialBytes,
+                ownsClose: true,
+                remoteAuthenticated: false
+            )
+        case .remoteAuthenticated:
+            serveHTTPSession(
+                fd: fd,
+                peer: peer,
+                initialBuffer: Data(),
+                ownsClose: true,
+                remoteAuthenticated: true
+            )
+        case .rejected:
+            acceptedSockets.close(fd)
+        }
     }
 
     /// C-07: HTTP keep-alive session. Serves request after request on one TCP
@@ -1862,7 +1897,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// `Connection: close`, or WebSocket upgrade. `ownsClose` is false only when
     /// a parent already registered a defer/close owner (unused today; reserved
     /// for nested call sites).
-    private func serveHTTPSession(fd: Int32, peer: String, initialBuffer: Data, ownsClose: Bool) {
+    private func serveHTTPSession(
+        fd: Int32,
+        peer: String,
+        initialBuffer: Data,
+        ownsClose: Bool,
+        remoteAuthenticated: Bool
+    ) {
         var subID: UUID?
         // PERF-114: when the /v1/rpc handler hands the fd off to an async
         // Task, that Task owns the fd lifecycle (send + close). The defer
@@ -2134,7 +2175,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let requiresToken = Self.httpAuthGateRequiresToken(
                 loopbackOnly: bindLoopbackOnly,
                 path: path,
-                hasAuthProvider: auth != nil
+                hasAuthProvider: auth != nil,
+                remoteAuthenticated: remoteAuthenticated
             )
             attachmentUploadOwnerFingerprint =
                 Self.attachmentUploadV2OwnerFingerprint(
@@ -2243,9 +2285,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
         let largeBodyAuthorized: Bool
         if requestedAttachmentUpload,
            Self.httpAuthGateRequiresToken(
-            loopbackOnly: bindLoopbackOnly,
-            path: path,
-            hasAuthProvider: auth != nil
+               loopbackOnly: bindLoopbackOnly,
+               path: path,
+               hasAuthProvider: auth != nil,
+               remoteAuthenticated: remoteAuthenticated
         ), let auth {
             if let presentedBearerToken {
                 largeBodyAuthorized = auth.verify(token: presentedBearerToken)
@@ -2336,7 +2379,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // receive terminal output, agent messages, and file-edit contents.
             // Loopback-only mode stays open, matching the HTTP gate (loopback is
             // trusted) and preserving the loopbackOnly: true test harness.
-            if Self.wsUpgradeRequiresToken(loopbackOnly: bindLoopbackOnly, hasAuthProvider: auth != nil),
+            if Self.wsUpgradeRequiresToken(
+                loopbackOnly: bindLoopbackOnly,
+                hasAuthProvider: auth != nil,
+                remoteAuthenticated: remoteAuthenticated
+            ),
                let auth = auth {
                 guard let token = presentedBearerToken, auth.verify(token: token) else {
                     send(fd: fd, status: 401, contentType: "text/plain",
@@ -2896,7 +2943,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // "Not authorized". It must be exempt like discovery.
         if attachmentUploadV2Route == nil,
            attachmentUploadV3Route == nil,
-           Self.httpAuthGateRequiresToken(loopbackOnly: bindLoopbackOnly, path: path, hasAuthProvider: auth != nil),
+           Self.httpAuthGateRequiresToken(
+               loopbackOnly: bindLoopbackOnly,
+               path: path,
+               hasAuthProvider: auth != nil,
+               remoteAuthenticated: remoteAuthenticated
+           ),
            let auth = auth {
             if requestBearerVerified {
                 // ok
@@ -3148,7 +3200,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     fd: fd,
                     peer: peer,
                     initialBuffer: rpcLeftover,
-                    ownsClose: true
+                    ownsClose: true,
+                    remoteAuthenticated: remoteAuthenticated
                 )
             }
             return
