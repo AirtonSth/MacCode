@@ -1044,6 +1044,15 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             ]
         }
         XCTAssertThrowsError(try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "atomic-missing-conversation",
+            "bot_id": target.botID,
+            "text": "must not retarget the grant",
+            "attachment_ids": [grantID],
+        ])) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .crossTarget)
+        }
+        XCTAssertEqual(sendCalls, 0)
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.send", params: [
             "client_request_id": "atomic-invalid-batch",
             "bot_id": target.botID,
             "conversation_id": target.conversationID,
