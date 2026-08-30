@@ -98,6 +98,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     public private(set) var bonjourPublicationState: BonjourPublicationState = .stopped
     private var directAccessSupervisor: DirectAccessLifecycleSupervisor?
     private let tailcatAuthenticator = TailcatRemoteConnectionAuthenticator()
+    private lazy var tailcatLoopbackListener = TailcatLoopbackListener(
+        authenticator: tailcatAuthenticator
+    )
     private var tailcatSupervisor: TailcatRuntimeSupervisor?
     public var palette: CommandPalette?
     public var settings: SettingsWindowController?
@@ -328,6 +331,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             displayName: Host.current().localizedName ?? "RemoteCode Mac",
             sessionProvider: { tailcatAccountStore.load() },
             authenticator: tailcatAuthenticator,
+            listener: tailcatLoopbackListener,
             statusHandler: { status in
                 DispatchQueue.main.async {
                     NotificationCenter.default.post(
@@ -1140,6 +1144,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                     try self?.startDirectHTTPServer(remoteEnabled: enabled, serverId: serverId, port: port)
                 },
                 stopServer: { [weak self] in
+                    self?.tailcatLoopbackListener.setHTTPServer(nil)
                     self?.httpServer?.stop()
                     self?.httpServer = nil
                 },
@@ -1210,10 +1215,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             bootEpoch: context.liveActivityHostIdentity.bootEpoch,
             clientReceiveTimeoutSeconds: keepAliveSeconds,
             attachmentUploadV2Store: attachmentUploadV2Store,
-            attachmentUploadV3Store: attachmentUploadV3Store,
-            tailcatAuthenticator: tailcatAuthenticator
+            attachmentUploadV3Store: attachmentUploadV3Store
         )
         try http.start()
+        tailcatLoopbackListener.setHTTPServer(http)
         httpServer = http
         configureTailcatAccess()
         try? Self.resolvePetServerFailure(

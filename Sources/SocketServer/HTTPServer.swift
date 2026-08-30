@@ -1345,7 +1345,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
     public let attachmentUploadV2Store: AttachmentUploadV2Store?
     public let attachmentUploadV3Store: AttachmentUploadV3Store?
     public weak var auth: DirectAuthProvider?
-    public let tailcatAuthenticator: TailcatRemoteConnectionAuthenticator?
     /// Stable, persisted **logical** host identity. iOS pins this (RCA-022); it must
     /// survive process restarts or every relaunch looks like a different
     /// Mac and forces a re-pair (GAP-2).
@@ -1420,8 +1419,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         clientReceiveTimeoutSeconds: Int = DirectHTTPServer.httpKeepAliveIdleTimeoutSeconds,
         webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes,
         attachmentUploadV2Store: AttachmentUploadV2Store? = nil,
-        attachmentUploadV3Store: AttachmentUploadV3Store? = nil,
-        tailcatAuthenticator: TailcatRemoteConnectionAuthenticator? = nil
+        attachmentUploadV3Store: AttachmentUploadV3Store? = nil
     ) {
         self.port = port
         self.bindLoopbackOnly = loopbackOnly
@@ -1430,7 +1428,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
         self.attachmentUploadV2Store = attachmentUploadV2Store
         self.attachmentUploadV3Store = attachmentUploadV3Store
         self.auth = auth
-        self.tailcatAuthenticator = tailcatAuthenticator
         self.serverId = serverId
         self.bootEpoch = bootEpoch
         self.receiveTimeoutSeconds = max(1, clientReceiveTimeoutSeconds)
@@ -1866,30 +1863,31 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     private func handle(fd: Int32, peer: String) {
         // C-07: entry owns close; RPC handoff re-enters via `serveHTTPSession`.
-        let classification = tailcatAuthenticator?.classify(
+        serveHTTPSession(
             fd: fd,
-            ordinaryReadTimeout: TimeInterval(receiveTimeoutSeconds)
-        ) ?? .ordinary(initialBytes: Data())
-        switch classification {
-        case .ordinary(let initialBytes):
-            serveHTTPSession(
-                fd: fd,
-                peer: peer,
-                initialBuffer: initialBytes,
-                ownsClose: true,
-                remoteAuthenticated: false
-            )
-        case .remoteAuthenticated:
-            serveHTTPSession(
-                fd: fd,
-                peer: peer,
-                initialBuffer: Data(),
-                ownsClose: true,
-                remoteAuthenticated: true
-            )
-        case .rejected:
-            acceptedSockets.close(fd)
-        }
+            peer: peer,
+            initialBuffer: Data(),
+            ownsClose: true,
+            remoteAuthenticated: false
+        )
+    }
+
+    func registerTailcatConnection(fd: Int32) -> Bool {
+        acceptedSockets.register(fd, scope: .tailcat)
+    }
+
+    func serveTailcatConnection(fd: Int32, peer: String) {
+        serveHTTPSession(
+            fd: fd,
+            peer: peer,
+            initialBuffer: Data(),
+            ownsClose: true,
+            remoteAuthenticated: true
+        )
+    }
+
+    func shutdownTailcatConnections() {
+        acceptedSockets.shutdown(scope: .tailcat)
     }
 
     /// C-07: HTTP keep-alive session. Serves request after request on one TCP

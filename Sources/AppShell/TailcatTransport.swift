@@ -11,7 +11,6 @@ enum TailcatTransportContract {
     static let primaryDERPPort: UInt16 = 444
     static let primarySTUNPort: UInt16 = 3478
     static let primaryRegionID: UInt32 = 1
-    static let loopbackPort: UInt16 = 18217
     static let pollInterval: TimeInterval = 15
     static let renewalInterval: TimeInterval = 5 * 60
     static let hostLease: TimeInterval = 15 * 60
@@ -257,6 +256,7 @@ protocol TailcatBridgeRuntime: Sendable {
         secret: Data,
         listenerID: Data,
         serverID: String,
+        loopbackPort: UInt16,
         relay: TailcatRelay
     ) throws -> TailcatRunningServer
     func closeServer(handle: UInt64) throws
@@ -289,6 +289,7 @@ final class LinkedTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable {
         secret: Data,
         listenerID: Data,
         serverID: String,
+        loopbackPort: UInt16,
         relay: TailcatRelay
     ) throws -> TailcatRunningServer {
         let actualBuild = try buildID()
@@ -321,7 +322,7 @@ final class LinkedTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable {
                                             UnsafeMutablePointer(mutating: serverIDValue),
                                             UnsafeMutablePointer(mutating: hostValue),
                                             UnsafeMutablePointer(mutating: ipv4Value),
-                                            TailcatTransportContract.loopbackPort,
+                                            loopbackPort,
                                             TailcatTransportContract.primaryDERPPort,
                                             TailcatTransportContract.primarySTUNPort,
                                             TailcatTransportContract.primaryRegionID
@@ -335,7 +336,7 @@ final class LinkedTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable {
                                     UnsafeMutablePointer(mutating: secretValue),
                                     UnsafeMutablePointer(mutating: listenerValue),
                                     UnsafeMutablePointer(mutating: serverIDValue),
-                                    TailcatTransportContract.loopbackPort
+                                    loopbackPort
                                 )
                             }
                         }

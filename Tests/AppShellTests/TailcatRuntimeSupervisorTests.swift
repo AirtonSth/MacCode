@@ -11,7 +11,6 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertEqual(TailcatTransportContract.primaryDERPPort, 444)
         XCTAssertEqual(TailcatTransportContract.primarySTUNPort, 3478)
         XCTAssertEqual(TailcatTransportContract.primaryRegionID, 1)
-        XCTAssertEqual(TailcatTransportContract.loopbackPort, 18_217)
         XCTAssertEqual(TailcatTransportContract.pollInterval, 15)
         XCTAssertEqual(TailcatTransportContract.renewalInterval, 5 * 60)
         XCTAssertEqual(TailcatTransportContract.hostLease, 15 * 60)
@@ -69,6 +68,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertNotEqual(starts[0].key, starts[1].key)
         XCTAssertEqual(starts[0].secret, starts[1].secret)
         XCTAssertEqual(starts[0].listenerID, starts[1].listenerID)
+        XCTAssertTrue(starts.allSatisfy { $0.loopbackPort == 45_123 })
         XCTAssertEqual(Set(starts.map(\.serverID)), ["server-1.primary", "server-1.fallback"])
         XCTAssertTrue(starts.allSatisfy { $0.allowedNodePublics == [peer(0xaa)] })
         let publish = await catalog.lastPublish
@@ -232,6 +232,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
             secureStore: store,
             sessionProvider: { Self.session },
             authenticator: TailcatRemoteConnectionAuthenticator(),
+            listener: FakeTailcatListener(),
             now: now,
             automaticPolling: false,
             statusHandler: { _ in }
@@ -306,6 +307,7 @@ private final class FakeTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable
         let secret: Data
         let listenerID: Data
         let serverID: String
+        let loopbackPort: UInt16
         let relay: TailcatRelay
     }
 
@@ -334,6 +336,7 @@ private final class FakeTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable
         secret: Data,
         listenerID: Data,
         serverID: String,
+        loopbackPort: UInt16,
         relay: TailcatRelay
     ) throws -> TailcatRunningServer {
         let call = StartCall(
@@ -342,6 +345,7 @@ private final class FakeTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable
             secret: secret,
             listenerID: listenerID,
             serverID: serverID,
+            loopbackPort: loopbackPort,
             relay: relay
         )
         lock.withLock { starts.append(call) }
@@ -361,6 +365,11 @@ private final class FakeTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable
         default: return false
         }
     }
+}
+
+private final class FakeTailcatListener: TailcatLoopbackListening, @unchecked Sendable {
+    func start() throws -> UInt16 { 45_123 }
+    func stop() {}
 }
 
 private actor FakeTailcatCatalog: TailcatCatalogAPI {

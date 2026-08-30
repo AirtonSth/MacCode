@@ -37,6 +37,7 @@ actor TailcatRuntimeSupervisor {
     private let secureStore: any TailcatSecureStateStoring
     private let sessionProvider: SessionProvider
     private let authenticator: TailcatRemoteConnectionAuthenticator
+    private let listener: any TailcatLoopbackListening
     private let statusHandler: StatusHandler
     private let now: @Sendable () -> Date
     private let automaticPolling: Bool
@@ -59,6 +60,7 @@ actor TailcatRuntimeSupervisor {
         secureStore: any TailcatSecureStateStoring = KeychainTailcatSecureStateStore(),
         sessionProvider: @escaping SessionProvider,
         authenticator: TailcatRemoteConnectionAuthenticator,
+        listener: any TailcatLoopbackListening,
         now: @escaping @Sendable () -> Date = { Date() },
         automaticPolling: Bool = true,
         statusHandler: @escaping StatusHandler
@@ -70,6 +72,7 @@ actor TailcatRuntimeSupervisor {
         self.secureStore = secureStore
         self.sessionProvider = sessionProvider
         self.authenticator = authenticator
+        self.listener = listener
         self.now = now
         self.automaticPolling = automaticPolling
         self.statusHandler = statusHandler
@@ -260,6 +263,7 @@ actor TailcatRuntimeSupervisor {
                     allowedPeerPublic: peers
                 ),
             ])
+            let loopbackPort = try listener.start()
 
             async let primaryTask: Result<TailcatRunningServer, Error> = Task.detached {
                 Result { try self.bridge.startServer(
@@ -268,6 +272,7 @@ actor TailcatRuntimeSupervisor {
                     secret: listenerSecret,
                     listenerID: listenerID,
                     serverID: "\(self.serverID).primary",
+                    loopbackPort: loopbackPort,
                     relay: .primary
                 ) }
             }.value
@@ -278,6 +283,7 @@ actor TailcatRuntimeSupervisor {
                     secret: listenerSecret,
                     listenerID: listenerID,
                     serverID: "\(self.serverID).fallback",
+                    loopbackPort: loopbackPort,
                     relay: .publicFallback
                 ) }
             }.value
@@ -407,6 +413,7 @@ actor TailcatRuntimeSupervisor {
 
     private func stopRuntime() async {
         authenticator.removeAllContexts()
+        listener.stop()
         guard let runtime else { return }
         self.runtime = nil
         _ = await Task.detached {
