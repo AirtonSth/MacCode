@@ -8129,7 +8129,14 @@ public final class BotsViewModel: ObservableObject {
         lastDeskRestoreAttentionListCountForTesting = attentionListCountForTesting
         lastDeskRestoreConversationListCountForTesting = conversationListCountForTesting
         let conversation = conversationForBot(botID)
-        var cached = cachedMessages(botID: botID, conversationID: conversation?.id)
+        if let conversation, selectedBotID == botID {
+            selectedConversation = conversation
+            selectedConversationByBot[botID] = conversation.id
+            if !conversations.contains(where: { $0.id == conversation.id }) {
+                conversations.insert(conversation, at: 0)
+            }
+        }
+        let cached = cachedMessages(botID: botID, conversationID: conversation?.id)
         // Dest first. First paint dest used to dest dest thread
         // (listRecent) before dest dested Chat. Dest dests dest
         // title now; dest dests dest thread after dest dested Chat.
@@ -8291,6 +8298,8 @@ public final class BotsViewModel: ObservableObject {
     private func persistDeskTokenSaverUserTranslation(
         threadID: AgentThreadID,
         runID: AgentRunID,
+        botID: BotID,
+        conversationID: BotConversationID,
         humanText: String,
         attachments: [AgentAttachment],
         wireRequest: String
@@ -8314,6 +8323,23 @@ public final class BotsViewModel: ObservableObject {
             messageId: messageID,
             wireRequestText: wireRequest
         )
+        func attach(to messages: inout [BotDeskMessage]) {
+            guard let index = messages.firstIndex(where: { $0.agentMessageID == messageID }) else {
+                return
+            }
+            messages[index].tokenSaverWireRequest = wireRequest
+        }
+        if var cached = messagesByConversation[conversationID] {
+            attach(to: &cached)
+            messagesByConversation[conversationID] = cached
+        }
+        if var cached = messagesByBot[botID] {
+            attach(to: &cached)
+            messagesByBot[botID] = cached
+        }
+        if selectedBotID == botID, selectedConversation?.id == conversationID {
+            attach(to: &deskMessages)
+        }
     }
 
     /// Dest first. First paint dest used to dest dest thread before
@@ -9093,6 +9119,8 @@ public final class BotsViewModel: ObservableObject {
             try persistDeskTokenSaverUserTranslation(
                 threadID: prepared.thread.id,
                 runID: prepared.runID,
+                botID: bot.id,
+                conversationID: prepared.conversation.id,
                 humanText: userText,
                 attachments: attachments,
                 wireRequest: compressedUser
