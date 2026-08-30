@@ -160,9 +160,89 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         case bulk
     }
 
+    /// Opaque transport data remains raw. Known events retain typed metadata and
+    /// are encoded only when the serial writer dequeues them.
+    private enum ApplicationFrame {
+        case raw(Data)
+        case knownEvent(KnownConnectionEventFrame)
+
+        var byteCount: Int {
+            switch self {
+            case .raw(let data): return data.count
+            case .knownEvent(let frame): return frame.encodedByteCount
+            }
+        }
+
+        var priority: ApplicationPriority {
+            switch self {
+            case .raw(let data): return WebSocketOutboundQueue.applicationPriority(of: data)
+            case .knownEvent(let frame):
+                return WebSocketOutboundQueue.isSheddableKind(frame.event.kind.rawValue)
+                    ? .bulk
+                    : .normal
+            }
+        }
+
+        var eventSequence: Int64? {
+            switch self {
+            case .raw(let data): return WebSocketOutboundQueue.eventSequence(in: data)
+            case .knownEvent(let frame): return frame.event.seq
+            }
+        }
+
+        var reportableDroppedSequence: Int64? {
+            switch self {
+            case .raw(let data):
+                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                return WebSocketOutboundQueue.reportableDroppedSequence(object: object)
+            case .knownEvent(let frame): return frame.event.seq
+            }
+        }
+
+        var isSheddable: Bool {
+            switch self {
+            case .raw(let data): return WebSocketOutboundQueue.isSheddableApplicationFrame(data)
+            case .knownEvent(let frame):
+                return WebSocketOutboundQueue.isSheddableKind(frame.event.kind.rawValue)
+            }
+        }
+
+        var knownCoalescingKey: String? {
+            switch self {
+            case .raw: return nil
+            case .knownEvent(let frame):
+                let payload = frame.event.payload
+                switch frame.event.kind {
+                case .surfaceOutput, .surfaceOutputSummary, .surfaceBrowser:
+                    guard let surfaceID = payload["surface_id"]?.stringValue else { return nil }
+                    return "\(frame.event.kind.rawValue):\(surfaceID)"
+                case .agentItemDelta:
+                    guard let threadID = payload["thread_id"]?.stringValue,
+                          let itemID = payload["item_id"]?.stringValue else { return nil }
+                    return AgentItemDeltaCoalescingIdentity.key(
+                        threadID: threadID,
+                        itemID: itemID,
+                        turnID: payload["turn_id"]?.stringValue
+                    )
+                default:
+                    return nil
+                }
+            }
+        }
+
+        func encoded(
+            knownEventEncoder: (KnownConnectionEventFrame) -> Data?
+        ) -> Data? {
+            switch self {
+            case .raw(let data): return data
+            case .knownEvent(let frame): return knownEventEncoder(frame)
+            }
+        }
+    }
+
     /// Buffered application frame with enqueue stamp for wait instrumentation.
     private struct QueuedApplicationFrame {
-        let data: Data
+        let frame: ApplicationFrame
         let priority: ApplicationPriority
         /// Monotonic timestamp from `now` at accept time (not wall clock).
         let enqueuedAt: TimeInterval
@@ -231,6 +311,7 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     private var pendingApplicationFrames = WebSocketFrameFIFO<QueuedApplicationFrame>()
     private var pendingControlFrames = WebSocketFrameFIFO<(opcode: UInt8, data: Data)>()
     private let applicationWriter: @Sendable (Data) -> Bool
+    private let knownEventEncoder: @Sendable (KnownConnectionEventFrame) -> Data?
     private let controlWriter: @Sendable (UInt8, Data) -> Bool
     private let writeFailureClosingData: Data
     private let onTerminal: @Sendable (String) -> Void
@@ -254,6 +335,9 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         maxQueuedBytes: Int = 1024 * 1024,
         maxQueuedFrames: Int = 4_096,
         applicationWriter: @escaping @Sendable (Data) -> Bool,
+        knownEventEncoder: @escaping @Sendable (KnownConnectionEventFrame) -> Data? = {
+            try? $0.encoded()
+        },
         controlWriter: @escaping @Sendable (UInt8, Data) -> Bool,
         writeFailureClosingData: Data,
         onTerminal: @escaping @Sendable (String) -> Void,
@@ -267,6 +351,7 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         self.configuredMaxQueuedBytes = max(1, maxQueuedBytes)
         self.maxQueuedFrames = max(1, maxQueuedFrames)
         self.applicationWriter = applicationWriter
+        self.knownEventEncoder = knownEventEncoder
         self.controlWriter = controlWriter
         self.writeFailureClosingData = writeFailureClosingData
         self.onTerminal = onTerminal
@@ -332,6 +417,15 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
 
     func enqueueApplication(_ data: Data) -> EnqueueResult {
         guard !data.isEmpty else { return .accepted }
+        return enqueueApplicationFrame(.raw(data))
+    }
+
+    func enqueueEvent(_ frame: KnownConnectionEventFrame) -> EnqueueResult {
+        enqueueApplicationFrame(.knownEvent(frame))
+    }
+
+    private func enqueueApplicationFrame(_ frame: ApplicationFrame) -> EnqueueResult {
+        let byteCount = frame.byteCount
         lock.lock()
         guard state == .open else {
             lock.unlock()
@@ -343,35 +437,35 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         let softAppCeiling = max(0, budget - controlReserve)
         let softBulkCeiling = max(0, softAppCeiling - interactiveReserve)
         let applicationQueued = max(0, queuedBytes - queuedControlBytes)
-        let priority = Self.applicationPriority(of: data)
+        let priority = frame.priority
         // Hard bound: never exceed the total byte/frame budget.
         guard queuedFrames < maxQueuedFrames,
-              data.count <= budget - queuedBytes else {
+              byteCount <= budget - queuedBytes else {
             lock.unlock()
             return .queueFull
         }
-        let afterApp = applicationQueued + data.count
+        let afterApp = applicationQueued + byteCount
         // Soft reservations: small frames must leave room for control and
         // interactive/priority traffic. A single large frame that cannot leave
         // those slices (cold start / oversized payload) still uses the hard budget.
         switch priority {
         case .bulk:
-            if afterApp > softBulkCeiling, data.count <= interactiveReserve + controlReserve {
+            if afterApp > softBulkCeiling, byteCount <= interactiveReserve + controlReserve {
                 lock.unlock()
                 return .queueFull
             }
         case .priority, .normal:
-            if afterApp > softAppCeiling, data.count <= controlReserve {
+            if afterApp > softAppCeiling, byteCount <= controlReserve {
                 lock.unlock()
                 return .queueFull
             }
         }
         let queued = QueuedApplicationFrame(
-            data: data,
+            frame: frame,
             priority: priority,
             enqueuedAt: now()
         )
-        queuedBytes += data.count
+        queuedBytes += byteCount
         queuedFrames += 1
         switch priority {
         case .priority:
@@ -450,63 +544,33 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             return .empty
         }
 
-        // Coalesce operates on payloads only; reattach the oldest matching stamp
-        // so enqueue→send wait still reflects original acceptance time.
-        var enqueueStampsByData: [Data: TimeInterval] = [:]
-        enqueueStampsByData.reserveCapacity(queued.count)
-        for frame in queued {
-            if let existing = enqueueStampsByData[frame.data] {
-                enqueueStampsByData[frame.data] = min(existing, frame.enqueuedAt)
-            } else {
-                enqueueStampsByData[frame.data] = frame.enqueuedAt
-            }
-        }
-
-        let frames = queued.map(\.data)
-        let beforeBytes = frames.reduce(0) { $0 + $1.count }
-        let beforeCount = frames.count
-
-        let coalesced = Self.coalesceApplicationFrames(frames)
-        let coalescedAway = beforeCount - coalesced.count
+        let beforeBytes = queued.reduce(0) { $0 + $1.frame.byteCount }
+        let beforeCount = queued.count
+        let coalesced = Self.coalesceQueuedApplicationFrames(queued)
+        let coalescedAway = beforeCount - coalesced.frames.count
 
         var kept: [QueuedApplicationFrame] = []
-        var droppedSequences: [Int64] = []
+        var droppedSequences = coalesced.droppedEventSequences
         var discardedBulk = 0
-        kept.reserveCapacity(coalesced.count)
-        for frame in coalesced {
-            // PERF: one JSON parse per coalesced frame for priority + shed +
-            // dropped sequence (was applicationPriority + isSheddable +
-            // eventSequence/frameType/snapshotSequence = 2–4 parses).
-            let object = try? JSONSerialization.jsonObject(with: frame) as? [String: Any]
+        kept.reserveCapacity(coalesced.frames.count)
+        for queuedFrame in coalesced.frames {
             // Snapshots and sheddable event kinds are bulk under pressure.
-            let priority = Self.applicationPriority(object: object)
-            if priority == .bulk || Self.isSheddableApplicationFrame(object: object) {
+            let priority = queuedFrame.frame.priority
+            if priority == .bulk || queuedFrame.frame.isSheddable {
                 discardedBulk += 1
-                if let sequence = Self.reportableDroppedSequence(object: object) {
+                if let sequence = queuedFrame.frame.reportableDroppedSequence {
                     droppedSequences.append(sequence)
                 }
                 continue
             }
-            let stamp = enqueueStampsByData[frame] ?? now()
-            kept.append(QueuedApplicationFrame(data: frame, priority: priority, enqueuedAt: stamp))
+            kept.append(QueuedApplicationFrame(
+                frame: queuedFrame.frame,
+                priority: priority,
+                enqueuedAt: queuedFrame.enqueuedAt
+            ))
         }
 
-        // If coalescing alone made room and nothing bulk was shed, still report
-        // sequences lost to last-write-wins coalesce so the caller can baseline.
-        if discardedBulk == 0, coalescedAway > 0 {
-            let keptSequences = Set(kept.compactMap { frame -> Int64? in
-                let object = try? JSONSerialization.jsonObject(with: frame.data) as? [String: Any]
-                return Self.eventSequence(object: object)
-            })
-            for frame in frames {
-                let object = try? JSONSerialization.jsonObject(with: frame) as? [String: Any]
-                guard let sequence = Self.eventSequence(object: object),
-                      !keptSequences.contains(sequence) else { continue }
-                droppedSequences.append(sequence)
-            }
-        }
-
-        let afterBytes = kept.reduce(0) { $0 + $1.data.count }
+        let afterBytes = kept.reduce(0) { $0 + $1.frame.byteCount }
         let controlBytes = queuedControlBytes
         let controlFrames = queuedFrames - beforeCount
         queuedBytes = max(0, controlBytes) + afterBytes
@@ -531,6 +595,96 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         )
         lock.unlock()
         return outcome
+    }
+
+    private struct CoalescedQueuedFrames {
+        var frames: [QueuedApplicationFrame]
+        var droppedEventSequences: [Int64]
+    }
+
+    /// Typed known events coalesce from metadata. Raw parsing is confined to
+    /// the opaque/replay adapter represented by `ApplicationFrame.raw`.
+    private static func coalesceQueuedApplicationFrames(
+        _ queued: [QueuedApplicationFrame],
+        onRawParse: (() -> Void)? = nil,
+        onRawEncode: (() -> Void)? = nil
+    ) -> CoalescedQueuedFrames {
+        var result: [QueuedApplicationFrame] = []
+        var keySlots: [String: Int] = [:]
+        var deltaFramesBySlot: [Int: [QueuedApplicationFrame]] = [:]
+        var dropped: [Int64] = []
+        result.reserveCapacity(queued.count)
+
+        for queuedFrame in queued {
+            let key: String?
+            switch queuedFrame.frame {
+            case .raw(let data):
+                onRawParse?()
+                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                key = coalescingKey(object: object)
+            case .knownEvent:
+                key = queuedFrame.frame.knownCoalescingKey
+            }
+            guard let key else {
+                result.append(queuedFrame)
+                continue
+            }
+            guard let index = keySlots[key] else {
+                keySlots[key] = result.count
+                result.append(queuedFrame)
+                continue
+            }
+
+            if key.hasPrefix("agent.item.delta:") {
+                if deltaFramesBySlot[index] == nil {
+                    deltaFramesBySlot[index] = [result[index]]
+                }
+                deltaFramesBySlot[index]?.append(queuedFrame)
+                continue
+            }
+            let previous = result[index]
+            if let sequence = previous.frame.eventSequence { dropped.append(sequence) }
+            result[index] = QueuedApplicationFrame(
+                frame: queuedFrame.frame,
+                priority: queuedFrame.frame.priority,
+                enqueuedAt: min(previous.enqueuedAt, queuedFrame.enqueuedAt)
+            )
+        }
+
+        for (index, frames) in deltaFramesBySlot {
+            dropped.append(contentsOf: frames.dropLast().compactMap(\.frame.eventSequence))
+            let earliest = frames.map(\.enqueuedAt).min() ?? frames[0].enqueuedAt
+            let mergedFrame: ApplicationFrame
+            if frames.allSatisfy({ if case .raw = $0.frame { true } else { false } }) {
+                let raw = frames.compactMap { queued -> Data? in
+                    guard case .raw(let data) = queued.frame else { return nil }
+                    return data
+                }
+                let linear = WebSocketEventBatcher.mergeAgentItemDeltasInOrder(
+                    raw,
+                    onParse: onRawParse,
+                    onEncode: onRawEncode
+                )
+                mergedFrame = .raw(linear.merged.last ?? raw.last!)
+            } else if frames.allSatisfy({ if case .knownEvent = $0.frame { true } else { false } }) {
+                let known = frames.compactMap { queued -> KnownConnectionEventFrame? in
+                    guard case .knownEvent(let frame) = queued.frame else { return nil }
+                    return frame
+                }
+                mergedFrame = .knownEvent(known.dropFirst().reduce(known[0]) { accumulated, frame in
+                    WebSocketEventBatcher.mergeKnownAgentItemDeltaFrames(accumulated, frame)
+                        ?? frame
+                })
+            } else {
+                mergedFrame = frames.last!.frame
+            }
+            result[index] = QueuedApplicationFrame(
+                frame: mergedFrame,
+                priority: mergedFrame.priority,
+                enqueuedAt: earliest
+            )
+        }
+        return CoalescedQueuedFrames(frames: result, droppedEventSequences: dropped)
     }
 
     /// Classify using only existing protocol `type` / sheddable `kind` fields
@@ -712,62 +866,17 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         onParse: (() -> Void)? = nil,
         onEncode: (() -> Void)? = nil
     ) -> [Data] {
-        guard !frames.isEmpty else { return [] }
-        var result: [Data] = []
-        var keySlots: [String: Int] = [:]
-        var deltaFramesBySlot: [Int: [Data]] = [:]
-
-        for frame in frames {
-            onParse?()
-            let object = try? JSONSerialization.jsonObject(with: frame) as? [String: Any]
-            guard let key = coalescingKey(object: object) else {
-                result.append(frame)
-                continue
-            }
-            if let index = keySlots[key] {
-                if key.hasPrefix("agent.item.delta:") {
-                    if deltaFramesBySlot[index] == nil {
-                        deltaFramesBySlot[index] = [result[index]]
-                    }
-                    deltaFramesBySlot[index]?.append(frame)
-                } else {
-                    result[index] = frame
-                }
-            } else {
-                keySlots[key] = result.count
-                result.append(frame)
-            }
+        let queued = frames.map {
+            QueuedApplicationFrame(frame: .raw($0), priority: .normal, enqueuedAt: 0)
         }
-
-        // Pressure backlogs can contain hundreds of deltas for one item. Merge
-        // each keyed run once so parsing, concatenation, and encoding stay O(n)
-        // instead of repeatedly rewriting a growing JSON frame.
-        for (index, deltaFrames) in deltaFramesBySlot {
-            let linear = WebSocketEventBatcher.mergeAgentItemDeltasInOrder(
-                deltaFrames,
-                onParse: onParse,
-                onEncode: onEncode
-            )
-            if linear.merged.count == 1, let merged = linear.merged.first {
-                result[index] = merged
-                continue
-            }
-
-            // Same coalescing keys carry the same thread/item/turn identity, so
-            // this is reachable only if Foundation cannot encode a parsed frame.
-            // Preserve the prior pairwise behavior in that failure mode.
-            var fallback = deltaFrames[0]
-            for frame in deltaFrames.dropFirst() {
-                fallback = WebSocketEventBatcher.mergeAgentItemDeltaFrames(
-                    fallback,
-                    frame,
-                    onParse: onParse,
-                    onEncode: onEncode
-                ) ?? frame
-            }
-            result[index] = fallback
+        return coalesceQueuedApplicationFrames(
+            queued,
+            onRawParse: onParse,
+            onRawEncode: onEncode
+        ).frames.compactMap { queued in
+            guard case .raw(let data) = queued.frame else { return nil }
+            return data
         }
-        return result
     }
 
     private func effectiveMaxQueuedBytesLocked() -> Int {
@@ -868,7 +977,7 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         case .control(let opcode, let data):
             writeControl(opcode: opcode, data: data)
         case .application(let frame, _):
-            writeApplication(frame.data)
+            writeApplication(frame.frame)
         case nil:
             return
         }
@@ -890,13 +999,19 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         return waitMs
     }
 
-    private func writeApplication(_ data: Data) {
+    private func writeApplication(_ frame: ApplicationFrame) {
+        let byteCount = frame.byteCount
         guard shouldWriteQueuedItem() else {
-            removeQueuedItem(byteCount: data.count, isControl: false)
+            removeQueuedItem(byteCount: byteCount, isControl: false)
+            return
+        }
+        guard let data = frame.encoded(knownEventEncoder: knownEventEncoder) else {
+            removeQueuedItem(byteCount: byteCount, isControl: false)
+            terminateImmediatelyAfterWriteFailure()
             return
         }
         let succeeded = applicationWriter(data)
-        removeQueuedItem(byteCount: data.count, isControl: false, countAsDrain: succeeded)
+        removeQueuedItem(byteCount: byteCount, isControl: false, countAsDrain: succeeded)
         if !succeeded { terminateImmediatelyAfterWriteFailure() }
     }
 

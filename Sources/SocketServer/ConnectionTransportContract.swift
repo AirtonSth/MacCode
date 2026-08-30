@@ -1,4 +1,5 @@
 import Foundation
+import RemoteCodeTreaty
 
 public struct ConnectionDomainRevisions: Codable, Equatable, Sendable {
     public let shell: Int64
@@ -308,6 +309,71 @@ struct ConnectionEventFrame: Codable, Equatable, Sendable {
     let occurredAtEpochMs: Int64
     let kind: String
     let payload: JSONValue
+
+    /// Exact encoded size without allocating/serializing the frame. JSON key
+    /// order does not affect byte length.
+    var encodedByteCount: Int {
+        let values: [(String, Int)] = [
+            ("protocolVersion", EventBus.jsonInt64ByteCount(Int64(protocolVersion))),
+            ("type", EventBus.jsonStringByteCount(type)),
+            ("connectionId", EventBus.jsonStringByteCount(connectionId)),
+            ("hostId", EventBus.jsonStringByteCount(hostId)),
+            ("bootEpoch", String(bootEpoch).utf8.count),
+            ("sequence", EventBus.jsonInt64ByteCount(sequence)),
+            ("eventId", EventBus.jsonStringByteCount(eventId)),
+            ("occurredAtEpochMs", EventBus.jsonInt64ByteCount(occurredAtEpochMs)),
+            ("kind", EventBus.jsonStringByteCount(kind)),
+            ("payload", EventBus.jsonValueByteCount(payload)),
+        ]
+        return 2 + max(0, values.count - 1) + values.reduce(0) { count, field in
+            count + EventBus.jsonStringByteCount(field.0) + 1 + field.1
+        }
+    }
+}
+
+/// Typed metadata carried from EventBus through transforms, batching and queue
+/// pressure. Conversion to `ConnectionEventFrame` happens only at the final
+/// socket write, so known event JSON is never parsed to recover metadata.
+struct KnownConnectionEventFrame: Equatable, Sendable {
+    let event: EventBus.KnownEvent
+    let connectionId: String
+    let hostId: String
+    let bootEpoch: UInt64
+
+    var wireFrame: ConnectionEventFrame {
+        ConnectionEventFrame(
+            protocolVersion: ConnectionTransportFrame.protocolVersion,
+            type: "event",
+            connectionId: connectionId,
+            hostId: hostId,
+            bootEpoch: bootEpoch,
+            sequence: event.seq,
+            eventId: "\(bootEpoch):\(event.seq)",
+            occurredAtEpochMs: Int64(event.ts * 1_000),
+            kind: event.kind.rawValue,
+            payload: .object(event.payload)
+        )
+    }
+
+    var encodedByteCount: Int { wireFrame.encodedByteCount }
+
+    func replacingPayload(_ payload: [String: JSONValue]) -> KnownConnectionEventFrame {
+        KnownConnectionEventFrame(
+            event: EventBus.KnownEvent(
+                seq: event.seq,
+                kind: event.kind,
+                payload: payload,
+                ts: event.ts
+            ),
+            connectionId: connectionId,
+            hostId: hostId,
+            bootEpoch: bootEpoch
+        )
+    }
+
+    func encoded() throws -> Data {
+        try ConnectionTransportFrame.event(wireFrame).encoded()
+    }
 }
 
 struct ConnectionBaselineRequiredFrame: Codable, Equatable, Sendable {

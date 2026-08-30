@@ -2700,23 +2700,21 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 }
             }
             let emitPressureBaseline: @Sendable () -> Void = { stickyBaseline.emit() }
-            let recordAcceptedEvent: @Sendable (Data) -> Void = { data in
-                if case .event(let frame) = try? ConnectionTransportFrame.decodeStrict(data) {
-                    if case .gap(let expected, let received) = sequenceWatermark.recordEnqueuedEvent(
-                        sequence: frame.sequence
-                    ) {
-                        _ = outbound.terminate(
-                            errorData: nil,
-                            closingData: self.connectionClosingData(
-                                connectionId: connectionId,
-                                reason: "eventGap_\(expected)_\(received)",
-                                code: 1012,
-                                retryable: true,
-                                retryAfterMs: 0
-                            ),
-                            reason: "event_gap"
-                        )
-                    }
+            let recordAcceptedEvent: @Sendable (Int64) -> Void = { sequence in
+                if case .gap(let expected, let received) = sequenceWatermark.recordEnqueuedEvent(
+                    sequence: sequence
+                ) {
+                    _ = outbound.terminate(
+                        errorData: nil,
+                        closingData: self.connectionClosingData(
+                            connectionId: connectionId,
+                            reason: "eventGap_\(expected)_\(received)",
+                            code: 1012,
+                            retryable: true,
+                            retryAfterMs: 0
+                        ),
+                        reason: "event_gap"
+                    )
                 }
             }
             // METRICS: last per-connection queue sample for /v1/health gauges.
@@ -2729,13 +2727,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 wsTracker.updateQueuedBytes(previous: previous, current: current)
             }
             /// C-04 degrade ladder: never close on queueFull.
-            let enqueueApplicationOrDegrade: @Sendable (Data) -> Void = { [wsTracker] data in
+            let enqueueEventOrDegrade: @Sendable (KnownConnectionEventFrame) -> Void = {
+                [wsTracker] frame in
                 // Transport-limit observability for 3G: frame size + queue depth
                 // + rejected/evicted counts. Does not change enqueue policy.
-                wsTracker.recordFrameBytes(data.count)
-                switch outbound.enqueueApplication(data) {
+                wsTracker.recordFrameBytes(frame.encodedByteCount)
+                switch outbound.enqueueEvent(frame) {
                 case .accepted:
-                    recordAcceptedEvent(data)
+                    recordAcceptedEvent(frame.event.seq)
                     sampleOutboundQueuedBytes()
                 case .queueFull:
                     let outcome = outbound.degrade()
@@ -2747,24 +2746,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         emitPressureBaseline()
                     }
                     // Prefer shedding bulk/diagnostic arrivals over closing.
-                    if WebSocketOutboundQueue.isSheddableApplicationFrame(data) {
-                        if let sequence = WebSocketOutboundQueue.eventSequence(in: data) {
-                            sequenceWatermark.recordFilteredEvent(sequence: sequence)
-                        }
+                    if WebSocketOutboundQueue.isSheddableKind(frame.event.kind.rawValue) {
+                        sequenceWatermark.recordFilteredEvent(sequence: frame.event.seq)
                         wsTracker.recordFramesRejectedOrEvicted(1)
                         emitPressureBaseline()
                         return
                     }
-                    switch outbound.enqueueApplication(data) {
+                    switch outbound.enqueueEvent(frame) {
                     case .accepted:
-                        recordAcceptedEvent(data)
+                        recordAcceptedEvent(frame.event.seq)
                         sampleOutboundQueuedBytes()
                     case .queueFull:
                         // Still saturated after degrade: drop with filtered
                         // watermark accounting; socket stays open.
-                        if let sequence = WebSocketOutboundQueue.eventSequence(in: data) {
-                            sequenceWatermark.recordFilteredEvent(sequence: sequence)
-                        }
+                        sequenceWatermark.recordFilteredEvent(sequence: frame.event.seq)
                         wsTracker.recordFramesRejectedOrEvicted(1)
                         emitPressureBaseline()
                     case .closed:
@@ -2790,10 +2785,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 coalescesStreamingDeltas: true,
                 // C-14: LWW-collapsed summary frames never leave the host; advance
                 // the gap watermark so zero new 1012 closes in soak.
-                onCoalescedAway: { data in
-                    if let sequence = WebSocketOutboundQueue.eventSequence(in: data) {
-                        sequenceWatermark.recordFilteredEvent(sequence: sequence)
-                    }
+                onCoalescedAway: { sequence in
+                    sequenceWatermark.recordFilteredEvent(sequence: sequence)
                 },
                 // S10: admission overflow records lost sequences and uses the
                 // established baselineRequired transport contract (not a custom event).
@@ -2802,10 +2795,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         sequenceWatermark.recordFilteredEvent(sequence: sequence)
                     }
                     emitPressureBaseline()
+                },
+                sendKnownEvent: { frame in
+                    enqueueEventOrDegrade(frame)
                 }
-            ) { data in
-                enqueueApplicationOrDegrade(data)
-            }
+            )
             // PERF-MAC_SOCKET-:110 -- honor the client's last-seen seq so a
             // reconnect receives only the delta (events after that seq), not the
             // full retained backlog (~4 MiB on a busy session).
@@ -2849,7 +2843,28 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     sequenceWatermark.recordFilteredEvent(sequence: sequence)
                 }
             ) { ev in
-                let frame = ConnectionTransportFrame.event(ConnectionEventFrame(
+                if let knownEvent = ev.knownEvent {
+                    batcher.enqueue(KnownConnectionEventFrame(
+                        event: knownEvent,
+                        connectionId: connectionId,
+                        hostId: self.serverId,
+                        bootEpoch: self.bootEpoch
+                    ))
+                    return
+                }
+                // A catalogued event with a malformed non-object payload cannot
+                // advance this connection. Re-anchor through the established
+                // baseline flow. Future unknown kinds stay raw and sequence-bearing.
+                guard ev.knownKind == nil else {
+                    batcher.flush()
+                    sequenceWatermark.recordFilteredEvent(sequence: ev.seq)
+                    emitPressureBaseline()
+                    return
+                }
+                // Preserve sequence order with known events already waiting in
+                // the typed coalescing window before using the future-raw adapter.
+                batcher.flush()
+                let rawFrame = ConnectionTransportFrame.event(ConnectionEventFrame(
                     protocolVersion: ConnectionTransportFrame.protocolVersion,
                     type: "event",
                     connectionId: connectionId,
@@ -2861,7 +2876,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     kind: ev.kind,
                     payload: ev.payload
                 ))
-                guard let data = try? frame.encoded() else {
+                guard let data = try? rawFrame.encoded() else {
                     _ = outbound.terminate(
                         errorData: nil,
                         closingData: self.connectionClosingData(
@@ -2875,7 +2890,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     )
                     return
                 }
-                batcher.enqueue(event: ev, data: data)
+                self.wsTracker.recordFrameBytes(data.count)
+                switch outbound.enqueueApplication(data) {
+                case .accepted:
+                    recordAcceptedEvent(ev.seq)
+                    sampleOutboundQueuedBytes()
+                case .queueFull:
+                    _ = outbound.degrade()
+                    if outbound.enqueueApplication(data) == .accepted {
+                        recordAcceptedEvent(ev.seq)
+                        sampleOutboundQueuedBytes()
+                    } else {
+                        sequenceWatermark.recordFilteredEvent(sequence: ev.seq)
+                        emitPressureBaseline()
+                    }
+                case .closed:
+                    break
+                }
             }
             subIDBox.value = id
             subID = id

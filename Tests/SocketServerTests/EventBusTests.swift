@@ -32,8 +32,8 @@ final class EventBusTests: XCTestCase {
         var live: [String] = []
         _ = bus.subscribe(since: nil) { live.append($0.kind) }
 
-        bus.publish(kind: .surfaceOutput, payload: .string("chunk"))
-        bus.publish(kind: .surfaceCreated, payload: .null)
+        bus.publish(kind: .surfaceOutput, payload: .object(["base64": .string("chunk")]))
+        bus.publish(kind: .surfaceCreated, payload: .object([:]))
 
         var replayed: [String] = []
         _ = bus.subscribe(since: 0) { replayed.append($0.kind) }
@@ -59,8 +59,12 @@ final class EventBusTests: XCTestCase {
 
     func test_recentEventsReportsBaselineRequiredWhenReplayByteCapIsExceeded() {
         let bus = EventBus(recentLimit: 512, recentByteLimit: 20_000)
-        bus.publish(kind: .surfaceOutput, payload: .string(String(repeating: "x", count: 2_000)))
-        bus.publish(kind: .surfaceOutput, payload: .string(String(repeating: "y", count: 2_000)))
+        bus.publish(kind: .surfaceOutput, payload: .object([
+            "base64": .string(String(repeating: "x", count: 2_000)),
+        ]))
+        bus.publish(kind: .surfaceOutput, payload: .object([
+            "base64": .string(String(repeating: "y", count: 2_000)),
+        ]))
 
         let recent = bus.recentEvents(since: 0, maxBytes: 800)
 
@@ -255,7 +259,7 @@ final class EventBusTests: XCTestCase {
         _ = bus.subscribe(since: nil) { _ in delivered.fulfill() }
 
         DispatchQueue.global().async {
-            bus.publish(kind: .workspaceUpdated, payload: .null)
+            bus.publish(kind: .workspaceUpdated, payload: .object([:]))
             publishFinished.fulfill()
         }
 

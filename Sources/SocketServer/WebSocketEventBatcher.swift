@@ -20,6 +20,35 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     /// immediately when only streaming coalescing is active.
     static let fullStreamCoalescedKinds: Set<RemoteCodeEventKind> = [.agentItemDelta]
 
+    private enum Frame: Sendable {
+        case raw(event: EventBus.Event, data: Data)
+        case known(KnownConnectionEventFrame)
+
+        var event: EventBus.Event {
+            switch self {
+            case .raw(let event, _): return event
+            case .known(let frame): return frame.event.rawEvent
+            }
+        }
+
+        var knownEvent: EventBus.KnownEvent? {
+            switch self {
+            case .raw(let event, _): return event.knownEvent
+            case .known(let frame): return frame.event
+            }
+        }
+
+        var byteCount: Int {
+            switch self {
+            case .raw(_, let data): return data.count
+            case .known(let frame): return frame.encodedByteCount
+            }
+        }
+
+        var count: Int { byteCount }
+        var sequence: Int64 { event.seq }
+    }
+
     private let enabled: Bool
     private let filter: EventStreamFilter
     private let delay: TimeInterval
@@ -34,20 +63,20 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     /// Called when keyed last-write-wins drops a previously buffered frame.
     /// C-14: caller must `recordFilteredEvent` so collapsed summary seqs do not
     /// surface as spurious 1012 gaps.
-    private let onCoalescedAway: (@Sendable (Data) -> Void)?
+    private let onCoalescedAway: @Sendable (Frame) -> Void
     /// S10: overflow records lost sequences and signals baseline recovery.
-    private let onAdmissionOverflow: (@Sendable (_ lostSequences: [Int64], _ reason: String) -> Void)?
-    private let send: @Sendable (Data) -> Void
+    private let onAdmissionOverflow: @Sendable (_ lostSequences: [Int64], _ reason: String) -> Void
+    private let send: @Sendable (Frame) -> Void
     private let maxPendingBytes: Int
     private let maxPendingCount: Int
     private let maxPendingAge: TimeInterval
     private let queue = DispatchQueue(label: "io.remotecode.ws-event-batcher")
     // Keyed (coalescing) state
-    private var pending: [String: Data] = [:]
+    private var pending: [String: Frame] = [:]
     private var order: [String] = []
     private var scheduled = false
     // Nil-key (cross-kind) batch state
-    private var nilKeyQueue: [Data] = []
+    private var nilKeyQueue: [Frame] = []
     private var nilKeyScheduled = false
     private var stopped = false
     private var pendingBytes: Int = 0
@@ -79,9 +108,43 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         self.maxPendingBytes = max(1, maxPendingBytes)
         self.maxPendingCount = max(1, maxPendingCount)
         self.maxPendingAge = max(0, maxPendingAge)
-        self.onCoalescedAway = onCoalescedAway
+        self.onCoalescedAway = { frame in
+            guard case .raw(_, let data) = frame else { return }
+            onCoalescedAway?(data)
+        }
+        self.onAdmissionOverflow = onAdmissionOverflow ?? { _, _ in }
+        self.send = { frame in
+            guard case .raw(_, let data) = frame else { return }
+            send(data)
+        }
+    }
+
+    init(
+        enabled: Bool,
+        filter: EventStreamFilter,
+        delay: TimeInterval = 0.075,
+        coalescesStreamingDeltas: Bool = false,
+        maxPendingBytes: Int = WebSocketEventBatcher.defaultMaxPendingBytes,
+        maxPendingCount: Int = WebSocketEventBatcher.defaultMaxPendingCount,
+        maxPendingAge: TimeInterval = WebSocketEventBatcher.defaultMaxPendingAge,
+        onCoalescedAway: @escaping @Sendable (Int64) -> Void = { _ in },
+        onAdmissionOverflow: @escaping @Sendable ([Int64], String) -> Void = { _, _ in },
+        sendKnownEvent: @escaping @Sendable (KnownConnectionEventFrame) -> Void
+    ) {
+        self.enabled = enabled
+        self.filter = filter
+        self.delay = max(0, delay)
+        self.nilKeyDelay = filter.isCellularSafe ? max(0, delay) : Self.crossKindDelay
+        self.coalescesStreamingDeltas = coalescesStreamingDeltas
+        self.maxPendingBytes = max(1, maxPendingBytes)
+        self.maxPendingCount = max(1, maxPendingCount)
+        self.maxPendingAge = max(0, maxPendingAge)
+        self.onCoalescedAway = { onCoalescedAway($0.sequence) }
         self.onAdmissionOverflow = onAdmissionOverflow
-        self.send = send
+        self.send = { frame in
+            guard case .known(let known) = frame else { return }
+            sendKnownEvent(known)
+        }
     }
 
     /// Test/telemetry seam: current bounded pending admission footprint.
@@ -95,6 +158,14 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     }
 
     func enqueue(event: EventBus.Event, data: Data) {
+        enqueue(event: event, frame: .raw(event: event, data: data))
+    }
+
+    func enqueue(_ frame: KnownConnectionEventFrame) {
+        enqueue(event: frame.event.rawEvent, frame: .known(frame))
+    }
+
+    private func enqueue(event: EventBus.Event, frame data: Frame) {
         // Synchronous pre-queue bound (bytes + count) before capturing data on the
         // serial queue. Prevents unbounded Dispatch backlog under flood.
         preQueueLock.lock()
@@ -105,9 +176,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             overflowCount += 1
             let count = overflowCount
             preQueueLock.unlock()
-            var lost: [Int64] = []
-            if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
-            onAdmissionOverflow?(lost, "pre_queue_admission")
+            onAdmissionOverflow([data.sequence], "pre_queue_admission")
             _ = count
             return
         }
@@ -142,12 +211,11 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                     }
                     guard self.canAdmitSingleFrameLocked(byteCount: data.count) else {
                         // Frame alone exceeds budget: record its sequence as lost and drop.
-                        var lost: [Int64] = []
-                        if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                        let lost = [data.sequence]
                         self.preQueueLock.lock()
                         self.overflowCount += 1
                         self.preQueueLock.unlock()
-                        self.onAdmissionOverflow?(lost, "frame_exceeds_budget")
+                        self.onAdmissionOverflow(lost, "frame_exceeds_budget")
                         return
                     }
                     self.noteEnqueueLocked(data)
@@ -171,23 +239,21 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                     defer { releasePreQueue() }
                     guard !self.stopped else { return }
                     guard self.canAdmitSingleFrameLocked(byteCount: data.count) else {
-                        var lost: [Int64] = []
-                        if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                        let lost = [data.sequence]
                         self.preQueueLock.lock()
                         self.overflowCount += 1
                         self.preQueueLock.unlock()
-                        self.onAdmissionOverflow?(lost, "frame_exceeds_budget")
+                        self.onAdmissionOverflow(lost, "frame_exceeds_budget")
                         return
                     }
                     if self.wouldExceedAdmissionLocked(additionalBytes: data.count) {
                         self.flushLocked()
                     }
                     if self.wouldExceedAdmissionLocked(additionalBytes: data.count) {
-                        var lost: [Int64] = []
-                        if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                        let lost = [data.sequence]
                         self.handleOverflowLocked(reason: "aggregate_after_non_delta")
                         if !lost.isEmpty {
-                            self.onAdmissionOverflow?(lost, "aggregate_after_non_delta")
+                            self.onAdmissionOverflow(lost, "aggregate_after_non_delta")
                         }
                         return
                     }
@@ -207,10 +273,10 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                 // charge only the growth vs any existing keyed entry so a fitting
                 // replacement does not trip the aggregate cap as a new frame.
                 let previous = self.pending[key]
-                let candidate: Data
+                let candidate: Frame
                 if let previous,
                    self.filter.coalescingMergesByConcatenation(for: event),
-                   let merged = Self.mergeAgentItemDeltaFrames(previous, data) {
+                   let merged = Self.mergeFrames(previous, data) {
                     candidate = merged
                 } else {
                     candidate = data
@@ -223,12 +289,11 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                         self.handleOverflowLocked(reason: "admission_bytes_or_count")
                     }
                     guard self.canAdmitSingleFrameLocked(byteCount: candidate.count) else {
-                        var lost: [Int64] = []
-                        if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                        let lost = [data.sequence]
                         self.preQueueLock.lock()
                         self.overflowCount += 1
                         self.preQueueLock.unlock()
-                        self.onAdmissionOverflow?(lost, "frame_exceeds_budget")
+                        self.onAdmissionOverflow(lost, "frame_exceeds_budget")
                         return
                     }
                 } else if additionalBytes > 0 {
@@ -242,14 +307,11 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                                 additionalCount: 1
                               )
                         else {
-                            var lost: [Int64] = []
-                            if let seq = WebSocketOutboundQueue.eventSequence(in: data) {
-                                lost.append(seq)
-                            }
+                            let lost = [data.sequence]
                             self.preQueueLock.lock()
                             self.overflowCount += 1
                             self.preQueueLock.unlock()
-                            self.onAdmissionOverflow?(lost, "replacement_after_overflow")
+                            self.onAdmissionOverflow(lost, "replacement_after_overflow")
                             return
                         }
                         self.order.append(key)
@@ -271,7 +333,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                 // for admission above. Re-merging here reparsed and re-encoded the
                 // growing delta a second time for every token.
                 if let livePrevious = self.pending[key] {
-                    self.onCoalescedAway?(livePrevious)
+                    self.onCoalescedAway(livePrevious)
                     self.pendingBytes -= livePrevious.count
                     self.noteEnqueueLocked(candidate)
                     self.pending[key] = candidate
@@ -301,12 +363,11 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                     self.handleOverflowLocked(reason: "admission_bytes_or_count")
                 }
                 guard self.canAdmitSingleFrameLocked(byteCount: data.count) else {
-                    var lost: [Int64] = []
-                    if let seq = WebSocketOutboundQueue.eventSequence(in: data) { lost.append(seq) }
+                    let lost = [data.sequence]
                     self.preQueueLock.lock()
                     self.overflowCount += 1
                     self.preQueueLock.unlock()
-                    self.onAdmissionOverflow?(lost, "frame_exceeds_budget")
+                    self.onAdmissionOverflow(lost, "frame_exceeds_budget")
                     return
                 }
                 self.noteEnqueueLocked(data)
@@ -324,7 +385,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         }
     }
 
-    private func noteEnqueueLocked(_ data: Data) {
+    private func noteEnqueueLocked(_ data: Frame) {
         pendingBytes += data.count
         if oldestEnqueueUptime == nil {
             oldestEnqueueUptime = ProcessInfo.processInfo.systemUptime
@@ -349,17 +410,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         preQueueLock.lock()
         overflowCount += 1
         preQueueLock.unlock()
-        var lost: [Int64] = []
-        for data in pending.values {
-            if let seq = WebSocketOutboundQueue.eventSequence(in: data) {
-                lost.append(seq)
-            }
-        }
-        for data in nilKeyQueue {
-            if let seq = WebSocketOutboundQueue.eventSequence(in: data) {
-                lost.append(seq)
-            }
-        }
+        let lost = pending.values.map(\.sequence) + nilKeyQueue.map(\.sequence)
         pending.removeAll(keepingCapacity: false)
         order.removeAll(keepingCapacity: false)
         nilKeyQueue.removeAll(keepingCapacity: false)
@@ -369,7 +420,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         nilKeyScheduled = false
         // Always notify; production must supply a handler that advances watermark
         // and emits baseline_required. Nil still counts as explicit overflow for tests.
-        onAdmissionOverflow?(lost.sorted(), reason)
+        onAdmissionOverflow(lost.sorted(), reason)
     }
 
     /// Whether a single frame may be admitted after an overflow clear.
@@ -401,7 +452,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         scheduled = false
         nilKeyScheduled = false
 
-        var frames: [Data] = []
+        var frames: [Frame] = []
         if !pending.isEmpty {
             let keys = order
             frames.append(contentsOf: keys.compactMap { pending[$0] })
@@ -411,9 +462,9 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         if !nilKeyQueue.isEmpty {
             // C-16 (Wi-Fi / nil-key path): concatenate same thread_id + item_id
             // deltas that landed in one window so N tokens become one frame.
-            let (merged, absorbed) = Self.mergeAgentItemDeltasInOrder(nilKeyQueue)
+            let (merged, absorbed) = Self.mergeFramesInOrder(nilKeyQueue)
             for dropped in absorbed {
-                onCoalescedAway?(dropped)
+                onCoalescedAway(dropped)
             }
             frames.append(contentsOf: merged)
             nilKeyQueue.removeAll(keepingCapacity: true)
@@ -422,18 +473,89 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         oldestEnqueueUptime = nil
         // C-14: emit by event sequence when present so keyed LWW + nil-key
         // events in the same window cannot invent host-side 1012 gaps.
-        // Frames without a parseable sequence keep relative order (stable sort).
-        frames.sort { lhs, rhs in
-            let l = WebSocketOutboundQueue.eventSequence(in: lhs) ?? Int64.max
-            let r = WebSocketOutboundQueue.eventSequence(in: rhs) ?? Int64.max
-            return l < r
-        }
+        frames.sort { $0.sequence < $1.sequence }
         for frame in frames {
             send(frame)
         }
     }
 
     // MARK: - C-16 agent.item.delta concatenation
+
+    private static func mergeFrames(_ earlier: Frame, _ later: Frame) -> Frame? {
+        switch (earlier, later) {
+        case (.raw(_, let earlierData), .raw(let laterEvent, let laterData)):
+            guard let merged = mergeAgentItemDeltaFrames(earlierData, laterData) else {
+                return nil
+            }
+            return .raw(event: laterEvent, data: merged)
+        case (.known(let earlierFrame), .known(let laterFrame)):
+            return mergeKnownAgentItemDeltaFrames(earlierFrame, laterFrame).map(Frame.known)
+        default:
+            return nil
+        }
+    }
+
+    private static func mergeFramesInOrder(
+        _ frames: [Frame]
+    ) -> (merged: [Frame], absorbed: [Frame]) {
+        guard var current = frames.first else { return ([], []) }
+        var merged: [Frame] = []
+        var absorbed: [Frame] = []
+        for frame in frames.dropFirst() {
+            if let candidate = mergeFrames(current, frame) {
+                absorbed.append(current)
+                current = candidate
+            } else {
+                merged.append(current)
+                current = frame
+            }
+        }
+        merged.append(current)
+        return (merged, absorbed)
+    }
+
+    static func mergeKnownAgentItemDeltaFrames(
+        _ earlier: KnownConnectionEventFrame,
+        _ later: KnownConnectionEventFrame
+    ) -> KnownConnectionEventFrame? {
+        guard earlier.event.kind == .agentItemDelta,
+              later.event.kind == .agentItemDelta,
+              knownDeltaIdentity(earlier.event.payload) == knownDeltaIdentity(later.event.payload),
+              knownDeltaIdentity(earlier.event.payload) != nil else { return nil }
+
+        var payload = later.event.payload
+        for field in ["body_append", "output_append", "text"] {
+            let a = earlier.event.payload[field]?.stringValue ?? ""
+            let b = later.event.payload[field]?.stringValue ?? ""
+            if !a.isEmpty || !b.isEmpty { payload[field] = .string(a + b) }
+        }
+        for field in ["summary", "progress"] where payload[field] == nil {
+            payload[field] = earlier.event.payload[field]
+        }
+        if earlier.event.payload["distill_applied"] == .bool(true)
+            || later.event.payload["distill_applied"] == .bool(true) {
+            payload["distill_applied"] = .bool(true)
+        }
+        return later.replacingPayload(payload)
+    }
+
+    private struct KnownDeltaIdentity: Equatable {
+        let thread: String
+        let item: String
+        let turn: String?
+    }
+
+    private static func knownDeltaIdentity(
+        _ payload: [String: JSONValue]
+    ) -> KnownDeltaIdentity? {
+        guard let thread = payload["thread_id"]?.stringValue,
+              let item = payload["item_id"]?.stringValue else { return nil }
+        return KnownDeltaIdentity(
+            thread: thread,
+            item: item,
+            turn: payload["turn_id"]?.stringValue
+        )
+    }
 
     /// Merge two encoded `agent.item.delta` frames for the same thread + item by
     /// concatenating append fields. Returns nil when kinds/ids do not match.
