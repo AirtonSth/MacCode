@@ -339,8 +339,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             sessionProvider: { tailcatAccountStore.load() },
             authenticator: tailcatAuthenticator,
             listener: tailcatLoopbackListener,
-            statusHandler: { status in
-                DispatchQueue.main.async {
+            statusHandler: { [weak self] status in
+                DispatchQueue.main.async { [weak self] in
+                    self?.tailcatAccessSettingAuthority.updateStatus(status)
                     NotificationCenter.default.post(
                         name: .rc2TailcatRuntimeStatusChanged,
                         object: nil,

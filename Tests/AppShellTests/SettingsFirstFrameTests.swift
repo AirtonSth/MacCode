@@ -90,6 +90,27 @@ final class SettingsFirstFrameTests: XCTestCase {
         XCTAssertEqual(controller.viewModel.reloadCountForTesting, 1)
     }
 
+    func test_showAfterTailcatBecomesActiveUsesCurrentAuthorityStatus() async throws {
+        let directory = NSTemporaryDirectory() + "RC2SettingsFirstFrame-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        try context.settingsRepo.set("tailcat_access_enabled", "1")
+        let authority = TailcatAccessSettingAuthority()
+        authority.updateStatus(.active)
+        let controller = SettingsWindowController(
+            context: context,
+            loadImmediately: false,
+            tailcatAccessSettingAuthority: authority
+        )
+        controller.window.animationBehavior = .none
+        defer { close(controller) }
+
+        controller.show()
+
+        let fresh = await drainUntil(controller.viewModel.tailcatAccessEnabled)
+        XCTAssertTrue(fresh)
+        XCTAssertEqual(controller.viewModel.tailcatAccessStatus, TailcatRuntimeStatus.active.displayText)
+    }
+
     func test_accountWindowPaintsBeforeFreshnessReload() async throws {
         let directory = NSTemporaryDirectory() + "RC2AccountFirstFrame-\(UUID().uuidString)"
         let context = try AppContext(channel: .debug, appSupportOverride: directory)

@@ -22,6 +22,7 @@ extension Notification.Name {
 
 public final class TailcatAccessSettingAuthority {
     private let applySetting: @MainActor (Bool) -> Void
+    @MainActor private(set) var currentStatus: TailcatRuntimeStatus = .off
 
     public init(applySetting: @escaping @MainActor (Bool) -> Void = { _ in }) {
         self.applySetting = applySetting
@@ -29,7 +30,13 @@ public final class TailcatAccessSettingAuthority {
 
     @MainActor
     func apply(_ enabled: Bool) {
+        currentStatus = enabled ? .checking : .off
         applySetting(enabled)
+    }
+
+    @MainActor
+    func updateStatus(_ status: TailcatRuntimeStatus) {
+        currentStatus = status
     }
 }
 
@@ -669,6 +676,9 @@ public final class SettingsViewModel: ObservableObject {
         #endif
         remoteAccessEnabled = (try? settingsRepo.get("remote_access_enabled")) == "1"
         tailcatAccessEnabled = (try? settingsRepo.get("tailcat_access_enabled")) == "1"
+        tailcatAccessStatus = tailcatAccessEnabled
+            ? tailcatAccessSettingAuthority.currentStatus.displayText
+            : TailcatRuntimeStatus.off.displayText
         // Refresh the general startup-failure list from AppDelegate on every reload
         // (Settings open, account/remote-access notification-driven reload).
         // Reading the shared array is idempotent and does not interfere with the
@@ -759,8 +769,8 @@ public final class SettingsViewModel: ObservableObject {
         do {
             try settingsRepo.set("tailcat_access_enabled", on ? "1" : "0")
             tailcatAccessEnabled = on
-            tailcatAccessStatus = on ? TailcatRuntimeStatus.checking.displayText : TailcatRuntimeStatus.off.displayText
             tailcatAccessSettingAuthority.apply(on)
+            tailcatAccessStatus = tailcatAccessSettingAuthority.currentStatus.displayText
             NotificationCenter.default.post(name: .rc2TailcatSettingChanged, object: nil)
         } catch {
             recordSettingsWriteError(error)
