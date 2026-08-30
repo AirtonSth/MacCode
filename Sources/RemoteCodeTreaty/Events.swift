@@ -223,3 +223,97 @@ public struct RemoteCodeEventEnvelope: Codable, Equatable, Sendable {
         try container.encodeIfPresent(treatyVersion, forKey: .treatyVersion)
     }
 }
+
+public enum EventsRecent: RemoteCodeRPCContract {
+    public static let method = "events.recent"
+
+    public struct Params: Codable, Equatable, Sendable {
+        public let sinceSeq: Int64
+        public let maxBytes: Int?
+
+        public init(sinceSeq: Int64, maxBytes: Int? = nil) {
+            self.sinceSeq = sinceSeq
+            self.maxBytes = maxBytes
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case sinceSeq = "since_seq"
+            case maxBytes = "max_bytes"
+        }
+    }
+
+    public struct Result: Codable, Equatable, Sendable {
+        public let lastSeq: Int64
+        public let events: [RemoteCodeEventEnvelope]
+        public let truncated: Bool
+        public let requiresBaseline: Bool
+        public let hostID: String?
+        public let bootEpoch: UInt64?
+        public let treatyVersion: TreatyVersion?
+
+        public init(
+            lastSeq: Int64,
+            events: [RemoteCodeEventEnvelope],
+            truncated: Bool,
+            requiresBaseline: Bool,
+            hostID: String?,
+            bootEpoch: UInt64?,
+            treatyVersion: TreatyVersion?
+        ) {
+            self.lastSeq = lastSeq
+            self.events = events
+            self.truncated = truncated
+            self.requiresBaseline = requiresBaseline
+            self.hostID = hostID
+            self.bootEpoch = bootEpoch
+            self.treatyVersion = treatyVersion
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case lastSeq = "last_seq"
+            case events, truncated
+            case requiresBaseline = "requires_baseline"
+            case hostID = "host_id"
+            case bootEpoch = "boot_epoch"
+            case treatyVersion = "treaty_version"
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            lastSeq = try container.decode(Int64.self, forKey: .lastSeq)
+            events = try container.decode([RemoteCodeEventEnvelope].self, forKey: .events)
+            truncated = try container.decode(Bool.self, forKey: .truncated)
+            requiresBaseline = try container.decode(Bool.self, forKey: .requiresBaseline)
+            hostID = try container.decodeIfPresent(String.self, forKey: .hostID)
+            bootEpoch = try container.decodeIfPresent(UInt64.self, forKey: .bootEpoch)
+            treatyVersion = try container.decodeIfPresent(TreatyVersion.self, forKey: .treatyVersion)
+
+            let hasAnyIdentity = hostID != nil || bootEpoch != nil || treatyVersion != nil
+            let hasCompleteIdentity = hostID?.isEmpty == false
+                && bootEpoch != nil
+                && treatyVersion != nil
+            guard !hasAnyIdentity || hasCompleteIdentity else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .hostID,
+                    in: container,
+                    debugDescription: "events.recent identity must be complete or absent"
+                )
+            }
+            guard events.allSatisfy({ event in
+                let eventHasAnyIdentity = event.hostID != nil
+                    || event.bootEpoch != nil
+                    || event.treatyVersion != nil
+                guard hasCompleteIdentity else { return !eventHasAnyIdentity }
+                return event.hostID == hostID
+                    && event.bootEpoch == bootEpoch
+                    && event.treatyVersion == treatyVersion
+            }) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .events,
+                    in: container,
+                    debugDescription: "events.recent event identity does not match its envelope"
+                )
+            }
+        }
+    }
+}

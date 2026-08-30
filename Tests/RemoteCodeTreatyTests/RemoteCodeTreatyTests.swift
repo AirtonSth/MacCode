@@ -248,6 +248,41 @@ final class RemoteCodeTreatyTests: XCTestCase {
         XCTAssertNil(legacy.treatyVersion)
     }
 
+    func testEventsRecentGoldenEnvelopeIsStrictAndIdentityBound() throws {
+        let data = Data(#"""
+        {
+          "last_seq":8,"truncated":false,"requires_baseline":false,
+          "host_id":"host-1","boot_epoch":42,"treaty_version":{"major":1,"minor":0},
+          "events":[{"seq":8,"kind":"agent.run.started","payload":{},"ts":2,
+            "host_id":"host-1","boot_epoch":42,"treaty_version":{"major":1,"minor":0}}]
+        }
+        """#.utf8)
+        let result = try decoder.decode(EventsRecent.Result.self, from: data)
+        XCTAssertEqual(result.lastSeq, 8)
+        XCTAssertEqual(result.hostID, "host-1")
+        XCTAssertEqual(result.events.first?.kind, .agentRunStarted)
+
+        let params = EventsRecent.Params(sinceSeq: 7, maxBytes: 65_536)
+        let paramsObject = try JSONSerialization.jsonObject(with: encoder.encode(params)) as? [String: Any]
+        XCTAssertEqual(paramsObject?["since_seq"] as? Int, 7)
+        XCTAssertEqual(paramsObject?["max_bytes"] as? Int, 65_536)
+    }
+
+    func testEventsRecentRejectsPartialMismatchedAndMalformedKnownEvents() throws {
+        XCTAssertThrowsError(try decoder.decode(
+            EventsRecent.Result.self,
+            from: Data(#"{"last_seq":1,"events":[],"truncated":false,"requires_baseline":false,"host_id":"host-1"}"#.utf8)
+        ))
+        XCTAssertThrowsError(try decoder.decode(
+            EventsRecent.Result.self,
+            from: Data(#"{"last_seq":1,"events":[{"seq":1,"kind":"agent.run.started","payload":{},"ts":1,"host_id":"host-2","boot_epoch":42,"treaty_version":{"major":1,"minor":0}}],"truncated":false,"requires_baseline":false,"host_id":"host-1","boot_epoch":42,"treaty_version":{"major":1,"minor":0}}"#.utf8)
+        ))
+        XCTAssertThrowsError(try decoder.decode(
+            EventsRecent.Result.self,
+            from: Data(#"{"last_seq":1,"events":[{"seq":1,"kind":"agent.run.started","payload":null,"ts":1}],"truncated":false,"requires_baseline":false}"#.utf8)
+        ))
+    }
+
     func testRemoteCodeErrorPreservesUnknownHostCode() throws {
         let value = RemoteCodeError(code: -39999, message: "future", data: nil)
         XCTAssertEqual(value.kind, .unknown(-39999))
