@@ -107,7 +107,30 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertFalse(emptyRuntime)
     }
 
-    func testPartialServerStartIsClosedAndNotPublished() async {
+    func testPrimaryFailurePublishesFallbackOnly() async {
+        let snapshot = makeSnapshot(epoch: "epoch-2", revision: 3, peers: [peer(0xbb)])
+        let catalog = FakeTailcatCatalog(snapshot: snapshot)
+        let bridge = FakeTailcatBridge(failingRelay: .primary)
+        let store = FakeTailcatStore()
+        let supervisor = makeSupervisor(bridge: bridge, catalog: catalog, store: store)
+
+        await supervisor.setEnabled(true)
+        await supervisor.reconcileNowForTesting()
+
+        let publish = await catalog.lastPublish
+        XCTAssertEqual(publish?.endpoints, [
+            TailcatCatalogEndpoint(kind: .derp, priority: 1, connBlob: "fallback-blob"),
+        ])
+        XCTAssertEqual(store.state?.phase, .active)
+        XCTAssertNotEqual(store.state?.active?.primary, store.state?.active?.fallback)
+        let activeRuntime = await supervisor.hasActiveRuntimeForTesting
+        XCTAssertTrue(activeRuntime)
+
+        await supervisor.setEnabled(false)
+        XCTAssertEqual(bridge.closedHandles, [202])
+    }
+
+    func testFallbackFailurePublishesPrimaryOnly() async {
         let snapshot = makeSnapshot(epoch: "epoch-2", revision: 3, peers: [peer(0xbb)])
         let catalog = FakeTailcatCatalog(snapshot: snapshot)
         let bridge = FakeTailcatBridge(failingRelay: .publicFallback)
@@ -117,13 +140,43 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         await supervisor.setEnabled(true)
         await supervisor.reconcileNowForTesting()
 
+        let publish = await catalog.lastPublish
+        XCTAssertEqual(publish?.endpoints, [
+            TailcatCatalogEndpoint(kind: .derp, priority: 0, connBlob: "primary-blob"),
+        ])
+        XCTAssertEqual(store.state?.phase, .active)
+        XCTAssertNotEqual(store.state?.active?.primary, store.state?.active?.fallback)
+        let activeRuntime = await supervisor.hasActiveRuntimeForTesting
+        XCTAssertTrue(activeRuntime)
+
+        await supervisor.setEnabled(false)
         XCTAssertEqual(bridge.closedHandles, [101])
-        let partialPublish = await catalog.lastPublish
-        XCTAssertNil(partialPublish)
+    }
+
+    func testBothRelayFailuresDoNotPublishOrActivate() async {
+        let snapshot = makeSnapshot(epoch: "epoch-2", revision: 3, peers: [peer(0xbb)])
+        let catalog = FakeTailcatCatalog(snapshot: snapshot)
+        let bridge = FakeTailcatBridge(failAll: true)
+        let store = FakeTailcatStore()
+        let statuses = FakeTailcatStatuses()
+        let supervisor = makeSupervisor(
+            bridge: bridge,
+            catalog: catalog,
+            store: store,
+            statusHandler: { statuses.append($0) }
+        )
+
+        await supervisor.setEnabled(true)
+        await supervisor.reconcileNowForTesting()
+
+        let publish = await catalog.lastPublish
+        XCTAssertNil(publish)
         XCTAssertEqual(store.state?.phase, .publishing)
         XCTAssertNotNil(store.state?.pending)
-        let partialRuntime = await supervisor.hasActiveRuntimeForTesting
-        XCTAssertFalse(partialRuntime)
+        let activeRuntime = await supervisor.hasActiveRuntimeForTesting
+        XCTAssertFalse(activeRuntime)
+        XCTAssertTrue(bridge.closedHandles.isEmpty)
+        XCTAssertEqual(statuses.values.last, .unavailable)
     }
 
     func testPublishingCrashRecoveryRotatesAwayFromOldAndPendingKeys() async {
@@ -286,7 +339,8 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         bridge: FakeTailcatBridge,
         catalog: FakeTailcatCatalog,
         store: FakeTailcatStore,
-        now: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1_000) }
+        now: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1_000) },
+        statusHandler: @escaping TailcatRuntimeSupervisor.StatusHandler = { _ in }
     ) -> TailcatRuntimeSupervisor {
         TailcatRuntimeSupervisor(
             serverID: "server-1",
@@ -299,7 +353,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
             listener: FakeTailcatListener(),
             now: now,
             automaticPolling: false,
-            statusHandler: { _ in }
+            statusHandler: statusHandler
         )
     }
 
@@ -337,6 +391,14 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
             }
         )
     }
+}
+
+private final class FakeTailcatStatuses: @unchecked Sendable {
+    private let lock = NSLock()
+    private var statuses: [TailcatRuntimeStatus] = []
+
+    var values: [TailcatRuntimeStatus] { lock.withLock { statuses } }
+    func append(_ status: TailcatRuntimeStatus) { lock.withLock { statuses.append(status) } }
 }
 
 private final class FakeTailcatClock: @unchecked Sendable {
@@ -380,8 +442,12 @@ private final class FakeTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable
     private var starts: [StartCall] = []
     private var closes: [UInt64] = []
     private let failingRelay: TailcatRelay?
+    private let failAll: Bool
 
-    init(failingRelay: TailcatRelay? = nil) { self.failingRelay = failingRelay }
+    init(failingRelay: TailcatRelay? = nil, failAll: Bool = false) {
+        self.failingRelay = failingRelay
+        self.failAll = failAll
+    }
 
     var startCalls: [StartCall] { lock.withLock { starts } }
     var closedHandles: [UInt64] { lock.withLock { closes } }
@@ -413,7 +479,7 @@ private final class FakeTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable
             relay: relay
         )
         lock.withLock { starts.append(call) }
-        if matches(relay, failingRelay) { throw TailcatBridgeError.rejected("start_failed") }
+        if failAll || matches(relay, failingRelay) { throw TailcatBridgeError.rejected("start_failed") }
         switch relay {
         case .primary: return TailcatRunningServer(handle: 101, connBlob: "primary-blob", nodePublic: key.publicKey)
         case .publicFallback: return TailcatRunningServer(handle: 202, connBlob: "fallback-blob", nodePublic: key.publicKey)

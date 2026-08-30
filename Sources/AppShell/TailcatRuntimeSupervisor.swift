@@ -25,8 +25,8 @@ actor TailcatRuntimeSupervisor {
     typealias StatusHandler = @Sendable (TailcatRuntimeStatus) -> Void
 
     private struct ActiveRuntime: Sendable {
-        let primary: TailcatRunningServer
-        let fallback: TailcatRunningServer
+        let primary: TailcatRunningServer?
+        let fallback: TailcatRunningServer?
         let endpoints: [TailcatCatalogEndpoint]
     }
 
@@ -286,23 +286,22 @@ actor TailcatRuntimeSupervisor {
                 ) }
             }.value
             let startResults = await (primaryTask, fallbackTask)
-            guard case .success(let primary) = startResults.0,
-                  case .success(let fallback) = startResults.1 else {
-                if case .success(let primary) = startResults.0 {
-                    try? bridge.closeServer(handle: primary.handle)
-                }
-                if case .success(let fallback) = startResults.1 {
-                    try? bridge.closeServer(handle: fallback.handle)
-                }
+            let primary = try? startResults.0.get()
+            let fallback = try? startResults.1.get()
+            guard primary != nil || fallback != nil else {
                 throw TailcatBridgeError.rejected("server_start_failed")
+            }
+            var endpoints: [TailcatCatalogEndpoint] = []
+            if let primary {
+                endpoints.append(TailcatCatalogEndpoint(kind: .derp, priority: 0, connBlob: primary.connBlob))
+            }
+            if let fallback {
+                endpoints.append(TailcatCatalogEndpoint(kind: .derp, priority: 1, connBlob: fallback.connBlob))
             }
             let started = ActiveRuntime(
                 primary: primary,
                 fallback: fallback,
-                endpoints: [
-                    TailcatCatalogEndpoint(kind: .derp, priority: 0, connBlob: primary.connBlob),
-                    TailcatCatalogEndpoint(kind: .derp, priority: 1, connBlob: fallback.connBlob),
-                ]
+                endpoints: endpoints
             )
             runtime = started
             guard enabled, generation == operationGeneration else {
@@ -415,8 +414,12 @@ actor TailcatRuntimeSupervisor {
         guard let runtime else { return }
         self.runtime = nil
         _ = await Task.detached {
-            try? self.bridge.closeServer(handle: runtime.primary.handle)
-            try? self.bridge.closeServer(handle: runtime.fallback.handle)
+            if let primary = runtime.primary {
+                try? self.bridge.closeServer(handle: primary.handle)
+            }
+            if let fallback = runtime.fallback {
+                try? self.bridge.closeServer(handle: fallback.handle)
+            }
         }.value
     }
 
