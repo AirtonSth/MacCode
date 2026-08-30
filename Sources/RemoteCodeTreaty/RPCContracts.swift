@@ -19,7 +19,18 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
         case botLimit
         case reservedCapability
         case crossTarget
-        case idempotencyConflict
+        case botHandleConflict
+        case pathContainment
+        case botBrowserPersistence
+        case dockerHomeClear
+        case botFileNotFound
+        case commandReceiptUnavailable
+        case legacyReceiptUnverifiable
+        case idempotencyRequestMismatch
+        case idempotencyOwnerMismatch
+        case commandOutcomeUnknown
+        case commandInProgress
+        case authenticatedHostMismatch
         case unknown(Int)
     }
 
@@ -46,7 +57,18 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
         case -32082: return .botLimit
         case -32083: return .reservedCapability
         case -32084: return .crossTarget
-        case -32086: return .idempotencyConflict
+        case -32085: return .botHandleConflict
+        case -32086: return .pathContainment
+        case -32087: return .botBrowserPersistence
+        case -32088: return .dockerHomeClear
+        case -32090: return .botFileNotFound
+        case -32091: return .commandReceiptUnavailable
+        case -32092: return .legacyReceiptUnverifiable
+        case -32093: return .idempotencyRequestMismatch
+        case -32094: return .idempotencyOwnerMismatch
+        case -32095: return .commandOutcomeUnknown
+        case -32096: return .commandInProgress
+        case -32098: return .authenticatedHostMismatch
         default: return .unknown(code)
         }
     }

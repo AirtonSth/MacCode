@@ -119,7 +119,7 @@ let package = Package(
         ),
         .target(
             name: "SocketServer",
-            dependencies: ["CoreModel", "Persistence", "AgentRuntime"],
+            dependencies: ["CoreModel", "Persistence", "AgentRuntime", "RemoteCodeTreaty"],
             path: "Sources/SocketServer"
         ),
         .target(

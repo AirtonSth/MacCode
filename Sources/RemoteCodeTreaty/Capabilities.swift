@@ -3,14 +3,14 @@ import Foundation
 public struct AuthenticatedCapabilities: Codable, Equatable, Sendable {
     public let authenticated: Bool
     public let serverID: String
-    public let bootEpoch: Int
+    public let bootEpoch: UInt64
     public let treaty: TreatyCompatibility?
     public let capabilities: HostCapabilities
 
     public init(
         authenticated: Bool,
         serverID: String,
-        bootEpoch: Int,
+        bootEpoch: UInt64,
         treaty: TreatyCompatibility?,
         capabilities: HostCapabilities
     ) {

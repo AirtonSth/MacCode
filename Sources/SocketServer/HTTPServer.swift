@@ -4,6 +4,7 @@ import CryptoKit
 import CoreModel
 import Persistence
 import AgentRuntime
+import RemoteCodeTreaty
 
 /// Minimal HTTP/1.1 + WebSocket-stub server used as the desktop-side
 /// foundation for a future direct-VPN/LAN mobile client. The intent is
@@ -1161,14 +1162,36 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return (!loopbackOnly || remoteAuthenticated) && !authExemptV1Paths.contains(path)
     }
 
-    /// Shared capabilities object for public `GET /v1/capabilities` and the
-    /// authenticated envelope's `capabilities` field. Single builder so the
-    /// two routes cannot drift.
-    nonisolated static func capabilitiesPayload(
+    /// Canonical host DTO from which both the public projection and the
+    /// authenticated identity envelope are derived.
+    struct HostCapabilitiesProjectionDTO {
+        let capabilities: [String: Any]
+        let treaty: TreatyCompatibility
+
+        func publicPayload() -> [String: Any] { capabilities }
+
+        func authenticatedPayload(serverID: String, bootEpoch: UInt64) -> [String: Any] {
+            [
+                "authenticated": true,
+                "server_id": serverID,
+                "boot_epoch": Int64(bootEpoch),
+                "treaty": [
+                    "current": [
+                        "major": treaty.current.major,
+                        "minor": treaty.current.minor,
+                    ],
+                    "supported_majors": treaty.supportedMajors,
+                ],
+                "capabilities": capabilities,
+            ]
+        }
+    }
+
+    nonisolated static func capabilitiesProjection(
         loopbackOnly: Bool,
         attachmentUpload:
             AgentAttachmentUploadCapabilityAdvertisement? = nil
-    ) -> [String: Any] {
+    ) -> HostCapabilitiesProjectionDTO {
         // GAP-3: advertise what the dispatcher actually implements.
         // git mutations + full browser automation are real (see
         // Dispatcher.swift git.*/browser.*); hiding them on the
@@ -1191,7 +1214,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         if let attachmentUpload {
             agent["attachment_upload"] = attachmentUpload.foundationObject
         }
-        return [
+        return HostCapabilitiesProjectionDTO(capabilities: [
             "surface_types": ["terminal", "ssh", "browser", "agentApp", "files", "markdown", "filePreview", "rightSidebarTool"],
             "ssh": [
                 "methods": ["ssh.host.list", "ssh.host.upsert", "ssh.host.delete", "ssh.connect", "ssh.disconnect", "ssh.transfer.upload", "ssh.transfer.download", "ssh.files.local.list", "ssh.files.remote.list", "ssh.files.remote.mkdir", "ssh.files.remote.rename", "ssh.files.remote.delete"]
@@ -1224,7 +1247,19 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "methods": ["git.status", "git.branches", "git.checkout", "git.create_branch", "git.commit", "git.log", "git.diff", "git.fetch", "git.pull", "git.push", "git.pull_request_url", "git.delivery_plan", "git.deliver"],
             ],
             "feature_flags": ["remote_access_enabled": !loopbackOnly]
-        ]
+        ], treaty: .v1)
+    }
+
+    /// Backward-compatible public projection used by existing call sites.
+    nonisolated static func capabilitiesPayload(
+        loopbackOnly: Bool,
+        attachmentUpload:
+            AgentAttachmentUploadCapabilityAdvertisement? = nil
+    ) -> [String: Any] {
+        capabilitiesProjection(
+            loopbackOnly: loopbackOnly,
+            attachmentUpload: attachmentUpload
+        ).publicPayload()
     }
 
     nonisolated static func isAttachmentUploadRPCEnvelope(_ data: Data) -> Bool {
@@ -3382,16 +3417,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
                      ])
                 return
             }
-            let body: [String: Any] = [
-                "authenticated": true,
-                "server_id": serverId,
-                "boot_epoch": Int64(bootEpoch),
-                "capabilities": Self.capabilitiesPayload(
-                    loopbackOnly: bindLoopbackOnly,
-                    attachmentUpload:
-                        dispatcher.agentAttachmentUploadCapability
-                )
-            ]
+            let body = Self.capabilitiesProjection(
+                loopbackOnly: bindLoopbackOnly,
+                attachmentUpload: dispatcher.agentAttachmentUploadCapability
+            ).authenticatedPayload(serverID: serverId, bootEpoch: bootEpoch)
             sendJSON(
                 fd: fd,
                 status: 200,

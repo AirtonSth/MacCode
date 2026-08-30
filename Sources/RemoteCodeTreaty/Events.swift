@@ -110,10 +110,13 @@ public enum RemoteCodeEvent: Equatable, Sendable {
 }
 
 public struct RemoteCodeEventEnvelope: Codable, Equatable, Sendable {
-    public let seq: Int
+    public let seq: Int64
     public let rawKind: String
     public let payload: RemoteCodeJSONValue
     public let ts: Double
+    public let hostID: String?
+    public let bootEpoch: UInt64?
+    public let treatyVersion: TreatyVersion?
 
     public var kind: RemoteCodeEventKind? { RemoteCodeEventKind(rawValue: rawKind) }
     public var isUnknown: Bool { kind == nil }
@@ -122,21 +125,43 @@ public struct RemoteCodeEventEnvelope: Codable, Equatable, Sendable {
         return .unknown(kind: rawKind, payload: payload)
     }
 
-    public init(seq: Int, kind: RemoteCodeEventKind, payload: RemoteCodeJSONValue, ts: Double) {
+    public init(
+        seq: Int64,
+        kind: RemoteCodeEventKind,
+        payload: RemoteCodeJSONValue,
+        ts: Double,
+        hostID: String? = nil,
+        bootEpoch: UInt64? = nil,
+        treatyVersion: TreatyVersion? = nil
+    ) {
         self.seq = seq
         self.rawKind = kind.rawValue
         self.payload = payload
         self.ts = ts
+        self.hostID = hostID
+        self.bootEpoch = bootEpoch
+        self.treatyVersion = treatyVersion
     }
 
-    private enum CodingKeys: String, CodingKey { case seq, kind, payload, ts }
+    private enum CodingKeys: String, CodingKey {
+        case seq, kind, payload, ts
+        case hostID = "host_id"
+        case bootEpoch = "boot_epoch"
+        case treatyVersion = "treaty_version"
+    }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        seq = try container.decode(Int.self, forKey: .seq)
+        seq = try container.decode(Int64.self, forKey: .seq)
         rawKind = try container.decode(String.self, forKey: .kind)
         payload = try container.decode(RemoteCodeJSONValue.self, forKey: .payload)
         ts = try container.decode(Double.self, forKey: .ts)
+        hostID = try container.decodeIfPresent(String.self, forKey: .hostID)
+        bootEpoch = try container.decodeIfPresent(UInt64.self, forKey: .bootEpoch)
+        treatyVersion = try container.decodeIfPresent(
+            TreatyVersion.self,
+            forKey: .treatyVersion
+        )
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -145,5 +170,8 @@ public struct RemoteCodeEventEnvelope: Codable, Equatable, Sendable {
         try container.encode(rawKind, forKey: .kind)
         try container.encode(payload, forKey: .payload)
         try container.encode(ts, forKey: .ts)
+        try container.encodeIfPresent(hostID, forKey: .hostID)
+        try container.encodeIfPresent(bootEpoch, forKey: .bootEpoch)
+        try container.encodeIfPresent(treatyVersion, forKey: .treatyVersion)
     }
 }

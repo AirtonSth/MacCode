@@ -59,6 +59,57 @@ final class RemoteCodeTreatyTests: XCTestCase {
         XCTAssertEqual(result.disposition, .started(threadID: "thread-1"))
     }
 
+    func testBotSendResultDecodesCurrentQueuedReceipt() throws {
+        let data = Data(#"""
+        {
+          "request_id":"request-2","client_request_id":"request-2",
+          "receipt_id":"receipt-2","status":"completed","host_id":"host-1","bot_id":"bot-1",
+          "readback":{"host_id":"host-1","bot_id":"bot-1","request_id":"request-2",
+            "client_request_id":"request-2","conversation_id":"conversation-1","run_id":"run-1",
+            "enqueued":true,"id":"queue-1","queue":[]}
+        }
+        """#.utf8)
+
+        let result = try decoder.decode(BotSend.Result.self, from: data)
+        XCTAssertEqual(result.status, .completed)
+        XCTAssertEqual(result.runID, "run-1")
+        XCTAssertEqual(result.disposition, .queued(queueID: "queue-1"))
+    }
+
+    func testBotUploadTargetAndGrantPreserveCurrentWire() throws {
+        let target = BotUploadTarget(
+            botID: "bot-1",
+            conversationID: "conversation-1",
+            attachmentID: "opaque-upload-1",
+            filename: "proof.txt",
+            kind: "file",
+            digest: String(repeating: "a", count: 64),
+            size: 5,
+            mimeType: "text/plain"
+        )
+        let targetObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(target)) as? [String: Any]
+        )
+        XCTAssertEqual(targetObject["bot_id"] as? String, "bot-1")
+        XCTAssertEqual(targetObject["conversation_id"] as? String, "conversation-1")
+        XCTAssertEqual(targetObject["attachment_id"] as? String, "opaque-upload-1")
+        XCTAssertEqual(targetObject["filename"] as? String, "proof.txt")
+        XCTAssertEqual(targetObject["kind"] as? String, "file")
+        XCTAssertEqual(targetObject["mime_type"] as? String, "text/plain")
+
+        let grantData = Data(#"""
+        {"id":"grant-1","bot_id":"bot-1","conversation_id":"conversation-1",
+         "attachment_id":"opaque-upload-1","filename":"proof.txt","kind":"file",
+         "digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+         "size":5,"mime_type":"text/plain","consumed":false}
+        """#.utf8)
+        let grant = try decoder.decode(BotAttachmentGrant.self, from: grantData)
+        XCTAssertEqual(grant.attachmentID, "opaque-upload-1")
+        XCTAssertEqual(grant.filename, "proof.txt")
+        XCTAssertEqual(grant.mimeType, "text/plain")
+        XCTAssertFalse(grant.consumed)
+    }
+
     func testAuthenticatedCapabilitiesDecodeTreatyAndIdentity() throws {
         let data = Data(#"""
         {
@@ -79,6 +130,43 @@ final class RemoteCodeTreatyTests: XCTestCase {
         XCTAssertEqual(envelope.capabilities.agent.providers, ["codex"])
     }
 
+    func testCompatibilityAcceptsLegacyV0V1AndFutureMinorButRejectsIncompatibleMajor() {
+        XCTAssertEqual(TreatyCompatibility.evaluate(host: nil), .compatibleLegacyV0)
+        XCTAssertEqual(
+            TreatyCompatibility.evaluate(host: .v1),
+            .compatible(TreatyVersion(major: 1, minor: 0))
+        )
+        let futureMinor = TreatyCompatibility(
+            current: TreatyVersion(major: 1, minor: 9),
+            supportedMajors: [0, 1]
+        )
+        XCTAssertEqual(
+            TreatyCompatibility.evaluate(host: futureMinor),
+            .compatible(TreatyVersion(major: 1, minor: 9))
+        )
+        let incompatible = TreatyCompatibility(
+            current: TreatyVersion(major: 2, minor: 0),
+            supportedMajors: [0, 2]
+        )
+        XCTAssertEqual(
+            TreatyCompatibility.evaluate(host: incompatible),
+            .updateRequired
+        )
+    }
+
+    func testAuthenticatedCapabilitiesRejectsMalformedTreaty() {
+        let data = Data(#"""
+        {
+          "authenticated":true,"server_id":"host-1","boot_epoch":42,
+          "treaty":{"current":"1.0","supported_majors":[0,1]},
+          "capabilities":{"surface_types":[],
+            "agent":{"providers":[],"supports_stream_events":true,"supports_resume":true},
+            "git":{"read_only":false},"feature_flags":{"remote_access_enabled":true}}
+        }
+        """#.utf8)
+        XCTAssertThrowsError(try decoder.decode(AuthenticatedCapabilities.self, from: data))
+    }
+
     func testEventEnvelopePreservesKnownAndUnknownKinds() throws {
         let known = try decoder.decode(
             RemoteCodeEventEnvelope.self,
@@ -95,8 +183,72 @@ final class RemoteCodeTreatyTests: XCTestCase {
         XCTAssertTrue(unknown.isUnknown)
     }
 
+    func testEveryKnownEventKindHasAnIdentityBearingGoldenEnvelope() throws {
+        for (offset, kind) in RemoteCodeEventKind.allCases.enumerated() {
+            let original = RemoteCodeEventEnvelope(
+                seq: Int64(offset + 1),
+                kind: kind,
+                payload: .object(["fixture": .string(kind.rawValue)]),
+                ts: 123.5,
+                hostID: "host-1",
+                bootEpoch: 42,
+                treatyVersion: TreatyVersion(major: 1, minor: 0)
+            )
+            let decoded = try decoder.decode(
+                RemoteCodeEventEnvelope.self,
+                from: encoder.encode(original)
+            )
+            XCTAssertEqual(decoded, original, "event fixture failed for \(kind.rawValue)")
+        }
+    }
+
+    func testLegacyEventEnvelopeStillDecodesWithoutIdentity() throws {
+        let legacy = try decoder.decode(
+            RemoteCodeEventEnvelope.self,
+            from: Data(#"{"seq":1,"kind":"agent.run.started","payload":{},"ts":1}"#.utf8)
+        )
+        XCTAssertNil(legacy.hostID)
+        XCTAssertNil(legacy.bootEpoch)
+        XCTAssertNil(legacy.treatyVersion)
+    }
+
     func testRemoteCodeErrorPreservesUnknownHostCode() throws {
         let value = RemoteCodeError(code: -39999, message: "future", data: nil)
         XCTAssertEqual(value.kind, .unknown(-39999))
+    }
+
+    func testRemoteCodeErrorMapsCurrentCommonAndBotCodes() {
+        let expected: [Int: RemoteCodeError.Kind] = [
+            -32700: .parseError,
+            -32600: .invalidRequest,
+            -32601: .methodNotFound,
+            -32602: .invalidParams,
+            -32603: .internalError,
+            -32044: .botNotFound,
+            -32081: .botControlPlaneOff,
+            -32082: .botLimit,
+            -32083: .reservedCapability,
+            -32084: .crossTarget,
+            -32085: .botHandleConflict,
+            -32086: .pathContainment,
+            -32087: .botBrowserPersistence,
+            -32088: .dockerHomeClear,
+            -32090: .botFileNotFound,
+            -32091: .commandReceiptUnavailable,
+            -32092: .legacyReceiptUnverifiable,
+            -32093: .idempotencyRequestMismatch,
+            -32094: .idempotencyOwnerMismatch,
+            -32095: .commandOutcomeUnknown,
+            -32096: .commandInProgress,
+            -32097: .missingRequestID,
+            -32098: .authenticatedHostMismatch,
+        ]
+        for (code, kind) in expected {
+            XCTAssertEqual(
+                RemoteCodeError(code: code, message: "fixture", data: nil).kind,
+                kind,
+                "error fixture failed for \(code)"
+            )
+        }
     }
 }

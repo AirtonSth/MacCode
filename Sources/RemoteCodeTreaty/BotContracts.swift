@@ -70,10 +70,12 @@ public enum BotSend: RemoteCodeRPCContract {
     }
 
     public struct Result: Codable, Equatable, Sendable {
-        public enum Status: String, Codable, Sendable { case accepted, completed, partial }
+        public enum Status: String, Codable, Sendable {
+            case accepted, completed, failed, unknown, partial
+        }
         public enum Disposition: Equatable, Sendable {
-            case started(threadID: String?)
-            case queued(queueID: String?)
+            case started(threadID: String)
+            case queued(queueID: String)
         }
 
         public let requestID: String
@@ -119,9 +121,24 @@ public enum BotSend: RemoteCodeRPCContract {
             self.runID = runID
             conversationID = object["conversation_id"]?.stringValue
             if object["enqueued"]?.boolValue == true {
-                disposition = .queued(queueID: object["id"]?.stringValue)
+                guard let queueID = object["id"]?.stringValue, !queueID.isEmpty else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .readback,
+                        in: container,
+                        debugDescription: "Queued Bot send receipt is missing its queue identity."
+                    )
+                }
+                disposition = .queued(queueID: queueID)
             } else {
-                disposition = .started(threadID: object["run"]?["thread_id"]?.stringValue)
+                guard let threadID = object["run"]?["thread_id"]?.stringValue,
+                      !threadID.isEmpty else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .readback,
+                        in: container,
+                        debugDescription: "Started Bot send receipt is missing its thread identity."
+                    )
+                }
+                disposition = .started(threadID: threadID)
             }
         }
 
@@ -141,15 +158,39 @@ public enum BotSend: RemoteCodeRPCContract {
 public struct BotUploadTarget: Codable, Equatable, Sendable {
     public let botID: String
     public let conversationID: String
+    public let attachmentID: String
+    public let filename: String
+    public let kind: String
+    public let digest: String
+    public let size: Int
+    public let mimeType: String?
 
-    public init(botID: String, conversationID: String) {
+    public init(
+        botID: String,
+        conversationID: String,
+        attachmentID: String,
+        filename: String,
+        kind: String,
+        digest: String,
+        size: Int,
+        mimeType: String? = nil
+    ) {
         self.botID = botID
         self.conversationID = conversationID
+        self.attachmentID = attachmentID
+        self.filename = filename
+        self.kind = kind
+        self.digest = digest
+        self.size = size
+        self.mimeType = mimeType
     }
 
     private enum CodingKeys: String, CodingKey {
         case botID = "bot_id"
         case conversationID = "conversation_id"
+        case attachmentID = "attachment_id"
+        case filename, kind, digest, size
+        case mimeType = "mime_type"
     }
 }
 
@@ -157,29 +198,43 @@ public struct BotAttachmentGrant: Codable, Equatable, Sendable {
     public let id: String
     public let botID: String
     public let conversationID: String
+    public let attachmentID: String
+    public let filename: String
+    public let kind: String
     public let digest: String
     public let size: Int
+    public let mimeType: String?
     public let consumed: Bool
 
     public init(
         id: String,
         botID: String,
         conversationID: String,
+        attachmentID: String,
+        filename: String,
+        kind: String,
         digest: String,
         size: Int,
+        mimeType: String? = nil,
         consumed: Bool
     ) {
         self.id = id
         self.botID = botID
         self.conversationID = conversationID
+        self.attachmentID = attachmentID
+        self.filename = filename
+        self.kind = kind
         self.digest = digest
         self.size = size
+        self.mimeType = mimeType
         self.consumed = consumed
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, digest, size, consumed
+        case id, filename, kind, digest, size, consumed
         case botID = "bot_id"
         case conversationID = "conversation_id"
+        case attachmentID = "attachment_id"
+        case mimeType = "mime_type"
     }
 }

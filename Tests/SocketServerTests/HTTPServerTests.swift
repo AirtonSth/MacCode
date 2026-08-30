@@ -1650,6 +1650,11 @@ final class HTTPServerTests: XCTestCase {
             XCTAssertEqual(obj?["authenticated"] as? Bool, true)
             XCTAssertEqual(obj?["server_id"] as? String, serverId)
             XCTAssertEqual(obj?["boot_epoch"] as? Int, Int(bootEpoch))
+            let treaty = obj?["treaty"] as? [String: Any]
+            let current = treaty?["current"] as? [String: Any]
+            XCTAssertEqual(current?["major"] as? Int, 1)
+            XCTAssertEqual(current?["minor"] as? Int, 0)
+            XCTAssertEqual(treaty?["supported_majors"] as? [Int], [0, 1])
             let embedded = obj?["capabilities"] as? [String: Any]
             XCTAssertNotNil(embedded, "envelope must embed the capabilities object")
             let embeddedAgent = embedded?["agent"] as? [String: Any]

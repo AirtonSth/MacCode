@@ -15,6 +15,12 @@ public struct TreatyVersion: Codable, Equatable, Hashable, Sendable, Comparable 
 }
 
 public struct TreatyCompatibility: Codable, Equatable, Sendable {
+    public enum Evaluation: Equatable, Sendable {
+        case compatibleLegacyV0
+        case compatible(TreatyVersion)
+        case updateRequired
+    }
+
     public static let v1 = TreatyCompatibility(
         current: TreatyVersion(major: 1, minor: 0),
         supportedMajors: [0, 1]
@@ -36,5 +42,16 @@ public struct TreatyCompatibility: Codable, Equatable, Sendable {
     public func supports(major: Int, minimumMinor: Int = 0) -> Bool {
         supportedMajors.contains(major)
             && (current.major != major || current.minor >= minimumMinor)
+    }
+
+    public static func evaluate(
+        host: TreatyCompatibility?,
+        client: TreatyVersion = TreatyVersion(major: 1, minor: 0)
+    ) -> Evaluation {
+        guard let host else { return .compatibleLegacyV0 }
+        guard host.supportedMajors.contains(client.major) else {
+            return .updateRequired
+        }
+        return .compatible(host.current)
     }
 }
