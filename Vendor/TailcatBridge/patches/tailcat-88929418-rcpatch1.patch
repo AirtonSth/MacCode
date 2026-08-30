@@ -1,0 +1,73 @@
+diff --git a/tailcat.go b/tailcat.go
+index a0eba13c..2ea25ea0 100644
+--- a/tailcat.go
++++ b/tailcat.go
+@@ -245,13 +245,23 @@ func (b *locoBackend) derpRegionID() int {
+ }
+ 
+ func (b *locoBackend) Close() error {
++	var closeErr error
++	if b.ns != nil {
++		closeErr = b.ns.Close()
++	}
+ 	if e, ok := b.sys.Engine.GetOK(); ok {
+ 		e.Close()
+ 	}
+ 	if m, ok := b.sys.NetMon.GetOK(); ok {
+ 		m.Close()
+ 	}
+-	return nil
++	if d, ok := b.sys.Dialer.GetOK(); ok {
++		d.Close()
++	}
++	if bus, ok := b.sys.Bus.GetOK(); ok {
++		bus.Close()
++	}
++	return closeErr
+ }
+ 
+ // Server listens for clients over a WireGuard tunnel relayed through DERP.
+@@ -311,6 +321,11 @@ type Server struct {
+ 	// It must be set before calling Start.
+ 	OnTCP func(port uint16) (handler func(net.Conn))
+ 
++	// OnTCPWithPeer, if non-nil, is preferred over OnTCP and receives the
++	// authenticated Tailcat node public key for the incoming connection.
++	// It must be set before calling Start.
++	OnTCPWithPeer func(peer key.NodePublic, port uint16) (handler func(net.Conn))
++
+ 	// OnTCPForward, if non-nil, specifies a func that returns a handler to handle
+ 	// incoming connections to the provided IP:port. If nil or if it returns nil,
+ 	// then a RST is sent.
+@@ -433,6 +448,13 @@ func (s *Server) Start() error {
+ 	ns.ProcessSubnets = true
+ 	ns.GetTCPHandlerForFlow = func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
+ 		if dst.Addr() == lb.addr {
++			if s.OnTCPWithPeer != nil {
++				peer, ok := lb.peerByIP(src.Addr())
++				if !ok {
++					return nil, true // send RST
++				}
++				return s.OnTCPWithPeer(peer, dst.Port()), true
++			}
+ 			if s.OnTCP == nil {
+ 				return nil, true // send RST
+ 			}
+@@ -1801,6 +1823,17 @@ func (s *Server) Status() *ipnstate.Status {
+ 	return s.lb.Status()
+ }
+ 
++// DERPReady reports whether the selected DERP relay has sent traffic to the
++// server, which confirms the server is registered before its ConnBlob is
++// published to clients.
++func (s *Server) DERPReady() bool {
++	if s.lb == nil {
++		return false
++	}
++	regionID := s.lb.derpRegionID()
++	return !s.lb.sys.HealthTracker.Get().GetDERPRegionReceivedTime(regionID).IsZero()
++}
++
+ // nodePrivateAsDiscoPrivate converts a NodePrivate to a DiscoPrivate by
+ // reusing the same raw key bytes. This is used in tailcat where the server
+ // uses its node key as the disco key.

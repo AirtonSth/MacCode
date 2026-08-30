@@ -22,7 +22,10 @@ final class SettingsWindowCloseRoutingTests: XCTestCase {
 
         let main = MainWindowController(context: context, router: router)
         router.windowController = main
-        let settings = SettingsWindowController(context: context)
+        let settings = SettingsWindowController(
+            context: context,
+            tailcatAccessSettingAuthority: TailcatAccessSettingAuthority()
+        )
         let delegate = AppDelegate(channel: .debug, appSupportOverride: directory)
         delegate.context = context
         delegate.router = router

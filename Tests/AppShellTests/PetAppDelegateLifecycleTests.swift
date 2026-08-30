@@ -126,7 +126,10 @@ final class PetAppDelegateLifecycleTests: XCTestCase {
         delegate.context = context
         delegate.router = router
         delegate.windowController = windowController
-        delegate.settings = SettingsWindowController(context: context)
+        delegate.settings = SettingsWindowController(
+            context: context,
+            tailcatAccessSettingAuthority: TailcatAccessSettingAuthority()
+        )
         return (delegate, context, router)
     }
 }

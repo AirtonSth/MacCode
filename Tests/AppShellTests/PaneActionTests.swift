@@ -1513,7 +1513,10 @@ final class PaneActionTests: XCTestCase {
             backing: .buffered,
             defer: false
         )
-        let settings = SettingsWindowController(context: ctx)
+        let settings = SettingsWindowController(
+            context: ctx,
+            tailcatAccessSettingAuthority: TailcatAccessSettingAuthority()
+        )
         parent.animationBehavior = .none
         settings.window.animationBehavior = .none
         settings.show(attachedTo: parent)

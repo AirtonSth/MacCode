@@ -25,7 +25,11 @@ final class SettingsUpdaterInjectionTests: XCTestCase {
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
         let updater = StubUpdater()
 
-        let controller = SettingsWindowController(context: ctx, updater: updater)
+        let controller = SettingsWindowController(
+            context: ctx,
+            updater: updater,
+            tailcatAccessSettingAuthority: TailcatAccessSettingAuthority()
+        )
 
         XCTAssertTrue(
             controller.viewModel.showsAppUpdates,
@@ -38,7 +42,11 @@ final class SettingsUpdaterInjectionTests: XCTestCase {
         let dir = NSTemporaryDirectory() + "RC2SettingsUpdater-\(UUID().uuidString)"
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
 
-        let controller = SettingsWindowController(context: ctx, updater: nil)
+        let controller = SettingsWindowController(
+            context: ctx,
+            updater: nil,
+            tailcatAccessSettingAuthority: TailcatAccessSettingAuthority()
+        )
 
         XCTAssertFalse(
             controller.viewModel.showsAppUpdates,
