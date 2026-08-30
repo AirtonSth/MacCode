@@ -83,7 +83,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
     }
 
     @MainActor
-    func testAppDelegateContextAuthorityActivatesAndDeletesBeforeBlockedRuntimeTeardown() async throws {
+    func testMenuPresentedSettingsExplicitAuthorityActivatesAndDeletesBeforeBlockedRuntimeTeardown() async throws {
         let directory = NSTemporaryDirectory() + "RCTailcatSettingsWindow-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: directory) }
         let context = try AppContext(channel: .debug, appSupportOverride: directory)
@@ -109,11 +109,20 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
             dispatcher: JSONRPCDispatcher(router: router),
             bootEpoch: 1
         )
-        let appDelegateSettings = SettingsWindowController(context: context, loadImmediately: false)
-        let sidebarFallbackSettings = SettingsWindowController(context: context, loadImmediately: false)
-        appDelegateSettings.viewModel.privateAccountUser = Self.session.user
+        let menuSettings = delegate.makeSettingsWindowController(
+            context: context,
+            updater: nil,
+            loadImmediately: false
+        )
+        delegate.settings = menuSettings
+        defer { menuSettings.close() }
+        XCTAssertTrue(
+            NSApp.sendAction(NSSelectorFromString("showSettings"), to: delegate, from: nil),
+            "the production Cmd-comma selector must present the factory-built Settings controller"
+        )
+        menuSettings.viewModel.privateAccountUser = Self.session.user
 
-        appDelegateSettings.viewModel.setTailcatAccess(true)
+        menuSettings.viewModel.setTailcatAccess(true)
 
         for _ in 0..<100 where !statuses.values.contains(.checking) {
             try await Task.sleep(nanoseconds: 10_000_000)
@@ -123,6 +132,11 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertEqual(bridge.startCalls.count, 2)
         let published = await catalog.lastPublish
         XCTAssertNotNil(published)
+        let sidebarFallbackSettings = SettingsWindowController(
+            context: context,
+            loadImmediately: false,
+            tailcatAccessSettingAuthority: delegate.tailcatAccessSettingAuthority
+        )
         sidebarFallbackSettings.viewModel.tailcatAccessEnabled = true
 
         sidebarFallbackSettings.viewModel.setTailcatAccess(false)

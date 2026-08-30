@@ -20,6 +20,19 @@ extension Notification.Name {
     static let rc2TailcatRuntimeStatusChanged = Notification.Name("rc2TailcatRuntimeStatusChanged")
 }
 
+public final class TailcatAccessSettingAuthority {
+    private let applySetting: @MainActor (Bool) -> Void
+
+    public init(applySetting: @escaping @MainActor (Bool) -> Void = { _ in }) {
+        self.applySetting = applySetting
+    }
+
+    @MainActor
+    func apply(_ enabled: Bool) {
+        applySetting(enabled)
+    }
+}
+
 /// Pure enumeration of every user-tunable AppSettings field key.
 /// Used by the Settings window to surface all fields and by tests to guard
 /// that no field is silently omitted from the UI.
@@ -318,6 +331,7 @@ public final class SettingsViewModel: ObservableObject {
     public let settingsStore: SettingsStore
     public let customModelStore: AgentCustomModelStore
     public let context: AppContext
+    private let tailcatAccessSettingAuthority: TailcatAccessSettingAuthority
     private let storageBudgetManager: LocalStorageBudgetManager
     private let privateAccountAPI: PrivateAccountAPI
     private let privateAccountStore: PrivateAccountSessionStore
@@ -466,12 +480,14 @@ public final class SettingsViewModel: ObservableObject {
 
     public init(
         context: AppContext,
+        tailcatAccessSettingAuthority: TailcatAccessSettingAuthority = TailcatAccessSettingAuthority(),
         privateAccountAPI: PrivateAccountAPI = URLSessionPrivateAccountAPI(),
         openURL: @escaping @MainActor (URL) -> Void = { NSWorkspace.shared.open($0) },
         updater: AppUpdateChecking? = nil,
         loadImmediately: Bool = true
     ) {
         self.context = context
+        self.tailcatAccessSettingAuthority = tailcatAccessSettingAuthority
         self.privateAccountAPI = privateAccountAPI
         self.openURL = openURL
         self.updater = updater
@@ -744,7 +760,7 @@ public final class SettingsViewModel: ObservableObject {
             try settingsRepo.set("tailcat_access_enabled", on ? "1" : "0")
             tailcatAccessEnabled = on
             tailcatAccessStatus = on ? TailcatRuntimeStatus.checking.displayText : TailcatRuntimeStatus.off.displayText
-            context.tailcatAccessSettingAuthority.apply(on)
+            tailcatAccessSettingAuthority.apply(on)
             NotificationCenter.default.post(name: .rc2TailcatSettingChanged, object: nil)
         } catch {
             recordSettingsWriteError(error)
@@ -3198,8 +3214,18 @@ public final class SettingsWindowController: NSObject {
     private var freshnessTask: Task<Void, Never>?
     private var freshnessGeneration: UInt64 = 0
 
-    public init(context: AppContext, updater: AppUpdateChecking? = nil, loadImmediately: Bool = true) {
-        self.viewModel = SettingsViewModel(context: context, updater: updater, loadImmediately: loadImmediately)
+    public init(
+        context: AppContext,
+        updater: AppUpdateChecking? = nil,
+        loadImmediately: Bool = true,
+        tailcatAccessSettingAuthority: TailcatAccessSettingAuthority = TailcatAccessSettingAuthority()
+    ) {
+        self.viewModel = SettingsViewModel(
+            context: context,
+            tailcatAccessSettingAuthority: tailcatAccessSettingAuthority,
+            updater: updater,
+            loadImmediately: loadImmediately
+        )
         let routeRegistry = SettingsRouteRegistry()
         self.routeRegistry = routeRegistry
         let host = NSHostingController(rootView: SettingsView(

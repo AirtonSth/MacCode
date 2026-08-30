@@ -280,19 +280,6 @@ final class ProjectScriptRunRegistry: @unchecked Sendable {
 }
 
 @MainActor
-public final class TailcatAccessSettingAuthority {
-    private var applySetting: (Bool) -> Void = { _ in }
-
-    func install(_ applySetting: @escaping (Bool) -> Void) {
-        self.applySetting = applySetting
-    }
-
-    func apply(_ enabled: Bool) {
-        applySetting(enabled)
-    }
-}
-
-@MainActor
 public final class AppContext {
     private final class WeakReference: @unchecked Sendable {
         weak var value: AppContext?
@@ -365,7 +352,6 @@ public final class AppContext {
     public private(set) var tokenSaverAccountUsageRefreshCount = 0
     public private(set) var persistenceWriteErrorMessage: String?
     public var onPersistenceWriteError: ((String) -> Void)?
-    public let tailcatAccessSettingAuthority = TailcatAccessSettingAuthority()
 
     public let reducer = LayoutReducer()
     public var state = LayoutState()

@@ -63,13 +63,7 @@ func closeSurfacesForApplicationTermination(
 
 @MainActor
 public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
-    public var context: AppContext! {
-        didSet {
-            context?.tailcatAccessSettingAuthority.install { [weak self] requested in
-                self?.applyTailcatAccessSetting(requested)
-            }
-        }
-    }
+    public var context: AppContext!
     public var router: AppCommandRouter!
     public var windowController: MainWindowController!
     public var socketServer: UnixSocketServer?
@@ -108,6 +102,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         authenticator: tailcatAuthenticator
     )
     var tailcatSupervisor: TailcatRuntimeSupervisor?
+    lazy var tailcatAccessSettingAuthority = TailcatAccessSettingAuthority { [weak self] requested in
+        self?.applyTailcatAccessSetting(requested)
+    }
     public var palette: CommandPalette?
     public var settings: SettingsWindowController?
     public private(set) var petController: PetController?
@@ -254,9 +251,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         updater?.onWillInstallUpdate = { [weak self] in
             self?.persistRestorableStateBeforeUpdate()
         }
-        windowController = MainWindowController(context: context, router: router, updater: updater)
+        windowController = MainWindowController(
+            context: context,
+            router: router,
+            updater: updater,
+            tailcatAccessSettingAuthority: tailcatAccessSettingAuthority
+        )
         router.windowController = windowController
-        settings = SettingsWindowController(context: context, updater: updater)
+        settings = makeSettingsWindowController(context: context, updater: updater)
         // Schedules run in-process (paste+play Agent App). Unregister any legacy
         // LaunchAgent so it cannot dual-claim after upgrade.
         startInProcessScheduledTaskScheduler()
@@ -1720,6 +1722,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         } else {
             settings?.show()
         }
+    }
+
+    func makeSettingsWindowController(
+        context: AppContext,
+        updater: AppUpdateChecking?,
+        loadImmediately: Bool = true
+    ) -> SettingsWindowController {
+        SettingsWindowController(
+            context: context,
+            updater: updater,
+            loadImmediately: loadImmediately,
+            tailcatAccessSettingAuthority: tailcatAccessSettingAuthority
+        )
     }
 
     @objc func checkForUpdatesAction() {
