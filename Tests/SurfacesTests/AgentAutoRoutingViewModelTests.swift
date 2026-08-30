@@ -147,6 +147,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
             orchestrationRuntime: runtime
         )
         vm.createThread(title: "dead external child")
+        await vm.waitForSelectThreadHydrationForTesting()
         let threadID = try XCTUnwrap(vm.selectedThreadId)
         let seedRuntime = AgentOrchestrationRuntime(
             repository: repository,
@@ -230,6 +231,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         )
 
         vm.createThread(title: "thread-with-subagents")
+        await vm.waitForSelectThreadHydrationForTesting()
         let busyThreadID = try XCTUnwrap(vm.selectedThreadId)
         let parentCapability = AgentDelegationCapability.issue()
         let parentRunID = AgentRunID()
@@ -267,6 +269,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         XCTAssertEqual(vm.subagentActivity.done.first?.nodeId, "busy-worker")
 
         vm.createThread(title: "empty-thread")
+        await vm.waitForSelectThreadHydrationForTesting()
         let emptyThreadID = try XCTUnwrap(vm.selectedThreadId)
         XCTAssertNotEqual(emptyThreadID, busyThreadID)
         // createThread/selectThread must rebuild immediately — not wait for the 2s poll.
@@ -276,6 +279,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         )
 
         vm.selectThread(busyThreadID)
+        await vm.waitForSelectThreadHydrationForTesting()
         await vm.awaitSubagentActivityRefreshForTesting()
         XCTAssertEqual(vm.subagentActivity.doneCount, 1,
                        "returning to the busy thread must restore its own subagents only")
@@ -303,6 +307,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         try runtime.finalizeReceipt(runId: nestedRunID, status: .completed)
 
         vm.selectThread(busyThreadID)
+        await vm.waitForSelectThreadHydrationForTesting()
         await vm.awaitSubagentActivityRefreshForTesting()
         XCTAssertEqual(
             Set(vm.subagentActivity.done.map(\.nodeId)),
@@ -310,6 +315,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
             "spawning thread badge must include parent-chain nested workers on other threads"
         )
         vm.selectThread(emptyThreadID)
+        await vm.waitForSelectThreadHydrationForTesting()
         XCTAssertTrue(
             vm.subagentActivity.isEmpty,
             "unrelated empty thread still must not inherit the spawner's nested workers"
@@ -353,6 +359,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         )
 
         vm.createThread(title: "doomed")
+        await vm.waitForSelectThreadHydrationForTesting()
         let threadID = try XCTUnwrap(vm.selectedThreadId)
         let parentCapability = AgentDelegationCapability.issue()
         let parentRunID = AgentRunID()
@@ -432,6 +439,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         )
 
         vm.createThread(title: "old selected thread")
+        await vm.waitForSelectThreadHydrationForTesting()
         let oldThreadID = try XCTUnwrap(vm.selectedThreadId)
         let parentRunID = AgentRunID()
         let parentCapability = AgentDelegationCapability.issue()
@@ -473,6 +481,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         await fulfillment(of: [clock.blocked], timeout: 2)
 
         vm.createThread(title: "new selected thread")
+        await vm.waitForSelectThreadHydrationForTesting()
         let newThreadID = try XCTUnwrap(vm.selectedThreadId)
         XCTAssertNotEqual(newThreadID, oldThreadID)
         XCTAssertTrue(vm.subagentActivity.isEmpty)

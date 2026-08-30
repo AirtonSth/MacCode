@@ -487,9 +487,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             77,
             78,
             79,
-            80
+            80,
+            81
         ])
-        XCTAssertEqual(Schema.currentVersion, 80)
+        XCTAssertEqual(Schema.currentVersion, 81)
         XCTAssertFalse(
             Schema.steps.contains { (63...66).contains($0.version) },
             "schema versions 63-66 are retired and must never be reused"
@@ -516,7 +517,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
 
         try Schema.migrateSteps(db, Schema.steps)
         XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
-        XCTAssertEqual(Schema.currentVersion, 80)
+        XCTAssertEqual(Schema.currentVersion, 81)
 
         XCTAssertEqual(try rowCount(db, table: "token_saver_run_winner_receipts"), 0,
                        "v72 must not backfill historical winners")
@@ -597,10 +598,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             Schema.steps.filter { $0.version == 71 }.count, 1,
             "HEAD/origin production last published step is 71"
         )
-        XCTAssertEqual(Schema.currentVersion, 80)
+        XCTAssertEqual(Schema.currentVersion, 81)
         XCTAssertEqual(
-            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76, 77, 78, 79, 80],
-            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec; v77 owns nullable agent_runs.terminal_reason; v78 deduplicates savings retries; v79 preserves host attestations outside rolling replay; v80 owns Bot queued follow-ups"
+            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76, 77, 78, 79, 80, 81],
+            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec; v77 owns nullable agent_runs.terminal_reason; v78 deduplicates savings retries; v79 preserves host attestations outside rolling replay; v80 owns Bot queued follow-ups; v81 indexes running thread IDs"
         )
         let v72 = try XCTUnwrap(Schema.steps.first { $0.version == 72 })
         XCTAssertTrue(v72.sql.contains("CHECK(format IN ('human', 'rcw1', 'rcs1'))"))
@@ -1275,6 +1276,66 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         }, "v62 must satisfy maintenance ordering without a temporary B-tree: \(details)")
     }
 
+    func test_v80ToV81PreservesThreadsAndIndexesRunningThreadProjection() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 80 })
+
+        let insert = try db.prepare("""
+            INSERT INTO agent_threads(id, title, provider, model, status, created_at, updated_at)
+            VALUES(?, ?, 'codex', 'gpt-test', ?, '2026-08-30T00:00:00Z', '2026-08-30T00:00:00Z');
+        """)
+        try db.transaction {
+            for index in 0..<1_024 {
+                insert.reset()
+                try insert.bind(1, String(format: "00000000-0000-0000-0000-%012d", index + 1))
+                try insert.bind(2, "v81-thread-\(index)")
+                try insert.bind(3, index < 8 ? "running" : "completed")
+                _ = try insert.step()
+            }
+        }
+
+        let query = """
+            EXPLAIN QUERY PLAN
+            SELECT t.id, r.mode, r.configuration_json, r.revision
+            FROM agent_threads AS t
+            LEFT JOIN agent_thread_routing AS r ON r.thread_id = t.id
+            WHERE t.status = 'running';
+        """
+        func planDetails() throws -> [String] {
+            let plan = try db.prepare(query)
+            defer { plan.reset() }
+            var details: [String] = []
+            while try plan.step() {
+                if let detail = plan.columnText(3) { details.append(detail) }
+            }
+            return details
+        }
+
+        XCTAssertEqual(try maxVersion(db), 80)
+        let before = try planDetails()
+        XCTAssertTrue(before.contains("SCAN t"), "v80 must show the pre-index full-history scan: \(before)")
+
+        try Schema.migrateSteps(db, Schema.steps)
+        XCTAssertEqual(try maxVersion(db), 81)
+        XCTAssertEqual(try rowCount(db, table: "agent_threads"), 1_024,
+                       "v80 to v81 must preserve every existing thread row")
+        let expected = Set((0..<8).map {
+            AgentThreadID(UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", $0 + 1))!)
+        })
+        XCTAssertEqual(try AgentThreadRepository(db: db).runningThreadIds(), expected,
+                       "the migrated running-ID projection must preserve the active rows")
+
+        let after = try planDetails()
+        XCTAssertTrue(
+            after.contains { $0.contains("INDEX idx_agent_threads_running") },
+            "v81 must use the partial running-thread index: \(after)"
+        )
+        XCTAssertFalse(
+            after.contains { $0.contains("SCAN t") && !$0.contains("INDEX idx_agent_threads_running") },
+            "v81 must remove the full-history scan from the production-shaped query: \(after)"
+        )
+    }
+
     func test_oldV61MaintenanceRollsBackFailedBatchAndRetriesToDrain() throws {
         let root = NSTemporaryDirectory() + "rc2-fork-intent-v61-recovery-" + UUID().uuidString
         let dbPath = root + "/remotecode.sqlite"
@@ -1590,7 +1651,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         try insert.bind(2, payload)
         _ = try insert.step()
 
-        try Schema.migrateSteps(db, Schema.steps)
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 79 })
 
         XCTAssertEqual(try maxVersion(db), 79)
         XCTAssertEqual(try rowCount(db, table: "agent_item_host_attestations"), 1,

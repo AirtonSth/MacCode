@@ -232,6 +232,7 @@ final class AgentWorkspaceRailReloadCoordinatorTests: XCTestCase {
         )
         defer { vm.dispose() }
         vm.createThread(title: "Live")
+        await vm.waitForSelectThreadHydrationForTesting()
         let threadID = try XCTUnwrap(vm.selectedThreadId)
         let seedRuntime = AgentOrchestrationRuntime(
             repository: repository,
