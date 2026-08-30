@@ -3218,7 +3218,7 @@ public final class SettingsWindowController: NSObject {
         context: AppContext,
         updater: AppUpdateChecking? = nil,
         loadImmediately: Bool = true,
-        tailcatAccessSettingAuthority: TailcatAccessSettingAuthority = TailcatAccessSettingAuthority()
+        tailcatAccessSettingAuthority: TailcatAccessSettingAuthority
     ) {
         self.viewModel = SettingsViewModel(
             context: context,

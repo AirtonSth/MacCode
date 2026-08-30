@@ -102,6 +102,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         authenticator: tailcatAuthenticator
     )
     var tailcatSupervisor: TailcatRuntimeSupervisor?
+    private var tailcatSettingTask: Task<Void, Never>?
     lazy var tailcatAccessSettingAuthority = TailcatAccessSettingAuthority { [weak self] requested in
         self?.applyTailcatAccessSetting(requested)
     }
@@ -1179,9 +1180,18 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private func applyTailcatAccessSetting(_ requested: Bool) {
-        guard let tailcatSupervisor else { return }
         let listenerReady = httpServer != nil
-        Task { await tailcatSupervisor.setEnabled(requested && listenerReady) }
+        NSLog(
+            "Tailcat setting requested=%@ supervisorReady=%@ listenerReady=%@",
+            requested.description,
+            (tailcatSupervisor != nil).description,
+            listenerReady.description
+        )
+        guard let tailcatSupervisor else { return }
+        let enabled = requested && listenerReady
+        tailcatSettingTask = Task {
+            await tailcatSupervisor.setEnabled(enabled)
+        }
         if requested && !listenerReady {
             NotificationCenter.default.post(
                 name: .rc2TailcatRuntimeStatusChanged,
