@@ -17,6 +17,7 @@ public enum BotSend: RemoteCodeRPCContract {
         public let permissionMode: String?
         public let reasoningEffort: String?
         public let serviceTier: String?
+        public let runAsUser: RemoteCodeJSONValue?
 
         public init(
             botID: String,
@@ -31,7 +32,8 @@ public enum BotSend: RemoteCodeRPCContract {
             routingMode: String? = nil,
             permissionMode: String? = nil,
             reasoningEffort: String? = nil,
-            serviceTier: String? = nil
+            serviceTier: String? = nil,
+            runAsUser: RemoteCodeJSONValue? = nil
         ) {
             self.botID = botID
             self.conversationID = conversationID
@@ -46,6 +48,7 @@ public enum BotSend: RemoteCodeRPCContract {
             self.permissionMode = permissionMode
             self.reasoningEffort = reasoningEffort
             self.serviceTier = serviceTier
+            self.runAsUser = runAsUser
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -62,6 +65,7 @@ public enum BotSend: RemoteCodeRPCContract {
             case permissionMode = "permission_mode"
             case reasoningEffort = "reasoning_effort"
             case serviceTier = "service_tier"
+            case runAsUser = "run_as_user"
         }
     }
 
