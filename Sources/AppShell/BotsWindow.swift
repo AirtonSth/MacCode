@@ -5392,6 +5392,54 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    /// Paired v1 stop is bound to the exact admitted conversation/run. A
+    /// delayed request must fail instead of discovering and stopping whatever
+    /// run happens to be active for the Bot when it arrives.
+    public func stopLiveRun(
+        for botID: BotID,
+        conversationID: String?,
+        runID: String?,
+        runRequestID: String?,
+        force: Bool,
+        onSettled: ((Bool) -> Void)? = nil
+    ) {
+        guard let conversationID,
+              let conversationUUID = UUID(uuidString: conversationID),
+              let runID,
+              let runUUID = UUID(uuidString: runID),
+              let conversation = try? botStore.conversation(
+                id: BotConversationID(conversationUUID)
+              ),
+              conversation.botID == botID,
+              let threadID = conversation.linkedAgentThreadID,
+              context.coordinator.activeRunId(threadId: threadID) == AgentRunID(runUUID) else {
+            onSettled?(false)
+            return
+        }
+        let matchingWorks = (deskSendTasks[botID] ?? []).filter {
+            $0.threadID == threadID && ($0.runID == nil || $0.runID == AgentRunID(runUUID))
+        }
+        matchingWorks.forEach { work in
+            work.task.cancel()
+            forgetDeskSend(work, botID: botID)
+        }
+        context.coordinator.stopRun(threadId: threadID)
+        deskStopRunIssuedCountForTesting += 1
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.context.coordinator.stopAndAwaitTermination(threadId: threadID)
+                onSettled?(self.context.coordinator.activeRunId(threadId: threadID) == nil)
+            } catch {
+                self.errorMessage = force
+                    ? "Force stop: \(error.localizedDescription)"
+                    : String(describing: error)
+                onSettled?(false)
+            }
+            _ = runRequestID // receipt identity is validated by the authority.
+        }
+    }
+
     private func liveThreadIDs(for botID: BotID, includeInFlightSends: Bool = true) throws -> [AgentThreadID] {
         if let error = liveThreadDiscoveryErrorForTesting {
             throw error

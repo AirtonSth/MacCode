@@ -3078,7 +3078,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "text": "queued",
         ])
         var stopped = false
-        authority.onStopRun = { _, force, _ in
+        authority.onStopRun = { _, _, _, _, force, _ in
             stopped = force
         }
         let uuid = try XCTUnwrap(UUID(uuidString: botID))
@@ -3090,6 +3090,62 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(result["status"] as? String, "accepted")
         XCTAssertNil((result["readback"] as? [String: Any])?["drained"] as? [String: Any])
         XCTAssertEqual(try store.listQueuedFollowUps(botID: BotID(uuid)).map(\.text), ["queued"])
+    }
+
+    func test_scopedStopCannotTerminateANewerRunAfterNetworkDelay() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "scoped-stop-bot",
+            "name": "Piper",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let conversation = try authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "scoped-stop-conversation",
+            "bot_id": botID,
+        ])
+        let conversationID = try XCTUnwrap(
+            (conversation["readback"] as? [String: Any])?["conversation_id"] as? String
+        )
+        let first = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "scoped-stop-run-1",
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "text": "first",
+        ])
+        let firstRunID = try XCTUnwrap(
+            (first["readback"] as? [String: Any])?["run_id"] as? String
+        )
+        _ = try authority.dispatch(method: "bot.stop", params: [
+            "client_request_id": "scoped-stop-first",
+            "bot_id": botID,
+        ])
+        let second = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "scoped-stop-run-2",
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "text": "second",
+        ])
+        let secondRunID = try XCTUnwrap(
+            (second["readback"] as? [String: Any])?["run_id"] as? String
+        )
+
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.stop", params: [
+            "client_request_id": "scoped-stop-delayed",
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "run_id": firstRunID,
+            "run_request_id": "scoped-stop-run-1",
+        ]))
+
+        let stopped = try authority.dispatch(method: "bot.stop", params: [
+            "client_request_id": "scoped-stop-current",
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "run_id": secondRunID,
+            "run_request_id": "scoped-stop-run-2",
+        ])
+        let readback = try XCTUnwrap(stopped["readback"] as? [String: Any])
+        XCTAssertEqual((readback["run"] as? [String: Any])?["run_id"] as? String, secondRunID)
+        XCTAssertEqual(readback["terminal"] as? Bool, true)
     }
 
     func test_forceStop_drainsStoreQueue() throws {
@@ -3243,7 +3299,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "text": "go",
         ])
         var requestID = ""
-        authority.onStopRun = { _, _, id in requestID = id }
+        authority.onStopRun = { _, _, _, _, _, id in requestID = id }
         let stopped = try authority.dispatch(method: "bot.force_stop", params: [
             "client_request_id": "stop-set-1",
             "bot_id": botID,

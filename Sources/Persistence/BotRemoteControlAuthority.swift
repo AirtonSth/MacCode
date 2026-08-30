@@ -56,7 +56,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private let attentionNotificationMetadata: BotAttentionNotificationMetadataStore
 
     public var onHasLiveRun: ((BotID) -> Bool)?
-    public var onStopRun: ((BotID, Bool, String) -> Void)?
+    public var onStopRun: ((BotID, String?, String?, String?, Bool, String) -> Void)?
     public var onStartGuest: ((BotID, String, String, [String: Any]) -> Void)?
     public var onStopGuest: ((BotID, String, [String: Any]) -> Void)?
     public var onRebuildGuest: ((BotID, String, [String: Any]) -> Void)?
@@ -1121,10 +1121,31 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     ) throws -> [String: Any] {
         let bot = try requireBot(params)
         let botID = id(bot)
-        let hadLive = onHasLiveRun?(bot.id) ?? (liveRuns[botID] != nil)
+        let requestedConversationID = string(params, "conversation_id")
+        let requestedRunID = string(params, "run_id")
+        let requestedRunRequestID = string(params, "run_request_id")
         let run = liveRuns[botID]
+        if requestedConversationID != nil || requestedRunID != nil || requestedRunRequestID != nil {
+            guard let requestedRunID,
+                  let requestedConversationID,
+                  let run,
+                  run["bot_id"] as? String == botID,
+                  run["conversation_id"] as? String == requestedConversationID,
+                  run["run_id"] as? String == requestedRunID,
+                  requestedRunRequestID.map({ run["request_id"] as? String == $0 }) ?? true else {
+                throw Error.crossTarget
+            }
+        }
+        let hadLive = onHasLiveRun?(bot.id) ?? (liveRuns[botID] != nil)
         let liveStop = onStopRun != nil
-        onStopRun?(bot.id, force, requestID)
+        onStopRun?(
+            bot.id,
+            requestedConversationID,
+            requestedRunID,
+            requestedRunRequestID,
+            force,
+            requestID
+        )
         liveRuns[botID] = nil
         var drained: [String: Any]?
         if !liveStop, let next = try store.dequeueQueuedFollowUp(botID: bot.id) {

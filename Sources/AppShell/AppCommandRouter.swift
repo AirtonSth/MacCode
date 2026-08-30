@@ -2995,7 +2995,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         created.onHasLiveRun = { [weak self] id in
             self?.botsViewModel?.hasLiveRun(botID: id) ?? false
         }
-        created.onStopRun = { [weak self] id, force, requestID in
+        created.onStopRun = { [weak self] id, conversationID, runID, runRequestID, force, requestID in
             guard let self else { return }
             guard let botsViewModel = self.botsViewModel else {
                 self.settlePairedBot(
@@ -3005,7 +3005,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 )
                 return
             }
-            botsViewModel.stopLiveRuns(for: id, force: force) { [weak self] ok in
+            botsViewModel.stopLiveRun(
+                for: id,
+                conversationID: conversationID,
+                runID: runID,
+                runRequestID: runRequestID,
+                force: force
+            ) { [weak self] ok in
                 self?.settlePairedBot(
                     requestID: requestID,
                     ok: ok,
