@@ -368,29 +368,38 @@ final class ProviderProxyPolicyTests: XCTestCase {
     func test_samGrokWorkerPromotion_preservesExactAgentAppContractForEveryEffort() throws {
         // WHY: the promoted execution must keep the worker report ABI while the
         // real Agent App thread owns persistence, Token Saver and usage.
-        for effort in ["low", "medium", "high", "xhigh", "max"] {
-            let delegation = try XCTUnwrap(
-                ProviderProxyPolicy.samGrokWorkerAgentAppDelegation(
-                    providerBasename: "/managed/grok",
-                    arguments: samGrokWorkerArguments(effort: effort)
+        // Live sam-grok-worker emits --model grok-4.6; grok-4.5 remains valid.
+        let models = ["grok-4.5", "grok-4.6", "grok-4.6-preview"]
+        for model in models {
+            for effort in ["low", "medium", "high", "xhigh", "max"] {
+                let delegation = try XCTUnwrap(
+                    ProviderProxyPolicy.samGrokWorkerAgentAppDelegation(
+                        providerBasename: "/managed/grok",
+                        arguments: samGrokWorkerArguments(effort: effort, model: model)
+                    )
                 )
-            )
-            XCTAssertEqual(delegation.provider, .grok)
-            XCTAssertEqual(delegation.promptFile, "/tmp/worker-prompt.txt")
-            XCTAssertEqual(delegation.model, "grok-4.5")
-            let normalizedEffort = ["xhigh": "high", "max": "high"][effort] ?? effort
-            XCTAssertEqual(delegation.reasoningEffort.rawValue, normalizedEffort)
-            XCTAssertEqual(delegation.permissionMode, .autoAcceptEdits)
-            XCTAssertEqual(delegation.outputFormat, .grokJSON)
-            XCTAssertEqual(delegation.arguments, [
-                "agent-app", "grok",
-                "--prompt-file", "/tmp/worker-prompt.txt",
-                "--model", "grok-4.5",
-                "--permission", "auto_accept_edits",
-                "--reasoning-effort", normalizedEffort,
-                "--output-format", "grok-json",
-                "--runtime-profile", "sam-grok-worker-v1"
-            ])
+                XCTAssertEqual(delegation.provider, .grok)
+                XCTAssertEqual(delegation.promptFile, "/tmp/worker-prompt.txt")
+                XCTAssertEqual(delegation.model, model)
+                let normalizedEffort: String
+                if model.hasPrefix("grok-4.6") {
+                    normalizedEffort = ["max": "xhigh"][effort] ?? effort
+                } else {
+                    normalizedEffort = ["xhigh": "high", "max": "high"][effort] ?? effort
+                }
+                XCTAssertEqual(delegation.reasoningEffort.rawValue, normalizedEffort)
+                XCTAssertEqual(delegation.permissionMode, .autoAcceptEdits)
+                XCTAssertEqual(delegation.outputFormat, .grokJSON)
+                XCTAssertEqual(delegation.arguments, [
+                    "agent-app", "grok",
+                    "--prompt-file", "/tmp/worker-prompt.txt",
+                    "--model", model,
+                    "--permission", "auto_accept_edits",
+                    "--reasoning-effort", normalizedEffort,
+                    "--output-format", "grok-json",
+                    "--runtime-profile", "sam-grok-worker-v1"
+                ])
+            }
         }
     }
 
@@ -469,8 +478,11 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ["--prompt-file=/tmp/worker-prompt.txt"] + Array(canonical.dropFirst(2)),
             ["--prompt-file", "relative.txt"] + Array(canonical.dropFirst(2)),
             replacingValue("--model", with: "grok-4", in: canonical),
+            replacingValue("--model", with: "grok-code", in: canonical),
+            replacingValue("--model", with: "gpt-5.6", in: canonical),
             replacingValue("--effort", with: "minimal", in: canonical),
             replacingValue("--effort", with: "future", in: canonical),
+            replacingValue("--effort", with: "ultracode", in: canonical),
             replacingValue("--output-format", with: "streaming-json", in: canonical),
             replacingValue("--sandbox", with: "workspace-write", in: canonical),
             replacingValue("--disallowed-tools", with: "Read", in: canonical)
@@ -745,14 +757,26 @@ final class ProviderProxyPolicyTests: XCTestCase {
     }
 
     func test_nestedCLIAgentAppDelegation_samGrokWorkerKeepsRuntimeProfile() throws {
-        let delegation = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+        let grok45 = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "grok",
             arguments: samGrokWorkerArguments(effort: "high"),
             promptFile: "/tmp/worker-prompt.txt"
         ))
-        XCTAssertEqual(delegation.runtimeProfile, .samGrokWorkerV1)
-        XCTAssertEqual(delegation.outputFormat, .grokJSON)
-        XCTAssertTrue(delegation.arguments.contains("sam-grok-worker-v1"))
+        XCTAssertEqual(grok45.model, "grok-4.5")
+        XCTAssertEqual(grok45.runtimeProfile, .samGrokWorkerV1)
+        XCTAssertEqual(grok45.outputFormat, .grokJSON)
+        XCTAssertTrue(grok45.arguments.contains("sam-grok-worker-v1"))
+
+        let grok46 = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: samGrokWorkerArguments(effort: "xhigh", model: "grok-4.6"),
+            promptFile: "/tmp/worker-prompt.txt"
+        ))
+        XCTAssertEqual(grok46.model, "grok-4.6")
+        XCTAssertEqual(grok46.reasoningEffort, .xhigh)
+        XCTAssertEqual(grok46.runtimeProfile, .samGrokWorkerV1)
+        XCTAssertEqual(grok46.outputFormat, .grokJSON)
+        XCTAssertTrue(grok46.arguments.contains("sam-grok-worker-v1"))
     }
 
     func test_agentAppSocketPathUsesInjectedScopeThenBundledChannelFallback() {
@@ -1646,10 +1670,13 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertFalse(tracker.claim(runId), "a committed finalization is idempotent")
     }
 
-    private func samGrokWorkerArguments(effort: String = "high") -> [String] {
+    private func samGrokWorkerArguments(
+        effort: String = "high",
+        model: String = "grok-4.5"
+    ) -> [String] {
         [
             "--prompt-file", "/tmp/worker-prompt.txt",
-            "--model", "grok-4.5",
+            "--model", model,
             "--effort", effort,
             "--output-format", "json",
             "--sandbox", "workspace",

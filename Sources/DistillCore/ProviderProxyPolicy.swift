@@ -1136,7 +1136,8 @@ public enum ProviderProxyPolicy {
               let promptFile = values["--prompt-file"],
               (promptFile as NSString).isAbsolutePath,
               !promptFile.isEmpty,
-              values["--model"] == "grok-4.5",
+              let model = values["--model"],
+              admitsSamGrokWorkerModel(model),
               let effortValue = values["--effort"],
               let requestedEffort = AgentReasoningEffort(rawValue: effortValue),
               [.low, .medium, .high, .xhigh, .max].contains(requestedEffort),
@@ -1147,17 +1148,26 @@ public enum ProviderProxyPolicy {
         }
         let effort = GrokReasoningPolicy.normalizedEffort(
             requestedEffort,
-            model: "grok-4.5"
+            model: model
         )
         return ProviderAgentAppDelegation(
             provider: .grok,
             promptFile: promptFile,
-            model: "grok-4.5",
+            model: model,
             reasoningEffort: effort,
             permissionMode: .autoAcceptEdits,
             outputFormat: .grokJSON,
             runtimeProfile: .samGrokWorkerV1
         )
+    }
+
+    /// Model half of `GrokACPClient.admitsSamGrokWorker`: grok-4.5 / grok-4.6
+    /// prefixes with a known reasoning contract. DistillCore cannot import
+    /// AgentRuntime, so this stays local and reuses `GrokReasoningPolicy`.
+    private static func admitsSamGrokWorkerModel(_ model: String) -> Bool {
+        let id = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard id.hasPrefix("grok-4.5") || id.hasPrefix("grok-4.6") else { return false }
+        return !GrokReasoningPolicy.supportedEfforts(for: model).isEmpty
     }
 
     /// Promote a nested shell-launched provider CLI into Agent App when the turn
