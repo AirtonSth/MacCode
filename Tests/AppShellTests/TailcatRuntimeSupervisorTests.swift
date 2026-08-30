@@ -83,26 +83,49 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
     }
 
     @MainActor
-    func testAppDelegateSettingsObserverDeletesBeforeBlockedRuntimeTeardown() async throws {
+    func testAppDelegateContextAuthorityActivatesAndDeletesBeforeBlockedRuntimeTeardown() async throws {
         let directory = NSTemporaryDirectory() + "RCTailcatSettingsWindow-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: directory) }
         let context = try AppContext(channel: .debug, appSupportOverride: directory)
-        try context.settingsRepo.set("tailcat_access_enabled", "1")
+        try context.settingsRepo.set("tailcat_access_enabled", "0")
         let snapshot = makeSnapshot(epoch: "epoch-live-disable", revision: 1, peers: [peer(0xda)])
         let catalog = FakeTailcatCatalog(snapshot: snapshot)
         let bridge = FakeTailcatBridge(blockCloses: true)
-        let supervisor = makeSupervisor(bridge: bridge, catalog: catalog, store: FakeTailcatStore())
-        await supervisor.setEnabled(true)
-        await supervisor.reconcileNowForTesting()
+        let statuses = FakeTailcatStatuses()
+        let supervisor = makeSupervisor(
+            bridge: bridge,
+            catalog: catalog,
+            store: FakeTailcatStore(),
+            statusHandler: { statuses.append($0) }
+        )
         let delegate = AppDelegate(channel: .debug, appSupportOverride: directory)
         delegate.context = context
         delegate.tailcatSupervisor = supervisor
-        delegate.installTailcatSettingObserver()
-        defer { NotificationCenter.default.removeObserver(delegate) }
-        let settings = SettingsWindowController(context: context, loadImmediately: false)
-        settings.viewModel.tailcatAccessEnabled = true
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        delegate.httpServer = DirectHTTPServer(
+            port: 0,
+            loopbackOnly: true,
+            dispatcher: JSONRPCDispatcher(router: router),
+            bootEpoch: 1
+        )
+        let appDelegateSettings = SettingsWindowController(context: context, loadImmediately: false)
+        let sidebarFallbackSettings = SettingsWindowController(context: context, loadImmediately: false)
+        appDelegateSettings.viewModel.privateAccountUser = Self.session.user
 
-        settings.viewModel.setTailcatAccess(false)
+        appDelegateSettings.viewModel.setTailcatAccess(true)
+
+        for _ in 0..<100 where !statuses.values.contains(.checking) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(statuses.values.contains(.checking), "the real Settings authority must enable the supervisor")
+        await supervisor.reconcileNowForTesting()
+        XCTAssertEqual(bridge.startCalls.count, 2)
+        let published = await catalog.lastPublish
+        XCTAssertNotNil(published)
+        sidebarFallbackSettings.viewModel.tailcatAccessEnabled = true
+
+        sidebarFallbackSettings.viewModel.setTailcatAccess(false)
 
         for _ in 0..<100 where !bridge.hasStartedClose {
             try await Task.sleep(nanoseconds: 10_000_000)
