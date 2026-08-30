@@ -205,6 +205,40 @@ public struct BotUploadTarget: Codable, Equatable, Sendable {
         self.mimeType = mimeType
     }
 
+    /// Converts the existing Agent attachment-upload result into the exact
+    /// Bot grant target without duplicating its wire-field interpretation in
+    /// either app.
+    public init?(
+        botID: String,
+        conversationID: String,
+        uploadResult: RemoteCodeJSONValue
+    ) {
+        guard !botID.isEmpty,
+              !conversationID.isEmpty,
+              let object = uploadResult.objectValue,
+              let attachmentID = object["id"]?.stringValue,
+              !attachmentID.isEmpty,
+              let filename = object["display_name"]?.stringValue,
+              !filename.isEmpty,
+              let kind = object["kind"]?.stringValue,
+              kind == "file" || kind == "image",
+              let digest = object["sha256"]?.stringValue,
+              digest.count == 64,
+              digest.allSatisfy(\.isHexDigit),
+              let size = object["size_bytes"]?.intValue,
+              size > 0 else { return nil }
+        self.init(
+            botID: botID,
+            conversationID: conversationID,
+            attachmentID: attachmentID,
+            filename: filename,
+            kind: kind,
+            digest: digest.lowercased(),
+            size: size,
+            mimeType: object["mime_type"]?.stringValue
+        )
+    }
+
     private enum CodingKeys: String, CodingKey {
         case botID = "bot_id"
         case conversationID = "conversation_id"

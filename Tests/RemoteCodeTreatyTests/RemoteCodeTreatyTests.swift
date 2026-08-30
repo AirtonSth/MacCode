@@ -128,6 +128,30 @@ final class RemoteCodeTreatyTests: XCTestCase {
         XCTAssertFalse(grant.consumed)
     }
 
+    func testBotUploadTargetMapsTheExistingUploadResultStrictly() throws {
+        let upload = try decoder.decode(RemoteCodeJSONValue.self, from: Data(#"""
+        {"id":"opaque-upload-1","display_name":"proof.txt","kind":"file",
+         "mime_type":"text/plain",
+         "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+         "size_bytes":5,"composer_insertion_text":"/host/proof.txt"}
+        """#.utf8))
+        let target = try XCTUnwrap(BotUploadTarget(
+            botID: "bot-1",
+            conversationID: "conversation-1",
+            uploadResult: upload
+        ))
+        XCTAssertEqual(target.attachmentID, "opaque-upload-1")
+        XCTAssertEqual(target.filename, "proof.txt")
+        XCTAssertEqual(target.digest, String(repeating: "a", count: 64))
+        XCTAssertEqual(target.size, 5)
+
+        XCTAssertNil(BotUploadTarget(
+            botID: "bot-1",
+            conversationID: "conversation-1",
+            uploadResult: .object(["id": .string("opaque-upload-1")])
+        ))
+    }
+
     func testAuthenticatedCapabilitiesDecodeTreatyAndIdentity() throws {
         let data = Data(#"""
         {
