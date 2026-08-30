@@ -5732,6 +5732,60 @@ final class BotsWindowTests: XCTestCase {
         vm.beforeBotRunDispatchForTesting = nil
     }
 
+    func test_pairedExactStopDuringReservedPreflightSettlesAndDoesNotStartProvider() async throws {
+        // WHY: bot.send returns the exact run identity before provider dispatch.
+        // A paired bot.stop for that identity must cancel the reserved Desk work;
+        // requiring activeRunId here rejects the valid preflight target and leaves
+        // iOS permanently showing Working/Stop.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            )
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.setDeskProvider(.claude)
+
+        let send = try vm.enqueueHostMessage(
+            botID: bot.id,
+            text: "go",
+            conversationID: nil,
+            routing: BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+        )
+        let payload = try XCTUnwrap(send.objectValue)
+        let conversationID = try XCTUnwrap(payload["conversation_id"]?.stringValue)
+        let runID = try XCTUnwrap(payload["run_id"]?.stringValue)
+        XCTAssertTrue(vm.deskSendInFlight)
+
+        let settled = expectation(description: "paired exact preflight stop settled")
+        var settledOK: Bool?
+        vm.stopLiveRun(
+            for: bot.id,
+            conversationID: conversationID,
+            runID: runID,
+            runRequestID: "send-request",
+            force: false
+        ) { ok in
+            settledOK = ok
+            settled.fulfill()
+        }
+
+        await fulfillment(of: [settled], timeout: 5)
+        XCTAssertEqual(settledOK, true)
+        XCTAssertTrue(runner.requests.isEmpty, "paired exact preflight stop must not reach the provider")
+        XCTAssertFalse(vm.deskSendInFlight)
+    }
+
     func test_pairedStopVariantsReturnOnlyAfterAsyncReceiptSettlement() async throws {
         // WHY: Phase4 finalizes the value returned by this router. Returning
         // the initial accepted receipt would permanently omit the terminal

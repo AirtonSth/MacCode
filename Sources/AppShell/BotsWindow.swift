@@ -5403,6 +5403,10 @@ public final class BotsViewModel: ObservableObject {
         force: Bool,
         onSettled: ((Bool) -> Void)? = nil
     ) {
+        if conversationID == nil, runID == nil, runRequestID == nil {
+            stopLiveRuns(for: botID, force: force, onSettled: onSettled)
+            return
+        }
         guard let conversationID,
               let conversationUUID = UUID(uuidString: conversationID),
               let runID,
@@ -5411,25 +5415,32 @@ public final class BotsViewModel: ObservableObject {
                 id: BotConversationID(conversationUUID)
               ),
               conversation.botID == botID,
-              let threadID = conversation.linkedAgentThreadID,
-              context.coordinator.activeRunId(threadId: threadID) == AgentRunID(runUUID) else {
+              let threadID = conversation.linkedAgentThreadID else {
             onSettled?(false)
             return
         }
+        let targetRunID = AgentRunID(runUUID)
         let matchingWorks = (deskSendTasks[botID] ?? []).filter {
-            $0.threadID == threadID && ($0.runID == nil || $0.runID == AgentRunID(runUUID))
+            $0.threadID == threadID && $0.runID == targetRunID
         }
-        matchingWorks.forEach { work in
-            work.task.cancel()
-            forgetDeskSend(work, botID: botID)
+        let activeRunMatches = context.coordinator.activeRunId(threadId: threadID) == targetRunID
+        guard activeRunMatches || !matchingWorks.isEmpty else {
+            onSettled?(false)
+            return
         }
+        matchingWorks.forEach { $0.task.cancel() }
         context.coordinator.stopRun(threadId: threadID)
         deskStopRunIssuedCountForTesting += 1
         Task { @MainActor [weak self] in
             guard let self else { return }
+            for work in matchingWorks {
+                await work.task.value
+                self.forgetDeskSend(work, botID: botID)
+            }
+            self.clearDeskSendInFlight(for: botID)
             do {
                 try await self.context.coordinator.stopAndAwaitTermination(threadId: threadID)
-                onSettled?(self.context.coordinator.activeRunId(threadId: threadID) == nil)
+                onSettled?(self.context.coordinator.activeRunId(threadId: threadID) != targetRunID)
             } catch {
                 self.errorMessage = force
                     ? "Force stop: \(error.localizedDescription)"
