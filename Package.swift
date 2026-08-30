@@ -155,6 +155,7 @@ let package = Package(
                 "AgentRuntime",
                 "DistillCore",
                 "SocketServer",
+                "RemoteCodeTreaty",
                 "Surfaces",
                 "AppLifecycleSupport",
                 "DesignSystemKit",
@@ -211,7 +212,7 @@ let package = Package(
         ),
         .testTarget(
             name: "SocketServerTests",
-            dependencies: ["SocketServer", "CoreModel", "Persistence"],
+            dependencies: ["SocketServer", "CoreModel", "Persistence", "RemoteCodeTreaty"],
             path: "Tests/SocketServerTests",
             resources: [
                 .copy("Fixtures")

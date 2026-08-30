@@ -369,7 +369,7 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
         _ = bus.subscribe(since: nil) { seen.append($0.seq) }
 
         for i in 0..<5 {
-            bus.publish(kind: "k.\(i)", payload: .null)
+            bus.publishRawForTesting(kind: "k.\(i)", payload: .null)
         }
 
         XCTAssertEqual(seen, [1, 2, 3, 4, 5])
@@ -382,7 +382,7 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
         // second authority would let HTTP mutation receipts race ahead of WS
         // events and create false gaps on the client.
         let bus = EventBus()
-        bus.publish(kind: "live", payload: .null) // seq 1
+        bus.publishRawForTesting(kind: "live", payload: .null) // seq 1
 
         let committed = try bus.commitPersistedEvents { floor in
             XCTAssertEqual(floor, 1, "commit floor is the publish watermark")
@@ -394,7 +394,7 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
         XCTAssertEqual(committed.map(\.seq), [2, 3])
         XCTAssertEqual(bus.currentSeq, 3)
 
-        bus.publish(kind: "after", payload: .null)
+        bus.publishRawForTesting(kind: "after", payload: .null)
         XCTAssertEqual(bus.currentSeq, 4,
                        "publish after commit must continue the same monotonic counter")
     }

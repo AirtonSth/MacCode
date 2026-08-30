@@ -541,7 +541,7 @@ final class UnixSocketServerTests: XCTestCase {
         let ack = try readLine(fd: fd)
 
         let kind = "unix.test.\(UUID().uuidString)"
-        EventBus.shared.publish(kind: kind, payload: .string("ok"))
+        EventBus.shared.publishRawForTesting(kind: kind, payload: .string("ok"))
         let event = try readLine(fd: fd)
 
         XCTAssertTrue(ack.contains(#""subscribed":true"#),
@@ -593,7 +593,7 @@ final class UnixSocketServerTests: XCTestCase {
 
         let diagnosticCursor = EventBus.shared.currentSeq
         let terminalPayload = String(repeating: "A", count: 64 * 1024)
-        EventBus.shared.publish(kind: "surface.output", payload: .object([
+        EventBus.shared.publish(kind: .surfaceOutput, payload: .object([
             "surface_id": .string("slow-unix-terminal"),
             "seq": .number(1),
             "base64": .string(terminalPayload)
@@ -601,7 +601,7 @@ final class UnixSocketServerTests: XCTestCase {
         XCTAssertTrue(writeGate.waitUntilBlocked(timeout: 1))
         var diagnostic: EventBus.Event?
         for index in 1..<64 {
-            EventBus.shared.publish(kind: "surface.output", payload: .object([
+            EventBus.shared.publish(kind: .surfaceOutput, payload: .object([
                 "surface_id": .string("slow-unix-terminal"),
                 "seq": .number(Double(index + 1)),
                 "base64": .string(terminalPayload)
@@ -667,7 +667,7 @@ final class UnixSocketServerTests: XCTestCase {
         let replayCursor = EventBus.shared.currentSeq
         let terminalPayload = String(repeating: "R", count: 64 * 1024)
         for index in 0..<128 {
-            EventBus.shared.publish(kind: "surface.output", payload: .object([
+            EventBus.shared.publish(kind: .surfaceOutput, payload: .object([
                 "surface_id": .string("unix-replay-overflow"),
                 "seq": .number(Double(index + 1)),
                 "base64": .string(terminalPayload)
@@ -714,7 +714,7 @@ final class UnixSocketServerTests: XCTestCase {
             "the subscriber UUID returned after synchronous replay must not remain orphaned"
         )
 
-        EventBus.shared.publish(kind: "unix.replay.post-close", payload: .string("probe"))
+        EventBus.shared.publishRawForTesting(kind: "unix.replay.post-close", payload: .string("probe"))
         XCTAssertEqual(EventBus.shared.subscriberCountForTests, subscriberBaseline)
     }
 

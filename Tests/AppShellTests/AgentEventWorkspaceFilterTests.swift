@@ -37,7 +37,7 @@ final class AgentEventWorkspaceFilterTests: XCTestCase {
     }
 
     private func publishForeignDeletion(of threadID: AgentThreadID) {
-        EventBus.shared.publish(kind: "agent.thread.deleted", payload: .object([
+        EventBus.shared.publish(kind: .agentThreadDeleted, payload: .object([
             "workspace_id": .string(foreignWorkspaceID.value.uuidString),
             "thread_id": .string(threadID.value.uuidString)
         ]))

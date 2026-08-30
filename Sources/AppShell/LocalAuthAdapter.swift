@@ -101,6 +101,19 @@ public final class LocalAuthAdapter: DirectAuthProvider {
         ((try? repo.verify(token: token)) ?? nil) != nil
     }
 
+    /// RPC authorization must use the same verified DeviceTrust row for both
+    /// durable owner binding and persisted capability grants. A second lookup
+    /// could observe a revoke or grant change between the two decisions.
+    public func authorizedRPCPrincipal(token: String) -> DirectRPCPrincipal? {
+        guard let trust = (try? repo.verify(token: token)) ?? nil else { return nil }
+        return DirectRPCPrincipal(
+            ownerFingerprint: Self.opaqueAuthorizedOwnerFingerprint(
+                stableIdentity: "token:\(trust.tokenHash)"
+            ),
+            grantedCapabilities: trust.capabilities
+        )
+    }
+
     /// Token-only durable owner for protected HTTP uploads. The stored token
     /// hash permits revocation checks without retaining or exposing the bearer;
     /// Mac identity and client-supplied pairing metadata are not inputs.
@@ -338,7 +351,7 @@ public final class LocalAuthAdapter: DirectAuthProvider {
         // criticalAlert-class EventBus event into an actual delivered alert, so
         // this event is correctly classified but inert until that consumer exists.
         EventBus.shared.publish(
-            kind: "device.revoke",
+            kind: .deviceRevoke,
             payload: .object([
                 "device_id": .string(id),
             ])

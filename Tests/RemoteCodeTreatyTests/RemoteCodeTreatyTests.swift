@@ -184,6 +184,11 @@ final class RemoteCodeTreatyTests: XCTestCase {
     }
 
     func testEveryKnownEventKindHasAnIdentityBearingGoldenEnvelope() throws {
+        XCTAssertEqual(RemoteCodeEventKind.allCases.count, 142)
+        XCTAssertEqual(
+            Set(RemoteCodeEventKind.allCases.map(\.rawValue)).count,
+            RemoteCodeEventKind.allCases.count
+        )
         for (offset, kind) in RemoteCodeEventKind.allCases.enumerated() {
             let original = RemoteCodeEventEnvelope(
                 seq: Int64(offset + 1),
@@ -200,6 +205,19 @@ final class RemoteCodeTreatyTests: XCTestCase {
             )
             XCTAssertEqual(decoded, original, "event fixture failed for \(kind.rawValue)")
         }
+    }
+
+    func testKnownMalformedEventFailsButFutureUnknownPayloadIsPreserved() throws {
+        XCTAssertThrowsError(try decoder.decode(
+            RemoteCodeEventEnvelope.self,
+            from: Data(#"{"seq":7,"kind":"agent.run.started","payload":null,"ts":1}"#.utf8)
+        ))
+        let future = try decoder.decode(
+            RemoteCodeEventEnvelope.self,
+            from: Data(#"{"seq":8,"kind":"future.scalar","payload":7,"ts":2}"#.utf8)
+        )
+        XCTAssertTrue(future.isUnknown)
+        XCTAssertEqual(future.payload, .number(7))
     }
 
     func testLegacyEventEnvelopeStillDecodesWithoutIdentity() throws {

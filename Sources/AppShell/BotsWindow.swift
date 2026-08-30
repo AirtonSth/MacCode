@@ -8715,7 +8715,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     static func publishDestAttentionChanged() {
-        EventBus.shared.publish(kind: "bots.attention.changed", payload: .object([:]))
+        EventBus.shared.publish(kind: .botsAttentionChanged, payload: .object([:]))
     }
 
     private func currentRevision(for bot: BotDefinition) throws -> BotRevision? {

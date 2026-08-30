@@ -228,7 +228,7 @@ final class MaterialWakeTaxonomyTests: XCTestCase {
         }
     }
 
-    /// Extract `EventBus.shared.publish(kind: "…")` string literals from host sources.
+    /// Extract `EventBus.shared.publishRawForTesting(kind: "…")` string literals from host sources.
     private static func eventBusPublishKinds(inRelativePaths paths: [String]) throws -> Set<String> {
         // Tests/AppShellTests/ThisFile.swift → repo root.
         let repoRoot = URL(fileURLWithPath: #filePath)

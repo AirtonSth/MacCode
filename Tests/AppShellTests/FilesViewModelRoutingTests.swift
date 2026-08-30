@@ -458,22 +458,22 @@ final class FilesViewModelRoutingTests: XCTestCase {
         let model = makeModel(router: router)
         defer { model.close() }
 
-        EventBus.shared.publish(kind: "agent.item.delta", payload: .object([
+        EventBus.shared.publish(kind: .agentItemDelta, payload: .object([
             "item_id": .string("i1"),
             "body_append": .string("x")
         ]))
-        EventBus.shared.publish(kind: "agent.item.progress", payload: .object([
+        EventBus.shared.publish(kind: .agentItemProgress, payload: .object([
             "item_id": .string("i1"),
             "progress": .number(0.5)
         ]))
-        EventBus.shared.publish(kind: "surface.output", payload: .object([
+        EventBus.shared.publish(kind: .surfaceOutput, payload: .object([
             "surface_id": .string("term")
         ]))
         drainMainQueue()
         XCTAssertEqual(model.eventReceiveCountForTests, 0,
             "stream kinds must be dropped on the EventBus delivery thread")
 
-        EventBus.shared.publish(kind: "files.state.updated", payload: .object([
+        EventBus.shared.publish(kind: .filesStateUpdated, payload: .object([
             "surface_id": .string(model.surfaceID.value.uuidString),
             "state": .object([
                 "current_directory": .string("src"),

@@ -649,7 +649,7 @@ final class MaterialWakeCoordinatorTests: XCTestCase {
         // Publish from the test thread (not from a subscriber) — EventBus
         // reentrancy precondition forbids publish-from-handler.
         EventBus.shared.publish(
-            kind: "host.boot_epoch",
+            kind: .hostBootEpoch,
             payload: .object([
                 "boot_epoch": .number(42),
                 "server_id": .string("test-server"),
@@ -699,11 +699,11 @@ final class MaterialWakeCoordinatorTests: XCTestCase {
         #endif
 
         EventBus.shared.publish(
-            kind: "agent.item.delta",
+            kind: .agentItemDelta,
             payload: .object(["text": .string("chunk")])
         )
         EventBus.shared.publish(
-            kind: "surface.output",
+            kind: .surfaceOutput,
             payload: .object(["chunk": .string("x")])
         )
 
@@ -751,7 +751,7 @@ final class MaterialWakeCoordinatorTests: XCTestCase {
         #endif
 
         EventBus.shared.publish(
-            kind: "agent.request.opened",
+            kind: .agentRequestOpened,
             payload: .object(["requestId": .string("r1")])
         )
 

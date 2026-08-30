@@ -36,7 +36,7 @@ private final class HTTPAttachmentReceiptRouter: FakeRouter, CommandReceiptState
         events.enumerated().map { ordinal, event in
             EventBus.Event(
                 seq: minimumEventSequence + Int64(ordinal) + 1,
-                kind: event.kind,
+                kind: event.kind.rawValue,
                 payload: event.payload,
                 ts: event.createdAt.timeIntervalSince1970
             )

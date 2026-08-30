@@ -122,7 +122,7 @@ final class PaneActionTests: XCTestCase {
     func test_feedPanelIgnoresBacklogPublishedBeforeOpen() throws {
         let (_, router) = try makeContext()
         let staleTitle = "feed-stale-\(UUID().uuidString)"
-        EventBus.shared.publish(kind: "feed.test.stale", payload: .object(["title": .string(staleTitle)]))
+        EventBus.shared.publishRawForTesting(kind: "feed.test.stale", payload: .object(["title": .string(staleTitle)]))
         let ws = try router.createWorkspace(name: "feed-open-\(UUID().uuidString)", cwd: NSTemporaryDirectory())
 
         let desc = try router.createSurface(workspace: ws.id, type: .rightSidebarTool, paneID: nil, title: "Feed")
@@ -135,7 +135,7 @@ final class PaneActionTests: XCTestCase {
                        "workspace events published before Feed opens must not appear as if they were live activity")
 
         let freshTitle = "feed-fresh-\(UUID().uuidString)"
-        EventBus.shared.publish(kind: "feed.test.fresh", payload: .object(["title": .string(freshTitle)]))
+        EventBus.shared.publishRawForTesting(kind: "feed.test.fresh", payload: .object(["title": .string(freshTitle)]))
         waitUntil("Feed should still stream events published after it opens") {
             feed.readText().contains(freshTitle)
         }

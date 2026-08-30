@@ -1,4 +1,5 @@
 import Foundation
+import RemoteCodeTreaty
 
 /// In-process event bus that the dispatcher writes to when mutations
 /// succeed. Each subscriber gets a per-connection async stream so JSON-RPC
@@ -15,11 +16,11 @@ public final class EventBus: @unchecked Sendable {
     )
 
     public struct MutationEventIntent: Sendable, Equatable {
-        public let kind: String
+        public let kind: RemoteCodeEventKind
         public let payload: JSONValue
         public let createdAt: Date
 
-        public init(kind: String, payload: JSONValue, createdAt: Date) {
+        public init(kind: RemoteCodeEventKind, payload: JSONValue, createdAt: Date) {
             self.kind = kind
             self.payload = payload
             self.createdAt = createdAt
@@ -67,6 +68,10 @@ public final class EventBus: @unchecked Sendable {
         public let kind: String
         public let payload: JSONValue
         public let ts: Double
+
+        public var knownKind: RemoteCodeEventKind? {
+            RemoteCodeEventKind(rawValue: kind)
+        }
 
         public init(seq: Int64, kind: String, payload: JSONValue, ts: Double) {
             self.seq = seq; self.kind = kind; self.payload = payload; self.ts = ts
@@ -195,7 +200,7 @@ public final class EventBus: @unchecked Sendable {
         return lastSeq
     }
 
-    public func publish(kind: String, payload: JSONValue) {
+    public func publish(kind: RemoteCodeEventKind, payload: JSONValue) {
         if let sink = Self.activeMutationEventSink {
             lock.lock()
             let createdAt = clock()
@@ -207,15 +212,32 @@ public final class EventBus: @unchecked Sendable {
             case .captured, .suppressed:
                 return
             case .sealed:
-                NSLog("[RC2.EventBus] late mutation event escaped sealed receipt sink: %@", kind)
+                NSLog(
+                    "[RC2.EventBus] late mutation event escaped sealed receipt sink: %@",
+                    kind.rawValue
+                )
             }
         }
+        if DispatchQueue.getSpecific(key: deliveryQueueKey) != nil {
+            deliveryQueue.async { [self] in
+                publishSerialized(kind: kind.rawValue, payload: payload)
+            }
+        } else {
+            deliveryQueue.sync { publishSerialized(kind: kind.rawValue, payload: payload) }
+        }
+    }
+
+#if DEBUG
+    /// Test-only escape hatch for forward-unknown and synthetic replay cases.
+    /// Productive callers must use `publish(kind: RemoteCodeEventKind, ...)`.
+    public func publishRawForTesting(kind: String, payload: JSONValue) {
         if DispatchQueue.getSpecific(key: deliveryQueueKey) != nil {
             deliveryQueue.async { [self] in publishSerialized(kind: kind, payload: payload) }
         } else {
             deliveryQueue.sync { publishSerialized(kind: kind, payload: payload) }
         }
     }
+#endif
 
     /// Wait until every publish accepted before this call has submitted its
     /// persistence work. Lifecycle code follows this barrier by draining the
@@ -916,13 +938,13 @@ public enum EventStreamFilter: Sendable, Equatable {
         guard case .cellularSafe = self else { return nil }
         guard case .object(let payload) = event.payload else { return nil }
         // C-14: last-write-wins for terminal summaries (seq + byte counts only).
-        if event.kind == "surface.output.summary",
+        if event.knownKind == .surfaceOutputSummary,
            let surfaceID = payload["surface_id"]?.stringValue {
             return "\(event.kind):\(surfaceID)"
         }
         // C-16: same thread_id + item_id merges by *concat* of append fields
         // (not LWW) so agent text stays byte-identical without crossing threads.
-        if event.kind == "agent.item.delta",
+        if event.knownKind == .agentItemDelta,
            let threadID = payload["thread_id"]?.stringValue,
            let itemID = payload["item_id"]?.stringValue {
             return AgentItemDeltaCoalescingIdentity.key(
@@ -936,7 +958,7 @@ public enum EventStreamFilter: Sendable, Equatable {
 
     /// Whether a coalescing key uses concatenate-merge (C-16) instead of LWW.
     public func coalescingMergesByConcatenation(for event: EventBus.Event) -> Bool {
-        event.kind == "agent.item.delta"
+        event.knownKind == .agentItemDelta
     }
 
     public func map(_ event: EventBus.Event) -> EventBus.Event? {
@@ -953,8 +975,8 @@ public enum EventStreamFilter: Sendable, Equatable {
         case .cellularSafe(let interestThreadIds):
             // `reducerRequired` means the *content* is required on the client,
             // not that every micro-token must be its own WS frame (C-16).
-            let classification = EventStreamClassification.classify(kind: event.kind)
-            if event.kind == "surface.output" {
+            let classification = EventStreamClassification.classify(event: event)
+            if event.knownKind == .surfaceOutput {
                 if Self.isGeometryOnlyTerminalOutput(event) {
                     return event
                 }
@@ -963,7 +985,7 @@ public enum EventStreamFilter: Sendable, Equatable {
             // On-screen interest: drop high-volume agent deltas for other threads.
             // Fail open when interest set is empty.
             if !interestThreadIds.isEmpty,
-               event.kind == "agent.item.delta" || event.kind == "agent.item.progress",
+               event.knownKind == .agentItemDelta || event.knownKind == .agentItemProgress,
                case .object(let payload) = event.payload,
                let threadId = payload["thread_id"]?.stringValue ?? payload["threadId"]?.stringValue,
                !interestThreadIds.contains(threadId) {
@@ -998,7 +1020,7 @@ public enum EventStreamFilter: Sendable, Equatable {
             summary["cols"] = cols
         }
         return EventBus.Event(seq: event.seq,
-                              kind: "surface.output.summary",
+                              kind: RemoteCodeEventKind.surfaceOutputSummary.rawValue,
                               payload: .object(summary),
                               ts: event.ts)
     }
@@ -1010,15 +1032,25 @@ private struct EventStreamClassification {
     let priority: Priority
     let reducerRequired: Bool
 
-    static func classify(kind: String) -> EventStreamClassification {
+    static func classify(event: EventBus.Event) -> EventStreamClassification {
+        guard let kind = event.knownKind else {
+            return EventStreamClassification(priority: .critical, reducerRequired: true)
+        }
         switch kind {
-        case let k where k.hasPrefix("diagnostic.") || k.hasPrefix("metrics."):
+        case .diagnosticHTTPClOExecFailed,
+             .diagnosticHTTPConnectionLimit,
+             .diagnosticUnixClientLimit,
+             .diagnosticUnixRequestLimit,
+             .diagnosticUnixRequestTimeout,
+             .diagnosticUnixSlowClient,
+             .diagnosticWSOutboundPressure,
+             .diagnosticWSSlowClient:
             return EventStreamClassification(priority: .diagnostic, reducerRequired: false)
-        case "surface.output", "agent.item.delta":
+        case .surfaceOutput, .agentItemDelta:
             return EventStreamClassification(priority: .bulk, reducerRequired: true)
-        case "surface.browser":
+        case .surfaceBrowser:
             return EventStreamClassification(priority: .interactive, reducerRequired: true)
-        case "settings.updated":
+        case .settingsUpdated:
             return EventStreamClassification(priority: .state, reducerRequired: true)
         default:
             return EventStreamClassification(priority: .critical, reducerRequired: true)

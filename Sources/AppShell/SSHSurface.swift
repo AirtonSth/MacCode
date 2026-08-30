@@ -674,7 +674,7 @@ final class SSHSurface: NSObject, SSHTransferSurface, TerminalRuntimeRoutingSurf
             refreshRemoteFiles()
             startSessionAliveTimer()
             next.focus()
-            EventBus.shared.publish(kind: "ssh.session.updated", payload: .object([
+            EventBus.shared.publish(kind: .sshSessionUpdated, payload: .object([
                 "workspace_id": .string(workspaceID.value.uuidString),
                 "surface_id": .string(descriptor.id.value.uuidString),
                 "profile_id": .string(saved.id.value.uuidString),
@@ -1027,7 +1027,7 @@ final class SSHSurface: NSObject, SSHTransferSurface, TerminalRuntimeRoutingSurf
     }
 
     private func publishDisconnected(reason: String) {
-        EventBus.shared.publish(kind: "ssh.session.updated", payload: .object([
+        EventBus.shared.publish(kind: .sshSessionUpdated, payload: .object([
             "workspace_id": .string(workspaceID.value.uuidString),
             "surface_id": .string(descriptor.id.value.uuidString),
             "status": .string("disconnected"),

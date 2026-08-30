@@ -1,6 +1,7 @@
 import Foundation
 import CoreModel
 import SocketServer
+import RemoteCodeTreaty
 
 /// Projects Agent runtime events only after a completed Bot send receipt binds
 /// one authenticated host/Bot/conversation/request/run/thread tuple.
@@ -84,14 +85,14 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
     }
 
     private func receive(_ event: EventBus.Event) {
-        let projectedKind: String
+        let projectedKind: RemoteCodeEventKind
         switch event.kind {
         case "agent.item.delta", "agent.item.progress":
-            projectedKind = "bot.run.stream"
+            projectedKind = .botRunStream
         case "agent.run.completed":
-            projectedKind = "bot.run.completed"
+            projectedKind = .botRunCompleted
         case "agent.run.failed":
-            projectedKind = "bot.run.failed"
+            projectedKind = .botRunFailed
         default:
             return
         }
@@ -105,7 +106,7 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
             lock.unlock()
             return
         }
-        if projectedKind == "bot.run.completed" || projectedKind == "bot.run.failed" {
+        if projectedKind == .botRunCompleted || projectedKind == .botRunFailed {
             bindingsByRunID.removeValue(forKey: runID)
         }
         lock.unlock()
@@ -118,11 +119,11 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
             "client_request_id": .string(binding.requestID),
             "run_id": .string(binding.runID),
         ]))
-        if projectedKind == "bot.run.completed" || projectedKind == "bot.run.failed" {
+        if projectedKind == .botRunCompleted || projectedKind == .botRunFailed {
             onTerminal(TerminalEvidence(
                 botID: binding.botID,
                 runID: binding.runID,
-                failed: projectedKind == "bot.run.failed"
+                failed: projectedKind == .botRunFailed
             ))
         }
     }

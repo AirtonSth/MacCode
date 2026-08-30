@@ -2,6 +2,7 @@ import Foundation
 import CoreModel
 import Persistence
 import AgentRuntime
+import RemoteCodeTreaty
 
 public struct AgentActiveRunSnapshot: Sendable, Equatable {
     public let runId: AgentRunID
@@ -1150,7 +1151,7 @@ public final class JSONRPCDispatcher {
         func canonicalBotSendLifecycle(
             receipt: [String: JSONValue],
             readback: [String: JSONValue]
-        ) -> (kind: String, payload: JSONValue)? {
+        ) -> (kind: RemoteCodeEventKind, payload: JSONValue)? {
             guard let hostID = receipt["host_id"]?.stringValue,
                   let botID = receipt["bot_id"]?.stringValue,
                   let requestID = receipt["request_id"]?.stringValue,
@@ -1174,7 +1175,7 @@ public final class JSONRPCDispatcher {
             if enqueued {
                 guard let itemID = readback["id"]?.stringValue, !itemID.isEmpty else { return nil }
                 payload["queue_item_id"] = .string(itemID)
-                return ("bot.message.queued", .object(payload))
+                return (.botMessageQueued, .object(payload))
             }
             guard let run = readback["run"]?.objectValue,
                   run["host_id"]?.stringValue == hostID,
@@ -1186,7 +1187,7 @@ public final class JSONRPCDispatcher {
             if let threadID = run["thread_id"]?.stringValue, !threadID.isEmpty {
                 payload["thread_id"] = .string(threadID)
             }
-            return ("bot.run.started", .object(payload))
+            return (.botRunStarted, .object(payload))
         }
         func canonicalBotStop(
             receipt: [String: JSONValue],
@@ -1248,42 +1249,42 @@ public final class JSONRPCDispatcher {
         }
         var payload: [String: JSONValue] = [:]
         var botNotifications: [JSONValue] = []
-        var botLifecycleEvents: [(kind: String, payload: JSONValue)] = []
+        var botLifecycleEvents: [(kind: RemoteCodeEventKind, payload: JSONValue)] = []
         var botTerminalPayload: [String: JSONValue]?
-        let kind: String
+        let kind: RemoteCodeEventKind
         switch method {
         case "agent.message.send":
-            kind = "agent.message.accepted"
+            kind = .agentMessageAccepted
             payload["thread_id"] = string("thread_id")
         case "agent.message.queue.cancel":
-            kind = "agent.message.queue.cancelled"
+            kind = .agentMessageQueueCancelled
             payload["queued_message_id"] = string("queued_message_id", "id")
         case "agent.message.queue.force_now":
-            kind = "agent.message.queue.force_requested"
+            kind = .agentMessageQueueForceRequested
             payload["queued_message_id"] = string("queued_message_id", "id")
         case "agent.message.queue.reorder":
-            kind = "agent.message.queue.updated"
+            kind = .agentMessageQueueUpdated
             payload["thread_id"] = string("thread_id")
             payload["queued_message_id"] = string("queued_message_id", "id")
         case "agent.message.queue.update":
-            kind = "agent.message.queue.updated"
+            kind = .agentMessageQueueUpdated
             payload["queued_message_id"] = string("queued_message_id", "id")
         case "agent.run.continue":
-            kind = "agent.run.continue_requested"
+            kind = .agentRunContinueRequested
             payload["thread_id"] = string("thread_id")
         case "agent.run.stop":
-            kind = "agent.run.stop_requested"
+            kind = .agentRunStopRequested
             payload["thread_id"] = string("thread_id")
         case "agent.request.respond":
-            kind = "agent.request.resolved"
+            kind = .agentRequestResolved
             payload["thread_id"] = string("thread_id")
             payload["request_id"] = string("request_id")
         case "agent.user_input.respond":
-            kind = "agent.user_input.resolved"
+            kind = .agentUserInputResolved
             payload["thread_id"] = string("thread_id")
             payload["request_id"] = string("request_id")
         case "agent.plan.implement":
-            kind = "agent.plan.implemented"
+            kind = .agentPlanImplemented
             payload["thread_id"] = string("thread_id")
             payload["plan_id"] = string("plan_id")
             if let object = result.objectValue {
@@ -1291,12 +1292,12 @@ public final class JSONRPCDispatcher {
                 payload["implementation_thread_id"] = object["implementation_thread_id"]
             }
         case "agent.plan.save":
-            kind = "agent.plan.saved"
+            kind = .agentPlanSaved
             payload["thread_id"] = string("thread_id")
             payload["plan_id"] = string("plan_id")
             payload["relative_path"] = result.objectValue?["relative_path"]
         case "agent.plan.notes.save":
-            kind = "agent.plan.notes.updated"
+            kind = .agentPlanNotesUpdated
             // Compact metadata only — full notes on the wire drop the live stream
             // on weak links. Authoritative text stays on disk and is paged via
             // agent.plan.notes.get protocol_version 1.
@@ -1309,7 +1310,7 @@ public final class JSONRPCDispatcher {
                 payload["rehydrate_required"] = .bool(true)
             }
         case "agent.checkpoint.revert":
-            kind = "agent.checkpoint.reverted"
+            kind = .agentCheckpointReverted
             payload["thread_id"] = string("thread_id")
             if let object = result.objectValue {
                 payload["turn_count"] = object["checkpointTurnCount"] ?? object["checkpoint_turn_count"]
@@ -1317,7 +1318,7 @@ public final class JSONRPCDispatcher {
                 payload["checkpoint_ref"] = object["checkpointRef"] ?? object["checkpoint_ref"]
             }
         case "agent.attachment.upload", "agent.attachment.import":
-            kind = "agent.attachment.uploaded"
+            kind = .agentAttachmentUploaded
             payload["workspace_id"] = string("workspace_id")
             if let object = result.objectValue {
                 payload["id"] = object["id"]
@@ -1326,7 +1327,7 @@ public final class JSONRPCDispatcher {
                 payload["size_bytes"] = object["sizeBytes"] ?? object["size_bytes"]
             }
         case "agent.provider.update":
-            kind = "agent.provider.updated"
+            kind = .agentProviderUpdated
             payload["provider"] = result.objectValue?["provider"] ?? string("provider") ?? .string("codex")
             payload["ok"] = result.objectValue?["ok"]
             payload["status"] = result.objectValue?["status"]
@@ -1343,10 +1344,10 @@ public final class JSONRPCDispatcher {
                 return
             }
             switch botMethod {
-            case "bot.create", "bot.duplicate": kind = "bot.created"
-            case "bot.discard_new", "bot.delete": kind = "bot.deleted"
-            case "bot.settings.set": kind = "bot.settings.updated"
-            case "bot.send": kind = "bot.message.accepted"
+            case "bot.create", "bot.duplicate": kind = .botCreated
+            case "bot.discard_new", "bot.delete": kind = .botDeleted
+            case "bot.settings.set": kind = .botSettingsUpdated
+            case "bot.send": kind = .botMessageAccepted
             case "bot.stop", "bot.force_stop":
                 guard let readback = object["readback"]?.objectValue,
                       let terminal = canonicalBotStop(
@@ -1356,30 +1357,30 @@ public final class JSONRPCDispatcher {
                       ) else {
                     return
                 }
-                kind = "bot.run.stop_requested"
+                kind = .botRunStopRequested
                 botTerminalPayload = terminal
-            case "bot.queue.remove": kind = "bot.queue.updated"
-            case "bot.conversation.select": kind = "bot.conversation.selected"
+            case "bot.queue.remove": kind = .botQueueUpdated
+            case "bot.conversation.select": kind = .botConversationSelected
             case "bot.conversation.create", "bot.conversation.clear_all":
-                kind = "bot.conversation.updated"
-            case "bot.routine.run": kind = "bot.routine.run_requested"
+                kind = .botConversationUpdated
+            case "bot.routine.run": kind = .botRoutineRunRequested
             case "bot.routine.create", "bot.routine.update", "bot.routine.enable", "bot.routine.delete":
-                kind = "bot.routine.updated"
-            case "bot.attachment.stage", "bot.attachment.remove": kind = "bot.attachment.updated"
-            case "bot.files.mutate": kind = "bot.files.changed"
-            case "bot.files.open_tab", "bot.files.split": kind = "bot.files.opened"
-            case "bot.files.location.set": kind = "bot.files.updated"
-            case "bot.browser.action": kind = "bot.browser.updated"
+                kind = .botRoutineUpdated
+            case "bot.attachment.stage", "bot.attachment.remove": kind = .botAttachmentUpdated
+            case "bot.files.mutate": kind = .botFilesChanged
+            case "bot.files.open_tab", "bot.files.split": kind = .botFilesOpened
+            case "bot.files.location.set": kind = .botFilesUpdated
+            case "bot.browser.action": kind = .botBrowserUpdated
             case "bot.link.open":
                 kind = object["readback"]?.objectValue?["link_kind"]?.stringValue == "file"
-                    ? "bot.files.opened"
-                    : "bot.browser.updated"
+                    ? .botFilesOpened
+                    : .botBrowserUpdated
             case "bot.guest.input", "bot.guest.start", "bot.guest.stop", "bot.guest.rebuild", "bot.guest.revoke":
-                kind = "bot.guest.updated"
-            case "bot.docker.clear": kind = "bot.docker.cleared"
-            case "bot.attention.ack": kind = "bot.attention.updated"
-            case "bot.scheduler.tick": kind = "bot.scheduler.updated"
-            default: kind = "bot.updated"
+                kind = .botGuestUpdated
+            case "bot.docker.clear": kind = .botDockerCleared
+            case "bot.attention.ack": kind = .botAttentionUpdated
+            case "bot.scheduler.tick": kind = .botSchedulerUpdated
+            default: kind = .botUpdated
             }
             payload["method"] = .string(botMethod)
             payload["request_id"] = object["request_id"]
@@ -1471,7 +1472,7 @@ public final class JSONRPCDispatcher {
             EventBus.shared.publish(kind: event.kind, payload: event.payload)
         }
         for notification in botNotifications {
-            EventBus.shared.publish(kind: "notification.created", payload: notification)
+            EventBus.shared.publish(kind: .notificationCreated, payload: notification)
         }
     }
 
@@ -1718,7 +1719,7 @@ public final class JSONRPCDispatcher {
             )
         }
         guard Self.hostMutationMethods.contains(req.method) else {
-            return await dispatchCore(req)
+            return await dispatchCore(req, eventIdentity: mutationContext)
         }
         return await dispatchRemoteMutation(req, context: mutationContext)
     }
@@ -2250,7 +2251,10 @@ public final class JSONRPCDispatcher {
         ))
     }
 
-    private func dispatchCore(_ req: JSONRPCRequest) async -> JSONRPCResponse {
+    private func dispatchCore(
+        _ req: JSONRPCRequest,
+        eventIdentity: MutationRequestContext? = nil
+    ) async -> JSONRPCResponse {
         let id = req.id
         let params = req.params ?? [:]
         do {
@@ -2399,19 +2403,37 @@ public final class JSONRPCDispatcher {
                 let maxBytes = params["max_bytes"]?.intValue
                 let result = EventBus.shared.recentEvents(since: sinceSeq, maxBytes: maxBytes)
                 let arr: [JSONValue] = result.events.map { ev in
-                    .object([
+                    var envelope: [String: JSONValue] = [
                         "seq": .number(Double(ev.seq)),
                         "kind": .string(ev.kind),
                         "payload": ev.payload,
-                        "ts": .number(ev.ts)
-                    ])
+                        "ts": .number(ev.ts),
+                        "treaty_version": .object([
+                            "major": .number(1),
+                            "minor": .number(0),
+                        ]),
+                    ]
+                    if let eventIdentity {
+                        envelope["host_id"] = .string(eventIdentity.hostId)
+                        envelope["boot_epoch"] = .number(Double(eventIdentity.bootEpoch))
+                    }
+                    return .object(envelope)
                 }
-                return .init(id: id, result: .object([
+                var response: [String: JSONValue] = [
                     "last_seq": .number(Double(result.lastSeq)),
                     "events": .array(arr),
                     "truncated": .bool(result.truncated),
-                    "requires_baseline": .bool(result.requiresBaseline)
-                ]))
+                    "requires_baseline": .bool(result.requiresBaseline),
+                    "treaty_version": .object([
+                        "major": .number(1),
+                        "minor": .number(0),
+                    ]),
+                ]
+                if let eventIdentity {
+                    response["host_id"] = .string(eventIdentity.hostId)
+                    response["boot_epoch"] = .number(Double(eventIdentity.bootEpoch))
+                }
+                return .init(id: id, result: .object(response))
             case "settings.get":
                 let keys: [String]
                 if case .array(let arr) = params["keys"] ?? .null {
@@ -2425,7 +2447,7 @@ public final class JSONRPCDispatcher {
                 guard let key = params["key"]?.stringValue,
                       let value = params["value"]?.stringValue else { throw JSONRPCError.invalidParams }
                 try router.settingsSet(key: key, value: value)
-                EventBus.shared.publish(kind: "settings.updated", payload: .object([
+                EventBus.shared.publish(kind: .settingsUpdated, payload: .object([
                     "key": .string(key),
                     "value": .string(value)
                 ]))
@@ -2444,14 +2466,14 @@ public final class JSONRPCDispatcher {
                 redacted.password = nil
                 var payload = encode(redacted).objectValue ?? [:]
                 payload["workspace_id"] = .string(workspace.value.uuidString)
-                EventBus.shared.publish(kind: "ssh.host.updated", payload: .object(payload))
+                EventBus.shared.publish(kind: .sshHostUpdated, payload: .object(payload))
                 return .init(id: id, result: encode(redacted))
             case "ssh.host.delete":
                 let workspace = try workspaceID(from: params)
                 guard let raw = params["id"]?.stringValue,
                       let uuid = UUID(uuidString: raw) else { throw JSONRPCError.invalidParams }
                 try router.sshHostDelete(SSHHostID(uuid), workspace: workspace)
-                EventBus.shared.publish(kind: "ssh.host.deleted", payload: .object([
+                EventBus.shared.publish(kind: .sshHostDeleted, payload: .object([
                     "id": .string(raw),
                     "workspace_id": .string(workspace.value.uuidString)
                 ]))
@@ -2470,11 +2492,11 @@ public final class JSONRPCDispatcher {
                 let s = try withSuppressedLayoutEvents {
                     try router.sshConnect(workspace: wid, profileID: profileID, profile: profile, title: params["title"]?.stringValue, paneID: pid)
                 }
-                EventBus.shared.publish(kind: "surface.created", payload: .object([
+                EventBus.shared.publish(kind: .surfaceCreated, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "surface": encode(s)
                 ]))
-                EventBus.shared.publish(kind: "ssh.session.updated", payload: .object([
+                EventBus.shared.publish(kind: .sshSessionUpdated, payload: .object([
                     "surface_id": .string(s.id.value.uuidString),
                     "status": .string(s.metadata["ssh_status"] ?? "connected"),
                     "destination": .string(s.metadata["ssh_destination"] ?? "")
@@ -2485,7 +2507,7 @@ public final class JSONRPCDispatcher {
             case "ssh.disconnect":
                 guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) ?? params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 try router.sshDisconnect(surface: sid)
-                EventBus.shared.publish(kind: "ssh.session.updated", payload: .object([
+                EventBus.shared.publish(kind: .sshSessionUpdated, payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "status": .string("disconnected")
                 ]))
@@ -2494,14 +2516,14 @@ public final class JSONRPCDispatcher {
                 guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) ?? params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let local = params["local_path"]?.stringValue,
                       let remote = params["remote_path"]?.stringValue else { throw JSONRPCError.invalidParams }
-                EventBus.shared.publish(kind: "ssh.transfer.started", payload: .object([
+                EventBus.shared.publish(kind: .sshTransferStarted, payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "direction": .string("upload"),
                     "local_path": .string(local),
                     "remote_path": .string(remote)
                 ]))
                 let result = try router.sshTransferUpload(surface: sid, localPath: local, remotePath: remote)
-                EventBus.shared.publish(kind: "ssh.transfer.finished", payload: .object([
+                EventBus.shared.publish(kind: .sshTransferFinished, payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "direction": .string("upload"),
                     "result": result
@@ -2511,14 +2533,14 @@ public final class JSONRPCDispatcher {
                 guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) ?? params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let remote = params["remote_path"]?.stringValue,
                       let local = params["local_path"]?.stringValue else { throw JSONRPCError.invalidParams }
-                EventBus.shared.publish(kind: "ssh.transfer.started", payload: .object([
+                EventBus.shared.publish(kind: .sshTransferStarted, payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "direction": .string("download"),
                     "local_path": .string(local),
                     "remote_path": .string(remote)
                 ]))
                 let result = try router.sshTransferDownload(surface: sid, remotePath: remote, localPath: local)
-                EventBus.shared.publish(kind: "ssh.transfer.finished", payload: .object([
+                EventBus.shared.publish(kind: .sshTransferFinished, payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "direction": .string("download"),
                     "result": result
@@ -2549,7 +2571,7 @@ public final class JSONRPCDispatcher {
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let path = params["path"]?.stringValue else { throw JSONRPCError.invalidParams }
                 let result = try router.fsWorkspaceCreateFile(workspace: wid, path: path, content: params["content"]?.stringValue ?? "")
-                EventBus.shared.publish(kind: "fs.workspace.changed", payload: .object([
+                EventBus.shared.publish(kind: .fsWorkspaceChanged, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "action": .string("create_file"),
                     "paths": .array([.string(result.objectValue?["relative_path"]?.stringValue ?? path)])
@@ -2560,7 +2582,7 @@ public final class JSONRPCDispatcher {
                       let path = params["path"]?.stringValue,
                       let newName = params["new_name"]?.stringValue else { throw JSONRPCError.invalidParams }
                 let result = try router.fsWorkspaceRename(workspace: wid, path: path, newName: newName)
-                EventBus.shared.publish(kind: "fs.workspace.changed", payload: .object([
+                EventBus.shared.publish(kind: .fsWorkspaceChanged, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "action": .string("rename"),
                     "paths": .array([.string(path), .string(result.objectValue?["relative_path"]?.stringValue ?? newName)])
@@ -2572,7 +2594,7 @@ public final class JSONRPCDispatcher {
                     ?? params["path"]?.stringValue.map { [$0] }
                     ?? []
                 let result = try router.fsWorkspaceDelete(workspace: wid, paths: paths)
-                EventBus.shared.publish(kind: "fs.workspace.changed", payload: .object([
+                EventBus.shared.publish(kind: .fsWorkspaceChanged, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "action": .string("delete"),
                     "paths": result.objectValue?["deleted"] ?? .array(paths.map { .string($0) })
@@ -2586,7 +2608,7 @@ public final class JSONRPCDispatcher {
                 let surface = try withSuppressedLayoutEvents {
                     try router.filesOpenTab(workspace: wid, sourceSurface: sourceSurface, paneID: pid, path: path)
                 }
-                EventBus.shared.publish(kind: "surface.created", payload: .object([
+                EventBus.shared.publish(kind: .surfaceCreated, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "surface": encode(surface)
                 ]))
@@ -2601,7 +2623,7 @@ public final class JSONRPCDispatcher {
                 let surface = try withSuppressedLayoutEvents {
                     try router.filesSplitTab(workspace: wid, sourceSurface: sourceSurface, paneID: pid, direction: dir, path: path)
                 }
-                EventBus.shared.publish(kind: "pane.split", payload: .object([
+                EventBus.shared.publish(kind: .paneSplit, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "surface": encode(surface)
                 ]))
@@ -2655,7 +2677,7 @@ public final class JSONRPCDispatcher {
                 let ws = try withSuppressedLayoutEvents {
                     try router.createWorkspace(name: name, cwd: cwd)
                 }
-                EventBus.shared.publish(kind: "workspace.created", payload: encode(ws))
+                EventBus.shared.publish(kind: .workspaceCreated, payload: encode(ws))
                 let result = encode(ws)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
@@ -2664,12 +2686,12 @@ public final class JSONRPCDispatcher {
                 try withSuppressedLayoutEvents {
                     try router.selectWorkspace(wid)
                 }
-                EventBus.shared.publish(kind: "workspace.selected", payload: .object(["workspace_id": .string(wid.value.uuidString)]))
+                EventBus.shared.publish(kind: .workspaceSelected, payload: .object(["workspace_id": .string(wid.value.uuidString)]))
                 return .init(id: id, result: .bool(true))
             case "workspace.close":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
                 try router.closeWorkspace(wid, publishEvent: false)
-                EventBus.shared.publish(kind: "workspace.closed", payload: .object(["workspace_id": .string(wid.value.uuidString)]))
+                EventBus.shared.publish(kind: .workspaceClosed, payload: .object(["workspace_id": .string(wid.value.uuidString)]))
                 return .init(id: id, result: .bool(true))
             case "workspace.rename":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
@@ -2677,7 +2699,7 @@ public final class JSONRPCDispatcher {
                 try withSuppressedLayoutEvents {
                     try router.renameWorkspace(wid, name)
                 }
-                EventBus.shared.publish(kind: "workspace.renamed", payload: .object(["workspace_id": .string(wid.value.uuidString), "name": .string(name)]))
+                EventBus.shared.publish(kind: .workspaceRenamed, payload: .object(["workspace_id": .string(wid.value.uuidString), "name": .string(name)]))
                 return .init(id: id, result: .bool(true))
             case "workspace.set_description":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
@@ -2685,7 +2707,7 @@ public final class JSONRPCDispatcher {
                 try withSuppressedLayoutEvents {
                     try router.setWorkspaceDescription(wid, text)
                 }
-                EventBus.shared.publish(kind: "workspace.updated", payload: .object([
+                EventBus.shared.publish(kind: .workspaceUpdated, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "metadata": .object(["description": .string(text)])
                 ]))
@@ -2696,7 +2718,7 @@ public final class JSONRPCDispatcher {
                 try withSuppressedLayoutEvents {
                     try router.setWorkspaceColor(wid, color)
                 }
-                EventBus.shared.publish(kind: "workspace.updated", payload: .object([
+                EventBus.shared.publish(kind: .workspaceUpdated, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "metadata": .object(["color": .string(color)])
                 ]))
@@ -2707,12 +2729,12 @@ public final class JSONRPCDispatcher {
                 try withSuppressedLayoutEvents {
                     try router.setWorkspacePinned(wid, pinned)
                 }
-                EventBus.shared.publish(kind: "workspace.updated", payload: .object([
+                EventBus.shared.publish(kind: .workspaceUpdated, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "metadata": .object(["pinned": pinned ? .string("true") : .string("")])
                 ]))
                 let order = try router.currentWindow().workspaces
-                EventBus.shared.publish(kind: "workspace.reordered", payload: .object([
+                EventBus.shared.publish(kind: .workspaceReordered, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "order": .array(order.map { .string($0.value.uuidString) })
                 ]))
@@ -2724,7 +2746,7 @@ public final class JSONRPCDispatcher {
                     try router.reorderWorkspace(wid, position: pos)
                 }
                 let order = try router.currentWindow().workspaces
-                EventBus.shared.publish(kind: "workspace.reordered", payload: .object([
+                EventBus.shared.publish(kind: .workspaceReordered, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "position": .number(Double(pos)),
                     "order": .array(order.map { .string($0.value.uuidString) })
@@ -2745,7 +2767,7 @@ public final class JSONRPCDispatcher {
                 let s = try withSuppressedLayoutEvents {
                     try router.createSurface(workspace: wid, type: type, paneID: pid, title: title)
                 }
-                EventBus.shared.publish(kind: "surface.created", payload: .object([
+                EventBus.shared.publish(kind: .surfaceCreated, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "surface": encode(s)
                 ]))
@@ -2761,7 +2783,7 @@ public final class JSONRPCDispatcher {
                     try withSuppressedLayoutEvents {
                         try router.splitSurface(workspace: wid, paneID: pid, surface: sid, direction: dir)
                     }
-                    EventBus.shared.publish(kind: "surface.moved", payload: .object([
+                    EventBus.shared.publish(kind: .surfaceMoved, payload: .object([
                         "workspace_id": .string(wid.value.uuidString),
                         "id": .string(sid.value.uuidString)
                     ]))
@@ -2773,7 +2795,7 @@ public final class JSONRPCDispatcher {
                 let s = try withSuppressedLayoutEvents {
                     try router.splitPane(workspace: wid, paneID: pid, direction: dir, surfaceType: type, title: title)
                 }
-                EventBus.shared.publish(kind: "pane.split", payload: .object(["workspace_id": .string(wid.value.uuidString), "surface": encode(s)]))
+                EventBus.shared.publish(kind: .paneSplit, payload: .object(["workspace_id": .string(wid.value.uuidString), "surface": encode(s)]))
                 return .init(id: id, result: encode(s))
             case "surface.close":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
@@ -2781,7 +2803,7 @@ public final class JSONRPCDispatcher {
                 try withSuppressedLayoutEvents {
                     try router.closeSurface(workspace: wid, surface: sid)
                 }
-                EventBus.shared.publish(kind: "surface.closed", payload: .object(["workspace_id": .string(wid.value.uuidString), "id": .string(sid.value.uuidString)]))
+                EventBus.shared.publish(kind: .surfaceClosed, payload: .object(["workspace_id": .string(wid.value.uuidString), "id": .string(sid.value.uuidString)]))
                 return .init(id: id, result: .bool(true))
             case "surface.focus":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
@@ -2789,14 +2811,14 @@ public final class JSONRPCDispatcher {
                 try withSuppressedLayoutEvents {
                     try router.focusSurface(workspace: wid, surface: sid)
                 }
-                EventBus.shared.publish(kind: "surface.focused", payload: .object(["workspace_id": .string(wid.value.uuidString), "id": .string(sid.value.uuidString)]))
+                EventBus.shared.publish(kind: .surfaceFocused, payload: .object(["workspace_id": .string(wid.value.uuidString), "id": .string(sid.value.uuidString)]))
                 return .init(id: id, result: .bool(true))
             case "surface.rename":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let title = params["title"]?.stringValue else { throw JSONRPCError.invalidParams }
                 try router.renameSurface(wid, sid, title)
-                EventBus.shared.publish(kind: "surface.renamed", payload: .object([
+                EventBus.shared.publish(kind: .surfaceRenamed, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "id": .string(sid.value.uuidString),
                     "title": .string(title)
@@ -2807,7 +2829,7 @@ public final class JSONRPCDispatcher {
                       let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let color = params["color"]?.stringValue else { throw JSONRPCError.invalidParams }
                 try router.setSurfaceColor(wid, sid, color)
-                EventBus.shared.publish(kind: "surface.updated", payload: .object([
+                EventBus.shared.publish(kind: .surfaceUpdated, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "id": .string(sid.value.uuidString),
                     "metadata": .object(["color": .string(color)])
@@ -2833,7 +2855,7 @@ public final class JSONRPCDispatcher {
                         "surface_alive": .bool(alive)
                     ])
                 }
-                EventBus.shared.publish(kind: "surface.updated", payload: .object([
+                EventBus.shared.publish(kind: .surfaceUpdated, payload: .object([
                     "id": .string(sid.value.uuidString),
                     "action": .string("send_text")
                 ]))
@@ -2857,7 +2879,7 @@ public final class JSONRPCDispatcher {
                         "surface_alive": .bool(alive)
                     ])
                 }
-                EventBus.shared.publish(kind: "surface.updated", payload: .object([
+                EventBus.shared.publish(kind: .surfaceUpdated, payload: .object([
                     "id": .string(sid.value.uuidString),
                     "action": .string("send_key")
                 ]))
@@ -2872,7 +2894,7 @@ public final class JSONRPCDispatcher {
             case "surface.clear_history":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 router.surfaceClearHistory(surface: sid)
-                EventBus.shared.publish(kind: "surface.updated", payload: .object([
+                EventBus.shared.publish(kind: .surfaceUpdated, payload: .object([
                     "id": .string(sid.value.uuidString),
                     "action": .string("clear_history")
                 ]))
@@ -2947,7 +2969,7 @@ public final class JSONRPCDispatcher {
                 let s = try withSuppressedLayoutEvents {
                     try router.openAgentApp(workspace: wid)
                 }
-                EventBus.shared.publish(kind: "surface.created", payload: .object([
+                EventBus.shared.publish(kind: .surfaceCreated, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "surface": encode(s)
                 ]))
@@ -3029,7 +3051,7 @@ public final class JSONRPCDispatcher {
                     soul: params["soul"]?.stringValue ?? "",
                     callerRun: runID
                 )
-                EventBus.shared.publish(kind: "bot.created", payload: result)
+                EventBus.shared.publish(kind: .botCreated, payload: result)
                 return .init(id: id, result: result)
             case "host.bot.list":
                 return .init(id: id, result: try router.listHostBots())
@@ -3123,7 +3145,7 @@ public final class JSONRPCDispatcher {
                 let routing = try routingRequest(from: params, requireManualSelection: true)
                 let nestedRunContext = try nestedRunContext(from: params)
                 let t = try await router.createAgentThreadRouting(workspace: wid, title: title, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, surfaceID: createSurfaceID, routing: routing, nestedRunContext: nestedRunContext)
-                EventBus.shared.publish(kind: "agent.thread.created", payload: threadPayload(t))
+                EventBus.shared.publish(kind: .agentThreadCreated, payload: threadPayload(t))
                 return .init(id: id, result: encodeThread(t))
             case "agent.thread.configure":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
@@ -3154,14 +3176,14 @@ public final class JSONRPCDispatcher {
                 payload["provider_locked"] = .bool(providerLocked(t))
                 payload["providerLocked"] = .bool(providerLocked(t))
                 appendRouting(t.effectiveRoutingConfiguration, to: &payload)
-                EventBus.shared.publish(kind: "agent.thread.updated", payload: .object(payload))
+                EventBus.shared.publish(kind: .agentThreadUpdated, payload: .object(payload))
                 return .init(id: id, result: encodeThread(t))
             case "agent.thread.execution.configure":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let modeValue = params["execution_mode"]?.stringValue,
                       let mode = AgentExecutionMode(rawValue: modeValue) else { throw JSONRPCError.invalidParams }
                 let t = try router.configureAgentThreadExecution(thread: tid, executionMode: mode, baseBranch: params["base_branch"]?.stringValue)
-                EventBus.shared.publish(kind: "agent.thread.updated", payload: threadPayload(t))
+                EventBus.shared.publish(kind: .agentThreadUpdated, payload: threadPayload(t))
                 return .init(id: id, result: encodeThread(t))
             case "agent.thread.prepare_pr":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
@@ -3174,8 +3196,8 @@ public final class JSONRPCDispatcher {
                 let serviceTier = modelSelection?.serviceTier ?? params["service_tier"]?.stringValue.flatMap(AgentServiceTier.init) ?? .auto
                 let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
                 let t = try router.prepareAgentThreadForPullRequest(workspace: wid, url: url, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
-                EventBus.shared.publish(kind: "agent.thread.created", payload: threadPayload(t))
-                EventBus.shared.publish(kind: "agent.thread.selected", payload: .object([
+                EventBus.shared.publish(kind: .agentThreadCreated, payload: threadPayload(t))
+                EventBus.shared.publish(kind: .agentThreadSelected, payload: .object([
                     "thread_id": .string(t.id.value.uuidString)
                 ]))
                 return .init(id: id, result: encodeThread(t))
@@ -3184,7 +3206,7 @@ public final class JSONRPCDispatcher {
                       let filename = params["filename"]?.stringValue,
                       let dataBase64 = params["data_base64"]?.stringValue ?? params["dataBase64"]?.stringValue else { throw JSONRPCError.invalidParams }
                 let uploaded = try router.uploadAgentAttachment(workspace: wid, filename: filename, mimeType: params["mime_type"]?.stringValue ?? params["mimeType"]?.stringValue, dataBase64: dataBase64)
-                EventBus.shared.publish(kind: "agent.attachment.uploaded", payload: .object([
+                EventBus.shared.publish(kind: .agentAttachmentUploaded, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "id": .string(uploaded.id),
                     "display_name": .string(uploaded.displayName),
@@ -3196,7 +3218,7 @@ public final class JSONRPCDispatcher {
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let relativePath = params["relative_path"]?.stringValue else { throw JSONRPCError.invalidParams }
                 let imported = try router.importAgentAttachment(workspace: wid, relativePath: relativePath)
-                EventBus.shared.publish(kind: "agent.attachment.uploaded", payload: .object([
+                EventBus.shared.publish(kind: .agentAttachmentUploaded, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "id": .string(imported.id),
                     "display_name": .string(imported.displayName),
@@ -3208,7 +3230,7 @@ public final class JSONRPCDispatcher {
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let selectSurfaceID = (params["surface_id"]?.stringValue ?? params["surfaceId"]?.stringValue).flatMap(UUID.init).map(SurfaceID.init)
                 try router.selectAgentThread(thread: tid, surfaceID: selectSurfaceID)
-                EventBus.shared.publish(kind: "agent.thread.selected", payload: .object(["thread_id": .string(tid.value.uuidString)]))
+                EventBus.shared.publish(kind: .agentThreadSelected, payload: .object(["thread_id": .string(tid.value.uuidString)]))
                 return .init(id: id, result: .bool(true))
             case "agent.message.send":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
@@ -3325,7 +3347,7 @@ public final class JSONRPCDispatcher {
                     serviceTier: serviceTier,
                     modelSelection: modelSelection
                 )
-                EventBus.shared.publish(kind: "agent.plan.implemented", payload: .object([
+                EventBus.shared.publish(kind: .agentPlanImplemented, payload: .object([
                     "thread_id": .string(tid.value.uuidString),
                     "plan_id": .string(planId),
                     "implementation_thread_id": .string(implemented.implementationThreadId.value.uuidString),
@@ -3705,7 +3727,7 @@ public final class JSONRPCDispatcher {
                     return .init(id: id, result: cached)
                 }
                 try await router.rollbackAgentThread(thread: tid, toTurnId: turnId)
-                EventBus.shared.publish(kind: "agent.thread.rolled_back", payload: .object([
+                EventBus.shared.publish(kind: .agentThreadRolledBack, payload: .object([
                     "thread_id": .string(tid.value.uuidString),
                     "turn_id": .string(turnId)
                 ]))
@@ -3808,7 +3830,7 @@ public final class JSONRPCDispatcher {
                     return .init(id: id, result: cached)
                 }
                 let checkpoint = try await router.revertAgentThreadToCheckpoint(thread: tid, checkpointTurnCount: turnCount)
-                EventBus.shared.publish(kind: "agent.checkpoint.reverted", payload: .object([
+                EventBus.shared.publish(kind: .agentCheckpointReverted, payload: .object([
                     "thread_id": .string(tid.value.uuidString),
                     "turn_count": .number(Double(checkpoint.checkpointTurnCount)),
                     "turn_id": .string(checkpoint.turnId),
@@ -3824,7 +3846,7 @@ public final class JSONRPCDispatcher {
                     return .init(id: id, result: cached)
                 }
                 try await router.deleteAgentThread(thread: tid)
-                EventBus.shared.publish(kind: "agent.thread.deleted", payload: .object(["thread_id": .string(tid.value.uuidString)]))
+                EventBus.shared.publish(kind: .agentThreadDeleted, payload: .object(["thread_id": .string(tid.value.uuidString)]))
                 let result = JSONValue.bool(true)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
@@ -3837,7 +3859,7 @@ public final class JSONRPCDispatcher {
                     return .init(id: id, result: cached)
                 }
                 try await router.deleteAgentThreads(tids)
-                EventBus.shared.publish(kind: "agent.thread.deleted_many", payload: .object([
+                EventBus.shared.publish(kind: .agentThreadDeletedMany, payload: .object([
                     "thread_ids": .array(tids.map { .string($0.value.uuidString) })
                 ]))
                 let result = JSONValue.bool(true)
@@ -3851,7 +3873,7 @@ public final class JSONRPCDispatcher {
                     return .init(id: id, result: cached)
                 }
                 let t = try router.renameAgentThread(thread: tid, title: title)
-                EventBus.shared.publish(kind: "agent.thread.renamed", payload: threadPayload(t))
+                EventBus.shared.publish(kind: .agentThreadRenamed, payload: threadPayload(t))
                 let result = encodeThread(t)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
@@ -3864,7 +3886,7 @@ public final class JSONRPCDispatcher {
                 }
                 let t = try router.setAgentThreadPinned(thread: tid, pinned: pinned)
                 let order = try router.listAgentThreads(workspace: t.workspaceId).map { $0.id.value.uuidString }
-                EventBus.shared.publish(kind: "agent.thread.updated", payload: .object([
+                EventBus.shared.publish(kind: .agentThreadUpdated, payload: .object([
                     "thread_id": .string(t.id.value.uuidString),
                     "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
                     "pinned": .bool(t.pinned),
@@ -3872,7 +3894,7 @@ public final class JSONRPCDispatcher {
                     "provider_locked": .bool(providerLocked(t)),
                     "providerLocked": .bool(providerLocked(t))
                 ]))
-                EventBus.shared.publish(kind: "agent.thread.reordered", payload: .object([
+                EventBus.shared.publish(kind: .agentThreadReordered, payload: .object([
                     "thread_id": .string(t.id.value.uuidString),
                     "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
                     "order": .array(order.map { .string($0) })
@@ -3888,7 +3910,7 @@ public final class JSONRPCDispatcher {
                     return .init(id: id, result: cached)
                 }
                 let t = try router.setAgentThreadColor(thread: tid, color: color)
-                EventBus.shared.publish(kind: "agent.thread.updated", payload: .object([
+                EventBus.shared.publish(kind: .agentThreadUpdated, payload: .object([
                     "thread_id": .string(t.id.value.uuidString),
                     "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
                     "color": t.color.map { .string($0) } ?? .string(""),
@@ -3907,7 +3929,7 @@ public final class JSONRPCDispatcher {
                 }
                 let list = try router.reorderAgentThread(thread: tid, position: pos)
                 let wid = list.first(where: { $0.id == tid })?.workspaceId
-                EventBus.shared.publish(kind: "agent.thread.reordered", payload: .object([
+                EventBus.shared.publish(kind: .agentThreadReordered, payload: .object([
                     "thread_id": .string(tid.value.uuidString),
                     "workspace_id": wid.map { .string($0.value.uuidString) } ?? .null,
                     "position": .number(Double(pos)),
@@ -3926,7 +3948,7 @@ public final class JSONRPCDispatcher {
                 // has_unread + unread: iOS accepts both; markAgentThreadRead also
                 // emits agent.thread.read. Keep updated for clients that only
                 // watch thread.updated for rail badges.
-                EventBus.shared.publish(kind: "agent.thread.updated", payload: .object([
+                EventBus.shared.publish(kind: .agentThreadUpdated, payload: .object([
                     "thread_id": .string(tid.value.uuidString),
                     "has_unread": .bool(false),
                     "hasUnread": .bool(false),
@@ -3945,13 +3967,13 @@ public final class JSONRPCDispatcher {
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let branch = params["branch"]?.stringValue else { throw JSONRPCError.invalidParams }
                 let r = try router.gitCheckout(workspace: wid, branch: branch)
-                EventBus.shared.publish(kind: "git.checkout", payload: .object(["workspace_id": .string(wid.value.uuidString), "branch": .string(branch), "ok": .bool(r.ok)]))
+                EventBus.shared.publish(kind: .gitCheckout, payload: .object(["workspace_id": .string(wid.value.uuidString), "branch": .string(branch), "ok": .bool(r.ok)]))
                 return .init(id: id, result: encode(r))
             case "git.create_branch":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let name = params["name"]?.stringValue else { throw JSONRPCError.invalidParams }
                 let r = try router.gitCreateBranch(workspace: wid, name: name)
-                EventBus.shared.publish(kind: "git.branch_created", payload: .object(["workspace_id": .string(wid.value.uuidString), "name": .string(name), "ok": .bool(r.ok)]))
+                EventBus.shared.publish(kind: .gitBranchCreated, payload: .object(["workspace_id": .string(wid.value.uuidString), "name": .string(name), "ok": .bool(r.ok)]))
                 return .init(id: id, result: encode(r))
             case "git.commit":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
@@ -3963,7 +3985,7 @@ public final class JSONRPCDispatcher {
                     return .init(id: id, result: cached)
                 }
                 let r = try router.gitCommit(workspace: wid, message: message)
-                EventBus.shared.publish(kind: "git.commit", payload: .object(["workspace_id": .string(wid.value.uuidString), "ok": .bool(r.ok)]))
+                EventBus.shared.publish(kind: .gitCommit, payload: .object(["workspace_id": .string(wid.value.uuidString), "ok": .bool(r.ok)]))
                 let result = encode(r)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
@@ -4001,7 +4023,7 @@ public final class JSONRPCDispatcher {
                     try router.ensureGitSurface(workspace: wid)
                 }
                 let r = try router.gitPush(workspace: wid)
-                EventBus.shared.publish(kind: "git.push", payload: .object([
+                EventBus.shared.publish(kind: .gitPush, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "surface_id": .string(destination.id.value.uuidString),
                     "ok": .bool(r.ok)
@@ -4022,7 +4044,7 @@ public final class JSONRPCDispatcher {
                     try router.ensureGitSurface(workspace: wid)
                 }
                 let r = try router.gitDeliver(workspace: wid, copy: gitDeliveryCopy(from: params))
-                EventBus.shared.publish(kind: "git.deliver", payload: .object([
+                EventBus.shared.publish(kind: .gitDeliver, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "surface_id": .string(destination.id.value.uuidString),
                     "ok": .bool(r.ok)
@@ -4039,7 +4061,7 @@ public final class JSONRPCDispatcher {
             case "project.open_in_editor":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
                 let app = try router.projectOpenInEditor(workspace: wid)
-                EventBus.shared.publish(kind: "project.opened_in_editor", payload: .object([
+                EventBus.shared.publish(kind: .projectOpenedInEditor, payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "app": .string(app)
                 ]))
@@ -4071,12 +4093,12 @@ public final class JSONRPCDispatcher {
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let url = params["url"]?.stringValue else { throw JSONRPCError.invalidParams }
                 try router.browserNavigate(surface: sid, url: url)
-                EventBus.shared.publish(kind: "surface.browser", payload: .object(["surface_id": .string(sid.value.uuidString), "url": .string(url)]))
+                EventBus.shared.publish(kind: .surfaceBrowser, payload: .object(["surface_id": .string(sid.value.uuidString), "url": .string(url)]))
                 return .init(id: id, result: .bool(true))
             case "browser.back":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 try router.browserBack(surface: sid)
-                EventBus.shared.publish(kind: "surface.browser", payload: .object([
+                EventBus.shared.publish(kind: .surfaceBrowser, payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "action": .string("back")
                 ]))
@@ -4084,7 +4106,7 @@ public final class JSONRPCDispatcher {
             case "browser.forward":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 try router.browserForward(surface: sid)
-                EventBus.shared.publish(kind: "surface.browser", payload: .object([
+                EventBus.shared.publish(kind: .surfaceBrowser, payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "action": .string("forward")
                 ]))
@@ -4092,7 +4114,7 @@ public final class JSONRPCDispatcher {
             case "browser.reload":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 try router.browserReload(surface: sid)
-                EventBus.shared.publish(kind: "surface.browser", payload: .object([
+                EventBus.shared.publish(kind: .surfaceBrowser, payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "action": .string("reload")
                 ]))
@@ -4104,7 +4126,7 @@ public final class JSONRPCDispatcher {
             case "browser.mirror_url.get":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 let mirror = try router.browserMirrorURL(surface: sid)
-                EventBus.shared.publish(kind: "browser.mirror_url.registered", payload: .object([
+                EventBus.shared.publish(kind: .browserMirrorURLRegistered, payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "is_file": mirror["is_file"] ?? .bool(false)
                 ]))
@@ -4113,7 +4135,7 @@ public final class JSONRPCDispatcher {
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let script = params["script"]?.stringValue else { throw JSONRPCError.invalidParams }
                 let s = try await router.browserEval(surface: sid, script: script)
-                EventBus.shared.publish(kind: "surface.browser", payload: .object([
+                EventBus.shared.publish(kind: .surfaceBrowser, payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "action": .string("eval")
                 ]))
@@ -4163,7 +4185,7 @@ public final class JSONRPCDispatcher {
                         )
                     }
                     EventBus.shared.publish(
-                        kind: "browser.screenshot.created",
+                        kind: .browserScreenshotCreated,
                         payload: .object([
                             "surface_id": .string(sid.value.uuidString),
                             "filename": .string("screenshot.jpg")
@@ -4179,7 +4201,7 @@ public final class JSONRPCDispatcher {
                     surface: sid,
                     savePath: path
                 )
-                EventBus.shared.publish(kind: "browser.screenshot.created", payload: .object([
+                EventBus.shared.publish(kind: .browserScreenshotCreated, payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "filename": .string(URL(fileURLWithPath: resolved).lastPathComponent)
                 ]))
@@ -4194,7 +4216,7 @@ public final class JSONRPCDispatcher {
                 let kind = String(req.method.dropFirst("browser.".count))
                 let value = params["value"]?.stringValue
                 let json = try await router.browserAction(surface: sid, kind: kind, ref: ref, value: value)
-                EventBus.shared.publish(kind: "surface.browser", payload: .object([
+                EventBus.shared.publish(kind: .surfaceBrowser, payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "action": .string(kind)
                 ]))
@@ -4226,7 +4248,7 @@ public final class JSONRPCDispatcher {
                         "title": .string(title)
                     ]
                     if let surfaceID { payload["surface_id"] = .string(surfaceID.value.uuidString) }
-                    EventBus.shared.publish(kind: "notification.created", payload: .object(payload))
+                    EventBus.shared.publish(kind: .notificationCreated, payload: .object(payload))
                 }
                 return .init(id: id, result: .object([
                     "id": .string(nid),
@@ -4241,7 +4263,7 @@ public final class JSONRPCDispatcher {
                 guard let nid = params["id"]?.stringValue else { throw JSONRPCError.invalidParams }
                 try router.notificationMarkRead(id: nid)
                 if !(router is NotificationEventPublishingRouting) {
-                    EventBus.shared.publish(kind: "notification.read", payload: .object([
+                    EventBus.shared.publish(kind: .notificationRead, payload: .object([
                         "id": .string(nid)
                     ]))
                 }
@@ -4250,7 +4272,7 @@ public final class JSONRPCDispatcher {
                 guard let nid = params["id"]?.stringValue else { throw JSONRPCError.invalidParams }
                 try router.notificationDismiss(id: nid)
                 if !(router is NotificationEventPublishingRouting) {
-                    EventBus.shared.publish(kind: "notification.dismissed", payload: .object([
+                    EventBus.shared.publish(kind: .notificationDismissed, payload: .object([
                         "id": .string(nid)
                     ]))
                 }
@@ -4355,7 +4377,7 @@ public final class JSONRPCDispatcher {
                     readback["device_id"] = .string(deviceID)
                     result = .object(readback)
                 }
-                EventBus.shared.publish(kind: "private.push_token.updated", payload: .object([
+                EventBus.shared.publish(kind: .privatePushTokenUpdated, payload: .object([
                     "push_token_type": .string(pushTokenType),
                     "device_id": params["device_id"] ?? .null,
                     "profile_id": boundProfileID.map(JSONValue.string) ?? .null,
@@ -4414,7 +4436,7 @@ public final class JSONRPCDispatcher {
                 try withSuppressedLayoutEvents {
                     try router.paneResize(workspace: wid, splitID: split, ratios: ratios)
                 }
-                EventBus.shared.publish(kind: "pane.resized", payload: .object(["workspace_id": .string(wid.value.uuidString), "split_id": .string(split.uuidString)]))
+                EventBus.shared.publish(kind: .paneResized, payload: .object(["workspace_id": .string(wid.value.uuidString), "split_id": .string(split.uuidString)]))
                 return .init(id: id, result: .bool(true))
             case "surface.move":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
@@ -4423,7 +4445,7 @@ public final class JSONRPCDispatcher {
                 try withSuppressedLayoutEvents {
                     try router.surfaceMove(workspace: wid, surface: sid, targetPane: pid)
                 }
-                EventBus.shared.publish(kind: "surface.moved", payload: .object(["workspace_id": .string(wid.value.uuidString), "id": .string(sid.value.uuidString), "target_pane_id": .string(pid.value.uuidString)]))
+                EventBus.shared.publish(kind: .surfaceMoved, payload: .object(["workspace_id": .string(wid.value.uuidString), "id": .string(sid.value.uuidString), "target_pane_id": .string(pid.value.uuidString)]))
                 return .init(id: id, result: .bool(true))
             case "surface.reorder":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
@@ -4433,7 +4455,7 @@ public final class JSONRPCDispatcher {
                 try withSuppressedLayoutEvents {
                     try router.surfaceReorder(workspace: wid, surface: sid, toPane: pid, position: pos)
                 }
-                EventBus.shared.publish(kind: "surface.reordered", payload: .object(["workspace_id": .string(wid.value.uuidString), "id": .string(sid.value.uuidString), "target_pane_id": .string(pid.value.uuidString), "position": .number(Double(pos))]))
+                EventBus.shared.publish(kind: .surfaceReordered, payload: .object(["workspace_id": .string(wid.value.uuidString), "id": .string(sid.value.uuidString), "target_pane_id": .string(pid.value.uuidString), "position": .number(Double(pos))]))
                 return .init(id: id, result: .bool(true))
             case "window.list":
                 let ws = try router.listWindows()
@@ -4444,19 +4466,19 @@ public final class JSONRPCDispatcher {
             case "window.create":
                 let title = params["title"]?.stringValue
                 let w = try router.createWindow(title: title)
-                EventBus.shared.publish(kind: "window.created", payload: encode(w))
+                EventBus.shared.publish(kind: .windowCreated, payload: encode(w))
                 return .init(id: id, result: encode(w))
             case "window.focus":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WindowID.init) else { throw JSONRPCError.invalidParams }
                 try router.focusWindow(wid)
-                EventBus.shared.publish(kind: "window.focused", payload: .object([
+                EventBus.shared.publish(kind: .windowFocused, payload: .object([
                     "id": .string(wid.value.uuidString)
                 ]))
                 return .init(id: id, result: .bool(true))
             case "window.close":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WindowID.init) else { throw JSONRPCError.invalidParams }
                 try router.closeWindow(wid)
-                EventBus.shared.publish(kind: "window.closed", payload: .object([
+                EventBus.shared.publish(kind: .windowClosed, payload: .object([
                     "id": .string(wid.value.uuidString)
                 ]))
                 return .init(id: id, result: .bool(true))
@@ -4464,7 +4486,7 @@ public final class JSONRPCDispatcher {
                 guard let workspaceId = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let target = params["window_id"]?.stringValue.flatMap(UUID.init).map(WindowID.init) else { throw JSONRPCError.invalidParams }
                 try router.moveWorkspaceToWindow(workspace: workspaceId, target: target)
-                EventBus.shared.publish(kind: "workspace.updated", payload: .object([
+                EventBus.shared.publish(kind: .workspaceUpdated, payload: .object([
                     "workspace_id": .string(workspaceId.value.uuidString),
                     "window_id": .string(target.value.uuidString)
                 ]))
@@ -4474,7 +4496,7 @@ public final class JSONRPCDispatcher {
                       let a = params["a"]?.stringValue.flatMap(UUID.init).map(PaneID.init),
                       let b = params["b"]?.stringValue.flatMap(UUID.init).map(PaneID.init) else { throw JSONRPCError.invalidParams }
                 try router.paneSwap(workspace: wid, a: a, b: b)
-                EventBus.shared.publish(kind: "pane.swapped", payload: .object(["workspace_id": .string(wid.value.uuidString), "a": .string(a.value.uuidString), "b": .string(b.value.uuidString)]))
+                EventBus.shared.publish(kind: .paneSwapped, payload: .object(["workspace_id": .string(wid.value.uuidString), "a": .string(a.value.uuidString), "b": .string(b.value.uuidString)]))
                 return .init(id: id, result: .bool(true))
             // V1 deferred families return a typed unsupported error.
             case "pane.break", "pane.join":
@@ -4582,7 +4604,9 @@ public final class JSONRPCDispatcher {
     nonisolated public static let readOnlyBatchMethods: Set<String> = [
         "rpc.batch",
         "system.ping", "system.capabilities", "system.identify",
+        "command.receipt.status",
         "events.recent", "settings.get", "token_saver.digest.get",
+        "sync.snapshot", "sync.snapshot.begin", "sync.snapshot.chunk", "sync.snapshot.commit",
         "ssh.host.list", "ssh.files.local.list", "ssh.files.remote.list",
         "fs.roots", "fs.list", "fs.workspace.list", "fs.workspace.read", "fs.workspace.preview_url",
         "files.state.get", "files.edit.session",
@@ -4617,7 +4641,7 @@ public final class JSONRPCDispatcher {
     /// prefix, not an exact method list, so it tolerates the switch growing
     /// within an existing namespace.
     nonisolated private static let knownMethodNamespaces: Set<String> = [
-        "system", "events", "settings", "rpc",
+        "system", "command", "events", "settings", "rpc",
         "ssh", "fs", "files",
         "workspace", "window", "surface", "pane",
         "agent", "git", "project", "browser", "mirror",

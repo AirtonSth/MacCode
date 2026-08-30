@@ -61,7 +61,7 @@ final class EventBusEncodeCacheTests: XCTestCase {
         // Ring of exactly 1 event so a second publish evicts the first.
         let bus = EventBus(recentLimit: 1, recentByteLimit: 1024 * 1024)
 
-        bus.publish(kind: "first.event", payload: .string("first"))
+        bus.publishRawForTesting(kind: "first.event", payload: .string("first"))
         let (_, snap1) = bus.snapshot()
         guard let firstEvent = snap1.first else {
             return XCTFail("expected one event in the ring after first publish")
@@ -72,7 +72,7 @@ final class EventBusEncodeCacheTests: XCTestCase {
         XCTAssertFalse(cachedBytes.isEmpty, "pre-condition: cache must have bytes for firstEvent before eviction")
 
         // Publish a second event, which pushes the first out of the ring.
-        bus.publish(kind: "second.event", payload: .string("second"))
+        bus.publishRawForTesting(kind: "second.event", payload: .string("second"))
         let (_, snap2) = bus.snapshot()
         XCTAssertEqual(snap2.count, 1, "ring size is 1, only the second event must remain")
         XCTAssertEqual(snap2.first?.kind, "second.event")
@@ -111,7 +111,7 @@ final class EventBusEncodeCacheTests: XCTestCase {
             }
         }
 
-        bus.publish(kind: kind, payload: payload)
+        bus.publishRawForTesting(kind: kind, payload: payload)
 
         // All subscribers receive the event.
         XCTAssertEqual(deliveredKinds.count, subCount,
@@ -184,7 +184,7 @@ final class EventBusEncodeCacheTests: XCTestCase {
     func test_publish_doesNotJSONEncodeForRingAccounting() {
         let bus = EventBus()
         bus.publish(
-            kind: "agent.item.delta",
+            kind: .agentItemDelta,
             payload: .object([
                 "thread_id": .string("t1"),
                 "item_id": .string("i1"),

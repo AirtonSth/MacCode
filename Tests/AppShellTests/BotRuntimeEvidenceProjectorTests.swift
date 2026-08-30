@@ -19,11 +19,11 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
         }
         defer { bus.unsubscribe(token) }
 
-        bus.publish(kind: "agent.item.delta", payload: agentPayload(runID: "wrong-run"))
-        bus.publish(kind: "agent.item.delta", payload: agentPayload(threadID: "wrong-thread"))
-        bus.publish(kind: "agent.item.delta", payload: agentPayload())
-        bus.publish(kind: "agent.run.completed", payload: agentPayload())
-        bus.publish(kind: "agent.item.delta", payload: agentPayload())
+        bus.publish(kind: .agentItemDelta, payload: agentPayload(runID: "wrong-run"))
+        bus.publish(kind: .agentItemDelta, payload: agentPayload(threadID: "wrong-thread"))
+        bus.publish(kind: .agentItemDelta, payload: agentPayload())
+        bus.publish(kind: .agentRunCompleted, payload: agentPayload())
+        bus.publish(kind: .agentItemDelta, payload: agentPayload())
 
         XCTAssertEqual(projected.map(\.kind), ["bot.run.stream", "bot.run.completed"])
         XCTAssertEqual(terminals, [.init(botID: "bot-a", runID: "run-a", failed: false)])
@@ -70,7 +70,7 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
         let threadID = "2969b74d-0bab-4486-bbf1-8b9a9761f936"
         XCTAssertTrue(projector.registerCompletedSend(sendReceipt(runID: runID, threadID: threadID)))
 
-        bus.publish(kind: "agent.run.completed", payload: agentPayload(
+        bus.publish(kind: .agentRunCompleted, payload: agentPayload(
             runID: runID.uppercased(),
             threadID: threadID.uppercased()
         ))

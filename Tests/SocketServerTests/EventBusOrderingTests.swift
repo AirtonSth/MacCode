@@ -33,12 +33,12 @@ final class EventBusOrderingTests: XCTestCase {
             // WHY: a handler may derive a follow-up event and then retire itself.
             // The follow-up must be queued after the current delivery, so this
             // subscriber cannot receive the event it just produced.
-            bus.publish(kind: "inner", payload: .null)
+            bus.publishRawForTesting(kind: "inner", payload: .null)
             bus.unsubscribe(originalSubscriptionID)
         }
 
         DispatchQueue.global().async {
-            bus.publish(kind: "outer", payload: .null)
+            bus.publishRawForTesting(kind: "outer", payload: .null)
             outerPublishReturned.fulfill()
         }
         wait(for: [outerDeliveryStarted], timeout: 1)
@@ -58,7 +58,7 @@ final class EventBusOrderingTests: XCTestCase {
 
         // A synchronous publish from outside the delivery queue drains any
         // already-queued inner event before this final event returns.
-        bus.publish(kind: "final", payload: .null)
+        bus.publishRawForTesting(kind: "final", payload: .null)
 
         let cursor = try XCTUnwrap(concurrentCursor.values.first)
         XCTAssertTrue(cursor == 1 || cursor == 2,
@@ -93,11 +93,11 @@ final class EventBusOrderingTests: XCTestCase {
         }
 
         DispatchQueue.global().async {
-            bus.publish(kind: "first", payload: .null)
+            bus.publishRawForTesting(kind: "first", payload: .null)
         }
         wait(for: [firstReachedPersistence], timeout: 1)
         DispatchQueue.global().async {
-            bus.publish(kind: "second", payload: .null)
+            bus.publishRawForTesting(kind: "second", payload: .null)
         }
         Thread.sleep(forTimeInterval: 0.05)
         releaseFirst.signal()
@@ -112,13 +112,13 @@ final class EventBusOrderingTests: XCTestCase {
 
     func test_subscribeFromCurrentAtomicallyCapturesCursorAndReceivesOnlyFutureEvents() {
         let bus = EventBus(recentLimit: 1)
-        bus.publish(kind: "old.a", payload: .null)
-        bus.publish(kind: "old.b", payload: .null)
+        bus.publishRawForTesting(kind: "old.a", payload: .null)
+        bus.publishRawForTesting(kind: "old.b", payload: .null)
         var received: [EventBus.Event] = []
 
         let subscription = bus.subscribeFromCurrent { received.append($0) }
-        bus.publish(kind: "live.c", payload: .null)
-        bus.publish(kind: "live.d", payload: .null)
+        bus.publishRawForTesting(kind: "live.c", payload: .null)
+        bus.publishRawForTesting(kind: "live.d", payload: .null)
 
         XCTAssertEqual(subscription.cursor, 2)
         XCTAssertEqual(received.map(\.seq), [3, 4])
@@ -134,16 +134,16 @@ final class EventBusOrderingTests: XCTestCase {
     /// in strict seq order -- no duplicates, no gaps.
     func test_subscribe_backlogliveInterleave_noDuplicatesNoGaps() {
         let bus = EventBus()
-        bus.publish(kind: "ev.a", payload: .number(1)) // seq 1
-        bus.publish(kind: "ev.b", payload: .number(2)) // seq 2
-        bus.publish(kind: "ev.c", payload: .number(3)) // seq 3
+        bus.publishRawForTesting(kind: "ev.a", payload: .number(1)) // seq 1
+        bus.publishRawForTesting(kind: "ev.b", payload: .number(2)) // seq 2
+        bus.publishRawForTesting(kind: "ev.c", payload: .number(3)) // seq 3
 
         var received: [Int64] = []
         // subscribe with since=2 -- should replay seq 3, then receive seq 4
         _ = bus.subscribe(since: 2) { received.append($0.seq) }
 
         // live event after subscribe
-        bus.publish(kind: "ev.d", payload: .number(4)) // seq 4
+        bus.publishRawForTesting(kind: "ev.d", payload: .number(4)) // seq 4
 
         XCTAssertEqual(received, [3, 4],
                        "subscribe(since:2) must replay exactly seq>2 from backlog then deliver live events in order -- duplicating seq 3 or dropping seq 4 breaks iOS state reconstruction")
@@ -153,9 +153,9 @@ final class EventBusOrderingTests: XCTestCase {
     /// receive their own correct backlog windows without cross-contamination.
     func test_subscribe_twoSubscribersWithDifferentSince_independentBacklogs() {
         let bus = EventBus()
-        bus.publish(kind: "ev.a", payload: .null) // seq 1
-        bus.publish(kind: "ev.b", payload: .null) // seq 2
-        bus.publish(kind: "ev.c", payload: .null) // seq 3
+        bus.publishRawForTesting(kind: "ev.a", payload: .null) // seq 1
+        bus.publishRawForTesting(kind: "ev.b", payload: .null) // seq 2
+        bus.publishRawForTesting(kind: "ev.c", payload: .null) // seq 3
 
         var receivedA: [Int64] = []
         var receivedB: [Int64] = []
@@ -175,15 +175,15 @@ final class EventBusOrderingTests: XCTestCase {
     /// synchronously before any live delivery -- verify the ordering contract.)
     func test_subscribe_liveEventsDontInterleaveWithBacklog() {
         let bus = EventBus()
-        bus.publish(kind: "base.a", payload: .null) // seq 1
-        bus.publish(kind: "base.b", payload: .null) // seq 2
+        bus.publishRawForTesting(kind: "base.a", payload: .null) // seq 1
+        bus.publishRawForTesting(kind: "base.b", payload: .null) // seq 2
 
         var order: [String] = []
         _ = bus.subscribe(since: 0) { order.append($0.kind) }
 
         // live events after subscribe
-        bus.publish(kind: "live.c", payload: .null) // seq 3
-        bus.publish(kind: "live.d", payload: .null) // seq 4
+        bus.publishRawForTesting(kind: "live.c", payload: .null) // seq 3
+        bus.publishRawForTesting(kind: "live.d", payload: .null) // seq 4
 
         XCTAssertEqual(order, ["base.a", "base.b", "live.c", "live.d"],
                        "backlog events must arrive before live events so iOS reducer applies history before present -- out-of-order delivery corrupts UI state")
@@ -197,8 +197,8 @@ final class EventBusOrderingTests: XCTestCase {
     /// with no duplicates and sorted by seq.
     func test_reloadFromPersistence_deduplicatesOverlappingEvents() {
         let bus = EventBus()
-        bus.publish(kind: "mem.a", payload: .null)  // seq 1
-        bus.publish(kind: "mem.b", payload: .null)  // seq 2
+        bus.publishRawForTesting(kind: "mem.a", payload: .null)  // seq 1
+        bus.publishRawForTesting(kind: "mem.b", payload: .null)  // seq 2
 
         let (snapSeq, _) = bus.snapshot()
         XCTAssertEqual(snapSeq, 2)
@@ -260,7 +260,7 @@ final class EventBusOrderingTests: XCTestCase {
         bus.reloadFromPersistence(lastSeq: 10, recent: persisted)
 
         // publish a new live event -- it must get seq 11, not seq 1
-        bus.publish(kind: "new.event", payload: .null)
+        bus.publishRawForTesting(kind: "new.event", payload: .null)
 
         var seqs: [Int64] = []
         _ = bus.subscribe(since: 0) { seqs.append($0.seq) }

@@ -98,7 +98,7 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
 
         let publishDone = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
-            EventBus.shared.publish(kind: "snapshot.responsiveness", payload: .object([:]))
+            EventBus.shared.publishRawForTesting(kind: "snapshot.responsiveness", payload: .object([:]))
             publishDone.signal()
         }
         XCTAssertEqual(
@@ -138,7 +138,7 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
         try await Task.sleep(nanoseconds: 5_000_000)
         let publishDone = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
-            EventBus.shared.publish(kind: "snapshot.off_main.responsiveness", payload: .object([:]))
+            EventBus.shared.publishRawForTesting(kind: "snapshot.off_main.responsiveness", payload: .object([:]))
             publishDone.signal()
         }
         XCTAssertEqual(
@@ -590,7 +590,7 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
 
     func test_eventBusSnapshotBarrier_assignsConcurrentEventImmediatelyAfterWatermark() {
         let bus = EventBus()
-        bus.publish(kind: "workspace.created", payload: .object([:]))
+        bus.publish(kind: .workspaceCreated, payload: .object([:]))
         let stateRead = DispatchSemaphore(value: 0)
         let releaseRead = DispatchSemaphore(value: 0)
         let snapshotDone = expectation(description: "snapshot done")
@@ -609,7 +609,7 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
         XCTAssertEqual(stateRead.wait(timeout: .now() + 2), .success)
 
         DispatchQueue.global().async {
-            bus.publish(kind: "surface.created", payload: .object([:]))
+            bus.publish(kind: .surfaceCreated, payload: .object([:]))
             publishDone.signal()
         }
         XCTAssertEqual(publishDone.wait(timeout: .now() + 0.05), .timedOut,
@@ -782,7 +782,7 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
 
         for testCase in cases {
             let bus = EventBus()
-            bus.publish(kind: testCase.kind, payload: .object([:]))
+            bus.publishRawForTesting(kind: testCase.kind, payload: .object([:]))
             XCTAssertEqual(bus.snapshotMetadata().domainRevisions, testCase.expected,
                            "unexpected domain revision intent for \(testCase.kind)")
         }
@@ -814,9 +814,9 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
 
     func test_expiredReplay_emitsBaselineBeforeFutureLiveEvent() {
         let bus = EventBus(recentLimit: 2)
-        bus.publish(kind: "workspace.created", payload: .object([:]))
-        bus.publish(kind: "workspace.updated", payload: .object([:]))
-        bus.publish(kind: "workspace.updated", payload: .object([:]))
+        bus.publish(kind: .workspaceCreated, payload: .object([:]))
+        bus.publish(kind: .workspaceUpdated, payload: .object([:]))
+        bus.publish(kind: .workspaceUpdated, payload: .object([:]))
         let observed = LockedPhase3Strings()
 
         let subscription = bus.subscribeDetectingReplayExpiry(
@@ -827,7 +827,7 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
             { event in observed.append("event:\(event.seq)") }
         )
         defer { bus.unsubscribe(subscription) }
-        bus.publish(kind: "workspace.updated", payload: .object([:]))
+        bus.publish(kind: .workspaceUpdated, payload: .object([:]))
 
         XCTAssertEqual(observed.value, ["baseline:3", "event:4"])
     }
@@ -835,9 +835,9 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
     func test_filteredInternalReplayGapRequiresBaselineInsteadOfSkippingSequence() {
         let bus = EventBus(recentLimit: 8)
         bus.shouldRetainRecentEvent = { $0.kind != "internal.filtered" }
-        bus.publish(kind: "workspace.created", payload: .object([:]))
-        bus.publish(kind: "internal.filtered", payload: .object([:]))
-        bus.publish(kind: "workspace.updated", payload: .object([:]))
+        bus.publish(kind: .workspaceCreated, payload: .object([:]))
+        bus.publishRawForTesting(kind: "internal.filtered", payload: .object([:]))
+        bus.publish(kind: .workspaceUpdated, payload: .object([:]))
 
         let replay = bus.recentEvents(since: 1, maxBytes: nil)
         XCTAssertEqual(replay.lastSeq, 3)
@@ -853,7 +853,7 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
             { event in observed.append("event:\(event.seq)") }
         )
         defer { bus.unsubscribe(subscription) }
-        bus.publish(kind: "workspace.updated", payload: .object([:]))
+        bus.publish(kind: .workspaceUpdated, payload: .object([:]))
 
         XCTAssertEqual(observed.value, ["baseline:3", "event:4"])
     }

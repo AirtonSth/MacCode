@@ -61,7 +61,7 @@ final class EventBusPersistencePerformanceTests: XCTestCase {
 
         DispatchQueue.global(qos: .userInitiated).async {
             for payload in payloads {
-                eventBus.publish(kind: "agent.run.started", payload: payload)
+                eventBus.publish(kind: .agentRunStarted, payload: payload)
             }
             producerReturned.fulfill()
         }
@@ -111,7 +111,7 @@ final class EventBusPersistencePerformanceTests: XCTestCase {
         defer { releaseWriter.signal() }
 
         AppDelegate.wireEventPersistence(context: context, eventBus: eventBus)
-        eventBus.publish(kind: "agent.run.started", payload: .string("normal"))
+        eventBus.publish(kind: .agentRunStarted, payload: .string("normal"))
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -242,7 +242,7 @@ final class EventBusPersistencePerformanceTests: XCTestCase {
         let firstSequence = harness.eventBus.currentSeq + 1
         let started = DispatchTime.now().uptimeNanoseconds
         for payload in payloads {
-            harness.eventBus.publish(kind: "agent.run.started", payload: payload)
+            harness.eventBus.publish(kind: .agentRunStarted, payload: payload)
         }
         let producerFinished = DispatchTime.now().uptimeNanoseconds
         harness.context.flushEventPersistence(eventBus: harness.eventBus)

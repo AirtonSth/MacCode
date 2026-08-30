@@ -108,7 +108,7 @@ final class EventBusSubscriberLeakTests: XCTestCase {
         let id = bus.subscribe(since: nil) { _ in ghostCalled = true }
         bus.unsubscribe(id)
 
-        bus.publish(kind: "ping", payload: .null)
+        bus.publishRawForTesting(kind: "ping", payload: .null)
 
         XCTAssertFalse(ghostCalled,
             "handler must not fire after unsubscribe(); " +

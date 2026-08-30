@@ -180,7 +180,7 @@ final class BackgroundWriterQueueTests: XCTestCase {
         }
 
         // Publish a non-surface.output event to trigger the persister.
-        EventBus.shared.publish(kind: "test.background.writer", payload: .string("probe"))
+        EventBus.shared.publishRawForTesting(kind: "test.background.writer", payload: .string("probe"))
 
         wait(for: [expectation], timeout: 2)
 

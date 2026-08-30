@@ -5,6 +5,7 @@ import CoreModel
 import Persistence
 import AgentRuntime
 import SocketServer
+import RemoteCodeTreaty
 import Surfaces
 import DistillCore
 import os
@@ -850,7 +851,7 @@ public final class AppContext {
         // publish the force class has zero runtime coverage and suspended
         // phones never rebaseline on host restart.
         EventBus.shared.publish(
-            kind: "host.boot_epoch",
+            kind: .hostBootEpoch,
             payload: .object([
                 "boot_epoch": .number(Double(liveActivityIdentity.bootEpoch)),
                 "server_id": .string(liveActivityIdentity.serverId),
@@ -1203,14 +1204,14 @@ public final class AppContext {
             return .object(payload)
         }
         coordinator.onRunStarted = { [weak self] tid, runId in
-            EventBus.shared.publish(kind: "agent.run.started",
+            EventBus.shared.publish(kind: .agentRunStarted,
                                     payload: agentRunPayload(threadId: tid, runId: runId))
             self?.beginTokenSaverAttempt(runId: runId)
         }
         coordinator.onMessageAppended = { message in
             // Bounded wire policy: never put a multi-MiB body into EventBus.
             EventBus.shared.publish(
-                kind: "agent.message.appended",
+                kind: .agentMessageAppended,
                 payload: AgentMessageTransport.appendedEventPayload(from: message)
             )
         }
@@ -1218,12 +1219,12 @@ public final class AppContext {
             let t = tid.value.uuidString
             switch ev {
             case .threadStarted:
-                EventBus.shared.publish(kind: "agent.run.started", payload: agentRunPayload(threadId: tid, runId: runId))
+                EventBus.shared.publish(kind: .agentRunStarted, payload: agentRunPayload(threadId: tid, runId: runId))
             case .turnStarted(let turnId):
-                EventBus.shared.publish(kind: "agent.turn.started",
+                EventBus.shared.publish(kind: .agentTurnStarted,
                                         payload: .object(["thread_id": .string(t), "turn_id": .string(turnId)]))
             case .itemStarted(let item):
-                EventBus.shared.publish(kind: "agent.item.started",
+                EventBus.shared.publish(kind: .agentItemStarted,
                                         payload: .object(["thread_id": .string(t), "item": Self.assistantItemJSON(item)]))
                 self.recordGraphifyUsageFromAssistantItem(
                     item: item,
@@ -1236,7 +1237,7 @@ public final class AppContext {
                 if let b = bodyAppend { p["body_append"] = .string(b) }
                 if let o = outputAppend { p["output_append"] = .string(o) }
                 if let s = summary { p["summary"] = .string(s) }
-                EventBus.shared.publish(kind: "agent.item.delta", payload: .object(p))
+                EventBus.shared.publish(kind: .agentItemDelta, payload: .object(p))
                 // Accumulate only — never finalize on partial stream chunks.
                 self.recordGraphifyUsageFromItemDelta(
                     itemId: itemId,
@@ -1254,10 +1255,10 @@ public final class AppContext {
                     "item_id": .string(itemId),
                 ]
                 if let distillApplied { p["distill_applied"] = .bool(distillApplied) }
-                EventBus.shared.publish(kind: "agent.item.delta", payload: .object(p))
+                EventBus.shared.publish(kind: .agentItemDelta, payload: .object(p))
             case .itemState(let itemId, let state):
                 if state != .streaming {
-                    EventBus.shared.publish(kind: "agent.item.completed",
+                    EventBus.shared.publish(kind: .agentItemCompleted,
                                             payload: .object(["thread_id": .string(t), "item_id": .string(itemId)]))
                 }
                 // Fail only — do not finalize on itemState.completed (can race
@@ -1270,9 +1271,9 @@ public final class AppContext {
                 var p: [String: JSONValue] = ["thread_id": .string(t), "item_id": .string(itemId)]
                 p["run_id"] = .string(runId.value.uuidString.lowercased())
                 if let progress { p["progress"] = .number(progress) }
-                EventBus.shared.publish(kind: "agent.item.progress", payload: .object(p))
+                EventBus.shared.publish(kind: .agentItemProgress, payload: .object(p))
             case .itemCompleted(let itemId, let state):
-                EventBus.shared.publish(kind: "agent.item.completed",
+                EventBus.shared.publish(kind: .agentItemCompleted,
                                         payload: .object(["thread_id": .string(t), "item_id": .string(itemId), "state": .string(state.rawValue)]))
                 if state == .failed || state == .cancelled {
                     self.failGraphifyUsageItem(itemId: itemId, runId: runId)
@@ -1282,7 +1283,7 @@ public final class AppContext {
             case .turnCompleted(let turnId, let final):
                 var p: [String: JSONValue] = ["thread_id": .string(t), "turn_id": .string(turnId)]
                 if let f = final { p["final"] = .string(f) }
-                EventBus.shared.publish(kind: "agent.turn.completed", payload: .object(p))
+                EventBus.shared.publish(kind: .agentTurnCompleted, payload: .object(p))
                 self.liveActivitySyncCoordinator.submitHeartbeat()
             case .proposedPlan(let plan):
                 try? self.proposedPlanRepo.upsert(threadId: tid, plan: plan)
@@ -1292,7 +1293,7 @@ public final class AppContext {
                     "markdown": .string(plan.markdown)
                 ]
                 if let turnId = plan.turnId { planPayload["turn_id"] = .string(turnId) }
-                EventBus.shared.publish(kind: "agent.plan.proposed", payload: .object(planPayload))
+                EventBus.shared.publish(kind: .agentPlanProposed, payload: .object(planPayload))
             case .activePlanUpdated(let plan):
                 var payload: [String: JSONValue] = [
                     "thread_id": .string(t),
@@ -1306,7 +1307,7 @@ public final class AppContext {
                     "updated_at_ms": .number(Double(plan.updatedAtMs))
                 ]
                 if let explanation = plan.explanation { payload["explanation"] = .string(explanation) }
-                EventBus.shared.publish(kind: "agent.plan.active_updated", payload: .object(payload))
+                EventBus.shared.publish(kind: .agentPlanActiveUpdated, payload: .object(payload))
             case .requestOpened(let request):
                 try? self.providerPendingCallbackRepo.record(threadId: tid, request: request)
                 var requestPayload: [String: JSONValue] = [
@@ -1317,7 +1318,7 @@ public final class AppContext {
                     "detail": request.detail.map(JSONValue.string) ?? .null
                 ]
                 if let turnId = request.turnId { requestPayload["turn_id"] = .string(turnId) }
-                EventBus.shared.publish(kind: "agent.request.opened", payload: .object(requestPayload))
+                EventBus.shared.publish(kind: .agentRequestOpened, payload: .object(requestPayload))
                 // Visible push for main-agent approvals only (subagents stay quiet).
                 self.postAgentUserActionPushIfNeeded(
                     threadId: tid,
@@ -1327,7 +1328,7 @@ public final class AppContext {
                 )
             case .requestResolved(let requestId, let state):
                 try? self.providerPendingCallbackRepo.resolve(threadId: tid, requestId: requestId, kind: .approval, state: state)
-                EventBus.shared.publish(kind: "agent.request.resolved", payload: .object([
+                EventBus.shared.publish(kind: .agentRequestResolved, payload: .object([
                     "thread_id": .string(t),
                     "request_id": .string(requestId),
                     "state": .string(state.rawValue)
@@ -1359,7 +1360,7 @@ public final class AppContext {
                     })
                 ]
                 if let turnId = request.turnId { userInputPayload["turn_id"] = .string(turnId) }
-                EventBus.shared.publish(kind: "agent.user_input.requested", payload: .object(userInputPayload))
+                EventBus.shared.publish(kind: .agentUserInputRequested, payload: .object(userInputPayload))
                 self.postAgentUserActionPushIfNeeded(
                     threadId: tid,
                     runId: runId,
@@ -1368,7 +1369,7 @@ public final class AppContext {
                 )
             case .userInputResolved(let requestId, let answer):
                 try? self.providerPendingCallbackRepo.resolve(threadId: tid, requestId: requestId, kind: .userInput, state: .resolved)
-                EventBus.shared.publish(kind: "agent.user_input.resolved", payload: .object([
+                EventBus.shared.publish(kind: .agentUserInputResolved, payload: .object([
                     "thread_id": .string(t),
                     "request_id": .string(requestId),
                     "answer": answer.map(JSONValue.string) ?? .null
@@ -1397,18 +1398,18 @@ public final class AppContext {
                 if let read = usage.cacheReadInputTokens {
                     p["cache_read_input_tokens"] = .number(Double(read))
                 }
-                EventBus.shared.publish(kind: "agent.thread.token_usage", payload: .object(p))
+                EventBus.shared.publish(kind: .agentThreadTokenUsage, payload: .object(p))
             case .accountUsage(let usage):
                 self.recordTokenSaverAccountUsage(usage)
-                EventBus.shared.publish(kind: "agent.account.usage",
+                EventBus.shared.publish(kind: .agentAccountUsage,
                     payload: .object(Self.accountUsagePayload(threadId: t, usage: usage)))
             case .contextCompaction(let summary):
-                EventBus.shared.publish(kind: "agent.context.compaction", payload: .object([
+                EventBus.shared.publish(kind: .agentContextCompaction, payload: .object([
                     "thread_id": .string(t),
                     "summary": summary.map(JSONValue.string) ?? .null
                 ]))
             case .providerRuntime(let event):
-                EventBus.shared.publish(kind: "agent.provider_runtime.event", payload: runtimeEventPayload(event, threadId: t))
+                EventBus.shared.publish(kind: .agentProviderRuntimeEvent, payload: runtimeEventPayload(event, threadId: t))
             case .wireTranslation(let translation):
                 var payload: [String: JSONValue] = [
                     "thread_id": .string(t),
@@ -1422,7 +1423,7 @@ public final class AppContext {
                 if let wireRequestText = translation.wireRequestText {
                     payload["wire_request_text"] = .string(AssistantTimelineState.cappedText(wireRequestText))
                 }
-                EventBus.shared.publish(kind: "agent.wire.translation", payload: .object(payload))
+                EventBus.shared.publish(kind: .agentWireTranslation, payload: .object(payload))
             case .sr1Translation(let translation):
                 // Historical replay only: paired clients still need to render
                 // persisted pre-RCW1 transcript rows. Texts remain capped.
@@ -1433,7 +1434,7 @@ public final class AppContext {
                 ]
                 if let itemId = translation.itemId { sr1Payload["item_id"] = .string(itemId) }
                 if let messageId = translation.messageId { sr1Payload["message_id"] = .string(messageId) }
-                EventBus.shared.publish(kind: "agent.sr1.translation", payload: .object(sr1Payload))
+                EventBus.shared.publish(kind: .agentSR1Translation, payload: .object(sr1Payload))
             case .error(let message, let recoverable):
                 // Carry the provider error text + recoverability so remote
                 // clients can show the reason and a Retry affordance instead
@@ -1441,15 +1442,17 @@ public final class AppContext {
                 var errorPayload = agentRunPayload(threadId: tid, runId: runId).objectValue ?? [:]
                 errorPayload["message"] = .string(message)
                 errorPayload["recoverable"] = .bool(recoverable)
-                EventBus.shared.publish(kind: "agent.run.error", payload: .object(errorPayload))
+                EventBus.shared.publish(kind: .agentRunError, payload: .object(errorPayload))
             }
         }
         coordinator.onRunFinished = { [weak self] tid, rid, status in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                let kind = (status == .completed) ? "agent.run.completed" : "agent.run.failed"
+                let kind: RemoteCodeEventKind = status == .completed
+                    ? .agentRunCompleted
+                    : .agentRunFailed
                 EventBus.shared.publish(kind: kind, payload: agentRunPayload(threadId: tid, runId: rid, status: status))
-                EventBus.shared.publish(kind: "agent.run.finished", payload: agentRunPayload(threadId: tid, runId: rid, status: status))
+                EventBus.shared.publish(kind: .agentRunFinished, payload: agentRunPayload(threadId: tid, runId: rid, status: status))
                 // Flush any debounced usage for this run now that the run is done so
                 // the final token batch is never stranded in the accumulator.
                 self.finishPendingTokenSaverUsage(runId: rid)
@@ -1516,13 +1519,14 @@ public final class AppContext {
                 payload["rows"] = .number(Double(rows))
                 payload["cols"] = .number(Double(cols))
             }
-            EventBus.shared.publish(kind: "surface.output", payload: .object(payload))
+            EventBus.shared.publish(kind: .surfaceOutput, payload: .object(payload))
         }
         LocalGitActivityBus.shared.sink = { activity in
-            guard ["git.checkout", "git.branch_created", "git.commit", "git.push"].contains(activity.kind) else {
+            guard let kind = RemoteCodeEventKind(rawValue: activity.kind),
+                  [.gitCheckout, .gitBranchCreated, .gitCommit, .gitPush].contains(kind) else {
                 return
             }
-            EventBus.shared.publish(kind: activity.kind, payload: .object([
+            EventBus.shared.publish(kind: kind, payload: .object([
                 "workspace_id": .string(activity.workspaceID.value.uuidString),
                 "surface_id": .string(activity.surfaceID.value.uuidString),
                 "ok": .bool(activity.succeeded)
@@ -1536,7 +1540,7 @@ public final class AppContext {
                     self?.router?.windowController?.refreshSurfaceRuntimeState()
                 }
             }
-            EventBus.shared.publish(kind: "surface.health", payload: .object([
+            EventBus.shared.publish(kind: .surfaceHealth, payload: .object([
                 "surface_id": .string(sid.value.uuidString),
                 "alive": .bool(health.alive),
                 "process_alive": .bool(health.processAlive),
@@ -1556,7 +1560,7 @@ public final class AppContext {
                 "cols": .number(Double(health.cols))
             ]))
             if let outcome = projectScriptOutcome {
-                EventBus.shared.publish(kind: "project.script.finished", payload: .object([
+                EventBus.shared.publish(kind: .projectScriptFinished, payload: .object([
                     "workspace_id": .string(outcome.workspaceID.value.uuidString),
                     "surface_id": .string(outcome.surfaceID.value.uuidString),
                     "name": .string(outcome.name),
@@ -1730,7 +1734,7 @@ public final class AppContext {
                   self.coordinator.hasProviderSession(threadId: threadId) else { return }
             switch try? self.threadRepo.status(of: threadId) {
             case .completed, .failed, .cancelled, .interrupted:
-                EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
+                EventBus.shared.publish(kind: .agentMessageQueueFailed, payload: .object([
                     "thread_id": .string(threadId.value.uuidString),
                     "message": .string("Provider is still stopping. The queued message remains safe and will start when the provider becomes idle.")
                 ]))
@@ -1769,7 +1773,7 @@ public final class AppContext {
         } catch is CancellationError {
             return
         } catch {
-            EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
+            EventBus.shared.publish(kind: .agentMessageQueueFailed, payload: .object([
                 "thread_id": .string(threadId.value.uuidString),
                 "message": .string(String(describing: error))
             ]))
@@ -3052,7 +3056,7 @@ public final class AppContext {
                 let acceptedUsages = usages.filter { $0.provider != .grok || acceptsGrok }
                 for usage in acceptedUsages {
                     self.recordTokenSaverAccountUsage(usage)
-                    EventBus.shared.publish(kind: "agent.account.usage",
+                    EventBus.shared.publish(kind: .agentAccountUsage,
                         payload: .object(Self.accountUsagePayload(reason: reason, usage: usage)))
                 }
                 // Partial success: providers that did not answer *and* have no
@@ -3208,7 +3212,7 @@ public final class AppContext {
                     self.recordTokenSaverAccountUsage(usage)
                     shouldPublishWidgetDigest = true
                     EventBus.shared.publish(
-                        kind: "agent.account.usage",
+                        kind: .agentAccountUsage,
                         payload: .object(Self.accountUsagePayload(reason: reason, usage: usage))
                     )
                     self.publishTokenSaverAccountUsageRefresh(
@@ -3302,7 +3306,7 @@ public final class AppContext {
             providers: providers,
             refreshCount: tokenSaverAccountUsageRefreshCount
         )
-        EventBus.shared.publish(kind: "agent.account.usage.refresh", payload: .object(payload))
+        EventBus.shared.publish(kind: .agentAccountUsageRefresh, payload: .object(payload))
     }
 
     /// Pure builder for the `agent.account.usage` event payload.

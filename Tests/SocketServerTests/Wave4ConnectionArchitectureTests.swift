@@ -104,12 +104,12 @@ final class Wave4ConnectionArchitectureTests: XCTestCase {
         let id = bus.subscribe(since: nil, filter: .cellularSafe(interestThreadIds: ["t1"])) { event in
             admitted.append(event.kind)
         }
-        bus.publish(kind: "agent.item.delta", payload: .object([
+        bus.publish(kind: .agentItemDelta, payload: .object([
             "thread_id": .string("t1"),
             "item_id": .string("i1"),
             "text": .string("a"),
         ]))
-        bus.publish(kind: "agent.item.delta", payload: .object([
+        bus.publish(kind: .agentItemDelta, payload: .object([
             "thread_id": .string("t2"),
             "item_id": .string("i2"),
             "text": .string("b"),
@@ -119,12 +119,12 @@ final class Wave4ConnectionArchitectureTests: XCTestCase {
 
         bus.updateSubscriberFilter(id, filter: .cellularSafe(interestThreadIds: ["t2"]))
         admitted.removeAll()
-        bus.publish(kind: "agent.item.delta", payload: .object([
+        bus.publish(kind: .agentItemDelta, payload: .object([
             "thread_id": .string("t2"),
             "item_id": .string("i3"),
             "text": .string("c"),
         ]))
-        bus.publish(kind: "agent.item.delta", payload: .object([
+        bus.publish(kind: .agentItemDelta, payload: .object([
             "thread_id": .string("t1"),
             "item_id": .string("i4"),
             "text": .string("d"),

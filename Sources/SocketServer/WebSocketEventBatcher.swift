@@ -1,4 +1,5 @@
 import Foundation
+import RemoteCodeTreaty
 
 final class WebSocketEventBatcher: @unchecked Sendable {
     /// Default short window for nil-key (non-coalescing) events on Wi-Fi so
@@ -17,7 +18,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     /// with its own frame. Ordering is preserved (all frames flow through the
     /// same nil-key buffer) and any non-delta event flushes the buffer
     /// immediately when only streaming coalescing is active.
-    static let fullStreamCoalescedKinds: Set<String> = ["agent.item.delta"]
+    static let fullStreamCoalescedKinds: Set<RemoteCodeEventKind> = [.agentItemDelta]
 
     private let enabled: Bool
     private let filter: EventStreamFilter
@@ -131,7 +132,8 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                 }
                 return
             }
-            if Self.fullStreamCoalescedKinds.contains(event.kind) {
+            if let kind = event.knownKind,
+               Self.fullStreamCoalescedKinds.contains(kind) {
                 queue.async {
                     defer { releasePreQueue() }
                     guard !self.stopped else { return }

@@ -178,7 +178,7 @@ final class PetCompanionControllerTests: XCTestCase {
 
         let runUUID = UUID()
         let threadUUID = UUID()
-        EventBus.shared.publish(kind: "agent.run.started", payload: .object([
+        EventBus.shared.publish(kind: .agentRunStarted, payload: .object([
             "run_id": .string(runUUID.uuidString),
         ]))
         // Host projection is authoritative; mirror production start order.
@@ -204,7 +204,7 @@ final class PetCompanionControllerTests: XCTestCase {
         controller.start()
 
         let runUUID = UUID()
-        EventBus.shared.publish(kind: "agent.run.started", payload: .object([
+        EventBus.shared.publish(kind: .agentRunStarted, payload: .object([
             "run_id": .string(runUUID.uuidString),
         ]))
         try await waitForState(.coding, controller: controller)
@@ -228,7 +228,7 @@ final class PetCompanionControllerTests: XCTestCase {
             title: "safe test notification",
             category: PetNotificationCategory.providerUpdateFailed.rawValue
         ))
-        EventBus.shared.publish(kind: "notification.created", payload: .object([:]))
+        EventBus.shared.publish(kind: .notificationCreated, payload: .object([:]))
 
         try await waitForState(.notificationPounce, controller: controller)
         XCTAssertEqual(controller.modelForTests.count, 1)
@@ -313,10 +313,10 @@ final class PetCompanionControllerTests: XCTestCase {
     }
 
     private func publishCompletedRun(_ runID: String) {
-        EventBus.shared.publish(kind: "agent.run.started", payload: .object([
+        EventBus.shared.publish(kind: .agentRunStarted, payload: .object([
             "run_id": .string(runID),
         ]))
-        EventBus.shared.publish(kind: "agent.run.finished", payload: .object([
+        EventBus.shared.publish(kind: .agentRunFinished, payload: .object([
             "run_id": .string(runID),
             "status": .string("completed"),
         ]))

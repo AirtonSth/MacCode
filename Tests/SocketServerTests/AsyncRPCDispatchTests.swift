@@ -127,7 +127,7 @@ final class AsyncRPCDispatchTests: XCTestCase {
     }
 
     @MainActor
-    func test_dispatchRPC_topLevelBatch_dispatchesEveryItemWithIndependentIDsAndErrors() async throws {
+    func test_dispatchRPC_topLevelBatch_rejectsMalformedSiblingBeforeAnyItem() async throws {
         let server = makeServer()
         let body = #"""
         [
@@ -138,15 +138,242 @@ final class AsyncRPCDispatchTests: XCTestCase {
         """#
 
         let response = await server.dispatchRPC(bodyData: Data(body.utf8))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: response) as? [String: Any])
+        XCTAssertEqual((object["error"] as? [String: Any])?["code"] as? Int, -32600)
+        XCTAssertTrue(object["id"] is NSNull)
+    }
+
+    @MainActor
+    func test_dispatchRPC_topLevelReadOnlyBatch_preservesOrderedIndependentResults() async throws {
+        let server = makeServer()
+        let body = #"""
+        [
+          {"jsonrpc":"2.0","id":"one","method":"workspace.list","params":{}},
+          {"jsonrpc":"2.0","id":"two","method":"system.ping","params":{}}
+        ]
+        """#
+
+        let response = await server.dispatchRPC(bodyData: Data(body.utf8))
         let items = try XCTUnwrap(JSONSerialization.jsonObject(with: response) as? [[String: Any]])
-        XCTAssertEqual(items.count, 3)
-        let byID = Dictionary(uniqueKeysWithValues: items.compactMap { item -> (String, [String: Any])? in
-            guard let id = item["id"] as? String else { return nil }
-            return (id, item)
-        })
-        XCTAssertNotNil(byID["one"]?["result"])
-        XCTAssertEqual((byID["bad"]?["error"] as? [String: Any])?["code"] as? Int, -32600)
-        XCTAssertNotNil(byID["two"]?["result"])
+        XCTAssertEqual(items.map { $0["id"] as? String }, ["one", "two"])
+        XCTAssertTrue(items.allSatisfy { $0["result"] != nil })
+    }
+
+    @MainActor
+    func test_dispatchRPC_persistedCapabilitiesGateSingleMethods() async throws {
+        let server = makeServer()
+        let readPrincipal = DirectRPCPrincipal(
+            ownerFingerprint: "read-owner",
+            grantedCapabilities: "read"
+        )
+
+        let read = await server.dispatchRPC(
+            bodyData: Data(#"{"jsonrpc":"2.0","id":"read","method":"workspace.list","params":{}}"#.utf8),
+            principal: readPrincipal
+        )
+        let readObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: read) as? [String: Any]
+        )
+        XCTAssertNotNil(readObject["result"])
+
+        let receipt = await server.dispatchRPC(
+            bodyData: Data(#"{"jsonrpc":"2.0","id":"receipt","method":"command.receipt.status","params":{"method":"workspace.create","client_request_id":"00000000-0000-0000-0000-000000000001"}}"#.utf8),
+            principal: readPrincipal
+        )
+        let receiptObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: receipt) as? [String: Any]
+        )
+        XCTAssertNotEqual(
+            (receiptObject["error"] as? [String: Any])?["code"] as? Int,
+            -32003,
+            "command.receipt.status must be classified as an authorized read"
+        )
+
+        let denied = await server.dispatchRPC(
+            bodyData: Data(#"{"jsonrpc":"2.0","id":"write","method":"workspace.create","params":{"name":"forbidden"}}"#.utf8),
+            principal: readPrincipal
+        )
+        let deniedObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: denied) as? [String: Any]
+        )
+        XCTAssertEqual(
+            (deniedObject["error"] as? [String: Any])?["code"] as? Int,
+            -32003
+        )
+
+        let filePrincipal = DirectRPCPrincipal(
+            ownerFingerprint: "file-owner",
+            grantedCapabilities: "file"
+        )
+        let fileAllowed = await server.dispatchRPC(
+            bodyData: Data(#"{"jsonrpc":"2.0","id":"file","method":"fs.roots","params":{}}"#.utf8),
+            principal: filePrincipal
+        )
+        let fileAllowedObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: fileAllowed) as? [String: Any]
+        )
+        XCTAssertNotEqual(
+            (fileAllowedObject["error"] as? [String: Any])?["code"] as? Int,
+            -32003,
+            "file scope must reach file RPC dispatch"
+        )
+        let fileDeniedRead = await server.dispatchRPC(
+            bodyData: Data(#"{"jsonrpc":"2.0","id":"file-read","method":"workspace.list","params":{}}"#.utf8),
+            principal: filePrincipal
+        )
+        let fileDeniedObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: fileDeniedRead) as? [String: Any]
+        )
+        XCTAssertEqual(
+            (fileDeniedObject["error"] as? [String: Any])?["code"] as? Int,
+            -32003
+        )
+
+        let nestedFileBatch = Data(#"{"jsonrpc":"2.0","id":"nested","method":"rpc.batch","params":{"calls":[{"method":"fs.roots","params":{}}]}}"#.utf8)
+        let nestedDenied = await server.dispatchRPC(
+            bodyData: nestedFileBatch,
+            principal: readPrincipal
+        )
+        let nestedDeniedObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: nestedDenied) as? [String: Any]
+        )
+        XCTAssertEqual(
+            (nestedDeniedObject["error"] as? [String: Any])?["code"] as? Int,
+            -32003,
+            "rpc.batch must not let read scope tunnel into file methods"
+        )
+        let nestedAllowed = await server.dispatchRPC(
+            bodyData: nestedFileBatch,
+            principal: filePrincipal
+        )
+        let nestedAllowedObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: nestedAllowed) as? [String: Any]
+        )
+        XCTAssertNotEqual(
+            (nestedAllowedObject["error"] as? [String: Any])?["code"] as? Int,
+            -32003,
+            "file scope must retain access to batched file reads"
+        )
+
+        XCTAssertTrue(JSONRPCDispatcher.isAuthorized(
+            method: "fs.workspace.read",
+            grantedCapabilities: "file"
+        ))
+        for method in ["sync.snapshot", "sync.snapshot.begin", "sync.snapshot.chunk", "sync.snapshot.commit"] {
+            XCTAssertTrue(JSONRPCDispatcher.isAuthorized(
+                method: method,
+                grantedCapabilities: "read"
+            ), "\(method) must remain readable for baseline recovery")
+        }
+
+        let snapshot = await server.dispatchRPC(
+            bodyData: Data(#"{"jsonrpc":"2.0","id":"snapshot","method":"sync.snapshot","params":{}}"#.utf8),
+            principal: readPrincipal
+        )
+        let snapshotObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: snapshot) as? [String: Any]
+        )
+        XCTAssertNotEqual(
+            (snapshotObject["error"] as? [String: Any])?["code"] as? Int,
+            -32003,
+            "sync.snapshot must pass read capability admission"
+        )
+    }
+
+    @MainActor
+    func test_dispatchRPC_starPrincipalPreservesSingleMutationAccess() async throws {
+        let router = FakeRouter()
+        let server = DirectHTTPServer(
+            port: UInt16.random(in: 33_000...44_000),
+            loopbackOnly: true,
+            dispatcher: JSONRPCDispatcher(router: router),
+            bootEpoch: 1
+        )
+        let requestID = UUID().uuidString
+        let body = #"{"jsonrpc":"2.0","id":"write","method":"workspace.create","params":{"name":"allowed","cwd":"/tmp","client_request_id":"\#(requestID)"}}"#
+        let principal = DirectRPCPrincipal(
+            ownerFingerprint: "full-owner",
+            grantedCapabilities: "*"
+        )
+
+        let response = await server.dispatchRPC(
+            bodyData: Data(body.utf8),
+            principal: principal
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: response) as? [String: Any]
+        )
+        XCTAssertNotEqual(
+            (object["error"] as? [String: Any])?["code"] as? Int,
+            -32003,
+            "full-access principal must pass capability admission"
+        )
+        // FakeRouter intentionally has no durable command-receipt repository,
+        // so dispatch then fails closed before the mutation for that unrelated
+        // reason. Reaching that domain error proves the capability gate admitted
+        // `*`; production mutation/receipt behavior is covered elsewhere.
+        XCTAssertEqual(
+            (object["error"] as? [String: Any])?["code"] as? Int,
+            -32091
+        )
+        XCTAssertTrue(router.workspaces.isEmpty)
+    }
+
+    @MainActor
+    func test_dispatchRPC_topLevelMutationBatchRejectsBeforeAnyEffect() async throws {
+        let router = FakeRouter()
+        let server = DirectHTTPServer(
+            port: UInt16.random(in: 33_000...44_000),
+            loopbackOnly: true,
+            dispatcher: JSONRPCDispatcher(router: router),
+            bootEpoch: 1
+        )
+        let requestID = UUID().uuidString
+        let body = #"""
+        [
+          {"jsonrpc":"2.0","id":"mutate","method":"workspace.create","params":{"name":"must-not-exist","cwd":"/tmp","client_request_id":"\#(requestID)"}},
+          {"jsonrpc":"2.0","id":"read","method":"workspace.list","params":{}}
+        ]
+        """#
+
+        let response = await server.dispatchRPC(bodyData: Data(body.utf8))
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: response) as? [String: Any]
+        )
+        XCTAssertEqual((object["error"] as? [String: Any])?["code"] as? Int, -32602)
+        XCTAssertTrue(router.workspaces.isEmpty,
+                      "batch preflight must reject before its first mutation executes")
+    }
+
+    @MainActor
+    func test_dispatchRPC_unauthorizedBatchSiblingRejectsBeforeAnyEffect() async throws {
+        let router = FakeRouter()
+        let server = DirectHTTPServer(
+            port: UInt16.random(in: 33_000...44_000),
+            loopbackOnly: true,
+            dispatcher: JSONRPCDispatcher(router: router),
+            bootEpoch: 1
+        )
+        let body = #"""
+        [
+          {"jsonrpc":"2.0","id":"read","method":"workspace.list","params":{}},
+          {"jsonrpc":"2.0","id":"write","method":"workspace.create","params":{"name":"must-not-exist"}}
+        ]
+        """#
+        let principal = DirectRPCPrincipal(
+            ownerFingerprint: "read-owner",
+            grantedCapabilities: "read"
+        )
+
+        let response = await server.dispatchRPC(
+            bodyData: Data(body.utf8),
+            principal: principal
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: response) as? [String: Any]
+        )
+        XCTAssertEqual((object["error"] as? [String: Any])?["code"] as? Int, -32003)
+        XCTAssertTrue(router.workspaces.isEmpty)
     }
 
     @MainActor
