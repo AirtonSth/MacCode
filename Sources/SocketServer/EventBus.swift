@@ -63,6 +63,20 @@ public final class EventBus: @unchecked Sendable {
     @TaskLocal public static var activeMutationEventSink: MutationEventSink?
     @TaskLocal public static var suppressMutationEventCapture = false
 
+    /// Starts work whose events belong to the runtime lifecycle after the
+    /// admitting mutation, not to that mutation's durable receipt range.
+    /// Unstructured Tasks inherit TaskLocal values at creation, so callers
+    /// must cross this boundary before creating work that can outlive a reply.
+    public static func outsideMutationCapture<Value>(
+        _ operation: () throws -> Value
+    ) rethrows -> Value {
+        try $activeMutationEventSink.withValue(nil) {
+            try $suppressMutationEventCapture.withValue(false) {
+                try operation()
+            }
+        }
+    }
+
     public struct Event: Codable, Sendable {
         public let seq: Int64
         public let kind: String

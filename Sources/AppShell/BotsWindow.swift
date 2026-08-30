@@ -8992,63 +8992,65 @@ public final class BotsViewModel: ObservableObject {
         work.threadID = prepared.thread.id
         work.runID = prepared.runID
         context.coordinator.reserveProviderStart(threadId: prepared.thread.id, runId: prepared.runID)
-        work.task = Task { [weak self] in
-            guard let self else { return }
-            defer {
-                if let threadID = work.threadID, let runID = work.runID {
-                    self.context.coordinator.discardProviderStartReservation(
-                        threadId: threadID,
-                        runId: runID
-                    )
+        work.task = EventBus.outsideMutationCapture {
+            Task { [weak self] in
+                guard let self else { return }
+                defer {
+                    if let threadID = work.threadID, let runID = work.runID {
+                        self.context.coordinator.discardProviderStartReservation(
+                            threadId: threadID,
+                            runId: runID
+                        )
+                    }
                 }
-            }
-            await Task.yield()
-            guard !Task.isCancelled, (self.deskStopEpoch[bot.id] ?? 0) == epoch else {
-                self.forgetDeskSend(work, botID: bot.id)
-                self.clearDeskSendInFlight(for: bot.id)
-                return
-            }
-            while let join = self.deskStopJoins[bot.id] {
-                if Task.isCancelled || (self.deskStopEpoch[bot.id] ?? 0) != epoch {
+                await Task.yield()
+                guard !Task.isCancelled, (self.deskStopEpoch[bot.id] ?? 0) == epoch else {
                     self.forgetDeskSend(work, botID: bot.id)
                     self.clearDeskSendInFlight(for: bot.id)
                     return
                 }
-                if (self.deskSendTasks[bot.id] ?? []).contains(where: { $0 === work }) {
-                    await Task.yield()
-                    continue
+                while let join = self.deskStopJoins[bot.id] {
+                    if Task.isCancelled || (self.deskStopEpoch[bot.id] ?? 0) != epoch {
+                        self.forgetDeskSend(work, botID: bot.id)
+                        self.clearDeskSendInFlight(for: bot.id)
+                        return
+                    }
+                    if (self.deskSendTasks[bot.id] ?? []).contains(where: { $0 === work }) {
+                        await Task.yield()
+                        continue
+                    }
+                    _ = await join.task.value
+                    break
                 }
-                _ = await join.task.value
-                break
-            }
-            guard !Task.isCancelled, (self.deskStopEpoch[bot.id] ?? 0) == epoch else {
+                guard !Task.isCancelled, (self.deskStopEpoch[bot.id] ?? 0) == epoch else {
+                    self.forgetDeskSend(work, botID: bot.id)
+                    self.clearDeskSendInFlight(for: bot.id)
+                    return
+                }
+                let started = await self.startSupervisedRun(
+                    bot: bot,
+                    revision: revision,
+                    prepared: prepared,
+                    userText: userText,
+                    attachments: attachments,
+                    memoryFiles: brain.memoryFiles,
+                    skills: brain.skills,
+                    routines: brain.routines,
+                    router: router,
+                    expectedEpoch: epoch
+                )
                 self.forgetDeskSend(work, botID: bot.id)
                 self.clearDeskSendInFlight(for: bot.id)
-                return
-            }
-            let started = await self.startSupervisedRun(
-                bot: bot,
-                revision: revision,
-                prepared: prepared,
-                userText: userText,
-                attachments: attachments,
-                memoryFiles: brain.memoryFiles,
-                skills: brain.skills,
-                routines: brain.routines,
-                router: router,
-                expectedEpoch: epoch
-            )
-            self.forgetDeskSend(work, botID: bot.id)
-            self.clearDeskSendInFlight(for: bot.id)
-            if let started {
-                self.lastSendStartedProviderRun = true
-                self.lastLinkedRunIDByBot[bot.id] = started.runID
-                self.restoreDeskWorkLog(botID: bot.id)
-                self.restoreDeskLiveTurn(botID: bot.id)
-                _ = await self.followLinkedRun(bot: bot, started: started)
-            } else {
-                self.deskSendInFlightStartedAt = nil
-                self.recordNeedsAttention(bot: bot, conversation: prepared.conversation, userText: userText)
+                if let started {
+                    self.lastSendStartedProviderRun = true
+                    self.lastLinkedRunIDByBot[bot.id] = started.runID
+                    self.restoreDeskWorkLog(botID: bot.id)
+                    self.restoreDeskLiveTurn(botID: bot.id)
+                    _ = await self.followLinkedRun(bot: bot, started: started)
+                } else {
+                    self.deskSendInFlightStartedAt = nil
+                    self.recordNeedsAttention(bot: bot, conversation: prepared.conversation, userText: userText)
+                }
             }
         }
         rememberDeskSend(work, botID: bot.id)

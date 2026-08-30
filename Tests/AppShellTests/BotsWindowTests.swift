@@ -5786,6 +5786,62 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(vm.deskSendInFlight)
     }
 
+    func test_hostBotRuntimeTaskDoesNotInheritMutationReceiptCapture() async throws {
+        // WHY: bot.send admits synchronously, but provider lifecycle events can
+        // occur after its receipt is sealed. Inheriting the receipt TaskLocals
+        // made those events timing-dependent: suppressed before seal and only
+        // published with a late-event warning after seal.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            )
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.setDeskProvider(.claude)
+        let crossedBoundary = expectation(description: "runtime crossed receipt capture boundary")
+        var inheritedSink = true
+        var inheritedSuppression = true
+        vm.beforeBotRunDispatchForTesting = { _ in
+            inheritedSink = EventBus.activeMutationEventSink != nil
+            inheritedSuppression = EventBus.suppressMutationEventCapture
+            crossedBoundary.fulfill()
+        }
+
+        let sink = EventBus.MutationEventSink()
+        _ = try EventBus.$activeMutationEventSink.withValue(sink) {
+            try EventBus.$suppressMutationEventCapture.withValue(true) {
+                try vm.enqueueHostMessage(
+                    botID: bot.id,
+                    text: "go",
+                    conversationID: nil,
+                    routing: BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+                )
+            }
+        }
+        await fulfillment(of: [crossedBoundary], timeout: 5)
+        XCTAssertFalse(inheritedSink)
+        XCTAssertFalse(inheritedSuppression)
+        let providerStarted = await waitUntil(timeout: 5) { !runner.requests.isEmpty }
+        XCTAssertTrue(providerStarted)
+        XCTAssertTrue(runner.finish(promptContaining: "go", status: .cancelled, reply: nil))
+        let runtimeSettled = await waitUntil(timeout: 5) {
+            !vm.hasLiveRun(botID: bot.id) && !vm.deskSendInFlight
+        }
+        XCTAssertTrue(runtimeSettled)
+        vm.beforeBotRunDispatchForTesting = nil
+    }
+
     func test_pairedStopVariantsReturnOnlyAfterAsyncReceiptSettlement() async throws {
         // WHY: Phase4 finalizes the value returned by this router. Returning
         // the initial accepted receipt would permanently omit the terminal
