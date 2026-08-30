@@ -87,6 +87,7 @@ public enum BotSend: RemoteCodeRPCContract {
         public let conversationID: String?
         public let runID: String
         public let disposition: Disposition
+        public let routingReadback: RemoteCodeJSONValue?
         public let readback: RemoteCodeJSONValue
 
         private enum CodingKeys: String, CodingKey {
@@ -103,12 +104,14 @@ public enum BotSend: RemoteCodeRPCContract {
                 ?? requestID
             receiptID = try container.decode(String.self, forKey: .receiptID)
             status = try container.decode(Status.self, forKey: .status)
-            hostID = try container.decode(String.self, forKey: .hostID)
-            botID = try container.decode(String.self, forKey: .botID)
+            let decodedHostID = try container.decode(String.self, forKey: .hostID)
+            let decodedBotID = try container.decode(String.self, forKey: .botID)
+            hostID = decodedHostID
+            botID = decodedBotID
             readback = try container.decode(RemoteCodeJSONValue.self, forKey: .readback)
             guard let object = readback.objectValue,
-                  object["host_id"]?.stringValue == hostID,
-                  object["bot_id"]?.stringValue == botID,
+                  object["host_id"]?.stringValue == decodedHostID,
+                  object["bot_id"]?.stringValue == decodedBotID,
                   object["request_id"]?.stringValue == requestID,
                   object["client_request_id"]?.stringValue == clientRequestID,
                   let runID = object["run_id"]?.stringValue else {
@@ -119,26 +122,43 @@ public enum BotSend: RemoteCodeRPCContract {
                 )
             }
             self.runID = runID
-            conversationID = object["conversation_id"]?.stringValue
+            let decodedConversationID = object["conversation_id"]?.stringValue
+            conversationID = decodedConversationID
             if object["enqueued"]?.boolValue == true {
-                guard let queueID = object["id"]?.stringValue, !queueID.isEmpty else {
+                guard let queueID = object["id"]?.stringValue, !queueID.isEmpty,
+                      case .array(let queue) = object["queue"],
+                      queue.contains(where: { item in
+                          guard let row = item.objectValue else { return false }
+                          return row["id"]?.stringValue == queueID
+                              && row["bot_id"]?.stringValue == decodedBotID
+                              && row["conversation_id"]?.stringValue == decodedConversationID
+                      }) else {
                     throw DecodingError.dataCorruptedError(
                         forKey: .readback,
                         in: container,
-                        debugDescription: "Queued Bot send receipt is missing its queue identity."
+                        debugDescription: "Queued Bot send receipt is missing its owned queue identity."
                     )
                 }
                 disposition = .queued(queueID: queueID)
+                routingReadback = object["effective_routing"]
             } else {
-                guard let threadID = object["run"]?["thread_id"]?.stringValue,
+                guard let run = object["run"]?.objectValue,
+                      run["host_id"]?.stringValue == decodedHostID,
+                      run["bot_id"]?.stringValue == decodedBotID,
+                      run["request_id"]?.stringValue == requestID,
+                      run["client_request_id"]?.stringValue == clientRequestID,
+                      run["conversation_id"]?.stringValue == decodedConversationID,
+                      run["run_id"]?.stringValue == runID,
+                      let threadID = run["thread_id"]?.stringValue,
                       !threadID.isEmpty else {
                     throw DecodingError.dataCorruptedError(
                         forKey: .readback,
                         in: container,
-                        debugDescription: "Started Bot send receipt is missing its thread identity."
+                        debugDescription: "Started Bot send receipt is missing its owned run identity."
                     )
                 }
                 disposition = .started(threadID: threadID)
+                routingReadback = run["routing"]
             }
         }
 

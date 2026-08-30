@@ -45,7 +45,9 @@ final class RemoteCodeTreatyTests: XCTestCase {
           "receipt_id":"receipt-1","status":"completed","host_id":"host-1","bot_id":"bot-1",
           "readback":{"host_id":"host-1","bot_id":"bot-1","request_id":"request-1",
             "client_request_id":"request-1","conversation_id":"conversation-1","run_id":"run-1",
-            "enqueued":false,"run":{"thread_id":"thread-1"}}
+            "enqueued":false,"run":{"host_id":"host-1","bot_id":"bot-1","request_id":"request-1",
+              "client_request_id":"request-1","conversation_id":"conversation-1","run_id":"run-1",
+              "thread_id":"thread-1"}}
         }
         """#.utf8)
 
@@ -66,7 +68,8 @@ final class RemoteCodeTreatyTests: XCTestCase {
           "receipt_id":"receipt-2","status":"completed","host_id":"host-1","bot_id":"bot-1",
           "readback":{"host_id":"host-1","bot_id":"bot-1","request_id":"request-2",
             "client_request_id":"request-2","conversation_id":"conversation-1","run_id":"run-1",
-            "enqueued":true,"id":"queue-1","queue":[]}
+            "enqueued":true,"id":"queue-1","queue":[{"id":"queue-1","bot_id":"bot-1",
+              "conversation_id":"conversation-1"}]}
         }
         """#.utf8)
 
@@ -74,6 +77,21 @@ final class RemoteCodeTreatyTests: XCTestCase {
         XCTAssertEqual(result.status, .completed)
         XCTAssertEqual(result.runID, "run-1")
         XCTAssertEqual(result.disposition, .queued(queueID: "queue-1"))
+    }
+
+    func testBotSendResultRejectsUnownedQueueReadback() throws {
+        let data = Data(#"""
+        {
+          "request_id":"request-2","client_request_id":"request-2",
+          "receipt_id":"receipt-2","status":"completed","host_id":"host-1","bot_id":"bot-1",
+          "readback":{"host_id":"host-1","bot_id":"bot-1","request_id":"request-2",
+            "client_request_id":"request-2","conversation_id":"conversation-1","run_id":"run-1",
+            "enqueued":true,"id":"queue-1","queue":[{"id":"queue-1","bot_id":"bot-2",
+              "conversation_id":"conversation-1"}]}
+        }
+        """#.utf8)
+
+        XCTAssertThrowsError(try decoder.decode(BotSend.Result.self, from: data))
     }
 
     func testBotUploadTargetAndGrantPreserveCurrentWire() throws {
