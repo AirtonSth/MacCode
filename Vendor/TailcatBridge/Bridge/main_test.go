@@ -47,3 +47,13 @@ func TestParseAllowedRejectsEmptyAndAcceptsSnapshot(t *testing.T) {
 		t.Fatalf("got %d allowed clients, want 2", len(allowed))
 	}
 }
+
+func TestTailcatTargetPortIsIndependentFromSwiftLoopbackPort(t *testing.T) {
+	const swiftLoopbackPort uint16 = 45123
+	if !acceptsTailcatTargetPort(18217) {
+		t.Fatal("frozen Tailcat service port 18217 must be accepted")
+	}
+	if acceptsTailcatTargetPort(swiftLoopbackPort) {
+		t.Fatal("ephemeral Swift forwarding port must not become the Tailcat service port")
+	}
+}

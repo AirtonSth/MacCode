@@ -29,9 +29,10 @@ import (
 )
 
 const (
-	buildID       = "tailcat-88929418b1a3f3c74904a3136d6a9e87b1b5b9bb+rcpatch1"
-	preambleMagic = "RCTC"
-	preambleSize  = 144
+	buildID                  = "tailcat-88929418b1a3f3c74904a3136d6a9e87b1b5b9bb+rcpatch1"
+	preambleMagic            = "RCTC"
+	preambleSize             = 144
+	tailcatTargetPort uint16 = 18217
 )
 
 type result struct {
@@ -172,6 +173,10 @@ func waitForServerRelay(server *tailcat.Server, timeout time.Duration) bool {
 		time.Sleep(10 * time.Millisecond)
 	}
 	return false
+}
+
+func acceptsTailcatTargetPort(port uint16) bool {
+	return port == tailcatTargetPort
 }
 
 func (runtime *serverRuntime) handle(peer key.NodePublic, incoming net.Conn) {
@@ -356,7 +361,7 @@ func serverStart(privateValue, allowedValue, secretValue, listenerValue, serverI
 		Logf:           func(string, ...any) {},
 	}
 	server.OnTCPWithPeer = func(peer key.NodePublic, port uint16) func(net.Conn) {
-		if port != runtime.port {
+		if !acceptsTailcatTargetPort(port) {
 			return nil
 		}
 		return func(connection net.Conn) {
