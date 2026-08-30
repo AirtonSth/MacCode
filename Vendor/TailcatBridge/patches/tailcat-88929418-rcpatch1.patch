@@ -1,8 +1,33 @@
 diff --git a/tailcat.go b/tailcat.go
-index a0eba13c..b91784b1 100644
+index a0eba13c..2ea25ea0 100644
 --- a/tailcat.go
 +++ b/tailcat.go
-@@ -311,6 +311,11 @@ type Server struct {
+@@ -245,13 +245,23 @@ func (b *locoBackend) derpRegionID() int {
+ }
+ 
+ func (b *locoBackend) Close() error {
++	var closeErr error
++	if b.ns != nil {
++		closeErr = b.ns.Close()
++	}
+ 	if e, ok := b.sys.Engine.GetOK(); ok {
+ 		e.Close()
+ 	}
+ 	if m, ok := b.sys.NetMon.GetOK(); ok {
+ 		m.Close()
+ 	}
+-	return nil
++	if d, ok := b.sys.Dialer.GetOK(); ok {
++		d.Close()
++	}
++	if bus, ok := b.sys.Bus.GetOK(); ok {
++		bus.Close()
++	}
++	return closeErr
+ }
+ 
+ // Server listens for clients over a WireGuard tunnel relayed through DERP.
+@@ -311,6 +321,11 @@ type Server struct {
  	// It must be set before calling Start.
  	OnTCP func(port uint16) (handler func(net.Conn))
  
@@ -14,7 +39,7 @@ index a0eba13c..b91784b1 100644
  	// OnTCPForward, if non-nil, specifies a func that returns a handler to handle
  	// incoming connections to the provided IP:port. If nil or if it returns nil,
  	// then a RST is sent.
-@@ -433,6 +438,13 @@ func (s *Server) Start() error {
+@@ -433,6 +448,13 @@ func (s *Server) Start() error {
  	ns.ProcessSubnets = true
  	ns.GetTCPHandlerForFlow = func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
  		if dst.Addr() == lb.addr {
@@ -28,7 +53,7 @@ index a0eba13c..b91784b1 100644
  			if s.OnTCP == nil {
  				return nil, true // send RST
  			}
-@@ -1801,6 +1813,17 @@ func (s *Server) Status() *ipnstate.Status {
+@@ -1801,6 +1823,17 @@ func (s *Server) Status() *ipnstate.Status {
  	return s.lb.Status()
  }
  
