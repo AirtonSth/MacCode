@@ -189,13 +189,13 @@ other_jobs="$(awk '
   /^[a-zA-Z][A-Za-z0-9_]*:/ {
     name=$1
     sub(/:.*/, "", name)
-    if (name != "stages" && name != "workflow" && name != "variables" && name != "stable_macos_arm64_dmg") {
+    if (name != "stages" && name != "workflow" && name != "variables" && name != "stable_macos_arm64_dmg" && name != "tailcat_notarized_canary") {
       print name
     }
   }
 ' "$ci_yaml")"
 if [ -n "$other_jobs" ]; then
-  echo "FAIL: CI still defines jobs besides stable_macos_arm64_dmg:" >&2
+  echo "FAIL: CI defines an unexpected job:" >&2
   printf '%s\n' "$other_jobs" >&2
   exit 1
 fi
@@ -210,10 +210,11 @@ if ! printf '%s\n' "$stable_rules" | grep -F "if: '\$CI_COMMIT_TAG =~ /^v[0-9]+\
 fi
 # shellcheck disable=SC2016
 if ! grep -F "if: '\$CI_COMMIT_TAG =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+$/'" "$ci_yaml" >/dev/null \
+  || ! grep -F "if: '\$CI_COMMIT_BRANCH == \"tailcat\"'" "$ci_yaml" >/dev/null \
   || grep -F 'merge_request_event' "$ci_yaml" >/dev/null \
   || grep -F 'CI_PIPELINE_SOURCE == "push"' "$ci_yaml" >/dev/null
 then
-  echo "FAIL: workflow still admits non-tag pipelines" >&2
+  echo "FAIL: workflow must admit only semver tags and the tailcat canary branch" >&2
   exit 1
 fi
 # shellcheck disable=SC2016

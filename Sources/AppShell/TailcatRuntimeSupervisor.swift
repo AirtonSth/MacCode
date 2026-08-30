@@ -92,8 +92,13 @@ actor TailcatRuntimeSupervisor {
         loopTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
+                let startedAt = DispatchTime.now().uptimeNanoseconds
                 await self.requestReconcile()
-                try? await Task.sleep(nanoseconds: UInt64(TailcatTransportContract.pollInterval * 1_000_000_000))
+                let elapsed = DispatchTime.now().uptimeNanoseconds - startedAt
+                let interval = UInt64(TailcatTransportContract.pollInterval * 1_000_000_000)
+                if elapsed < interval {
+                    try? await Task.sleep(nanoseconds: interval - elapsed)
+                }
             }
         }
     }
@@ -147,8 +152,8 @@ actor TailcatRuntimeSupervisor {
         do {
             let response = try await catalog.host(serverID: serverID, accessToken: session.accessToken)
             guard enabled, generation == operationGeneration else { return }
-            lastBackendSuccess = now()
             try validate(response.snapshot, accountID: session.user.id)
+            lastBackendSuccess = now()
             currentETag = response.eTag
 
             if response.snapshot.admittedNodePublics.isEmpty {
@@ -167,15 +172,18 @@ actor TailcatRuntimeSupervisor {
                 || stored?.allowlistEpoch != response.snapshot.epoch
                 || stored?.revision != response.snapshot.revision
                 || stored?.snapshotHash != response.snapshot.hash
+                || stored?.phase != .active
                 || stored?.active == nil
+                || response.host == nil
+                || response.eTag == nil
                 || runtime == nil
 
             currentSnapshot = response.snapshot
             if needsRotation {
                 await rotateAndPublish(snapshot: response.snapshot, session: session, eTag: response.eTag)
-            } else if let runtime,
+            } else if let runtime, let eTag = response.eTag,
                       now().timeIntervalSince(lastRenewal ?? .distantPast) >= TailcatTransportContract.renewalInterval {
-                await renew(runtime: runtime, session: session, eTag: response.eTag)
+                await renew(runtime: runtime, session: session, eTag: eTag)
             } else if runtime != nil {
                 statusHandler(.active)
             }
@@ -206,13 +214,18 @@ actor TailcatRuntimeSupervisor {
     private func rotateAndPublish(
         snapshot: TailcatAllowlistSnapshot,
         session: PrivateAccountSession,
-        eTag: String
+        eTag: String?
     ) async {
         let operationGeneration = generation
         await stopRuntime()
         statusHandler(.checking)
         do {
-            let old = try secureStore.load()?.active
+            let stored = try secureStore.load()
+            // A crash may leave an old active key next to a publishing or
+            // revoked phase. Only an explicitly active record may carry that
+            // key forward while a replacement is published; fail-closed
+            // recovery always rotates away from non-active key material.
+            let old = stored?.phase == .active ? stored?.active : nil
             let primaryKey = try await Task.detached { try self.bridge.generateKey() }.value
             let fallbackKey = try await Task.detached { try self.bridge.generateKey() }.value
             guard primaryKey != fallbackKey else {
@@ -230,25 +243,20 @@ actor TailcatRuntimeSupervisor {
                 pending: keys
             ))
 
-            let primarySecret = try Self.randomBytes(count: 32)
-            let fallbackSecret = try Self.randomBytes(count: 32)
-            let primaryListener = try Self.randomBytes(count: 16)
-            let fallbackListener = try Self.randomBytes(count: 16)
-            guard primarySecret != fallbackSecret, primaryListener != fallbackListener else {
-                throw TailcatBridgeError.rejected("listener_randomness_collision")
-            }
+            let listenerSecret = try Self.randomBytes(count: 32)
+            let listenerID = try Self.randomBytes(count: 16)
             let peers = snapshot.admittedNodePublics
             authenticator.replaceContexts([
                 .init(
                     serverID: "\(serverID).primary",
-                    listenerID: primaryListener,
-                    secret: primarySecret,
+                    listenerID: listenerID,
+                    secret: listenerSecret,
                     allowedPeerPublic: peers
                 ),
                 .init(
                     serverID: "\(serverID).fallback",
-                    listenerID: fallbackListener,
-                    secret: fallbackSecret,
+                    listenerID: listenerID,
+                    secret: listenerSecret,
                     allowedPeerPublic: peers
                 ),
             ])
@@ -257,8 +265,8 @@ actor TailcatRuntimeSupervisor {
                 Result { try self.bridge.startServer(
                     key: keys.primary,
                     allowedNodePublics: peers,
-                    secret: primarySecret,
-                    listenerID: primaryListener,
+                    secret: listenerSecret,
+                    listenerID: listenerID,
                     serverID: "\(self.serverID).primary",
                     relay: .primary
                 ) }
@@ -267,8 +275,8 @@ actor TailcatRuntimeSupervisor {
                 Result { try self.bridge.startServer(
                     key: keys.fallback,
                     allowedNodePublics: peers,
-                    secret: fallbackSecret,
-                    listenerID: fallbackListener,
+                    secret: listenerSecret,
+                    listenerID: listenerID,
                     serverID: "\(self.serverID).fallback",
                     relay: .publicFallback
                 ) }

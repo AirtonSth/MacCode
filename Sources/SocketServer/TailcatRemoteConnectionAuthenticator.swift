@@ -106,12 +106,17 @@ public final class TailcatRemoteConnectionAuthenticator: @unchecked Sendable {
     }
 
     public func classify(fd: Int32, ordinaryReadTimeout: TimeInterval) -> TailcatConnectionClassification {
-        setReadTimeout(fd: fd, seconds: ordinaryReadTimeout)
+        Self.setReadTimeout(fd: fd, seconds: ordinaryReadTimeout)
         guard let prefix = Self.readExactly(fd: fd, count: 4) else { return .rejected }
         guard prefix == Data("RCTC".utf8) else { return .ordinary(initialBytes: prefix) }
 
-        setReadTimeout(fd: fd, seconds: Self.preambleDeadline)
-        guard let suffix = Self.readExactly(fd: fd, count: Self.preambleSize - prefix.count) else {
+        let deadline = DispatchTime.now().uptimeNanoseconds
+            &+ UInt64(Self.preambleDeadline * 1_000_000_000)
+        guard let suffix = Self.readExactly(
+            fd: fd,
+            count: Self.preambleSize - prefix.count,
+            deadlineUptimeNanoseconds: deadline
+        ) else {
             return .rejected
         }
         return verify(prefix + suffix) ? .remoteAuthenticated : .rejected
@@ -158,10 +163,22 @@ public final class TailcatRemoteConnectionAuthenticator: @unchecked Sendable {
         return Data(bytes)
     }
 
-    private static func readExactly(fd: Int32, count: Int) -> Data? {
+    private static func readExactly(
+        fd: Int32,
+        count: Int,
+        deadlineUptimeNanoseconds: UInt64? = nil
+    ) -> Data? {
         var bytes = [UInt8](repeating: 0, count: count)
         var offset = 0
         while offset < count {
+            if let deadlineUptimeNanoseconds {
+                let current = DispatchTime.now().uptimeNanoseconds
+                guard current < deadlineUptimeNanoseconds else { return nil }
+                setReadTimeout(
+                    fd: fd,
+                    seconds: TimeInterval(deadlineUptimeNanoseconds - current) / 1_000_000_000
+                )
+            }
             let readCount = bytes.withUnsafeMutableBytes { raw -> Int in
                 guard let base = raw.baseAddress else { return -1 }
                 return Darwin.read(fd, base.advanced(by: offset), count - offset)
@@ -173,7 +190,7 @@ public final class TailcatRemoteConnectionAuthenticator: @unchecked Sendable {
         return Data(bytes)
     }
 
-    private func setReadTimeout(fd: Int32, seconds: TimeInterval) {
+    private static func setReadTimeout(fd: Int32, seconds: TimeInterval) {
         let clamped = max(0.001, seconds)
         var timeout = timeval(
             tv_sec: Int(clamped),

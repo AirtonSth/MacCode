@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import XCTest
 @testable import SocketServer
 
@@ -84,6 +85,33 @@ final class TailcatRemoteConnectionAuthenticatorTests: XCTestCase {
             allowedPeerPublic: [nodePublic(substitutedPeer)]
         )])
         XCTAssertFalse(crossServer.verify(preamble))
+    }
+
+    func testPreambleUsesOneAbsoluteTwoSecondDeadlineAcrossReads() throws {
+        var sockets: [Int32] = [0, 0]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
+        defer {
+            Darwin.close(sockets[0])
+            Darwin.close(sockets[1])
+        }
+        XCTAssertEqual(Data("RCTC".utf8).withUnsafeBytes {
+            Darwin.write(sockets[1], $0.baseAddress, $0.count)
+        }, 4)
+        let writer = sockets[1]
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.2) {
+            var byte: UInt8 = 1
+            _ = Darwin.write(writer, &byte, 1)
+        }
+
+        let started = DispatchTime.now().uptimeNanoseconds
+        let classification = TailcatRemoteConnectionAuthenticator().classify(
+            fd: sockets[0],
+            ordinaryReadTimeout: 1
+        )
+        let elapsed = TimeInterval(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000_000
+        if case .rejected = classification {} else { XCTFail("incomplete preamble must be rejected") }
+        XCTAssertGreaterThanOrEqual(elapsed, 1.8)
+        XCTAssertLessThan(elapsed, 2.6, "a drip-fed byte must not reset the two-second deadline")
     }
 
     private func makePreamble(

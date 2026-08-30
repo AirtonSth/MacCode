@@ -69,9 +69,9 @@ struct TailcatCatalogHost: Codable, Equatable, Sendable {
 }
 
 struct TailcatHostSnapshot: Sendable {
-    let host: TailcatCatalogHost
+    let host: TailcatCatalogHost?
     let snapshot: TailcatAllowlistSnapshot
-    let eTag: String
+    let eTag: String?
 }
 
 struct TailcatPublishedHost: Sendable {
@@ -122,15 +122,15 @@ final class URLSessionTailcatCatalogAPI: TailcatCatalogAPI, @unchecked Sendable 
 
     func host(serverID: String, accessToken: String) async throws -> TailcatHostSnapshot {
         struct Response: Decodable {
-            let host: TailcatCatalogHost
+            let host: TailcatCatalogHost?
             let snapshot: TailcatAllowlistSnapshot
         }
-        let (response, eTag): (Response, String) = try await request(
+        let (response, eTag): (Response, String?) = try await request(
             serverID: serverID,
             method: "GET",
             accessToken: accessToken
         )
-        guard response.host.transportBuildId == TailcatTransportContract.buildID else {
+        if let host = response.host, host.transportBuildId != TailcatTransportContract.buildID {
             throw TailcatCatalogError.http(status: 409, code: "unsupported_tailcat_version")
         }
         return TailcatHostSnapshot(host: response.host, snapshot: response.snapshot, eTag: eTag)
@@ -148,16 +148,18 @@ final class URLSessionTailcatCatalogAPI: TailcatCatalogAPI, @unchecked Sendable 
             let endpoints: [TailcatCatalogEndpoint]
         }
         struct Response: Decodable { let host: TailcatCatalogHost }
-        let (response, eTag): (Response, String) = try await request(
+        let (response, eTag): (Response, String?) = try await request(
             serverID: serverID,
             method: "PUT",
             accessToken: accessToken,
             ifMatch: ifMatch,
-            body: Body(displayName: displayName, endpoints: endpoints)
+            body: Body(displayName: displayName, endpoints: endpoints),
+            requiresETag: true
         )
         guard response.host.transportBuildId == TailcatTransportContract.buildID else {
             throw TailcatCatalogError.http(status: 409, code: "unsupported_tailcat_version")
         }
+        guard let eTag else { throw TailcatCatalogError.invalidResponse }
         return TailcatPublishedHost(host: response.host, eTag: eTag)
     }
 
@@ -166,8 +168,9 @@ final class URLSessionTailcatCatalogAPI: TailcatCatalogAPI, @unchecked Sendable 
         method: String,
         accessToken: String,
         ifMatch: String? = nil,
-        body: (any Encodable)? = nil
-    ) async throws -> (Response, String) {
+        body: (any Encodable)? = nil,
+        requiresETag: Bool = false
+    ) async throws -> (Response, String?) {
         let escaped = serverID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? serverID
         var request = URLRequest(
             url: baseURL.appendingPathComponent("v1/private/tailcat/hosts/\(escaped)")
@@ -191,7 +194,8 @@ final class URLSessionTailcatCatalogAPI: TailcatCatalogAPI, @unchecked Sendable 
             let code = try? decoder.decode(FailureResponse.self, from: data).code
             throw TailcatCatalogError.http(status: http.statusCode, code: code)
         }
-        guard let eTag = http.value(forHTTPHeaderField: "ETag"), !eTag.isEmpty else {
+        let eTag = http.value(forHTTPHeaderField: "ETag")
+        if requiresETag, eTag?.isEmpty != false {
             throw TailcatCatalogError.invalidResponse
         }
         do {

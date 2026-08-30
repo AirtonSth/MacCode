@@ -18,7 +18,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertEqual(try LinkedTailcatBridge().buildID(), TailcatTransportContract.buildID)
     }
 
-    func testCatalogUsesFrozenHostSchemaBuildHeaderAndETagCAS() async throws {
+    func testCatalogBootstrapsMissingHostWithoutETagThenPublishesWithoutIfMatch() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [TailcatCatalogURLProtocol.self]
         TailcatCatalogURLProtocol.reset()
@@ -28,6 +28,8 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         )
 
         let fetched = try await api.host(serverID: "server-1", accessToken: "access-token")
+        XCTAssertNil(fetched.host)
+        XCTAssertNil(fetched.eTag)
         _ = try await api.publishHost(
             serverID: "server-1",
             displayName: "Test Mac",
@@ -43,7 +45,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Authorization"), "Bearer access-token")
         XCTAssertEqual(requests[0].value(forHTTPHeaderField: "x-tailcat-transport-build-id"), TailcatTransportContract.buildID)
         XCTAssertEqual(requests[1].httpMethod, "PUT")
-        XCTAssertEqual(requests[1].value(forHTTPHeaderField: "If-Match"), "\"1\"")
+        XCTAssertNil(requests[1].value(forHTTPHeaderField: "If-Match"))
         let body = try XCTUnwrap(requests[1].httpBody)
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         XCTAssertEqual(Set(json.keys), ["displayName", "endpoints"])
@@ -65,8 +67,8 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         let starts = bridge.startCalls
         XCTAssertEqual(starts.count, 2)
         XCTAssertNotEqual(starts[0].key, starts[1].key)
-        XCTAssertNotEqual(starts[0].secret, starts[1].secret)
-        XCTAssertNotEqual(starts[0].listenerID, starts[1].listenerID)
+        XCTAssertEqual(starts[0].secret, starts[1].secret)
+        XCTAssertEqual(starts[0].listenerID, starts[1].listenerID)
         XCTAssertEqual(Set(starts.map(\.serverID)), ["server-1.primary", "server-1.fallback"])
         XCTAssertTrue(starts.allSatisfy { $0.allowedNodePublics == [peer(0xaa)] })
         let publish = await catalog.lastPublish
@@ -122,6 +124,69 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertNotNil(store.state?.pending)
         let partialRuntime = await supervisor.hasActiveRuntimeForTesting
         XCTAssertFalse(partialRuntime)
+    }
+
+    func testPublishingCrashRecoveryRotatesAwayFromOldAndPendingKeys() async {
+        let snapshot = makeSnapshot(epoch: 3, revision: 9, peers: [peer(0xdd)])
+        let staleActive = TailcatKeyVersion(
+            primary: .init(privateKey: "old-primary", publicKey: "old-primary-public"),
+            fallback: .init(privateKey: "old-fallback", publicKey: "old-fallback-public")
+        )
+        let interruptedPending = TailcatKeyVersion(
+            primary: .init(privateKey: "pending-primary", publicKey: "pending-primary-public"),
+            fallback: .init(privateKey: "pending-fallback", publicKey: "pending-fallback-public")
+        )
+        let store = FakeTailcatStore(TailcatSecureState(
+            phase: .publishing,
+            accountID: "account-1",
+            allowlistEpoch: snapshot.epoch,
+            revision: snapshot.revision,
+            snapshotHash: snapshot.hash,
+            eTag: "\"1\"",
+            active: staleActive,
+            pending: interruptedPending
+        ))
+        let catalog = FakeTailcatCatalog(snapshot: snapshot)
+        let bridge = FakeTailcatBridge()
+        let supervisor = makeSupervisor(bridge: bridge, catalog: catalog, store: store)
+
+        await supervisor.setEnabled(true)
+        await supervisor.reconcileNowForTesting()
+
+        let startedKeys = Set(bridge.startCalls.map(\.key.privateKey))
+        XCTAssertTrue(startedKeys.isDisjoint(with: ["old-primary", "old-fallback", "pending-primary", "pending-fallback"]))
+        XCTAssertEqual(store.state?.phase, .active)
+        XCTAssertNil(store.state?.pending)
+        XCTAssertNotEqual(store.state?.active, staleActive)
+        XCTAssertNotEqual(store.state?.active, interruptedPending)
+    }
+
+    func testRevokedRecordNeverResurrectsRetainedActiveKeys() async {
+        let snapshot = makeSnapshot(epoch: 5, revision: 6, peers: [peer(0xee)])
+        let revokedKeys = TailcatKeyVersion(
+            primary: .init(privateKey: "revoked-primary", publicKey: "revoked-primary-public"),
+            fallback: .init(privateKey: "revoked-fallback", publicKey: "revoked-fallback-public")
+        )
+        let store = FakeTailcatStore(TailcatSecureState(
+            phase: .revoked,
+            accountID: "account-1",
+            allowlistEpoch: snapshot.epoch,
+            revision: snapshot.revision,
+            snapshotHash: snapshot.hash,
+            eTag: "\"1\"",
+            active: revokedKeys,
+            pending: nil
+        ))
+        let catalog = FakeTailcatCatalog(snapshot: snapshot)
+        let bridge = FakeTailcatBridge()
+        let supervisor = makeSupervisor(bridge: bridge, catalog: catalog, store: store)
+
+        await supervisor.setEnabled(true)
+        await supervisor.reconcileNowForTesting()
+
+        XCTAssertTrue(Set(bridge.startCalls.map(\.key.privateKey)).isDisjoint(with: ["revoked-primary", "revoked-fallback"]))
+        XCTAssertEqual(store.state?.phase, .active)
+        XCTAssertNotEqual(store.state?.active, revokedKeys)
     }
 
     func testBackendOutageKeepsRuntimeUntilHostLeaseThenFailsClosed() async {
@@ -225,6 +290,8 @@ private final class FakeTailcatClock: @unchecked Sendable {
 private final class FakeTailcatStore: TailcatSecureStateStoring, @unchecked Sendable {
     private let lock = NSLock()
     private var stored: TailcatSecureState?
+
+    init(_ stored: TailcatSecureState? = nil) { self.stored = stored }
 
     var state: TailcatSecureState? { lock.withLock { stored } }
     func load() throws -> TailcatSecureState? { state }
@@ -376,12 +443,13 @@ private final class TailcatCatalogURLProtocol: URLProtocol, @unchecked Sendable 
         """
         let body = method == "PUT"
             ? "{\"host\":\(host)}"
-            : "{\"host\":\(host),\"snapshot\":{\"epoch\":1,\"revision\":1,\"clients\":[]}}"
+            : "{\"host\":null,\"snapshot\":{\"epoch\":1,\"revision\":1,\"clients\":[]}}"
+        let headers = method == "PUT" ? ["ETag": "\"2\""] : [:]
         let response = HTTPURLResponse(
             url: request.url!,
             statusCode: 200,
             httpVersion: "HTTP/1.1",
-            headerFields: ["ETag": method == "PUT" ? "\"2\"" : "\"1\""]
+            headerFields: headers
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(body.utf8))
