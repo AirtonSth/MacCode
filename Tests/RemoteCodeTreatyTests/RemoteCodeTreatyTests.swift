@@ -152,6 +152,27 @@ final class RemoteCodeTreatyTests: XCTestCase {
         ))
     }
 
+    func testBotAttachmentStageAndRemoveReceiptsDecodeCurrentWire() throws {
+        let stage = try decoder.decode(BotAttachmentStage.Result.self, from: Data(#"""
+        {"request_id":"stage-1","receipt_id":"receipt-1","status":"completed","bot_id":"bot-1",
+         "readback":{"id":"grant-1","bot_id":"bot-1","conversation_id":"conversation-1",
+         "attachment_id":"opaque-upload-1","filename":"proof.txt","kind":"file",
+         "digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+         "size":5,"mime_type":"text/plain","consumed":false}}
+        """#.utf8))
+        XCTAssertEqual(stage.botID, "bot-1")
+        XCTAssertEqual(stage.readback.id, "grant-1")
+        XCTAssertFalse(stage.readback.consumed)
+
+        let remove = try decoder.decode(BotAttachmentRemove.Result.self, from: Data(#"""
+        {"request_id":"remove-1","receipt_id":"receipt-2","status":"completed","bot_id":"bot-1",
+         "readback":{"removed":true,"id":"grant-1","bot_id":"bot-1",
+         "conversation_id":"conversation-1"}}
+        """#.utf8))
+        XCTAssertTrue(remove.readback.removed)
+        XCTAssertEqual(remove.readback.id, "grant-1")
+    }
+
     func testAuthenticatedCapabilitiesDecodeTreatyAndIdentity() throws {
         let data = Data(#"""
         {

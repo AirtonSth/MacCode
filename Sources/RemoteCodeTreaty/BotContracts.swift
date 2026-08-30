@@ -292,3 +292,62 @@ public struct BotAttachmentGrant: Codable, Equatable, Sendable {
         case mimeType = "mime_type"
     }
 }
+
+public struct BotMutationReceipt<Readback: Codable & Sendable>: Codable, Sendable {
+    public let requestID: String
+    public let receiptID: String
+    public let status: String
+    public let botID: String
+    public let readback: Readback
+
+    private enum CodingKeys: String, CodingKey {
+        case requestID = "request_id"
+        case receiptID = "receipt_id"
+        case status
+        case botID = "bot_id"
+        case readback
+    }
+}
+
+public enum BotAttachmentStage: RemoteCodeRPCContract {
+    public static let method = "bot.attachment.stage"
+    public typealias Params = BotUploadTarget
+    public typealias Result = BotMutationReceipt<BotAttachmentGrant>
+}
+
+public enum BotAttachmentRemove: RemoteCodeRPCContract {
+    public static let method = "bot.attachment.remove"
+
+    public struct Params: Codable, Equatable, Sendable {
+        public let botID: String
+        public let conversationID: String
+        public let id: String
+
+        public init(botID: String, conversationID: String, id: String) {
+            self.botID = botID
+            self.conversationID = conversationID
+            self.id = id
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case botID = "bot_id"
+            case conversationID = "conversation_id"
+            case id
+        }
+    }
+
+    public struct Readback: Codable, Equatable, Sendable {
+        public let removed: Bool
+        public let id: String
+        public let botID: String
+        public let conversationID: String
+
+        private enum CodingKeys: String, CodingKey {
+            case removed, id
+            case botID = "bot_id"
+            case conversationID = "conversation_id"
+        }
+    }
+
+    public typealias Result = BotMutationReceipt<Readback>
+}
