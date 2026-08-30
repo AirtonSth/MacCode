@@ -102,6 +102,7 @@ protocol TailcatCatalogAPI: Sendable {
         accessToken: String,
         ifMatch: String?
     ) async throws -> TailcatPublishedHost
+    func deleteHost(serverID: String, accessToken: String) async throws
 }
 
 final class URLSessionTailcatCatalogAPI: TailcatCatalogAPI, @unchecked Sendable {
@@ -160,6 +161,27 @@ final class URLSessionTailcatCatalogAPI: TailcatCatalogAPI, @unchecked Sendable 
         }
         guard let eTag else { throw TailcatCatalogError.invalidResponse }
         return TailcatPublishedHost(host: response.host, eTag: eTag)
+    }
+
+    func deleteHost(serverID: String, accessToken: String) async throws {
+        let escaped = serverID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? serverID
+        var request = URLRequest(
+            url: baseURL.appendingPathComponent("v1/private/tailcat/hosts/\(escaped)")
+        )
+        request.httpMethod = "DELETE"
+        request.timeoutInterval = 4
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(
+            TailcatTransportContract.buildID,
+            forHTTPHeaderField: "x-tailcat-transport-build-id"
+        )
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw TailcatCatalogError.invalidResponse }
+        guard (200..<300).contains(http.statusCode) else {
+            let code = try? decoder.decode(FailureResponse.self, from: data).code
+            throw TailcatCatalogError.http(status: http.statusCode, code: code)
+        }
     }
 
     private func request<Response: Decodable>(

@@ -36,9 +36,10 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
             accessToken: "access-token",
             ifMatch: fetched.eTag
         )
+        try await api.deleteHost(serverID: "server-1", accessToken: "access-token")
 
         let requests = TailcatCatalogURLProtocol.capturedRequests
-        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests.count, 3)
         XCTAssertEqual(requests[0].httpMethod, "GET")
         XCTAssertEqual(requests[0].url?.path, "/v1/private/tailcat/hosts/server-1")
         XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Authorization"), "Bearer access-token")
@@ -51,6 +52,13 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertEqual(json["displayName"] as? String, "Test Mac")
         let endpoints = try XCTUnwrap(json["endpoints"] as? [[String: Any]])
         XCTAssertEqual(Set(endpoints[0].keys), ["kind", "priority", "connBlob"])
+        XCTAssertEqual(requests[2].httpMethod, "DELETE")
+        XCTAssertEqual(requests[2].url?.path, "/v1/private/tailcat/hosts/server-1")
+        XCTAssertEqual(requests[2].value(forHTTPHeaderField: "Authorization"), "Bearer access-token")
+        XCTAssertEqual(
+            requests[2].value(forHTTPHeaderField: "x-tailcat-transport-build-id"),
+            TailcatTransportContract.buildID
+        )
     }
 
     func testAdmittedSnapshotStartsDistinctServersPublishesBothAndDisableStopsThem() async throws {
@@ -105,6 +113,60 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertNil(store.state?.pending)
         let emptyRuntime = await supervisor.hasActiveRuntimeForTesting
         XCTAssertFalse(emptyRuntime)
+    }
+
+    func testDisableDeletesPublishedHostOnceAndStopsTailcatRuntime() async {
+        let snapshot = makeSnapshot(epoch: "epoch-disable", revision: 1, peers: [peer(0xba)])
+        let catalog = FakeTailcatCatalog(snapshot: snapshot)
+        let bridge = FakeTailcatBridge()
+        let store = FakeTailcatStore()
+        let listener = FakeTailcatListener()
+        let supervisor = makeSupervisor(
+            bridge: bridge,
+            catalog: catalog,
+            store: store,
+            listener: listener
+        )
+
+        await supervisor.setEnabled(true)
+        await supervisor.reconcileNowForTesting()
+        let listenerStopsBeforeDisable = listener.stopCount
+
+        await supervisor.setEnabled(false)
+
+        let deleteAccessTokens = await catalog.deleteAccessTokens
+        XCTAssertEqual(deleteAccessTokens, ["access-token"])
+        XCTAssertEqual(Set(bridge.closedHandles), [101, 202])
+        XCTAssertEqual(listener.stopCount, listenerStopsBeforeDisable + 1)
+        let activeRuntime = await supervisor.hasActiveRuntimeForTesting
+        XCTAssertFalse(activeRuntime)
+    }
+
+    func testLogoutDeletesPublishedHostWithLastMemoryHeldToken() async {
+        let snapshot = makeSnapshot(epoch: "epoch-logout", revision: 1, peers: [peer(0xca)])
+        let catalog = FakeTailcatCatalog(snapshot: snapshot)
+        let bridge = FakeTailcatBridge()
+        let store = FakeTailcatStore()
+        let sessions = FakeTailcatSessions(Self.session)
+        let supervisor = makeSupervisor(
+            bridge: bridge,
+            catalog: catalog,
+            store: store,
+            sessionProvider: { sessions.value }
+        )
+
+        await supervisor.setEnabled(true)
+        await supervisor.reconcileNowForTesting()
+        sessions.value = nil
+
+        await supervisor.accountChanged()
+
+        let deleteAccessTokens = await catalog.deleteAccessTokens
+        XCTAssertEqual(deleteAccessTokens, ["access-token"])
+        XCTAssertEqual(Set(bridge.closedHandles), [101, 202])
+        XCTAssertNil(store.state)
+        let activeRuntime = await supervisor.hasActiveRuntimeForTesting
+        XCTAssertFalse(activeRuntime)
     }
 
     func testPrimaryFailurePublishesFallbackOnly() async {
@@ -333,6 +395,8 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertFalse(activeAfterExpiry)
         XCTAssertEqual(Set(bridge.closedHandles), [101, 202])
         XCTAssertEqual(store.state?.phase, .revoked)
+        let deleteAccessTokens = await catalog.deleteAccessTokens
+        XCTAssertTrue(deleteAccessTokens.isEmpty)
     }
 
     private func makeSupervisor(
@@ -340,6 +404,10 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         catalog: FakeTailcatCatalog,
         store: FakeTailcatStore,
         now: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1_000) },
+        listener: FakeTailcatListener = FakeTailcatListener(),
+        sessionProvider: @escaping TailcatRuntimeSupervisor.SessionProvider = {
+            TailcatRuntimeSupervisorTests.session
+        },
         statusHandler: @escaping TailcatRuntimeSupervisor.StatusHandler = { _ in }
     ) -> TailcatRuntimeSupervisor {
         TailcatRuntimeSupervisor(
@@ -348,9 +416,9 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
             bridge: bridge,
             catalog: catalog,
             secureStore: store,
-            sessionProvider: { Self.session },
+            sessionProvider: sessionProvider,
             authenticator: TailcatRemoteConnectionAuthenticator(),
-            listener: FakeTailcatListener(),
+            listener: listener,
             now: now,
             automaticPolling: false,
             statusHandler: statusHandler
@@ -399,6 +467,18 @@ private final class FakeTailcatStatuses: @unchecked Sendable {
 
     var values: [TailcatRuntimeStatus] { lock.withLock { statuses } }
     func append(_ status: TailcatRuntimeStatus) { lock.withLock { statuses.append(status) } }
+}
+
+private final class FakeTailcatSessions: @unchecked Sendable {
+    private let lock = NSLock()
+    private var session: PrivateAccountSession?
+
+    init(_ session: PrivateAccountSession?) { self.session = session }
+
+    var value: PrivateAccountSession? {
+        get { lock.withLock { session } }
+        set { lock.withLock { session = newValue } }
+    }
 }
 
 private final class FakeTailcatClock: @unchecked Sendable {
@@ -498,8 +578,12 @@ private final class FakeTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable
 }
 
 private final class FakeTailcatListener: TailcatLoopbackListening, @unchecked Sendable {
+    private let lock = NSLock()
+    private var stops = 0
+
+    var stopCount: Int { lock.withLock { stops } }
     func start() throws -> UInt16 { 45_123 }
-    func stop() {}
+    func stop() { lock.withLock { stops += 1 } }
 }
 
 private actor FakeTailcatCatalog: TailcatCatalogAPI {
@@ -511,6 +595,7 @@ private actor FakeTailcatCatalog: TailcatCatalogAPI {
     private let snapshot: TailcatAllowlistSnapshot
     private var unavailable = false
     private(set) var lastPublish: Publish?
+    private(set) var deleteAccessTokens: [String] = []
 
     init(snapshot: TailcatAllowlistSnapshot) { self.snapshot = snapshot }
 
@@ -531,6 +616,11 @@ private actor FakeTailcatCatalog: TailcatCatalogAPI {
         if unavailable { throw URLError(.notConnectedToInternet) }
         lastPublish = Publish(endpoints: endpoints, ifMatch: ifMatch)
         return TailcatPublishedHost(host: hostValue(serverID: serverID, version: 2, endpoints: endpoints), eTag: "\"2\"")
+    }
+
+    func deleteHost(serverID: String, accessToken: String) async throws {
+        if unavailable { throw URLError(.notConnectedToInternet) }
+        deleteAccessTokens.append(accessToken)
     }
 
     private func hostValue(
@@ -580,13 +670,16 @@ private final class TailcatCatalogURLProtocol: URLProtocol, @unchecked Sendable 
         let host = """
         {"serverId":"server-1","displayName":"Test Mac","endpoints":[],"transportBuildId":"\(TailcatTransportContract.buildID)","createdAt":"2026-08-30T00:00:00Z","updatedAt":"2026-08-30T00:00:00Z","leaseExpiresAt":"2026-08-30T00:15:00Z","version":\(method == "PUT" ? 2 : 1)}
         """
-        let body = method == "PUT"
-            ? "{\"host\":\(host)}"
-            : "{\"host\":null,\"snapshot\":{\"epoch\":\"epoch-1\",\"revision\":1,\"clients\":[]}}"
+        let body: String
+        switch method {
+        case "PUT": body = "{\"host\":\(host)}"
+        case "DELETE": body = ""
+        default: body = "{\"host\":null,\"snapshot\":{\"epoch\":\"epoch-1\",\"revision\":1,\"clients\":[]}}"
+        }
         let headers = method == "PUT" ? ["ETag": "\"2\""] : [:]
         let response = HTTPURLResponse(
             url: request.url!,
-            statusCode: 200,
+            statusCode: method == "DELETE" ? 204 : 200,
             httpVersion: "HTTP/1.1",
             headerFields: headers
         )!

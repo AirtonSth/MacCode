@@ -49,6 +49,7 @@ actor TailcatRuntimeSupervisor {
     private var lastRenewal: Date?
     private var currentSnapshot: TailcatAllowlistSnapshot?
     private var currentETag: String?
+    private var lastAccessToken: String?
     private var reconcilePending = false
     private var reconciling = false
 
@@ -82,10 +83,13 @@ actor TailcatRuntimeSupervisor {
         generation &+= 1
         self.enabled = enabled
         if !enabled {
+            let accessToken = sessionProvider()?.accessToken ?? lastAccessToken
             loopTask?.cancel()
             loopTask = nil
             await stopRuntime()
             statusHandler(.off)
+            await deletePublishedHost(accessToken: accessToken)
+            lastAccessToken = nil
             return
         }
         statusHandler(.checking)
@@ -117,20 +121,28 @@ actor TailcatRuntimeSupervisor {
     func accountChanged() async {
         generation &+= 1
         guard enabled else { return }
-        guard sessionProvider()?.user.subscribed == true else {
+        let currentSession = sessionProvider()
+        guard let session = currentSession, session.user.subscribed else {
+            let accessToken = currentSession?.accessToken ?? lastAccessToken
             await revoke(clearKeys: true, status: .requiresSubscription)
+            await deletePublishedHost(accessToken: accessToken)
+            lastAccessToken = nil
             return
         }
+        lastAccessToken = session.accessToken
         await requestReconcile()
     }
 
     func shutdown() async {
         generation &+= 1
+        let accessToken = sessionProvider()?.accessToken ?? lastAccessToken
         enabled = false
         loopTask?.cancel()
         loopTask = nil
         await stopRuntime()
         statusHandler(.off)
+        await deletePublishedHost(accessToken: accessToken)
+        lastAccessToken = nil
     }
 
     private func requestReconcile() async {
@@ -152,6 +164,7 @@ actor TailcatRuntimeSupervisor {
             await revoke(clearKeys: true, status: .requiresSubscription)
             return
         }
+        lastAccessToken = session.accessToken
         do {
             let response = try await catalog.host(serverID: serverID, accessToken: session.accessToken)
             guard enabled, generation == operationGeneration else { return }
@@ -421,6 +434,11 @@ actor TailcatRuntimeSupervisor {
                 try? self.bridge.closeServer(handle: fallback.handle)
             }
         }.value
+    }
+
+    private func deletePublishedHost(accessToken: String?) async {
+        guard let accessToken else { return }
+        try? await catalog.deleteHost(serverID: serverID, accessToken: accessToken)
     }
 
     private static func randomBytes(count: Int) throws -> Data {
