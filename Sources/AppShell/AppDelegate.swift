@@ -101,7 +101,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private lazy var tailcatLoopbackListener = TailcatLoopbackListener(
         authenticator: tailcatAuthenticator
     )
-    private var tailcatSupervisor: TailcatRuntimeSupervisor?
+    var tailcatSupervisor: TailcatRuntimeSupervisor?
     public var palette: CommandPalette?
     public var settings: SettingsWindowController?
     public private(set) var petController: PetController?
@@ -306,6 +306,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
         NotificationCenter.default.addObserver(self, selector: #selector(remoteAccessSettingChanged),
                                                name: .rc2RemoteAccessSettingChanged, object: nil)
+        installTailcatSettingObserver()
         NotificationCenter.default.addObserver(self, selector: #selector(tailcatAccountChanged),
                                                name: .rc2PrivateAccountChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(keybindingsReloaded),
@@ -340,9 +341,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 }
             }
         )
-        context.onTailcatAccessSettingChanged = { [weak self] requested in
-            self?.applyTailcatAccessSetting(requested)
-        }
         configureTailcatAccess()
 
         palette = CommandPalette(router: router)
@@ -1026,6 +1024,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     @objc private func remoteAccessSettingChanged() {
         configureDirectAccess()
+    }
+
+    func installTailcatSettingObserver() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(tailcatAccessSettingChanged),
+            name: .rc2TailcatSettingChanged,
+            object: nil
+        )
+    }
+
+    @objc private func tailcatAccessSettingChanged() {
+        configureTailcatAccess()
     }
 
     @objc private func tailcatAccountChanged() {

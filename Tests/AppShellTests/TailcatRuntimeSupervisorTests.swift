@@ -83,23 +83,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
     }
 
     @MainActor
-    func testSettingsToggleOffInvokesDirectTailcatAuthorityAfterPersistence() throws {
-        let directory = NSTemporaryDirectory() + "RCTailcatSettings-" + UUID().uuidString
-        defer { try? FileManager.default.removeItem(atPath: directory) }
-        let context = try AppContext(channel: .debug, appSupportOverride: directory)
-        try context.settingsRepo.set("tailcat_access_enabled", "1")
-        let settings = SettingsViewModel(context: context, loadImmediately: false)
-        var applied: [Bool] = []
-        context.onTailcatAccessSettingChanged = { applied.append($0) }
-
-        settings.setTailcatAccess(false)
-
-        XCTAssertEqual(try context.settingsRepo.get("tailcat_access_enabled"), "0")
-        XCTAssertEqual(applied, [false])
-    }
-
-    @MainActor
-    func testSettingsWindowDisableDeletesBeforeBlockedRuntimeTeardown() async throws {
+    func testAppDelegateSettingsObserverDeletesBeforeBlockedRuntimeTeardown() async throws {
         let directory = NSTemporaryDirectory() + "RCTailcatSettingsWindow-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: directory) }
         let context = try AppContext(channel: .debug, appSupportOverride: directory)
@@ -110,9 +94,11 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         let supervisor = makeSupervisor(bridge: bridge, catalog: catalog, store: FakeTailcatStore())
         await supervisor.setEnabled(true)
         await supervisor.reconcileNowForTesting()
-        context.onTailcatAccessSettingChanged = { requested in
-            Task { await supervisor.setEnabled(requested) }
-        }
+        let delegate = AppDelegate(channel: .debug, appSupportOverride: directory)
+        delegate.context = context
+        delegate.tailcatSupervisor = supervisor
+        delegate.installTailcatSettingObserver()
+        defer { NotificationCenter.default.removeObserver(delegate) }
         let settings = SettingsWindowController(context: context, loadImmediately: false)
         settings.viewModel.tailcatAccessEnabled = true
 

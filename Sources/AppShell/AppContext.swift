@@ -352,7 +352,6 @@ public final class AppContext {
     public private(set) var tokenSaverAccountUsageRefreshCount = 0
     public private(set) var persistenceWriteErrorMessage: String?
     public var onPersistenceWriteError: ((String) -> Void)?
-    public var onTailcatAccessSettingChanged: ((Bool) -> Void)?
 
     public let reducer = LayoutReducer()
     public var state = LayoutState()
