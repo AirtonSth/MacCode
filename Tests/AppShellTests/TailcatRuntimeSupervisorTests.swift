@@ -96,6 +96,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
             bridge: bridge,
             catalog: catalog,
             store: FakeTailcatStore(),
+            automaticPolling: true,
             statusHandler: { statuses.append($0) }
         )
         let delegate = AppDelegate(channel: .debug, appSupportOverride: directory)
@@ -124,12 +125,14 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
 
         menuSettings.viewModel.setTailcatAccess(true)
 
+        XCTAssertTrue(
+            waitSynchronously(timeout: 1) { bridge.startCalls.count == 2 },
+            "the production Settings dispatch must not depend on the UI actor yielding"
+        )
         for _ in 0..<100 where !statuses.values.contains(.checking) {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTAssertTrue(statuses.values.contains(.checking), "the real Settings authority must enable the supervisor")
-        await supervisor.reconcileNowForTesting()
-        XCTAssertEqual(bridge.startCalls.count, 2)
         let published = await catalog.lastPublish
         XCTAssertNotNil(published)
         let sidebarFallbackSettings = SettingsWindowController(
@@ -141,10 +144,10 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
 
         sidebarFallbackSettings.viewModel.setTailcatAccess(false)
 
-        for _ in 0..<100 where !bridge.hasStartedClose {
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTAssertTrue(bridge.hasStartedClose, "the real Settings window must reach runtime teardown")
+        XCTAssertTrue(
+            waitSynchronously(timeout: 1) { bridge.hasStartedClose },
+            "the real Settings window must reach runtime teardown without a UI actor yield"
+        )
         let deletesBeforeTeardownRelease = await catalog.deleteAccessTokens
         bridge.releaseBlockedCloses()
         XCTAssertEqual(
@@ -502,6 +505,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         store: FakeTailcatStore,
         now: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1_000) },
         listener: FakeTailcatListener = FakeTailcatListener(),
+        automaticPolling: Bool = false,
         sessionProvider: @escaping TailcatRuntimeSupervisor.SessionProvider = {
             TailcatRuntimeSupervisorTests.session
         },
@@ -517,7 +521,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
             authenticator: TailcatRemoteConnectionAuthenticator(),
             listener: listener,
             now: now,
-            automaticPolling: false,
+            automaticPolling: automaticPolling,
             statusHandler: statusHandler
         )
     }
@@ -601,6 +605,14 @@ private final class FakeTailcatStore: TailcatSecureStateStoring, @unchecked Send
     func load() throws -> TailcatSecureState? { state }
     func save(_ state: TailcatSecureState) throws { lock.withLock { stored = state } }
     func clear() throws { lock.withLock { stored = nil } }
+}
+
+private func waitSynchronously(timeout: TimeInterval, until condition: () -> Bool) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while !condition(), Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.01)
+    }
+    return condition()
 }
 
 private final class FakeTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable {

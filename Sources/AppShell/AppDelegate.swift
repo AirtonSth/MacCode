@@ -1189,7 +1189,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         )
         guard let tailcatSupervisor else { return }
         let enabled = requested && listenerReady
-        tailcatSettingTask = Task {
+        tailcatSettingTask = Task.detached(priority: .userInitiated) {
             await tailcatSupervisor.setEnabled(enabled)
         }
         if requested && !listenerReady {
