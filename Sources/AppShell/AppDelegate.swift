@@ -306,8 +306,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
         NotificationCenter.default.addObserver(self, selector: #selector(remoteAccessSettingChanged),
                                                name: .rc2RemoteAccessSettingChanged, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(tailcatAccessSettingChanged),
-                                               name: .rc2TailcatSettingChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(tailcatAccountChanged),
                                                name: .rc2PrivateAccountChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(keybindingsReloaded),
@@ -342,6 +340,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 }
             }
         )
+        context.onTailcatAccessSettingChanged = { [weak self] requested in
+            self?.applyTailcatAccessSetting(requested)
+        }
         configureTailcatAccess()
 
         palette = CommandPalette(router: router)
@@ -1027,10 +1028,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         configureDirectAccess()
     }
 
-    @objc private func tailcatAccessSettingChanged() {
-        configureTailcatAccess()
-    }
-
     @objc private func tailcatAccountChanged() {
         Task { await tailcatSupervisor?.accountChanged() }
     }
@@ -1171,8 +1168,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private func configureTailcatAccess() {
-        guard let context, let tailcatSupervisor else { return }
+        guard let context else { return }
         let requested = ((try? context.settingsRepo.get("tailcat_access_enabled")) ?? "0") == "1"
+        applyTailcatAccessSetting(requested)
+    }
+
+    private func applyTailcatAccessSetting(_ requested: Bool) {
+        guard let tailcatSupervisor else { return }
         let listenerReady = httpServer != nil
         Task { await tailcatSupervisor.setEnabled(requested && listenerReady) }
         if requested && !listenerReady {

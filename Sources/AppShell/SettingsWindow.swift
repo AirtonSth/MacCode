@@ -744,6 +744,7 @@ public final class SettingsViewModel: ObservableObject {
             try settingsRepo.set("tailcat_access_enabled", on ? "1" : "0")
             tailcatAccessEnabled = on
             tailcatAccessStatus = on ? TailcatRuntimeStatus.checking.displayText : TailcatRuntimeStatus.off.displayText
+            context.onTailcatAccessSettingChanged?(on)
             NotificationCenter.default.post(name: .rc2TailcatSettingChanged, object: nil)
         } catch {
             recordSettingsWriteError(error)

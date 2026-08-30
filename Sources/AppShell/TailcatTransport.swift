@@ -182,6 +182,8 @@ final class URLSessionTailcatCatalogAPI: TailcatCatalogAPI, @unchecked Sendable 
             let code = try? decoder.decode(FailureResponse.self, from: data).code
             throw TailcatCatalogError.http(status: http.statusCode, code: code)
         }
+        let readback = try await host(serverID: serverID, accessToken: accessToken)
+        guard readback.host == nil else { throw TailcatCatalogError.invalidResponse }
     }
 
     private func request<Response: Decodable>(

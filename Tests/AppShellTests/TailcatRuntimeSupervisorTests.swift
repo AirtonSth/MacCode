@@ -39,7 +39,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         try await api.deleteHost(serverID: "server-1", accessToken: "access-token")
 
         let requests = TailcatCatalogURLProtocol.capturedRequests
-        XCTAssertEqual(requests.count, 3)
+        XCTAssertEqual(requests.count, 4)
         XCTAssertEqual(requests[0].httpMethod, "GET")
         XCTAssertEqual(requests[0].url?.path, "/v1/private/tailcat/hosts/server-1")
         XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Authorization"), "Bearer access-token")
@@ -59,6 +59,43 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
             requests[2].value(forHTTPHeaderField: "x-tailcat-transport-build-id"),
             TailcatTransportContract.buildID
         )
+        XCTAssertEqual(requests[3].httpMethod, "GET")
+        XCTAssertEqual(requests[3].url?.path, "/v1/private/tailcat/hosts/server-1")
+        XCTAssertEqual(requests[3].value(forHTTPHeaderField: "Authorization"), "Bearer access-token")
+    }
+
+    func testCatalogDeleteRejectsPersistedHostReadback() async {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [TailcatCatalogURLProtocol.self]
+        TailcatCatalogURLProtocol.reset(retainHostOnReadback: true)
+        let api = URLSessionTailcatCatalogAPI(
+            baseURL: URL(string: "https://private.example")!,
+            session: URLSession(configuration: configuration)
+        )
+
+        do {
+            try await api.deleteHost(serverID: "server-1", accessToken: "access-token")
+            XCTFail("delete must not succeed while the host remains published")
+        } catch {
+            XCTAssertEqual(error as? TailcatCatalogError, .invalidResponse)
+        }
+        XCTAssertEqual(TailcatCatalogURLProtocol.capturedRequests.map(\.httpMethod), ["DELETE", "GET"])
+    }
+
+    @MainActor
+    func testSettingsToggleOffInvokesDirectTailcatAuthorityAfterPersistence() throws {
+        let directory = NSTemporaryDirectory() + "RCTailcatSettings-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        try context.settingsRepo.set("tailcat_access_enabled", "1")
+        let settings = SettingsViewModel(context: context, loadImmediately: false)
+        var applied: [Bool] = []
+        context.onTailcatAccessSettingChanged = { applied.append($0) }
+
+        settings.setTailcatAccess(false)
+
+        XCTAssertEqual(try context.settingsRepo.get("tailcat_access_enabled"), "0")
+        XCTAssertEqual(applied, [false])
     }
 
     func testAdmittedSnapshotStartsDistinctServersPublishesBothAndDisableStopsThem() async throws {
@@ -644,9 +681,15 @@ private actor FakeTailcatCatalog: TailcatCatalogAPI {
 private final class TailcatCatalogURLProtocol: URLProtocol, @unchecked Sendable {
     private static let lock = NSLock()
     private static var requests: [URLRequest] = []
+    private static var retainHostOnReadback = false
 
     static var capturedRequests: [URLRequest] { lock.withLock { requests } }
-    static func reset() { lock.withLock { requests = [] } }
+    static func reset(retainHostOnReadback: Bool = false) {
+        lock.withLock {
+            requests = []
+            self.retainHostOnReadback = retainHostOnReadback
+        }
+    }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -665,7 +708,10 @@ private final class TailcatCatalogURLProtocol: URLProtocol, @unchecked Sendable 
             }
             captured.httpBody = body
         }
-        Self.lock.withLock { Self.requests.append(captured) }
+        let retainHostOnReadback = Self.lock.withLock {
+            Self.requests.append(captured)
+            return Self.retainHostOnReadback
+        }
         let method = request.httpMethod ?? "GET"
         let host = """
         {"serverId":"server-1","displayName":"Test Mac","endpoints":[],"transportBuildId":"\(TailcatTransportContract.buildID)","createdAt":"2026-08-30T00:00:00Z","updatedAt":"2026-08-30T00:00:00Z","leaseExpiresAt":"2026-08-30T00:15:00Z","version":\(method == "PUT" ? 2 : 1)}
@@ -674,7 +720,10 @@ private final class TailcatCatalogURLProtocol: URLProtocol, @unchecked Sendable 
         switch method {
         case "PUT": body = "{\"host\":\(host)}"
         case "DELETE": body = ""
-        default: body = "{\"host\":null,\"snapshot\":{\"epoch\":\"epoch-1\",\"revision\":1,\"clients\":[]}}"
+        default:
+            body = retainHostOnReadback
+                ? "{\"host\":\(host),\"snapshot\":{\"epoch\":\"epoch-1\",\"revision\":1,\"clients\":[]}}"
+                : "{\"host\":null,\"snapshot\":{\"epoch\":\"epoch-1\",\"revision\":1,\"clients\":[]}}"
         }
         let headers = method == "PUT" ? ["ETag": "\"2\""] : [:]
         let response = HTTPURLResponse(
