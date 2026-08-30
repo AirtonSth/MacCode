@@ -333,10 +333,20 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     private var workspaceRebuildTask: Task<Void, Never>?
     private var workspaceRebuildGeneration: UInt64 = 0
 
-    public init(context: AppContext, router: AppCommandRouter, updater: AppUpdateChecking? = nil) {
+    public init(
+        context: AppContext,
+        router: AppCommandRouter,
+        updater: AppUpdateChecking? = nil,
+        tailcatAccessSettingAuthority: TailcatAccessSettingAuthority = TailcatAccessSettingAuthority()
+    ) {
         self.context = context
         self.router = router
-        self.sidebar = SidebarView(context: context, router: router, updater: updater)
+        self.sidebar = SidebarView(
+            context: context,
+            router: router,
+            updater: updater,
+            tailcatAccessSettingAuthority: tailcatAccessSettingAuthority
+        )
         self.sidebarWidth = Self.storedSidebarWidth(context: context)
 
         let style: NSWindow.StyleMask = [.titled, .resizable, .closable, .miniaturizable]

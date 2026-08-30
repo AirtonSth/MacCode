@@ -72,7 +72,11 @@ final class SettingsFirstFrameTests: XCTestCase {
         let context = try AppContext(channel: .debug, appSupportOverride: directory)
         // SidebarView constructs controllers with loadImmediately: false so the
         // first click turn does no SQLite/disk work; show() owns hydration.
-        let controller = SettingsWindowController(context: context, loadImmediately: false)
+        let controller = SettingsWindowController(
+            context: context,
+            loadImmediately: false,
+            tailcatAccessSettingAuthority: TailcatAccessSettingAuthority()
+        )
         controller.window.animationBehavior = .none
         defer { close(controller) }
         try context.settingsRepo.set("remote_access_enabled", "1")
@@ -84,6 +88,27 @@ final class SettingsFirstFrameTests: XCTestCase {
         let fresh = await drainUntil(controller.viewModel.remoteAccessEnabled)
         XCTAssertTrue(fresh, "first freshness pass must hydrate the deferred VM")
         XCTAssertEqual(controller.viewModel.reloadCountForTesting, 1)
+    }
+
+    func test_showAfterTailcatBecomesActiveUsesCurrentAuthorityStatus() async throws {
+        let directory = NSTemporaryDirectory() + "RC2SettingsFirstFrame-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        try context.settingsRepo.set("tailcat_access_enabled", "1")
+        let authority = TailcatAccessSettingAuthority()
+        authority.updateStatus(.active)
+        let controller = SettingsWindowController(
+            context: context,
+            loadImmediately: false,
+            tailcatAccessSettingAuthority: authority
+        )
+        controller.window.animationBehavior = .none
+        defer { close(controller) }
+
+        controller.show()
+
+        let fresh = await drainUntil(controller.viewModel.tailcatAccessEnabled)
+        XCTAssertTrue(fresh)
+        XCTAssertEqual(controller.viewModel.tailcatAccessStatus, TailcatRuntimeStatus.active.displayText)
     }
 
     func test_accountWindowPaintsBeforeFreshnessReload() async throws {
@@ -108,7 +133,10 @@ final class SettingsFirstFrameTests: XCTestCase {
     private func makeController() throws -> (SettingsWindowController, AppContext) {
         let directory = NSTemporaryDirectory() + "RC2SettingsFirstFrame-\(UUID().uuidString)"
         let context = try AppContext(channel: .debug, appSupportOverride: directory)
-        let controller = SettingsWindowController(context: context)
+        let controller = SettingsWindowController(
+            context: context,
+            tailcatAccessSettingAuthority: TailcatAccessSettingAuthority()
+        )
         controller.window.animationBehavior = .none
         return (controller, context)
     }

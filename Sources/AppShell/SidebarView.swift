@@ -5589,6 +5589,7 @@ public final class SidebarView: NSObject {
     private var settingsController: SettingsWindowController?
     private var accountController: AccountWindowController?
     private let updater: AppUpdateChecking?
+    private let tailcatAccessSettingAuthority: TailcatAccessSettingAuthority
     /// Main window mounts Schedule Tasks in the workspace content column.
     public var onPresentScheduledTasks: (() -> Void)?
     /// Main window mounts Active Threads in the workspace content column.
@@ -5601,10 +5602,16 @@ public final class SidebarView: NSObject {
         set { viewModel.onWorkspaceContentActivated = newValue }
     }
 
-    public init(context: AppContext, router: AppCommandRouter, updater: AppUpdateChecking? = nil) {
+    public init(
+        context: AppContext,
+        router: AppCommandRouter,
+        updater: AppUpdateChecking? = nil,
+        tailcatAccessSettingAuthority: TailcatAccessSettingAuthority = TailcatAccessSettingAuthority()
+    ) {
         self.context = context
         self.router = router
         self.updater = updater
+        self.tailcatAccessSettingAuthority = tailcatAccessSettingAuthority
         self.viewModel = SidebarViewModel(context: context, router: router, updateChecker: updater)
         self.botsViewModel = BotsViewModel(context: context, router: router)
         let h = NSHostingView(rootView: SidebarRootView(vm: viewModel, botsVM: botsViewModel))
@@ -5691,7 +5698,10 @@ public final class SidebarView: NSObject {
         // Defer hydration to the post-commit freshness pass so the first
         // click paints the window immediately (AGENTS.md loading rule).
         let controller = settingsController ?? SettingsWindowController(
-            context: context, updater: updater, loadImmediately: false
+            context: context,
+            updater: updater,
+            loadImmediately: false,
+            tailcatAccessSettingAuthority: tailcatAccessSettingAuthority
         )
         settingsController = controller
         if let window = view.window {

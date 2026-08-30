@@ -97,6 +97,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var bonjourPublicationGeneration = UUID()
     public private(set) var bonjourPublicationState: BonjourPublicationState = .stopped
     private var directAccessSupervisor: DirectAccessLifecycleSupervisor?
+    private let tailcatAuthenticator = TailcatRemoteConnectionAuthenticator()
+    private lazy var tailcatLoopbackListener = TailcatLoopbackListener(
+        authenticator: tailcatAuthenticator
+    )
+    var tailcatSupervisor: TailcatRuntimeSupervisor?
+    private var tailcatSettingTask: Task<Void, Never>?
+    lazy var tailcatAccessSettingAuthority = TailcatAccessSettingAuthority { [weak self] requested in
+        self?.applyTailcatAccessSetting(requested)
+    }
     public var palette: CommandPalette?
     public var settings: SettingsWindowController?
     public private(set) var petController: PetController?
@@ -243,9 +252,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         updater?.onWillInstallUpdate = { [weak self] in
             self?.persistRestorableStateBeforeUpdate()
         }
-        windowController = MainWindowController(context: context, router: router, updater: updater)
+        windowController = MainWindowController(
+            context: context,
+            router: router,
+            updater: updater,
+            tailcatAccessSettingAuthority: tailcatAccessSettingAuthority
+        )
         router.windowController = windowController
-        settings = SettingsWindowController(context: context, updater: updater)
+        settings = makeSettingsWindowController(context: context, updater: updater)
         // Schedules run in-process (paste+play Agent App). Unregister any legacy
         // LaunchAgent so it cannot dual-claim after upgrade.
         startInProcessScheduledTaskScheduler()
@@ -301,6 +315,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
         NotificationCenter.default.addObserver(self, selector: #selector(remoteAccessSettingChanged),
                                                name: .rc2RemoteAccessSettingChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(tailcatAccountChanged),
+                                               name: .rc2PrivateAccountChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(keybindingsReloaded),
                                                name: .rc2KeybindingsReloaded, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -316,6 +332,25 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             object: nil
         )
         configureDirectAccess()
+        let tailcatAccountStore = PrivateAccountSessionStore(repo: context.settingsRepo)
+        tailcatSupervisor = TailcatRuntimeSupervisor(
+            serverID: context.liveActivityHostIdentity.serverId,
+            displayName: Host.current().localizedName ?? "RemoteCode Mac",
+            sessionProvider: { tailcatAccountStore.load() },
+            authenticator: tailcatAuthenticator,
+            listener: tailcatLoopbackListener,
+            statusHandler: { [weak self] status in
+                DispatchQueue.main.async { [weak self] in
+                    self?.tailcatAccessSettingAuthority.updateStatus(status)
+                    NotificationCenter.default.post(
+                        name: .rc2TailcatRuntimeStatusChanged,
+                        object: nil,
+                        userInfo: ["status": status.displayText]
+                    )
+                }
+            }
+        )
+        configureTailcatAccess()
 
         palette = CommandPalette(router: router)
         SystemNotifier.shared.bootstrap()
@@ -581,6 +616,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         socketServer?.stop()
         directAccessSupervisor?.shutdown()
         directAccessSupervisor = nil
+        let tailcat = tailcatSupervisor
+        tailcatSupervisor = nil
+        Task { await tailcat?.shutdown() }
         providerSessionReaperTimer?.invalidate()
         ccrRetentionTimer?.invalidate()
         diagnosticsHeartbeatTimer?.invalidate()
@@ -997,10 +1035,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         configureDirectAccess()
     }
 
+    @objc private func tailcatAccountChanged() {
+        Task { await tailcatSupervisor?.accountChanged() }
+    }
+
     @objc private func workspaceWillSleep() {
         hangWatchdogAwakeState.value = .displaySleep
         lifecycleRecorder?.record("hang_watchdog_awake state=displaySleep")
         directAccessSupervisor?.suspend()
+        Task { await tailcatSupervisor?.shutdown() }
     }
 
     @objc private func workspaceDidWake() {
@@ -1010,6 +1053,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let remoteEnabled = ((try? context.settingsRepo.get("remote_access_enabled")) ?? "0") == "1"
         do {
             try directAccessSupervisor?.resume(remoteEnabled: remoteEnabled)
+            configureTailcatAccess()
         } catch {
             NSLog("Failed to restart HTTP server after wake: \(error)")
             recordServerStartupFailure("HTTP server", reason: error.localizedDescription)
@@ -1104,6 +1148,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                     try self?.startDirectHTTPServer(remoteEnabled: enabled, serverId: serverId, port: port)
                 },
                 stopServer: { [weak self] in
+                    self?.tailcatLoopbackListener.setHTTPServer(nil)
                     self?.httpServer?.stop()
                     self?.httpServer = nil
                 },
@@ -1126,6 +1171,34 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         } catch {
             NSLog("Failed to start HTTP server: \(error)")
             recordServerStartupFailure("HTTP server", reason: error.localizedDescription)
+        }
+    }
+
+    private func configureTailcatAccess() {
+        guard let context else { return }
+        let requested = ((try? context.settingsRepo.get("tailcat_access_enabled")) ?? "0") == "1"
+        applyTailcatAccessSetting(requested)
+    }
+
+    private func applyTailcatAccessSetting(_ requested: Bool) {
+        let listenerReady = httpServer != nil
+        NSLog(
+            "Tailcat setting requested=%@ supervisorReady=%@ listenerReady=%@",
+            requested.description,
+            (tailcatSupervisor != nil).description,
+            listenerReady.description
+        )
+        guard let tailcatSupervisor else { return }
+        let enabled = requested && listenerReady
+        tailcatSettingTask = Task.detached(priority: .userInitiated) {
+            await tailcatSupervisor.setEnabled(enabled)
+        }
+        if requested && !listenerReady {
+            NotificationCenter.default.post(
+                name: .rc2TailcatRuntimeStatusChanged,
+                object: nil,
+                userInfo: ["status": TailcatRuntimeStatus.unavailable.displayText]
+            )
         }
     }
 
@@ -1163,7 +1236,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             attachmentUploadV3Store: attachmentUploadV3Store
         )
         try http.start()
+        tailcatLoopbackListener.setHTTPServer(http)
         httpServer = http
+        configureTailcatAccess()
         try? Self.resolvePetServerFailure(
             server: "HTTP server",
             repository: NotificationRepository(db: context.db)
@@ -1658,6 +1733,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         } else {
             settings?.show()
         }
+    }
+
+    func makeSettingsWindowController(
+        context: AppContext,
+        updater: AppUpdateChecking?,
+        loadImmediately: Bool = true
+    ) -> SettingsWindowController {
+        SettingsWindowController(
+            context: context,
+            updater: updater,
+            loadImmediately: loadImmediately,
+            tailcatAccessSettingAuthority: tailcatAccessSettingAuthority
+        )
     }
 
     @objc func checkForUpdatesAction() {
