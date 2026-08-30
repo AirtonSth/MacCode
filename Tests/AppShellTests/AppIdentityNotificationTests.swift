@@ -1138,7 +1138,7 @@ final class AppIdentityNotificationTests: XCTestCase {
             if event.kind == "agent.message.appended" { events.append(event) }
         }
         defer { EventBus.shared.unsubscribe(token) }
-        EventBus.shared.publish(kind: "agent.message.appended", payload: payloadValue)
+        EventBus.shared.publish(kind: .agentMessageAppended, payload: payloadValue)
         await waitAsync("bounded append event is visible on the bus") { !events.isEmpty }
         guard case .object(let busPayload) = events.first?.payload else {
             return XCTFail("EventBus must retain the bounded payload object")

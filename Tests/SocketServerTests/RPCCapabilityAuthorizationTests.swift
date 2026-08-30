@@ -46,7 +46,10 @@ final class RPCCapabilityAuthorizationTests: XCTestCase {
         // otherwise the scope is useless.
         for method in ["workspace.list", "workspace.current", "events.recent",
                        "settings.get", "agent.thread.list", "git.status",
-                       "agent.message.get", "system.ping", "mirror.snapshot"] {
+                       "agent.message.get", "system.ping", "mirror.snapshot",
+                       "command.receipt.status", "sync.snapshot",
+                       "sync.snapshot.begin", "sync.snapshot.chunk",
+                       "sync.snapshot.commit"] {
             XCTAssertTrue(authorized(method, "read"),
                           "read scope must authorize read method \(method)")
         }

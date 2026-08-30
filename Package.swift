@@ -4,7 +4,8 @@ import PackageDescription
 let package = Package(
     name: "RemoteCode",
     platforms: [
-        .macOS(.v14)
+        .macOS(.v14),
+        .iOS("18.0")
     ],
     products: [
         .executable(name: "RemoteCode", targets: ["AppShell"]),
@@ -20,7 +21,8 @@ let package = Package(
         .library(name: "SocketServer", targets: ["SocketServer"]),
         .library(name: "Surfaces", targets: ["Surfaces"]),
         .library(name: "AppLifecycleSupport", targets: ["AppLifecycleSupport"]),
-        .library(name: "DesignSystemKit", targets: ["DesignSystemKit"])
+        .library(name: "DesignSystemKit", targets: ["DesignSystemKit"]),
+        .library(name: "RemoteCodeTreaty", targets: ["RemoteCodeTreaty"])
     ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.0.0"),
@@ -48,6 +50,10 @@ let package = Package(
             name: "RemoteCodeCSystem",
             path: "Sources/CSystem",
             publicHeadersPath: "include"
+        ),
+        .target(
+            name: "RemoteCodeTreaty",
+            path: "Sources/RemoteCodeTreaty"
         ),
         .target(
             name: "CoreModel",
@@ -113,7 +119,7 @@ let package = Package(
         ),
         .target(
             name: "SocketServer",
-            dependencies: ["CoreModel", "Persistence", "AgentRuntime"],
+            dependencies: ["CoreModel", "Persistence", "AgentRuntime", "RemoteCodeTreaty"],
             path: "Sources/SocketServer"
         ),
         .target(
@@ -149,6 +155,7 @@ let package = Package(
                 "AgentRuntime",
                 "DistillCore",
                 "SocketServer",
+                "RemoteCodeTreaty",
                 "Surfaces",
                 "AppLifecycleSupport",
                 "DesignSystemKit",
@@ -205,7 +212,7 @@ let package = Package(
         ),
         .testTarget(
             name: "SocketServerTests",
-            dependencies: ["SocketServer", "CoreModel", "Persistence"],
+            dependencies: ["SocketServer", "CoreModel", "Persistence", "RemoteCodeTreaty"],
             path: "Tests/SocketServerTests",
             resources: [
                 .copy("Fixtures")
@@ -225,6 +232,11 @@ let package = Package(
             name: "DesignSystemKitTests",
             dependencies: ["DesignSystemKit"],
             path: "Tests/DesignSystemKitTests"
+        ),
+        .testTarget(
+            name: "RemoteCodeTreatyTests",
+            dependencies: ["RemoteCodeTreaty"],
+            path: "Tests/RemoteCodeTreatyTests"
         )
     ],
     swiftLanguageVersions: [.v5]

@@ -3,11 +3,12 @@ import CoreModel
 import AgentRuntime
 import Persistence
 import SocketServer
+import RemoteCodeTreaty
 
 /// Glanceable Token Saver card pushed to paired iOS clients for the Home Screen
 /// widget and in-app modal. Mirrors the macOS sidebar details popover.
 public enum TokenSaverWidgetDigest {
-    public static let eventKind = "token_saver.digest"
+    public static let eventKind = RemoteCodeEventKind.tokenSaverDigest
     /// Posted by EventBus when a remote subscriber is added so AppShell can
     /// re-emit the latest digest (late-connecting iOS clients).
     public static let subscriberAddedNotification = Notification.Name(

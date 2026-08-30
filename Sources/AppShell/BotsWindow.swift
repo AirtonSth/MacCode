@@ -5392,6 +5392,65 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    /// Paired v1 stop is bound to the exact admitted conversation/run. A
+    /// delayed request must fail instead of discovering and stopping whatever
+    /// run happens to be active for the Bot when it arrives.
+    public func stopLiveRun(
+        for botID: BotID,
+        conversationID: String?,
+        runID: String?,
+        runRequestID: String?,
+        force: Bool,
+        onSettled: ((Bool) -> Void)? = nil
+    ) {
+        if conversationID == nil, runID == nil, runRequestID == nil {
+            stopLiveRuns(for: botID, force: force, onSettled: onSettled)
+            return
+        }
+        guard let conversationID,
+              let conversationUUID = UUID(uuidString: conversationID),
+              let runID,
+              let runUUID = UUID(uuidString: runID),
+              let conversation = try? botStore.conversation(
+                id: BotConversationID(conversationUUID)
+              ),
+              conversation.botID == botID,
+              let threadID = conversation.linkedAgentThreadID else {
+            onSettled?(false)
+            return
+        }
+        let targetRunID = AgentRunID(runUUID)
+        let matchingWorks = (deskSendTasks[botID] ?? []).filter {
+            $0.threadID == threadID && $0.runID == targetRunID
+        }
+        let activeRunMatches = context.coordinator.activeRunId(threadId: threadID) == targetRunID
+        guard activeRunMatches || !matchingWorks.isEmpty else {
+            onSettled?(false)
+            return
+        }
+        matchingWorks.forEach { $0.task.cancel() }
+        context.coordinator.stopRun(threadId: threadID)
+        deskStopRunIssuedCountForTesting += 1
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            for work in matchingWorks {
+                await work.task.value
+                self.forgetDeskSend(work, botID: botID)
+            }
+            self.clearDeskSendInFlight(for: botID)
+            do {
+                try await self.context.coordinator.stopAndAwaitTermination(threadId: threadID)
+                onSettled?(self.context.coordinator.activeRunId(threadId: threadID) != targetRunID)
+            } catch {
+                self.errorMessage = force
+                    ? "Force stop: \(error.localizedDescription)"
+                    : String(describing: error)
+                onSettled?(false)
+            }
+            _ = runRequestID // receipt identity is validated by the authority.
+        }
+    }
+
     private func liveThreadIDs(for botID: BotID, includeInFlightSends: Bool = true) throws -> [AgentThreadID] {
         if let error = liveThreadDiscoveryErrorForTesting {
             throw error
@@ -5430,6 +5489,42 @@ public final class BotsViewModel: ObservableObject {
     public func reloadQueuedFollowUpsFromStore() {
         queuedFollowUpsByBot = decodeQueuedFollowUpsFromStore()
         syncQueuedFollowUps()
+    }
+
+    /// Promote an exact persisted remote queue row and either interrupt its
+    /// current conversation or start it immediately when that conversation is
+    /// idle. The authority has already moved the row to the front transactionally.
+    public func forceQueuedFollowUpFromStore(botID: BotID, id: String) throws -> [String: Any] {
+        reloadQueuedFollowUpsFromStore()
+        guard let itemID = UUID(uuidString: id),
+              let bot = try botStore.get(id: botID), bot.deletedAt == nil,
+              let item = queuedFollowUpsByBot[botID]?.first,
+              item.id == itemID,
+              let conversationID = item.conversationID,
+              let conversation = try botStore.conversation(id: conversationID),
+              conversation.botID == botID,
+              let threadID = conversation.linkedAgentThreadID else {
+            throw BotStoreError.invalidRow("queued follow-up authority is stale")
+        }
+        if try liveThreadIDs(for: botID).contains(threadID) {
+            stopDeskThread(conversationID)
+            return [
+                "force_status": "queued",
+                "conversation_id": conversationID.value.uuidString.lowercased(),
+                "thread_id": threadID.value.uuidString.lowercased(),
+            ]
+        }
+        drainHostQueuedFollowUp(bot: bot, conversation: conversation)
+        guard queuedFollowUpsByBot[botID]?.contains(where: { $0.id == itemID }) != true,
+              let runID = context.coordinator.activeRunId(threadId: threadID) else {
+            throw BotStoreError.invalidRow("queued follow-up did not start")
+        }
+        return [
+            "force_status": "started",
+            "conversation_id": conversationID.value.uuidString.lowercased(),
+            "thread_id": threadID.value.uuidString.lowercased(),
+            "run_id": runID.value.uuidString.lowercased(),
+        ]
     }
 
     public func stopDeskRun() {
@@ -5541,6 +5636,7 @@ public final class BotsViewModel: ObservableObject {
         botID: BotID,
         text: String,
         conversationID: BotConversationID?,
+        attachments: [AgentAttachment] = [],
         routing: BotDeskRouting
     ) throws -> JSONValue {
         guard let bot = try botStore.get(id: botID), bot.deletedAt == nil else {
@@ -5562,6 +5658,7 @@ public final class BotsViewModel: ObservableObject {
                let activeRunID = context.coordinator.activeRunId(threadId: threadID) {
                 let followUp = BotQueuedFollowUp(
                     text: message,
+                    attachments: attachments,
                     conversationID: existing.id,
                     routing: routing
                 )
@@ -5578,7 +5675,7 @@ public final class BotsViewModel: ObservableObject {
             }
         }
 
-        let display = AgentChatTranscriptChrome.displayUserLine(text: message, attachments: [])
+        let display = AgentChatTranscriptChrome.displayUserLine(text: message, attachments: attachments)
         let conversation = try persistUserMessage(
             bot: bot,
             text: display,
@@ -5595,7 +5692,7 @@ public final class BotsViewModel: ObservableObject {
             bot: bot,
             conversation: conversation,
             userText: message,
-            attachments: [],
+            attachments: attachments,
             routingOverride: routing
         ) else {
             throw BotStoreError.invalidRow("Bot runtime is unavailable")
@@ -8032,7 +8129,14 @@ public final class BotsViewModel: ObservableObject {
         lastDeskRestoreAttentionListCountForTesting = attentionListCountForTesting
         lastDeskRestoreConversationListCountForTesting = conversationListCountForTesting
         let conversation = conversationForBot(botID)
-        var cached = cachedMessages(botID: botID, conversationID: conversation?.id)
+        if let conversation, selectedBotID == botID {
+            selectedConversation = conversation
+            selectedConversationByBot[botID] = conversation.id
+            if !conversations.contains(where: { $0.id == conversation.id }) {
+                conversations.insert(conversation, at: 0)
+            }
+        }
+        let cached = cachedMessages(botID: botID, conversationID: conversation?.id)
         // Dest first. First paint dest used to dest dest thread
         // (listRecent) before dest dested Chat. Dest dests dest
         // title now; dest dests dest thread after dest dested Chat.
@@ -8194,6 +8298,8 @@ public final class BotsViewModel: ObservableObject {
     private func persistDeskTokenSaverUserTranslation(
         threadID: AgentThreadID,
         runID: AgentRunID,
+        botID: BotID,
+        conversationID: BotConversationID,
         humanText: String,
         attachments: [AgentAttachment],
         wireRequest: String
@@ -8217,6 +8323,23 @@ public final class BotsViewModel: ObservableObject {
             messageId: messageID,
             wireRequestText: wireRequest
         )
+        func attach(to messages: inout [BotDeskMessage]) {
+            guard let index = messages.firstIndex(where: { $0.agentMessageID == messageID }) else {
+                return
+            }
+            messages[index].tokenSaverWireRequest = wireRequest
+        }
+        if var cached = messagesByConversation[conversationID] {
+            attach(to: &cached)
+            messagesByConversation[conversationID] = cached
+        }
+        if var cached = messagesByBot[botID] {
+            attach(to: &cached)
+            messagesByBot[botID] = cached
+        }
+        if selectedBotID == botID, selectedConversation?.id == conversationID {
+            attach(to: &deskMessages)
+        }
     }
 
     /// Dest first. First paint dest used to dest dest thread before
@@ -8713,7 +8836,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     static func publishDestAttentionChanged() {
-        EventBus.shared.publish(kind: "bots.attention.changed", payload: .object([:]))
+        EventBus.shared.publish(kind: .botsAttentionChanged, payload: .object([:]))
     }
 
     private func currentRevision(for bot: BotDefinition) throws -> BotRevision? {
@@ -8869,63 +8992,65 @@ public final class BotsViewModel: ObservableObject {
         work.threadID = prepared.thread.id
         work.runID = prepared.runID
         context.coordinator.reserveProviderStart(threadId: prepared.thread.id, runId: prepared.runID)
-        work.task = Task { [weak self] in
-            guard let self else { return }
-            defer {
-                if let threadID = work.threadID, let runID = work.runID {
-                    self.context.coordinator.discardProviderStartReservation(
-                        threadId: threadID,
-                        runId: runID
-                    )
+        work.task = EventBus.outsideMutationCapture {
+            Task { [weak self] in
+                guard let self else { return }
+                defer {
+                    if let threadID = work.threadID, let runID = work.runID {
+                        self.context.coordinator.discardProviderStartReservation(
+                            threadId: threadID,
+                            runId: runID
+                        )
+                    }
                 }
-            }
-            await Task.yield()
-            guard !Task.isCancelled, (self.deskStopEpoch[bot.id] ?? 0) == epoch else {
-                self.forgetDeskSend(work, botID: bot.id)
-                self.clearDeskSendInFlight(for: bot.id)
-                return
-            }
-            while let join = self.deskStopJoins[bot.id] {
-                if Task.isCancelled || (self.deskStopEpoch[bot.id] ?? 0) != epoch {
+                await Task.yield()
+                guard !Task.isCancelled, (self.deskStopEpoch[bot.id] ?? 0) == epoch else {
                     self.forgetDeskSend(work, botID: bot.id)
                     self.clearDeskSendInFlight(for: bot.id)
                     return
                 }
-                if (self.deskSendTasks[bot.id] ?? []).contains(where: { $0 === work }) {
-                    await Task.yield()
-                    continue
+                while let join = self.deskStopJoins[bot.id] {
+                    if Task.isCancelled || (self.deskStopEpoch[bot.id] ?? 0) != epoch {
+                        self.forgetDeskSend(work, botID: bot.id)
+                        self.clearDeskSendInFlight(for: bot.id)
+                        return
+                    }
+                    if (self.deskSendTasks[bot.id] ?? []).contains(where: { $0 === work }) {
+                        await Task.yield()
+                        continue
+                    }
+                    _ = await join.task.value
+                    break
                 }
-                _ = await join.task.value
-                break
-            }
-            guard !Task.isCancelled, (self.deskStopEpoch[bot.id] ?? 0) == epoch else {
+                guard !Task.isCancelled, (self.deskStopEpoch[bot.id] ?? 0) == epoch else {
+                    self.forgetDeskSend(work, botID: bot.id)
+                    self.clearDeskSendInFlight(for: bot.id)
+                    return
+                }
+                let started = await self.startSupervisedRun(
+                    bot: bot,
+                    revision: revision,
+                    prepared: prepared,
+                    userText: userText,
+                    attachments: attachments,
+                    memoryFiles: brain.memoryFiles,
+                    skills: brain.skills,
+                    routines: brain.routines,
+                    router: router,
+                    expectedEpoch: epoch
+                )
                 self.forgetDeskSend(work, botID: bot.id)
                 self.clearDeskSendInFlight(for: bot.id)
-                return
-            }
-            let started = await self.startSupervisedRun(
-                bot: bot,
-                revision: revision,
-                prepared: prepared,
-                userText: userText,
-                attachments: attachments,
-                memoryFiles: brain.memoryFiles,
-                skills: brain.skills,
-                routines: brain.routines,
-                router: router,
-                expectedEpoch: epoch
-            )
-            self.forgetDeskSend(work, botID: bot.id)
-            self.clearDeskSendInFlight(for: bot.id)
-            if let started {
-                self.lastSendStartedProviderRun = true
-                self.lastLinkedRunIDByBot[bot.id] = started.runID
-                self.restoreDeskWorkLog(botID: bot.id)
-                self.restoreDeskLiveTurn(botID: bot.id)
-                _ = await self.followLinkedRun(bot: bot, started: started)
-            } else {
-                self.deskSendInFlightStartedAt = nil
-                self.recordNeedsAttention(bot: bot, conversation: prepared.conversation, userText: userText)
+                if let started {
+                    self.lastSendStartedProviderRun = true
+                    self.lastLinkedRunIDByBot[bot.id] = started.runID
+                    self.restoreDeskWorkLog(botID: bot.id)
+                    self.restoreDeskLiveTurn(botID: bot.id)
+                    _ = await self.followLinkedRun(bot: bot, started: started)
+                } else {
+                    self.deskSendInFlightStartedAt = nil
+                    self.recordNeedsAttention(bot: bot, conversation: prepared.conversation, userText: userText)
+                }
             }
         }
         rememberDeskSend(work, botID: bot.id)
@@ -8996,6 +9121,8 @@ public final class BotsViewModel: ObservableObject {
             try persistDeskTokenSaverUserTranslation(
                 threadID: prepared.thread.id,
                 runID: prepared.runID,
+                botID: bot.id,
+                conversationID: prepared.conversation.id,
                 humanText: userText,
                 attachments: attachments,
                 wireRequest: compressedUser

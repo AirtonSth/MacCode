@@ -20,7 +20,7 @@ final class EventBusClockTests: XCTestCase {
     func test_defaultClock_producesWallTimeTs() {
         let bus = EventBus()
         let before = Date().timeIntervalSince1970
-        bus.publish(kind: "ping", payload: .null)
+        bus.publishRawForTesting(kind: "ping", payload: .null)
         let after = Date().timeIntervalSince1970
         let (_, recent) = bus.snapshot()
         let ts = try! XCTUnwrap(recent.first?.ts)
@@ -39,8 +39,8 @@ final class EventBusClockTests: XCTestCase {
         let fixedDate = Date(timeIntervalSince1970: 1_000_000)
         let bus = EventBus()
         bus.setClockForTests { fixedDate }
-        bus.publish(kind: "a", payload: .null)
-        bus.publish(kind: "b", payload: .null)
+        bus.publishRawForTesting(kind: "a", payload: .null)
+        bus.publishRawForTesting(kind: "b", payload: .null)
         let (_, recent) = bus.snapshot()
         XCTAssertEqual(recent.count, 2)
         for ev in recent {
@@ -61,9 +61,9 @@ final class EventBusClockTests: XCTestCase {
             tick += 1
             return Date(timeIntervalSince1970: tick)
         }
-        bus.publish(kind: "first",  payload: .null)
-        bus.publish(kind: "second", payload: .null)
-        bus.publish(kind: "third",  payload: .null)
+        bus.publishRawForTesting(kind: "first",  payload: .null)
+        bus.publishRawForTesting(kind: "second", payload: .null)
+        bus.publishRawForTesting(kind: "third",  payload: .null)
         let (_, recent) = bus.snapshot()
         let tss = recent.map(\.ts)
         XCTAssertEqual(tss.count, 3)
@@ -83,10 +83,10 @@ final class EventBusClockTests: XCTestCase {
         // publish two events at ts=100, then one at ts=200
         var phase: TimeInterval = 100
         bus.setClockForTests { Date(timeIntervalSince1970: phase) }
-        bus.publish(kind: "old-1", payload: .null)
-        bus.publish(kind: "old-2", payload: .null)
+        bus.publishRawForTesting(kind: "old-1", payload: .null)
+        bus.publishRawForTesting(kind: "old-2", payload: .null)
         phase = 200
-        bus.publish(kind: "new",   payload: .null)
+        bus.publishRawForTesting(kind: "new",   payload: .null)
 
         var received: [String] = []
         // subscribe since=2 to get only the event with seq > 2 (which is "new")
@@ -108,7 +108,7 @@ final class EventBusClockTests: XCTestCase {
         for _ in 0..<20 {
             group.enter()
             DispatchQueue.global().async {
-                bus.publish(kind: "concurrent", payload: .null)
+                bus.publishRawForTesting(kind: "concurrent", payload: .null)
                 group.leave()
             }
         }

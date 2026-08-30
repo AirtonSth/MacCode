@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import RemoteCodeTreaty
 @testable import SocketServer
 import CoreModel
 import AgentRuntime
@@ -296,7 +297,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
             baseRevision: baseRevision,
             deviceID: deviceID
         )
-        EventBus.shared.publish(kind: "files.state.updated", payload: .object([
+        EventBus.shared.publish(kind: .filesStateUpdated, payload: .object([
             "surface_id": .string(surface.value.uuidString),
             "state": result
         ]))
@@ -400,7 +401,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
     }
 
     private func publishPhase4FilesUpdate(surface: SurfaceID, result: JSONValue) {
-        EventBus.shared.publish(kind: "files.state.updated", payload: .object([
+        EventBus.shared.publish(kind: .filesStateUpdated, payload: .object([
             "surface_id": .string(surface.value.uuidString),
             "state": result
         ]))
@@ -442,11 +443,11 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
     override func projectRunScript(workspace: WorkspaceID, name: String) throws -> SurfaceDescriptor {
         synchronousBatchEffectCallCount += 1
         let surface = SurfaceDescriptor(type: .terminal, title: "Run: \(name)")
-        EventBus.shared.publish(kind: "surface.created", payload: .object([
+        EventBus.shared.publish(kind: .surfaceCreated, payload: .object([
             "workspace_id": .string(workspace.value.uuidString),
             "surface": .object(["id": .string(surface.id.value.uuidString)])
         ]))
-        EventBus.shared.publish(kind: "project.script_started", payload: .object([
+        EventBus.shared.publish(kind: .projectScriptStarted, payload: .object([
             "workspace_id": .string(workspace.value.uuidString),
             "surface_id": .string(surface.id.value.uuidString),
             "name": .string(name)
@@ -664,6 +665,10 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         synchronousBatchEffectCallCount += 1
     }
 
+    override func browserStop(surface: SurfaceID) throws {
+        synchronousBatchEffectCallCount += 1
+    }
+
     override func browserMirrorURL(surface: SurfaceID) throws -> [String: JSONValue] {
         synchronousBatchEffectCallCount += 1
         return ["url": .string("file:///secret/path/index.html"), "is_file": .bool(true)]
@@ -756,7 +761,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         }
         finalizationCallCount += 1
         let key = phase4ReceiptKey(method: method, clientRequestId: clientRequestId)
-        finalizedEventKinds[key] = events.map(\.kind)
+        finalizedEventKinds[key] = events.map(\.kind.rawValue)
         finalizedEvents[key] = events
         try commitCommandReceipt(
             method: method,
@@ -768,7 +773,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         return events.enumerated().map { ordinal, event in
             EventBus.Event(
                 seq: minimumEventSequence + Int64(ordinal) + 1,
-                kind: event.kind,
+                kind: event.kind.rawValue,
                 payload: event.payload,
                 ts: event.createdAt.timeIntervalSince1970
             )
@@ -832,7 +837,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
             providerInstanceId: providerInstanceId,
             attachments: attachments
         )
-        EventBus.shared.publish(kind: "agent.message.appended", payload: .object([
+        EventBus.shared.publish(kind: .agentMessageAppended, payload: .object([
             "client_request_id": .string(eventClientRequestId),
             "thread_id": .string(thread.value.uuidString),
         ]))
@@ -840,7 +845,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
             let lateEventKind = self.lateEventKind
             Task {
                 await lateEventGate.waitForRelease()
-                EventBus.shared.publish(kind: lateEventKind, payload: .object([
+                EventBus.shared.publishRawForTesting(kind: lateEventKind, payload: .object([
                     "thread_id": .string(thread.value.uuidString),
                 ]))
             }
@@ -927,7 +932,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         response: AgentProviderRequestResponse
     ) async throws {
         synchronousBatchEffectCallCount += 1
-        EventBus.shared.publish(kind: "agent.thread.updated", payload: .object([
+        EventBus.shared.publish(kind: .agentThreadUpdated, payload: .object([
             "thread_id": .string(thread.value.uuidString),
         ]))
     }
@@ -938,7 +943,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         text: String
     ) async throws {
         synchronousBatchEffectCallCount += 1
-        EventBus.shared.publish(kind: "agent.user_input.resolved", payload: .object([
+        EventBus.shared.publish(kind: .agentUserInputResolved, payload: .object([
             "thread_id": .string(thread.value.uuidString),
             "request_id": .string(requestId),
             "answer": .string("secret-phase4-answer"),
@@ -1181,7 +1186,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
     func test_canonicalManifestExactlyMatchesDispatcherMutationCatalog() throws {
         let canonical = try canonicalMutationMethods()
 
-        XCTAssertEqual(canonical.count, 142)
+        XCTAssertEqual(canonical.count, 143)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }
@@ -2126,7 +2131,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         params["bot_id"] = botID
         _ = try await live.rpc(method: "bot.attention.ack", params: params)
         let event = try XCTUnwrap(router.finalizedEvents["bot.attention.ack:attention-ack-completed"]?.first)
-        XCTAssertEqual(event.kind, "bot.attention.updated")
+        XCTAssertEqual(event.kind, .botAttentionUpdated)
         let payload = try XCTUnwrap(event.payload.objectValue)
         XCTAssertEqual(payload["profile_id"]?.stringValue, profileID)
         XCTAssertEqual(payload["host_id"]?.stringValue, Phase4LiveServer.hostId)
@@ -2195,7 +2200,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         let events = try XCTUnwrap(
             router.finalizedEvents["bot.scheduler.tick:bot-notification-completed"]
         )
-        XCTAssertEqual(events.map(\.kind), ["bot.scheduler.updated", "notification.created"])
+        XCTAssertEqual(events.map(\.kind), [.botSchedulerUpdated, .notificationCreated])
         let payload = try XCTUnwrap(events.last?.payload.objectValue)
         XCTAssertEqual(payload["id"]?.stringValue, itemID)
         XCTAssertEqual(payload["title"]?.stringValue, "Scheduled Bot finished")
@@ -2358,6 +2363,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             ("browser.back", ["id": surfaceID], ["surface.browser"]),
             ("browser.forward", ["id": surfaceID], ["surface.browser"]),
             ("browser.reload", ["id": surfaceID], ["surface.browser"]),
+            ("browser.stop", ["id": surfaceID], ["surface.browser"]),
             ("browser.click", ["id": surfaceID, "ref": "button"], ["surface.browser"]),
             ("browser.fill", ["id": surfaceID, "ref": "input", "value": "secret-browser-value"], ["surface.browser"]),
             ("browser.type", ["id": surfaceID, "ref": "input", "value": "secret-browser-value"], ["surface.browser"]),
@@ -2931,7 +2937,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             XCTAssertEqual(router.pairedBotRemoteCallCount, 1, method)
             XCTAssertEqual(router.finalizationCallCount, 1, method)
             let event = try XCTUnwrap(router.finalizedEvents["\(method):\(requestID)"]?.first, method)
-            XCTAssertEqual(event.kind, "bot.deleted", method)
+            XCTAssertEqual(event.kind, .botDeleted, method)
             let payload = try XCTUnwrap(event.payload.objectValue)
             XCTAssertEqual(payload["bot_id"]?.stringValue, botID, method)
             XCTAssertEqual(payload["deleted"]?.boolValue, true, method)
@@ -3023,7 +3029,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             let events = try XCTUnwrap(router.finalizedEvents["\(method):\(requestID)"], method)
             XCTAssertEqual(events.count, 1, method)
             let event = try XCTUnwrap(events.first)
-            XCTAssertEqual(event.kind, "bot.run.stop_requested", method)
+            XCTAssertEqual(event.kind, .botRunStopRequested, method)
             let payload = try XCTUnwrap(event.payload.objectValue)
             XCTAssertEqual(payload["host_id"]?.stringValue, Phase4LiveServer.hostId, method)
             XCTAssertEqual(payload["bot_id"]?.stringValue, botID, method)
@@ -3149,7 +3155,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             XCTAssertEqual(router.pairedBotRemoteCallCount, 1)
             XCTAssertEqual(router.finalizationCallCount, 1)
             let events = try XCTUnwrap(router.finalizedEvents["bot.send:\(requestID)"])
-            XCTAssertEqual(events.map(\.kind), [
+            XCTAssertEqual(events.map(\.kind.rawValue), [
                 "bot.message.accepted",
                 queued ? "bot.message.queued" : "bot.run.started",
             ])
@@ -3282,7 +3288,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
 
             _ = try await live.rpc(method: testCase.method, params: params)
             let event = try XCTUnwrap(router.finalizedEvents["\(testCase.method):\(requestID)"]?.first)
-            XCTAssertEqual(event.kind, testCase.event)
+            XCTAssertEqual(event.kind.rawValue, testCase.event)
             let payload = try XCTUnwrap(event.payload.objectValue)
             XCTAssertEqual(payload["bot_id"]?.stringValue, botID)
             for key in testCase.readback.keys where key != "bot_id" {
@@ -3440,6 +3446,26 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         let eventWire = try XCTUnwrap(String(data: eventData, encoding: .utf8))
         XCTAssertFalse(eventWire.contains("127.0.0.1"))
         XCTAssertFalse(eventWire.contains("unsafe-bearer"))
+    }
+
+    func test_mutationManifestEventKindsAreCoveredByTreatyCatalog() throws {
+        let url = try XCTUnwrap(Bundle.module.url(
+            forResource: "host-mutation-event-manifest",
+            withExtension: "json",
+            subdirectory: "Fixtures"
+        ))
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+        )
+        let mutations = try XCTUnwrap(object["mutations"] as? [[String: Any]])
+        let manifestKinds = Set(mutations.flatMap { $0["eventKinds"] as? [String] ?? [] })
+        let treatyKinds = Set(RemoteCodeEventKind.allCases.map(\.rawValue))
+
+        XCTAssertEqual(treatyKinds.count, 142)
+        XCTAssertTrue(
+            manifestKinds.isSubset(of: treatyKinds),
+            "Treaty is missing manifest kinds: \(manifestKinds.subtracting(treatyKinds).sorted())"
+        )
     }
 
     private func canonicalMutationMethods() throws -> Set<String> {

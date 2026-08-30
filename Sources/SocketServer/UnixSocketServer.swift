@@ -163,7 +163,7 @@ public final class UnixSocketServer: @unchecked Sendable {
             close(listenerFD)
             unlink(socketPath)
             let failPayload = unixSocketListenerEventPayload(bound: false, path: socketPath)
-            EventBus.shared.publish(kind: "server.listener", payload: .object(failPayload.mapValues { v -> JSONValue in
+            EventBus.shared.publish(kind: .serverListener, payload: .object(failPayload.mapValues { v -> JSONValue in
                 if let b = v as? Bool { return .bool(b) }
                 if let i = v as? Int { return .number(Double(i)) }
                 if let s = v as? String { return .string(s) }
@@ -191,7 +191,7 @@ public final class UnixSocketServer: @unchecked Sendable {
             close(listenerFD)
             unlink(socketPath)
             let failPayload = unixSocketListenerEventPayload(bound: false, path: socketPath)
-            EventBus.shared.publish(kind: "server.listener", payload: .object(failPayload.mapValues { v -> JSONValue in
+            EventBus.shared.publish(kind: .serverListener, payload: .object(failPayload.mapValues { v -> JSONValue in
                 if let b = v as? Bool { return .bool(b) }
                 if let i = v as? Int { return .number(Double(i)) }
                 if let s = v as? String { return .string(s) }
@@ -230,7 +230,7 @@ public final class UnixSocketServer: @unchecked Sendable {
         // Publish success event so AppDelegate (or any observer) can surface
         // the server status without polling. Mirrors HTTPServer's pattern.
         let successPayload = unixSocketListenerEventPayload(bound: true, path: socketPath)
-        EventBus.shared.publish(kind: "server.listener", payload: .object(successPayload.mapValues { v -> JSONValue in
+        EventBus.shared.publish(kind: .serverListener, payload: .object(successPayload.mapValues { v -> JSONValue in
             if let b = v as? Bool { return .bool(b) }
             if let i = v as? Int { return .number(Double(i)) }
             if let s = v as? String { return .string(s) }
@@ -278,7 +278,7 @@ public final class UnixSocketServer: @unchecked Sendable {
                 shutdown(client, SHUT_RDWR)
                 close(client)
                 if isRunning(generation: generation) {
-                    EventBus.shared.publish(kind: "diagnostic.unix_client_limit", payload: .object([
+                    EventBus.shared.publish(kind: .diagnosticUnixClientLimit, payload: .object([
                         "max_clients": .number(Double(Self.maxConnectedClients))
                     ]))
                 }
@@ -368,7 +368,7 @@ public final class UnixSocketServer: @unchecked Sendable {
                 }
                 let queuedBytes = outboundReference.value?.queuedByteCount ?? 0
                 shutdown(fd, SHUT_RDWR)
-                EventBus.shared.publish(kind: "diagnostic.unix_slow_client", payload: .object([
+                EventBus.shared.publish(kind: .diagnosticUnixSlowClient, payload: .object([
                     "reason": .string(reason),
                     "queued_bytes": .number(Double(queuedBytes)),
                     "max_queued_bytes": .number(Double(Self.maxStreamQueuedBytes))
@@ -476,7 +476,7 @@ public final class UnixSocketServer: @unchecked Sendable {
         encoder: JSONEncoder
     ) -> Bool {
         guard beginRequest(generation: generation) else {
-            EventBus.shared.publish(kind: "diagnostic.unix_request_limit", payload: .object([
+            EventBus.shared.publish(kind: .diagnosticUnixRequestLimit, payload: .object([
                 "max_active_requests": .number(Double(activeRequestLimit))
             ]))
             return false
@@ -520,7 +520,7 @@ public final class UnixSocketServer: @unchecked Sendable {
         } else {
             guard semaphore.wait(timeout: .now() + requestTimeout) == .success else {
                 task.cancel()
-                EventBus.shared.publish(kind: "diagnostic.unix_request_timeout", payload: .object([
+                EventBus.shared.publish(kind: .diagnosticUnixRequestTimeout, payload: .object([
                     "method": .string(req.method),
                     "timeout_seconds": .number(Self.timeoutSeconds(requestTimeout))
                 ]))
@@ -560,7 +560,7 @@ public final class UnixSocketServer: @unchecked Sendable {
                 idle: idle
             ) {
                 task.cancel()
-                EventBus.shared.publish(kind: "diagnostic.unix_request_timeout", payload: .object([
+                EventBus.shared.publish(kind: .diagnosticUnixRequestTimeout, payload: .object([
                     "method": .string(req.method),
                     "timeout_seconds": .number(idle)
                 ]))

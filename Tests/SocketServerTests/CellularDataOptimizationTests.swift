@@ -29,9 +29,9 @@ final class CellularDataOptimizationTests: XCTestCase {
     @MainActor
     func testEventsRecentHonorsSinceSeqAndMaxBytesWithTruncationMetadata() async throws {
         let bus = EventBus()
-        bus.publish(kind: "a", payload: .string(String(repeating: "a", count: 500)))
-        bus.publish(kind: "b", payload: .string(String(repeating: "b", count: 500)))
-        bus.publish(kind: "c", payload: .string("small"))
+        bus.publishRawForTesting(kind: "a", payload: .string(String(repeating: "a", count: 500)))
+        bus.publishRawForTesting(kind: "b", payload: .string(String(repeating: "b", count: 500)))
+        bus.publishRawForTesting(kind: "c", payload: .string("small"))
 
         let result = bus.recentEvents(since: 1, maxBytes: 600)
 
@@ -153,21 +153,34 @@ final class CellularDataOptimizationTests: XCTestCase {
         _ = bus.subscribe(since: nil) { full.append($0.kind) }
         _ = bus.subscribe(since: nil, filter: .cellularSafe()) { filtered.append($0.kind) }
 
-        bus.publish(kind: "diagnostic.tick", payload: .object(["sample": .string(String(repeating: "x", count: 200))]))
-        bus.publish(kind: "surface.output", payload: .object([
+        bus.publish(kind: .diagnosticWSSlowClient, payload: .object(["sample": .string(String(repeating: "x", count: 200))]))
+        bus.publish(kind: .surfaceOutput, payload: .object([
             "surface_id": .string("s1"),
             "seq": .number(7),
             "rows": .number(33),
             "cols": .number(101),
             "base64": .string(Data(String(repeating: "log ", count: 200).utf8).base64EncodedString())
         ]))
-        bus.publish(kind: "surface.browser", payload: .object(["surface_id": .string("s1"), "url": .string("https://example.test")]))
-        bus.publish(kind: "agent.run.completed", payload: .object(["thread_id": .string("t1")]))
+        bus.publish(kind: .surfaceBrowser, payload: .object(["surface_id": .string("s1"), "url": .string("https://example.test")]))
+        bus.publish(kind: .agentRunCompleted, payload: .object(["thread_id": .string("t1")]))
 
-        XCTAssertEqual(full, ["diagnostic.tick", "surface.output", "surface.browser", "agent.run.completed"],
+        XCTAssertEqual(full, ["diagnostic.ws_slow_client", "surface.output", "surface.browser", "agent.run.completed"],
                        "old/unfiltered clients must keep receiving the full stream")
         XCTAssertEqual(filtered, ["surface.output.summary", "surface.browser", "agent.run.completed"],
                        "cellular-safe WS filtering may summarize passive terminal output and drop diagnostics while visible state and critical events pass")
+    }
+
+    func testCellularSafeFilterForwardsFutureUnknownKindsForSequenceContinuity() {
+        let bus = EventBus()
+        var delivered: [String] = []
+        _ = bus.subscribe(since: nil, filter: .cellularSafe()) { delivered.append($0.kind) }
+
+        bus.publishRawForTesting(
+            kind: "future.event.kind",
+            payload: .object(["value": .number(1)])
+        )
+
+        XCTAssertEqual(delivered, ["future.event.kind"])
     }
 
     /// WHY: the cellular-safe filter legitimately skips seqs (diagnostic.*),
@@ -191,9 +204,9 @@ final class CellularDataOptimizationTests: XCTestCase {
             delivered.append(event.seq)
         }
 
-        bus.publish(kind: "workspace.updated", payload: .object([:]))
-        bus.publish(kind: "diagnostic.ws_slow_client", payload: .object([:]))
-        bus.publish(kind: "workspace.updated", payload: .object([:]))
+        bus.publish(kind: .workspaceUpdated, payload: .object([:]))
+        bus.publish(kind: .diagnosticWSSlowClient, payload: .object([:]))
+        bus.publish(kind: .workspaceUpdated, payload: .object([:]))
 
         XCTAssertEqual(delivered, [1, 3],
                        "the filter must drop only the diagnostic seq while both critical events pass")

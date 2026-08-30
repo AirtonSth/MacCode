@@ -564,7 +564,7 @@ final class WebSocketIntegrationTests: XCTestCase {
         let connectionId = try XCTUnwrap(welcome["connectionId"] as? String)
         let bootEpoch = try XCTUnwrap((welcome["bootEpoch"] as? NSNumber)?.uint64Value)
         let kind = uniqueEventKind("test.ws.typed_event")
-        EventBus.shared.publish(kind: kind, payload: .object(["value": .number(7)]))
+        EventBus.shared.publishRawForTesting(kind: kind, payload: .object(["value": .number(7)]))
 
         let event = try await receiveEvent(task, kind: kind)
         XCTAssertEqual(event["type"] as? String, "event")
@@ -582,7 +582,7 @@ final class WebSocketIntegrationTests: XCTestCase {
         // terminating the new socket with closing.reason=invalidEvent.
         let baseline = EventBus.shared.currentSeq
         EventBus.shared.publish(
-            kind: "token_saver.digest",
+            kind: .tokenSaverDigest,
             payload: .object(["enabled": .bool(false)])
         )
         let (server, port) = try startServer(serverId: "token-saver-host")
@@ -601,7 +601,7 @@ final class WebSocketIntegrationTests: XCTestCase {
     func test_CONN005_welcomeExposesReplayWindowForGapDetection() async throws {
         let (server, port) = try startServer()
         defer { server.stop() }
-        EventBus.shared.publish(kind: "test.ws.replay_window", payload: .object([:]))
+        EventBus.shared.publishRawForTesting(kind: "test.ws.replay_window", payload: .object([:]))
         let expected = EventBus.shared.snapshot()
         let task = wsTask(port: port, sinceSeq: expected.lastSeq)
         defer { task.cancel(with: .normalClosure, reason: nil) }
@@ -712,7 +712,7 @@ final class WebSocketIntegrationTests: XCTestCase {
         XCTAssertFalse((heartbeat["nonce"] as? String)?.isEmpty ?? true)
 
         let kind = uniqueEventKind("test.ws.after_heartbeat")
-        EventBus.shared.publish(kind: kind, payload: .object(["live": .bool(true)]))
+        EventBus.shared.publishRawForTesting(kind: kind, payload: .object(["live": .bool(true)]))
         let event = try await receiveEvent(task, kind: kind)
         XCTAssertEqual(event["connectionId"] as? String, connectionId)
     }
@@ -778,13 +778,13 @@ final class WebSocketIntegrationTests: XCTestCase {
         let kind = uniqueEventKind("test.ws.queuefull")
         // Bulk payloads that exceed the 128-byte queue budget.
         for i in 0..<4 {
-            EventBus.shared.publish(kind: "agent.item.delta", payload: .object([
+            EventBus.shared.publish(kind: .agentItemDelta, payload: .object([
                 "item_id": .string("i1"),
                 "n": .number(Double(i)),
                 "blob": .string(String(repeating: "x", count: 4_096))
             ]))
         }
-        EventBus.shared.publish(kind: kind, payload: .object([
+        EventBus.shared.publishRawForTesting(kind: kind, payload: .object([
             "blob": .string(String(repeating: "y", count: 4_096))
         ]))
 
@@ -823,7 +823,7 @@ final class WebSocketIntegrationTests: XCTestCase {
         // replay floor sits above 0 and since-seq=0 is deterministically expired.
         let fillerKind = uniqueEventKind("test.ws.replay_roll")
         for _ in 0..<513 {
-            EventBus.shared.publish(kind: fillerKind, payload: .object([:]))
+            EventBus.shared.publishRawForTesting(kind: fillerKind, payload: .object([:]))
         }
 
         let task = wsTask(port: port, sinceSeq: 0)
@@ -831,7 +831,7 @@ final class WebSocketIntegrationTests: XCTestCase {
         try await Task.sleep(nanoseconds: 150_000_000)   // let the upgrade + subscribe complete
 
         let liveKind = uniqueEventKind("test.ws.after_expiry")
-        EventBus.shared.publish(kind: liveKind, payload: .object(["live": .bool(true)]))
+        EventBus.shared.publishRawForTesting(kind: liveKind, payload: .object(["live": .bool(true)]))
 
         // The client must see baselineRequired BEFORE the live event, and the
         // live event must NOT be followed by a 1012 eventGap close.
@@ -884,7 +884,7 @@ final class WebSocketIntegrationTests: XCTestCase {
         // than the raw frame (the server only sends a binary envelope when it wins).
         let kind = uniqueEventKind("test.ws.compress")
         let big = String(repeating: "same visible state ", count: 400)
-        EventBus.shared.publish(kind: kind, payload: .object(["blob": .string(big)]))
+        EventBus.shared.publishRawForTesting(kind: kind, payload: .object(["blob": .string(big)]))
 
         for _ in 0..<50 {
             let message = try await task.receive()
@@ -932,8 +932,8 @@ final class WebSocketIntegrationTests: XCTestCase {
         // Publish a DROPPED diagnostic event first, then a KEPT critical event.
         let droppedKind = uniqueEventKind("diagnostic.test")   // priority .diagnostic -> filtered out
         let keptKind = uniqueEventKind("test.ws.critical")     // default -> .critical -> kept
-        EventBus.shared.publish(kind: droppedKind, payload: .object(["d": .bool(true)]))
-        EventBus.shared.publish(kind: keptKind, payload: .object(["k": .bool(true)]))
+        EventBus.shared.publishRawForTesting(kind: droppedKind, payload: .object(["d": .bool(true)]))
+        EventBus.shared.publishRawForTesting(kind: keptKind, payload: .object(["k": .bool(true)]))
 
         // The first non-heartbeat event must be the critical one; the diagnostic
         // event must never appear (the negotiated filter dropped it server-side).
@@ -982,9 +982,9 @@ final class WebSocketIntegrationTests: XCTestCase {
         let firstKind = uniqueEventKind("test.ws.kept_before_hole")
         let droppedKind = uniqueEventKind("diagnostic.hole")
         let secondKind = uniqueEventKind("test.ws.kept_after_hole")
-        EventBus.shared.publish(kind: firstKind, payload: .object(["k": .number(1)]))
-        EventBus.shared.publish(kind: droppedKind, payload: .object(["d": .bool(true)]))
-        EventBus.shared.publish(kind: secondKind, payload: .object(["k": .number(3)]))
+        EventBus.shared.publishRawForTesting(kind: firstKind, payload: .object(["k": .number(1)]))
+        EventBus.shared.publishRawForTesting(kind: droppedKind, payload: .object(["d": .bool(true)]))
+        EventBus.shared.publishRawForTesting(kind: secondKind, payload: .object(["k": .number(3)]))
 
         var sawFirst = false
         var sawSecond = false
@@ -1027,7 +1027,7 @@ final class WebSocketIntegrationTests: XCTestCase {
         try await Task.sleep(nanoseconds: 150_000_000)   // let the upgrade + subscribe complete
 
         let kind = uniqueEventKind("test.ws.roundtrip")
-        EventBus.shared.publish(kind: kind, payload: .object(["hello": .string("ws"), "n": .number(7)]))
+        EventBus.shared.publishRawForTesting(kind: kind, payload: .object(["hello": .string("ws"), "n": .number(7)]))
 
         let obj = try await receiveEvent(task, kind: kind)
         let payload = obj["payload"] as? [String: Any]
@@ -1050,14 +1050,14 @@ final class WebSocketIntegrationTests: XCTestCase {
         // be delivered. Event B is published after and MUST be. The baseline is
         // captured AFTER the stale publish, so the since-seq head sits past it.
         let staleKind = uniqueEventKind("test.ws.stale")
-        EventBus.shared.publish(kind: staleKind, payload: .object(["pre": .bool(true)]))
+        EventBus.shared.publishRawForTesting(kind: staleKind, payload: .object(["pre": .bool(true)]))
         let baseline = EventBus.shared.currentSeq
 
         let task = wsTask(port: port, sinceSeq: baseline)
         try await Task.sleep(nanoseconds: 150_000_000)
 
         let freshKind = uniqueEventKind("test.ws.fresh")
-        EventBus.shared.publish(kind: freshKind, payload: .object(["post": .bool(true)]))
+        EventBus.shared.publishRawForTesting(kind: freshKind, payload: .object(["post": .bool(true)]))
 
         // The first non-heartbeat event we see must be the fresh one -- if the stale
         // pre-connect event were delivered we would see it first (lower seq).

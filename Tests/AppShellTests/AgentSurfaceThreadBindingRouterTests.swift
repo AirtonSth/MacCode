@@ -1213,7 +1213,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.rawSingle", code: 1)
         }
 
-        EventBus.shared.publish(kind: "agent.thread.deleted", payload: .object([
+        EventBus.shared.publish(kind: .agentThreadDeleted, payload: .object([
             "thread_id": .string(rawSingle.id.value.uuidString)
         ]))
 
@@ -1243,7 +1243,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.rawMany", code: 2)
         }
 
-        EventBus.shared.publish(kind: "agent.thread.deleted_many", payload: .object([
+        EventBus.shared.publish(kind: .agentThreadDeletedMany, payload: .object([
             "thread_ids": .array(rawMany.reversed().map { .string($0.id.value.uuidString) })
         ]))
 
@@ -1958,7 +1958,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         restoredSurface.viewModel.setReloadThreadListForTesting {
             throw NSError(domain: "AgentSurfaceThreadBindingRouterTests.restoredDelete", code: 1)
         }
-        EventBus.shared.publish(kind: "agent.thread.deleted", payload: .object([
+        EventBus.shared.publish(kind: .agentThreadDeleted, payload: .object([
             "thread_id": .string(threadId.value.uuidString)
         ]))
 

@@ -1249,7 +1249,7 @@ final class TokenSaverAppContextTests: XCTestCase {
         savePrivateSession(in: context)
         let digestEvents = LockedEventCount()
         let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
-            if event.kind == TokenSaverWidgetDigest.eventKind {
+            if event.kind == TokenSaverWidgetDigest.eventKind.rawValue {
                 digestEvents.increment()
             }
         }

@@ -1114,7 +1114,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             body: nil,
             category: category.rawValue
         ))
-        EventBus.shared.publish(kind: "notification.created", payload: .object([
+        EventBus.shared.publish(kind: .notificationCreated, payload: .object([
             "id": .string(id),
             "category": .string(category.rawValue)
         ]))
@@ -1127,7 +1127,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     ) throws {
         let id = petServerFailureID(server: server)
         try repository.markRead(id: id)
-        EventBus.shared.publish(kind: "notification.read", payload: .object(["id": .string(id)]))
+        EventBus.shared.publish(kind: .notificationRead, payload: .object(["id": .string(id)]))
     }
 
     private func configureDirectAccess() {
@@ -1937,7 +1937,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         if let workspaceID {
             payload["workspace_id"] = .string(workspaceID.value.uuidString)
         }
-        EventBus.shared.publish(kind: "notification.created", payload: .object(payload))
+        EventBus.shared.publish(kind: .notificationCreated, payload: .object(payload))
         return id
     }
 

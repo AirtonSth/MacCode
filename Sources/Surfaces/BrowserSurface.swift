@@ -779,6 +779,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     public func goBackAction() { webView.goBack() }
     public func goForwardAction() { webView.goForward() }
     public func reloadAction() { webView.reload() }
+    public func stopLoadingAction() { webView.stopLoading() }
     public func openInDefaultBrowserAction() { openCurrentURLInDefaultBrowser() }
 
     public func evaluate(_ js: String, completion: @escaping (Any?, Error?) -> Void) {

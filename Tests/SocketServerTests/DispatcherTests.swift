@@ -982,6 +982,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func browserBack(surface: SurfaceID) throws {}
     func browserForward(surface: SurfaceID) throws {}
     func browserReload(surface: SurfaceID) throws {}
+    func browserStop(surface: SurfaceID) throws {}
     func browserURL(surface: SurfaceID) throws -> String { "about:blank" }
     var browserURLString = "about:blank"
     func browserMirrorURL(surface: SurfaceID) throws -> [String: JSONValue] {

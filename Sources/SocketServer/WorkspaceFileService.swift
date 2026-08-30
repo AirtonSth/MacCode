@@ -607,7 +607,7 @@ public final class FileEditSessionStore: @unchecked Sendable {
         sessions[id] = session
         lock.unlock()
         let payload = sessionJSON(session, includeContent: true)
-        EventBus.shared.publish(kind: "files.edit.opened", payload: .object(payload))
+        EventBus.shared.publish(kind: .filesEditOpened, payload: .object(payload))
         return .object(payload)
     }
 
@@ -636,7 +636,7 @@ public final class FileEditSessionStore: @unchecked Sendable {
             "replacement": .string(replacement)
         ], updatedBy: deviceID)
         lock.unlock()
-        EventBus.shared.publish(kind: "files.edit.patch_applied", payload: .object(payload))
+        EventBus.shared.publish(kind: .filesEditPatchApplied, payload: .object(payload))
         return .object(payload)
     }
 
@@ -654,7 +654,7 @@ public final class FileEditSessionStore: @unchecked Sendable {
             let payload = sessionJSON(session, includeContent: true)
             lockHeld = false
             lock.unlock()
-            EventBus.shared.publish(kind: "files.edit.conflict", payload: .object(payload.merging(["reason": .string("disk_changed")]) { _, new in new }))
+            EventBus.shared.publish(kind: .filesEditConflict, payload: .object(payload.merging(["reason": .string("disk_changed")]) { _, new in new }))
             throw JSONRPCError(code: -32013, message: "disk changed", data: .object(payload))
         }
         let data = encodeText(session.draftText, encoding: session.encoding)
@@ -666,7 +666,7 @@ public final class FileEditSessionStore: @unchecked Sendable {
         let payload = sessionJSON(session, includeContent: true).merging(["disk_hash": .string("sha256:\(session.baseHash)")]) { _, new in new }
         lockHeld = false
         lock.unlock()
-        EventBus.shared.publish(kind: "files.edit.saved", payload: .object(payload))
+        EventBus.shared.publish(kind: .filesEditSaved, payload: .object(payload))
         return .object(payload)
     }
 
@@ -687,7 +687,7 @@ public final class FileEditSessionStore: @unchecked Sendable {
             sessions[sessionID] = session
             let payload = sessionJSON(session, includeContent: true)
             lock.unlock()
-            EventBus.shared.publish(kind: "files.edit.discarded", payload: .object(payload))
+            EventBus.shared.publish(kind: .filesEditDiscarded, payload: .object(payload))
             return .object(payload)
         } catch {
             lock.unlock()
@@ -703,7 +703,7 @@ public final class FileEditSessionStore: @unchecked Sendable {
             throw JSONRPCError(code: -32602, message: "edit session not found", data: .string(sessionID))
         }
         let payload = sessionJSON(removed, includeContent: false)
-        EventBus.shared.publish(kind: "files.edit.closed", payload: .object(payload))
+        EventBus.shared.publish(kind: .filesEditClosed, payload: .object(payload))
         return .object(payload)
     }
 

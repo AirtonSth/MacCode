@@ -27,7 +27,7 @@ final class EventBusFloodStressTests: XCTestCase {
         let bus = EventBus(recentLimit: limit, recentByteLimit: 512 * 1024)
 
         for i in 0..<(limit * 2 + 1) {
-            bus.publish(kind: "flood", payload: .number(Double(i)))
+            bus.publishRawForTesting(kind: "flood", payload: .number(Double(i)))
         }
 
         let count = bus.recentCountForTests
@@ -47,7 +47,7 @@ final class EventBusFloodStressTests: XCTestCase {
         // each payload ~4 KB; 400 events = ~1.6 MB raw, well above the 128 KiB cap
         let chunk = String(repeating: "x", count: 4_000)
         for i in 0..<400 {
-            bus.publish(kind: "flood.\(i)", payload: .string(chunk))
+            bus.publishRawForTesting(kind: "flood.\(i)", payload: .string(chunk))
         }
 
         let bytes = bus.recentBytesForTests
@@ -67,7 +67,7 @@ final class EventBusFloodStressTests: XCTestCase {
         let byteLimit = EventBus.defaultRecentByteLimit
 
         for i in 0..<600 {
-            bus.publish(kind: "e\(i)", payload: .number(Double(i)))
+            bus.publishRawForTesting(kind: "e\(i)", payload: .number(Double(i)))
         }
 
         let count = bus.recentCountForTests
@@ -90,7 +90,7 @@ final class EventBusFloodStressTests: XCTestCase {
         // each payload ~3 KB; 100 events = ~300 KB stored
         let chunk = String(repeating: "y", count: 3_000)
         for i in 0..<100 {
-            bus.publish(kind: "big.\(i)", payload: .string(chunk))
+            bus.publishRawForTesting(kind: "big.\(i)", payload: .string(chunk))
         }
 
         // request replay with a cap much smaller than the stored payload
@@ -112,7 +112,7 @@ final class EventBusFloodStressTests: XCTestCase {
 
         // publish 2*limit events; only the last `limit` must survive
         for i in 0..<(limit * 2) {
-            bus.publish(kind: "ev\(i)", payload: .number(Double(i)))
+            bus.publishRawForTesting(kind: "ev\(i)", payload: .number(Double(i)))
         }
 
         let (_, recent) = bus.snapshot()

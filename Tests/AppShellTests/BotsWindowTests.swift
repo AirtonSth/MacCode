@@ -96,6 +96,74 @@ final class BotsWindowTests: XCTestCase {
         router.sendAgentMessageResolvedAttachmentsProbeForTesting = nil
     }
 
+    func test_pairedBotSendResolvesOpaqueUploadAndDeliversAttachmentToAgentRun() async throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        let botID = bot.id.value.uuidString.lowercased()
+        let conversation = try await router.dispatchPairedBotRemote(
+            method: "bot.conversation.create",
+            params: [
+                "client_request_id": .string("paired-attachment-conversation"),
+                "bot_id": .string(botID),
+                "title": .string("Uploaded file"),
+            ]
+        )
+        let conversationID = try XCTUnwrap(
+            conversation.objectValue?["readback"]?.objectValue?["conversation_id"]?.stringValue
+        )
+        let attachmentStore = AgentAttachmentStore(
+            root: context.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)
+        )
+        let uploaded = try attachmentStore.stage(
+            data: Data("remote bytes".utf8),
+            displayName: "remote.txt",
+            kind: .file,
+            mimeType: "text/plain"
+        )
+        let reference = try XCTUnwrap(AgentAttachmentReference(uploaded))
+        let staged = try await router.dispatchPairedBotRemote(
+            method: "bot.attachment.stage",
+            params: [
+                "client_request_id": .string("paired-attachment-stage"),
+                "bot_id": .string(botID),
+                "conversation_id": .string(conversationID),
+                "attachment_id": .string(reference.id),
+                "filename": .string(reference.displayName),
+                "kind": .string(reference.kind.rawValue),
+                "mime_type": .string(reference.mimeType ?? "application/octet-stream"),
+                "digest": .string(reference.sha256),
+                "size": .number(Double(reference.sizeBytes)),
+            ]
+        )
+        let grantID = try XCTUnwrap(staged.objectValue?["readback"]?.objectValue?["id"]?.stringValue)
+        let delivered = expectation(description: "paired attachment reached agent run")
+        var resolved: [AgentAttachment] = []
+        router.sendAgentMessageResolvedAttachmentsProbeForTesting = { attachments in
+            resolved = attachments
+            delivered.fulfill()
+        }
+        let sent = try await router.dispatchPairedBotRemote(method: "bot.send", params: [
+            "client_request_id": .string("paired-attachment-send"),
+            "host_id": .string("paired-host"),
+            "bot_id": .string(botID),
+            "conversation_id": .string(conversationID),
+            "text": .string("Read the upload"),
+            "attachment_ids": .array([.string(grantID)]),
+        ])
+        XCTAssertNotEqual(sent.objectValue?["status"]?.stringValue, "failed")
+        await fulfillment(of: [delivered], timeout: 3)
+        let attachment = try XCTUnwrap(resolved.first)
+        XCTAssertEqual(attachment.id, reference.id)
+        XCTAssertEqual(attachment.sha256, reference.sha256)
+        XCTAssertEqual(attachment.sizeBytes, reference.sizeBytes)
+        XCTAssertTrue(attachment.path.hasPrefix(attachmentStore.root.path + "/"))
+        router.sendAgentMessageResolvedAttachmentsProbeForTesting = nil
+    }
+
     func test_deskSendWithImageShowsLiteralImageMarker_becauseBotsMustMatchAgentApp() async throws {
         // WHY: a one-image Desk turn must paint `[Image #1]` through the same
         // displayUserLine Agent App uses — not a 📎 filename.
@@ -5661,6 +5729,116 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(runner.requests.isEmpty)
         XCTAssertFalse(vm.lastSendStartedProviderRun)
         XCTAssertEqual(settledOK, true)
+        vm.beforeBotRunDispatchForTesting = nil
+    }
+
+    func test_pairedExactStopDuringReservedPreflightSettlesAndDoesNotStartProvider() async throws {
+        // WHY: bot.send returns the exact run identity before provider dispatch.
+        // A paired bot.stop for that identity must cancel the reserved Desk work;
+        // requiring activeRunId here rejects the valid preflight target and leaves
+        // iOS permanently showing Working/Stop.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            )
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.setDeskProvider(.claude)
+
+        let send = try vm.enqueueHostMessage(
+            botID: bot.id,
+            text: "go",
+            conversationID: nil,
+            routing: BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+        )
+        let payload = try XCTUnwrap(send.objectValue)
+        let conversationID = try XCTUnwrap(payload["conversation_id"]?.stringValue)
+        let runID = try XCTUnwrap(payload["run_id"]?.stringValue)
+        XCTAssertTrue(vm.deskSendInFlight)
+
+        let settled = expectation(description: "paired exact preflight stop settled")
+        var settledOK: Bool?
+        vm.stopLiveRun(
+            for: bot.id,
+            conversationID: conversationID,
+            runID: runID,
+            runRequestID: "send-request",
+            force: false
+        ) { ok in
+            settledOK = ok
+            settled.fulfill()
+        }
+
+        await fulfillment(of: [settled], timeout: 5)
+        XCTAssertEqual(settledOK, true)
+        XCTAssertTrue(runner.requests.isEmpty, "paired exact preflight stop must not reach the provider")
+        XCTAssertFalse(vm.deskSendInFlight)
+    }
+
+    func test_hostBotRuntimeTaskDoesNotInheritMutationReceiptCapture() async throws {
+        // WHY: bot.send admits synchronously, but provider lifecycle events can
+        // occur after its receipt is sealed. Inheriting the receipt TaskLocals
+        // made those events timing-dependent: suppressed before seal and only
+        // published with a late-event warning after seal.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            )
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.setDeskProvider(.claude)
+        let crossedBoundary = expectation(description: "runtime crossed receipt capture boundary")
+        var inheritedSink = true
+        var inheritedSuppression = true
+        vm.beforeBotRunDispatchForTesting = { _ in
+            inheritedSink = EventBus.activeMutationEventSink != nil
+            inheritedSuppression = EventBus.suppressMutationEventCapture
+            crossedBoundary.fulfill()
+        }
+
+        let sink = EventBus.MutationEventSink()
+        _ = try EventBus.$activeMutationEventSink.withValue(sink) {
+            try EventBus.$suppressMutationEventCapture.withValue(true) {
+                try vm.enqueueHostMessage(
+                    botID: bot.id,
+                    text: "go",
+                    conversationID: nil,
+                    routing: BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+                )
+            }
+        }
+        await fulfillment(of: [crossedBoundary], timeout: 5)
+        XCTAssertFalse(inheritedSink)
+        XCTAssertFalse(inheritedSuppression)
+        let providerStarted = await waitUntil(timeout: 5) { !runner.requests.isEmpty }
+        XCTAssertTrue(providerStarted)
+        XCTAssertTrue(runner.finish(promptContaining: "go", status: .cancelled, reply: nil))
+        let runtimeSettled = await waitUntil(timeout: 5) {
+            !vm.hasLiveRun(botID: bot.id) && !vm.deskSendInFlight
+        }
+        XCTAssertTrue(runtimeSettled)
         vm.beforeBotRunDispatchForTesting = nil
     }
 

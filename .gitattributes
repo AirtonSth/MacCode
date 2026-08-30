@@ -1,3 +1,4 @@
 Vendor/GhosttyKit.xcframework/** filter=lfs diff=lfs merge=lfs -text
+Vendor/GhosttyKit.xcframework/Info.plist -filter -diff -merge text
 Vendor/TailcatBridge/Artifacts/RCTailcat.xcframework/** filter=lfs diff=lfs merge=lfs -text
 Vendor/TailcatBridge/patches/*.patch -whitespace

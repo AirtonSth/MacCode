@@ -4,6 +4,21 @@ import CryptoKit
 import CoreModel
 import Persistence
 import AgentRuntime
+import RemoteCodeTreaty
+
+/// One authenticated HTTP JSON-RPC caller resolved from a single durable
+/// trusted-device read. Keeping owner and grants together prevents revocation,
+/// identity, and capability admission from being derived from different rows
+/// or different moments in time.
+public struct DirectRPCPrincipal: Sendable, Equatable {
+    public let ownerFingerprint: String
+    public let grantedCapabilities: String
+
+    public init(ownerFingerprint: String, grantedCapabilities: String) {
+        self.ownerFingerprint = ownerFingerprint
+        self.grantedCapabilities = grantedCapabilities
+    }
+}
 
 /// Minimal HTTP/1.1 + WebSocket-stub server used as the desktop-side
 /// foundation for a future direct-VPN/LAN mobile client. The intent is
@@ -18,6 +33,9 @@ import AgentRuntime
 /// - GET|HEAD /__rc2_static/<grant>/<relative-path>
 public protocol DirectAuthProvider: AnyObject {
     func verify(token: String) -> Bool
+    /// Resolve the durable owner and its persisted RPC grants atomically.
+    /// Returns nil when the bearer is invalid or revoked.
+    func authorizedRPCPrincipal(token: String) -> DirectRPCPrincipal?
     /// Opaque durable owner fingerprint for a verified bearer.
     ///
     /// Used by Attachment Upload v2 so a bearer refresh for the same
@@ -199,6 +217,19 @@ public struct AgentAttachmentUploadCapabilityAdvertisement: Sendable, Equatable 
 /// Defaulted so existing conformers (e.g. test doubles) need no change
 /// until they opt into the request/approve flow.
 public extension DirectAuthProvider {
+    /// Existing providers and test doubles remain full-access until they opt
+    /// into persisted scopes. Production LocalAuthAdapter overrides this and
+    /// derives both values from one DeviceTrustRepository.verify call.
+    func authorizedRPCPrincipal(token: String) -> DirectRPCPrincipal? {
+        guard let ownerFingerprint = authorizedOwnerFingerprint(token: token) else {
+            return nil
+        }
+        return DirectRPCPrincipal(
+            ownerFingerprint: ownerFingerprint,
+            grantedCapabilities: "*"
+        )
+    }
+
     /// Safe default: still validates the token and preserves owner isolation
     /// via the existing token-derived fingerprint. Providers that can expose
     /// a stable authorized identity (e.g. LocalAuthAdapter) should override.
@@ -1161,14 +1192,36 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return (!loopbackOnly || remoteAuthenticated) && !authExemptV1Paths.contains(path)
     }
 
-    /// Shared capabilities object for public `GET /v1/capabilities` and the
-    /// authenticated envelope's `capabilities` field. Single builder so the
-    /// two routes cannot drift.
-    nonisolated static func capabilitiesPayload(
+    /// Canonical host DTO from which both the public projection and the
+    /// authenticated identity envelope are derived.
+    struct HostCapabilitiesProjectionDTO {
+        let capabilities: [String: Any]
+        let treaty: TreatyCompatibility
+
+        func publicPayload() -> [String: Any] { capabilities }
+
+        func authenticatedPayload(serverID: String, bootEpoch: UInt64) -> [String: Any] {
+            [
+                "authenticated": true,
+                "server_id": serverID,
+                "boot_epoch": Int64(bootEpoch),
+                "treaty": [
+                    "current": [
+                        "major": treaty.current.major,
+                        "minor": treaty.current.minor,
+                    ],
+                    "supported_majors": treaty.supportedMajors,
+                ],
+                "capabilities": capabilities,
+            ]
+        }
+    }
+
+    nonisolated static func capabilitiesProjection(
         loopbackOnly: Bool,
         attachmentUpload:
             AgentAttachmentUploadCapabilityAdvertisement? = nil
-    ) -> [String: Any] {
+    ) -> HostCapabilitiesProjectionDTO {
         // GAP-3: advertise what the dispatcher actually implements.
         // git mutations + full browser automation are real (see
         // Dispatcher.swift git.*/browser.*); hiding them on the
@@ -1191,7 +1244,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         if let attachmentUpload {
             agent["attachment_upload"] = attachmentUpload.foundationObject
         }
-        return [
+        return HostCapabilitiesProjectionDTO(capabilities: [
             "surface_types": ["terminal", "ssh", "browser", "agentApp", "files", "markdown", "filePreview", "rightSidebarTool"],
             "ssh": [
                 "methods": ["ssh.host.list", "ssh.host.upsert", "ssh.host.delete", "ssh.connect", "ssh.disconnect", "ssh.transfer.upload", "ssh.transfer.download", "ssh.files.local.list", "ssh.files.remote.list", "ssh.files.remote.mkdir", "ssh.files.remote.rename", "ssh.files.remote.delete"]
@@ -1219,12 +1272,27 @@ public final class DirectHTTPServer: @unchecked Sendable {
             "files": [
                 "methods": ["fs.mkdir", "fs.workspace.list", "fs.workspace.read", "fs.workspace.preview_url", "fs.workspace.create_file", "fs.workspace.rename", "fs.workspace.delete", "files.tab.open", "files.tab.split", "files.state.get", "files.state.update", "files.edit.session", "files.edit.open", "files.edit.apply_patch", "files.edit.save", "files.edit.discard", "files.edit.close"]
             ],
+            "bot": [
+                "queue_controls": ["remove", "update", "reorder", "force_now"]
+            ],
             "git": [
                 "read_only": false,
                 "methods": ["git.status", "git.branches", "git.checkout", "git.create_branch", "git.commit", "git.log", "git.diff", "git.fetch", "git.pull", "git.push", "git.pull_request_url", "git.delivery_plan", "git.deliver"],
             ],
             "feature_flags": ["remote_access_enabled": !loopbackOnly]
-        ]
+        ], treaty: .v1)
+    }
+
+    /// Backward-compatible public projection used by existing call sites.
+    nonisolated static func capabilitiesPayload(
+        loopbackOnly: Bool,
+        attachmentUpload:
+            AgentAttachmentUploadCapabilityAdvertisement? = nil
+    ) -> [String: Any] {
+        capabilitiesProjection(
+            loopbackOnly: loopbackOnly,
+            attachmentUpload: attachmentUpload
+        ).publicPayload()
     }
 
     nonisolated static func isAttachmentUploadRPCEnvelope(_ data: Data) -> Bool {
@@ -1477,7 +1545,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             close(listenFD); listenFD = -1
             let bindAddr = bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0"
             let failPayload = serverListenerEventPayload(bound: false, address: bindAddr, port: port)
-            EventBus.shared.publish(kind: "server.listener", payload: .object(failPayload.mapValues { v in
+            EventBus.shared.publish(kind: .serverListener, payload: .object(failPayload.mapValues { v in
                 if let b = v as? Bool { return .bool(b) }
                 if let i = v as? Int { return .number(Double(i)) }
                 if let s = v as? String { return .string(s) }
@@ -1509,7 +1577,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
         let bindAddr = bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0"
         let successPayload = serverListenerEventPayload(bound: true, address: bindAddr, port: port)
-        EventBus.shared.publish(kind: "server.listener", payload: .object(successPayload.mapValues { v in
+        EventBus.shared.publish(kind: .serverListener, payload: .object(successPayload.mapValues { v in
             if let b = v as? Bool { return .bool(b) }
             if let i = v as? Int { return .number(Double(i)) }
             if let s = v as? String { return .string(s) }
@@ -1619,7 +1687,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             return .string("\(v)")
         }
         payload["correlation_id"] = .string(correlationId)
-        EventBus.shared.publish(kind: "server.listener.publication", payload: .object(payload))
+        EventBus.shared.publish(kind: .serverListenerPublication, payload: .object(payload))
     }
 
     /// Bind an IPv6 listener with `IPV6_V6ONLY` so IPv4-mapped accepts stay on
@@ -1676,7 +1744,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 let savedErrno = errno
                 shutdown(fd, SHUT_RDWR)
                 close(fd)
-                EventBus.shared.publish(kind: "diagnostic.http_cloexec_failed", payload: .object([
+                EventBus.shared.publish(kind: .diagnosticHTTPClOExecFailed, payload: .object([
                     "errno": .number(Double(savedErrno)),
                     "correlation_id": .string(ConnectionTelemetryRedactor.makeCorrelationId())
                 ]))
@@ -1690,7 +1758,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 continue
             case let .atCapacity(active, limit, shouldPublishDiagnostic):
                 if shouldPublishDiagnostic {
-                    EventBus.shared.publish(kind: "diagnostic.http_connection_limit", payload: .object([
+                    EventBus.shared.publish(kind: .diagnosticHTTPConnectionLimit, payload: .object([
                         "active_connections": .number(Double(active)),
                         "maximum_connections": .number(Double(limit)),
                         "correlation_id": .string(ConnectionTelemetryRedactor.makeCorrelationId())
@@ -2280,6 +2348,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             && path == "/v1/rpc"
             && headers["x-remotecode-attachment-upload"] == "1"
         var requestBearerVerified = false
+        var requestRPCPrincipal: DirectRPCPrincipal?
         let largeBodyAuthorized: Bool
         if requestedAttachmentUpload,
            Self.httpAuthGateRequiresToken(
@@ -2288,9 +2357,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                hasAuthProvider: auth != nil,
                remoteAuthenticated: remoteAuthenticated
         ), let auth {
-            if let presentedBearerToken {
-                largeBodyAuthorized = auth.verify(token: presentedBearerToken)
-                requestBearerVerified = largeBodyAuthorized
+            if let presentedBearerToken,
+               let principal = auth.authorizedRPCPrincipal(
+                   token: presentedBearerToken
+               ) {
+                requestRPCPrincipal = principal
+                largeBodyAuthorized = true
+                requestBearerVerified = true
             } else {
                 largeBodyAuthorized = false
             }
@@ -2525,7 +2598,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     NSLog("[RC2.WS] slow-client close: reason=%@ baseline_required=true", reason)
                     if let id = subIDBox.value { EventBus.shared.unsubscribe(id) }
                     self?.wsTracker.recordSlowClientDrop()
-                    EventBus.shared.publish(kind: "diagnostic.ws_slow_client", payload: .object([
+                    EventBus.shared.publish(kind: .diagnosticWSSlowClient, payload: .object([
                         "reason": .string(reason),
                         "baseline_required": .bool(true)
                     ]))
@@ -2613,7 +2686,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         "[RC2.WS] outbound pressure: baseline_required without close seq=%lld",
                         current
                     )
-                    EventBus.shared.publish(kind: "diagnostic.ws_outbound_pressure", payload: .object([
+                    EventBus.shared.publish(kind: .diagnosticWSOutboundPressure, payload: .object([
                         "reason": .string("outbound_queue_pressure"),
                         "baseline_required": .bool(true),
                         "current_sequence": .number(Double(current))
@@ -2627,23 +2700,21 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 }
             }
             let emitPressureBaseline: @Sendable () -> Void = { stickyBaseline.emit() }
-            let recordAcceptedEvent: @Sendable (Data) -> Void = { data in
-                if case .event(let frame) = try? ConnectionTransportFrame.decodeStrict(data) {
-                    if case .gap(let expected, let received) = sequenceWatermark.recordEnqueuedEvent(
-                        sequence: frame.sequence
-                    ) {
-                        _ = outbound.terminate(
-                            errorData: nil,
-                            closingData: self.connectionClosingData(
-                                connectionId: connectionId,
-                                reason: "eventGap_\(expected)_\(received)",
-                                code: 1012,
-                                retryable: true,
-                                retryAfterMs: 0
-                            ),
-                            reason: "event_gap"
-                        )
-                    }
+            let recordAcceptedEvent: @Sendable (Int64) -> Void = { sequence in
+                if case .gap(let expected, let received) = sequenceWatermark.recordEnqueuedEvent(
+                    sequence: sequence
+                ) {
+                    _ = outbound.terminate(
+                        errorData: nil,
+                        closingData: self.connectionClosingData(
+                            connectionId: connectionId,
+                            reason: "eventGap_\(expected)_\(received)",
+                            code: 1012,
+                            retryable: true,
+                            retryAfterMs: 0
+                        ),
+                        reason: "event_gap"
+                    )
                 }
             }
             // METRICS: last per-connection queue sample for /v1/health gauges.
@@ -2656,13 +2727,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 wsTracker.updateQueuedBytes(previous: previous, current: current)
             }
             /// C-04 degrade ladder: never close on queueFull.
-            let enqueueApplicationOrDegrade: @Sendable (Data) -> Void = { [wsTracker] data in
+            let enqueueEventOrDegrade: @Sendable (KnownConnectionEventFrame) -> Void = {
+                [wsTracker] frame in
                 // Transport-limit observability for 3G: frame size + queue depth
                 // + rejected/evicted counts. Does not change enqueue policy.
-                wsTracker.recordFrameBytes(data.count)
-                switch outbound.enqueueApplication(data) {
+                wsTracker.recordFrameBytes(frame.encodedByteCount)
+                switch outbound.enqueueEvent(frame) {
                 case .accepted:
-                    recordAcceptedEvent(data)
+                    recordAcceptedEvent(frame.event.seq)
                     sampleOutboundQueuedBytes()
                 case .queueFull:
                     let outcome = outbound.degrade()
@@ -2674,24 +2746,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         emitPressureBaseline()
                     }
                     // Prefer shedding bulk/diagnostic arrivals over closing.
-                    if WebSocketOutboundQueue.isSheddableApplicationFrame(data) {
-                        if let sequence = WebSocketOutboundQueue.eventSequence(in: data) {
-                            sequenceWatermark.recordFilteredEvent(sequence: sequence)
-                        }
+                    if WebSocketOutboundQueue.isSheddableKind(frame.event.kind.rawValue) {
+                        sequenceWatermark.recordFilteredEvent(sequence: frame.event.seq)
                         wsTracker.recordFramesRejectedOrEvicted(1)
                         emitPressureBaseline()
                         return
                     }
-                    switch outbound.enqueueApplication(data) {
+                    switch outbound.enqueueEvent(frame) {
                     case .accepted:
-                        recordAcceptedEvent(data)
+                        recordAcceptedEvent(frame.event.seq)
                         sampleOutboundQueuedBytes()
                     case .queueFull:
                         // Still saturated after degrade: drop with filtered
                         // watermark accounting; socket stays open.
-                        if let sequence = WebSocketOutboundQueue.eventSequence(in: data) {
-                            sequenceWatermark.recordFilteredEvent(sequence: sequence)
-                        }
+                        sequenceWatermark.recordFilteredEvent(sequence: frame.event.seq)
                         wsTracker.recordFramesRejectedOrEvicted(1)
                         emitPressureBaseline()
                     case .closed:
@@ -2717,10 +2785,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 coalescesStreamingDeltas: true,
                 // C-14: LWW-collapsed summary frames never leave the host; advance
                 // the gap watermark so zero new 1012 closes in soak.
-                onCoalescedAway: { data in
-                    if let sequence = WebSocketOutboundQueue.eventSequence(in: data) {
-                        sequenceWatermark.recordFilteredEvent(sequence: sequence)
-                    }
+                onCoalescedAway: { sequence in
+                    sequenceWatermark.recordFilteredEvent(sequence: sequence)
                 },
                 // S10: admission overflow records lost sequences and uses the
                 // established baselineRequired transport contract (not a custom event).
@@ -2729,10 +2795,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         sequenceWatermark.recordFilteredEvent(sequence: sequence)
                     }
                     emitPressureBaseline()
+                },
+                sendKnownEvent: { frame in
+                    enqueueEventOrDegrade(frame)
                 }
-            ) { data in
-                enqueueApplicationOrDegrade(data)
-            }
+            )
             // PERF-MAC_SOCKET-:110 -- honor the client's last-seen seq so a
             // reconnect receives only the delta (events after that seq), not the
             // full retained backlog (~4 MiB on a busy session).
@@ -2776,7 +2843,28 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     sequenceWatermark.recordFilteredEvent(sequence: sequence)
                 }
             ) { ev in
-                let frame = ConnectionTransportFrame.event(ConnectionEventFrame(
+                if let knownEvent = ev.knownEvent {
+                    batcher.enqueue(KnownConnectionEventFrame(
+                        event: knownEvent,
+                        connectionId: connectionId,
+                        hostId: self.serverId,
+                        bootEpoch: self.bootEpoch
+                    ))
+                    return
+                }
+                // A catalogued event with a malformed non-object payload cannot
+                // advance this connection. Re-anchor through the established
+                // baseline flow. Future unknown kinds stay raw and sequence-bearing.
+                guard ev.knownKind == nil else {
+                    batcher.flush()
+                    sequenceWatermark.recordFilteredEvent(sequence: ev.seq)
+                    emitPressureBaseline()
+                    return
+                }
+                // Preserve sequence order with known events already waiting in
+                // the typed coalescing window before using the future-raw adapter.
+                batcher.flush()
+                let rawFrame = ConnectionTransportFrame.event(ConnectionEventFrame(
                     protocolVersion: ConnectionTransportFrame.protocolVersion,
                     type: "event",
                     connectionId: connectionId,
@@ -2788,7 +2876,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     kind: ev.kind,
                     payload: ev.payload
                 ))
-                guard let data = try? frame.encoded() else {
+                guard let data = try? rawFrame.encoded() else {
                     _ = outbound.terminate(
                         errorData: nil,
                         closingData: self.connectionClosingData(
@@ -2802,7 +2890,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     )
                     return
                 }
-                batcher.enqueue(event: ev, data: data)
+                self.wsTracker.recordFrameBytes(data.count)
+                switch outbound.enqueueApplication(data) {
+                case .accepted:
+                    recordAcceptedEvent(ev.seq)
+                    sampleOutboundQueuedBytes()
+                case .queueFull:
+                    _ = outbound.degrade()
+                    if outbound.enqueueApplication(data) == .accepted {
+                        recordAcceptedEvent(ev.seq)
+                        sampleOutboundQueuedBytes()
+                    } else {
+                        sequenceWatermark.recordFilteredEvent(sequence: ev.seq)
+                        emitPressureBaseline()
+                    }
+                case .closed:
+                    break
+                }
             }
             subIDBox.value = id
             subID = id
@@ -2948,11 +3052,22 @@ public final class DirectHTTPServer: @unchecked Sendable {
                remoteAuthenticated: remoteAuthenticated
            ),
            let auth = auth {
+            let authenticated: Bool
             if requestBearerVerified {
-                // ok
+                authenticated = true
+            } else if path == "/v1/rpc",
+                      let token = presentedBearerToken,
+                      let principal = auth.authorizedRPCPrincipal(token: token) {
+                requestRPCPrincipal = principal
+                requestBearerVerified = true
+                authenticated = true
             } else if let token = presentedBearerToken, auth.verify(token: token) {
                 requestBearerVerified = true
+                authenticated = true
             } else {
+                authenticated = false
+            }
+            if !authenticated {
                 var challengeHeaders = [
                     "WWW-Authenticate":
                         wwwAuthenticateHeaderValue(
@@ -2975,6 +3090,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
         let requestOwnerFingerprint = Self.connectionOwnerFingerprint(
             token: presentedBearerToken
         )
+        // A valid bearer on a trusted loopback connection still carries its
+        // persisted scopes. Tokenless/invalid-token loopback remains the
+        // existing trusted-local full-access path.
+        if path == "/v1/rpc",
+           requestRPCPrincipal == nil,
+           let auth,
+           let token = presentedBearerToken {
+            requestRPCPrincipal = auth.authorizedRPCPrincipal(token: token)
+        }
+        let effectiveRPCPrincipal = requestRPCPrincipal
+            ?? DirectRPCPrincipal(
+                ownerFingerprint: requestOwnerFingerprint,
+                grantedCapabilities: "*"
+            )
         // POST body for pair endpoints; honor Content-Length read above.
         var bodyData = buffer.subdata(in: bodyStartAbsolute..<min(bodyStartAbsolute + contentLength, buffer.endIndex))
         if attachmentUploadV2Route == nil,
@@ -3147,7 +3276,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 let work = Task(priority: rpcTaskPriority) {
                     await self.dispatchRPC(
                         bodyData: bodyData,
-                        ownerFingerprint: requestOwnerFingerprint
+                        principal: effectiveRPCPrincipal
                     )
                 }
                 let watchdog = Task {
@@ -3382,16 +3511,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
                      ])
                 return
             }
-            let body: [String: Any] = [
-                "authenticated": true,
-                "server_id": serverId,
-                "boot_epoch": Int64(bootEpoch),
-                "capabilities": Self.capabilitiesPayload(
-                    loopbackOnly: bindLoopbackOnly,
-                    attachmentUpload:
-                        dispatcher.agentAttachmentUploadCapability
-                )
-            ]
+            let body = Self.capabilitiesProjection(
+                loopbackOnly: bindLoopbackOnly,
+                attachmentUpload: dispatcher.agentAttachmentUploadCapability
+            ).authenticatedPayload(serverID: serverId, bootEpoch: bootEpoch)
             sendJSON(
                 fd: fd,
                 status: 200,
@@ -3466,20 +3589,37 @@ public final class DirectHTTPServer: @unchecked Sendable {
         bodyData: Data,
         ownerFingerprint: String? = nil
     ) async -> Data {
+        let principal = DirectRPCPrincipal(
+            ownerFingerprint: ownerFingerprint
+                ?? Self.connectionOwnerFingerprint(token: nil),
+            grantedCapabilities: "*"
+        )
+        return await dispatchRPC(
+            bodyData: bodyData,
+            principal: principal,
+            wireTransport: .http
+        )
+    }
+
+    /// Authenticated HTTP entry point. The principal has already been resolved
+    /// from one trusted-device read and remains immutable for the entire call
+    /// or top-level batch.
+    public func dispatchRPC(
+        bodyData: Data,
+        principal: DirectRPCPrincipal
+    ) async -> Data {
         await dispatchRPC(
             bodyData: bodyData,
-            ownerFingerprint: ownerFingerprint,
+            principal: principal,
             wireTransport: .http
         )
     }
 
     private func dispatchRPC(
         bodyData: Data,
-        ownerFingerprint: String?,
+        principal: DirectRPCPrincipal,
         wireTransport: AgentCheckpointListContract.WireTransport
     ) async -> Data {
-        let ownerFingerprint = ownerFingerprint
-            ?? Self.connectionOwnerFingerprint(token: nil)
         let root: Any
         do {
             root = try JSONSerialization.jsonObject(with: bodyData, options: [.fragmentsAllowed])
@@ -3491,34 +3631,69 @@ public final class DirectHTTPServer: @unchecked Sendable {
             guard !batch.isEmpty else {
                 return rpcErrorData(.invalidRequest, id: NSNull())
             }
-            // Checkpoint-specific admission only: reject explicit v1 items before
-            // any sibling executes. No global item/byte caps (legacy batch shape).
+            // Validate and authorize the entire batch before dispatching any
+            // sibling. Top-level arrays are read-only: arbitrary mutations span
+            // unrelated stores/external effects and cannot be made transactional.
             var seenIDs = Set<String>()
             for item in batch {
                 guard let object = item as? [String: Any] else {
                     return rpcErrorData(.invalidRequest, id: NSNull())
                 }
-                if let method = object["method"] as? String {
-                    let itemParams = object["params"] as? [String: Any]
-                    do {
-                        try AgentCheckpointListContract.preflightTransport(
-                            method: method,
-                            transport: wireTransport,
-                            inBatch: true,
-                            isExplicitV1: AgentCheckpointListContract.isExplicitV1(
-                                params: itemParams
-                            )
-                        )
-                    } catch let error as JSONRPCError {
-                        return rpcErrorData(error, id: NSNull())
-                    } catch {
-                        return rpcErrorData(.invalidRequest, id: NSNull())
-                    }
+                let expectedKeys: Set<String> = object.keys.contains("params")
+                    ? ["jsonrpc", "id", "method", "params"]
+                    : ["jsonrpc", "id", "method"]
+                guard Set(object.keys) == expectedKeys,
+                      object["jsonrpc"] as? String == "2.0",
+                      let method = object["method"] as? String,
+                      !method.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      let (_, key) = strictRPCID(
+                          object["id"],
+                          keyIsPresent: object.keys.contains("id")
+                      ) else {
+                    return rpcErrorData(.invalidRequest, id: NSNull())
                 }
-                if let (_, key) = strictRPCID(object["id"], keyIsPresent: object.keys.contains("id")) {
-                    guard seenIDs.insert(key).inserted else {
+                let itemParams: [String: Any]?
+                if object.keys.contains("params") {
+                    guard let params = object["params"] as? [String: Any] else {
                         return rpcErrorData(.invalidRequest, id: NSNull())
                     }
+                    itemParams = params
+                } else {
+                    itemParams = nil
+                }
+                do {
+                    try AgentCheckpointListContract.preflightTransport(
+                        method: method,
+                        transport: wireTransport,
+                        inBatch: true,
+                        isExplicitV1: AgentCheckpointListContract.isExplicitV1(
+                            params: itemParams
+                        )
+                    )
+                } catch let error as JSONRPCError {
+                    return rpcErrorData(error, id: NSNull())
+                } catch {
+                    return rpcErrorData(.invalidRequest, id: NSNull())
+                }
+                guard Self.isAuthorizedRPCEnvelope(
+                    method: method,
+                    params: itemParams,
+                    grantedCapabilities: principal.grantedCapabilities
+                ) else {
+                    return rpcErrorData(
+                        Self.rpcCapabilityDenied(method: method),
+                        id: NSNull()
+                    )
+                }
+                guard JSONRPCDispatcher.isReadOnlyBatchMethod(method) else {
+                    return rpcErrorData(JSONRPCError(
+                        code: -32602,
+                        message: "Top-level batch only supports read-only RPC methods.",
+                        data: .string(method)
+                    ), id: NSNull())
+                }
+                guard seenIDs.insert(key).inserted else {
+                    return rpcErrorData(.invalidRequest, id: NSNull())
                 }
             }
             var responses: [[String: Any]] = []
@@ -3526,7 +3701,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             for item in batch {
                 responses.append(await dispatchStrictRPCItem(
                     item,
-                    ownerFingerprint: ownerFingerprint,
+                    principal: principal,
                     wireTransport: wireTransport
                 ))
             }
@@ -3538,30 +3713,44 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // Chunk begin/chunk share bearer-owner admission with the full path
         // (no WS registry / host-boot / watermark prerequisites).
         if let object = root as? [String: Any],
-           let method = object["method"] as? String {
+           let method = strictRPCMethodIfValid(object) {
+            guard Self.isAuthorizedRPCEnvelope(
+                method: method,
+                params: object["params"] as? [String: Any],
+                grantedCapabilities: principal.grantedCapabilities
+            ) else {
+                let wireID = strictRPCID(
+                    object["id"],
+                    keyIsPresent: object.keys.contains("id")
+                )?.0 ?? NSNull()
+                return rpcErrorData(
+                    Self.rpcCapabilityDenied(method: method),
+                    id: wireID
+                )
+            }
             let phaseMetrics = wireTransport == .http ? requestPhaseMetrics : nil
             switch method {
             case "sync.snapshot":
                 return await dispatchSyncSnapshotRPCData(
                     object,
-                    ownerFingerprint: ownerFingerprint,
+                    ownerFingerprint: principal.ownerFingerprint,
                     phaseMetrics: phaseMetrics
                 )
             case "sync.snapshot.begin":
                 return await dispatchSyncSnapshotBeginRPCData(
                     object,
-                    ownerFingerprint: ownerFingerprint,
+                    ownerFingerprint: principal.ownerFingerprint,
                     phaseMetrics: phaseMetrics
                 )
             case "sync.snapshot.chunk":
                 return await dispatchSyncSnapshotChunkRPCData(
                     object,
-                    ownerFingerprint: ownerFingerprint
+                    ownerFingerprint: principal.ownerFingerprint
                 )
             case "sync.snapshot.commit":
                 return await dispatchSyncSnapshotCommitRPCData(
                     object,
-                    ownerFingerprint: ownerFingerprint
+                    ownerFingerprint: principal.ownerFingerprint
                 )
             default:
                 break
@@ -3570,14 +3759,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
         return rpcJSONData(await dispatchStrictRPCItem(
             root,
-            ownerFingerprint: ownerFingerprint,
+            principal: principal,
             wireTransport: wireTransport
         ))
     }
 
     private func dispatchStrictRPCItem(
         _ value: Any,
-        ownerFingerprint: String,
+        principal: DirectRPCPrincipal,
         wireTransport: AgentCheckpointListContract.WireTransport = .http
     ) async -> [String: Any] {
         guard let object = value as? [String: Any] else {
@@ -3607,6 +3796,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 return rpcErrorObject(.invalidRequest, id: wireID)
             }
             rawParams = objectParams
+        }
+        guard Self.isAuthorizedRPCEnvelope(
+            method: method,
+            params: rawParams,
+            grantedCapabilities: principal.grantedCapabilities
+        ) else {
+            return rpcErrorObject(Self.rpcCapabilityDenied(method: method), id: wireID)
         }
         if method == AgentCheckpointListContract.method {
             // Explicit v1 transport gate before any repository work.
@@ -3642,7 +3838,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             return await dispatchSyncSnapshotObject(
                 rawParams: rawParams,
                 wireID: wireID,
-                ownerFingerprint: ownerFingerprint
+                ownerFingerprint: principal.ownerFingerprint
             )
         }
         if method == "sync.snapshot.begin" {
@@ -3652,7 +3848,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let data = await encodeSyncSnapshotBeginResponse(
                 rawParams: rawParams,
                 wireID: wireID,
-                ownerFingerprint: ownerFingerprint
+                ownerFingerprint: principal.ownerFingerprint
             )
             if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 return object
@@ -3666,7 +3862,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let data = encodeSyncSnapshotChunkResponse(
                 rawParams: rawParams,
                 wireID: wireID,
-                ownerFingerprint: ownerFingerprint
+                ownerFingerprint: principal.ownerFingerprint
             )
             if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 return object
@@ -3680,7 +3876,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let data = encodeSyncSnapshotCommitResponse(
                 rawParams: rawParams,
                 wireID: wireID,
-                ownerFingerprint: ownerFingerprint
+                ownerFingerprint: principal.ownerFingerprint
             )
             if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 return object
@@ -3714,7 +3910,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // HTTP is independently authoritative: bearer owner only. Live/absent/
         // foreign WS registry identity is never a mutation precondition.
         let mutationContext = MutationRequestContext(
-            ownerFingerprint: ownerFingerprint,
+            ownerFingerprint: principal.ownerFingerprint,
             hostId: serverId,
             bootEpoch: bootEpoch
         )
@@ -4291,6 +4487,77 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return connectionOwnerFingerprint(token: token)
     }
 
+    /// Return the method only when the complete strict JSON-RPC envelope is
+    /// valid. Snapshot fast paths use this so malformed objects cannot bypass
+    /// the same shape checks as ordinary dispatcher calls.
+    private func strictRPCMethodIfValid(_ object: [String: Any]) -> String? {
+        let expectedKeys: Set<String> = object.keys.contains("params")
+            ? ["jsonrpc", "id", "method", "params"]
+            : ["jsonrpc", "id", "method"]
+        guard Set(object.keys) == expectedKeys,
+              object["jsonrpc"] as? String == "2.0",
+              let method = object["method"] as? String,
+              !method.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              strictRPCID(
+                  object["id"],
+                  keyIsPresent: object.keys.contains("id")
+              ) != nil else {
+            return nil
+        }
+        if object.keys.contains("params"), object["params"] as? [String: Any] == nil {
+            return nil
+        }
+        return method
+    }
+
+    private nonisolated static func rpcCapabilityDenied(
+        method: String
+    ) -> JSONRPCError {
+        JSONRPCError(
+            code: -32003,
+            message: "RPC capability is not authorized.",
+            data: .object([
+                "method": .string(method),
+                "reason": .string("capability_denied"),
+            ])
+        )
+    }
+
+    /// Authorize a wire method and, for the method-style batch container, each
+    /// nested method. Without the nested pass a read-scoped device could wrap
+    /// `fs.*` reads in `rpc.batch` and bypass the distinct file grant.
+    private nonisolated static func isAuthorizedRPCEnvelope(
+        method: String,
+        params: [String: Any]?,
+        grantedCapabilities: String
+    ) -> Bool {
+        guard method == "rpc.batch" else {
+            return JSONRPCDispatcher.isAuthorized(
+                method: method,
+                grantedCapabilities: grantedCapabilities
+            )
+        }
+        if JSONRPCDispatcher.parseCapabilities(grantedCapabilities).contains("*") {
+            return true
+        }
+        // Malformed nested shapes are left for dispatcher's existing all-item
+        // validation, which rejects them before executing any call.
+        guard let calls = params?["calls"] as? [Any] else { return true }
+        for value in calls {
+            guard let call = value as? [String: Any],
+                  let nestedMethod = call["method"] as? String else {
+                continue
+            }
+            guard JSONRPCDispatcher.isAuthorized(
+                method: nestedMethod,
+                grantedCapabilities: grantedCapabilities
+            ) else {
+                return false
+            }
+        }
+        return true
+    }
+
     private func strictRPCID(_ value: Any?, keyIsPresent: Bool) -> (Any, String)? {
         guard keyIsPresent else { return nil }
         if value is NSNull { return (NSNull(), "null") }
@@ -4509,7 +4776,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
 
             if status.newlyCommitted, let result = status.result {
-                EventBus.shared.publish(kind: "agent.attachment.uploaded", payload: .object([
+                EventBus.shared.publish(kind: .agentAttachmentUploaded, payload: .object([
                     "workspace_id": .string(status.workspaceId),
                     "id": .string(result.id),
                     "display_name": .string(result.displayName),
@@ -4663,7 +4930,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 )
                 if status.newlyCommitted, let result = status.result {
                     EventBus.shared.publish(
-                        kind: "agent.attachment.uploaded",
+                        kind: .agentAttachmentUploaded,
                         payload: .object([
                             "workspace_id": .string(status.workspaceId),
                             "id": .string(result.id),

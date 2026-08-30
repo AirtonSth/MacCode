@@ -102,7 +102,7 @@ private final class HybridReceiptRouter: FakeRouter, CommandReceiptStateRouting,
         return events.enumerated().map { ordinal, event in
             EventBus.Event(
                 seq: minimumEventSequence + Int64(ordinal) + 1,
-                kind: event.kind,
+                kind: event.kind.rawValue,
                 payload: event.payload,
                 ts: event.createdAt.timeIntervalSince1970
             )
@@ -267,7 +267,7 @@ final class HybridHTTPWebSocketContractTests: XCTestCase {
                        "sync.snapshot over gated HTTP must reject an invalid bearer")
 
         let before = EventBus.shared.currentSeq
-        EventBus.shared.publish(
+        EventBus.shared.publishRawForTesting(
             kind: "hybrid.http.probe",
             payload: .object(["marker": .string("without-ws")])
         )
@@ -494,7 +494,7 @@ final class HybridHTTPWebSocketContractTests: XCTestCase {
         _ = try await receiveObject(socket)
 
         let marker = "http-mut-\(UUID().uuidString.prefix(8))"
-        EventBus.shared.publish(
+        EventBus.shared.publishRawForTesting(
             kind: "hybrid.http.mutation_probe",
             payload: .object(["marker": .string(marker)])
         )

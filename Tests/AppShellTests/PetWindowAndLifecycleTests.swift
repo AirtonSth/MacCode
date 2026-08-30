@@ -462,7 +462,7 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         XCTAssertFalse(controller.togglePopoverFromKeyboard())
         XCTAssertEqual(EventBus.shared.subscriberCountForTests, baselineSubscribers + 1)
 
-        EventBus.shared.publish(kind: "agent.run.started", payload: .object([
+        EventBus.shared.publish(kind: .agentRunStarted, payload: .object([
             "run_id": .string(UUID().uuidString)
         ]))
         try await Task.sleep(nanoseconds: 20_000_000)
@@ -605,7 +605,7 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         )
         let detailBefore = before.detail
 
-        EventBus.shared.publish(kind: "agent.item.started", payload: .object([
+        EventBus.shared.publish(kind: .agentItemStarted, payload: .object([
             "thread_id": .string(thread.id.value.uuidString),
             "item": .object([
                 "id": .string("item-git"),
@@ -679,7 +679,7 @@ final class PetWindowAndLifecycleTests: XCTestCase {
 
         try context.db.execute("DELETE FROM agent_threads;")
 
-        EventBus.shared.publish(kind: "agent.item.started", payload: .object([
+        EventBus.shared.publish(kind: .agentItemStarted, payload: .object([
             "thread_id": .string(thread.id.value.uuidString),
             "item": .object([
                 "id": .string("item-git"),
@@ -1220,14 +1220,14 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         context.router = router
         SettingsStore(db: context.db).save(AppSettings(petEnabled: false))
 
-        EventBus.shared.publish(kind: "git.push", payload: .object([
+        EventBus.shared.publish(kind: .gitPush, payload: .object([
             "workspace_id": .string(UUID().uuidString),
             "ok": .bool(false)
         ]))
         let controller = try PetController(context: context, router: router, openSettings: { _ in false })
         defer { controller.stop() }
         controller.afterStartupCursorCapturedForTests = {
-            EventBus.shared.publish(kind: "agent.run.started", payload: .object([
+            EventBus.shared.publish(kind: .agentRunStarted, payload: .object([
                 "run_id": .string(UUID().uuidString)
             ]))
         }
@@ -1260,7 +1260,7 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         await withTaskGroup(of: Void.self) { group in
             for _ in 0..<100 {
                 group.addTask {
-                    EventBus.shared.publish(kind: "agent.run.started", payload: .object([
+                    EventBus.shared.publish(kind: .agentRunStarted, payload: .object([
                         "run_id": .string(UUID().uuidString)
                     ]))
                 }
@@ -1287,10 +1287,10 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         controller.start()
 
         for _ in 0..<250 {
-            EventBus.shared.publish(kind: "surface.output", payload: .object([:]))
-            EventBus.shared.publish(kind: "agent.item.delta", payload: .object([:]))
-            EventBus.shared.publish(kind: "agent.item.progress", payload: .object([:]))
-            EventBus.shared.publish(kind: "agent.account.usage", payload: .object([:]))
+            EventBus.shared.publish(kind: .surfaceOutput, payload: .object([:]))
+            EventBus.shared.publish(kind: .agentItemDelta, payload: .object([:]))
+            EventBus.shared.publish(kind: .agentItemProgress, payload: .object([:]))
+            EventBus.shared.publish(kind: .agentAccountUsage, payload: .object([:]))
         }
         try await Task.sleep(nanoseconds: 100_000_000)
 
@@ -1580,7 +1580,7 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         controller.start()
 
         for _ in 0..<5 {
-            EventBus.shared.publish(kind: "agent.account.usage", payload: .object([:]))
+            EventBus.shared.publish(kind: .agentAccountUsage, payload: .object([:]))
             try await Task.sleep(nanoseconds: 5_000_000)
         }
 

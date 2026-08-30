@@ -85,6 +85,7 @@ public enum HostMutationContract {
     browser.back
     browser.forward
     browser.reload
+    browser.stop
     browser.click
     browser.fill
     browser.type
@@ -119,6 +120,9 @@ public enum HostMutationContract {
     bot.settings.set
     bot.send
     bot.queue.remove
+    bot.queue.update
+    bot.queue.reorder
+    bot.queue.force_now
     bot.stop
     bot.force_stop
     bot.conversation.create
@@ -323,6 +327,12 @@ public enum HostMutationContract {
                 return []
             case "bot.settings.set":
                 return [.string("key")]
+            case "bot.queue.remove", "bot.queue.force_now":
+                return [.uuid("bot_id"), .uuid("id")]
+            case "bot.queue.update":
+                return [.uuid("bot_id"), .uuid("id"), .string("text", nonempty: true)]
+            case "bot.queue.reorder":
+                return [.uuid("bot_id"), .uuid("id"), .int("position")]
             case "bot.peer.ask":
                 return [
                     .uuid("thread_id"), .uuid("run_id"), .string("handle"), .string("prompt"),
@@ -418,7 +428,7 @@ public enum HostMutationContract {
         case "git.create_branch": return [.uuid("workspace_id"), .string("name")]
         case "git.deliver", "git.push", "project.open_in_editor": return [.uuid("workspace_id")]
         case "browser.navigate": return [.uuid("id"), .string("url")]
-        case "browser.back", "browser.forward", "browser.reload", "browser.mirror_url.get", "browser.screenshot": return [.uuid("id")]
+        case "browser.back", "browser.forward", "browser.reload", "browser.stop", "browser.mirror_url.get", "browser.screenshot": return [.uuid("id")]
         case "browser.click", "browser.fill", "browser.type", "browser.focus", "browser.hover", "browser.check", "browser.uncheck", "browser.select": return [.uuid("id"), .string("ref")]
         case "browser.eval": return [.uuid("id"), .string("script")]
         case "ssh.connect": return [.uuid("workspace_id"), .optionalSSHProfile]

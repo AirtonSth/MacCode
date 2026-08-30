@@ -57,6 +57,35 @@ final class LocalAuthAdapterOwnerFingerprintTests: XCTestCase {
         )
     }
 
+    /// WHY: HTTP RPC admission must not separately verify the bearer and then
+    /// guess full access. The exact persisted grants and opaque owner must come
+    /// from the same verified DeviceTrust row.
+    func test_authorizedRPCPrincipal_usesPersistedCapabilitiesAndVerifiedOwner() throws {
+        let (auth, repo, dir) = try makeAuth()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+
+        let request = try repo.createPairingRequest(deviceName: "read-only")
+        let approved = try XCTUnwrap(try repo.approvePairingRequest(id: request.id))
+        let update = try repo.db.prepare(
+            "UPDATE device_trust SET capabilities = ? WHERE id = ?;"
+        )
+        try update.bind(1, "read")
+        try update.bind(2, approved.0.id)
+        _ = try update.step()
+
+        let principal = try XCTUnwrap(
+            auth.authorizedRPCPrincipal(token: approved.token)
+        )
+        XCTAssertEqual(principal.grantedCapabilities, "read")
+        XCTAssertEqual(
+            principal.ownerFingerprint,
+            LocalAuthAdapter.opaqueAuthorizedOwnerFingerprint(
+                stableIdentity: "token:\(approved.0.tokenHash)"
+            )
+        )
+        XCTAssertNil(auth.authorizedRPCPrincipal(token: "invalid"))
+    }
+
     /// WHY: separate bearer tokens must remain separate upload owners even when
     /// client-supplied pairing metadata is byte-identical.
     func test_authorizedOwnerFingerprint_doesNotMergeTokensWithSameClientDeviceID() throws {

@@ -6,6 +6,7 @@ import CoreModel
 import Persistence
 import AgentRuntime
 import SocketServer
+import RemoteCodeTreaty
 import Surfaces
 
 private let appRouterLog = Logger(subsystem: "io.remotecode.appshell", category: "router")
@@ -389,7 +390,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func publishAgentThreadUpdated(_ thread: AgentThread) {
-        EventBus.shared.publish(kind: "agent.thread.updated", payload: agentThreadPayload(thread))
+        EventBus.shared.publish(kind: .agentThreadUpdated, payload: agentThreadPayload(thread))
     }
 
     private func publishAgentPlanNotesUpdated(thread: AgentThreadID, notes: String) {
@@ -397,13 +398,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // overflow the WS outbound budget; clients rehydrate via
         // agent.plan.notes.get protocol_version 1. Persistence remains full.
         EventBus.shared.publish(
-            kind: "agent.plan.notes.updated",
+            kind: .agentPlanNotesUpdated,
             payload: PlanNotesProjectionV1.compactUpdateEvent(threadId: thread, notes: notes)
         )
     }
 
     private func publishAgentThreadRead(_ threadID: AgentThreadID) {
-        EventBus.shared.publish(kind: "agent.thread.read", payload: .object([
+        EventBus.shared.publish(kind: .agentThreadRead, payload: .object([
             "thread_id": .string(threadID.value.uuidString)
         ]))
     }
@@ -494,11 +495,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func publishAgentThreadLifecycle(_ event: AgentThreadLifecycleEvent) {
         switch event {
         case .created(let thread):
-            EventBus.shared.publish(kind: "agent.thread.created", payload: agentThreadPayload(thread))
+            EventBus.shared.publish(kind: .agentThreadCreated, payload: agentThreadPayload(thread))
         case .updated(let thread):
-            EventBus.shared.publish(kind: "agent.thread.updated", payload: agentThreadPayload(thread))
+            EventBus.shared.publish(kind: .agentThreadUpdated, payload: agentThreadPayload(thread))
         case .reordered(let workspaceId, let order):
-            EventBus.shared.publish(kind: "agent.thread.reordered", payload: .object([
+            EventBus.shared.publish(kind: .agentThreadReordered, payload: .object([
                 "workspace_id": .string(workspaceId.value.uuidString),
                 "order": .array(order.map { .string($0.value.uuidString) })
             ]))
@@ -514,11 +515,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 )
             }
             if ids.count > 1 {
-                EventBus.shared.publish(kind: "agent.thread.deleted_many", payload: .object([
+                EventBus.shared.publish(kind: .agentThreadDeletedMany, payload: .object([
                     "thread_ids": .array(ids.map { .string($0.value.uuidString) })
                 ]))
             } else if let id = ids.first {
-                EventBus.shared.publish(kind: "agent.thread.deleted", payload: .object([
+                EventBus.shared.publish(kind: .agentThreadDeleted, payload: .object([
                     "thread_id": .string(id.value.uuidString)
                 ]))
             }
@@ -531,6 +532,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func publishQueuedMessage(kind: String, _ message: AgentQueuedMessage) {
+        guard let eventKind = RemoteCodeEventKind(rawValue: kind) else {
+            assertionFailure("Unknown productive Agent queue event kind: \(kind)")
+            return
+        }
         var payload: [String: JSONValue] = [
             "id": .string(message.id.value.uuidString),
             "queued_message_id": .string(message.id.value.uuidString),
@@ -552,7 +557,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if let workspaceId = try? context?.threadRepo.workspaceId(of: message.threadId) {
             payload["workspace_id"] = .string(workspaceId.value.uuidString)
         }
-        EventBus.shared.publish(kind: kind, payload: .object(payload))
+        EventBus.shared.publish(kind: eventKind, payload: .object(payload))
     }
 
     private func jsonValue<T: Encodable>(_ value: T) -> JSONValue {
@@ -1179,7 +1184,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if shouldPublishLayoutEvents {
             // The canonical mirror must be observable before selectWorkspace
             // returns so paired terminal clients cannot lag behind local state.
-            EventBus.shared.publish(kind: "workspace.selected", payload: .object([
+            EventBus.shared.publish(kind: .workspaceSelected, payload: .object([
                 "workspace_id": .string(id.value.uuidString)
             ]))
         }
@@ -1262,7 +1267,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func publishWorkspaceClosed(_ id: WorkspaceID) {
-        EventBus.shared.publish(kind: "workspace.closed", payload: .object([
+        EventBus.shared.publish(kind: .workspaceClosed, payload: .object([
             "workspace_id": .string(id.value.uuidString)
         ]))
     }
@@ -1309,23 +1314,23 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func publishWorkspaceCreated(_ workspace: Workspace) {
         guard shouldPublishLayoutEvents else { return }
-        EventBus.shared.publish(kind: "workspace.created", payload: Self.workspaceCreatedPayload(workspace))
+        EventBus.shared.publish(kind: .workspaceCreated, payload: Self.workspaceCreatedPayload(workspace))
     }
 
     private func publishWorkspaceRenamed(_ id: WorkspaceID, _ name: String) {
         guard shouldPublishLayoutEvents else { return }
-        EventBus.shared.publish(kind: "workspace.renamed", payload: Self.workspaceRenamedPayload(id: id, name: name))
+        EventBus.shared.publish(kind: .workspaceRenamed, payload: Self.workspaceRenamedPayload(id: id, name: name))
     }
 
     private func publishWorkspaceUpdated(_ id: WorkspaceID, metadata: [String: JSONValue]) {
         guard shouldPublishLayoutEvents else { return }
-        EventBus.shared.publish(kind: "workspace.updated", payload: Self.workspaceUpdatedPayload(id: id, metadata: metadata))
+        EventBus.shared.publish(kind: .workspaceUpdated, payload: Self.workspaceUpdatedPayload(id: id, metadata: metadata))
     }
 
     private func publishWorkspaceReordered(_ id: WorkspaceID, position: Int?) {
         guard shouldPublishLayoutEvents else { return }
         let order = context?.state.window.workspaces ?? []
-        EventBus.shared.publish(kind: "workspace.reordered", payload: Self.workspaceReorderedPayload(id: id, position: position, order: order))
+        EventBus.shared.publish(kind: .workspaceReordered, payload: Self.workspaceReorderedPayload(id: id, position: position, order: order))
     }
 
     public func setWorkspacePinned(_ id: WorkspaceID, _ pinned: Bool) throws {
@@ -1353,7 +1358,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func publishSurfaceCreated(workspace: WorkspaceID, surface: SurfaceDescriptor) {
         guard shouldPublishLayoutEvents else { return }
-        EventBus.shared.publish(kind: "surface.created", payload: .object([
+        EventBus.shared.publish(kind: .surfaceCreated, payload: .object([
             "workspace_id": .string(workspace.value.uuidString),
             "surface": jsonValue(surface)
         ]))
@@ -1361,7 +1366,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func publishPaneSplit(workspace: WorkspaceID, surface: SurfaceDescriptor) {
         guard shouldPublishLayoutEvents else { return }
-        EventBus.shared.publish(kind: "pane.split", payload: .object([
+        EventBus.shared.publish(kind: .paneSplit, payload: .object([
             "workspace_id": .string(workspace.value.uuidString),
             "surface": jsonValue(surface)
         ]))
@@ -1369,7 +1374,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func publishSurfaceClosed(workspace: WorkspaceID, surface: SurfaceID) {
         guard shouldPublishLayoutEvents else { return }
-        EventBus.shared.publish(kind: "surface.closed", payload: .object([
+        EventBus.shared.publish(kind: .surfaceClosed, payload: .object([
             "workspace_id": .string(workspace.value.uuidString),
             "id": .string(surface.value.uuidString)
         ]))
@@ -1377,7 +1382,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func publishSurfaceFocused(workspace: WorkspaceID, surface: SurfaceID) {
         guard shouldPublishLayoutEvents else { return }
-        EventBus.shared.publish(kind: "surface.focused", payload: .object([
+        EventBus.shared.publish(kind: .surfaceFocused, payload: .object([
             "workspace_id": .string(workspace.value.uuidString),
             "id": .string(surface.value.uuidString)
         ]))
@@ -1392,12 +1397,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if let targetPane {
             payload["target_pane_id"] = .string(targetPane.value.uuidString)
         }
-        EventBus.shared.publish(kind: "surface.moved", payload: .object(payload))
+        EventBus.shared.publish(kind: .surfaceMoved, payload: .object(payload))
     }
 
     private func publishSurfaceReordered(workspace: WorkspaceID, surface: SurfaceID, targetPane: PaneID, position: Int) {
         guard shouldPublishLayoutEvents else { return }
-        EventBus.shared.publish(kind: "surface.reordered", payload: .object([
+        EventBus.shared.publish(kind: .surfaceReordered, payload: .object([
             "workspace_id": .string(workspace.value.uuidString),
             "id": .string(surface.value.uuidString),
             "target_pane_id": .string(targetPane.value.uuidString),
@@ -1407,7 +1412,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func publishPaneResized(workspace: WorkspaceID, splitID: UUID) {
         guard shouldPublishLayoutEvents else { return }
-        EventBus.shared.publish(kind: "pane.resized", payload: .object([
+        EventBus.shared.publish(kind: .paneResized, payload: .object([
             "workspace_id": .string(workspace.value.uuidString),
             "split_id": .string(splitID.uuidString)
         ]))
@@ -2260,7 +2265,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         reconcileSurfaceVisibility()
         publishSurfaceCreated(workspace: workspace, surface: desc)
         if shouldPublishLayoutEvents {
-            EventBus.shared.publish(kind: "ssh.session.updated", payload: .object([
+            EventBus.shared.publish(kind: .sshSessionUpdated, payload: .object([
                 "surface_id": .string(desc.id.value.uuidString),
                 "status": .string(desc.metadata["ssh_status"] ?? "connected"),
                 "destination": .string(desc.metadata["ssh_destination"] ?? "")
@@ -2990,7 +2995,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         created.onHasLiveRun = { [weak self] id in
             self?.botsViewModel?.hasLiveRun(botID: id) ?? false
         }
-        created.onStopRun = { [weak self] id, force, requestID in
+        created.onStopRun = { [weak self] id, conversationID, runID, runRequestID, force, requestID in
             guard let self else { return }
             guard let botsViewModel = self.botsViewModel else {
                 self.settlePairedBot(
@@ -3000,7 +3005,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 )
                 return
             }
-            botsViewModel.stopLiveRuns(for: id, force: force) { [weak self] ok in
+            botsViewModel.stopLiveRun(
+                for: id,
+                conversationID: conversationID,
+                runID: runID,
+                runRequestID: runRequestID,
+                force: force
+            ) { [weak self] ok in
                 self?.settlePairedBot(
                     requestID: requestID,
                     ok: ok,
@@ -3086,21 +3097,32 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             try service.removeGuestRuntime(botID: id)
         }
-        created.onSend = { [weak self] id, text, conversationID, routingValues in
-            guard let vm = self?.botsViewModel else {
+        created.onSend = { [weak self] id, text, conversationID, attachmentReferences, routingValues in
+            guard let self, let vm = self.botsViewModel else {
                 throw BotRemoteControlAuthority.Error(
                     code: -32091,
                     message: "Bot runtime is unavailable."
                 )
             }
             let routing = try Self.pairedBotDeskRouting(routingValues)
+            let attachments = try self.resolveInboundAgentAttachments(attachmentReferences)
             let result = try vm.enqueueHostMessage(
                 botID: id,
                 text: text,
                 conversationID: conversationID,
+                attachments: attachments,
                 routing: routing
             )
             return Self.foundationObject(result.objectValue ?? [:])
+        }
+        created.onForceQueuedFollowUp = { [weak self] id, itemID in
+            guard let vm = self?.botsViewModel else {
+                throw BotRemoteControlAuthority.Error(
+                    code: -32091,
+                    message: "Bot runtime is unavailable."
+                )
+            }
+            return try vm.forceQueuedFollowUpFromStore(botID: id, id: itemID)
         }
         created.onDelegatedAttentionSnapshot = { [weak self] in
             self?.context?.botPeerHandoffAuthority.remoteAttentionOwnershipSnapshots() ?? []
@@ -3134,7 +3156,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             )
             if let settled,
                let payload = Self.pairedGuestTerminalEventPayload(settled) {
-                EventBus.shared.publish(kind: "bot.guest.updated", payload: payload)
+                EventBus.shared.publish(kind: .botGuestUpdated, payload: payload)
             }
             let waiters = self.pairedBotSettlementWaiters.removeValue(forKey: requestID) ?? []
             waiters.forEach { $0.resume() }
@@ -3738,7 +3760,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // After rails reload: broadcast create so iOS mirrors and any EventBus
         // subscribers (including Agent App surfaces that listen for thread.*)
         // see scheduled / RPC-created threads immediately.
-        EventBus.shared.publish(kind: "agent.thread.created", payload: agentThreadPayload(t))
+        EventBus.shared.publish(kind: .agentThreadCreated, payload: agentThreadPayload(t))
         softGraphifyPreflight(workspace: resolvedWorkspace)
         return t
     }
@@ -3825,7 +3847,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         } else {
             // Nested orchestrate worker: keep the controller selected so the
             // parent's Subagents surface owns live activity for this child.
-            EventBus.shared.publish(kind: "agent.thread.created", payload: agentThreadPayload(thread))
+            EventBus.shared.publish(kind: .agentThreadCreated, payload: agentThreadPayload(thread))
         }
         return thread
     }
@@ -4819,7 +4841,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
            !alreadyStarted {
             t.title = AgentThreadTitle.titleFromFirstMessage(text)
             try ctx.threadRepo.updateTitlePreservingActivity(thread, title: t.title)
-            EventBus.shared.publish(kind: "agent.thread.renamed", payload: .object([
+            EventBus.shared.publish(kind: .agentThreadRenamed, payload: .object([
                 "thread_id": .string(t.id.value.uuidString),
                 "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
                 "title": .string(t.title),
@@ -5285,7 +5307,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         do {
             threadIds = try ctx.queuedMessageRepo.threadIdsWithQueuedMessages()
         } catch {
-            EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
+            EventBus.shared.publish(kind: .agentMessageQueueFailed, payload: .object([
                 "message": .string("Queue launch recovery failed: \(error)")
             ]))
             return
@@ -5297,7 +5319,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     recoverPreparedFromPriorProcess: true
                 )
             } catch {
-                EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
+                EventBus.shared.publish(kind: .agentMessageQueueFailed, payload: .object([
                     "thread_id": .string(threadId.value.uuidString),
                     "message": .string("Queue launch recovery failed: \(error)")
                 ]))
@@ -5487,7 +5509,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if let threadId {
             payload["thread_id"] = .string(threadId.value.uuidString)
         }
-        EventBus.shared.publish(kind: "graphify.thread.roots", payload: .object(payload))
+        EventBus.shared.publish(kind: .graphifyThreadRoots, payload: .object(payload))
     }
 
     func effectiveAgentExecutionCwd(for thread: AgentThread) throws -> String {
@@ -5720,7 +5742,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 throw JSONRPCError.internalError
             }
             return CommandReceiptEventIntent(
-                kind: event.kind,
+                kind: event.kind.rawValue,
                 payloadJSON: payloadJSON,
                 createdAt: event.createdAt
             )
@@ -5797,7 +5819,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         do {
             try await ctx.coordinator.respondToRequest(threadId: thread, requestId: requestId, response: response)
             try? ctx.providerPendingCallbackRepo.resolve(threadId: thread, requestId: requestId, kind: .approval, state: state)
-            EventBus.shared.publish(kind: "agent.request.resolved", payload: .object([
+            EventBus.shared.publish(kind: .agentRequestResolved, payload: .object([
                 "thread_id": .string(thread.value.uuidString),
                 "request_id": .string(requestId),
                 "state": .string(state.rawValue)
@@ -5818,7 +5840,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         } catch {
             let reason = "Provider approval response failed: \(error)"
             try? ctx.providerPendingCallbackRepo.markStale(threadId: thread, requestId: requestId, kind: .approval, reason: reason)
-            EventBus.shared.publish(kind: "agent.request.resolved", payload: .object([
+            EventBus.shared.publish(kind: .agentRequestResolved, payload: .object([
                 "thread_id": .string(thread.value.uuidString),
                 "request_id": .string(requestId),
                 "state": .string(AssistantRequestState.stale.rawValue),
@@ -5833,7 +5855,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         do {
             try await ctx.coordinator.respondToUserInput(threadId: thread, requestId: requestId, text: text)
             try? ctx.providerPendingCallbackRepo.resolve(threadId: thread, requestId: requestId, kind: .userInput, state: .resolved)
-            EventBus.shared.publish(kind: "agent.user_input.resolved", payload: .object([
+            EventBus.shared.publish(kind: .agentUserInputResolved, payload: .object([
                 "thread_id": .string(thread.value.uuidString),
                 "request_id": .string(requestId),
                 "answer": .string(text)
@@ -5841,7 +5863,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         } catch {
             let reason = "Provider user-input response failed: \(error)"
             try? ctx.providerPendingCallbackRepo.markStale(threadId: thread, requestId: requestId, kind: .userInput, reason: reason)
-            EventBus.shared.publish(kind: "agent.user_input.resolved", payload: .object([
+            EventBus.shared.publish(kind: .agentUserInputResolved, payload: .object([
                 "thread_id": .string(thread.value.uuidString),
                 "request_id": .string(requestId),
                 "state": .string(AssistantRequestState.stale.rawValue),
@@ -6707,7 +6729,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             "stdout": .string(result.stdout),
             "stderr": .string(result.stderr)
         ])
-        EventBus.shared.publish(kind: "agent.provider.updated", payload: .object([
+        EventBus.shared.publish(kind: .agentProviderUpdated, payload: .object([
             "provider": .string(provider.rawValue),
             "ok": .bool(result.ok),
             "status": .number(Double(result.status))
@@ -7135,7 +7157,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             throw LayoutError.surfaceNotFound
         }
         context.projectScriptRuns.register(workspaceID: workspace, surfaceID: desc.id, name: name)
-        EventBus.shared.publish(kind: "project.script_started", payload: .object([
+        EventBus.shared.publish(kind: .projectScriptStarted, payload: .object([
             "workspace_id": .string(workspace.value.uuidString),
             "surface_id": .string(desc.id.value.uuidString),
             "name": .string(name)
@@ -7165,7 +7187,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             for (key, value) in fields {
                 payload[key] = .string(value)
             }
-            EventBus.shared.publish(kind: BotBrowserHostState.eventKind, payload: .object(payload))
+            EventBus.shared.publish(kind: .surfaceBrowser, payload: .object(payload))
         }
         browser.onHTTPCookiesCaptured = { [weak self] surfaceID, cookies, url, title in
             self?.persistBotBrowserCookies(surfaceID: surfaceID, cookies: cookies, url: url, title: title)
@@ -7197,7 +7219,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 )
                 return
             }
-            EventBus.shared.publish(kind: "surface.renamed", payload: .object([
+            EventBus.shared.publish(kind: .surfaceRenamed, payload: .object([
                 "workspace_id": .string(workspace.value.uuidString),
                 "id": .string(surfaceID.value.uuidString),
                 "title": .string(title)
@@ -7545,7 +7567,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             // follow the mac-side thread selection. Shape matches the
             // surface.set_color emitter (Dispatcher "surface.updated"); an
             // empty selected_thread clears the binding on the client.
-            EventBus.shared.publish(kind: "surface.updated", payload: .object([
+            EventBus.shared.publish(kind: .surfaceUpdated, payload: .object([
                 "workspace_id": .string(wid.value.uuidString),
                 "id": .string(surfaceID.value.uuidString),
                 "surface_id": .string(surfaceID.value.uuidString),
@@ -7584,6 +7606,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func browserBack(surface: SurfaceID) throws { try browserSurface(surface).goBackAction() }
     public func browserForward(surface: SurfaceID) throws { try browserSurface(surface).goForwardAction() }
     public func browserReload(surface: SurfaceID) throws { try browserSurface(surface).reloadAction() }
+    public func browserStop(surface: SurfaceID) throws { try browserSurface(surface).stopLoadingAction() }
     public func browserURL(surface: SurfaceID) throws -> String { try browserSurface(surface).currentURL() }
     public func browserMirrorURL(surface: SurfaceID) throws -> [String: JSONValue] {
         let raw = try browserSurface(surface).currentURL()
@@ -7765,7 +7788,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if let workspaceId { eventPayload["workspace_id"] = .string(workspaceId.value.uuidString) }
         if let surfaceId { eventPayload["surface_id"] = .string(surfaceId.value.uuidString) }
         if let category { eventPayload["category"] = .string(category) }
-        EventBus.shared.publish(kind: "notification.created", payload: .object(eventPayload))
+        EventBus.shared.publish(kind: .notificationCreated, payload: .object(eventPayload))
         return n.id
     }
 
@@ -7797,13 +7820,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func notificationMarkRead(id: String) throws {
         guard let ctx = context else { return }
         try NotificationRepository(db: ctx.db).markRead(id: id)
-        EventBus.shared.publish(kind: "notification.read", payload: .object(["id": .string(id)]))
+        EventBus.shared.publish(kind: .notificationRead, payload: .object(["id": .string(id)]))
     }
 
     public func notificationDismiss(id: String) throws {
         guard let ctx = context else { return }
         try NotificationRepository(db: ctx.db).dismiss(id: id)
-        EventBus.shared.publish(kind: "notification.dismissed", payload: .object(["id": .string(id)]))
+        EventBus.shared.publish(kind: .notificationDismissed, payload: .object(["id": .string(id)]))
     }
 
     public func privatePushTokenUpdate(
@@ -7959,7 +7982,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         state["updated_at"] = .number(Date().timeIntervalSince1970)
         state["updated_by_device"] = deviceID.map { .string($0) } ?? .null
         try persistFilesState(surface: surface, workspace: located.workspaceID, state: state)
-        EventBus.shared.publish(kind: "files.state.updated", payload: .object([
+        EventBus.shared.publish(kind: .filesStateUpdated, payload: .object([
             "surface_id": .string(surface.value.uuidString),
             "workspace_id": .string(located.workspaceID.value.uuidString),
             "state": .object(state),
@@ -8326,7 +8349,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             direction: direction,
             startedAt: Date()
         )
-        EventBus.shared.publish(kind: "ssh.transfer.started", payload: .object([
+        EventBus.shared.publish(kind: .sshTransferStarted, payload: .object([
             "workspace_id": .string(workspaceID.value.uuidString),
             "surface_id": .string(surface.value.uuidString),
             "transfer_id": .string(lifecycle.transferID),
@@ -8338,7 +8361,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func finishSSHTransfer(_ lifecycle: SSHTransferLifecycle, exitCode: Int32?) {
         let succeeded = exitCode == 0
         let durationMilliseconds = max(0, Int64(Date().timeIntervalSince(lifecycle.startedAt) * 1_000))
-        EventBus.shared.publish(kind: succeeded ? "ssh.transfer.completed" : "ssh.transfer.failed", payload: .object([
+        EventBus.shared.publish(kind: succeeded ? .sshTransferCompleted : .sshTransferFailed, payload: .object([
             "workspace_id": .string(lifecycle.workspaceID.value.uuidString),
             "surface_id": .string(lifecycle.surfaceID.value.uuidString),
             "transfer_id": .string(lifecycle.transferID),
@@ -8777,7 +8800,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         state["revision"] = .number(Double((state["revision"]?.intValue ?? 0) + 1))
         state["updated_at"] = .number(Date().timeIntervalSince1970)
         try persistFilesState(surface: surface, workspace: located.workspaceID, state: state, refreshWindow: false)
-        EventBus.shared.publish(kind: "files.state.updated", payload: .object([
+        EventBus.shared.publish(kind: .filesStateUpdated, payload: .object([
             "surface_id": .string(surface.value.uuidString),
             "workspace_id": .string(located.workspaceID.value.uuidString),
             "state": .object(state),
@@ -8817,7 +8840,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         try? ctx.apply(.promoteWorkspace(id))
         let order = ctx.state.window.workspaces
         guard order != before else { return false }
-        EventBus.shared.publish(kind: "workspace.reordered", payload: .object([
+        EventBus.shared.publish(kind: .workspaceReordered, payload: .object([
             "workspace_id": .string(id.value.uuidString),
             "order": .array(order.map { .string($0.value.uuidString) })
         ]))
