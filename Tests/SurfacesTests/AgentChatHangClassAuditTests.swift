@@ -42,7 +42,7 @@ final class AgentChatHangClassAuditTests: XCTestCase {
         )
     }
 
-    func test_liveStreamingAssistantUsesPlainTextNotFullMarkdown() throws {
+    func test_liveStreamingAssistantUsesMarkdownWithoutCachingPartials() throws {
         let source = try Self.readRepoFile("Sources/Surfaces/AgentChatLiveTurnChrome.swift")
         let marker = try XCTUnwrap(source.range(of: "case .assistantMessage:"))
         let rest = source[marker.lowerBound...]
@@ -50,11 +50,15 @@ final class AgentChatHangClassAuditTests: XCTestCase {
         let chunk = String(source[marker.lowerBound..<end])
         XCTAssertTrue(
             chunk.contains("item.state == .streaming"),
-            "streaming assistant items must take a cheap path"
+            "streaming assistant items must keep their live-specific render path"
         )
         XCTAssertTrue(
+            chunk.contains("AgentMessageMarkdownView(text: item.body, cacheResults: false)"),
+            "streaming assistant items must render Markdown without caching growing partials"
+        )
+        XCTAssertFalse(
             chunk.contains("AgentSelectablePlainText"),
-            "streaming assistant items must not rebuild markdown+NSTextView every token"
+            "streaming assistant items must not render Markdown source as plain text"
         )
     }
 

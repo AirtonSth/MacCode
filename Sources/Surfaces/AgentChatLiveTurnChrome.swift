@@ -712,7 +712,7 @@ public struct AgentChatLiveItemRow: View {
         case .assistantMessage:
             if !item.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 if item.state == .streaming {
-                    AgentSelectablePlainText(text: item.body)
+                    AgentMessageMarkdownView(text: item.body, cacheResults: false)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .accessibilityIdentifier("bots.desk.role.assistant")
                 } else {
