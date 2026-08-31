@@ -1024,6 +1024,95 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         }
     }
 
+    func test_attachmentList_restoresOnlyUnconsumedConversationGrantsAfterRelaunch() throws {
+        let target = try createBotConversation(prefix: "attachment-restore")
+        let grantID = try stageAttachment(
+            prefix: "attachment-restore",
+            botID: target.botID,
+            conversationID: target.conversationID
+        )
+
+        let relaunched = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: settings,
+            appSupportDirectory: supportDir
+        )
+        let restored = try relaunched.dispatch(method: "bot.attachment.list", params: [
+            "bot_id": target.botID,
+            "conversation_id": target.conversationID,
+        ])
+        let rows = try XCTUnwrap(restored["attachments"] as? [[String: Any]])
+        XCTAssertEqual(rows.map { $0["id"] as? String }, [grantID])
+        XCTAssertEqual(rows.first?["filename"] as? String, "attachment-restore.txt")
+
+        relaunched.onSend = { botID, _, conversationID, _, _ in
+            [
+                "bot_id": botID.value.uuidString.lowercased(),
+                "conversation_id": conversationID?.value.uuidString.lowercased() as Any,
+                "thread_id": UUID().uuidString.lowercased(),
+                "run_id": UUID().uuidString.lowercased(),
+                "queued_follow_up": false,
+            ]
+        }
+        _ = try relaunched.dispatch(method: "bot.send", params: [
+            "client_request_id": "attachment-restore-send",
+            "bot_id": target.botID,
+            "conversation_id": target.conversationID,
+            "text": "consume",
+            "attachment_ids": [grantID],
+        ])
+        let consumed = try relaunched.dispatch(method: "bot.attachment.list", params: [
+            "bot_id": target.botID,
+            "conversation_id": target.conversationID,
+        ])
+        XCTAssertEqual((consumed["attachments"] as? [[String: Any]])?.count, 0)
+    }
+
+    func test_attachmentImport_usesCurrentOpaqueMacFileAuthorityAndStagesGrant() throws {
+        let target = try createBotConversation(prefix: "attachment-import")
+        let root = try fileRootGrant(botID: target.botID, hostID: "host-a")
+        let created = try authority.dispatch(method: "bot.files.mutate", params: [
+            "client_request_id": "attachment-import-file",
+            "host_id": "host-a",
+            "bot_id": target.botID,
+            "root_handle": root.handle,
+            "expected_generation": root.generation,
+            "expected_cas": root.cas,
+            "relative_path": "report.md",
+            "op": "write",
+            "contents": "report",
+        ])
+        let file = try XCTUnwrap(created["readback"] as? [String: Any])
+        authority.onImportFile = { botID, url in
+            XCTAssertEqual(botID.value.uuidString.lowercased(), target.botID)
+            XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "report")
+            return AgentAttachment(
+                id: "rcatt1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                path: "",
+                displayName: url.lastPathComponent,
+                kind: .file,
+                mimeType: "text/markdown",
+                sha256: String(repeating: "b", count: 64),
+                sizeBytes: 6
+            )
+        }
+        let imported = try authority.dispatch(method: "bot.attachment.import", params: [
+            "client_request_id": "attachment-import-grant",
+            "host_id": "host-a",
+            "bot_id": target.botID,
+            "conversation_id": target.conversationID,
+            "root_handle": try XCTUnwrap(file["root_handle"] as? String),
+            "handle": try XCTUnwrap(file["handle"] as? String),
+            "expected_generation": try XCTUnwrap(file["generation"] as? Int),
+            "expected_cas": try XCTUnwrap(file["root_cas"] as? String),
+        ])
+        let grant = try XCTUnwrap(imported["readback"] as? [String: Any])
+        XCTAssertEqual(grant["filename"] as? String, "report.md")
+        XCTAssertEqual(grant["conversation_id"] as? String, target.conversationID)
+        XCTAssertEqual(grant["consumed"] as? Bool, false)
+    }
+
     func test_attachmentBatchValidationIsAtomicAndRejectsDuplicateGrantIDs() throws {
         let target = try createBotConversation(prefix: "atomic-attachment")
         let grantID = try stageAttachment(

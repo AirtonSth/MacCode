@@ -134,6 +134,7 @@ public enum HostMutationContract {
     bot.routine.run
     bot.routine.delete
     bot.attachment.stage
+    bot.attachment.import
     bot.attachment.remove
     bot.files.mutate
     bot.files.open_tab

@@ -66,6 +66,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     public var onForceQueuedFollowUp: ((BotID, String) throws -> [String: Any])?
     public var onDelegatedAttentionSnapshot: (() throws -> [[String: Any]])?
     public var onOpenFile: ((BotID, String, Bool, String) throws -> Void)?
+    public var onImportFile: ((BotID, URL) throws -> AgentAttachment)?
     public var notifyBrowserPendingOpen: ((Notification.Name) throws -> Void)?
 
     private var receipts: [String: [String: Any]] = [:]
@@ -188,6 +189,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try queueList(params: params)
         case "conversation.list":
             return try conversationList(params: params)
+        case "attachment.list":
+            return try attachmentList(params: params)
         case "routine.list":
             return try routineList(params: params)
         case "files.list":
@@ -622,6 +625,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try routineDelete(params: params, requestID: requestID)
         case "attachment.stage":
             return try attachmentStage(params: params, requestID: requestID)
+        case "attachment.import":
+            return try attachmentImport(params: params, requestID: requestID)
         case "attachment.remove":
             return try attachmentRemove(params: params, requestID: requestID)
         case "files.mutate":
@@ -1493,22 +1498,118 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               digest.count == 64, digest.allSatisfy(\.isHexDigit),
               let size = int(params, "size"), size > 0,
               size <= AgentAttachmentStore.maximumSizeBytes else { throw Error.crossTarget }
-        let conversationID = conversation.id.value.uuidString.lowercased()
+        let grant = storeAttachmentGrant(
+            botID: id(bot),
+            conversationID: conversation.id.value.uuidString.lowercased(),
+            attachmentID: attachmentID,
+            filename: filename,
+            kind: rawKind,
+            digest: digest,
+            size: size,
+            mimeType: string(params, "mime_type")
+        )
+        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: grant)
+    }
+
+    private func attachmentImport(params: [String: Any], requestID: String) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        guard let conversationRaw = string(params, "conversation_id"),
+              let conversationUUID = UUID(uuidString: conversationRaw),
+              let conversation = try store.conversation(id: BotConversationID(conversationUUID)),
+              conversation.botID == bot.id else { throw Error.crossTarget }
+        let hostID = try requireFileHost(params: params, botID: id(bot))
+        let rootHandle = string(params, "root_handle") ?? ""
+        let handle = string(params, "handle") ?? ""
+        guard !rootHandle.isEmpty, !handle.isEmpty else { throw Error.invalidParams }
+        let rootEntry = try resolveFileEntry(bot: bot, handle: rootHandle)
+        let entry = try resolveFileEntry(bot: bot, handle: handle)
+        let root = (entry["root"] as? String) ?? (filesLocation[id(bot)] ?? "bot_home")
+        let currentGeneration = fileGeneration(botID: id(bot), root: root)
+        let currentCAS = fileCASValue(botID: id(bot), root: root)
+        guard let expectedGeneration = int(params, "expected_generation"),
+              let expectedCAS = string(params, "expected_cas"),
+              root == (filesLocation[id(bot)] ?? "bot_home"),
+              rootEntry["host_id"] as? String == hostID,
+              rootEntry["root"] as? String == root,
+              rootEntry["kind"] as? String == "root",
+              rootEntry["generation"] as? Int == currentGeneration,
+              rootEntry["cas"] as? String == currentCAS,
+              entry["host_id"] as? String == hostID,
+              entry["kind"] as? String == "file",
+              entry["generation"] as? Int == currentGeneration,
+              entry["cas"] as? String == currentCAS,
+              expectedGeneration == currentGeneration,
+              expectedCAS == currentCAS else { throw Error.crossTarget }
+        let path = entry["path"] as? String ?? ""
+        let rootURL = root == "docker_home"
+            ? BotGuestHome.url(appSupport: appSupport, botID: bot.id)
+            : botHome(bot).root
+        let url = try secureContainedURL(root: rootURL, path: path)
+        guard FileManager.default.isReadableFile(atPath: url.path),
+              let attachment = try onImportFile?(bot.id, url),
+              let reference = AgentAttachmentReference(attachment) else {
+            throw Error(code: -32090, message: "Bot file was not found.")
+        }
+        let grant = storeAttachmentGrant(
+            botID: id(bot),
+            conversationID: conversation.id.value.uuidString.lowercased(),
+            attachmentID: reference.id,
+            filename: reference.displayName,
+            kind: reference.kind.rawValue,
+            digest: reference.sha256,
+            size: reference.sizeBytes,
+            mimeType: reference.mimeType
+        )
+        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: grant)
+    }
+
+    private func storeAttachmentGrant(
+        botID: String,
+        conversationID: String,
+        attachmentID: String,
+        filename: String,
+        kind: String,
+        digest: String,
+        size: Int,
+        mimeType: String?
+    ) -> [String: Any] {
         let grantID = UUID().uuidString.lowercased()
         var grant: [String: Any] = [
             "id": grantID,
-            "bot_id": id(bot),
+            "bot_id": botID,
             "conversation_id": conversationID,
             "attachment_id": attachmentID,
             "filename": filename,
-            "kind": rawKind,
+            "kind": kind,
             "digest": digest,
             "size": size,
             "consumed": false,
         ]
-        if let mimeType = string(params, "mime_type") { grant["mime_type"] = mimeType }
+        if let mimeType { grant["mime_type"] = mimeType }
         attachments[grantID] = grant
-        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: grant)
+        return grant
+    }
+
+    private func attachmentList(params: [String: Any]) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        guard let conversationRaw = string(params, "conversation_id"),
+              let conversationUUID = UUID(uuidString: conversationRaw),
+              let conversation = try store.conversation(id: BotConversationID(conversationUUID)),
+              conversation.botID == bot.id else { throw Error.crossTarget }
+        let botID = id(bot)
+        let conversationID = conversation.id.value.uuidString.lowercased()
+        let rows = attachments.values.filter {
+            $0["bot_id"] as? String == botID
+                && $0["conversation_id"] as? String == conversationID
+                && $0["consumed"] as? Bool == false
+        }.sorted {
+            ($0["id"] as? String ?? "") < ($1["id"] as? String ?? "")
+        }
+        return [
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "attachments": rows,
+        ]
     }
 
     private func attachmentRemove(params: [String: Any], requestID: String) throws -> [String: Any] {
@@ -3137,6 +3238,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: String]] {
             receiptClaims = decoded
         }
+        if let data = loadData("bot.remote.attachments"),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
+            attachments = decoded
+        }
         if let data = loadData("bot.remote.files_location"),
            let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
             filesLocation = decoded
@@ -3218,6 +3323,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         removed += unpublishedCount - unpublished.count
 
         retainLive(&filesLocation) { key, _ in key }
+        retainLive(&attachments) { _, entry in entry["bot_id"] as? String }
         retainLive(&files) { _, entry in entry["bot_id"] as? String }
         retainLive(&fileGenerations) { key, _ in key.split(separator: "|", maxSplits: 1).first.map(String.init) }
         retainLive(&fileCAS) { key, _ in key.split(separator: "|", maxSplits: 1).first.map(String.init) }
@@ -3290,6 +3396,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         save("bot.remote.unpublished", Array(unpublished).sorted())
         save("bot.remote.receipts", persistentReceiptSnapshot())
         save("bot.remote.receipt_claims", receiptClaims)
+        save("bot.remote.attachments", attachments)
         save("bot.remote.files_location", filesLocation)
         save("bot.remote.file_grants", files)
         save("bot.remote.file_generations", fileGenerations)

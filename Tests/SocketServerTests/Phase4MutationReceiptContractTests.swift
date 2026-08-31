@@ -1186,7 +1186,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
     func test_canonicalManifestExactlyMatchesDispatcherMutationCatalog() throws {
         let canonical = try canonicalMutationMethods()
 
-        XCTAssertEqual(canonical.count, 143)
+        XCTAssertEqual(canonical.count, 147)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }
@@ -3461,7 +3461,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         let manifestKinds = Set(mutations.flatMap { $0["eventKinds"] as? [String] ?? [] })
         let treatyKinds = Set(RemoteCodeEventKind.allCases.map(\.rawValue))
 
-        XCTAssertEqual(treatyKinds.count, 142)
+        XCTAssertEqual(treatyKinds.count, 144)
         XCTAssertTrue(
             manifestKinds.isSubset(of: treatyKinds),
             "Treaty is missing manifest kinds: \(manifestKinds.subtracting(treatyKinds).sorted())"

@@ -3136,6 +3136,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             try vm.openRemoteFile(botID: botID, relativePath: path, split: split, root: root)
         }
+        created.onImportFile = { [weak self] _, url in
+            guard let self else {
+                throw BotRemoteControlAuthority.Error(
+                    code: -32089,
+                    message: "Bot files surface is unavailable."
+                )
+            }
+            return try self.agentAttachmentStore().stage(path: url.path)
+        }
         created.notifyBrowserPendingOpen = { [weak self] name in
             DistributedNotificationCenter.default().post(name: name, object: nil)
             _ = try self?.reconcileBotBrowserOpens()

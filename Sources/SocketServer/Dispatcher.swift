@@ -831,6 +831,7 @@ public final class JSONRPCDispatcher {
         "bot.routine.run",
         "bot.routine.delete",
         "bot.attachment.stage",
+        "bot.attachment.import",
         "bot.attachment.remove",
         "bot.link.open",
         "bot.browser.action",
@@ -1372,7 +1373,7 @@ public final class JSONRPCDispatcher {
             case "bot.routine.run": kind = .botRoutineRunRequested
             case "bot.routine.create", "bot.routine.update", "bot.routine.enable", "bot.routine.delete":
                 kind = .botRoutineUpdated
-            case "bot.attachment.stage", "bot.attachment.remove": kind = .botAttachmentUpdated
+            case "bot.attachment.stage", "bot.attachment.import", "bot.attachment.remove": kind = .botAttachmentUpdated
             case "bot.files.mutate": kind = .botFilesChanged
             case "bot.files.open_tab", "bot.files.split": kind = .botFilesOpened
             case "bot.files.location.set": kind = .botFilesUpdated
@@ -4634,7 +4635,7 @@ public final class JSONRPCDispatcher {
         "git.status", "git.branches", "git.log", "git.diff", "git.pull_request_url", "git.delivery_plan",
         "project.scripts",
         "agent.models.list", "agent.providers.list", "agent.run_as_users.list", "agent.state.current", "agent.prompt_history",
-        "bot.list", "bot.get", "bot.settings.get", "bot.queue.list", "bot.conversation.list",
+        "bot.list", "bot.get", "bot.settings.get", "bot.queue.list", "bot.conversation.list", "bot.attachment.list",
         "bot.routine.list", "bot.files.list", "bot.browser.state", "bot.guest.state",
         "bot.receipt.status", "bot.peer.receipt.status", "bot.attention.list",
         "browser.url.get", "browser.snapshot", "browser.wait",

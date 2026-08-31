@@ -179,6 +179,7 @@
     {"method": "bot.routine.run", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.routine.run_requested"], "readbackMethods": ["bot.routine.list"]},
     {"method": "bot.routine.delete", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.routine.updated"], "readbackMethods": ["bot.routine.list"]},
     {"method": "bot.attachment.stage", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.attachment.updated"], "readbackMethods": ["bot.receipt.status"]},
+    {"method": "bot.attachment.import", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.attachment.updated"], "readbackMethods": ["bot.receipt.status"]},
     {"method": "bot.attachment.remove", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.attachment.updated"], "readbackMethods": ["bot.receipt.status"]},
     {"method": "bot.files.mutate", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.files.changed"], "readbackMethods": ["bot.files.list"]},
     {"method": "bot.files.open_tab", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.files.opened"], "readbackMethods": ["bot.files.list"]},
