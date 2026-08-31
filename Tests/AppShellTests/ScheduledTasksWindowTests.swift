@@ -100,6 +100,18 @@ final class ScheduledTasksWindowTests: XCTestCase {
                       "failure disclosure must be a dedicated control, not the whole row")
     }
 
+    func test_failedHistoryRowShowsReasonWithoutExpansion_becauseFailureMustNotBeOpaque() throws {
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
+        let primaryStart = try XCTUnwrap(source.range(of: "private func historyRowPrimaryContent"))
+        let primaryEnd = try XCTUnwrap(source.range(of: "private func agentTaskTitle"))
+        let primary = String(source[primaryStart.lowerBound..<primaryEnd.lowerBound])
+
+        XCTAssertTrue(primary.contains("if run.status == .failed, let error = run.errorSummary"))
+        XCTAssertTrue(primary.contains("Text(error)"))
+        XCTAssertTrue(primary.contains(".lineLimit(1)"),
+                      "the visible reason must keep history rows compact; full text stays in details")
+    }
+
     func test_historyRowOpensThreadOnPrimaryClick_becauseCompletedRunsMustStayNavigable() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
         // WHY: completed runs used to wrap the row in a disabled Button, which also

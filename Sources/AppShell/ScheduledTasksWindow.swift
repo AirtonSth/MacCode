@@ -1162,10 +1162,20 @@ public struct ScheduledTasksRootView: View {
                 .frame(width: 80, alignment: .leading)
             runStatusPill(run.status)
                 .frame(width: 110, alignment: .leading)
-            Text(agentTaskTitle(task: task, run: run))
-                .font(DS.Font.caption.weight(linkStyle ? .medium : .regular))
-                .foregroundColor(linkStyle ? DS.Palette.accent : DS.Palette.textSecondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                Text(agentTaskTitle(task: task, run: run))
+                    .font(DS.Font.caption.weight(linkStyle ? .medium : .regular))
+                    .foregroundColor(linkStyle ? DS.Palette.accent : DS.Palette.textSecondary)
+                if run.status == .failed, let error = run.errorSummary {
+                    Text(error)
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.danger)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .help(error)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
