@@ -8,6 +8,48 @@ import Surfaces
 
 @MainActor
 final class BotsDeskActiveThreadComposerPerformanceTests: XCTestCase {
+    func test_studioTyping_doesNotRepublishBotsViewModel() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BotsStudioDraftPerformanceTests")
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let context = try AppContext(channel: .debug, appSupportOverride: root.path)
+        let viewModel = BotsViewModel(context: context)
+        let bot = try viewModel.create(name: "Piper", title: "Scout")
+        viewModel.beginEdit(bot)
+
+        var viewModelEmissions = 0
+        var studioStateEmissions = 0
+        let subscription = viewModel.objectWillChange.sink { _ in
+            viewModelEmissions += 1
+        }
+        let studioSubscription = viewModel.studioState.objectWillChange.sink { _ in
+            studioStateEmissions += 1
+        }
+        defer {
+            subscription.cancel()
+            studioSubscription.cancel()
+        }
+
+        viewModel.didEditStudioName("P")
+        viewModel.didEditStudioName("Pi")
+
+        XCTAssertEqual(
+            viewModelEmissions,
+            0,
+            "Studio keystrokes must not rebuild the roster and every other Bots destination"
+        )
+        XCTAssertEqual(
+            studioStateEmissions,
+            2,
+            "each keystroke must publish one atomic Studio draft update"
+        )
+        XCTAssertEqual(viewModel.studioDraft.name, "Pi")
+        XCTAssertEqual(viewModel.studioDraft.handle, "pi")
+    }
+
     func test_liveDeskReplay_doesNotRepublishDeskViewModelWhenComposerOrCaretChanges() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("BotsDeskActiveThreadComposerPerformanceTests")

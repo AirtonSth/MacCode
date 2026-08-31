@@ -247,6 +247,13 @@ public struct BotStudioDraft: Equatable, Codable {
     public var isNew: Bool { botID == nil }
 }
 
+/// Keeps Studio form edits off the view model that also owns the roster,
+/// conversations, schedules, and every other Bots destination.
+@MainActor
+public final class BotsStudioDraftState: ObservableObject {
+    @Published public var draft = BotStudioDraft()
+}
+
 public enum BotStudioFilesLocation: String, Codable, Sendable, Equatable {
     case botFiles
     case dockerHome
@@ -3070,8 +3077,13 @@ public final class BotsViewModel: ObservableObject {
     @Published public var isShellSidebarCollapsed: Bool = false
     /// Detached Desk windows hide the pop-out control so they do not nest.
     public var presentsAsDetachedWindow: Bool = false
-    @Published public var studioDraft = BotStudioDraft() {
-        didSet { persistStudioDraftIfHydrated() }
+    public let studioState = BotsStudioDraftState()
+    public var studioDraft: BotStudioDraft {
+        get { studioState.draft }
+        set {
+            studioState.draft = newValue
+            persistStudioDraftIfHydrated()
+        }
     }
     /// Keep live composer edits and caret movement off the Desk view model that
     /// owns the transcript and live timeline. The computed proxies preserve the
@@ -4297,11 +4309,22 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func didEditStudioName(_ name: String) {
-        if studioSlugFollowsName, let derived = BotHandle.derive(from: name) {
-            studioDraft.handle = derived
-            studioDraft.slugFollowsName = true
+        var next = studioDraft
+        let followsName = next.slugFollowsName
+            ?? BotHandle.shouldFollowName(handle: next.handle, name: next.name)
+        next.name = name
+        if followsName, let derived = BotHandle.derive(from: name) {
+            next.handle = derived
+            next.slugFollowsName = true
         }
-        refreshGeneratedStandingInstructions()
+        if BotStandingInstructions.looksGenerated(next.soul) {
+            next.soul = BotStandingInstructions.fallback(
+                name: next.name,
+                title: next.title,
+                description: next.description
+            )
+        }
+        studioDraft = next
     }
 
     public func didEditStudioSlug(_ raw: String) {
@@ -7126,6 +7149,7 @@ public final class BotsViewModel: ObservableObject {
         } else {
             bots.append(bot)
         }
+        publishRosterIfNeeded()
     }
 
     /// Re-read a bot after `bot_set_settings` (or any out-of-process publish).
@@ -10373,6 +10397,15 @@ private struct BotsComposerReactiveScope<Content: View>: View {
     var body: some View { content() }
 }
 
+/// Studio fields publish only inside Studio. A keystroke must not rebuild the
+/// roster, conversations, schedules, and every other Bots destination.
+private struct BotsStudioReactiveScope<Content: View>: View {
+    @ObservedObject var studioState: BotsStudioDraftState
+    @ViewBuilder var content: () -> Content
+
+    var body: some View { content() }
+}
+
 public struct BotsRootView: View {
     @ObservedObject private var vm: BotsViewModel
     /// Standalone Bots window keeps its own rail. The main shell hosts the
@@ -10407,7 +10440,9 @@ public struct BotsRootView: View {
             Group {
                 switch vm.screen.resolvedDestination {
                 case .studio:
-                    studioScreen
+                    BotsStudioReactiveScope(studioState: vm.studioState) {
+                        studioScreen
+                    }
                 case .activeBots:
                     ActiveBotsRootView(vm: vm)
                 case .scheduleTasks:
@@ -10724,10 +10759,13 @@ public struct BotsRootView: View {
             studioSectionHeader(BotsChrome.Label.roleAndIdentity)
             HStack(alignment: .top, spacing: DS.Space.xl) {
                 labeledField("Name") {
-                    studioField(placeholder: "e.g. Piper", text: $vm.studioDraft.name)
-                        .onChange(of: vm.studioDraft.name) { name in
-                            vm.didEditStudioName(name)
-                        }
+                    studioField(
+                        placeholder: "e.g. Piper",
+                        text: Binding(
+                            get: { vm.studioDraft.name },
+                            set: { vm.didEditStudioName($0) }
+                        )
+                    )
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 labeledField("Role") {

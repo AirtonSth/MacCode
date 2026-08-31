@@ -1130,7 +1130,7 @@ final class BotsWindowTests: XCTestCase {
         let saved = try vm.saveStudio()
         XCTAssertEqual(saved.name, "Piper Night")
         XCTAssertEqual(saved.title, "Night scout")
-        let row = try XCTUnwrap(vm.fleet.first(where: { $0.id == piper.id }))
+        let row = try XCTUnwrap(vm.publishedRoster.first(where: { $0.id == piper.id }))
         XCTAssertEqual(row.name, "Piper Night")
         XCTAssertEqual(row.title, "Night scout")
         XCTAssertTrue(vm.fleet.contains(where: { $0.name == "Quinn" }))
