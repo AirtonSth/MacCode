@@ -2,12 +2,16 @@ import Foundation
 import Security
 import SocketServer
 
-enum TailcatRuntimeStatus: Equatable, Sendable {
+enum TailcatRuntimeStatus: String, Equatable, Sendable {
     case off
     case requiresSubscription
     case checking
     case unavailable
     case active
+
+    /// Green sidebar badge = connected through the DERP relay (.active);
+    /// every other state renders yellow.
+    var isDERPConnected: Bool { self == .active }
 
     var displayText: String {
         switch self {
@@ -17,6 +21,15 @@ enum TailcatRuntimeStatus: Equatable, Sendable {
         case .unavailable: return "Unavailable — retrying securely"
         case .active: return "Available anywhere"
         }
+    }
+}
+
+/// `tailcat_access_enabled` ("Connect from anywhere") defaults to on: a missing
+/// key — fresh install or never touched — means enabled, and only an explicit
+/// "0" (the user turned it off) keeps it disabled.
+public enum TailcatAccessDefaults {
+    public static func isEnabled(_ rawSetting: String?) -> Bool {
+        (rawSetting ?? "1") == "1"
     }
 }
 

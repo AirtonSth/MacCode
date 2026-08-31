@@ -345,7 +345,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                     NotificationCenter.default.post(
                         name: .rc2TailcatRuntimeStatusChanged,
                         object: nil,
-                        userInfo: ["status": status.displayText]
+                        userInfo: [
+                            "status": status.displayText,
+                            "rawStatus": status.rawValue,
+                        ]
                     )
                 }
             }
@@ -1176,7 +1179,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     private func configureTailcatAccess() {
         guard let context else { return }
-        let requested = ((try? context.settingsRepo.get("tailcat_access_enabled")) ?? "0") == "1"
+        let requested = TailcatAccessDefaults.isEnabled(try? context.settingsRepo.get("tailcat_access_enabled"))
         applyTailcatAccessSetting(requested)
     }
 

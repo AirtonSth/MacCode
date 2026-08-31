@@ -675,7 +675,7 @@ public final class SettingsViewModel: ObservableObject {
         reloadCountForTesting += 1
         #endif
         remoteAccessEnabled = (try? settingsRepo.get("remote_access_enabled")) == "1"
-        tailcatAccessEnabled = (try? settingsRepo.get("tailcat_access_enabled")) == "1"
+        tailcatAccessEnabled = TailcatAccessDefaults.isEnabled(try? settingsRepo.get("tailcat_access_enabled"))
         tailcatAccessStatus = tailcatAccessEnabled
             ? tailcatAccessSettingAuthority.currentStatus.displayText
             : TailcatRuntimeStatus.off.displayText
