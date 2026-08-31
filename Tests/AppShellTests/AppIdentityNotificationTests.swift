@@ -151,6 +151,24 @@ final class AppIdentityNotificationTests: XCTestCase {
                        "Settings must not move back into the full-width action row area")
     }
 
+    func testSidebarConnectionBadgeOverlaysAccountAvatar() throws {
+        let source = try String(contentsOf: sidebarViewURL())
+        let headerStart = try XCTUnwrap(source.range(of: "HStack(spacing: 2)"))
+        let headerEnd = try XCTUnwrap(
+            source.range(of: "BotsModeSwitcher(", range: headerStart.upperBound..<source.endIndex)
+        )
+        let header = source[headerStart.lowerBound..<headerEnd.lowerBound]
+        let account = try XCTUnwrap(header.range(of: "if vm.privateAccountUser != nil"))
+        let badge = try XCTUnwrap(header.range(of: "TailcatConnectionBadge(status: vm.tailcatRuntimeStatus)"))
+
+        XCTAssertLessThan(account.lowerBound, badge.lowerBound,
+                          "the connection badge belongs inside the account control, not in its own header slot")
+        XCTAssertTrue(header.contains("headerAccountAvatar\n                            .overlay(alignment: .bottomTrailing)"),
+                      "the connection badge must visually overlay the account avatar")
+        XCTAssertTrue(header.contains(".accessibilityValue(accountSubtitle + \", \" + vm.tailcatRuntimeStatus.displayText)"),
+                      "the account control must expose the connection state without relying on color")
+    }
+
     func testSidebarLiquidGlassAvoidsOpaqueBottomBand() throws {
         let source = try String(contentsOf: sidebarViewURL())
 

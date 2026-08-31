@@ -2803,19 +2803,21 @@ public struct SidebarRootView: View {
                 .help("Settings")
                 .accessibilityLabel("Settings")
 
-                TailcatConnectionBadge(status: vm.tailcatRuntimeStatus)
-                    .frame(width: 28, height: 32)
-
                 if vm.privateAccountUser != nil {
                     Button(action: onOpenAccount) {
                         headerAccountAvatar
+                            .overlay(alignment: .bottomTrailing) {
+                                TailcatConnectionBadge(status: vm.tailcatRuntimeStatus)
+                                    .offset(x: 2, y: 2)
+                                    .accessibilityHidden(true)
+                            }
                             .frame(width: 28, height: 32)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help(accountSubtitle)
+                    .help(accountSubtitle + "\n" + vm.tailcatRuntimeStatus.displayText)
                     .accessibilityLabel("Account")
-                    .accessibilityValue(accountSubtitle)
+                    .accessibilityValue(accountSubtitle + ", " + vm.tailcatRuntimeStatus.displayText)
                 }
             }
             .padding(.horizontal, DS.Space.md)
