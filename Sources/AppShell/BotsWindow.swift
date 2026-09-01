@@ -3168,6 +3168,9 @@ public final class BotsViewModel: ObservableObject {
     /// Test seam: full-fleet reloads. Roster dest must not increment this.
     public private(set) var fleetReloadCountForTesting = 0
 #if DEBUG
+    public private(set) var reloadSelectedBotCountForTesting = 0
+#endif
+#if DEBUG
     public private(set) var liveWorkingBotsCountForTesting = 0
 #endif
     /// Test seam: actual Active Bots store hydration passes, excluding
@@ -3979,13 +3982,21 @@ public final class BotsViewModel: ObservableObject {
         // Dest first. Remount dest used to scan every teammate's
         // conversations + recent messages before dest dested Chat.
         // Dest already has this teammate's thread and dest cache.
+        let selectedBotIDBeforeReload = selectedBotID
+        let selectedConversationIDBeforeReload = selectedConversation?.id
         if !bots.isEmpty, let selectedBotID {
             reloadSelectedBot(id: selectedBotID)
         }
         reloadFleet()
         restoreSelectedBotIfNeeded()
         if let selectedBotID {
-            reloadSelectedBot(id: selectedBotID)
+            // Perf BT-12: the pre-fleet pass already restored this exact bot and
+            // conversation; a remount that keeps both must not repeat the desk
+            // restore reads (messages, work log, live turn, inspector support).
+            let conversationChanged = selectedConversation?.id != selectedConversationIDBeforeReload
+            if selectedBotID != selectedBotIDBeforeReload || conversationChanged {
+                reloadSelectedBot(id: selectedBotID)
+            }
         }
         // Dest first. First paint dest used to dest inbox
         // (listAttention) before dest dested Chat. Dest dests
@@ -6728,6 +6739,9 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func reloadSelectedBot(id: BotID) {
+#if DEBUG
+        reloadSelectedBotCountForTesting += 1
+#endif
         leaveDeskLiveWatch()
         resetTokenSaverFooterSnapshot()
         let conversation = destConversation(for: id)

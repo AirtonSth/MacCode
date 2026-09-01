@@ -3123,6 +3123,34 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_reloadDoesNotRestoreTheSameDeskTwice_becauseRemountsRepeatTheReads() throws {
+        // WHY (perf BT-12): reload() ran reloadSelectedBot before and after
+        // reloadFleet; when the selected bot and conversation are unchanged the
+        // second pass repeated the desk restore reads (messages, work log, live
+        // turn, inspector support) for nothing on every remount.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+
+        let before = vm.reloadSelectedBotCountForTesting
+        vm.reload()
+        XCTAssertEqual(
+            vm.reloadSelectedBotCountForTesting - before, 1,
+            "a remount that keeps the same bot and conversation must restore the desk once"
+        )
+
+        // Switching to a different bot must still restore that bot's desk.
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer")
+        vm.openDesk(quinn)
+        let beforeSwitch = vm.reloadSelectedBotCountForTesting
+        vm.reload()
+        XCTAssertEqual(
+            vm.reloadSelectedBotCountForTesting - beforeSwitch, 1,
+            "a remount after switching bots restores the newly selected bot's desk exactly once"
+        )
+    }
+
     func test_setPinnedStillSortsPinnedFirst_becauseStaleOrderMustNotLookCurrent() throws {
         // WHY: cache-first dest is honest only when Pin still jumps the
         // teammate to the top and Unpin puts them back with the live rows.
