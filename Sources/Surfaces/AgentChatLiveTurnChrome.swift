@@ -946,6 +946,9 @@ public struct AgentChatWorkingStatusStrip: View {
 }
 
 /// 1s cadence for the first minute, 5s after — same as Agent App workingStatus.
+/// Perf CH-12: honours `mode == .lowFrequency` (SwiftUI passes it while the
+/// view is occluded / its window is minimized) by pinning the 5s cadence, so
+/// hidden working strips are not a steady 1s wake-up source.
 struct AgentChatElapsedTickSchedule: TimelineSchedule {
     let start: Date
 
@@ -954,7 +957,7 @@ struct AgentChatElapsedTickSchedule: TimelineSchedule {
         return AnyIterator {
             let current = next
             let elapsed = current.timeIntervalSince(start)
-            let step: TimeInterval = elapsed < 60 ? 1 : 5
+            let step: TimeInterval = (elapsed < 60 && mode != .lowFrequency) ? 1 : 5
             next = current.addingTimeInterval(step)
             return current
         }
