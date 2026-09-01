@@ -3075,6 +3075,54 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(vm.fleet.first).pinned)
     }
 
+    func test_activeBotCountSurvivesPublishesWithoutRosterQueries_andTracksRunTransitions() throws {
+        // WHY (perf BT-01): the roster body read `activeBotCount` up to 8× and
+        // every read ran `liveWorkingBots()` — two SQLite queries plus a
+        // coordinator lock — on every VM publish: per streamed token, per 250ms
+        // live-turn tick, per roster-search keystroke. The stored count must
+        // survive publishes with zero liveWorkingBots() runs and still track
+        // run start/end transitions.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        let thread = AgentThread(title: "Run", provider: .codex, model: "test")
+        try context.threadRepo.upsert(thread)
+        try context.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Run chat", linkedAgentThreadID: thread.id)
+        )
+
+        vm.activeThreadIDsOverrideForTesting = []
+        XCTAssertEqual(vm.activeBotCount, 0)
+        let baseline = vm.liveWorkingBotsCountForTesting
+
+        // 50 unrelated publishes (per-token desk timeline writes are the worst
+        // case), each followed by the roster badge/subtitle/footer reads.
+        for _ in 0..<50 {
+            vm.objectWillChange.send()
+            _ = vm.activeBotCount
+            _ = vm.activeBotsSubtitle
+            _ = vm.activeBotsFooterLine
+        }
+        XCTAssertEqual(
+            vm.liveWorkingBotsCountForTesting, baseline,
+            "50 VM publishes with badge/subtitle/footer reads must not run liveWorkingBots() (roster SQLite queries)"
+        )
+
+        // Run start: the linked thread joins the active set -> count 0 -> 1.
+        vm.activeThreadIDsOverrideForTesting = [thread.id]
+        XCTAssertEqual(
+            vm.activeBotCount, 1,
+            "a bot whose linked thread starts running must count as active"
+        )
+
+        // Run end: the thread leaves the active set -> count back to 0.
+        vm.activeThreadIDsOverrideForTesting = []
+        XCTAssertEqual(
+            vm.activeBotCount, 0,
+            "a bot whose linked run finished must leave the active count"
+        )
+    }
+
     func test_setPinnedStillSortsPinnedFirst_becauseStaleOrderMustNotLookCurrent() throws {
         // WHY: cache-first dest is honest only when Pin still jumps the
         // teammate to the top and Unpin puts them back with the live rows.
