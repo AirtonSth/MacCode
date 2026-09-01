@@ -45,12 +45,12 @@ running_pids="$(ps -axo pid=,command= \
 for pid in $running_pids; do
   kill "$pid" 2>/dev/null || true
 done
-# Use the debug build while preserving the existing bundle-id override contract.
-# An explicit caller override still wins.
+# Use the release build by default while preserving the existing config override.
+# An explicit caller override still wins; the package guard rejects debug here.
 # Agents: this default still packages io.remotecode.desktop and can quit the
 # user's host app. Use scripts/isolated-sandbox.sh for an isolated debug GUI.
 RC2_REPLACE_RUNNING_APP=1 \
-RC2_CONFIG=debug \
+RC2_CONFIG="${RC2_CONFIG:-release}" \
 ./scripts/package-app.sh
 /usr/bin/open -n "$APP_BUNDLE"
 
