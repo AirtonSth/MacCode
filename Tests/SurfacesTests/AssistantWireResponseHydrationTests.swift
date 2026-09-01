@@ -32,37 +32,29 @@ final class AssistantWireResponseHydrationTests: XCTestCase {
             expected[message.id] = wire
         }
 
-        let recentLoaded = await AgentAppViewModel.loadMessagePageOffMain(
+        let recentPayload = await AgentAppViewModel.loadMessagePagePayloadOffMain(
             repository: messages,
             threadId: thread.id
         )
-        let recent = try XCTUnwrap(recentLoaded)
+        let recent = try XCTUnwrap(recentPayload.page)
         XCTAssertEqual(recent.rows.count, 25)
         XCTAssertTrue(recent.hasMoreOlder)
-        let recentResponses = await AgentAppViewModel.loadPersistedAssistantRCW1ResponsesOffMain(
-            repository: messages,
-            threadId: thread.id,
-            messageIds: recent.rows.map(\.id)
-        )
+        let recentResponses = recentPayload.assistantRCW1Responses
         XCTAssertEqual(recentResponses.count, 25)
         for message in recent.rows {
             XCTAssertEqual(recentResponses[message.id]?.wireResponseText, expected[message.id])
         }
 
         let oldestRecent = try XCTUnwrap(recent.rows.first)
-        let olderLoaded = await AgentAppViewModel.loadMessagePageOffMain(
+        let olderPayload = await AgentAppViewModel.loadMessagePagePayloadOffMain(
             repository: messages,
             threadId: thread.id,
             before: AgentMessageCursor(createdAt: oldestRecent.createdAt, id: oldestRecent.id)
         )
-        let older = try XCTUnwrap(olderLoaded)
+        let older = try XCTUnwrap(olderPayload.page)
         XCTAssertEqual(older.rows.count, 5)
         XCTAssertFalse(older.hasMoreOlder)
-        let olderResponses = await AgentAppViewModel.loadPersistedAssistantRCW1ResponsesOffMain(
-            repository: messages,
-            threadId: thread.id,
-            messageIds: older.rows.map(\.id)
-        )
+        let olderResponses = olderPayload.assistantRCW1Responses
         XCTAssertEqual(olderResponses.count, 5)
         for message in older.rows {
             XCTAssertEqual(olderResponses[message.id]?.wireResponseText, expected[message.id])

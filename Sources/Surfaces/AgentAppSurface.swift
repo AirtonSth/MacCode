@@ -945,19 +945,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.liveTokenSaverOptimizedMessageIds.insert(msgId)
                 self.tokenSaverOptimizedMessageIds.insert(msgId)
                 guard let threadId = self.selectedThreadId else { return }
-                let persisted = await Self.loadPersistedUserRCW1RequestsOffMain(
+                let persisted = await Self.loadPersistedWireTranslationsOffMain(
                     repository: self.messageRepo,
                     threadId: threadId,
-                    messageIds: [msgId]
-                )
-                let persistedResponses = await Self.loadPersistedAssistantRCW1ResponsesOffMain(
-                    repository: self.messageRepo,
-                    threadId: threadId,
-                    messageIds: [msgId]
+                    messageId: msgId
                 )
                 guard self.selectedThreadId == threadId else { return }
-                self.mergePersistedUserRCW1Requests(persisted)
-                self.mergePersistedAssistantRCW1Responses(persistedResponses)
+                self.mergePersistedUserRCW1Requests(persisted.requests)
+                self.mergePersistedAssistantRCW1Responses(persisted.responses)
             }
         }
         // XCTest: same-stack rail load so selectThread(initial) sees rows.
@@ -3867,23 +3862,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         cancelOlderMessageLoad()
         let repository = messageRepo
         messageHistoryLoadTask = Task { @MainActor [weak self] in
-            let loaded = await Self.loadMessagePageOffMain(repository: repository, threadId: id)
-            let loadedRows = loaded?.rows ?? []
-            let persistedRequests = await Self.loadPersistedUserRCW1RequestsOffMain(
+            // Perf AA-10: one detached round-trip for the page and the three
+            // persisted lookups (was 4 sequential detached hops + MainActor
+            // returns).
+            let payload = await Self.loadMessagePagePayloadOffMain(
                 repository: repository,
-                threadId: id,
-                messageIds: Array(loadedRows.lazy.filter { $0.role == .user }.map(\.id))
+                threadId: id
             )
-            let persistedResponses = await Self.loadPersistedAssistantRCW1ResponsesOffMain(
-                repository: repository,
-                threadId: id,
-                messageIds: Array(loadedRows.lazy.filter { $0.role == .assistant }.map(\.id))
-            )
-            let persistedDisplayModes = await Self.loadPersistedTokenSaverDisplayModesOffMain(
-                repository: repository,
-                threadId: id,
-                messageIds: loadedRows.map(\.id)
-            )
+            let loadedRows = payload.page?.rows ?? []
             guard let self, !Task.isCancelled, !self.isDisposed,
                   self.selectedThreadId == id else { return }
             // Rows appended in-memory while the page was being read (system
@@ -3895,10 +3881,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 inMemory: self.messages,
                 threadId: id
             )
-            self.mergePersistedUserRCW1Requests(persistedRequests)
-            self.mergePersistedAssistantRCW1Responses(persistedResponses)
-            self.mergePersistedTokenSaverDisplayModes(persistedDisplayModes)
-            self.messageHistoryIsPartial = loaded?.hasMoreOlder ?? false
+            self.mergePersistedUserRCW1Requests(payload.userRCW1Requests)
+            self.mergePersistedAssistantRCW1Responses(payload.assistantRCW1Responses)
+            self.mergePersistedTokenSaverDisplayModes(payload.tokenSaverDisplayModes)
+            self.messageHistoryIsPartial = payload.page?.hasMoreOlder ?? false
             self.ensureBotPeerReconciliation()
             // Queue rows are not transcript bubbles; only re-apply plan
             // suppression after the durable message merge.
@@ -3996,45 +3982,71 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }.value
     }
 
-    nonisolated static func loadPersistedUserRCW1RequestsOffMain(
+    /// Wire-translation hydration for one message id, in a single detached hop.
+    nonisolated static func loadPersistedWireTranslationsOffMain(
         repository: AgentMessageRepository,
         threadId: AgentThreadID,
-        messageIds: [AgentMessageID]
-    ) async -> [AgentMessageID: String] {
-        guard !messageIds.isEmpty else { return [:] }
-        return await Task.detached(priority: .userInitiated) {
-            (try? repository.rcw1RequestTranslations(
+        messageId: AgentMessageID
+    ) async -> (requests: [AgentMessageID: String], responses: [AgentMessageID: AgentMessageRCW1Response]) {
+        await Task.detached(priority: .userInitiated) {
+            let requests = (try? repository.rcw1RequestTranslations(
                 threadId: threadId,
-                messageIds: messageIds
+                messageIds: [messageId]
             )) ?? [:]
+            let responses = (try? repository.rcw1ResponseTranslations(
+                threadId: threadId,
+                messageIds: [messageId]
+            )) ?? [:]
+            return (requests, responses)
         }.value
     }
 
-    nonisolated static func loadPersistedAssistantRCW1ResponsesOffMain(
-        repository: AgentMessageRepository,
-        threadId: AgentThreadID,
-        messageIds: [AgentMessageID]
-    ) async -> [AgentMessageID: AgentMessageRCW1Response] {
-        guard !messageIds.isEmpty else { return [:] }
-        return await Task.detached(priority: .userInitiated) {
-            (try? repository.rcw1ResponseTranslations(
-                threadId: threadId,
-                messageIds: messageIds
-            )) ?? [:]
-        }.value
+    /// Everything `loadAllMessages` needs, gathered in ONE detached round-trip
+    /// (perf AA-10: the page query and the three persisted per-message lookups
+    /// used to be 4 sequential detached hops with a MainActor return each).
+    struct AgentMessagePagePayload: Sendable {
+        var page: AgentMessageBodyBudgetResult?
+        var userRCW1Requests: [AgentMessageID: String] = [:]
+        var assistantRCW1Responses: [AgentMessageID: AgentMessageRCW1Response] = [:]
+        var tokenSaverDisplayModes: [AgentMessageID: AgentMessageTokenSaverDisplayMode] = [:]
     }
 
-    nonisolated static func loadPersistedTokenSaverDisplayModesOffMain(
+    nonisolated static func loadMessagePagePayloadOffMain(
         repository: AgentMessageRepository,
         threadId: AgentThreadID,
-        messageIds: [AgentMessageID]
-    ) async -> [AgentMessageID: AgentMessageTokenSaverDisplayMode] {
-        guard !messageIds.isEmpty else { return [:] }
-        return await Task.detached(priority: .userInitiated) {
-            (try? repository.tokenSaverDisplayModes(
+        before: AgentMessageCursor? = nil
+    ) async -> AgentMessagePagePayload {
+        await Task.detached(priority: .userInitiated) {
+            var payload = AgentMessagePagePayload()
+            payload.page = try? repository.listPageWithinBodyBudget(
                 threadId: threadId,
-                messageIds: messageIds
-            )) ?? [:]
+                limit: messageHistoryPageLimit,
+                before: before,
+                budget: fullLoadBodyBudgetBytes,
+                contentLimit: AssistantTimelineState.liveTextLimit
+            )
+            let rows = payload.page?.rows ?? []
+            let userIds = rows.filter { $0.role == .user }.map(\.id)
+            let assistantIds = rows.filter { $0.role == .assistant }.map(\.id)
+            if !userIds.isEmpty {
+                payload.userRCW1Requests = (try? repository.rcw1RequestTranslations(
+                    threadId: threadId,
+                    messageIds: userIds
+                )) ?? [:]
+            }
+            if !assistantIds.isEmpty {
+                payload.assistantRCW1Responses = (try? repository.rcw1ResponseTranslations(
+                    threadId: threadId,
+                    messageIds: assistantIds
+                )) ?? [:]
+            }
+            if !rows.isEmpty {
+                payload.tokenSaverDisplayModes = (try? repository.tokenSaverDisplayModes(
+                    threadId: threadId,
+                    messageIds: rows.map(\.id)
+                )) ?? [:]
+            }
+            return payload
         }.value
     }
 
@@ -4089,26 +4101,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     self.isLoadingOlderMessages = false
                 }
             }
-            let loaded = await Self.loadMessagePageOffMain(
+            let payload = await Self.loadMessagePagePayloadOffMain(
                 repository: repository,
                 threadId: expectedThread,
                 before: cursor
-            )
-            let loadedRows = loaded?.rows ?? []
-            let persistedRequests = await Self.loadPersistedUserRCW1RequestsOffMain(
-                repository: repository,
-                threadId: expectedThread,
-                messageIds: Array(loadedRows.lazy.filter { $0.role == .user }.map(\.id))
-            )
-            let persistedResponses = await Self.loadPersistedAssistantRCW1ResponsesOffMain(
-                repository: repository,
-                threadId: expectedThread,
-                messageIds: Array(loadedRows.lazy.filter { $0.role == .assistant }.map(\.id))
-            )
-            let persistedDisplayModes = await Self.loadPersistedTokenSaverDisplayModesOffMain(
-                repository: repository,
-                threadId: expectedThread,
-                messageIds: loadedRows.map(\.id)
             )
             guard let self, !self.isDisposed,
                   self.selectedThreadId == expectedThread,
@@ -4116,14 +4112,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     myGeneration: myGeneration,
                     currentGeneration: self.loadingOlderGeneration
                   ) else { return }
-            guard let loaded else { return }
+            guard let loaded = payload.page else { return }
             self.messages = Self.mergeOlderMessagePage(
                 older: loaded.rows,
                 current: self.messages
             )
-            self.mergePersistedUserRCW1Requests(persistedRequests)
-            self.mergePersistedAssistantRCW1Responses(persistedResponses)
-            self.mergePersistedTokenSaverDisplayModes(persistedDisplayModes)
+            self.mergePersistedUserRCW1Requests(payload.userRCW1Requests)
+            self.mergePersistedAssistantRCW1Responses(payload.assistantRCW1Responses)
+            self.mergePersistedTokenSaverDisplayModes(payload.tokenSaverDisplayModes)
             self.messageHistoryIsPartial = loaded.hasMoreOlder
             if !loaded.hasMoreOlder {
                 NSLog("[AgentApp] older message pages exhausted for thread \(expectedThread.value.uuidString)")
