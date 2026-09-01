@@ -1083,7 +1083,34 @@ public enum AgentFileEditDiffPresentation {
         return false
     }
 
+    private final class DiffModelBox { let value: Model?; init(_ v: Model?) { value = v } }
+    /// Perf CH-03: the live tool row re-ran the full diff extraction (2-4
+    /// JSONSerialization passes over the whole blob + full-text splits) on every
+    /// body pass — even for Bash tools whose 50 KB output is not a diff. Cached
+    /// per item growth signature (byte counts invalidate on growth).
+    private static let diffModelCache: NSCache<NSString, DiffModelBox> = {
+        let cache = NSCache<NSString, DiffModelBox>()
+        cache.countLimit = 512
+        cache.totalCostLimit = 4 * 1_024 * 1_024
+        return cache
+    }()
+    #if DEBUG
+    nonisolated(unsafe) static var diffModelComputeCountForTesting = 0
+    #endif
+
     public static func model(for item: AssistantItem, maxLines: Int = defaultMaxLines) -> Model? {
+        let key = "\(item.id)|\(item.state.rawValue)|\(item.body.utf8.count)|\(item.output?.utf8.count ?? 0)|\(item.summary?.utf8.count ?? 0)|\(item.resourcePath?.utf8.count ?? 0)|\(maxLines)" as NSString
+        if let cached = diffModelCache.object(forKey: key) { return cached.value }
+        #if DEBUG
+        diffModelComputeCountForTesting &+= 1
+        #endif
+        let result = computeModel(for: item, maxLines: maxLines)
+        let cost = max(1, (item.body.utf8.count + (item.output?.utf8.count ?? 0)) / 8)
+        diffModelCache.setObject(DiffModelBox(result), forKey: key, cost: cost)
+        return result
+    }
+
+    private static func computeModel(for item: AssistantItem, maxLines: Int) -> Model? {
         let path = extractPath(from: item)
         guard let raw = extractDiffText(from: item), !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
@@ -1125,15 +1152,21 @@ public enum AgentFileEditDiffPresentation {
             let trimmed = blob.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
             if looksLikeDiff(trimmed) { return trimmed }
-            if let fromJSON = diffFromJSONChanges(trimmed) { return fromJSON }
-            if let fromEdit = synthesizeDiffFromEditJSON(trimmed) { return fromEdit }
+            // Perf CH-03: JSON payloads must start with { or [ — skip both
+            // JSONSerialization attempts for plain text (the common Bash case).
+            if let first = trimmed.first, first == "{" || first == "[" {
+                if let fromJSON = diffFromJSONChanges(trimmed) { return fromJSON }
+                if let fromEdit = synthesizeDiffFromEditJSON(trimmed) { return fromEdit }
+            }
             if let fromPatch = extractApplyPatchBlock(trimmed) { return fromPatch }
         }
         return nil
     }
 
     public static func looksLikeDiff(_ text: String) -> Bool {
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true).prefix(60) {
+        // Perf CH-03: lazy line scanning — the old eager split allocated the
+        // entire (possibly 50 KB) output before looking at the first lines.
+        for line in text.lazy.split(separator: "\n", omittingEmptySubsequences: true).prefix(60) {
             let s = String(line)
             if s.hasPrefix("diff --git ") || s.hasPrefix("@@") || s.hasPrefix("--- ") || s.hasPrefix("+++ ") {
                 return true
@@ -1144,7 +1177,8 @@ public enum AgentFileEditDiffPresentation {
         }
         // Heuristic: several +/- code lines without being a bullet list.
         var plus = 0, minus = 0
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true).prefix(80) {
+        for lazyLine in text.lazy.split(separator: "\n", omittingEmptySubsequences: true).prefix(80) {
+            let line = String(lazyLine)
             if line.hasPrefix("+") && !line.hasPrefix("++") { plus += 1 }
             if line.hasPrefix("-") && !line.hasPrefix("--") { minus += 1 }
         }

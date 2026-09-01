@@ -3009,7 +3009,13 @@ public final class BotsViewModel: ObservableObject {
 
     public static let assistantPlaceholder = BotsDeskFollowThrough.noRouterPlaceholder
 
-    @Published public private(set) var bots: [BotDefinition] = []
+    @Published public private(set) var bots: [BotDefinition] = [] {
+        didSet { refreshActiveBotCount() }
+    }
+    /// Stored working-bot count so roster/Active Bots bodies never run the
+    /// `liveWorkingBots()` SQLite reads (perf BT-01). Refreshed only where the
+    /// inputs change — see `refreshActiveBotCount()`.
+    @Published public private(set) var activeBotCount: Int = 0
     /// Stored roster snapshot so ForEach does not re-filter/sort `fleet` on
     /// unrelated @Published writes (desk timeline, inspector, Token Saver).
     @Published public private(set) var publishedRoster: [BotDefinition] = []
@@ -3115,7 +3121,9 @@ public final class BotsViewModel: ObservableObject {
     public private(set) var lastDeskRunPermissionForTesting: AgentPermissionMode?
     public private(set) var lastDeskRunReasoningForTesting: AgentReasoningEffort?
     public private(set) var lastMentionedBotIDForTesting: BotID?
-    public var activeThreadIDsOverrideForTesting: Set<AgentThreadID>?
+    public var activeThreadIDsOverrideForTesting: Set<AgentThreadID>? {
+        didSet { refreshActiveBotCount() }
+    }
     public private(set) var lastHopUserTextForTesting: String?
     public private(set) var lastSupervisedRunUserTextForTesting: String?
     public private(set) var supervisedRunBotIDsForTesting: [BotID] = []
@@ -3159,6 +3167,12 @@ public final class BotsViewModel: ObservableObject {
     public private(set) var lastAttentionAcknowledgedOnScreenForTesting: BotsScreen?
     /// Test seam: full-fleet reloads. Roster dest must not increment this.
     public private(set) var fleetReloadCountForTesting = 0
+#if DEBUG
+    public private(set) var reloadSelectedBotCountForTesting = 0
+#endif
+#if DEBUG
+    public private(set) var liveWorkingBotsCountForTesting = 0
+#endif
     /// Test seam: actual Active Bots store hydration passes, excluding
     /// generation-coalesced appearance/tab requests.
     public private(set) var activeBotsHydrationCountForTesting = 0
@@ -3306,7 +3320,9 @@ public final class BotsViewModel: ObservableObject {
     /// reuse it or flash empty while SQLite hydrates.
     private var messagesByConversation: [BotConversationID: [BotDeskMessage]] = [:]
     private var selectedConversationByBot: [BotID: BotConversationID] = [:]
-    private var attentionStateByBot: [BotID: BotAttentionState] = [:]
+    private var attentionStateByBot: [BotID: BotAttentionState] = [:] {
+        didSet { refreshActiveBotCount() }
+    }
     private var lastPreviewByBot: [BotID: String] = [:]
     private var lastUpdatedByBot: [BotID: Date] = [:]
     private var lastLinkedRunIDByBot: [BotID: AgentRunID] = [:]
@@ -3326,7 +3342,9 @@ public final class BotsViewModel: ObservableObject {
     private var deskRoutingHydrated = false
     private var isApplyingDeskRouting = false
     private var deskRoutingByConversation: [BotConversationID: BotDeskRouting] = [:]
-    private var peerHandoffs: [UUID: PersistedBotPeerHandoff] = [:]
+    private var peerHandoffs: [UUID: PersistedBotPeerHandoff] = [:] {
+        didSet { refreshActiveBotCount() }
+    }
     private var armedRunIDs: Set<AgentRunID> = []
     private var exactRunWaiters: [AgentRunID: [CheckedContinuation<AgentRun?, Never>]] = [:]
     private var observedTerminalRuns: [AgentRunID: AgentRun] = [:]
@@ -3517,7 +3535,17 @@ public final class BotsViewModel: ObservableObject {
 
     /// Bots that are actually running — same idea as Active Threads.
     /// Needs-you is not a live run.
-    public var activeBotCount: Int { liveWorkingBots().count }
+    /// Recomputes the stored `activeBotCount`. Called only where the inputs
+    /// change: roster/attention/handoff writes (didSet), run status transitions,
+    /// and the Active Bots screen reload. Bodies read the stored count —
+    /// `liveWorkingBots()` costs two SQLite queries plus a coordinator lock
+    /// (perf BT-01).
+    public func refreshActiveBotCount() {
+        let next = liveWorkingBots().count
+        if next != activeBotCount {
+            activeBotCount = next
+        }
+    }
 
     public var activeBotsFooterLine: String {
         let activeLabel = activeBotCount == 1 ? "1 active" : "\(activeBotCount) active"
@@ -3744,6 +3772,9 @@ public final class BotsViewModel: ObservableObject {
         activeBotsHydrationCountForTesting += 1
         settleTerminalWorkingConversations()
         let liveBots = liveWorkingBots()
+        if activeBotCount != liveBots.count {
+            activeBotCount = liveBots.count
+        }
         let inMemoryStartedAt = Dictionary(uniqueKeysWithValues: liveBots.compactMap { bot in
             inMemoryStartedAtForLiveBot(bot).map { (bot.id, $0) }
         })
@@ -3765,6 +3796,9 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func liveWorkingBots() -> [BotDefinition] {
+#if DEBUG
+        liveWorkingBotsCountForTesting += 1
+#endif
         var seen = Set<BotID>()
         var result: [BotDefinition] = []
         let handoffBotIDs = activeHandoffBotIDs()
@@ -3948,13 +3982,21 @@ public final class BotsViewModel: ObservableObject {
         // Dest first. Remount dest used to scan every teammate's
         // conversations + recent messages before dest dested Chat.
         // Dest already has this teammate's thread and dest cache.
+        let selectedBotIDBeforeReload = selectedBotID
+        let selectedConversationIDBeforeReload = selectedConversation?.id
         if !bots.isEmpty, let selectedBotID {
             reloadSelectedBot(id: selectedBotID)
         }
         reloadFleet()
         restoreSelectedBotIfNeeded()
         if let selectedBotID {
-            reloadSelectedBot(id: selectedBotID)
+            // Perf BT-12: the pre-fleet pass already restored this exact bot and
+            // conversation; a remount that keeps both must not repeat the desk
+            // restore reads (messages, work log, live turn, inspector support).
+            let conversationChanged = selectedConversation?.id != selectedConversationIDBeforeReload
+            if selectedBotID != selectedBotIDBeforeReload || conversationChanged {
+                reloadSelectedBot(id: selectedBotID)
+            }
         }
         // Dest first. First paint dest used to dest inbox
         // (listAttention) before dest dested Chat. Dest dests
@@ -6697,6 +6739,9 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func reloadSelectedBot(id: BotID) {
+#if DEBUG
+        reloadSelectedBotCountForTesting += 1
+#endif
         leaveDeskLiveWatch()
         resetTokenSaverFooterSnapshot()
         let conversation = destConversation(for: id)
@@ -9944,6 +9989,7 @@ extension BotsViewModel: AgentRunObserver {
                 providerThreadID: providerThreadId
             )
             self?.adoptLinkedRunTerminal(runId: runId, threadId: threadId)
+            self?.refreshActiveBotCount()
         }
     }
 
@@ -9957,6 +10003,7 @@ extension BotsViewModel: AgentRunObserver {
             guard let self else { return }
             if BotsDeskFollowThrough.isTerminal(status) {
                 self.adoptLinkedRunTerminal(runId: runId, threadId: threadId)
+                self.refreshActiveBotCount()
                 return
             }
             if let conversation = try? self.botStore.conversationLinked(to: threadId) {

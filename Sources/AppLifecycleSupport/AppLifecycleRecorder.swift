@@ -151,6 +151,12 @@ public final class AppLifecycleRecorder {
         let marker = "pid=\(pid) startedAt=\(ts)"
         try? Data(marker.utf8).write(to: markerURL)
         record("launch \(marker)")
+#if DEBUG
+        // Debug builds run SwiftUI diffing / JSON decode 5-20x slower; one
+        // boot line makes a debug-packaged app identifiable in perf triage
+        // (perf audit X-00).
+        record("build=debug")
+#endif
     }
 
     /// Clear the run marker; call from `applicationWillTerminate` so the next

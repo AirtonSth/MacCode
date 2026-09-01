@@ -89,6 +89,25 @@ if [ "${RC2_REQUIRE_SPARKLE_KEY:-0}" = "1" ] && [ -z "$SPARKLE_PUBLIC_ED_KEY" ];
   exit 1
 fi
 
+# The owner-facing app at dist/RemoteCode.app must never be a debug build:
+# SwiftUI diffing, JSONDecoder and AttributedString(markdown:) run 5-20x
+# slower under -Onone, amplifying every transcript/streaming cost (perf audit
+# X-00: the running app was a 216 MB debug binary). The isolated sandbox
+# packages dist/RemoteCodeDebug.app, which may stay debug.
+resolve_path_for_config_guard() {
+  local dir
+  dir="$(dirname "$1")"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s/%s\n' "$(cd "$dir" && pwd -P)" "$(basename "$1")"
+}
+if [ "$CONFIG" != "release" ] \
+  && [ "$(resolve_path_for_config_guard "${RC2_PACKAGE_APP_OUTPUT:-$DIST/$BUNDLE}")" \
+       = "$(resolve_path_for_config_guard "$DIST/$BUNDLE")" ]; then
+  echo "[package] refusing to package a $CONFIG build into the stable app $DIST/$BUNDLE" >&2
+  echo "[package] use RC2_CONFIG=release, or package a debug build to a different RC2_PACKAGE_APP_OUTPUT (the sandbox uses dist/RemoteCodeDebug.app)" >&2
+  exit 1
+fi
+
 BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
 echo "[package] building $CONFIG …"
 swift build -c "$CONFIG"

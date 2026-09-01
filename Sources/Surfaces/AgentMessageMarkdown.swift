@@ -89,7 +89,10 @@ enum AgentMessageMarkdown {
 
     static func blocks(from text: String, cache: Bool = true) -> [AgentMessageMarkdownBlock] {
         let key = text as NSString
-        if cache, let cached = blocksCache.object(forKey: key) { return cached.blocks }
+        // Perf CH-04: `cache: false` (live streaming rows) must only skip the
+        // STORE — the read still hits, so a body that was parsed while finished
+        // (or by a sibling surface) is never re-parsed.
+        if let cached = blocksCache.object(forKey: key) { return cached.blocks }
         let result = computeBlocks(from: text)
         let cost = text.utf8.count
         if shouldStoreMarkdownCache(textUTF8Count: cost, cache: cache) {
@@ -163,7 +166,10 @@ enum AgentMessageMarkdown {
                 continue
             }
 
-            var line = attributedInline(source, cache: cache)
+            // Perf CH-04: in a live streaming group only the LAST block can
+            // still grow; stable earlier blocks are cached and read like
+            // finished content so a token does not re-parse them.
+            var line = attributedInline(source, cache: cache || index < blocks.count - 1)
             line.font = .system(size: size, weight: weight)
             line.foregroundColor = color
             result.append(line)
@@ -338,7 +344,8 @@ enum AgentMessageMarkdown {
 
     static func attributedInline(_ text: String, cache: Bool = true) -> AttributedString {
         let key = text as NSString
-        if cache, let cached = inlineCache.object(forKey: key) { return cached.value }
+        // Perf CH-04: `cache: false` skips only the store; the read still hits.
+        if let cached = inlineCache.object(forKey: key) { return cached.value }
         let result = computeAttributedInline(text)
         let cost = text.utf8.count
         if shouldStoreMarkdownCache(textUTF8Count: cost, cache: cache) {
@@ -607,8 +614,15 @@ public struct AgentMessageMarkdownView: View {
                     if group.count == 1, let block = group.first, isIsolatedBlock(block) {
                         blockView(block, index: index)
                     } else {
+                        // Perf CH-04: only the last group of a live row can still
+                        // grow; earlier groups parse (and cache) like finished
+                        // content so tokens do not re-parse stable paragraphs.
                         AgentLinkedAttributedText(
-                            attributed: AgentMessageMarkdown.selectableProse(from: group, compact: compact, cache: cacheResults),
+                            attributed: AgentMessageMarkdown.selectableProse(
+                                from: group,
+                                compact: compact,
+                                cache: cacheResults || index < groups.count - 1
+                            ),
                             font: .systemFont(ofSize: 13),
                             textColor: DS.NS.text,
                             lineFragmentPadding: 0,

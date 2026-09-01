@@ -137,7 +137,13 @@ public struct AgentComposerTextEditor: NSViewRepresentable {
            !context.coordinator.isIMEComposing {
             context.coordinator.applyExternalText(text, to: textView)
         }
-        context.coordinator.recalculateHeight()
+        // Perf CH-10: every unrelated SwiftUI update of this representable used
+        // to force a full layoutManager.ensureLayout of the prompt. Layout is
+        // only needed when external text was applied or the container width
+        // changed; textDidChange keeps its single per-keystroke pass.
+        if context.coordinator.needsHeightRecalculation(for: textView) {
+            context.coordinator.recalculateHeight()
+        }
         scroll.hasVerticalScroller = height >= Self.maxHeight
         if context.coordinator.appliedFocusTick != focusTick {
             context.coordinator.appliedFocusTick = focusTick
@@ -164,12 +170,41 @@ public struct AgentComposerTextEditor: NSViewRepresentable {
         let onTextEdited: () -> Void
         let onCursorMoved: (Int) -> Void
         let onCaretRectChanged: (CGRect) -> Void
-        fileprivate weak var textView: PromptComposerTextView?
+        weak var textView: PromptComposerTextView?
         var appliedFocusTick: Int?
         /// True while AppKit reports marked text (dead-key / IME preedit).
         /// Blocks SwiftUI→NSTextView applies that would abort composition.
         var isIMEComposing = false
         private var externallyAppliedText: String?
+        /// Width the last height layout ran at (perf CH-10).
+        private var lastCalculatedWidth: CGFloat?
+        /// Set when external text was applied and the height must be re-laid-out
+        /// even at an unchanged width (perf CH-10).
+        private var pendingExternalTextHeightRecalc = false
+#if DEBUG
+        var recalculateHeightCountForTesting = 0
+#endif
+
+        /// Whether `updateNSView` must run a layout pass: external text applied,
+        /// or the container width changed since the last one (perf CH-10).
+        func needsHeightRecalculation(for textView: NSTextView) -> Bool {
+            if pendingExternalTextHeightRecalc { return true }
+            guard let container = textView.textContainer else { return false }
+            if lastCalculatedWidth == nil { return true }
+            return abs(container.size.width - (lastCalculatedWidth ?? 0)) > 0.5
+        }
+
+        /// Pure gate for tests: external applies always need layout; otherwise
+        /// only a width change does.
+        nonisolated static func shouldRecalculateHeight(
+            appliedExternalText: Bool,
+            currentWidth: CGFloat,
+            lastCalculatedWidth: CGFloat?
+        ) -> Bool {
+            if appliedExternalText { return true }
+            guard let lastCalculatedWidth else { return true }
+            return abs(currentWidth - lastCalculatedWidth) > 0.5
+        }
 
         init(
             text: Binding<String>,
@@ -258,16 +293,22 @@ public struct AgentComposerTextEditor: NSViewRepresentable {
             let endOffset = (value as NSString).length
             textView.setSelectedRange(NSRange(location: endOffset, length: 0))
             onCursorMoved(endOffset)
+            pendingExternalTextHeightRecalc = true
         }
 
         func recalculateHeight() {
             guard let textView else { return }
             guard let layoutManager = textView.layoutManager,
                   let container = textView.textContainer else { return }
+#if DEBUG
+            recalculateHeightCountForTesting += 1
+#endif
             layoutManager.ensureLayout(for: container)
             let used = layoutManager.usedRect(for: container).height
             let next = min(AgentComposerTextEditor.maxHeight,
                            max(AgentComposerTextEditor.minHeight, ceil(used + textView.textContainerInset.height * 2)))
+            lastCalculatedWidth = container.size.width
+            pendingExternalTextHeightRecalc = false
             if abs(height - next) > 0.5 {
                 DispatchQueue.main.async { [weak self] in
                     self?.height = next
@@ -277,7 +318,7 @@ public struct AgentComposerTextEditor: NSViewRepresentable {
     }
 }
 
-private final class PromptComposerTextView: NSTextView {
+final class PromptComposerTextView: NSTextView {
     var onSend: (() -> Void)?
     var onPreviousHistory: (() -> Bool)?
     var onNextHistory: (() -> Bool)?

@@ -35,9 +35,11 @@ public enum Schema {
     /// v77 owns nullable agent_runs.terminal_reason (downgrade-safe),
     /// v78 deduplicates Token Saver savings by logical request, v79 keeps
     /// authenticated item metadata outside the rolling replay window, and
-    /// v80 owns host-authoritative Bot queued follow-ups, and v81 indexes the
-    /// exact running-thread predicate used by provider-session reaping.
-    public static let currentVersion: Int = 81
+    /// v80 owns host-authoritative Bot queued follow-ups, v81 indexes the
+    /// exact running-thread predicate used by provider-session reaping, and
+    /// v82 indexes audit_log(action, id) so the orchestration receipt poll
+    /// can read its append signature without a table scan.
+    public static let currentVersion: Int = 82
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1756,6 +1758,10 @@ public enum Schema {
         CREATE INDEX IF NOT EXISTS idx_agent_threads_running
             ON agent_threads(id)
             WHERE status = 'running';
+        """),
+        SchemaStep(82, """
+        CREATE INDEX IF NOT EXISTS idx_audit_log_action_id
+            ON audit_log(action, id);
         """),
     ]
 

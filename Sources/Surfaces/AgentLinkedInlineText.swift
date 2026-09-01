@@ -504,11 +504,27 @@ final class IntrinsicHeightTextView: NSTextView {
     }
 
     /// Same layout engine as the live NSTextView, without mounting a view.
+    private final class IdealSizeBox { let value: CGSize; init(_ v: CGSize) { value = v } }
+    /// Perf CH-02: user-bubble hug measurement allocates NSTextStorage +
+    /// NSLayoutManager and ensureLayouts the WHOLE prompt; it used to run on
+    /// every bubble body pass. Cached per (font, padding, text).
+    private static let idealSizeCache: NSCache<NSString, IdealSizeBox> = {
+        let cache = NSCache<NSString, IdealSizeBox>()
+        cache.countLimit = 256
+        cache.totalCostLimit = 1_024 * 1_024
+        return cache
+    }()
+    #if DEBUG
+    nonisolated(unsafe) static var idealSizeComputeCountForTesting = 0
+    #endif
+
     static func idealSize(
         string: String,
         font: NSFont,
         lineFragmentPadding: CGFloat = 0
     ) -> CGSize {
+        let key = "\(font.fontName)|\(font.pointSize)|\(lineFragmentPadding)|\(string)" as NSString
+        if let cached = idealSizeCache.object(forKey: key) { return cached.value }
         let attributed = NSAttributedString(string: string, attributes: [.font: font])
         let storage = NSTextStorage(attributedString: attributed)
         let manager = NSLayoutManager()
@@ -523,10 +539,15 @@ final class IntrinsicHeightTextView: NSTextView {
         manager.ensureLayout(for: container)
         let used = manager.usedRect(for: container)
         let fallback = font.boundingRectForFont.height
-        return CGSize(
+        let result = CGSize(
             width: max(ceil(used.width), 0),
             height: max(ceil(used.height), fallback)
         )
+        idealSizeCache.setObject(IdealSizeBox(result), forKey: key, cost: max(1, string.utf8.count))
+        #if DEBUG
+        idealSizeComputeCountForTesting &+= 1
+        #endif
+        return result
     }
 
     func sizeThatFitsWidth(_ width: CGFloat) -> CGSize {

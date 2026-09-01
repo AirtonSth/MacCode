@@ -35,6 +35,27 @@ final class AppLifecycleRecorderTests: XCTestCase {
         )
     }
 
+    func test_beginRunRecordsDebugBuildMarkerInDebugBuilds() throws {
+        // WHY (perf X-00): a debug-packaged app is 5-20x slower in SwiftUI /
+        // JSON paths; the boot log must make the build config visible in one
+        // line so perf triage never has to guess from binary size again.
+        let (recorder, dir) = makeRecorder()
+        recorder.beginRun()
+#if DEBUG
+        let log = try String(contentsOf: dir.appendingPathComponent("lifecycle.log"), encoding: .utf8)
+        XCTAssertTrue(
+            log.contains("build=debug"),
+            "a debug build must stamp build=debug at boot so a debug-packaged app is identifiable in one line"
+        )
+#else
+        let log = try String(contentsOf: dir.appendingPathComponent("lifecycle.log"), encoding: .utf8)
+        XCTAssertFalse(
+            log.contains("build=debug"),
+            "a release build must not claim to be debug at boot"
+        )
+#endif
+    }
+
     func test_consumingStaleMarkerIsIdempotent() {
         let (first, dir) = makeRecorder()
         first.beginRun()

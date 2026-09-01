@@ -624,6 +624,89 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
+    // MARK: - Append-signature activity cache (perf X-01)
+
+    /// Receipt rows in `audit_log` are append-only, so `(count, max id)` over
+    /// the two receipt actions is a cheap cross-process-safe signature: other
+    /// processes (distill provider proxies) append receipts too, so a cache fed
+    /// only by local writes would go stale. A `nil` signature (file storage,
+    /// empty table, query failure) disables caching entirely — callers then pay
+    /// the uncached path exactly as before.
+    private struct ReceiptSetSignature: Equatable {
+        let count: Int
+        let maxID: Int64
+    }
+
+    private let activityCacheLock = NSLock()
+    private var cachedThreadActivityFetch: (
+        key: String,
+        signature: ReceiptSetSignature,
+        receipts: [AgentOrchestrationAdmissionReceipt]
+    )?
+    private var cachedRunReceipts:
+        [AgentRunID: (signature: ReceiptSetSignature, receipt: AgentOrchestrationAdmissionReceipt?)] = [:]
+    private static let runReceiptMemoCap = 256
+#if DEBUG
+    public private(set) var receiptDetailDecodeCountForTesting = 0
+#endif
+
+    /// Must be called under `withReceiptRead`/`withReceiptMutation` so the
+    /// signature read joins the caller's transaction.
+    private func receiptSetSignatureUnlocked() -> ReceiptSetSignature? {
+        switch storage {
+        case .database(_, let repository):
+            guard let signature = try? repository.auditLogSignature(
+                actions: [Self.admissionAction, Self.lifecycleAction]
+            ) else { return nil }
+            return ReceiptSetSignature(count: signature.count, maxID: signature.maxID)
+        case .file:
+            return nil
+        }
+    }
+
+    private func cachedThreadActivityUnlocked(
+        threadIds: Set<AgentThreadID>,
+        limit: Int,
+        childRecordLimit: Int,
+        signature: ReceiptSetSignature?
+    ) -> [AgentOrchestrationAdmissionReceipt]? {
+        guard let signature else { return nil }
+        let key = Self.threadActivityCacheKey(
+            threadIds: threadIds, limit: limit, childRecordLimit: childRecordLimit
+        )
+        return activityCacheLock.withLock { () -> [AgentOrchestrationAdmissionReceipt]? in
+            guard let cached = cachedThreadActivityFetch,
+                  cached.key == key,
+                  cached.signature == signature else { return nil }
+            return cached.receipts
+        }
+    }
+
+    private func storeThreadActivityCache(
+        threadIds: Set<AgentThreadID>,
+        limit: Int,
+        childRecordLimit: Int,
+        signature: ReceiptSetSignature?,
+        receipts: [AgentOrchestrationAdmissionReceipt]
+    ) {
+        guard let signature else { return }
+        let key = Self.threadActivityCacheKey(
+            threadIds: threadIds, limit: limit, childRecordLimit: childRecordLimit
+        )
+        activityCacheLock.withLock {
+            cachedThreadActivityFetch = (key, signature, receipts)
+        }
+    }
+
+    private static func threadActivityCacheKey(
+        threadIds: Set<AgentThreadID>,
+        limit: Int,
+        childRecordLimit: Int
+    ) -> String {
+        let ids = threadIds.map(\.value.uuidString).sorted().joined(separator: ",")
+        return "\(ids)#\(limit)#\(childRecordLimit)"
+    }
+
     public init(db: SQLiteDB) {
         storage = .database(db, DeviceTrustRepository(db: db))
         let databaseURL = URL(fileURLWithPath: db.path).standardizedFileURL
@@ -779,6 +862,15 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
         childRecordLimit: Int
     ) throws -> [AgentOrchestrationAdmissionReceipt] {
         guard !threadIds.isEmpty else { return [] }
+        // Signature-guarded cache: the 2s badge poll re-runs this fetch with
+        // identical parameters; when no process appended or pruned receipt rows
+        // the previous result is still exact (perf X-01).
+        let signature = receiptSetSignatureUnlocked()
+        if let cached = cachedThreadActivityUnlocked(
+            threadIds: threadIds, limit: limit, childRecordLimit: childRecordLimit, signature: signature
+        ) {
+            return cached
+        }
         let threadBound = max(1, limit)
         let childBound = max(1, childRecordLimit)
         let headroom = 4
@@ -844,10 +936,20 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
                 kept.append(receipt)
             }
         }
+        storeThreadActivityCache(
+            threadIds: threadIds,
+            limit: limit,
+            childRecordLimit: childRecordLimit,
+            signature: signature,
+            receipts: kept
+        )
         return kept
     }
 
     private func decodeReceiptDetail(_ detail: String) -> AgentOrchestrationAdmissionReceipt? {
+#if DEBUG
+        activityCacheLock.withLock { receiptDetailDecodeCountForTesting += 1 }
+#endif
         guard let data = detail.data(using: .utf8) else { return nil }
         return try? decoder.decode(AgentOrchestrationAdmissionReceipt.self, from: data)
     }
@@ -893,7 +995,25 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
     }
 
     fileprivate func receiptUnlocked(runId: AgentRunID) throws -> AgentOrchestrationAdmissionReceipt? {
-        try latestReceiptUnlocked(containing: runId.value.uuidString) { $0.runId == runId }
+        // Signature-guarded memo: `isNestedAgentWorker` resolves the same run
+        // repeatedly after terminal events; the memo avoids the full audit scan
+        // when no receipt rows changed (perf X-01).
+        let signature = receiptSetSignatureUnlocked()
+        if let signature,
+           let cached = activityCacheLock.withLock({ cachedRunReceipts[runId] }),
+           cached.signature == signature {
+            return cached.receipt
+        }
+        let receipt = try latestReceiptUnlocked(containing: runId.value.uuidString) { $0.runId == runId }
+        if let signature {
+            activityCacheLock.withLock {
+                if cachedRunReceipts.count >= Self.runReceiptMemoCap {
+                    cachedRunReceipts.removeAll(keepingCapacity: true)
+                }
+                cachedRunReceipts[runId] = (signature, receipt)
+            }
+        }
+        return receipt
     }
 
     fileprivate func receiptUnlocked(id: UUID) throws -> AgentOrchestrationAdmissionReceipt? {

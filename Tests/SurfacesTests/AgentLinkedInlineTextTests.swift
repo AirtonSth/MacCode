@@ -591,4 +591,38 @@ final class AgentLinkedInlineTextTests: XCTestCase {
             "measurement must still use the SwiftUI width proposal after apply"
         )
     }
+
+    /// WHY (perf CH-02): the user-bubble hug measurement allocates a fresh
+    /// NSLayoutManager pipeline and ensureLayouts the WHOLE prompt; it used to
+    /// run on every bubble body pass (multi-KB pasted prompts x every parent
+    /// invalidation). Identical (text, font) must measure exactly once.
+    func test_idealSize_measuresOncePerTextAndFont() {
+        let font = NSFont.systemFont(ofSize: 13)
+        IntrinsicHeightTextView.idealSizeComputeCountForTesting = 0
+
+        let first = IntrinsicHeightTextView.idealSize(string: "short prompt", font: font)
+        XCTAssertGreaterThan(first.width, 0)
+
+        // Repeated body passes with identical text/font: cache hits, no layout.
+        for _ in 0..<20 {
+            _ = IntrinsicHeightTextView.idealSize(string: "short prompt", font: font)
+        }
+        XCTAssertEqual(
+            IntrinsicHeightTextView.idealSizeComputeCountForTesting, 1,
+            "20 measurement passes of the same prompt must run exactly one layout"
+        )
+
+        // A different font (size change) is a different measurement.
+        let biggerFont = NSFont.systemFont(ofSize: 15)
+        _ = IntrinsicHeightTextView.idealSize(string: "short prompt", font: biggerFont)
+        XCTAssertEqual(IntrinsicHeightTextView.idealSizeComputeCountForTesting, 2)
+
+        // Different text measures again and returns a sane wider result.
+        let longer = IntrinsicHeightTextView.idealSize(
+            string: "a considerably longer pasted prompt that wraps",
+            font: font
+        )
+        XCTAssertEqual(IntrinsicHeightTextView.idealSizeComputeCountForTesting, 3)
+        XCTAssertGreaterThan(longer.width, first.width)
+    }
 }

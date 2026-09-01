@@ -224,6 +224,13 @@ public enum SubagentActivityProjection {
     // Matches AgentOrchestrationRuntime.defaultActivityReceiptLimit (was 10_000, then 500, then 256).
     public static let defaultReceiptFetchLimit = 128
 
+    /// Child bound for the 2s badge poll only (perf X-01): the badge paints at
+    /// most `defaultActiveVisibleLimit + defaultDoneVisibleLimit +
+    /// defaultUnknownVisibleLimit` avatars, so fetching 64 children (×4
+    /// headroom = 256 nested-worker rows decoded per tick) was excessive. The
+    /// wider reconciliation default stays on the runtime for launch-style reads.
+    public static let defaultBadgeChildReceiptLimit = 16
+
     public static func project(
         receipts: [AgentOrchestrationAdmissionReceipt],
         threadIds: Set<AgentThreadID>? = nil,

@@ -2516,9 +2516,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// `@handle` remains an autocomplete affordance. The provider receives the
     /// complete turn and decides whether to call the Bot delegation tool; this
     /// layer must not infer or pre-dispatch a peer prompt from user prose.
+    /// Serves `BotStore.listCached()` so transcript bodies and keystrokes never
+    /// hit SQLite (perf audit AA-01).
     private func configureAgentAppBotMentions(_ agent: AgentAppSurface) {
         agent.viewModel.mentionableBotsProvider = { [weak self] in
-            (try? self?.context?.botStore.list()) ?? []
+            (try? self?.context?.botStore.listCached()) ?? []
         }
     }
 

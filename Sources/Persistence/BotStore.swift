@@ -69,8 +69,59 @@ public final class BotStore: @unchecked Sendable {
         self.decoder = JSONDecoder()
     }
 
+    // MARK: - Cached bot list
+
+    /// Guards `botsListRevisionValue` / `cachedBotList` / the DEBUG query
+    /// counter. Kept off the db queue so cached reads never wait behind the
+    /// SQLite writer.
+    private let listCacheState = NSLock()
+    private var botsListRevisionValue: UInt64 = 0
+    private var cachedBotList: (revision: UInt64, includeHidden: Bool, bots: [BotDefinition])?
+#if DEBUG
+    public private(set) var listQueryCountForTesting = 0
+#endif
+
+    /// Monotonic revision of bot-definition writes (create, updateProfile,
+    /// renameHandle, setPinned, setHidden, publish, duplicate, delete).
+    public var botsListRevision: UInt64 {
+        listCacheState.withLock { botsListRevisionValue }
+    }
+
+    private func bumpBotsListRevision() {
+        listCacheState.withLock { botsListRevisionValue += 1 }
+    }
+
+    /// `list()` served from an in-memory cache; re-queries only after a bot
+    /// write bumped the revision. Hot main-thread callers (composer
+    /// suggestions, transcript mention rows) must not touch SQLite per body
+    /// pass or per keystroke while a run is streaming (perf audit AA-01).
+    public func listCached(includeHidden: Bool = false) throws -> [BotDefinition] {
+        let revisionAtStart = botsListRevision
+        let cachedHit = listCacheState.withLock { () -> [BotDefinition]? in
+            if let cached = cachedBotList,
+               cached.revision == revisionAtStart,
+               cached.includeHidden == includeHidden {
+                return cached.bots
+            }
+            return nil
+        }
+        if let cachedHit { return cachedHit }
+        let bots = try list(includeHidden: includeHidden)
+        // A write that raced the query bumps the revision; do not cache under
+        // the stale tag, the next call refreshes.
+        listCacheState.withLock {
+            if botsListRevisionValue == revisionAtStart {
+                cachedBotList = (revisionAtStart, includeHidden, bots)
+            }
+        }
+        return bots
+    }
+
     public func list(includeHidden: Bool = false, includeDeleted: Bool = false) throws -> [BotDefinition] {
-        try db.performSync { database in
+#if DEBUG
+        listCacheState.withLock { listQueryCountForTesting += 1 }
+#endif
+        return try db.performSync { database in
             var sql = Self.botSelect + " WHERE 1=1"
             if !includeDeleted { sql += " AND deleted_at IS NULL" }
             if !includeHidden { sql += " AND (hidden = 0 OR deleted_at IS NOT NULL)" }
@@ -192,6 +243,7 @@ public final class BotStore: @unchecked Sendable {
             )
             try insertLiveHandle(bot.handle, botID: botID, at: now, database: db)
         }
+        bumpBotsListRevision()
         return created
     }
 
@@ -236,7 +288,7 @@ public final class BotStore: @unchecked Sendable {
         notificationsEnabled: Bool? = nil,
         now: Date = Date()
     ) throws -> BotDefinition {
-        try db.transaction {
+        let updatedProfile = try db.transaction {
             guard let bot = try loadBot(id: id, database: db), bot.deletedAt == nil else {
                 throw BotStoreError.notFound
             }
@@ -266,11 +318,13 @@ public final class BotStore: @unchecked Sendable {
             guard let updated = try loadBot(id: id, database: db) else { throw BotStoreError.notFound }
             return updated
         }
+        bumpBotsListRevision()
+        return updatedProfile
     }
 
     public func renameHandle(id: BotID, handle: String, now: Date = Date()) throws -> BotDefinition {
         guard let normalized = BotHandle.normalize(handle) else { throw BotPublishError.handleEmpty }
-        return try db.transaction {
+        let renamed = try db.transaction {
             guard let bot = try loadBot(id: id, database: db), bot.deletedAt == nil else {
                 throw BotStoreError.notFound
             }
@@ -293,6 +347,8 @@ public final class BotStore: @unchecked Sendable {
             guard let updated = try loadBot(id: id, database: db) else { throw BotStoreError.notFound }
             return updated
         }
+        bumpBotsListRevision()
+        return renamed
     }
 
     public func setPinned(id: BotID, pinned: Bool, now: Date = Date()) throws {
@@ -306,6 +362,7 @@ public final class BotStore: @unchecked Sendable {
             try statement.bind(3, id.value.uuidString.lowercased())
             _ = try statement.step()
         }
+        bumpBotsListRevision()
     }
 
     public func setHidden(id: BotID, hidden: Bool, now: Date = Date()) throws {
@@ -321,6 +378,7 @@ public final class BotStore: @unchecked Sendable {
             try statement.bind(3, id.value.uuidString.lowercased())
             _ = try statement.step()
         }
+        bumpBotsListRevision()
     }
 
     public func publish(
@@ -335,7 +393,7 @@ public final class BotStore: @unchecked Sendable {
     ) throws -> BotRevision {
         var externalMutationApplied = false
         do {
-            return try db.transaction {
+            let published = try db.transaction {
                 guard let bot = try loadBot(id: botID, database: db), bot.deletedAt == nil else {
                     throw BotStoreError.notFound
                 }
@@ -355,6 +413,8 @@ public final class BotStore: @unchecked Sendable {
 #endif
                 return revision
             }
+            bumpBotsListRevision()
+            return published
         } catch {
             if externalMutationApplied { try onRollback?() }
             throw error
@@ -362,7 +422,7 @@ public final class BotStore: @unchecked Sendable {
     }
 
     public func duplicate(id: BotID, now: Date = Date()) throws -> BotDefinition {
-        try db.transaction {
+        let duplicated = try db.transaction {
             guard let source = try loadBot(id: id, database: db), source.deletedAt == nil else {
                 throw BotStoreError.notFound
             }
@@ -458,6 +518,8 @@ public final class BotStore: @unchecked Sendable {
             }
             return copy
         }
+        bumpBotsListRevision()
+        return duplicated
     }
 
     public func delete(id: BotID, now: Date = Date()) throws {
@@ -506,6 +568,7 @@ public final class BotStore: @unchecked Sendable {
             try executeBound("DELETE FROM bot_routine_definitions WHERE bot_id = ?;", id: id)
             try executeBound("DELETE FROM bot_queued_follow_ups WHERE bot_id = ?;", id: id)
         }
+        bumpBotsListRevision()
     }
 
     public func listLinkedAgentThreadIDs() throws -> Set<AgentThreadID> {

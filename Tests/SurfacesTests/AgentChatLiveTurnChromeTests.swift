@@ -436,4 +436,24 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
             "Agent App reasoningRow must pin the same column width as live-turn chrome"
         )
     }
+
+    func test_elapsedTickSchedule_lowFrequencyPinsThe5sCadence() {
+        // WHY (perf CH-12): TimelineView keeps ticking while its window is
+        // occluded or minimized; several live working strips at a forced 1s
+        // cadence were a steady idle wake-up source. lowFrequency (which
+        // SwiftUI passes for non-visible views) must fall back to 5s.
+        let start = Date(timeIntervalSince1970: 1_000)
+        let schedule = AgentChatElapsedTickSchedule(start: start)
+        let early = start.addingTimeInterval(10)
+
+        var regular = schedule.entries(from: early, mode: .normal)
+        XCTAssertEqual(regular.next()?.timeIntervalSince(early), 0)
+        XCTAssertEqual(regular.next()?.timeIntervalSince(early), 1,
+                       "a visible strip inside the first minute ticks every second")
+
+        var lowFrequency = schedule.entries(from: early, mode: .lowFrequency)
+        XCTAssertEqual(lowFrequency.next()?.timeIntervalSince(early), 0)
+        XCTAssertEqual(lowFrequency.next()?.timeIntervalSince(early), 5,
+                       "an occluded/minimized strip must not tick every second")
+    }
 }
