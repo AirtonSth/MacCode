@@ -1101,6 +1101,108 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         }
     }
 
+    func testBadgePollServesUnchangedReceiptsFromSignatureCache_becauseIdleTicksMustNotDecode() throws {
+        // WHY (perf X-01): the 2s Subagents badge poll used to decode ~770
+        // audit_log receipts per tick even when nothing changed, on the same
+        // serial SQLite queue that persists stream events. With the
+        // append-signature cache, an idle poll must decode nothing, a receipt
+        // write must refresh the next poll, and receipt(runId:) repeats must
+        // not re-scan the audit log.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let now = Date(timeIntervalSince1970: 70_000)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            now: { now }
+        )
+        let threadID = AgentThreadID()
+        let firstRunID = AgentRunID()
+
+        try repository.save(AgentOrchestrationAdmissionReceipt(
+            runId: firstRunID,
+            threadId: threadID,
+            routingRevision: 0,
+            policyDigest: "external",
+            packageRevision: "external",
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            capabilitySnapshotId: "external",
+            decisionReason: "manual-agent-app-controller",
+            admittedAt: now,
+            lifecycleStatus: .accepted,
+            deadlineAt: now.addingTimeInterval(600),
+            permissionMode: .fullAccess,
+            delegationCapabilitySHA256: nil,
+            ownerProcessID: 111
+        ))
+
+        let firstPass = try runtime.activityReceipts(
+            threadIds: [threadID],
+            persistLifecycleReconciliation: false
+        )
+        XCTAssertEqual(firstPass.count, 1, "sanity: the first poll fetches the saved receipt")
+        let decodesAfterFirstPoll = repository.receiptDetailDecodeCountForTesting
+        XCTAssertGreaterThan(decodesAfterFirstPoll, 0, "sanity: the first poll decoded from SQLite")
+
+        // Ten idle poll ticks with no receipt writes: zero JSON decodes.
+        for _ in 0..<10 {
+            let pass = try runtime.activityReceipts(
+                threadIds: [threadID],
+                persistLifecycleReconciliation: false
+            )
+            XCTAssertEqual(pass.count, 1, "the cached poll result must be identical to the fresh fetch")
+        }
+        XCTAssertEqual(
+            repository.receiptDetailDecodeCountForTesting, decodesAfterFirstPoll,
+            "idle poll ticks must be served from the signature cache (0 decodes per tick)"
+        )
+
+        // A receipt append changes the signature; the next poll refreshes and sees it.
+        try repository.save(AgentOrchestrationAdmissionReceipt(
+            runId: AgentRunID(),
+            threadId: threadID,
+            routingRevision: 0,
+            policyDigest: "external",
+            packageRevision: "external",
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt",
+            capabilitySnapshotId: "external",
+            decisionReason: "manual-agent-app-controller",
+            admittedAt: now.addingTimeInterval(1),
+            lifecycleStatus: .accepted,
+            deadlineAt: now.addingTimeInterval(600),
+            permissionMode: .fullAccess,
+            delegationCapabilitySHA256: nil,
+            ownerProcessID: 111
+        ))
+        let refreshed = try runtime.activityReceipts(
+            threadIds: [threadID],
+            persistLifecycleReconciliation: false
+        )
+        XCTAssertEqual(refreshed.count, 2, "a receipt write must refresh the cached poll result")
+        XCTAssertGreaterThan(
+            repository.receiptDetailDecodeCountForTesting, decodesAfterFirstPoll,
+            "the refresh after a write decodes from SQLite again"
+        )
+
+        // receipt(runId:) — used by isNestedAgentWorker after terminal events —
+        // must not re-scan the audit log for a repeated unchanged lookup.
+        let firstLookup = try runtime.receipt(runId: firstRunID)
+        XCTAssertEqual(firstLookup?.runId, firstRunID, "sanity: the keyed lookup resolves the run")
+        let decodesAfterRunLookup = repository.receiptDetailDecodeCountForTesting
+        _ = try runtime.receipt(runId: firstRunID)
+        _ = try runtime.receipt(runId: firstRunID)
+        XCTAssertEqual(
+            repository.receiptDetailDecodeCountForTesting, decodesAfterRunLookup,
+            "repeated receipt(runId:) lookups with no writes must not re-decode the audit log"
+        )
+    }
+
     func testManualControllerRootLinksActualCrossProviderChildRun() throws {
         // WHY: explicit `remote-code agent-app` delegation must not invent a
         // second synthetic run id. The parent and child receipts need the real

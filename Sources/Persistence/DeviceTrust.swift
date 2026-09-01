@@ -668,6 +668,28 @@ public final class DeviceTrustRepository {
         return out
     }
 
+    /// Cheap `(count, max id)` signature over the audit rows of the given
+    /// actions. Served by `idx_audit_log_action_id` (schema v82) so hot polls
+    /// (e.g. the 2s orchestration receipt poll, perf X-01) can skip re-decoding
+    /// receipt JSON while no process appended or pruned rows. Returns nil when
+    /// no row matches (callers treat nil as "uncacheable" the same way).
+    public func auditLogSignature(actions: [String]) throws -> (count: Int, maxID: Int64)? {
+        guard !actions.isEmpty else { return nil }
+        let placeholders = Array(repeating: "?", count: actions.count).joined(separator: ",")
+        let st = try db.prepare(
+            "SELECT COUNT(*), MAX(id) FROM audit_log WHERE action IN (\(placeholders));"
+        )
+        for (index, action) in actions.enumerated() {
+            try st.bind(Int32(index + 1), action)
+        }
+        defer { st.reset() }
+        guard try st.step() else { return nil }
+        let count = Int(st.columnInt64(0))
+        let maxID = st.columnInt64(1)
+        guard count > 0, maxID > 0 else { return nil }
+        return (count, maxID)
+    }
+
     /// Prune unbounded device-trust tables so they cannot grow without limit
     /// over long-lived server sessions.
     ///

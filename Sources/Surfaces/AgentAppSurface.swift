@@ -1495,6 +1495,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             let receipts = (try? orchestrationRuntime.activityReceipts(
                 threadIds: Set(uniqueThreadIds),
                 limit: SubagentActivityProjection.defaultReceiptFetchLimit * uniqueThreadIds.count,
+                childRecordLimit: SubagentActivityProjection.defaultBadgeChildReceiptLimit,
                 persistLifecycleReconciliation: persistLifecycleReconciliation
             )) ?? []
             let now = clock()

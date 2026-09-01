@@ -488,9 +488,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             78,
             79,
             80,
-            81
+            81,
+            82
         ])
-        XCTAssertEqual(Schema.currentVersion, 81)
+        XCTAssertEqual(Schema.currentVersion, 82)
         XCTAssertFalse(
             Schema.steps.contains { (63...66).contains($0.version) },
             "schema versions 63-66 are retired and must never be reused"
@@ -517,7 +518,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
 
         try Schema.migrateSteps(db, Schema.steps)
         XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
-        XCTAssertEqual(Schema.currentVersion, 81)
+        XCTAssertEqual(Schema.currentVersion, 82)
 
         XCTAssertEqual(try rowCount(db, table: "token_saver_run_winner_receipts"), 0,
                        "v72 must not backfill historical winners")
@@ -598,10 +599,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             Schema.steps.filter { $0.version == 71 }.count, 1,
             "HEAD/origin production last published step is 71"
         )
-        XCTAssertEqual(Schema.currentVersion, 81)
+        XCTAssertEqual(Schema.currentVersion, 82)
         XCTAssertEqual(
-            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76, 77, 78, 79, 80, 81],
-            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec; v77 owns nullable agent_runs.terminal_reason; v78 deduplicates savings retries; v79 preserves host attestations outside rolling replay; v80 owns Bot queued follow-ups; v81 indexes running thread IDs"
+            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82],
+            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec; v77 owns nullable agent_runs.terminal_reason; v78 deduplicates savings retries; v79 preserves host attestations outside rolling replay; v80 owns Bot queued follow-ups; v81 indexes running thread IDs; v82 indexes audit_log(action, id)"
         )
         let v72 = try XCTUnwrap(Schema.steps.first { $0.version == 72 })
         XCTAssertTrue(v72.sql.contains("CHECK(format IN ('human', 'rcw1', 'rcs1'))"))
@@ -1316,7 +1317,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         XCTAssertTrue(before.contains("SCAN t"), "v80 must show the pre-index full-history scan: \(before)")
 
         try Schema.migrateSteps(db, Schema.steps)
-        XCTAssertEqual(try maxVersion(db), 81)
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
         XCTAssertEqual(try rowCount(db, table: "agent_threads"), 1_024,
                        "v80 to v81 must preserve every existing thread row")
         let expected = Set((0..<8).map {
@@ -1333,6 +1334,65 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         XCTAssertFalse(
             after.contains { $0.contains("SCAN t") && !$0.contains("INDEX idx_agent_threads_running") },
             "v81 must remove the full-history scan from the production-shaped query: \(after)"
+        )
+    }
+
+    func test_v81ToV82IndexesAuditLogActionIdForReceiptSignatureReads() throws {
+        // WHY (perf X-01): the 2s Subagents badge poll reads a
+        // (COUNT, MAX(id)) append signature over audit_log receipt rows to
+        // skip re-decoding receipts when nothing changed; without an index that
+        // signature read is itself a full-table scan over every detail blob.
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 81 })
+
+        let insert = try db.prepare(
+            "INSERT INTO audit_log(ts, actor, action, detail) VALUES(?, 'RemoteCode', ?, ?);"
+        )
+        try db.transaction {
+            for index in 0..<512 {
+                insert.reset()
+                try insert.bind(1, "2026-09-01T00:00:00Z")
+                try insert.bind(2, index % 4 == 0 ? "other.action" : "agent.orchestration.admitted")
+                try insert.bind(3, "{\"run\":\(index),\"detail\":\"\(String(repeating: "x", count: 900))\"}")
+                _ = try insert.step()
+            }
+        }
+
+        let query = """
+            EXPLAIN QUERY PLAN
+            SELECT COUNT(*), MAX(id) FROM audit_log
+            WHERE action IN ('agent.orchestration.admitted', 'agent.orchestration.lifecycle');
+        """
+        func planDetails() throws -> [String] {
+            let plan = try db.prepare(query)
+            defer { plan.reset() }
+            var details: [String] = []
+            while try plan.step() {
+                if let detail = plan.columnText(3) { details.append(detail) }
+            }
+            return details
+        }
+
+        XCTAssertEqual(try maxVersion(db), 81)
+        let before = try planDetails()
+        XCTAssertTrue(
+            before.contains { $0.contains("SCAN audit_log") },
+            "v81 must show the pre-index full-table scan: \(before)"
+        )
+
+        try Schema.migrateSteps(db, Schema.steps)
+        XCTAssertEqual(try maxVersion(db), 82)
+        XCTAssertEqual(try rowCount(db, table: "audit_log"), 512,
+                       "v81 to v82 must preserve every audit row")
+
+        let after = try planDetails()
+        XCTAssertTrue(
+            after.contains { $0.contains("INDEX idx_audit_log_action_id") },
+            "v82 must serve the receipt signature read from idx_audit_log_action_id: \(after)"
+        )
+        XCTAssertFalse(
+            after.contains { $0.contains("SCAN audit_log") && !$0.contains("INDEX idx_audit_log_action_id") },
+            "v82 must remove the full-table scan from the signature read: \(after)"
         )
     }
 
