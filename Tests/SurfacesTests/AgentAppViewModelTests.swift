@@ -9097,6 +9097,56 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(fusedBig.rows.map(\.content), refBig.rows.map(\.content),
                        "single-pass cap+budget must equal map(cap)+applyBodyBudget over budget (oldest blanked)")
     }
+
+    func test_mentionCatalogSurvivesKeystrokesAndPaintPassesWithoutSQLite() throws {
+        // WHY (perf AA-01): 20 keystrokes + 10 transcript paint passes used to cost
+        // >=30 synchronous botStore.list() trips on the main thread (composer
+        // suggestions recompute per keystroke, the transcript body re-reads the
+        // catalog per paint pass) — each waiting behind the stream-persist writer.
+        // With the router serving BotStore.listCached(), the whole burst must cost
+        // exactly one query, and a bot created later must still appear in suggestions.
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let botStore = BotStore(db: db)
+        try botStore.create(name: "Piper", title: "Scout", description: "", handle: "piper")
+
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coord = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(), cwd: tmp, coordinator: coord, threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            draftRepo: AgentThreadDraftRepository(db: db),
+            attachmentStore: AgentAttachmentStore(root: URL(fileURLWithPath: tmp).appendingPathComponent("agent-attachments")),
+            promptHistoryStore: PromptHistoryStore(db: db)
+        )
+        // Same wiring AppCommandRouter.configureAgentAppBotMentions installs.
+        vm.mentionableBotsProvider = { (try? botStore.listCached()) ?? [] }
+
+        // 20 keystrokes: each prompt write recomputes composerSuggestions.
+        for index in 0..<20 {
+            vm.prompt = "typing \(index)"
+            _ = vm.composerSuggestions
+        }
+        // 10 transcript paint passes: the body re-reads the mention catalog.
+        for _ in 0..<10 { _ = vm.mentionableBotsProvider() }
+
+        XCTAssertEqual(
+            botStore.listQueryCountForTesting, 1,
+            "30 catalog reads during typing/painting must hit SQLite exactly once"
+        )
+
+        // A bot created later appears on the next suggestion pass (cache refresh).
+        try botStore.create(name: "Rio", title: "Ops", description: "", handle: "rio")
+        let bots = vm.mentionableBotsProvider()
+        XCTAssertTrue(bots.contains { $0.name == "Rio" },
+                      "a bot created after the cache must appear in the next catalog read")
+        XCTAssertEqual(botStore.listQueryCountForTesting, 2)
+    }
 }
 
 private final class SlowStartRunner: AgentProviderRunner, @unchecked Sendable {

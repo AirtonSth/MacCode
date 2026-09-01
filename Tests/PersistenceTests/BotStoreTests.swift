@@ -730,4 +730,72 @@ final class BotStoreTests: XCTestCase {
         try store.delete(id: bot.id)
         XCTAssertTrue(try store.listQueuedFollowUps(botID: bot.id).isEmpty)
     }
+
+    func test_listCached_servesRepeatReadsWithoutRequery_becauseBodiesMustNotHitSQLitePerKeystroke() throws {
+        // WHY (perf AA-01): the transcript body and every composer keystroke read
+        // the mentionable-bot catalog; that read used to be a synchronous SQLite
+        // list() behind the stream-persist writer, so typing hitched during runs.
+        // The cached read must not re-query while no bot write happened and must
+        // refresh after every bot write.
+        let piper = try store.create(name: "Piper", title: "Scout", description: "", handle: "piper")
+        let quinn = try store.create(name: "Quinn", title: "CRM", description: "", handle: "quinn")
+
+        let first = try store.listCached()
+        XCTAssertEqual(Set(first.map(\.id)), Set([piper.id, quinn.id]))
+        XCTAssertEqual(
+            store.listQueryCountForTesting, 1,
+            "the first cached read performs exactly one SQLite list()"
+        )
+
+        for _ in 0..<30 { _ = try store.listCached() }
+        XCTAssertEqual(
+            store.listQueryCountForTesting, 1,
+            "30 body passes / keystrokes with no bot write must be served from memory (0 re-queries)"
+        )
+
+        let rio = try store.create(name: "Rio", title: "Ops", description: "", handle: "rio")
+        let second = try store.listCached()
+        XCTAssertEqual(store.listQueryCountForTesting, 2, "a bot write bumps the revision and forces one re-query")
+        XCTAssertTrue(
+            second.contains { $0.id == rio.id },
+            "a bot created after the cache must appear on the next read (the cache must not pin stale data)"
+        )
+
+        try store.setHidden(id: rio.id, hidden: true)
+        XCTAssertFalse(
+            try store.listCached().contains { $0.id == rio.id },
+            "hiding a bot must refresh the cached visible list"
+        )
+        XCTAssertEqual(store.listQueryCountForTesting, 3)
+
+        try store.delete(id: quinn.id)
+        XCTAssertFalse(
+            try store.listCached().contains { $0.id == quinn.id },
+            "deleting a bot must refresh the cached visible list"
+        )
+        XCTAssertEqual(store.listQueryCountForTesting, 4)
+    }
+
+    func test_listCached_coversProfileRenameAndDuplicate_becauseEveryCatalogWriteInvalidates() throws {
+        // WHY (perf AA-01): a stale mention catalog after a rename/duplicate would
+        // surface outdated handles in @autocomplete; every bot-definition write
+        // path must bump the revision.
+        let piper = try store.create(name: "Piper", title: "Scout", description: "", handle: "piper")
+        _ = try store.listCached()
+
+        _ = try store.updateProfile(id: piper.id, name: "Piper II", title: "Scout", description: "")
+        let renamed = try store.listCached()
+        XCTAssertEqual(renamed.first { $0.id == piper.id }?.name, "Piper II")
+
+        _ = try store.renameHandle(id: piper.id, handle: "piperprime")
+        XCTAssertEqual(try store.listCached().first { $0.id == piper.id }?.handle, "piperprime")
+
+        _ = try store.duplicate(id: piper.id)
+        XCTAssertEqual(try store.listCached().count, 2, "a duplicated bot must appear on the next cached read")
+
+        try store.setPinned(id: piper.id, pinned: true)
+        _ = try store.listCached()
+        // Pinning does not change membership; it only proves the write path still refreshes.
+        XCTAssertEqual(try store.listCached().count, 2)
+    }
 }
