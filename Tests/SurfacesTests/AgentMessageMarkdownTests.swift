@@ -111,6 +111,45 @@ final class AgentMessageMarkdownTests: XCTestCase {
         )
     }
 
+    /// WHY (perf CH-04): the live streaming row used to bypass the cache on the
+    /// READ as well, so every token re-parsed every earlier paragraph of the
+    /// growing answer (O(n²) in answer length). `cache:false` must mean
+    /// "don't store", never "don't read".
+    func test_attributedInline_cacheFalse_stillReadsTheCache() {
+        let text = "stable paragraph parsed while finished"
+        _ = AgentMessageMarkdown.attributedInline(text, cache: true)
+        AgentMessageMarkdown.inlineComputeCountForTesting = 0
+        _ = AgentMessageMarkdown.attributedInline(text, cache: false)
+        XCTAssertEqual(
+            AgentMessageMarkdown.inlineComputeCountForTesting, 0,
+            "a live row (cache:false) must still READ cached parses of identical text"
+        )
+    }
+
+    /// WHY (perf CH-04): during a stream only the LAST block of a group grows;
+    /// stable earlier blocks must parse once and hit the cache on every tick.
+    func test_selectableProse_liveGroup_reparsesOnlyTheLastBlock() {
+        let blocks = [
+            AgentMessageMarkdownBlock(kind: .paragraph, text: "first stable paragraph"),
+            AgentMessageMarkdownBlock(kind: .paragraph, text: "second stable paragraph"),
+            AgentMessageMarkdownBlock(kind: .paragraph, text: "growing tail")
+        ]
+        AgentMessageMarkdown.inlineComputeCountForTesting = 0
+        _ = AgentMessageMarkdown.selectableProse(from: blocks, compact: false, cache: false)
+        let computesAfterFirstPaint = AgentMessageMarkdown.inlineComputeCountForTesting
+        XCTAssertEqual(computesAfterFirstPaint, 3, "sanity: the first paint parses all blocks")
+
+        // Ten stream ticks with the same stable prefix: only the tail reparses.
+        for _ in 0..<10 {
+            _ = AgentMessageMarkdown.selectableProse(from: blocks, compact: false, cache: false)
+        }
+        XCTAssertEqual(
+            AgentMessageMarkdown.inlineComputeCountForTesting,
+            computesAfterFirstPaint + 10,
+            "10 ticks on a 3-block live group must reparse only the last block (10 computes), not 30"
+        )
+    }
+
     func test_shouldStoreMarkdownCache_respectsFlagAndSizeBand() {
         XCTAssertTrue(AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 64, cache: true))
         XCTAssertFalse(AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 64, cache: false),
