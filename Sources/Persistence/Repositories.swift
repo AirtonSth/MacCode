@@ -7215,6 +7215,9 @@ public final class AgentTurnCheckpointRepository {
     }
 
     public func list(threadId: AgentThreadID) throws -> [AgentTurnCheckpointSummary] {
+#if DEBUG
+        fullRowListReadCountForTesting += 1
+#endif
         let st = try db.prepare("""
             SELECT thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_json, assistant_message_id, error_message, completed_at, file_snapshots_json, diff_patch, file_diffs_json
             FROM agent_turn_checkpoints
@@ -7233,7 +7236,71 @@ public final class AgentTurnCheckpointRepository {
         return AgentTurnCheckpointRepository.decodableCheckpoints(attempts).healthy
     }
 
+#if DEBUG
+    /// Perf-probe counters (AA-03): the thread-open path must read summaries,
+    /// never the full blob columns.
+    public private(set) var fullRowListReadCountForTesting = 0
+    public private(set) var summaryListReadCountForTesting = 0
+#endif
+
+    /// Metadata-only summary list for surfaces that paint the checkpoint
+    /// browser and fetch diff payloads per selection (perf AA-03). Skips the
+    /// heavy `file_snapshots_json`, `diff_patch`, and `file_diffs_json`
+    /// columns entirely — `list(threadId:)` selects them for every row and the
+    /// open path paid all of it on the MainActor even with the panel hidden.
+    public func listSummaries(threadId: AgentThreadID) throws -> [AgentTurnCheckpointSummary] {
+#if DEBUG
+        summaryListReadCountForTesting += 1
+#endif
+        let st = try db.prepare("""
+            SELECT thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_json, assistant_message_id, error_message, completed_at
+            FROM agent_turn_checkpoints
+            WHERE thread_id = ?
+            ORDER BY checkpoint_turn_count ASC, completed_at ASC;
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        var attempts: [Result<AgentTurnCheckpointSummary, Error>] = []
+        while try st.step() {
+            do {
+                attempts.append(.success(try decodeCheckpointSummary(from: st, fallbackThreadId: threadId)))
+            } catch {
+                attempts.append(.failure(error))
+            }
+        }
+        return AgentTurnCheckpointRepository.decodableCheckpoints(attempts).healthy
+    }
+
+    /// Same row shape as `decodeCheckpoint(from:fallbackThreadId:)` minus the
+    /// three heavy blob columns (snapshots, unified diff, per-file diffs).
+    private func decodeCheckpointSummary(from st: SQLiteStatement, fallbackThreadId: AgentThreadID) throws -> AgentTurnCheckpointSummary {
+        let filesJSON = st.columnText(6) ?? "[]"
+        let files: [AgentTurnCheckpointFile]
+        do {
+            files = try decoder.decode([AgentTurnCheckpointFile].self, from: Data(filesJSON.utf8))
+        } catch {
+            throw PersistenceDataError.corruptCheckpoint("invalid files_json for turn \(st.columnText(2) ?? "<unknown>"): \(error)")
+        }
+        return AgentTurnCheckpointSummary(
+            threadId: AgentThreadID(UUID(uuidString: st.columnText(0) ?? "") ?? fallbackThreadId.value),
+            runId: AgentRunID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID()),
+            turnId: st.columnText(2) ?? "",
+            checkpointTurnCount: Int(st.columnInt64(3)),
+            checkpointRef: st.columnText(4) ?? "",
+            status: AgentTurnCheckpointStatus(rawValue: st.columnText(5) ?? "") ?? .error,
+            files: files,
+            fileSnapshots: [],
+            diffPatch: nil,
+            fileDiffs: [],
+            assistantMessageId: st.columnText(7).flatMap(UUID.init(uuidString:)).map(AgentMessageID.init),
+            errorMessage: st.columnText(8),
+            completedAt: parseDate(st.columnText(9))
+        )
+    }
+
     public func get(threadId: AgentThreadID, checkpointTurnCount: Int) throws -> AgentTurnCheckpointSummary? {
+#if DEBUG
+        fullRowListReadCountForTesting += 1
+#endif
         let st = try db.prepare("""
             SELECT thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_json, assistant_message_id, error_message, completed_at, file_snapshots_json, diff_patch, file_diffs_json
             FROM agent_turn_checkpoints

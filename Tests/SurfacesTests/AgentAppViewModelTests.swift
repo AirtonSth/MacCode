@@ -7637,7 +7637,7 @@ final class AgentAppViewModelTests: XCTestCase {
                        "proposed plans must rehydrate into the Agent App main timeline after restart/reload")
     }
 
-    func test_selectThreadRehydratesCheckpointsAndFileDiffPreview() throws {
+    func test_selectThreadRehydratesCheckpointsAndFileDiffPreview() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-checkpoint-browser-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -7671,15 +7671,157 @@ final class AgentAppViewModelTests: XCTestCase {
                                    messageRepo: messageRepo,
                                    checkpointRepo: checkpointRepo)
 
+        // WHY (perf AA-02/AA-03): opening a thread must hydrate the checkpoint
+        // browser from metadata only — the diff blobs (108 MB table at audit
+        // time) are fetched per selection while the sidebar shows them.
         vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
 
         XCTAssertEqual(vm.checkpoints.map(\.checkpointTurnCount), [1])
-        XCTAssertTrue(vm.checkpointDiffPreview.contains("visible checkpoint"),
-                      "selecting a thread must hydrate the checkpoint browser with a readable all-files diff")
+        XCTAssertEqual(
+            checkpointRepo.fullRowListReadCountForTesting, 0,
+            "opening a thread must not read any checkpoint diff/blob rows (metadata list only)"
+        )
+        XCTAssertGreaterThanOrEqual(checkpointRepo.summaryListReadCountForTesting, 1)
+        XCTAssertEqual(vm.checkpointDiffPreview, "",
+                       "with the plan sidebar hidden, the auto-selected checkpoint fetches nothing")
+
+        // Opening the sidebar fetches the selected checkpoint's diff on demand.
+        vm.showPlanSidebar = true
+        try await waitForCondition(timeout: 2.0) {
+            vm.checkpointDiffPreview.contains("visible checkpoint")
+        }
+        XCTAssertEqual(checkpointRepo.fullRowListReadCountForTesting, 1,
+                       "exactly the selected checkpoint's full row is fetched on demand")
         let checkpoint = try XCTUnwrap(vm.checkpoints.first)
         vm.selectCheckpoint(checkpoint, path: "Sources/App.swift")
-        XCTAssertTrue(vm.checkpointDiffPreview.contains("visible file checkpoint"),
-                      "the checkpoint browser must let users inspect the file-level diff before choosing rollback")
+        try await waitForCondition(timeout: 2.0) {
+            vm.checkpointDiffPreview.contains("visible file checkpoint")
+        }
+        XCTAssertEqual(checkpointRepo.fullRowListReadCountForTesting, 2,
+                       "the checkpoint browser must let users inspect the file-level diff before choosing rollback")
+    }
+
+    func test_selectThreadLoadsQueueAndDropsStaleOpenBundles() async throws {
+        // WHY (perf AA-02/AA-04): the open bundle is gathered off-main; a rapid
+        // A→B switch must reject A's bundle (stale-result rejection) while the
+        // winning thread still gets its queue rows and checkpoint list exactly.
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-open-bundle-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let checkpointRepo = AgentTurnCheckpointRepository(db: db)
+        let queuedMessageRepo = AgentQueuedMessageRepository(db: db)
+        let draftRepo = AgentThreadDraftRepository(db: db)
+        let workspaceID = WorkspaceID()
+        let threadA = AgentThread(workspaceId: workspaceID, title: "A", provider: .codex, model: "gpt-5.5")
+        let threadB = AgentThread(workspaceId: workspaceID, title: "B", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(threadA)
+        try threadRepo.upsert(threadB)
+        let runId = AgentRunID()
+        try runRepo.upsert(AgentRun(id: runId, threadId: threadA.id, provider: .codex, model: "gpt-5.5", status: .completed))
+        try checkpointRepo.upsert(AgentTurnCheckpointSummary(
+            threadId: threadA.id,
+            runId: runId,
+            turnId: "turn-1",
+            checkpointTurnCount: 1,
+            checkpointRef: "local-diff:test:turn-1",
+            status: .ready,
+            files: [],
+            diffPatch: "+A checkpoint"
+        ))
+        let queued = AgentQueuedMessage(threadId: threadB.id, text: "queued on B")
+        try queuedMessageRepo.upsert(queued)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providers: [.codex: FakeProviderRunner(provider: .codex)])
+        let vm = AgentAppViewModel(workspaceID: workspaceID,
+                                   cwd: tmp,
+                                   coordinator: coordinator,
+                                   threadRepo: threadRepo,
+                                   messageRepo: messageRepo,
+                                   draftRepo: draftRepo,
+                                   queuedMessageRepo: queuedMessageRepo,
+                                   checkpointRepo: checkpointRepo)
+
+        // Rapid A→B: A's bundle (with its checkpoint) must never land on B.
+        vm.selectThread(threadA.id)
+        vm.selectThread(threadB.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+
+        XCTAssertEqual(vm.selectedThreadId, threadB.id)
+        XCTAssertTrue(
+            vm.checkpoints.isEmpty,
+            "the stale A bundle must be rejected; B's checkpoint list (empty) is what stays"
+        )
+        XCTAssertEqual(
+            vm.queuedMessages.map(\.text), ["queued on B"],
+            "the winning thread's queue rows must still load through the open bundle"
+        )
+
+        // Opening A afterwards still applies A's own bundle (no stale-cache lockout).
+        vm.selectThread(threadA.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        XCTAssertEqual(vm.checkpoints.map(\.checkpointTurnCount), [1])
+        XCTAssertEqual(vm.queuedMessages.map(\.text), [],
+                       "switching to A clears B's queue rows")
+    }
+
+    func test_selectThreadStashesLeavingDraftOffMainAndKeepsQueueStatus() async throws {
+        // WHY (perf AA-04): the leaving thread's draft write and the new
+        // thread's queue read no longer block the first paint; both must still
+        // land exactly once.
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-open-draft-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let draftRepo = AgentThreadDraftRepository(db: db)
+        let queuedMessageRepo = AgentQueuedMessageRepository(db: db)
+        let workspaceID = WorkspaceID()
+        let threadA = AgentThread(workspaceId: workspaceID, title: "A", provider: .codex, model: "gpt-5.5")
+        let threadB = AgentThread(workspaceId: workspaceID, title: "B", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(threadA)
+        try threadRepo.upsert(threadB)
+        try queuedMessageRepo.upsert(AgentQueuedMessage(threadId: threadB.id, text: "queued on B"))
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providers: [.codex: FakeProviderRunner(provider: .codex)])
+        let vm = AgentAppViewModel(workspaceID: workspaceID,
+                                   cwd: tmp,
+                                   coordinator: coordinator,
+                                   threadRepo: threadRepo,
+                                   messageRepo: messageRepo,
+                                   draftRepo: draftRepo,
+                                   queuedMessageRepo: queuedMessageRepo)
+
+        vm.selectThread(threadA.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        vm.prompt = "unsent words on A"
+        vm.selectThread(threadB.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+
+        // The off-main stash lands within a moment; poll the durable row.
+        try await waitForCondition(timeout: 2.0) {
+            (try? draftRepo.get(threadId: threadA.id, providerInstanceId: vm.providerInstanceId))??.text == "unsent words on A"
+        }
+        XCTAssertEqual(vm.queuedMessages.map(\.text), ["queued on B"])
+    }
+
+    /// Polls `condition` until it returns true or `timeout` elapses.
+    private func waitForCondition(
+        timeout: TimeInterval,
+        condition: @escaping () -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(condition(), "condition not met within \(timeout)s")
     }
 
     func test_implementLatestPlanStartsRunAndMarksPlanTraceability() async throws {

@@ -391,7 +391,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var tokenSaverFooterReloadTask: Task<Void, Never>?
     @Published public var currentRunId: AgentRunID?
     @Published public var hasUnreadActivity: Bool = false
-    @Published public var showPlanSidebar: Bool = false
+    @Published public var showPlanSidebar: Bool = false {
+        didSet {
+            // The checkpoint diff preview is fetched per selection and only
+            // while the sidebar shows it (perf AA-03); catch up on open.
+            guard showPlanSidebar, oldValue == false else { return }
+            refreshCheckpointDiffPreviewIfNeeded()
+        }
+    }
     /// Provider-neutral Subagents activity derived from admission receipts +
     /// coordinator active runs. Empty until the first refresh; never invents rows.
     @Published public private(set) var subagentActivity: SubagentActivitySnapshot = .empty
@@ -684,6 +691,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private let streamEventBatch = StreamEventBatch()
     /// Serializes off-MainActor stream apply so concurrent flushes cannot reorder.
     private var streamApplyInFlight = false
+    /// Monotonic count of stream quanta committed to the painted timeline, and
+    /// of quanta dropped by an open-path generation bump. The thread-open bundle
+    /// uses both to detect stream activity that happened while the bundle was
+    /// gathered off-main (perf AA-02) and re-read the durable window so nothing
+    /// observed during the gather is lost.
+    private var streamQuantumCommits: UInt64 = 0
+    private var streamQuantumDrops: UInt64 = 0
     /// Set when append tried to flush while an apply was already running.
     private var streamFlushNeeded = false
     /// Counts applied stream events since the last aggregate hot-text budget walk.
@@ -1765,6 +1779,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         persistComposerDraftToRepository(draft)
     }
 
+    /// Thread-switch draft stash (perf AA-04): the leaving thread's draft write
+    /// no longer blocks the MainActor behind the shared SQLite queue before the
+    /// first paint of the newly selected thread. The in-memory cache keeps the
+    /// draft restorable if the user switches back before the write lands, and
+    /// dispose() re-persists on close.
+    private func stashComposerDraftOffMain(for threadId: AgentThreadID) {
+        cancelPendingComposerDraftPersistence()
+        let draft = makeComposerDraft(for: threadId)
+        cacheComposerDraft(draft)
+        persistComposerDraftOffMain(draft)
+    }
+
     private func scheduleComposerDraftPersistence(for threadId: AgentThreadID) {
         let draft = makeComposerDraft(for: threadId)
         cacheComposerDraft(draft)
@@ -2097,7 +2123,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // IMP-MAC_AGENT-011: stash the leaving thread's draft before swapping,
         // then restore the opened thread's draft.
         if let previous = selectedThreadId {
-            persistComposerDraft(for: previous)
+            stashComposerDraftOffMain(for: previous)
             paintedTimelineByThread[previous] = timeline
         }
         selectedThreadId = id
@@ -2137,7 +2163,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // to THIS thread (not threads.first). Only fires on an actual change;
         // wired by the host after init, so restore-time selects don't re-persist.
         onSelectedThreadChanged?(id)
-        reloadQueuedMessages()
+        // Thread-local queue status restore is in-memory; keep it synchronous so
+        // the queue strip never carries the previous thread's lifecycle warning
+        // across a switch. The queue rows themselves load with the open bundle
+        // (perf AA-04).
+        applyQueuedStatusForSelectedThread()
         let routing = selectedThread.effectiveRoutingConfiguration
         routingMode = routing.mode
         let manual = routing.manualSelection
@@ -2154,19 +2184,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         status = selectedThread.status
         restoreComposerDraft(for: selectedThread)
         if let trackedRunId = trackedRunId(for: id) {
-            // UX-XPLAT-008: use the host's persisted run start time so
-            // "Working for Xs" reflects real elapsed time even after
-            // selectThread is called mid-run (e.g. after app relaunch or
-            // switching away and back). Fallback to Date() only when the
-            // run record is not yet committed (race on the very first tick).
-            runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
-                current: runStartedAt,
-                persisted: try? coordinator.runStartedAt(threadId: id)
-            )
+            // UX-XPLAT-008: the persisted run start time is read off-main by the
+            // open bundle and resolved when it applies, so "Working for Xs"
+            // still reflects real elapsed time after selectThread mid-run.
+            // Clear the leaving thread's start time now so the gap frames never
+            // paint the previous thread's elapsed time.
             // RUN-LIFECYCLE-STREAM-004: resync currentRunId to THIS thread's
             // active run. Without this, switching to an already-running
             // thread left a stale currentRunId from the previous thread, so
             // Stop could cancel the wrong thread's run.
+            runStartedAt = nil
             currentRunId = trackedRunId
             stopScheduledLivePoll()
         } else if isScheduledThreadRunning?(id) == true {
@@ -2256,7 +2283,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     return
                 }
             }
-            self.hydrateOpenedThread(
+            await self.hydrateOpenedThread(
                 thread,
                 markRead: markRead,
                 openGeneration: openGeneration
@@ -2264,15 +2291,107 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    // MARK: Off-main thread open bundle (perf AA-02/AA-03/AA-04)
+
+    /// Everything a full thread open needs from SQLite + JSON decode + replay
+    /// CPU, gathered in one detached pass. The open path used to run 8-10
+    /// synchronous SQLite reads on the MainActor between click and first paint
+    /// (including every checkpoint's full diff blobs) while the stream-persist
+    /// writer held the same serial queue.
+    struct AgentThreadOpenBundle: Sendable {
+        var hasRecoverableContext = false
+        var persistedEvents: [AssistantEvent] = []
+        var hotReplayIsPartial = false
+        var replayedTimeline = AssistantTimelineState()
+        var errorRecoverable = false
+        var durableActiveState: AgentActiveThreadState?
+        var proposedPlans: [AgentProposedPlanRecord] = []
+        var pendingCallbackEvents: [AssistantEvent] = []
+        var checkpointSummaries: [AgentTurnCheckpointSummary] = []
+        var planNotes: String?
+        var planNotesFailed = false
+        var queuedMessages: [AgentQueuedMessage] = []
+        var runStartedAt: Date?
+    }
+
+    nonisolated static func gatherThreadOpenBundle(
+        threadId: AgentThreadID,
+        coordinator: AgentRunCoordinator,
+        proposedPlanRepo: AgentProposedPlanRepository?,
+        pendingCallbackRepo: ProviderPendingCallbackRepository?,
+        checkpointRepo: AgentTurnCheckpointRepository?,
+        planNotesStore: PlanNotesStore?,
+        queuedMessageRepo: AgentQueuedMessageRepository?,
+        includeRunStartedAt: Bool
+    ) async -> AgentThreadOpenBundle {
+        await Task.detached(priority: .userInitiated) {
+            var bundle = AgentThreadOpenBundle()
+            bundle.hasRecoverableContext = coordinator.hasRecoverableContext(threadId: threadId)
+            let persistedEvents = coordinator.latestStreamEvents(threadId: threadId)
+            bundle.persistedEvents = persistedEvents
+            bundle.hotReplayIsPartial = coordinator.hotReplayIsPartial(threadId: threadId)
+            let persistedReplay = chooseReplayEvents(persisted: persistedEvents, snapshot: nil)
+            bundle.replayedTimeline = timelineByReplaying(persistedReplay)
+            bundle.errorRecoverable = displayedErrorIsRecoverable(in: persistedReplay)
+            bundle.durableActiveState = coordinator.durableActiveThreadState(threadId: threadId)
+            if let proposedPlanRepo {
+                bundle.proposedPlans = (try? proposedPlanRepo.list(threadId: threadId)) ?? []
+            }
+            if let pendingCallbackRepo {
+                // Mirror of rehydratePendingCallbacks' decode, off-main.
+                let callbacks = (try? pendingCallbackRepo.listVisible(threadId: threadId)) ?? []
+                var events: [AssistantEvent] = []
+                let decoder = JSONDecoder()
+                for callback in callbacks {
+                    guard let data = callback.payloadJSON.data(using: .utf8) else { continue }
+                    switch callback.kind {
+                    case .approval:
+                        guard var request = try? decoder.decode(
+                            AssistantPendingRequest.self, from: data
+                        ) else { continue }
+                        request.state = callback.state
+                        request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
+                        events.append(.requestOpened(request))
+                    case .userInput:
+                        guard var request = try? decoder.decode(
+                            AssistantUserInputRequest.self, from: data
+                        ) else { continue }
+                        request.state = callback.state
+                        request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
+                        events.append(.userInputRequested(request))
+                    }
+                }
+                bundle.pendingCallbackEvents = events
+            }
+            if let checkpointRepo {
+                // Metadata-only (AA-03): diff blobs are fetched per selection,
+                // never for the whole list on open.
+                bundle.checkpointSummaries = (try? checkpointRepo.listSummaries(threadId: threadId)) ?? []
+            }
+            if let planNotesStore {
+                do {
+                    bundle.planNotes = try planNotesStore.load(threadId: threadId)
+                } catch {
+                    bundle.planNotes = ""
+                    bundle.planNotesFailed = true
+                }
+            }
+            if let queuedMessageRepo {
+                bundle.queuedMessages = (try? queuedMessageRepo.list(threadId: threadId)) ?? []
+            }
+            if includeRunStartedAt {
+                bundle.runStartedAt = try? coordinator.runStartedAt(threadId: threadId)
+            }
+            return bundle
+        }.value
+    }
+
     private func hydrateOpenedThread(
         _ selectedThread: AgentThread,
         markRead: Bool,
         openGeneration: UInt64
-    ) {
+    ) async {
         let id = selectedThread.id
-        // UX-MAC_AGENT-CONTINUE: check whether the newly selected thread was
-        // interrupted by a relaunch and has a recoverable provider session.
-        selectedThreadHasRecoverableContext = coordinator.hasRecoverableContext(threadId: id)
         // B6: the host owns the one throwing persistence + publication mutation.
         // Reflect success locally without re-querying; retain persisted rail state
         // when the mutation fails.
@@ -2293,35 +2412,171 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         streamFlushNeeded = false
         streamUIBackpressured = false
         streamAggregateBudgetOps = 0
-        _ = streamEventBatch.drain()
-        let persistedEvents = coordinator.latestStreamEvents(threadId: id)
-        if coordinator.hotReplayIsPartial(threadId: id) {
-            historyReplayNotice = Self.replayNoticeText(isPartial: true)
+        // No batch drain here: with the replay gathered off-main (perf AA-02), a
+        // drained-but-unflushed event would be uncovered until the apply lands.
+        // Buffered events instead flush onto the (pre- or post-apply) timeline,
+        // and committed/dropped quanta are re-read from the durable window in
+        // the apply-phase stability loop below.
+        let streamActivityAtGatherStart = (streamQuantumCommits, streamQuantumDrops)
+        // PERF (AA-02): every SQLite read, JSON decode and the replay itself now
+        // run off-main in one detached pass; the MainActor applies the bundle in
+        // a single publish guarded by open generation + selection.
+        let bundle = await Self.gatherThreadOpenBundle(
+            threadId: id,
+            coordinator: coordinator,
+            proposedPlanRepo: proposedPlanRepo,
+            pendingCallbackRepo: pendingCallbackRepo,
+            checkpointRepo: checkpointRepo,
+            planNotesStore: planNotesStore,
+            queuedMessageRepo: queuedMessageRepo,
+            includeRunStartedAt: trackedRunId(for: id) != nil
+        )
+        guard !Task.isCancelled,
+              selectThreadOpenGeneration == openGeneration,
+              selectedThreadId == id else {
+            Self.agentOpenTrace("open bundle dropped stale gen=\(openGeneration)")
+            return
         }
+        var effective = bundle
+        // Reconcile with stream activity that happened while the bundle was in
+        // flight. Only quanta reduced from the pre-open timeline are dropped
+        // (the generation bump); events still in the batch are NOT drained —
+        // their flush applies them on top of the new timeline, which is exactly
+        // where newer-than-replay events belong. Committed/dropped quanta are
+        // re-read from the durable window (the coordinator persists before
+        // notifying observers), looping until stable so the applied timeline is
+        // never staler than what the user already saw. The final apply runs
+        // synchronously on the MainActor, so nothing interleaves after the last
+        // stability check.
+        var stabilityAttempts = 0
+        while stabilityAttempts < 3 {
+            streamApplyGeneration &+= 1
+            streamApplyInFlight = false
+            let activityBeforeReread = (streamQuantumCommits, streamQuantumDrops)
+            if activityBeforeReread != streamActivityAtGatherStart {
+                Self.agentOpenTrace("open bundle re-reads durable window (stream activity during gather)")
+                effective = await Self.rerefreshOpenBundleReplay(bundle: effective, threadId: id, coordinator: coordinator)
+                guard !Task.isCancelled,
+                      selectThreadOpenGeneration == openGeneration,
+                      selectedThreadId == id else {
+                    Self.agentOpenTrace("open re-replay dropped stale gen=\(openGeneration)")
+                    return
+                }
+            }
+            if (streamQuantumCommits, streamQuantumDrops) == activityBeforeReread {
+                break
+            }
+            stabilityAttempts += 1
+        }
+        applyThreadOpenBundle(effective, thread: selectedThread, openGeneration: openGeneration)
+    }
+
+    /// Re-reads the durable replay window after stream events landed during the
+    /// open bundle gather (perf AA-02): the durable rows are the complete,
+    /// persisted record — the coordinator persists before notifying observers.
+    nonisolated static func rerefreshOpenBundleReplay(
+        bundle: AgentThreadOpenBundle,
+        threadId: AgentThreadID,
+        coordinator: AgentRunCoordinator
+    ) async -> AgentThreadOpenBundle {
+        var refreshed = bundle
+        await Task.detached(priority: .userInitiated) {
+            let events = coordinator.latestStreamEvents(threadId: threadId)
+            let replay = chooseReplayEvents(persisted: events, snapshot: nil)
+            refreshed.persistedEvents = events
+            refreshed.replayedTimeline = timelineByReplaying(replay)
+            refreshed.errorRecoverable = displayedErrorIsRecoverable(in: replay)
+            refreshed.hotReplayIsPartial = coordinator.hotReplayIsPartial(threadId: threadId)
+        }.value
+        return refreshed
+    }
+
+    private func applyThreadOpenBundle(
+        _ bundle: AgentThreadOpenBundle,
+        thread selectedThread: AgentThread,
+        openGeneration: UInt64
+    ) {
+        let id = selectedThread.id
+        // UX-MAC_AGENT-CONTINUE: the newly selected thread may have been
+        // interrupted by a relaunch and hold a recoverable provider session.
+        selectedThreadHasRecoverableContext = bundle.hasRecoverableContext
+        historyReplayNotice = bundle.hotReplayIsPartial ? Self.replayNoticeText(isPartial: true) : nil
         // PERF: open instantly from persisted events (no main-thread provider
         // round-trip). Build the first timeline off the previous published value
         // so SwiftUI sees one swap, not empty→partial apply ticks.
-        // Then optionally refresh from the provider snapshot asynchronously —
-        // only replace the published timeline when the chosen replay is richer
-        // (avoids the open-thread blink when snapshot == local history).
-        let persistedReplay = Self.chooseReplayEvents(persisted: persistedEvents, snapshot: nil)
         // One publish of a fully-built timeline (not empty → apply-tick cascade).
-        timeline = Self.timelineByReplaying(persistedReplay)
-        lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: persistedReplay)
-        rehydrateDurableActiveState(threadId: id)
+        let paintedErrorBeforeOpen = timeline.error
+        timeline = bundle.replayedTimeline
+        // The stream path may have displayed a NEWER error while the bundle was
+        // in flight (its replay read predates that event; the re-replay loop
+        // narrows but cannot fully close that window). The recoverability flag
+        // must track the error actually displayed: when the painted error is
+        // not the one the replay carries, the painted flag is newer — keep it.
+        if paintedErrorBeforeOpen == nil || paintedErrorBeforeOpen == bundle.replayedTimeline.error {
+            lastErrorRecoverable = bundle.errorRecoverable
+        }
+        rehydrateDurableActiveState(from: bundle.durableActiveState)
         // A pending follow-up means the user already superseded the prior Active
         // plan; keep it cleared across select/reopen until the next run starts.
         // Queued text stays in the queue UI only until drain starts the turn.
         restoreQueuedFollowupTranscriptPresentation(threadId: id)
-        rehydrateProposedPlans(threadId: id)
-        rehydratePendingCallbacks(threadId: id)
+        for record in bundle.proposedPlans {
+            timeline.apply(.proposedPlan(record.plan))
+        }
+        for event in bundle.pendingCallbackEvents {
+            timeline.apply(event)
+        }
         refreshTokenSaverOptimizationStateFromTimeline(preservingExisting: true)
         // PERF: rebuild the O(1) item index once over the fully-replayed timeline so
         // subsequent item-location lookups skip the O(turns x items) linear scan.
         timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
-        reloadCheckpoints()
+        applyCheckpointSummaries(bundle.checkpointSummaries)
         suppressPersistedFinalDuplicatedByTimeline()
         resetTimelineUpdateTick()
+        applyQueuedMessagesFromOpenBundle(bundle.queuedMessages)
+        if trackedRunId(for: id) != nil {
+            // UX-XPLAT-008: use the host's persisted run start time so
+            // "Working for Xs" reflects real elapsed time even after
+            // selectThread is called mid-run (e.g. after app relaunch or
+            // switching away and back). Fallback to Date() only when the
+            // run record is not yet committed (race on the very first tick).
+            runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
+                current: runStartedAt,
+                persisted: bundle.runStartedAt
+            )
+        }
+        scheduleDeferredProviderSnapshotIfNeeded(
+            thread: selectedThread,
+            persistedEvents: bundle.persistedEvents,
+            openGeneration: openGeneration
+        )
+        // Do NOT auto-implement on select/reopen (pet, sidebar, restore). Opening a
+        // thread is a view action — Full Access only auto-implements when a plan
+        // arrives mid-stream, a run finishes with a pending plan, or the user
+        // switches into full access on an already-open thread.
+        // Restore persisted plan notes for the opened thread. A failed read must
+        // not masquerade as absent notes and then overwrite the durable value.
+        setPlanNotesWithoutSaving(bundle.planNotes ?? "", threadId: id)
+        if bundle.planNotesFailed {
+            statusMessage = "Could not load plan notes"
+        }
+        // Subagents is thread-scoped chrome: rebuild after first paint so
+        // switching threads never keeps another thread's Active/Done counts.
+        refreshSubagentActivity()
+        // Token Saver footer is per-thread; re-read the permanent total on open.
+        reloadTokenSaverThreadSavings()
+        paintedTimelineByThread[id] = timeline
+        Self.agentOpenTrace(
+            "full open bundle applied gen=\(openGeneration) items=\(Self.renderableItemCount(bundle.persistedEvents)) turns=\(timeline.turns.count) recoverable=\(selectedThreadHasRecoverableContext)"
+        )
+    }
+
+    private func scheduleDeferredProviderSnapshotIfNeeded(
+        thread selectedThread: AgentThread,
+        persistedEvents: [AssistantEvent],
+        openGeneration: UInt64
+    ) {
+        let id = selectedThread.id
         let persistedItemCount = Self.renderableItemCount(persistedEvents)
         let fetchSnapshot = Self.shouldFetchProviderSnapshotOnOpen(
             hasRecoverableContext: selectedThreadHasRecoverableContext,
@@ -2331,89 +2586,70 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         Self.agentOpenTrace(
             "full open firstPaint items=\(persistedItemCount) turns=\(timeline.turns.count) fetchSnapshot=\(fetchSnapshot) recoverable=\(selectedThreadHasRecoverableContext)"
         )
-        if fetchSnapshot {
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                do {
-                    let snapshot = try await self.providerThreadSnapshotEvents(threadId: id)
-                    // Drop if the user switched threads OR a newer full open
-                    // superseded this task (soft reselect does not bump gen).
-                    guard self.selectedThreadId == id,
-                          self.selectThreadOpenGeneration == openGeneration else {
-                        Self.agentOpenTrace("deferred snapshot dropped stale gen=\(openGeneration)")
-                        return
-                    }
-                    let confirmedAt = Date()
-                    self.providerThreadSnapshotConfirmedAtByThread[id] = confirmedAt
-                    self.providerThreadSnapshotLastConfirmedAt = confirmedAt
-                    self.providerThreadSnapshotStatusMessage = nil
-                    guard !snapshot.isEmpty else {
-                        Self.agentOpenTrace("deferred snapshot empty thread=\(id.value.uuidString.prefix(8))")
-                        return
-                    }
-                    let mergedSnapshot = self.mergePersistedContextTelemetry(
-                        snapshot: snapshot,
-                        persisted: persistedEvents
-                    )
-                    // Only replace the painted timeline when the provider has
-                    // STRICTLY more work items than local history. Equal/thinner
-                    // snapshots used to rebuild with a different event stream and
-                    // blink the same completed thread multiple times.
-                    let snapshotItemCount = Self.renderableItemCount(mergedSnapshot)
-                    let terminal = Self.isTerminalOpenStatus(selectedThread.status)
-                    let apply = Self.shouldApplyDeferredSnapshotReplay(
-                        firstPaintItemCount: persistedItemCount,
-                        deferredSnapshotItemCount: snapshotItemCount,
-                        threadIsTerminal: terminal
-                    )
-                    Self.agentOpenTrace(
-                        "deferred snapshot decide apply=\(apply) local=\(persistedItemCount) snap=\(snapshotItemCount) terminal=\(terminal) gen=\(openGeneration)"
-                    )
-                    guard apply else { return }
-                    let replayEvents = Self.chooseReplayEvents(
-                        persisted: persistedEvents,
-                        snapshot: mergedSnapshot
-                    )
-                    // Single atomic publish: never assign an empty intermediate timeline.
-                    Self.agentOpenTrace("deferred snapshot APPLY timeline rebuild gen=\(openGeneration)")
-                    self.timeline = Self.timelineByReplaying(replayEvents)
-                    self.rehydrateDurableActiveState(threadId: id)
-                    self.restoreQueuedFollowupTranscriptPresentation(threadId: id)
-                    self.rehydrateProposedPlans(threadId: id)
-                    self.rehydratePendingCallbacks(threadId: id)
-                    self.lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: replayEvents)
-                    self.refreshTokenSaverOptimizationStateFromTimeline(preservingExisting: true)
-                    self.timelineItemIndex = TimelineItemIndex(turns: self.timeline.turns)
-                } catch {
-                    guard self.selectedThreadId == id,
-                          self.selectThreadOpenGeneration == openGeneration else { return }
-                    let threadHasProviderContext = self.threads.first(where: { $0.id == id })?.providerThreadId?.isEmpty == false
-                        || !persistedEvents.isEmpty
-                    guard threadHasProviderContext else { return }
-                    self.providerThreadSnapshotStatusMessage = Self.providerThreadSnapshotFailureMessage(
-                        lastConfirmedAt: self.providerThreadSnapshotConfirmedAtByThread[id]
-                    )
+        guard fetchSnapshot else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let snapshot = try await self.providerThreadSnapshotEvents(threadId: id)
+                // Drop if the user switched threads OR a newer full open
+                // superseded this task (soft reselect does not bump gen).
+                guard self.selectedThreadId == id,
+                      self.selectThreadOpenGeneration == openGeneration else {
+                    Self.agentOpenTrace("deferred snapshot dropped stale gen=\(openGeneration)")
+                    return
                 }
+                let confirmedAt = Date()
+                self.providerThreadSnapshotConfirmedAtByThread[id] = confirmedAt
+                self.providerThreadSnapshotLastConfirmedAt = confirmedAt
+                self.providerThreadSnapshotStatusMessage = nil
+                guard !snapshot.isEmpty else {
+                    Self.agentOpenTrace("deferred snapshot empty thread=\(id.value.uuidString.prefix(8))")
+                    return
+                }
+                let mergedSnapshot = self.mergePersistedContextTelemetry(
+                    snapshot: snapshot,
+                    persisted: persistedEvents
+                )
+                // Only replace the painted timeline when the provider has
+                // STRICTLY more work items than local history. Equal/thinner
+                // snapshots used to rebuild with a different event stream and
+                // blink the same completed thread multiple times.
+                let snapshotItemCount = Self.renderableItemCount(mergedSnapshot)
+                let terminal = Self.isTerminalOpenStatus(selectedThread.status)
+                let apply = Self.shouldApplyDeferredSnapshotReplay(
+                    firstPaintItemCount: persistedItemCount,
+                    deferredSnapshotItemCount: snapshotItemCount,
+                    threadIsTerminal: terminal
+                )
+                Self.agentOpenTrace(
+                    "deferred snapshot decide apply=\(apply) local=\(persistedItemCount) snap=\(snapshotItemCount) terminal=\(terminal) gen=\(openGeneration)"
+                )
+                guard apply else { return }
+                let replayEvents = Self.chooseReplayEvents(
+                    persisted: persistedEvents,
+                    snapshot: mergedSnapshot
+                )
+                // Single atomic publish: never assign an empty intermediate timeline.
+                Self.agentOpenTrace("deferred snapshot APPLY timeline rebuild gen=\(openGeneration)")
+                self.timeline = Self.timelineByReplaying(replayEvents)
+                self.rehydrateDurableActiveState(threadId: id)
+                self.restoreQueuedFollowupTranscriptPresentation(threadId: id)
+                self.rehydrateProposedPlans(threadId: id)
+                self.rehydratePendingCallbacks(threadId: id)
+                self.lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: replayEvents)
+                self.refreshTokenSaverOptimizationStateFromTimeline(preservingExisting: true)
+                self.timelineItemIndex = TimelineItemIndex(turns: self.timeline.turns)
+            } catch {
+                guard self.selectedThreadId == id,
+                      self.selectThreadOpenGeneration == openGeneration else { return }
+                let threadHasProviderContext = self.threads.first(where: { $0.id == id })?.providerThreadId?.isEmpty == false
+                    || !persistedEvents.isEmpty
+                guard threadHasProviderContext else { return }
+                self.providerThreadSnapshotStatusMessage = Self.providerThreadSnapshotFailureMessage(
+                    lastConfirmedAt: self.providerThreadSnapshotConfirmedAtByThread[id]
+                )
             }
         }
-        // Do NOT auto-implement on select/reopen (pet, sidebar, restore). Opening a
-        // thread is a view action — Full Access only auto-implements when a plan
-        // arrives mid-stream, a run finishes with a pending plan, or the user
-        // switches into full access on an already-open thread.
-        // Restore persisted plan notes for the opened thread. A failed read must
-        // not masquerade as absent notes and then overwrite the durable value.
-        do {
-            setPlanNotesWithoutSaving(try planNotesStore?.load(threadId: id) ?? "", threadId: id)
-        } catch {
-            setPlanNotesWithoutSaving("", threadId: id)
-            statusMessage = "Could not load plan notes: \(error)"
-        }
-        // Subagents is thread-scoped chrome: rebuild after first paint so
-        // switching threads never keeps another thread's Active/Done counts.
-        refreshSubagentActivity()
-        // Token Saver footer is per-thread; re-read the permanent total on open.
-        reloadTokenSaverThreadSavings()
-        paintedTimelineByThread[id] = timeline
     }
 
     /// Called by the plan sidebar whenever planNotes changes to persist the
@@ -2448,19 +2684,31 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func reloadQueuedMessages() {
         guard let selectedThreadId, let queuedMessageRepo else {
-            guard Self.shouldPublishQueuedMessagesReload(
-                current: queuedMessages,
-                next: [],
-                currentStatus: queueStatusMessage,
-                nextStatus: nil
-            ) else { return }
-            queuedMessages = []
-            queueStatusMessage = nil
+            applyQueuedMessagesReload([], for: selectedThreadId)
             return
         }
         let next = (try? queuedMessageRepo.list(threadId: selectedThreadId)) ?? []
+        applyQueuedMessagesReload(next, for: selectedThreadId)
+    }
+
+    /// Queue rows fetched off-main by the thread open bundle (perf AA-02/AA-04):
+    /// the queue list no longer costs a synchronous SQLite read before the
+    /// first paint.
+    private func applyQueuedMessagesFromOpenBundle(_ next: [AgentQueuedMessage]) {
+        applyQueuedMessagesReload(next, for: selectedThreadId)
+    }
+
+    /// In-memory thread-local queue status swap at selection time — no SQLite.
+    private func applyQueuedStatusForSelectedThread() {
+        let nextStatus = selectedThreadId.flatMap { queueStatusByThread[$0] }
+        if queueStatusMessage != nextStatus {
+            queueStatusMessage = nextStatus
+        }
+    }
+
+    private func applyQueuedMessagesReload(_ next: [AgentQueuedMessage], for threadId: AgentThreadID?) {
         let nextStatus: String?
-        if let status = queueStatusByThread[selectedThreadId] {
+        if let threadId, let status = queueStatusByThread[threadId] {
             nextStatus = status
         } else if next.first?.durableState == .prepared {
             nextStatus = Self.preparedQueueStatusMessage
@@ -2723,7 +2971,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             checkpointDiffPreview = ""
             return
         }
-        let loaded = (try? checkpointRepo.list(threadId: selectedThreadId)) ?? []
+        // Metadata-only (perf AA-03): diff blobs are fetched per selection via
+        // loadCheckpointDiffPreview, never for the whole list on open/reselect.
+        let loaded = (try? checkpointRepo.listSummaries(threadId: selectedThreadId)) ?? []
+        applyCheckpointSummaries(loaded)
+    }
+
+    /// Publishes a metadata-only checkpoint list and (re)selects a checkpoint.
+    private func applyCheckpointSummaries(_ loaded: [AgentTurnCheckpointSummary]) {
         let next = Array(loaded.reversed())
         // Soft reselect / host refresh re-enters here every time. Re-assigning an
         // identical list re-selected the same checkpoint and rewrote the diff
@@ -2768,14 +3023,68 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         selectedCheckpointTurnCount = checkpoint.checkpointTurnCount
         selectedCheckpointPath = path
         checkpointStatusMessage = nil
+        loadCheckpointDiffPreview(
+            threadId: selectedThreadId,
+            checkpointTurnCount: checkpoint.checkpointTurnCount,
+            path: path
+        )
+    }
+
+    /// Fetches the selected checkpoint's diff payload off-main and publishes the
+    /// preview (perf AA-03: checkpoint rows no longer carry the diff blobs, so
+    /// the fetch happens per selection and only while the plan sidebar shows
+    /// them). The sidebar-open hook refetches when the panel was hidden at
+    /// select time.
+    private func loadCheckpointDiffPreview(
+        threadId: AgentThreadID?,
+        checkpointTurnCount: Int,
+        path: String?
+    ) {
+        guard let threadId, let checkpointRepo else {
+            checkpointDiffPreview = ""
+            return
+        }
+        guard showPlanSidebar else {
+            checkpointDiffPreview = ""
+            return
+        }
+        checkpointDiffPreview = ""
+        Task { @MainActor [weak self] in
+            let fetched = await Task.detached(priority: .userInitiated) {
+                try? checkpointRepo.get(threadId: threadId, checkpointTurnCount: checkpointTurnCount)
+            }.value
+            guard let self, !self.isDisposed,
+                  self.selectedThreadId == threadId,
+                  self.selectedCheckpointTurnCount == checkpointTurnCount else { return }
+            self.checkpointDiffPreview = Self.checkpointDiffPreviewText(from: fetched, path: path)
+        }
+    }
+
+    /// Pure preview builder (testable): all-files or single-file diff text.
+    nonisolated public static func checkpointDiffPreviewText(
+        from checkpoint: AgentTurnCheckpointSummary?,
+        path: String?
+    ) -> String {
+        guard let checkpoint else { return "No diff captured for this checkpoint." }
+        let preview: String
         if let path {
-            checkpointDiffPreview = checkpoint.fileDiffs.first(where: { $0.path == path })?.patch ?? ""
+            preview = checkpoint.fileDiffs.first(where: { $0.path == path })?.patch ?? ""
         } else {
-            checkpointDiffPreview = checkpoint.diffPatch ?? checkpoint.fileDiffs.map(\.patch).joined(separator: "\n\n")
+            preview = checkpoint.diffPatch ?? checkpoint.fileDiffs.map(\.patch).joined(separator: "\n\n")
         }
-        if checkpointDiffPreview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            checkpointDiffPreview = checkpoint.errorMessage ?? "No diff captured for this checkpoint."
+        if preview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return checkpoint.errorMessage ?? "No diff captured for this checkpoint."
         }
+        return preview
+    }
+
+    /// When the plan sidebar opens, the selected checkpoint's preview may not
+    /// have been fetched (the panel was hidden at select time).
+    private func refreshCheckpointDiffPreviewIfNeeded() {
+        guard showPlanSidebar,
+              let threadId = selectedThreadId,
+              let turnCount = selectedCheckpointTurnCount else { return }
+        loadCheckpointDiffPreview(threadId: threadId, checkpointTurnCount: turnCount, path: selectedCheckpointPath)
     }
 
     nonisolated public static func canRevertCheckpoint(
@@ -3512,6 +3821,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard !suppressStaleActivePlanUpdates else { return }
         guard let state = coordinator.durableActiveThreadState(threadId: threadId),
               let activePlan = state.activePlan else { return }
+        // Chat contract: never resurrect a fully completed prior checklist.
+        guard !AgentAppView.activePlanIsFullyCompleted(activePlan) else { return }
+        timeline.apply(.activePlanUpdated(activePlan))
+    }
+
+    /// Applies a durable active state that was gathered off-main as part of the
+    /// thread open bundle (perf AA-02). The completed-checklist contract and the
+    /// follow-up suppression check still run here, at apply time.
+    private func rehydrateDurableActiveState(from state: AgentActiveThreadState?) {
+        guard !suppressStaleActivePlanUpdates else { return }
+        guard let activePlan = state?.activePlan else { return }
         // Chat contract: never resurrect a fully completed prior checklist.
         guard !AgentAppView.activePlanIsFullyCompleted(activePlan) else { return }
         timeline.apply(.activePlanUpdated(activePlan))
@@ -8426,9 +8746,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         streamApplyInFlight = false
         guard !isDisposed, streamApplyGeneration == generation else {
             streamFlushNeeded = false
+            // The quantum was reduced from a pre-open timeline and dropped by a
+            // generation bump; its events are durable and the thread-open apply
+            // re-reads them (perf AA-02).
+            streamQuantumDrops &+= 1
             return
         }
         commitStreamQuantum(reduced)
+        streamQuantumCommits &+= 1
         let needsAnother = hasMore
             || streamFlushNeeded
             || !streamEventBatch.isEmpty
