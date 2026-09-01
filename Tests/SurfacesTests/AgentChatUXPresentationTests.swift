@@ -703,6 +703,84 @@ final class AgentChatUXPresentationTests: XCTestCase {
         XCTAssertTrue(model?.lines.contains(where: { $0.kind == .addition && $0.text.contains("let x = 2") }) == true)
     }
 
+    /// WHY (perf CH-03): the live tool row re-ran the whole diff extraction (JSON
+    /// parses + full-text splits) on every body pass — even for a Bash tool whose
+    /// 50 KB output is not a diff. Identical growth signatures must extract once.
+    func test_fileEditDiff_modelExtractsOncePerGrowthSignature() {
+        let bigNonDiffOutput = String(
+            repeating: "plain build log line with no diff markers at all\n", count: 1_200
+        )
+        var item = AssistantItem(
+            id: "bash-50k",
+            turnId: "t1",
+            type: .tool,
+            state: .streaming,
+            summary: "Bash",
+            body: "npm run build",
+            output: bigNonDiffOutput,
+            startedAtMs: 1
+        )
+        AgentFileEditDiffPresentation.diffModelComputeCountForTesting = 0
+
+        let first = AgentFileEditDiffPresentation.model(for: item)
+        XCTAssertNil(first, "sanity: a non-diff build log is not an Edit card")
+        XCTAssertEqual(AgentFileEditDiffPresentation.diffModelComputeCountForTesting, 1)
+
+        // Twenty body passes (tokens streaming into sibling rows): cache hits.
+        for _ in 0..<20 {
+            XCTAssertNil(AgentFileEditDiffPresentation.model(for: item))
+        }
+        XCTAssertEqual(
+            AgentFileEditDiffPresentation.diffModelComputeCountForTesting, 1,
+            "20 body passes of the same 50 KB non-diff output must run zero re-extractions"
+        )
+
+        // Output growth (the tool streaming more) invalidates the signature.
+        item.output! += "final line\n"
+        _ = AgentFileEditDiffPresentation.model(for: item)
+        XCTAssertEqual(
+            AgentFileEditDiffPresentation.diffModelComputeCountForTesting, 2,
+            "output growth must re-extract exactly once for the new signature"
+        )
+
+        // A state transition (streaming -> completed) also invalidates.
+        item.state = .completed
+        _ = AgentFileEditDiffPresentation.model(for: item)
+        XCTAssertEqual(AgentFileEditDiffPresentation.diffModelComputeCountForTesting, 3)
+    }
+
+    /// WHY (perf CH-03): plain-text tool output must never reach
+    /// JSONSerialization — only payloads starting with { or [ can be JSON.
+    func test_extractDiffText_skipsJSONAttemptsForPlainText() {
+        let plain = "compiling module A\ncompiling module B\nDone."
+        let item = AssistantItem(
+            id: "plain-1",
+            turnId: "t1",
+            type: .tool,
+            state: .completed,
+            summary: "Bash",
+            body: "swift build",
+            output: plain,
+            startedAtMs: 1
+        )
+        XCTAssertNil(AgentFileEditDiffPresentation.extractDiffText(from: item),
+                     "plain build output is not a diff")
+        // A JSON tool output still extracts through the JSON path.
+        let json = #"{"file_path":"a.ts","old_string":"x","new_string":"y"}"#
+        let jsonItem = AssistantItem(
+            id: "json-1",
+            turnId: "t1",
+            type: .tool,
+            state: .completed,
+            summary: "Edit",
+            body: json,
+            startedAtMs: 1
+        )
+        let extracted = AgentFileEditDiffPresentation.extractDiffText(from: jsonItem)
+        XCTAssertNotNil(extracted, "Edit JSON still extracts a diff")
+        XCTAssertTrue(extracted?.contains("a.ts") == true)
+    }
+
     func test_appendFriendlyCompletedWorkBlocks_refreshesPayloadWhenIdsUnchanged() {
         // WHY: token deltas keep item ids; returning previous blocks froze body mid-stream.
         var first = AssistantItem(
