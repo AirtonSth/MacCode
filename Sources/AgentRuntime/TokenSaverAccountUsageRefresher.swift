@@ -1,6 +1,5 @@
 import Foundation
 import Darwin
-import Security
 import CoreModel
 import RemoteCodeCSystem
 
@@ -364,25 +363,6 @@ public enum AssistantAccountUsageParser {
             ?? obj["claude_ai_oauth"] as? [String: Any]
             ?? obj
         return string(oauth["accessToken"]) ?? string(oauth["access_token"])
-    }
-
-    /// macOS Claude Code stores the same JSON in Keychain, not `~/.claude/.credentials.json`.
-    public static func claudeAccessTokenFromKeychain(
-        service: String = "Claude Code-credentials"
-    ) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess, let data = item as? Data,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        return claudeAccessToken(fromAuthObject: obj)
     }
 
     /// ChatGPT Codex `GET …/wham/usage` mapped onto the existing app-server parser.
@@ -879,8 +859,10 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     }
 
     private func fetchClaudeOAuthUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
-        guard request.claudeAuthFileURL != nil else { return nil }
-        guard let token = claudeToken(for: request) else { return nil }
+        guard let authFile = request.claudeAuthFileURL,
+              let token = AssistantAccountUsageParser.claudeAccessToken(fromAuthFile: authFile) else {
+            return nil
+        }
         let endpoint = request.claudeUsageAPIURL
             ?? TokenSaverAccountUsageRefreshRequest.defaultClaudeUsageAPIURL
         guard let payload = await fetchJSON(endpoint: endpoint, headers: [
@@ -914,19 +896,6 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
             return nil
         }
         return AssistantAccountUsageParser.codexWhamUsage(from: payload)
-    }
-
-    private func claudeToken(for request: TokenSaverAccountUsageRefreshRequest) -> String? {
-        guard let authFile = request.claudeAuthFileURL else { return nil }
-        if let token = AssistantAccountUsageParser.claudeAccessToken(fromAuthFile: authFile) {
-            return token
-        }
-        let defaultFile = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/.credentials.json")
-        guard authFile.standardizedFileURL.path == defaultFile.standardizedFileURL.path else {
-            return nil
-        }
-        return AssistantAccountUsageParser.claudeAccessTokenFromKeychain()
     }
 
     private func fetchJSON(endpoint: URL, headers: [String: String]) async -> [String: Any]? {

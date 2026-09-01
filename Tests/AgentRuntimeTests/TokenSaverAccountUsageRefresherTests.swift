@@ -68,6 +68,24 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
         )
     }
 
+    func test_claudeLimitRefreshNeverReadsClaudeCodeKeychain() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/AgentRuntime/TokenSaverAccountUsageRefresher.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertFalse(
+            source.contains("Claude Code-credentials") || source.contains("SecItemCopyMatching"),
+            "checking Claude limits must use Claude's own CLI fallback instead of prompting for Keychain access"
+        )
+    }
+
     func test_codexParserPrefersWeeklyCodexLimitBucket() {
         let usage = AssistantAccountUsageParser.codex(from: [
             "rateLimits": [
