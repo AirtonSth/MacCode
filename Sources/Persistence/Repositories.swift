@@ -74,6 +74,14 @@ private func parseDate(_ s: String?) -> Date {
     return Date()
 }
 
+/// X-02: rail list uses SQLite `unixepoch()` so ISO8601 is not parsed per row
+/// on the UI path. Zero/NULL (unparseable TEXT) falls back to now, matching
+/// `parseDate`.
+private func dateFromUnixEpoch(_ seconds: Int64) -> Date {
+    guard seconds > 0 else { return Date() }
+    return Date(timeIntervalSince1970: TimeInterval(seconds))
+}
+
 // PERF: agent-thread model selection / run-as-user / routing row fields each
 // allocated JSONDecoder/JSONEncoder on every list/get/upsert. Shared process-
 // wide pair under a short lock (codecs are not thread-safe); wire JSON
@@ -878,7 +886,7 @@ public final class AgentThreadRepository {
         // JOIN routing so a 20-thread rail is one statement, not 1+N.
         // PF-30: WAL reader so the rail does not wait on stream writers.
         let columns = """
-            t.id, t.project_id, t.workspace_id, t.title, t.provider, t.provider_instance_id, t.model, t.provider_thread_id, t.status, t.created_at, t.updated_at, t.diff_additions, t.diff_deletions, t.has_unread, t.color, t.pinned, t.sort_order, t.permission_mode, t.reasoning_effort, t.execution_mode, t.base_branch, t.worktree_path, t.service_tier, t.model_selection_json, t.interaction_mode, t.run_as_user_json, r.mode, r.configuration_json, r.revision
+            t.id, t.project_id, t.workspace_id, t.title, t.provider, t.provider_instance_id, t.model, t.provider_thread_id, t.status, unixepoch(t.created_at), unixepoch(t.updated_at), t.diff_additions, t.diff_deletions, t.has_unread, t.color, t.pinned, t.sort_order, t.permission_mode, t.reasoning_effort, t.execution_mode, t.base_branch, t.worktree_path, t.service_tier, t.model_selection_json, t.interaction_mode, t.run_as_user_json, r.mode, r.configuration_json, r.revision
             """
         let from = "FROM agent_threads t LEFT JOIN agent_thread_routing r ON r.thread_id = t.id"
         let order = "ORDER BY t.updated_at DESC, t.id DESC"
@@ -918,8 +926,8 @@ public final class AgentThreadRepository {
                     model: model,
                     providerThreadId: st.columnText(7),
                     status: AgentRunStatus(rawValue: st.columnText(8) ?? "") ?? .pending,
-                    createdAt: parseDate(st.columnText(9)),
-                    updatedAt: parseDate(st.columnText(10)),
+                    createdAt: dateFromUnixEpoch(st.columnInt64(9)),
+                    updatedAt: dateFromUnixEpoch(st.columnInt64(10)),
                     diffAdditions: Int(st.columnInt64(11)),
                     diffDeletions: Int(st.columnInt64(12)),
                     hasUnread: st.columnInt64(13) != 0,

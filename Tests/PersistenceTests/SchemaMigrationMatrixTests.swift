@@ -489,9 +489,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             79,
             80,
             81,
-            82
+            82,
+            83
         ])
-        XCTAssertEqual(Schema.currentVersion, 82)
+        XCTAssertEqual(Schema.currentVersion, 83)
         XCTAssertFalse(
             Schema.steps.contains { (63...66).contains($0.version) },
             "schema versions 63-66 are retired and must never be reused"
@@ -518,7 +519,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
 
         try Schema.migrateSteps(db, Schema.steps)
         XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
-        XCTAssertEqual(Schema.currentVersion, 82)
+        XCTAssertEqual(Schema.currentVersion, 83)
 
         XCTAssertEqual(try rowCount(db, table: "token_saver_run_winner_receipts"), 0,
                        "v72 must not backfill historical winners")
@@ -599,7 +600,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             Schema.steps.filter { $0.version == 71 }.count, 1,
             "HEAD/origin production last published step is 71"
         )
-        XCTAssertEqual(Schema.currentVersion, 82)
+        XCTAssertEqual(Schema.currentVersion, 83)
         XCTAssertEqual(
             Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82],
             "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec; v77 owns nullable agent_runs.terminal_reason; v78 deduplicates savings retries; v79 preserves host attestations outside rolling replay; v80 owns Bot queued follow-ups; v81 indexes running thread IDs; v82 indexes audit_log(action, id)"
@@ -1394,6 +1395,56 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             after.contains { $0.contains("SCAN audit_log") && !$0.contains("INDEX idx_audit_log_action_id") },
             "v82 must remove the full-table scan from the signature read: \(after)"
         )
+    }
+
+    func test_v82ToV83IndexesWorkspaceUpdatedAtForRailList() throws {
+        // WHY (perf X-02): idle rail reloads ORDER BY updated_at DESC without
+        // a matching index, so 300 threads SCAN. v83 adds
+        // (workspace_id, updated_at DESC, id DESC).
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 82 })
+        let workspaceID = WorkspaceID()
+        let repo = AgentThreadRepository(db: db)
+        for index in 0..<64 {
+            try repo.upsert(AgentThread(
+                workspaceId: workspaceID,
+                title: "rail-\(index)",
+                provider: .codex,
+                model: "gpt-test"
+            ))
+        }
+
+        let query = """
+            EXPLAIN QUERY PLAN
+            SELECT t.id
+            FROM agent_threads t
+            WHERE t.workspace_id = ?
+            ORDER BY t.updated_at DESC, t.id DESC;
+            """
+        func planDetails() throws -> [String] {
+            let plan = try db.prepare(query)
+            try plan.bind(1, workspaceID.value.uuidString)
+            defer { plan.reset() }
+            var details: [String] = []
+            while try plan.step() {
+                if let detail = plan.columnText(3) { details.append(detail) }
+            }
+            return details
+        }
+
+        XCTAssertEqual(try maxVersion(db), 82)
+        try Schema.migrateSteps(db, Schema.steps)
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
+        let after = try planDetails()
+        XCTAssertTrue(
+            after.contains { $0.contains("idx_agent_threads_workspace_updated") },
+            "v83 must use the workspace+updated_at rail index: \(after)"
+        )
+        let listed = try repo.list(workspaceId: workspaceID)
+        XCTAssertEqual(listed.count, 64)
+        for window in zip(listed, listed.dropFirst()) {
+            XCTAssertGreaterThanOrEqual(window.0.updatedAt, window.1.updatedAt)
+        }
     }
 
     func test_oldV61MaintenanceRollsBackFailedBatchAndRetriesToDrain() throws {

@@ -38,8 +38,9 @@ public enum Schema {
     /// v80 owns host-authoritative Bot queued follow-ups, v81 indexes the
     /// exact running-thread predicate used by provider-session reaping, and
     /// v82 indexes audit_log(action, id) so the orchestration receipt poll
-    /// can read its append signature without a table scan.
-    public static let currentVersion: Int = 82
+    /// can read its append signature without a table scan, and v83 indexes
+    /// agent_threads(workspace_id, updated_at DESC, id DESC) for the rail list.
+    public static let currentVersion: Int = 83
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1762,6 +1763,10 @@ public enum Schema {
         SchemaStep(82, """
         CREATE INDEX IF NOT EXISTS idx_audit_log_action_id
             ON audit_log(action, id);
+        """),
+        SchemaStep(83, """
+        CREATE INDEX IF NOT EXISTS idx_agent_threads_workspace_updated
+            ON agent_threads(workspace_id, updated_at DESC, id DESC);
         """),
     ]
 
