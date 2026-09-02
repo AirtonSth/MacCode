@@ -133,8 +133,14 @@ public struct BotDeskRouting: Equatable, Codable {
         )
     }
 
+    /// 1.2: `auto` is honest — it resolves to the provider default and never
+    /// pretends to run a Token Saver / eligibleProviders router. Renaming
+    /// the wire value would break persisted routing; keep `auto` but make the
+    /// contract explicit in code and UI.
+    public var isAutoRouting: Bool { routingMode == .auto }
+
     public func resolvedModel(defaultModel: (AgentProvider) -> String) -> String {
-        if routingMode == .auto || model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if isAutoRouting || model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return defaultModel(provider)
         }
         return model
@@ -8987,13 +8993,33 @@ public final class BotsViewModel: ObservableObject {
     ) throws -> BotStartedRun {
         let model = routing.resolvedModel(defaultModel: Self.defaultModel(for:))
         var liveConversation = conversation
+        // 1.8: Bot runs use BotHome as cwd (not "/") so provider file tools
+        // operate inside the bot's home directory. Workspace-less threads
+        // fall back to BotHome via executionCwdOverride at send time.
+        let botHomeURL = BotHome(appSupportDirectory: context.appSupportDirectory, bot: bot).root
+        try? FileManager.default.createDirectory(at: botHomeURL, withIntermediateDirectories: true)
         let thread: AgentThread
-        if let linked = conversation.linkedAgentThreadID,
-           let existing = try context.threadRepo.get(id: linked),
-           !threadBelongsToAnotherBot(linked, botID: bot.id),
-           existing.provider == routing.provider,
-           existing.providerInstanceId == routing.providerInstanceID,
-           (existing.runAsUser ?? AgentRunAsUser.current()).id == routing.runAsUser.id {
+        let canReuseExisting = conversation.linkedAgentThreadID.flatMap { linked -> Bool? in
+            guard let existing = try? context.threadRepo.get(id: linked),
+                  !threadBelongsToAnotherBot(linked, botID: bot.id),
+                  existing.provider == routing.provider,
+                  existing.providerInstanceId == routing.providerInstanceID,
+                  (existing.runAsUser ?? AgentRunAsUser.current()).id == routing.runAsUser.id else { return false }
+            // 1.3: model/reasoning/permission drift updates the existing thread
+            // in place instead of forking a new thread and losing history.
+            var updated = existing
+            var didUpdate = false
+            if updated.model != model { updated.model = model; didUpdate = true }
+            if updated.reasoningEffort != routing.reasoningEffort { updated.reasoningEffort = routing.reasoningEffort; didUpdate = true }
+            if updated.permissionMode != routing.permissionMode { updated.permissionMode = routing.permissionMode; didUpdate = true }
+            if updated.serviceTier != routing.serviceTier { updated.serviceTier = routing.serviceTier; didUpdate = true }
+            if didUpdate {
+                updated.modelSelection = AgentModelSelection(provider: routing.provider, modelId: model, reasoningEffort: routing.reasoningEffort, serviceTier: routing.serviceTier)
+                try? context.threadRepo.upsert(updated)
+            }
+            return true
+        } ?? false
+        if canReuseExisting, let linked = conversation.linkedAgentThreadID, let existing = try? context.threadRepo.get(id: linked) {
             thread = existing
         } else {
             thread = try router.createAgentThread(
@@ -9201,6 +9227,10 @@ public final class BotsViewModel: ObservableObject {
                 cancelExactRunWait(prepared.runID)
                 return nil
             }
+            // 1.8: Bot threads are workspace-less; provider file tools
+            // must start in the bot's home directory, not "/".
+            let botHomeCwd = BotHome(appSupportDirectory: context.appSupportDirectory, bot: bot).root.path
+            try? FileManager.default.createDirectory(at: URL(fileURLWithPath: botHomeCwd), withIntermediateDirectories: true)
             let result = try await router.sendAgentMessage(
                 thread: prepared.thread.id,
                 text: receipt.compiledPayload,
@@ -9217,7 +9247,8 @@ public final class BotsViewModel: ObservableObject {
                 ),
                 providerInstanceId: routing.providerInstanceID,
                 attachments: attachments,
-                requestedRunID: prepared.runID
+                requestedRunID: prepared.runID,
+                executionCwdOverride: botHomeCwd
             )
             // Dest persist cannot unstart a live provider turn.
             _ = try? persistWorkingConversation(prepared.conversation)

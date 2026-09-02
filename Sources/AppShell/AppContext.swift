@@ -1181,9 +1181,9 @@ public final class AppContext {
             return .object(payload)
         }
         func agentRunPayload(threadId: AgentThreadID, runId: AgentRunID? = nil, status: AgentRunStatus? = nil) -> JSONValue {
-            var payload: [String: JSONValue] = ["thread_id": .string(threadId.value.uuidString)]
+            var payload: [String: JSONValue] = ["thread_id": .string(threadId.value.uuidString.lowercased())]
             if let runId {
-                payload["run_id"] = .string(runId.value.uuidString)
+                payload["run_id"] = .string(runId.value.uuidString.lowercased())
                 if let timing = try? runRepo.timing(of: runId) {
                     let startedAtMs = Int64(timing.startedAt.timeIntervalSince1970 * 1000)
                     payload["started_at_ms"] = .number(Double(startedAtMs))
@@ -1196,14 +1196,22 @@ public final class AppContext {
                 }
             }
             if let wid = try? threadRepo.workspaceId(of: threadId) {
-                payload["workspace_id"] = .string(wid.value.uuidString)
+                payload["workspace_id"] = .string(wid.value.uuidString.lowercased())
             }
             if let status {
                 payload["status"] = .string(status.rawValue)
             }
             return .object(payload)
         }
+        // 1.7: onRunStarted + .threadStarted both mapped to agent.run.started.
+        // Dedup by (threadId, runId) so one logical run emits one event even
+        // though coordinator fires both callbacks within the same turn. Resume
+        // paths only emit .threadStarted, so onRunStarted becomes the single
+        // source for new runs.
+        var lastPublishedRunStarted: (AgentThreadID, AgentRunID)?
         coordinator.onRunStarted = { [weak self] tid, runId in
+            if lastPublishedRunStarted == (tid, runId) { return }
+            lastPublishedRunStarted = (tid, runId)
             EventBus.shared.publish(kind: .agentRunStarted,
                                     payload: agentRunPayload(threadId: tid, runId: runId))
             self?.beginTokenSaverAttempt(runId: runId)
@@ -1216,9 +1224,11 @@ public final class AppContext {
             )
         }
         coordinator.onAssistantEvent = { ev, tid, runId in
-            let t = tid.value.uuidString
+            let t = tid.value.uuidString.lowercased()
             switch ev {
             case .threadStarted:
+                if lastPublishedRunStarted == (tid, runId) { break }
+                lastPublishedRunStarted = (tid, runId)
                 EventBus.shared.publish(kind: .agentRunStarted, payload: agentRunPayload(threadId: tid, runId: runId))
             case .turnStarted(let turnId):
                 EventBus.shared.publish(kind: .agentTurnStarted,
@@ -1451,7 +1461,13 @@ public final class AppContext {
                 let kind: RemoteCodeEventKind = status == .completed
                     ? .agentRunCompleted
                     : .agentRunFailed
-                EventBus.shared.publish(kind: kind, payload: agentRunPayload(threadId: tid, runId: rid, status: status))
+                var failedPayload = agentRunPayload(threadId: tid, runId: rid, status: status)
+                if status == .failed, let msg = try? self.runRepo.errorMessage(of: rid), !msg.isEmpty {
+                    var obj = failedPayload.objectValue ?? [:]
+                    obj["message"] = .string(msg)
+                    failedPayload = .object(obj)
+                }
+                EventBus.shared.publish(kind: kind, payload: kind == .agentRunFailed ? failedPayload : agentRunPayload(threadId: tid, runId: rid, status: status))
                 EventBus.shared.publish(kind: .agentRunFinished, payload: agentRunPayload(threadId: tid, runId: rid, status: status))
                 // Flush any debounced usage for this run now that the run is done so
                 // the final token batch is never stranded in the accumulator.

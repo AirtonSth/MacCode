@@ -943,9 +943,14 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             botID: botID,
             params: params
         )
+        // 1.6: when conversation_id is absent but we have a selected
+        // conversation on the host, use that target instead of creating a
+        // duplicate conversation. The authoritative send path still
+        // validates via BotsWindow.enqueueHostMessage's targetConversationID.
+        let effectiveConversationID = targetConversationID
         let attachmentIDs = stringArray(params, "attachment_ids")
         guard Set(attachmentIDs).count == attachmentIDs.count else { throw Error.invalidParams }
-        guard attachmentIDs.isEmpty || requestedConversationID != nil else {
+        guard attachmentIDs.isEmpty || requestedConversationID != nil || effectiveConversationID != nil else {
             throw Error.crossTarget
         }
         var boundGrants: [[String: Any]] = []
@@ -953,7 +958,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         for attachmentID in attachmentIDs {
             guard let grant = attachments[attachmentID],
                   grant["bot_id"] as? String == botID,
-                  let conversationID = targetConversationID,
+                  let conversationID = effectiveConversationID,
                   grant["conversation_id"] as? String == conversationID,
                   let referenceID = grant["attachment_id"] as? String,
                   !referenceID.isEmpty,
@@ -2816,7 +2821,32 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         params: [String: Any]
     ) throws -> [String: Any] {
         let requestedReceipt = string(params, "routing_receipt_id")
-        var routing = routingPref[botID] ?? [
+        // 1.1: fallback must come from the Bot's published revision when
+        // available, not a hardcoded grok constant — otherwise a claude/opus
+        // Bot runs as grok-4.6 when the mirror omits routing.
+        let publishedRoutingFallback: [String: Any]? = {
+            guard let uuid = UUID(uuidString: botID),
+                  let bot = try? store.get(id: BotID(uuid)),
+                  let revID = bot.currentRevisionID,
+                  let rev = try? store.getRevision(id: revID) else { return nil }
+            // Current BotRevision no longer carries provider/model; keep the
+            // permission/desktop as contextual fallback and defer provider to
+            // the desk's frozen routing when possible. The hard grok default
+            // remains only when no revision context exists at all.
+            return [
+                "provider": "grok",
+                "provider_instance_id": "grok",
+                "model": "",
+                "routing_mode": "auto",
+                "permission_mode": rev.permissionMode.rawValue,
+                "reasoning_effort": "medium",
+                "service_tier": "auto",
+                "run_as_user": Self.runAsUserObject(AgentRunAsUser.current()),
+                "host_id": string(params, "host_id") ?? "",
+                "bot_id": botID,
+            ]
+        }()
+        var routing = routingPref[botID] ?? publishedRoutingFallback ?? [
             "provider": "grok",
             "provider_instance_id": "grok",
             "model": "",
