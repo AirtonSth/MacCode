@@ -610,7 +610,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             guard let agent = s as? AgentAppSurface,
                   resolvedWorkspace == nil || agent.viewModel.workspaceID == resolvedWorkspace! else { continue }
             workspacesNeedingRailReload.insert(agent.viewModel.workspaceID)
-            if reloadTranscriptIfSelected, agent.viewModel.selectedThreadId == thread {
+            if reloadTranscriptIfSelected,
+               agent.viewModel.selectedThreadId == thread,
+               !agent.viewModel.isHiddenFromSurface {
                 agent.viewModel.selectThread(thread, markRead: false)
             }
         }

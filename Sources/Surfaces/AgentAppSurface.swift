@@ -1062,6 +1062,48 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// callbacks become no-ops even if a weak observer slot is briefly live.
     private var isDisposed = false
 
+    /// PF-10: hidden Agent App tabs keep reducing the stream but must not
+    /// publish at 30 Hz, tick, or reload savings/rail until they are visible.
+    private var surfaceVisibility: AgentVisibilityState = .visible
+    private var latestHiddenTimeline: AssistantTimelineState?
+    private var hiddenTimelineThreadId: AgentThreadID?
+    private var hiddenTimelineOpenGeneration: UInt64 = 0
+    private var lastHiddenTimelinePublishAt: Date?
+    private(set) var hiddenTimelinePublishCountForTesting = 0
+    private(set) var timelineTickScheduleCountForTesting = 0
+    var hiddenTimelinePublishIntervalForTesting: TimeInterval = 1
+    var nowForTesting: () -> Date = { Date() }
+    public var isHiddenFromSurface: Bool { surfaceVisibility == .hidden }
+
+    func setVisibility(_ visibility: AgentVisibilityState) {
+        guard !isDisposed else { return }
+        let previous = surfaceVisibility
+        surfaceVisibility = visibility
+        if visibility == .hidden {
+            timelineUpdateTickTask?.cancel()
+            timelineUpdateTickTask = nil
+            hiddenTimelineThreadId = selectedThreadId
+            hiddenTimelineOpenGeneration = selectThreadOpenGeneration
+            latestHiddenTimeline = timeline
+            lastHiddenTimelinePublishAt = nil
+            hiddenTimelinePublishCountForTesting = 0
+            return
+        }
+        guard previous == .hidden else { return }
+        let sameOpen = hiddenTimelineThreadId == selectedThreadId
+            && hiddenTimelineOpenGeneration == selectThreadOpenGeneration
+        if sameOpen, let latestHiddenTimeline {
+            timeline = latestHiddenTimeline
+        }
+        hiddenTimelineThreadId = nil
+        latestHiddenTimeline = nil
+        lastHiddenTimelinePublishAt = nil
+        guard sameOpen else { return }
+        objectWillChange.send()
+        scheduleReloadThreads()
+        reloadTokenSaverThreadSavings()
+    }
+
     private func publishInterestedThreadId(_ id: AgentThreadID?) {
         interestedThread.set(id)
     }
@@ -1075,6 +1117,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// DB on the main actor for the same event and the UI freezes under load.
     func scheduleReloadThreads(delayMilliseconds: UInt64 = 50) {
         guard !isDisposed else { return }
+        guard surfaceVisibility != .hidden else { return }
         guard pendingThreadReloadTask == nil else { return }
         pendingThreadReloadTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(delayMilliseconds))
@@ -1930,6 +1973,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Schedule a coalesced reload: eligibility + ledger + estimate all off-main.
     public func reloadTokenSaverThreadSavings() {
         guard !isDisposed else { return }
+        guard surfaceVisibility != .hidden else { return }
         tokenSaverFooterReloadTask?.cancel()
         let eligibleCheck = tokenSaverFooterEligibleCheck
         let graphifyCheck = tokenSaverGraphifyActiveCheck
@@ -8698,7 +8742,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         let input = StreamQuantumReduceInput(
             selectedThreadId: selected,
-            timeline: timeline,
+            timeline: latestHiddenTimeline ?? timeline,
             suppressStaleActivePlanUpdates: suppressStaleActivePlanUpdates,
             newestUserMessageAt: messages.last(where: { $0.role == .user })?.createdAt,
             runStartedAt: runStartedAt,
@@ -8965,7 +9009,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if liveBackgroundTasks != reduced.liveBackgroundTasks {
             liveBackgroundTasks = reduced.liveBackgroundTasks
         }
-        timeline = reduced.timeline
+        if surfaceVisibility == .hidden {
+            latestHiddenTimeline = reduced.timeline
+            let now = nowForTesting()
+            let due = lastHiddenTimelinePublishAt.map {
+                now.timeIntervalSince($0) >= hiddenTimelinePublishIntervalForTesting
+            } ?? true
+            if due {
+                timeline = reduced.timeline
+                lastHiddenTimelinePublishAt = now
+                hiddenTimelinePublishCountForTesting += 1
+            }
+        } else {
+            timeline = reduced.timeline
+        }
         let budget = Self.aggregateBudgetDecision(
             force: reduced.forceAggregateBudget,
             opsSinceLastWalk: streamAggregateBudgetOps,
@@ -9196,6 +9253,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     private func scheduleTimelineUpdateTick() {
+        guard surfaceVisibility != .hidden else { return }
+        timelineTickScheduleCountForTesting += 1
         guard timelineUpdateTickTask == nil else { return }
         // ~30 Hz paint coalesce (was 16 ms / 60 Hz) — fewer full transcript
         // re-evaluations while tokens stream.
@@ -18584,6 +18643,12 @@ public final class AgentAppSurface: NSObject, Surface {
         view.window?.makeFirstResponder(view)
     }
     public func unfocus() {}
+    public func didBecomeHidden() {
+        viewModel.setVisibility(.hidden)
+    }
+    public func didBecomeVisible() {
+        viewModel.setVisibility(.visible)
+    }
     public func close() {
         // Drop coordinator fan-out + heavy transcript state before unregister.
         // Multi-tab freezes were amplified by closed surfaces still buffering

@@ -9289,6 +9289,151 @@ final class AgentAppViewModelTests: XCTestCase {
                       "a bot created after the cache must appear in the next catalog read")
         XCTAssertEqual(botStore.listQueryCountForTesting, 2)
     }
+
+    func test_hiddenSurface_coalescesStreamPublishesAndStopsTicks() async throws {
+        // WHY: PF-10 — a hidden Agent App tab with a live run used to flush and
+        // tick at 30 Hz. Hidden must keep reducing so reveal matches a tab that
+        // stayed visible, but must not publish every token or schedule ticks.
+        let (hidden, hiddenRepo) = try makeVM()
+        let (visible, visibleRepo) = try makeVM()
+        let hiddenThread = AgentThread(
+            workspaceId: hidden.workspaceID,
+            title: "live",
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running
+        )
+        let visibleThread = AgentThread(
+            workspaceId: visible.workspaceID,
+            title: "live",
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running
+        )
+        try hiddenRepo.upsert(hiddenThread)
+        try visibleRepo.upsert(visibleThread)
+        hidden.selectThread(hiddenThread.id)
+        visible.selectThread(visibleThread.id)
+        await hidden.waitForSelectThreadHydrationForTesting()
+        await visible.waitForSelectThreadHydrationForTesting()
+
+        hidden.hiddenTimelinePublishIntervalForTesting = 3_600
+        hidden.setVisibility(.hidden)
+        XCTAssertTrue(hidden.isHiddenFromSurface)
+
+        pumpStream(on: hidden, threadId: hiddenThread.id, run: AgentRunID(), deltas: 200)
+        pumpStream(on: visible, threadId: visibleThread.id, run: AgentRunID(), deltas: 200)
+        await settleStream(hidden)
+        await settleStream(visible)
+
+        XCTAssertEqual(
+            hidden.timelineTickScheduleCountForTesting,
+            0,
+            "hidden surfaces must not arm the 33 ms transcript tick"
+        )
+        XCTAssertLessThanOrEqual(
+            hidden.hiddenTimelinePublishCountForTesting,
+            1,
+            "hidden stream must coalesce publishes to at most one per interval"
+        )
+        XCTAssertGreaterThan(
+            visible.timelineTickScheduleCountForTesting,
+            0,
+            "the visible twin must still tick so the comparison is honest"
+        )
+
+        hidden.setVisibility(.visible)
+        XCTAssertEqual(
+            hidden.timeline.turns.map(\.turnId),
+            visible.timeline.turns.map(\.turnId),
+            "revealing a hidden tab must match a surface that stayed visible"
+        )
+        XCTAssertEqual(
+            hidden.timeline.turns.map { $0.items.map(\.body) },
+            visible.timeline.turns.map { $0.items.map(\.body) }
+        )
+    }
+
+    func test_hiddenSurface_dropsStaleStreamAfterThreadSwitch() async throws {
+        // WHY: hide → switch thread → show must not paint the leaving thread.
+        let (vm, repo) = try makeVM()
+        let first = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "first",
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running
+        )
+        let second = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "second",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        try repo.upsert(first)
+        try repo.upsert(second)
+        vm.selectThread(first.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        vm.setVisibility(.hidden)
+        pumpStream(on: vm, threadId: first.id, run: AgentRunID(), deltas: 20)
+        await settleStream(vm)
+        vm.selectThread(second.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        vm.setVisibility(.visible)
+        XCTAssertFalse(
+            vm.timeline.turns.contains { turn in
+                turn.items.contains { $0.body.contains("hidden-delta") }
+            },
+            "a thread switch while hidden must drop the leaving thread's coalesced stream"
+        )
+    }
+
+    private func pumpStream(
+        on vm: AgentAppViewModel,
+        threadId: AgentThreadID,
+        run: AgentRunID,
+        deltas: Int
+    ) {
+        vm.runCoordinator(
+            vm.coordinator,
+            didReceive: .turnStarted(turnId: "turn-hidden"),
+            run: run,
+            threadId: threadId
+        )
+        vm.runCoordinator(
+            vm.coordinator,
+            didReceive: .itemStarted(
+                item: AssistantItem(
+                    id: "asst",
+                    turnId: "turn-hidden",
+                    type: .assistantMessage,
+                    startedAtMs: 1
+                )
+            ),
+            run: run,
+            threadId: threadId
+        )
+        for _ in 0..<deltas {
+            vm.runCoordinator(
+                vm.coordinator,
+                didReceive: .itemDelta(
+                    itemId: "asst",
+                    bodyAppend: "hidden-delta",
+                    outputAppend: nil,
+                    summary: nil
+                ),
+                run: run,
+                threadId: threadId
+            )
+        }
+    }
+
+    private func settleStream(_ vm: AgentAppViewModel) async {
+        for _ in 0..<40 {
+            await Task.yield()
+            if !vm.timeline.turns.isEmpty { return }
+        }
+    }
 }
 
 private final class SlowStartRunner: AgentProviderRunner, @unchecked Sendable {
