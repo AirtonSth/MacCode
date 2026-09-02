@@ -56,4 +56,27 @@ final class EventPersistencePolicyTests: XCTestCase {
             "progress stays in the recent ring for live reconnect; only surface.output is dropped from memory"
         )
     }
+
+    @MainActor func test_providerRuntimeEventsAreLiveOnlyAndNotPersisted() {
+        let runtime = EventBus.Event(seq: 7, kind: "agent.provider_runtime.event", payload: .null, ts: 0)
+        let started = EventBus.Event(seq: 8, kind: "agent.item.started", payload: .null, ts: 0)
+        let completed = EventBus.Event(seq: 9, kind: "agent.item.completed", payload: .null, ts: 0)
+
+        XCTAssertFalse(
+            AppDelegate.shouldPersistEvent(runtime),
+            "provider-runtime is already stored in agent_provider_event_logs; the capped events table must not take one SQLite write per ~5 Hz diagnostic"
+        )
+        XCTAssertTrue(
+            AppDelegate.shouldRetainRecentEvent(runtime),
+            "in-session iOS reconnect still needs the recent ring; only surface.output is dropped from memory"
+        )
+        XCTAssertTrue(
+            AppDelegate.shouldPersistEvent(started),
+            "item start is lifecycle and must still persist for restart/replay"
+        )
+        XCTAssertTrue(
+            AppDelegate.shouldPersistEvent(completed),
+            "item complete is lifecycle and must still persist for restart/replay"
+        )
+    }
 }

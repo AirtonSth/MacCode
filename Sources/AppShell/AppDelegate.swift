@@ -1018,12 +1018,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     /// Durable event-log rows. High-frequency stream chunks stay live-only:
     /// `surface.output` is large terminal base64; `agent.item.delta` /
-    /// `agent.item.progress` fire at token rate (~30 Hz). The transcript,
-    /// item start/complete, and run lifecycle still persist. Live EventBus
-    /// plus the recent ring still carry deltas for in-session iOS reconnect.
+    /// `agent.item.progress` fire at token rate (~30 Hz);
+    /// `agent.provider_runtime.event` is provider diagnostics already stored
+    /// in `agent_provider_event_logs`. The transcript, item start/complete,
+    /// and run lifecycle still persist. Live EventBus plus the recent ring still
+    /// carry deltas and provider-runtime for in-session iOS reconnect.
     static func shouldPersistEvent(_ event: EventBus.Event) -> Bool {
         switch event.kind {
-        case "surface.output", "agent.item.delta", "agent.item.progress":
+        case "surface.output",
+             "agent.item.delta",
+             "agent.item.progress",
+             "agent.provider_runtime.event":
             return false
         default:
             return true
