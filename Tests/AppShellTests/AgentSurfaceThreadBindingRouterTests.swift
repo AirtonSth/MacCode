@@ -1930,6 +1930,7 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             XCTAssertEqual(defaults.count, 1, "new workspaces open with exactly one default Agent App tab")
             let surface = try XCTUnwrap(defaults.first)
             surface.viewModel.selectThread(t.id) // binds + persists via onSelectedThreadChanged
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
             ctx.saveSnapshot()
             closeAndUnregisterAgentSurfaces(workspace: ws.id)
         }

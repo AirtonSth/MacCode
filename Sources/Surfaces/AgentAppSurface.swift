@@ -2210,7 +2210,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // Persist the per-surface binding so app restart restores THIS surface
         // to THIS thread (not threads.first). Only fires on an actual change;
         // wired by the host after init, so restore-time selects don't re-persist.
-        onSelectedThreadChanged?(id)
+        // PF-21: publish selection first; persist on the next main turn so the
+        // click path is not blocked on workspace walk + surface.updated.
+        let persistID = id
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.selectedThreadId == persistID else { return }
+            self.onSelectedThreadChanged?(persistID)
+        }
         // Thread-local queue status restore is in-memory; keep it synchronous so
         // the queue strip never carries the previous thread's lifecycle warning
         // across a switch. The queue rows themselves load with the open bundle
