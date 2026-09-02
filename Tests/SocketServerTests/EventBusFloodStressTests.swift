@@ -41,12 +41,12 @@ final class EventBusFloodStressTests: XCTestCase {
     /// Publish events whose total encoded size exceeds recentByteLimit and assert
     /// recentBytes stays at or below the cap.
     func test_flood_recentBytesStayAtOrBelowByteLimit() {
-        let byteLimit = EventBus.defaultRecentByteLimit  // 128 KiB production default
+        let byteLimit = EventBus.defaultRecentByteLimit
         let bus = EventBus(recentLimit: 4096, recentByteLimit: byteLimit)
 
-        // each payload ~4 KB; 400 events = ~1.6 MB raw, well above the 128 KiB cap
+        // each payload ~4 KB; 800 events exceed the bounded production cap
         let chunk = String(repeating: "x", count: 4_000)
-        for i in 0..<400 {
+        for i in 0..<800 {
             bus.publishRawForTesting(kind: "flood.\(i)", payload: .string(chunk))
         }
 
@@ -102,6 +102,21 @@ final class EventBusFloodStressTests: XCTestCase {
             "incomplete terminal/agent state after reconnect")
     }
 
+    func test_defaultRingKeepsContiguousPrefixAcrossDERPCatchUpRace() {
+        let bus = EventBus()
+        let chunk = String(repeating: "z", count: 32 * 1_024)
+        for i in 0..<40 {
+            bus.publishRawForTesting(kind: "derp-race.\(i)", payload: .string(chunk))
+        }
+
+        let firstPage = bus.recentEvents(since: 0, maxBytes: 512 * 1_024)
+
+        XCTAssertEqual(firstPage.events.first?.seq, 1)
+        XCTAssertFalse(firstPage.events.isEmpty)
+        XCTAssertTrue(firstPage.requiresBaseline,
+                      "the bounded first page remains pageable while more retained events follow")
+    }
+
     // MARK: - LRU eviction preserves most-recent events
 
     /// When the count cap forces eviction the oldest events must be dropped and
@@ -129,9 +144,9 @@ final class EventBusFloodStressTests: XCTestCase {
             "keeping stale state over fresh state defeats the replay buffer's purpose")
     }
 
-    func test_defaultRecentLimitIs128() {
+    func test_defaultRecentLimitsStayBoundedForDERPCatchUp() {
         XCTAssertEqual(EventBus.defaultRecentLimit, 128)
-        XCTAssertEqual(EventBus.defaultRecentByteLimit, 128 * 1024)
+        XCTAssertEqual(EventBus.defaultRecentByteLimit, 2 * 1_024 * 1_024)
     }
 
     func test_retentionEstimate_256EventsTo128Window() {
@@ -143,24 +158,16 @@ final class EventBusFloodStressTests: XCTestCase {
         // Basis: typical EventBus payload + encode-cache entry ≈ 1KB.
         // Prior default 256 events (encode cache mirrors the ring).
         // 256 × 1KB ≈ 256KB → 128 × 1KB ≈ 128KB (−50%) for ring+cache keys;
-        // recentByteLimit (128 KiB) still bounds large payloads.
+        // The independent byte limit still bounds large payloads.
         let perEvent = 1_024
         XCTAssertEqual(uncapped * perEvent, 262_144)
         XCTAssertEqual(limit * perEvent, 131_072)
     }
 
-    func test_retentionEstimate_recentByteLimit_256KiBTo128KiB() {
-        let prior = 256 * 1024 // prior defaultRecentByteLimit
+    func test_defaultRecentByteLimitCoversMultipleHealthyReplayWindows() {
         let limit = EventBus.defaultRecentByteLimit
-        let reduction = Double(prior - limit) / Double(prior)
-        XCTAssertGreaterThan(reduction, 0.49)
-        XCTAssertEqual(limit, 128 * 1024)
-
-        // Basis: peak in-process EventBus recent[] payload retention.
-        // 256 KiB → 128 KiB (−50%) after count already at 128.
-        XCTAssertEqual(prior, 262_144)
-        XCTAssertEqual(limit, 131_072)
-        XCTAssertLessThan(limit, prior)
+        XCTAssertEqual(limit, 2 * 1_024 * 1_024)
+        XCTAssertGreaterThanOrEqual(limit, 4 * 512 * 1_024)
     }
 
 }
