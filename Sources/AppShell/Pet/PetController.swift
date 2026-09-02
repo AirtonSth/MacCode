@@ -53,6 +53,10 @@ public final class PetController {
     private var activeThreadChromeByID: [AgentThreadID: CachedActiveThreadChrome] = [:]
     /// Durable `threadRepo.get` calls from `applyActiveThreadIDs`.
     private(set) var activeThreadDurableLookupCountForTesting = 0
+    /// Latest-wins generation for off-main chrome fetches. A stale Task must
+    /// not apply chrome over a newer active set.
+    private var activeThreadChromeGeneration: UInt64 = 0
+    private var activeThreadChromeFetchTask: Task<Void, Never>?
     /// True when the last progress republish reused cached chrome.
     private(set) var progressRepublishUsedCachedChromeForTesting = false
     /// Local-LLM Live Activity descriptions, cached per card and debounced so a
@@ -179,20 +183,10 @@ public final class PetController {
     }
 
     nonisolated static func isPrefilteredNoiseKind(_ kind: String) -> Bool {
-        switch kind {
-        case "agent.item.delta", "agent.item.progress",
-             "surface.output", "surface.output.summary",
-             "agent.thread.token_usage", "agent.account.usage", "agent.account.usage.refresh",
-             "fs.workspace.changed", "files.state.updated",
-             "pane.resized", "pane.split", "pane.swapped",
-             "surface.created", "surface.closed", "surface.focused", "surface.moved",
-             "surface.reordered", "surface.renamed", "surface.updated", "window.created",
-             "workspace.created", "workspace.closed", "workspace.renamed",
-             "workspace.reordered", "workspace.selected", "workspace.updated":
-            return true
-        default:
-            return false
-        }
+        if alwaysPrefilteredNoiseKinds.contains(kind) { return true }
+        return !PetEventDecoder.acceptedKinds.contains(kind)
+            && !attentionProjectionKinds.contains(kind)
+            && !liveActivityProgressKinds.contains(kind)
     }
 
     public func stop() {
@@ -211,6 +205,9 @@ public final class PetController {
         attentionRefreshTask = nil
         idleTask?.cancel()
         idleTask = nil
+        activeThreadChromeFetchTask?.cancel()
+        activeThreadChromeFetchTask = nil
+        activeThreadChromeGeneration += 1
         animationController?.stop()
         windowController?.stop()
         animationController = nil
@@ -305,9 +302,24 @@ public final class PetController {
     ]
     private static let attentionProjectionKinds: Set<String> = [
         "notification.created", "notification.read", "notification.dismissed",
-        "agent.thread.read", "agent.thread.updated", "agent.thread.deleted",
+        "agent.thread.read", "agent.thread.updated", "agent.thread.renamed",
+        "agent.thread.deleted",
         "agent.thread.deleted_many",
         "bots.attention.changed",
+    ]
+    private static let liveActivityProgressKinds: Set<String> = [
+        "agent.item.started", "agent.item.delta", "agent.item.completed",
+        "agent.turn.completed",
+        "agent.run.started", "agent.run.finished", "agent.run.completed",
+        "agent.run.failed", "agent.run.cancelled",
+    ]
+    /// Always dropped before MainActor, even if later listed in acceptedKinds.
+    /// `agent.item.delta` stays here so Live Activity still does not observe
+    /// the high-rate delta stream (existing prefilter contract).
+    private static let alwaysPrefilteredNoiseKinds: Set<String> = [
+        "agent.provider_runtime.event",
+        "token_saver.digest",
+        "agent.item.delta",
     ]
 
     private static func isPotentialProjectionKind(_ kind: String) -> Bool {
@@ -469,6 +481,9 @@ public final class PetController {
             handledEventOutOfOrderForTests = true
         }
         lastHandledEventSequence = event.seq
+        if event.kind == "agent.thread.updated" || event.kind == "agent.thread.renamed" {
+            invalidateCachedActiveThreadChrome(from: event)
+        }
         let attentionProjectionChanged = Self.attentionProjectionKinds.contains(event.kind)
         let focusedSurfaceByWorkspace = context.state.workspaces.reduce(
             into: [WorkspaceID: SurfaceID]()
@@ -1045,7 +1060,12 @@ public final class PetController {
         // Primary threads only — delegated bot-peer runs show under Subagents.
         let threadIDs = Array(context.coordinator.primaryActiveThreadIdsSnapshot())
         if !threadIDs.isEmpty {
-            applyActiveThreadIDs(threadIDs)
+            let missing = threadIDs.filter { activeThreadChromeByID[$0] == nil }
+            if missing.isEmpty {
+                applyActiveThreadIDs(threadIDs)
+            } else {
+                fetchActiveThreadChromeOffMain(threadIDs: threadIDs, missing: missing)
+            }
         }
         // Reconcile animation active-run set to coordinator truth when it has
         // positive evidence. An empty snapshot during event delivery can be a
@@ -1059,10 +1079,40 @@ public final class PetController {
         }
     }
 
+    private func fetchActiveThreadChromeOffMain(
+        threadIDs: [AgentThreadID],
+        missing: [AgentThreadID]
+    ) {
+        activeThreadChromeGeneration += 1
+        let generation = activeThreadChromeGeneration
+        activeThreadChromeFetchTask?.cancel()
+        let threadRepo = context.threadRepo
+        activeThreadChromeFetchTask = Task.detached { [weak self] in
+            let chromeByID = (try? threadRepo.listChrome(ids: missing)) ?? [:]
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self else { return }
+                guard generation == self.activeThreadChromeGeneration else { return }
+                self.mergeActiveThreadChrome(chromeByID, missingIDs: missing)
+                self.applyActiveThreadIDs(threadIDs)
+            }
+        }
+    }
+
     private func applyActiveRunProjection(_ projection: ActiveRunProjection) {
-        let stamps = (try? context.runRepo.startedAt(ids: projection.runs.map(\.runId))) ?? [:]
+        let runsMissingStamp = projection.runs.filter { startedAtByThread[$0.threadId] == nil }
+        let stamps: [AgentRunID: Date]
+        if runsMissingStamp.isEmpty {
+            stamps = [:]
+        } else {
+            stamps = (try? context.runRepo.startedAt(ids: runsMissingStamp.map(\.runId))) ?? [:]
+        }
         var startedByThread: [AgentThreadID: Date] = [:]
         for run in projection.runs {
+            if let retained = startedAtByThread[run.threadId] {
+                startedByThread[run.threadId] = retained
+                continue
+            }
             guard let startedAt = stamps[run.runId] else { continue }
             if let existing = startedByThread[run.threadId] {
                 startedByThread[run.threadId] = min(existing, startedAt)
@@ -1096,6 +1146,9 @@ public final class PetController {
         _ threadIDs: [AgentThreadID],
         startedByThread: [AgentThreadID: Date] = [:]
     ) {
+        activeThreadChromeGeneration += 1
+        activeThreadChromeFetchTask?.cancel()
+        activeThreadChromeFetchTask = nil
         // Drop progress cache for threads that are no longer active.
         let activeSet = Set(threadIDs)
         lastUpdatePreviewByThread = lastUpdatePreviewByThread.filter { activeSet.contains($0.key) }
@@ -1106,29 +1159,18 @@ public final class PetController {
             incoming: startedByThread,
             retained: startedAtByThread
         )
+        activeThreadChromeByID = activeThreadChromeByID.filter { activeSet.contains($0.key) }
+        cacheMissingActiveThreadChrome(ids: threadIDs)
 
-        var nextChrome: [AgentThreadID: CachedActiveThreadChrome] = [:]
-        let chromeByID = (try? context.threadRepo.listChrome(ids: threadIDs)) ?? [:]
-        activeThreadDurableLookupCountForTesting += chromeByID.count
         let items = PetActiveThreadProjector.items(threadIDs: threadIDs) { [weak self] threadID in
-            guard let self, let meta = chromeByID[threadID] else {
-                nextChrome[threadID] = .empty(threadID: threadID)
+            guard let self, let chrome = self.activeThreadChromeByID[threadID] else {
                 return nil
             }
-            let workspaceName = meta.workspaceId.flatMap { self.context.state.workspaces[$0]?.name }
-            let providerName = PetActiveThreadProjector.providerLabel(meta.provider)
-            nextChrome[threadID] = CachedActiveThreadChrome(
-                workspaceID: meta.workspaceId,
-                workspaceName: workspaceName,
-                providerName: providerName,
-                threadTitle: meta.title,
-                route: .agentThread(threadID: threadID, workspaceID: meta.workspaceId)
-            )
             return (
-                workspaceID: meta.workspaceId,
-                workspaceName: workspaceName,
-                providerName: providerName,
-                threadTitle: meta.title,
+                workspaceID: chrome.workspaceID,
+                workspaceName: chrome.workspaceName,
+                providerName: chrome.providerName,
+                threadTitle: chrome.threadTitle,
                 startedAt: self.startedAtByThread[threadID],
                 lastUpdatePreview: self.lastUpdatePreviewByThread[threadID]
             )
@@ -1152,7 +1194,7 @@ public final class PetController {
                 threadTitle: destNames[botID],
                 route: .botsDesk(botID: botID)
             )
-            nextChrome[item.threadID] = chrome
+            self.activeThreadChromeByID[item.threadID] = chrome
             return PetActiveThreadItem(
                 threadID: item.threadID,
                 workspaceID: nil,
@@ -1163,7 +1205,6 @@ public final class PetController {
                 route: chrome.route
             )
         }
-        activeThreadChromeByID = nextChrome
         model.apply(activeThreads: remapped)
         // User-visible Active is empty → pet must leave work/plan even if EventBus
         // still holds a ghost run id (missed finished / stale projection lag).
@@ -1171,6 +1212,43 @@ public final class PetController {
             reconcilePetActiveRuns([])
         }
         publishLiveActivitySurface()
+    }
+
+    private func cacheMissingActiveThreadChrome(ids: [AgentThreadID]) {
+        let missing = ids.filter { activeThreadChromeByID[$0] == nil }
+        guard !missing.isEmpty else { return }
+        let chromeByID = (try? context.threadRepo.listChrome(ids: missing)) ?? [:]
+        mergeActiveThreadChrome(chromeByID, missingIDs: missing)
+    }
+
+    private func mergeActiveThreadChrome(
+        _ chromeByID: [AgentThreadID: AgentThreadRepository.ListChrome],
+        missingIDs: [AgentThreadID]
+    ) {
+        activeThreadDurableLookupCountForTesting += chromeByID.count
+        for threadID in missingIDs {
+            guard activeThreadChromeByID[threadID] == nil else { continue }
+            if let meta = chromeByID[threadID] {
+                let workspaceName = meta.workspaceId.flatMap { context.state.workspaces[$0]?.name }
+                let providerName = PetActiveThreadProjector.providerLabel(meta.provider)
+                activeThreadChromeByID[threadID] = CachedActiveThreadChrome(
+                    workspaceID: meta.workspaceId,
+                    workspaceName: workspaceName,
+                    providerName: providerName,
+                    threadTitle: meta.title,
+                    route: .agentThread(threadID: threadID, workspaceID: meta.workspaceId)
+                )
+            } else {
+                activeThreadChromeByID[threadID] = .empty(threadID: threadID)
+            }
+        }
+    }
+
+    private func invalidateCachedActiveThreadChrome(from event: EventBus.Event) {
+        guard case .object(let payload) = event.payload else { return }
+        let raw = payload["thread_id"]?.stringValue ?? payload["id"]?.stringValue
+        guard let raw, let uuid = UUID(uuidString: raw) else { return }
+        activeThreadChromeByID.removeValue(forKey: AgentThreadID(uuid))
     }
 
     private func verifyAndOpen(_ route: PetAttentionRoute) throws -> Bool {
