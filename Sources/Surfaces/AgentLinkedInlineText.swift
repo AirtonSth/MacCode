@@ -154,6 +154,25 @@ struct AgentLinkedInlineTextAppliedState {
     let lineSpacing: CGFloat
     let maximumNumberOfLines: Int?
     let lineFragmentPadding: CGFloat
+    let sourceFingerprint: Int
+
+    init(
+        attributed: AttributedString,
+        font: NSFont,
+        textColor: NSColor,
+        lineSpacing: CGFloat,
+        maximumNumberOfLines: Int?,
+        lineFragmentPadding: CGFloat,
+        sourceFingerprint: Int = 0
+    ) {
+        self.attributed = attributed
+        self.font = font
+        self.textColor = textColor
+        self.lineSpacing = lineSpacing
+        self.maximumNumberOfLines = maximumNumberOfLines
+        self.lineFragmentPadding = lineFragmentPadding
+        self.sourceFingerprint = sourceFingerprint
+    }
 }
 
 /// Pure dirty-flag plan for transcript text updates (test seam).
@@ -183,7 +202,8 @@ struct AgentLinkedInlineTextUpdatePlan: Equatable {
                 lineFragmentPaddingDirty: true
             )
         }
-        let attributedChanged = previous.attributed != next.attributed
+        let attributedChanged = previous.sourceFingerprint != next.sourceFingerprint
+            || previous.attributed != next.attributed
         let fontChanged = !previous.font.isEqual(next.font)
         let textColorChanged = !previous.textColor.isEqual(next.textColor)
         let lineSpacingChanged = previous.lineSpacing != next.lineSpacing
@@ -284,13 +304,20 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
 
     private func apply(to tv: IntrinsicHeightTextView, context: Context) {
         tv.clipsToBounds = true
+        var hasher = Hasher()
+        hasher.combine(attributed.characters.count)
+        hasher.combine(font.pointSize)
+        hasher.combine(lineSpacing)
+        hasher.combine(maximumNumberOfLines)
+        hasher.combine(lineFragmentPadding)
         let next = AgentLinkedInlineTextAppliedState(
             attributed: attributed,
             font: font,
             textColor: textColor,
             lineSpacing: lineSpacing,
             maximumNumberOfLines: maximumNumberOfLines,
-            lineFragmentPadding: lineFragmentPadding
+            lineFragmentPadding: lineFragmentPadding,
+            sourceFingerprint: hasher.finalize()
         )
         let plan = AgentLinkedInlineTextUpdatePlan.make(
             previous: context.coordinator.applied,
