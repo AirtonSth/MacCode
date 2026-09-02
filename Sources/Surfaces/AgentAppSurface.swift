@@ -18624,6 +18624,7 @@ public final class AgentAppSurface: NSObject, Surface {
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: metadata)
         self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, draftRepo: draftRepo, attachmentStore: attachmentStore, queuedMessageRepo: queuedMessageRepo, providerSessionRepo: providerSessionRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId, initialRoutingMode: .auto, newThreadDefaultsStore: .shared, orchestrationRuntime: orchestrationRuntime)
         let host = NSHostingView(rootView: AgentAppView(vm: viewModel))
+        host.sizingOptions = []
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false

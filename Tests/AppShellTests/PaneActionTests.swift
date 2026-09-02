@@ -721,6 +721,51 @@ final class PaneActionTests: XCTestCase {
                        "focusing another tab must change the visible surface")
     }
 
+    func test_switchingTabsKeepsPreviousViewHiddenInHierarchy() throws {
+        // WHY: PF-11 — tearing down the NSHostingView on every tab click relayouts
+        // the whole Agent App transcript. Keep both views mounted and hide the
+        // inactive one; closing the tab must still remove it.
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "keep-mounted", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane0) = ws.layout else { return XCTFail() }
+        let firstID = pane0.surfaces.first!.id
+        let ptv = PaneTabsView(pane: pane0, router: router)
+        let terminal = try XCTUnwrap(ptv.performAdd(.terminal, title: "term"))
+        guard case .pane(let afterAdd) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+        _ = ptv.reconcile(to: afterAdd)
+
+        XCTAssertEqual(
+            ptv.isMountedContentHiddenForTesting(firstID),
+            true,
+            "the previous Agent App tab must stay in the hierarchy, hidden"
+        )
+        XCTAssertEqual(ptv.isMountedContentHiddenForTesting(terminal.id), false)
+        let firstView = try XCTUnwrap(SurfaceRegistry.shared.surface(firstID)?.view)
+        XCTAssertTrue(
+            ptv.contentAreaSubviewsForTesting.contains { $0 === firstView },
+            "the unselected tab's view must still be a content-area subview"
+        )
+
+        try router.focusSurface(workspace: ws.id, surface: firstID)
+        guard case .pane(let afterFocus) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+        _ = ptv.reconcile(to: afterFocus)
+        XCTAssertEqual(ptv.isMountedContentHiddenForTesting(firstID), false)
+        XCTAssertEqual(ptv.isMountedContentHiddenForTesting(terminal.id), true)
+
+        try router.closeSurface(workspace: ws.id, surface: terminal.id)
+        guard case .pane(let afterClose) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+        _ = ptv.reconcile(to: afterClose)
+        XCTAssertNil(
+            ptv.isMountedContentHiddenForTesting(terminal.id),
+            "closing a tab must remove its view from the pane"
+        )
+        XCTAssertFalse(
+            ptv.contentAreaSubviewsForTesting.contains {
+                $0 === SurfaceRegistry.shared.surface(terminal.id)?.view
+            }
+        )
+    }
+
     func test_paneListExposesSelectedSurfaceForIOSWorkspaceOpen() throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "ios-visible-tab", cwd: NSTemporaryDirectory())

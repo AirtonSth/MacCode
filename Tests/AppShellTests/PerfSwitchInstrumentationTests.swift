@@ -33,6 +33,14 @@ final class PerfSwitchInstrumentationTests: XCTestCase {
         XCTAssertTrue(install.contains("endTabSwitchCommitted"))
     }
 
+    func test_agentAppHostingViewDisablesIntrinsicSizing() throws {
+        let agent = try source("Sources/Surfaces/AgentAppSurface.swift")
+        XCTAssertTrue(
+            agent.contains("host.sizingOptions = []"),
+            "PF-11 (a): NSHostingView intrinsic-size passes are unused under constraint layout"
+        )
+    }
+
     func test_selectThreadRecordsConversationSwitchUntilHydrate() throws {
         let agent = try source("Sources/Surfaces/AgentAppSurface.swift")
         XCTAssertTrue(agent.contains("PerfSwitchMetrics.beginConversationSwitch"))
