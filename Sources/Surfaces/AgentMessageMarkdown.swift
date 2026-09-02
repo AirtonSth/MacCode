@@ -37,27 +37,15 @@ enum AgentMessageMarkdown {
     private final class AttributedBox { let value: AttributedString; init(_ v: AttributedString) { value = v } }
 
     /// Soft byte budget for cached markdown parse results (blocks + inline share
-    /// independent budgets). Large finished messages still cache once; streaming
-    /// partial thrash cannot unbounded-grow occupancy. 128 KiB each matches other
-    /// agent paint budgets after count limits were already 128 — was 256 KiB each
-    /// (512 KiB / 1 MiB / 2 MiB before that).
-    static let blocksCacheCostLimit = 128 * 1_024
-    static let inlineCacheCostLimit = 128 * 1_024
-    /// Skip storing partials above this band even when `cache: true` — finished
-    /// large bodies still benefit if they re-render with identical text (hit path
-    /// after first store under cost limit). Below this, every intermediate stream
-    /// length used to pin a slot under countLimit-only.
-    private static let maxCachedTextUTF8Bytes = 48 * 1_024
-
+    /// independent budgets). AA-08: a few MB so finished 60 KiB replies stay
+    /// cached across conversation switches. Streaming partials still skip store
+    /// via `cache: false`.
+    static let blocksCacheCostLimit = 4 * 1_024 * 1_024
+    static let inlineCacheCostLimit = 4 * 1_024 * 1_024
     /// Peak block-parse results retained process-wide (NSCache countLimit).
-    /// Each value is a full `[AgentMessageMarkdownBlock]` tree (can be multi-KB).
-    /// 128 matches inline + other agent surface caps — was 512, then 256.
-    /// Cost limit still bounds total bytes.
-    static let blocksCacheCountLimit = 128
+    static let blocksCacheCountLimit = 512
     /// Peak inline AttributedString results retained process-wide.
-    /// Each value is a full attributed parse (can be multi-KB). 128 matches other
-    /// agent surface caps — was 2_048, then 256. Cost limit still bounds bytes.
-    static let inlineCacheCountLimit = 128
+    static let inlineCacheCountLimit = 512
 
     private static let blocksCache: NSCache<NSString, BlocksBox> = {
         let cache = NSCache<NSString, BlocksBox>()
@@ -82,13 +70,23 @@ enum AgentMessageMarkdown {
     nonisolated(unsafe) static var inlineCacheStoreCountForTesting = 0
     #endif
 
-    /// Whether a source string is eligible to occupy NSCache under R4-B policy.
+    /// Whether a source string is eligible to occupy NSCache.
+    /// `cache: false` is live-only: never store, even under 48 KiB.
     static func shouldStoreMarkdownCache(textUTF8Count: Int, cache: Bool) -> Bool {
-        cache && textUTF8Count > 0 && textUTF8Count <= maxCachedTextUTF8Bytes
+        cache && textUTF8Count > 0
+    }
+
+    /// CH-08: key by utf8 count + 64-bit hash so SwiftUI body does not rehash
+    /// the full NSString on every pass.
+    static func cacheKey(for text: String) -> NSString {
+        var hasher = Hasher()
+        hasher.combine(text.utf8.count)
+        hasher.combine(text)
+        return "\(text.utf8.count):\(hasher.finalize())" as NSString
     }
 
     static func blocks(from text: String, cache: Bool = true) -> [AgentMessageMarkdownBlock] {
-        let key = text as NSString
+        let key = cacheKey(for: text)
         // Perf CH-04: `cache: false` (live streaming rows) must only skip the
         // STORE — the read still hits, so a body that was parsed while finished
         // (or by a sibling surface) is never re-parsed.
@@ -127,7 +125,27 @@ enum AgentMessageMarkdown {
         return groups
     }
 
+    private static let proseCache: NSCache<NSString, AttributedBox> = {
+        let cache = NSCache<NSString, AttributedBox>()
+        cache.countLimit = inlineCacheCountLimit
+        cache.totalCostLimit = inlineCacheCostLimit
+        return cache
+    }()
+
     static func selectableProse(from blocks: [AgentMessageMarkdownBlock], compact: Bool, cache: Bool = true) -> AttributedString {
+        let proseKey: NSString = {
+            var hasher = Hasher()
+            hasher.combine(compact)
+            hasher.combine(blocks.count)
+            for block in blocks {
+                hasher.combine(block.text.utf8.count)
+                hasher.combine(block.text)
+            }
+            return "prose:\(hasher.finalize())" as NSString
+        }()
+        if cache, let cached = proseCache.object(forKey: proseKey) {
+            return cached.value
+        }
         var result = AttributedString()
         for (index, block) in blocks.enumerated() {
             if index > 0 { result.append(AttributedString("\n")) }
@@ -173,6 +191,10 @@ enum AgentMessageMarkdown {
             line.font = .system(size: size, weight: weight)
             line.foregroundColor = color
             result.append(line)
+        }
+        if cache {
+            let cost = blocks.reduce(0) { $0 + $1.text.utf8.count }
+            proseCache.setObject(AttributedBox(result), forKey: proseKey, cost: max(1, cost))
         }
         return result
     }
@@ -343,7 +365,7 @@ enum AgentMessageMarkdown {
     }
 
     static func attributedInline(_ text: String, cache: Bool = true) -> AttributedString {
-        let key = text as NSString
+        let key = cacheKey(for: text)
         // Perf CH-04: `cache: false` skips only the store; the read still hits.
         if let cached = inlineCache.object(forKey: key) { return cached.value }
         let result = computeAttributedInline(text)
