@@ -544,6 +544,11 @@ public final class PetWindowController: NSObject {
         let fallbackFrame: CGRect?
     }
 
+    private struct DockPlacementCacheEntry {
+        let visibleFrame: CGRect
+        let context: PetPlacementContext
+    }
+
     public var onOpenItem: ((PetAttentionItem) -> Void)?
     public var onOpenActiveThread: ((PetActiveThreadItem) -> Void)?
     public var onMarkAllViewed: (() -> Void)?
@@ -574,11 +579,16 @@ public final class PetWindowController: NSObject {
     /// Deterministic geometry seam for placement tests; production reads the
     /// live Dock window hit shape instead.
     var dockFrameProviderForTests: ((NSScreen) -> CGRect?)?
+    private(set) var dockFrameProviderCallCountForTests = 0
+    private var dockPlacementCacheByDisplayID: [String: DockPlacementCacheEntry] = [:]
+    private var dockPlacementObservationTokens: [(NotificationCenter, NSObjectProtocol)] = []
+    private var dockPlacementRevalidateTask: Task<Void, Never>?
 
     public init(model: PetViewModel, placementStore: PetPlacementStore) {
         self.model = model
         self.placementStore = placementStore
         super.init()
+        installDockPlacementCacheObservers()
     }
 
     public var isVisible: Bool { petPanel?.isVisible == true }
@@ -618,6 +628,7 @@ public final class PetWindowController: NSObject {
 
     public func stop() {
         hide()
+        uninstallDockPlacementCacheObservers()
         petPanel?.close()
         popoverPanel?.close()
         petPanel = nil
@@ -652,7 +663,12 @@ public final class PetWindowController: NSObject {
     }
 
     public func screensDidChange() {
+        invalidateDockPlacementCache()
         applySettings(model.settings)
+    }
+
+    func invalidateDockPlacementCacheForTests() {
+        invalidateDockPlacementCache()
     }
 
     public func togglePopover() {
@@ -895,6 +911,21 @@ public final class PetWindowController: NSObject {
     }
 
     private func petPlacementContext(for screen: NSScreen) -> PetPlacementContext {
+        let id = displayID(for: screen)
+        let visibleFrame = screen.visibleFrame
+        if let cached = dockPlacementCacheByDisplayID[id], cached.visibleFrame == visibleFrame {
+            return cached.context
+        }
+        let context = makePetPlacementContext(for: screen)
+        dockPlacementCacheByDisplayID[id] = DockPlacementCacheEntry(
+            visibleFrame: visibleFrame,
+            context: context
+        )
+        return context
+    }
+
+    private func makePetPlacementContext(for screen: NSScreen) -> PetPlacementContext {
+        dockFrameProviderCallCountForTests += 1
         let physicalFrame = PetScreenGeometry.petPlacementFrame(
             screenFrame: screen.frame,
             visibleFrame: screen.visibleFrame
@@ -922,6 +953,56 @@ public final class PetWindowController: NSObject {
                 dockFrame: dockFrame
             )
         )
+    }
+
+    private func invalidateDockPlacementCache() {
+        dockPlacementCacheByDisplayID.removeAll()
+    }
+
+    private func revalidateDockPlacementCache() {
+        invalidateDockPlacementCache()
+        for screen in NSScreen.screens {
+            _ = petPlacementContext(for: screen)
+        }
+    }
+
+    private func installDockPlacementCacheObservers() {
+        guard dockPlacementObservationTokens.isEmpty else { return }
+        observeDockPlacement(
+            NotificationCenter.default,
+            name: NSApplication.didChangeScreenParametersNotification
+        )
+        observeDockPlacement(
+            DistributedNotificationCenter.default(),
+            name: Notification.Name("com.apple.dock.prefchanged")
+        )
+        dockPlacementRevalidateTask?.cancel()
+        dockPlacementRevalidateTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    self?.revalidateDockPlacementCache()
+                }
+            }
+        }
+    }
+
+    private func observeDockPlacement(_ center: NotificationCenter, name: Notification.Name) {
+        let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.invalidateDockPlacementCache() }
+        }
+        dockPlacementObservationTokens.append((center, token))
+    }
+
+    private func uninstallDockPlacementCacheObservers() {
+        for (center, token) in dockPlacementObservationTokens {
+            center.removeObserver(token)
+        }
+        dockPlacementObservationTokens.removeAll()
+        dockPlacementRevalidateTask?.cancel()
+        dockPlacementRevalidateTask = nil
+        invalidateDockPlacementCache()
     }
 
     private func resolvedPetFrame(
