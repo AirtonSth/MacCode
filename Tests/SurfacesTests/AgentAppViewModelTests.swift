@@ -9211,6 +9211,26 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(vm.prompt, "hi", "the prompt proxy still reads/writes the composer text")
     }
 
+    @MainActor
+    func test_focusTick_publishesComposerStateNotViewModel() throws {
+        // WHY: PF-12 — tab focus used to bump a @Published on the 78-field VM
+        // and rebuild AgentAppView. Focus belongs on the composer object.
+        let (vm, _) = try makeVM()
+        var vmEmissions = 0
+        var composerEmissions = 0
+        let vmSub = vm.objectWillChange.sink { _ in vmEmissions += 1 }
+        let composerSub = vm.composerState.objectWillChange.sink { _ in composerEmissions += 1 }
+        defer { vmSub.cancel(); composerSub.cancel() }
+
+        vm.focusTick &+= 1
+        vm.focusTick &+= 1
+
+        XCTAssertEqual(vmEmissions, 0, "focus() must not rebuild the Agent App transcript")
+        XCTAssertGreaterThanOrEqual(composerEmissions, 2, "the composer must still observe focusTick")
+        XCTAssertEqual(vm.focusTick, 2)
+        XCTAssertEqual(vm.composerState.focusTick, 2)
+    }
+
     // F5: the single-pass cap+budget that replaced `map(cap) + applyBodyBudget` on the
     // thread-open path must be byte-for-byte equivalent to the prior two-pass version.
     func test_cappedRowsWithinBudget_matchesMapThenBudgetComposition() {

@@ -71,6 +71,8 @@ struct TimelineItemIndex: Sendable, Equatable {
 public final class AgentComposerState: ObservableObject {
     @Published public var prompt: String = ""
     @Published public var cursorOffset: Int? = nil
+    /// PF-12: focusing the composer must not republish the 78-field Agent App VM.
+    @Published public var focusTick: Int = 0
 }
 
 /// Stream/transcript paint state on its OWN ObservableObject so token/tool storms
@@ -293,7 +295,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
     @Published public var userInputSelections: [String: Set<String>] = [:]
     @Published public var userInputDrafts: [String: String] = [:]
-    @Published public var focusTick: Int = 0
+    public var focusTick: Int {
+        get { composerState.focusTick }
+        set { composerState.focusTick = newValue }
+    }
     /// P1/F4: number of hidden pre-run transcript items revealed read-only.
     /// Reset to zero on each new run and paged so one tap cannot render a huge history.
     @Published public var transcriptHistoryRevealCount: Int = 0
@@ -13644,7 +13649,12 @@ public struct AgentAppView: View {
             // F1: render the composer inside a scope that observes only the composer
             // text, so a keystroke re-renders the composer subtree and NOT this body
             // (which builds the whole transcript).
-            ComposerReactiveScope(composerState: vm.composerState) { composer }
+            ComposerReactiveScope(composerState: vm.composerState) {
+                composer
+                    .onChange(of: vm.composerState.focusTick) { _ in
+                        collapseTranscriptForNewTurn()
+                    }
+            }
         }
         .background(DS.Palette.bg)
         // C6: Esc interrupts an in-flight run (remotecode.io parity).
@@ -14095,9 +14105,6 @@ public struct AgentAppView: View {
                     .padding(DS.Space.sm)
                     .allowsHitTesting(false)
             }
-        }
-        .onChange(of: vm.focusTick) { _ in
-            collapseTranscriptForNewTurn()
         }
         .onChange(of: vm.timeline.turns.count) { _ in
             DispatchQueue.main.async {
