@@ -561,6 +561,10 @@ public final class ClaudeParser {
             return authStatusEvents(from: obj, now: now)
         case "rate_limit_event":
             return rateLimitEvents(from: obj, now: now)
+        case "api_retry":
+            // Claude Code headless stream-json emits system/api_retry before a
+            // retriable API call. Surface it so long retries do not look hung.
+            return apiRetryEvents(from: obj, now: now)
         default:
             if let usage = tokenUsage(from: obj) {
                 return [.tokenUsage(usage)]
@@ -685,13 +689,21 @@ public final class ClaudeParser {
     }
 
     private func rateLimitEvents(from obj: [String: Any], now: Int64) -> [AssistantEvent] {
+        let info = obj["rate_limit_info"] as? [String: Any]
+            ?? obj["rateLimitInfo"] as? [String: Any]
         let reset = stringValue(obj["reset_at"]) ?? stringValue(obj["resetAt"])
+            ?? (info.flatMap { stringValue($0["resetsAt"] ?? $0["resets_at"]) })
+        let limitType = stringValue(obj["limit_type"])
+            ?? stringValue(obj["limitType"])
+            ?? (info.flatMap { stringValue($0["rateLimitType"] ?? $0["rate_limit_type"]) })
+            ?? "rate limit"
+        let status = info.flatMap { stringValue($0["status"]) }
         let message = stringValue(obj["message"])
-            ?? [stringValue(obj["limit_type"]) ?? stringValue(obj["limitType"]) ?? "rate limit", reset.map { "reset \($0)" }]
+            ?? [limitType, status.map { "status \($0)" }, reset.map { "reset \($0)" }]
                 .compactMap { $0 }
                 .joined(separator: " ")
         var events = completedRuntimeItem(
-            id: stringValue(obj["id"]) ?? "claude-rate-limit-\(now)",
+            id: stringValue(obj["id"]) ?? stringValue(obj["uuid"]) ?? "claude-rate-limit-\(now)",
             type: .tool,
             summary: "Claude rate limit",
             body: message,
@@ -701,6 +713,34 @@ public final class ClaudeParser {
             events.append(.accountUsage(usage))
         }
         return events
+    }
+
+    private func apiRetryEvents(from obj: [String: Any], now: Int64) -> [AssistantEvent] {
+        let attempt = intValue(obj["attempt"])
+        let maxRetries = intValue(obj["max_retries"]) ?? intValue(obj["maxRetries"])
+        let delayMs = intValue(obj["retry_delay_ms"]) ?? intValue(obj["retryDelayMs"])
+        let error = stringValue(obj["error"]) ?? stringValue(obj["error_status"]).map { "HTTP \($0)" }
+        var parts: [String] = ["API retry"]
+        if let attempt {
+            if let maxRetries {
+                parts.append("\(attempt)/\(maxRetries)")
+            } else {
+                parts.append("#\(attempt)")
+            }
+        }
+        if let error, !error.isEmpty {
+            parts.append(error)
+        }
+        if let delayMs, delayMs > 0 {
+            parts.append("in \(delayMs)ms")
+        }
+        return completedRuntimeItem(
+            id: stringValue(obj["uuid"]) ?? stringValue(obj["id"]) ?? "claude-api-retry-\(now)",
+            type: .tool,
+            summary: "Claude API retry",
+            body: parts.joined(separator: " · "),
+            now: now
+        )
     }
 
     private func accountUsage(from obj: [String: Any]) -> AssistantAccountUsage? {

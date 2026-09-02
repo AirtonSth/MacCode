@@ -186,6 +186,12 @@ public enum AssistantAccountUsageParser {
             ?? payload["rateLimitInfo"] as? [String: Any]
             ?? payload["rateLimits"] as? [String: Any]
             ?? payload
+        // Claude Code 2.1.258+ stream-json `rate_limit_event` ships utilization under
+        // `unifiedWindows.{five_hour,seven_day}` (0–1 or 0–100). Prefer that shape so
+        // live turns update Token Saver rings; fall back to legacy primary.usedPercent.
+        if let unified = claudeUnifiedWindowsUsage(from: info, payload: payload) {
+            return unified
+        }
         let snapshot = info["primary"] as? [String: Any]
             ?? info["weekly"] as? [String: Any]
             ?? info["allModels"] as? [String: Any]
@@ -201,6 +207,36 @@ public enum AssistantAccountUsageParser {
             weeklyResetsAtMs: resetMilliseconds(from: snapshot["resetsAt"] ?? snapshot["resets_at"] ?? payload["reset_at"] ?? payload["resetAt"]),
             currentSessionUsedPercent: currentSessionUsedPercent(from: info),
             currentSessionResetsAtMs: currentSessionResetsAtMilliseconds(from: info)
+        )
+    }
+
+    /// Maps Claude Code stream-json `rate_limit_info.unifiedWindows` onto account usage.
+    /// Weekly = `seven_day` (all-models week); session = `five_hour`.
+    private static func claudeUnifiedWindowsUsage(
+        from info: [String: Any],
+        payload: [String: Any]
+    ) -> AssistantAccountUsage? {
+        let windows = info["unifiedWindows"] as? [String: Any]
+            ?? info["unified_windows"] as? [String: Any]
+        guard let windows else { return nil }
+        let week = windows["seven_day"] as? [String: Any]
+            ?? windows["sevenDay"] as? [String: Any]
+        guard let weeklyUsed = utilizationPercent(week?["utilization"]) else { return nil }
+        let session = windows["five_hour"] as? [String: Any]
+            ?? windows["fiveHour"] as? [String: Any]
+        return AssistantAccountUsage(
+            provider: .claude,
+            weeklyUsedPercent: weeklyUsed,
+            weeklyWindowDurationMinutes: 10_080,
+            weeklyResetsAtMs: resetMilliseconds(
+                from: week?["resetsAt"] ?? week?["resets_at"]
+                    ?? info["resetsAt"] ?? info["resets_at"]
+                    ?? payload["reset_at"] ?? payload["resetAt"]
+            ),
+            currentSessionUsedPercent: utilizationPercent(session?["utilization"]),
+            currentSessionResetsAtMs: resetMilliseconds(
+                from: session?["resetsAt"] ?? session?["resets_at"]
+            )
         )
     }
 
@@ -659,11 +695,13 @@ public enum AssistantAccountUsageParser {
         return double(value)
     }
 
-    /// Claude OAuth `utilization` is documented as 0–100 and also observed as 0–1.
+    /// Claude OAuth / stream-json `utilization` is documented as 0–100 and also
+    /// observed as 0–1. Round fractional→percent so IEEE values like 0.58 map to
+    /// the same whole percents Claude Code prints in `/usage`.
     private static func utilizationPercent(_ value: Any?) -> Double? {
         guard let raw = double(value) else { return nil }
         if raw > 1 { return min(100, max(0, raw)) }
-        return min(100, max(0, raw * 100))
+        return min(100, max(0, (raw * 100).rounded()))
     }
 }
 

@@ -355,6 +355,47 @@ final class ClaudeParserCLITests: XCTestCase {
         }, "Claude rate_limit_event must not render as an agent error when the turn later succeeds")
     }
 
+    /// Live Claude Code 2.1.258 emits `unifiedWindows` instead of `primary.usedPercent`.
+    /// Parser must still feed `.accountUsage` so Token Saver rings move during the turn.
+    func test_rateLimitEvent_unifiedWindowsFeedsAccountUsage() {
+        let line = #"{"type":"rate_limit_event","uuid":"rl-1","session_id":"s-rl","rate_limit_info":{"rateLimitType":"five_hour","resetsAt":1788368400,"status":"allowed","unifiedWindows":{"five_hour":{"resetsAt":1788368400,"utilization":0.58},"seven_day":{"resetsAt":1788703200,"utilization":0.30},"seven_day_overage_included":{"resetsAt":1788703200,"utilization":0.39}}}}"#
+        let evs = collect([line])
+        XCTAssertTrue(evs.contains {
+            if case .itemStarted(let item) = $0 {
+                return item.type == .tool
+                    && item.summary == "Claude rate limit"
+                    && item.body.contains("five_hour")
+                    && item.body.contains("allowed")
+            }
+            return false
+        }, "unifiedWindows rate_limit_event must stay visible in the work log")
+        XCTAssertTrue(evs.contains {
+            if case .accountUsage(let usage) = $0 {
+                return usage.provider == .claude
+                    && usage.weeklyUsedPercent == 30
+                    && usage.currentSessionUsedPercent == 58
+            }
+            return false
+        }, "Claude Code 2.1.258 unifiedWindows must update Token Saver rings during the turn")
+    }
+
+    /// Headless docs: system/api_retry precedes a retriable API failure. Without a
+    /// visible row, long retries look like a hung Claude turn.
+    func test_systemApiRetry_becomesVisibleTelemetry() {
+        let line = #"{"type":"system","subtype":"api_retry","attempt":2,"max_retries":5,"retry_delay_ms":1200,"error_status":429,"error":"rate_limit","uuid":"retry-1","session_id":"s-retry"}"#
+        let evs = collect([line])
+        XCTAssertTrue(evs.contains {
+            if case .itemStarted(let item) = $0 {
+                return item.type == .tool
+                    && item.summary == "Claude API retry"
+                    && item.body.contains("2/5")
+                    && item.body.contains("rate_limit")
+                    && item.body.contains("1200ms")
+            }
+            return false
+        }, "system/api_retry must surface so retries are not mistaken for a hung turn")
+    }
+
     /// Live Claude CLI (2.1.219) task / heartbeat payloads put human text on
     /// `description` / `task_type` / `status` / `elapsed_time_seconds` — not on
     /// the older `title`/`message` keys. Rows must not fall back to raw JSON.

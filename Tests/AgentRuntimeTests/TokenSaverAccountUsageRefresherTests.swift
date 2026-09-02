@@ -503,6 +503,45 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
         XCTAssertEqual(usage?.weeklyUsedPercent, 31)
     }
 
+    /// Claude Code 2.1.258 stream-json `rate_limit_event` nests utilization under
+    /// `unifiedWindows`. Without this mapping, live Claude turns never refresh
+    /// Token Saver rings even though the CLI is streaming accurate percentages.
+    func test_claudeFrom_readsUnifiedWindowsUtilization() {
+        let usage = AssistantAccountUsageParser.claude(from: [
+            "type": "rate_limit_event",
+            "rate_limit_info": [
+                "rateLimitType": "five_hour",
+                "resetsAt": 1_788_368_400,
+                "status": "allowed",
+                "unifiedWindows": [
+                    "five_hour": ["resetsAt": 1_788_368_400, "utilization": 0.58],
+                    "seven_day": ["resetsAt": 1_788_703_200, "utilization": 0.30],
+                    "seven_day_overage_included": ["resetsAt": 1_788_703_200, "utilization": 0.39]
+                ]
+            ]
+        ])
+        XCTAssertEqual(usage?.provider, .claude)
+        XCTAssertEqual(usage?.weeklyUsedPercent, 30)
+        XCTAssertEqual(usage?.currentSessionUsedPercent, 58)
+        XCTAssertEqual(usage?.weeklyWindowDurationMinutes, 10_080)
+        XCTAssertEqual(usage?.weeklyResetsAtMs, 1_788_703_200_000)
+        XCTAssertEqual(usage?.currentSessionResetsAtMs, 1_788_368_400_000)
+    }
+
+    func test_claudeFrom_stillReadsLegacyPrimaryUsedPercent() {
+        let usage = AssistantAccountUsageParser.claude(from: [
+            "rate_limit_info": [
+                "primary": [
+                    "usedPercent": 57,
+                    "windowDurationMins": 10_080,
+                    "resetsAt": "2026-05-23T12:00:00Z"
+                ]
+            ]
+        ])
+        XCTAssertEqual(usage?.weeklyUsedPercent, 57)
+        XCTAssertEqual(usage?.weeklyWindowDurationMinutes, 10_080)
+    }
+
     func test_claudeAccessToken_readsClaudeAiOauthObject() {
         let token = AssistantAccountUsageParser.claudeAccessToken(fromAuthObject: [
             "claudeAiOauth": ["accessToken": "claude-live-token"]
