@@ -94,6 +94,11 @@ final class Wave4ConnectionArchitectureTests: XCTestCase {
             XCTFail("expected cellularSafe")
         }
         XCTAssertEqual(EventStreamFilter.full.applyingInterestThreadIds(["x"]), .full)
+        XCTAssertEqual(
+            EventStreamFilter.diagnostics.applyingInterestThreadIds(["x"]),
+            .diagnostics,
+            "diagnostics stays diagnostics — interest only gates cellular-safe admissions"
+        )
     }
 
     func test_eventBus_updateSubscriberFilter_changesAdmissionMidSession() {
