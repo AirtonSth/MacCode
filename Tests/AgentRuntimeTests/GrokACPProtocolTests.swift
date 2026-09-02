@@ -367,6 +367,13 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(rateLimit.category, .rateLimited)
         XCTAssertTrue(rateLimit.message.hasPrefix(GrokACPFailureTaxonomy.rateLimitedMarker))
 
+        let payment = GrokACPFailureTaxonomy.normalize(
+            GrokACPError.rpcError(code: 402, message: "Payment Required: balance exhausted"),
+            context: .turn
+        )
+        XCTAssertEqual(payment.category, .nonRecoverable,
+                       "Grok Build balance exhaustion must not be retried as auth or rate limit")
+
         let network = GrokACPFailureTaxonomy.normalize(
             GrokACPError.rpcError(code: nil, message: "network connection reset"),
             context: .turn

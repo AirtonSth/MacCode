@@ -8997,14 +8997,14 @@ public final class BotsViewModel: ObservableObject {
         // operate inside the bot's home directory. Workspace-less threads
         // fall back to BotHome via executionCwdOverride at send time.
         let botHomeURL = BotHome(appSupportDirectory: context.appSupportDirectory, bot: bot).root
-        try? FileManager.default.createDirectory(at: botHomeURL, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: botHomeURL, withIntermediateDirectories: true)
         let thread: AgentThread
-        let canReuseExisting = conversation.linkedAgentThreadID.flatMap { linked -> Bool? in
-            guard let existing = try? context.threadRepo.get(id: linked),
+        let reusableThread: AgentThread? = try conversation.linkedAgentThreadID.flatMap { linked -> AgentThread? in
+            guard let existing = try context.threadRepo.get(id: linked),
                   !threadBelongsToAnotherBot(linked, botID: bot.id),
                   existing.provider == routing.provider,
                   existing.providerInstanceId == routing.providerInstanceID,
-                  (existing.runAsUser ?? AgentRunAsUser.current()).id == routing.runAsUser.id else { return false }
+                  (existing.runAsUser ?? AgentRunAsUser.current()).id == routing.runAsUser.id else { return nil }
             // 1.3: model/reasoning/permission drift updates the existing thread
             // in place instead of forking a new thread and losing history.
             var updated = existing
@@ -9015,12 +9015,12 @@ public final class BotsViewModel: ObservableObject {
             if updated.serviceTier != routing.serviceTier { updated.serviceTier = routing.serviceTier; didUpdate = true }
             if didUpdate {
                 updated.modelSelection = AgentModelSelection(provider: routing.provider, modelId: model, reasoningEffort: routing.reasoningEffort, serviceTier: routing.serviceTier)
-                try? context.threadRepo.upsert(updated)
+                try context.threadRepo.upsert(updated)
             }
-            return true
-        } ?? false
-        if canReuseExisting, let linked = conversation.linkedAgentThreadID, let existing = try? context.threadRepo.get(id: linked) {
-            thread = existing
+            return updated
+        }
+        if let reusableThread {
+            thread = reusableThread
         } else {
             thread = try router.createAgentThread(
                 workspace: nil,

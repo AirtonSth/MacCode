@@ -12,6 +12,18 @@ import os
 
 private let appContextRuntimeLog = Logger(subsystem: "io.remotecode.agent", category: "app-context")
 
+private final class AgentRunStartedDeduplicator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var keys: Set<String> = []
+
+    func insert(threadID: AgentThreadID, runID: AgentRunID) -> Bool {
+        let key = "\(threadID.value.uuidString.lowercased()):\(runID.value.uuidString.lowercased())"
+        lock.lock()
+        defer { lock.unlock() }
+        return keys.insert(key).inserted
+    }
+}
+
 public extension Notification.Name {
     static let rc2TokenSaverConfigurationChanged = Notification.Name("rc2TokenSaverConfigurationChanged")
 }
@@ -1195,9 +1207,10 @@ public final class AppContext {
                     }
                 }
             }
-            if let wid = try? threadRepo.workspaceId(of: threadId) {
-                payload["workspace_id"] = .string(wid.value.uuidString.lowercased())
-            }
+            let workspaceID: WorkspaceID? = try? threadRepo.workspaceId(of: threadId)
+            payload["workspace_id"] = workspaceID.map {
+                .string($0.value.uuidString.lowercased())
+            } ?? .null
             if let status {
                 payload["status"] = .string(status.rawValue)
             }
@@ -1208,10 +1221,9 @@ public final class AppContext {
         // though coordinator fires both callbacks within the same turn. Resume
         // paths only emit .threadStarted, so onRunStarted becomes the single
         // source for new runs.
-        var lastPublishedRunStarted: (AgentThreadID, AgentRunID)?
+        let runStartedDeduplicator = AgentRunStartedDeduplicator()
         coordinator.onRunStarted = { [weak self] tid, runId in
-            if lastPublishedRunStarted == (tid, runId) { return }
-            lastPublishedRunStarted = (tid, runId)
+            guard runStartedDeduplicator.insert(threadID: tid, runID: runId) else { return }
             EventBus.shared.publish(kind: .agentRunStarted,
                                     payload: agentRunPayload(threadId: tid, runId: runId))
             self?.beginTokenSaverAttempt(runId: runId)
@@ -1227,8 +1239,7 @@ public final class AppContext {
             let t = tid.value.uuidString.lowercased()
             switch ev {
             case .threadStarted:
-                if lastPublishedRunStarted == (tid, runId) { break }
-                lastPublishedRunStarted = (tid, runId)
+                guard runStartedDeduplicator.insert(threadID: tid, runID: runId) else { break }
                 EventBus.shared.publish(kind: .agentRunStarted, payload: agentRunPayload(threadId: tid, runId: runId))
             case .turnStarted(let turnId):
                 EventBus.shared.publish(kind: .agentTurnStarted,

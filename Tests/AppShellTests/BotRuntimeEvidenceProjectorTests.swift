@@ -78,6 +78,33 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
         XCTAssertEqual(terminals, [.init(botID: "bot-a", runID: runID, failed: false)])
     }
 
+    /// WHY: the host's failure reason must survive Bot runtime projection so
+    /// iOS can show the provider's actual error instead of a generic failure.
+    func test_projectsFailureMessageIntoBotEvidence() throws {
+        let bus = EventBus(recentLimit: 8)
+        let projector = BotRuntimeEvidenceProjector(eventBus: bus)
+        XCTAssertTrue(projector.registerCompletedSend(sendReceipt()))
+
+        var projected: [EventBus.Event] = []
+        let token = bus.subscribe(since: bus.currentSeq) { event in
+            if event.kind == "bot.run.failed" { projected.append(event) }
+        }
+        defer { bus.unsubscribe(token) }
+
+        bus.publish(kind: .agentRunFailed, payload: .object([
+            "run_id": .string("run-a"),
+            "thread_id": .string("thread-a"),
+            "message": .string("Grok ACP failure: balance exhausted"),
+        ]))
+        bus.flushPersistenceSubmissions()
+
+        XCTAssertEqual(projected.count, 1)
+        XCTAssertEqual(
+            projected.first?.payload.objectValue?["message"]?.stringValue,
+            "Grok ACP failure: balance exhausted"
+        )
+    }
+
     private func sendReceipt(
         runID: String = "run-a",
         threadID: String = "thread-a"

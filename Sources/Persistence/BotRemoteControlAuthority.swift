@@ -950,7 +950,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let effectiveConversationID = targetConversationID
         let attachmentIDs = stringArray(params, "attachment_ids")
         guard Set(attachmentIDs).count == attachmentIDs.count else { throw Error.invalidParams }
-        guard attachmentIDs.isEmpty || requestedConversationID != nil || effectiveConversationID != nil else {
+        guard attachmentIDs.isEmpty || requestedConversationID != nil else {
             throw Error.crossTarget
         }
         var boundGrants: [[String: Any]] = []
