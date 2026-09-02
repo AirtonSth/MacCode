@@ -91,6 +91,25 @@ public final class AgentTranscriptState: ObservableObject {
     @Published public var messages: [AgentMessage] = [] {
         didSet {
             if oldValue != messages { contentGeneration &+= 1 }
+            waitingBotPeerActivity = Self.hasWaitingBotPeerActivity(
+                in: messages,
+                threadId: selectedThreadIdForPeerFlag
+            )
+        }
+    }
+    /// AA-16: chrome busy must not walk `messages` on every tab poll.
+    var waitingBotPeerActivity = false
+    var selectedThreadIdForPeerFlag: AgentThreadID?
+
+    nonisolated static func hasWaitingBotPeerActivity(
+        in messages: [AgentMessage],
+        threadId: AgentThreadID?
+    ) -> Bool {
+        guard let threadId else { return false }
+        return messages.contains {
+            $0.threadId == threadId
+                && $0.role == .assistant
+                && BotPeerTranscript.parseActivity($0.content)?.phase == .waiting
         }
     }
     @Published public var timeline = AssistantTimelineState() {
@@ -283,7 +302,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public let transcriptState = AgentTranscriptState()
     public var messages: [AgentMessage] {
         get { transcriptState.messages }
-        set { transcriptState.messages = newValue }
+        set {
+            transcriptState.selectedThreadIdForPeerFlag = selectedThreadId
+            transcriptState.messages = newValue
+        }
     }
     public var timeline: AssistantTimelineState {
         get { transcriptState.timeline }
@@ -1139,6 +1161,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard !isDisposed else { return }
         if let selectedThreadId { persistComposerDraft(for: selectedThreadId) }
         isDisposed = true
+        paintedTimelineByThread.removeAll()
+        paintedTimelineOrder.removeAll()
         AgentWorkspaceRailReloadCoordinator.shared.unregister(self)
         stopScheduledLivePoll()
         pendingGitRefresh?.cancel()
@@ -1988,27 +2012,23 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let measuredLoader = tokenSaverMeasuredLoader
         let threadId = selectedThreadId
         let repo = tokenSaverSavingsRepo
-        // Capture assistant size + turn/usage on MainActor (UI/timeline state).
-        let assistantChars = messages
-            .filter { $0.role == .assistant }
-            .reduce(0) { $0 + $1.content.utf8.count }
-        let turnCount = max(timeline.turns.count, messages.filter { $0.role == .user }.count)
+        // AA-12: snapshot message bodies and sum UTF-8 off-main. The Task
+        // already left MainActor for ledger reads; the reduce used to walk
+        // every assistant message on the click/idle path.
+        let messageSnapshot = messages
+        let turnCountSnapshot = timeline.turns.count
         let usage = timeline.tokenUsage
         let cacheRead = usage?.cacheReadInputTokens ?? 0
         let providerRaw = usage.map { max(0, $0.inputTokens) + max(0, $0.outputTokens) } ?? 0
         let providerBilled = usage.map { $0.billedTotalTokenUnits } ?? 0
         let autoRouting = routingMode == .auto
-        let observation = TokenSaverThreadFooterReload.Observation(
-            assistantChars: assistantChars,
-            turnCount: turnCount,
-            cacheReadInputTokens: cacheRead,
-            providerRawTokens: providerRaw,
-            providerBilledTokenUnits: providerBilled > 0 ? providerBilled : nil,
-            autoRoutingActive: autoRouting
-        )
         tokenSaverFooterReloadTask = Task { [weak self] in
             // Eligibility/settings reads off-main so a savings burst does not
             // stack cold SettingsStore performSync on the MainActor.
+            let assistantChars = messageSnapshot
+                .filter { $0.role == .assistant }
+                .reduce(0) { $0 + $1.content.utf8.count }
+            let turnCount = max(turnCountSnapshot, messageSnapshot.filter { $0.role == .user }.count)
             let eligible = eligibleCheck?() == true
             let graphifyActive = graphifyCheck?() == true
             let graphifyCount = graphifySignalCountCheck?() ?? 0
@@ -2025,12 +2045,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 eligible: eligible,
                 graphifyActive: graphifyActive,
                 observation: TokenSaverThreadFooterReload.Observation(
-                    assistantChars: observation.assistantChars,
-                    turnCount: observation.turnCount,
-                    cacheReadInputTokens: observation.cacheReadInputTokens,
-                    providerRawTokens: observation.providerRawTokens,
-                    providerBilledTokenUnits: observation.providerBilledTokenUnits,
-                    autoRoutingActive: observation.autoRoutingActive,
+                    assistantChars: assistantChars,
+                    turnCount: turnCount,
+                    cacheReadInputTokens: cacheRead,
+                    providerRawTokens: providerRaw,
+                    providerBilledTokenUnits: providerBilled > 0 ? providerBilled : nil,
+                    autoRoutingActive: autoRouting,
                     graphifySignalCount: graphifyCount
                 ),
                 deliveredRuns: deliveredRuns
@@ -2088,6 +2108,33 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var selectThreadOpenGeneration: UInt64 = 0
     private var selectThreadHydrationTask: Task<Void, Never>?
     private var paintedTimelineByThread: [AgentThreadID: AssistantTimelineState] = [:]
+    private var paintedTimelineOrder: [AgentThreadID] = []
+    private static let paintedTimelineLimit = 3
+    var paintedTimelineCountForTesting: Int { paintedTimelineByThread.count }
+
+    /// AA-07: keep at most 3 painted timelines, plus the selected thread and any
+    /// thread that still has a live run on this surface.
+    private func rememberPaintedTimeline(_ id: AgentThreadID, _ timeline: AssistantTimelineState) {
+        paintedTimelineByThread[id] = timeline
+        paintedTimelineOrder.removeAll { $0 == id }
+        paintedTimelineOrder.append(id)
+        let active = Set(runThreads.values)
+        while paintedTimelineByThread.count > Self.paintedTimelineLimit {
+            guard let evict = paintedTimelineOrder.first(where: { candidate in
+                candidate != selectedThreadId && !active.contains(candidate)
+            }) else { break }
+            paintedTimelineOrder.removeAll { $0 == evict }
+            paintedTimelineByThread.removeValue(forKey: evict)
+        }
+    }
+
+    /// X-02: run status changes used to re-list every workspace thread.
+    private func applyInMemoryThreadStatus(_ threadId: AgentThreadID, status: AgentRunStatus) {
+        guard let idx = threads.firstIndex(where: { $0.id == threadId }) else { return }
+        guard threads[idx].status != status else { return }
+        threads[idx].status = status
+        threads[idx].updatedAt = Date()
+    }
     /// True when the last `selectThread` used the in-memory rail instead of a full `get`.
     private(set) var lastThreadSelectionUsedRailForTesting = false
     /// Count of durable `threadRepo.get` lookups from `selectThread` (cache misses).
@@ -2171,9 +2218,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // then restore the opened thread's draft.
         if let previous = selectedThreadId {
             stashComposerDraftOffMain(for: previous)
-            paintedTimelineByThread[previous] = timeline
+            rememberPaintedTimeline(previous, timeline)
         }
         selectedThreadId = id
+        transcriptState.selectedThreadIdForPeerFlag = id
+        transcriptState.waitingBotPeerActivity = AgentTranscriptState.hasWaitingBotPeerActivity(
+            in: messages,
+            threadId: id
+        )
         PerfSwitchMetrics.markConversationFirstPublish()
         publishInterestedThreadId(id)
         // Per-thread chip: never keep the leaving thread's savings on the
@@ -2621,7 +2673,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         refreshSubagentActivity()
         // Token Saver footer is per-thread; re-read the permanent total on open.
         reloadTokenSaverThreadSavings()
-        paintedTimelineByThread[id] = timeline
+        rememberPaintedTimeline(id, timeline)
         Self.agentOpenTrace(
             "full open bundle applied gen=\(openGeneration) items=\(Self.renderableItemCount(bundle.persistedEvents)) turns=\(timeline.turns.count) recoverable=\(selectedThreadHasRecoverableContext)"
         )
@@ -3873,14 +3925,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private func rehydrateProposedPlans(threadId: AgentThreadID) {
         guard let proposedPlanRepo,
               let records = try? proposedPlanRepo.list(threadId: threadId) else { return }
+        var next = timeline
         for record in records {
-            timeline.apply(.proposedPlan(record.plan))
+            next.apply(.proposedPlan(record.plan))
         }
+        timeline = next
     }
 
     private func rehydratePendingCallbacks(threadId: AgentThreadID) {
         guard let pendingCallbackRepo,
               let callbacks = try? pendingCallbackRepo.listVisible(threadId: threadId) else { return }
+        var next = timeline
         for callback in callbacks {
             guard let data = callback.payloadJSON.data(using: .utf8) else { continue }
             switch callback.kind {
@@ -3891,7 +3946,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 ) else { continue }
                 request.state = callback.state
                 request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
-                timeline.apply(.requestOpened(request))
+                next.apply(.requestOpened(request))
             case .userInput:
                 guard var request = try? pendingCallbackDecoder.decode(
                     AssistantUserInputRequest.self,
@@ -3899,9 +3954,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 ) else { continue }
                 request.state = callback.state
                 request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
-                timeline.apply(.userInputRequested(request))
+                next.apply(.userInputRequested(request))
             }
         }
+        timeline = next
     }
 
     private func rehydrateDurableActiveState(threadId: AgentThreadID) {
@@ -6717,6 +6773,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             isStopping = false
         }
         for id in ids {
+            paintedTimelineByThread.removeValue(forKey: id)
+            paintedTimelineOrder.removeAll { $0 == id }
             repairedThreadIds.remove(id)
             threadWorkspaceCache.removeValue(forKey: id)
             composerDraftsByThread.removeValue(forKey: id)
@@ -7580,12 +7638,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     private var hasWaitingBotPeerActivity: Bool {
-        guard let threadID = selectedThreadId else { return false }
-        return messages.contains {
-            $0.threadId == threadID
-                && $0.role == .assistant
-                && BotPeerTranscript.parseActivity($0.content)?.phase == .waiting
-        }
+        transcriptState.waitingBotPeerActivity
     }
 
     private var needsBotPeerReconciliation: Bool {
@@ -9435,8 +9488,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // DB only on a cache miss (first event for a thread not yet loaded here).
             let threadWorkspace = self.resolvedWorkspaceID(for: threadId)
             guard threadWorkspace == self.workspaceID else { return }
-            // Coalesce N same-workspace Agent App tabs into one reload per surface.
-            self.scheduleReloadThreads()
+            // X-02: status-only events must not re-list the rail (ISO parse × N).
+            // Patch the in-memory row; create/delete/rename still call reloadThreads.
+            self.applyInMemoryThreadStatus(threadId, status: status)
             if threadId == self.selectedThreadId {
                 if status == .running {
                     self.status = status
@@ -11998,17 +12052,7 @@ public struct AgentAppView: View {
     /// "Changed 3 files", or "Running 2 commands…" while any member is still streaming.
     /// Task-wait members use "Waiting…" so color is not the only live signal.
     static func toolGroupSummary(_ items: [AssistantItem]) -> String {
-        let noun = toolGroupNoun(items)
-        if items.contains(where: { AgentTimelineItemPresentation.showsLiveToolElapsed(for: $0)
-            && AgentTimelineItemPresentation.isTaskWaitTool(for: $0) }) {
-            return "Waiting \(items.count) \(noun)…"
-        }
-        if items.contains(where: { $0.state == .streaming }) {
-            return "Running \(items.count) \(noun)…"
-        }
-        let verbs = Set(items.map { AgentTimelineItemPresentation.make(for: $0).verb })
-        let verb = verbs.count == 1 ? (verbs.first ?? "Ran") : "Ran"
-        return "\(verb) \(items.count) \(noun)"
+        AgentChatLiveTurnChrome.toolGroupSummary(items)
     }
 
     /// Earliest live wait/background member for group-header elapsed (defense in depth).
@@ -13514,7 +13558,13 @@ public struct AgentAppView: View {
         ) {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
-                    ForEach(vm.filteredThreads, id: \.id) { t in threadRow(t) }
+                    let runningThreadIds = Set(vm.filteredThreads.compactMap { thread in
+                        vm.isThreadStartingOrRunning(thread.id) ? thread.id : nil
+                    })
+                    let now = vm.currentTime()
+                    ForEach(vm.filteredThreads, id: \.id) { t in
+                        threadRow(t, running: runningThreadIds.contains(t.id), now: now)
+                    }
                 }.padding(DS.Space.sm)
             }
             .focusable()
@@ -13538,13 +13588,12 @@ public struct AgentAppView: View {
     }
 
     @ViewBuilder
-    private func threadRow(_ t: AgentThread) -> some View {
+    private func threadRow(_ t: AgentThread, running: Bool, now: Date) -> some View {
         if renamingThreadId == t.id {
             renameRow(t)
         } else {
             let selected = vm.selectedThreadId == t.id
             let multiSelected = selectedThreadIds.contains(t.id)
-            let running = vm.isThreadStartingOrRunning(t.id)
             let markColor = TabColor.from(t.color).map { Color(hex: $0.hex) }
                 ?? (t.status == .failed ? DS.Palette.danger : DS.Palette.textTertiary)
             let status: AgentChatThreadStatusMark = {
@@ -13560,7 +13609,7 @@ public struct AgentAppView: View {
                     provider: t.provider,
                     model: t.model,
                     updatedAt: t.updatedAt,
-                    now: vm.currentTime()
+                    now: now
                 ),
                 unread: t.hasUnread,
                 selected: selected || multiSelected,
@@ -15690,6 +15739,7 @@ public struct AgentAppView: View {
                 )
                 : nil
         )
+        .equatable()
     }
 
     private static func peerHopIdentity(
@@ -15746,6 +15796,7 @@ public struct AgentAppView: View {
                     }
                 )
         )
+        .equatable()
     }
 
     @ViewBuilder

@@ -9310,6 +9310,56 @@ final class AgentAppViewModelTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func test_paintedTimelineByThread_evictsLRUAndDeletedThreads() throws {
+        // WHY (AA-07): paintedTimelineByThread grew for every thread visited
+        // in the session. Cap at 3 plus the selected/live run, and drop
+        // deleted ids.
+        let (vm, repo) = try makeVM()
+        var ids: [AgentThreadID] = []
+        for index in 0..<5 {
+            let thread = AgentThread(
+                workspaceId: vm.workspaceID,
+                title: "t\(index)",
+                provider: .codex,
+                model: "gpt-5.5"
+            )
+            try repo.upsert(thread)
+            ids.append(thread.id)
+            vm.selectThread(thread.id)
+        }
+        XCTAssertLessThanOrEqual(
+            vm.paintedTimelineCountForTesting,
+            3,
+            "visiting 5 threads must not keep every painted timeline"
+        )
+
+        vm.selectThread(ids[0])
+        XCTAssertLessThanOrEqual(vm.paintedTimelineCountForTesting, 3)
+    }
+
+    @MainActor
+    func test_didChangeStatus_doesNotReloadThreadList() throws {
+        // WHY (X-02): every run status hop used to list the workspace rail
+        // (ISO parse × N) in idle with 5 runs.
+        let (vm, repo) = try makeVM()
+        let thread = AgentThread(workspaceId: vm.workspaceID, title: "live", provider: .codex, model: "gpt-5.5")
+        try repo.upsert(thread)
+        vm.selectThread(thread.id)
+        let before = repo.durableListCountForTesting
+        vm.runCoordinator(
+            vm.coordinator,
+            didChangeStatus: .running,
+            runId: AgentRunID(),
+            threadId: thread.id
+        )
+        XCTAssertEqual(
+            repo.durableListCountForTesting,
+            before,
+            "status-only events must patch the in-memory rail, not re-list SQLite"
+        )
+    }
+
     // F5: the single-pass cap+budget that replaced `map(cap) + applyBodyBudget` on the
     // thread-open path must be byte-for-byte equivalent to the prior two-pass version.
     func test_cappedRowsWithinBudget_matchesMapThenBudgetComposition() {
