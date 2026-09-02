@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import CoreModel
+import Persistence
 import SocketServer
 import Surfaces
 import DesignSystemKit
@@ -271,6 +272,12 @@ public final class PaneTabsView: NSObject {
 
     @discardableResult
     private func installSelectedContent(selectedID: SurfaceID?, in pane: PaneNode) -> Bool {
+        defer {
+            PerfSwitchMetrics.endTabSwitchInstall()
+            CATransaction.setCompletionBlock {
+                PerfSwitchMetrics.endTabSwitchCommitted()
+            }
+        }
         let selectedView = selectedID.flatMap { SurfaceRegistry.shared.surface($0)?.view }
         if let selectedView,
            contentArea.subviews.count == 1,

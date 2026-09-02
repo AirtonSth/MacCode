@@ -362,25 +362,27 @@ public final class SQLiteDB {
     }
 
     public func execute(_ sql: String) throws {
-        try withSerializedOperation {
-            // Inside an open transaction, surface lock errors immediately so the
-            // transaction owner can ROLLBACK and retry the whole unit.
-            let run: () throws -> Void = { [self] in
-                if transactionDepth > 0 {
-                    try executeDirect(sql)
-                } else {
-                    try withTransientLockRetry(onRetry: { [self] in
-                        releaseReadSnapshotForRetry()
-                    }) {
+        try measureCallerWaitIfOnMain {
+            try withSerializedOperation {
+                // Inside an open transaction, surface lock errors immediately so the
+                // transaction owner can ROLLBACK and retry the whole unit.
+                let run: () throws -> Void = { [self] in
+                    if transactionDepth > 0 {
                         try executeDirect(sql)
+                    } else {
+                        try withTransientLockRetry(onRetry: { [self] in
+                            releaseReadSnapshotForRetry()
+                        }) {
+                            try executeDirect(sql)
+                        }
                     }
                 }
+                if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+                    try run()
+                    return
+                }
+                try queue.sync { try run() }
             }
-            if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
-                try run()
-                return
-            }
-            try queue.sync { try run() }
         }
     }
 
@@ -430,17 +432,27 @@ public final class SQLiteDB {
     }
 
     public func performSync<T>(_ block: (SQLiteDB) throws -> T) rethrows -> T {
-        try withSerializedOperation {
-            if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
-                return try block(self)
-            }
-            return try queue.sync {
-                // Early-returned SELECTs must not retain a WAL read snapshot after
-                // the serialized operation ends, including when the block throws.
-                defer { resetCachedStatements() }
-                return try block(self)
+        try measureCallerWaitIfOnMain {
+            try withSerializedOperation {
+                if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+                    return try block(self)
+                }
+                return try queue.sync {
+                    // Early-returned SELECTs must not retain a WAL read snapshot after
+                    // the serialized operation ends, including when the block throws.
+                    defer { resetCachedStatements() }
+                    return try block(self)
+                }
             }
         }
+    }
+
+    /// PF-00 (c): the idle capture blocked on `NSRecursiveLock` (operationLock)
+    /// before `queue.sync`. Measure the caller-thread wait, not just the inner hop.
+    private func measureCallerWaitIfOnMain<T>(_ body: () throws -> T) rethrows -> T {
+        let onMain = Thread.isMainThread && DispatchQueue.getSpecific(key: Self.queueKey) == nil
+        guard onMain else { return try body() }
+        return try PerfSwitchMetrics.measureQueueSync(onMainThread: true, body: body)
     }
 
     public func prepare(_ sql: String) throws -> SQLiteStatement {

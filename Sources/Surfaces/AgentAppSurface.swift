@@ -2109,6 +2109,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             softReselectOpenThread(selectedThread, markRead: markRead)
             return
         }
+        PerfSwitchMetrics.beginConversationSwitch(threadID: id.value.uuidString)
         // Full open path — only when the selected thread actually changes.
         selectThreadOpenGeneration &+= 1
         let openGeneration = selectThreadOpenGeneration
@@ -2122,6 +2123,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             paintedTimelineByThread[previous] = timeline
         }
         selectedThreadId = id
+        PerfSwitchMetrics.markConversationFirstPublish()
         publishInterestedThreadId(id)
         // Per-thread chip: never keep the leaving thread's savings on the
         // newly selected one while its ledger read is in flight (or if it fails).
@@ -2430,6 +2432,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
               selectThreadOpenGeneration == openGeneration,
               selectedThreadId == id else {
             Self.agentOpenTrace("open bundle dropped stale gen=\(openGeneration)")
+            PerfSwitchMetrics.endConversationHydrate()
             return
         }
         var effective = bundle
@@ -2455,6 +2458,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                       selectThreadOpenGeneration == openGeneration,
                       selectedThreadId == id else {
                     Self.agentOpenTrace("open re-replay dropped stale gen=\(openGeneration)")
+                    PerfSwitchMetrics.endConversationHydrate()
                     return
                 }
             }
@@ -2564,6 +2568,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         Self.agentOpenTrace(
             "full open bundle applied gen=\(openGeneration) items=\(Self.renderableItemCount(bundle.persistedEvents)) turns=\(timeline.turns.count) recoverable=\(selectedThreadHasRecoverableContext)"
         )
+        PerfSwitchMetrics.endConversationHydrate()
     }
 
     private func scheduleDeferredProviderSnapshotIfNeeded(
