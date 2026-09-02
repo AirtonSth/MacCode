@@ -81,6 +81,40 @@ public final class BotStore: @unchecked Sendable {
     public private(set) var listQueryCountForTesting = 0
 #endif
 
+    /// In-memory `linked_agent_thread_id → bot` map so run-status broadcasts
+    /// can skip SQLite for threads that never belonged to a bot.
+    private let linkedThreadCacheState = NSLock()
+    private var botIDByLinkedThread: [AgentThreadID: BotID] = [:]
+    private var linkedThreadByConversation: [BotConversationID: AgentThreadID] = [:]
+    public private(set) var conversationLinkedQueryCountForTesting = 0
+
+    /// Hot-path lookup. Does not touch SQLite.
+    public func cachedBotID(linkedTo threadID: AgentThreadID) -> BotID? {
+        linkedThreadCacheState.withLock { botIDByLinkedThread[threadID] }
+    }
+
+    private func rememberLinkedThread(_ conversation: BotConversation) {
+        linkedThreadCacheState.withLock {
+            if let previous = linkedThreadByConversation[conversation.id],
+               previous != conversation.linkedAgentThreadID,
+               botIDByLinkedThread[previous] == conversation.botID {
+                botIDByLinkedThread[previous] = nil
+            }
+            if let threadID = conversation.linkedAgentThreadID {
+                botIDByLinkedThread[threadID] = conversation.botID
+                linkedThreadByConversation[conversation.id] = threadID
+            } else {
+                linkedThreadByConversation[conversation.id] = nil
+            }
+        }
+    }
+
+    private func forgetLinkedThreads(botID: BotID) {
+        linkedThreadCacheState.withLock {
+            botIDByLinkedThread = botIDByLinkedThread.filter { $0.value != botID }
+        }
+    }
+
     /// Monotonic revision of bot-definition writes (create, updateProfile,
     /// renameHandle, setPinned, setHidden, publish, duplicate, delete).
     public var botsListRevision: UInt64 {
@@ -568,6 +602,7 @@ public final class BotStore: @unchecked Sendable {
             try executeBound("DELETE FROM bot_routine_definitions WHERE bot_id = ?;", id: id)
             try executeBound("DELETE FROM bot_queued_follow_ups WHERE bot_id = ?;", id: id)
         }
+        forgetLinkedThreads(botID: id)
         bumpBotsListRevision()
     }
 
@@ -623,7 +658,8 @@ public final class BotStore: @unchecked Sendable {
     }
 
     public func conversationLinked(to threadID: AgentThreadID) throws -> BotConversation? {
-        try db.performSync { database in
+        linkedThreadCacheState.withLock { conversationLinkedQueryCountForTesting += 1 }
+        return try db.performSync { database in
             let statement = try database.prepare(
                 Self.conversationSelect + " WHERE linked_agent_thread_id = ? LIMIT 1;"
             )
@@ -787,6 +823,7 @@ public final class BotStore: @unchecked Sendable {
             try statement.bind(1, botID.value.uuidString.lowercased())
             _ = try statement.step()
         }
+        forgetLinkedThreads(botID: botID)
     }
 
     public func upsertConversation(_ conversation: BotConversation) throws {
@@ -818,6 +855,7 @@ public final class BotStore: @unchecked Sendable {
             try statement.bind(10, string(conversation.updatedAt))
             _ = try statement.step()
         }
+        rememberLinkedThread(conversation)
     }
 
     public func listMemory(botID: BotID, includeForgotten: Bool = false) throws -> [BotMemoryItem] {
@@ -2205,7 +2243,7 @@ public final class BotStore: @unchecked Sendable {
             let updated = date(statement.columnText(9))
         else { throw BotStoreError.invalidRow("bot_conversations") }
         let thread = statement.columnText(7).flatMap(UUID.init(uuidString:)).map(AgentThreadID.init)
-        return BotConversation(
+        let conversation = BotConversation(
             id: BotConversationID(id),
             botID: BotID(bot),
             title: title,
@@ -2217,6 +2255,8 @@ public final class BotStore: @unchecked Sendable {
             createdAt: created,
             updatedAt: updated
         )
+        rememberLinkedThread(conversation)
+        return conversation
     }
 
     private func decodeMemory(_ statement: SQLiteStatement) throws -> BotMemoryItem {
