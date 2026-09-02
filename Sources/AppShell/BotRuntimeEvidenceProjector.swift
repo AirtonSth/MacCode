@@ -111,14 +111,23 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
         }
         lock.unlock()
 
-        eventBus.publish(kind: projectedKind, payload: .object([
+        var projectedPayload: [String: JSONValue] = [
             "host_id": .string(binding.hostID),
             "bot_id": .string(binding.botID),
             "conversation_id": binding.conversationID.map(JSONValue.string) ?? .null,
             "request_id": .string(binding.requestID),
             "client_request_id": .string(binding.requestID),
             "run_id": .string(binding.runID),
-        ]))
+        ]
+        if projectedKind == .botRunFailed,
+           let message = nonempty(
+               source["message"]?.stringValue
+                   ?? source["error_message"]?.stringValue
+                   ?? source["error"]?.stringValue
+           ) {
+            projectedPayload["message"] = .string(message)
+        }
+        eventBus.publish(kind: projectedKind, payload: .object(projectedPayload))
         if projectedKind == .botRunCompleted || projectedKind == .botRunFailed {
             onTerminal(TerminalEvidence(
                 botID: binding.botID,

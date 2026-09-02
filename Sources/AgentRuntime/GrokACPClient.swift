@@ -137,6 +137,19 @@ enum GrokACPFailureTaxonomy {
            normalized.contains("invalid session") || normalized.contains("unknown session") {
             return .invalidResume
         }
+        // 402 Payment Required: Grok Build balance exhausted is not retryable
+        // or auth-required — surface it verbatim so the host can circuit-break
+        // and the mirror can show the real cause. Must precede auth/rate checks
+        // so "402 Payment" isn't mis-tagged as auth.
+        if normalized.contains("402") && normalized.contains("payment") {
+            return .nonRecoverable
+        }
+        if normalized.contains("balance exhausted") || normalized.contains("usage balance") {
+            return .nonRecoverable
+        }
+        if normalized.contains("payment required") {
+            return .nonRecoverable
+        }
         let authMarkers = [
             "unauthorized", "unauthenticated", "authentication required", "login required",
             "sign in required", "token expired", "credential expired", "invalid_api_key",
