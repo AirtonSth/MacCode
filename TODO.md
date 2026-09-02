@@ -76,7 +76,8 @@ Severidade: **P0** bloqueia main thread / hang visível; **P1** stutter mensurá
 - [x] **BT-12 · P2 · switch — `reload()` chama `reloadSelectedBot` duas vezes por remontagem** (`BotsWindow.swift:3951` e `:3956`). Pular a 2ª quando bot e conversa selecionados não mudaram após `reloadFleet`.
   **FEITO (35f640c1)**: a 2ª chamada só roda quando bot ou conversa selecionada mudaram. Medido por teste: reload com mesmo bot+conversa → 1 `reloadSelectedBot` (antes 2); após trocar de bot → 1.
 
-- [ ] **AA-08 + CH-08 + CH-09 · P1 · load + switch — cache de markdown pequeno demais, chaveado por texto inteiro, e `selectableProse` nunca cacheado.** (juntos)
+- [x] **AA-08 + CH-08 + CH-09 · P1 · load + switch — cache de markdown pequeno demais, chaveado por texto inteiro, e `selectableProse` nunca cacheado.** (juntos)
+  **FEITO (8135b67e)**: NSCache 4 MiB / 512; chave por hash; selectableProse por grupo; 48 KiB só no live `cache:false`. Teste: 60 KiB finished → 2ª parse = 0 computes.
   `Sources/Surfaces/AgentMessageMarkdown.swift:44-60`: orçamento total 128 KiB (blocos) + 128 KiB (inline), `countLimit 128`, `maxCachedTextUTF8Bytes = 48 KiB` (`:50`, `:86-88` recusa mensagens finalizadas maiores). Chave `text as NSString` re-hasheada por body (`:91-92`, `:340-341`). `selectableProse` (`:127-172`) concatena um `AttributedString` novo por grupo por body (`:611`) mesmo com hits no cache. Resultado: uma thread com 3 respostas médias já evita tudo ao trocar de conversa; respostas > 48 KiB reparseiam a cada body.
   Fazer: orçamento de alguns MB (os `NSTextView`s já mantêm esses `AttributedString`s vivos); chave por hash de 64 bits pré-computado no modelo da mensagem (`messageId`+`utf8Count`); cachear o resultado de `selectableProse` por grupo; manter a regra de 48 KiB só para `cache:false` (linha viva).
   Verificar: teste que abrir uma thread com 5 respostas de 60 KiB duas vezes reparseia 0 blocos na 2ª; medir tempo do primeiro body após `selectThread` antes/depois.
@@ -110,7 +111,8 @@ Severidade: **P0** bloqueia main thread / hang visível; **P1** stutter mensurá
 
 ## F4 — Streaming: parar de rebuildar N linhas por token
 
-- [ ] **CH-01 · P0 · load + stream — linhas do transcript carregam `AnyView?`/closures, então o SwiftUI nunca consegue pular o body delas.** (este é o multiplicador de CH-02/03/04/06, AA-14 e BT-09)
+- [x] **CH-01 · P0 · load + stream — linhas do transcript carregam `AnyView?`/closures, então o SwiftUI nunca consegue pular o body delas.** (este é o multiplicador de CH-02/03/04/06, AA-14 e BT-09)
+  **FEITO (f47714a8)**: Equatable nas linhas (value fields) + `.equatable()` no live turn. Teste: views iguais ignoram closures novas.
   `AgentChatTranscriptChrome.swift:271-272` (`AgentChatUserBubble.header/belowBubble: AnyView?`), `:388` (`AgentChatAssistantReply.content: AnyView?`), `AgentChatLiveTurnChrome.swift:~770` (`AgentChatLiveTurnView.renderFinal: ((String)->AnyView)?`, `afterWork: AnyView?`), `AgentChatSharedChrome.swift:34-40` (`AgentChatThreadRow.onSelect/onStop`). O transcript é `VStack` eager por decisão documentada (`AgentChatTimelineChrome.swift:13-19`, janela de 30 entradas), logo cada uma das ~30 linhas montadas re-executa body a cada token.
   Fazer: `Equatable` em cada view de linha comparando só campos-valor (`text`, `createdAt`, `columnWidth`, `turn`, `live`, ids) + `.equatable()` no ponto de montagem; ou trocar os slots `AnyView?` por parâmetros genéricos `Header: View` com `EquatableView`. Os chamadores (`AgentAppSurface`, `BotsWindow`) já têm os ids para o `==`.
   Verificar: `Self._printChanges()` em `AgentChatUserBubble` durante um stream de 300 deltas: linhas históricas 0 bodies (hoje 300 cada). Teste de snapshot que o conteúdo ainda atualiza quando `text` muda.
@@ -134,6 +136,7 @@ Severidade: **P0** bloqueia main thread / hang visível; **P1** stutter mensurá
   **FEITO (50911efe)**: `cache:false` agora significa "não gravar" (a leitura sempre consulta o cache); a view passa `cache:true` para todos os grupos exceto o último da linha viva, e `selectableProse` cacheia todos os blocos do grupo exceto o último. Medido por teste: 10 ticks num grupo vivo de 3 blocos → 10 parses (só o rabo), não 30; testes R4-B de não-gravação seguem verdes.
 
 - [ ] **AA-05 + AA-06 · P1 · switch + digitar + idle — observação do VM inteiro: 78 `@Published` num único objeto rebuildam o `AgentAppView` de 6,8 mil linhas, e os "ReactiveScopes" não impedem pai→filho.** (juntos)
+  **PARCIAL (1be74848)**: `focusTick` saiu do VM (PF-12). Composer/transcript já têm reactive scopes. Chrome fields (token saver, git, shells, subagent) ainda publicam no VM de 78 campos.
   `AgentAppSurface.swift:10958` (`@ObservedObject var vm`), `:276-588` (`@Published` de alto churn: `runStartedAt` 515, `statusMessage` 345, `liveBackgroundShellCount/Tasks` 366-370, `subagentActivity` 397, `tokenSaverThread*` 373-380, `gitSummary` 403, `focusTick` 296, `queuedMessages` 509, `checkpoints/checkpointDiffPreview` 492-495). `ComposerReactiveScope`/`TranscriptReactiveScope` (`:217-231`) recebem `content: () -> Content` — o próprio comentário (211-215) admite que o pai recria o wrapper a cada publish. No body do transcript (`:13494-13585`) `paintOrderedTranscriptEntries` ×2, `splitTrailingLiveTurns`, `chatFlowRows` ×2, `makeChatRowPaintContext` (12127-12178, `shouldHideAssistantOutput(previousTurns:)` = O(turnos²) em strings), `activeBotPeerReviewName` (12480-12499) rodam a cada passada; só `transcriptEntries` é memoizado.
   Fazer: coluna do transcript como `View` struct separada com entradas-valor explícitas (`transcriptState`, `status`, `runStartedAt`, `revealCount`, `columnWidth`) e sem closures; publishes só-de-chrome (footer token saver, badge subagentes, contagem de shells, git summary) num `AgentChromeState: ObservableObject` observado apenas pelas strips. Memoizar a tupla derivada `(paintSequence, historyRows, liveRows, paintContext)` chaveada em `(contentGeneration, status, runStartedAt, revealCount, botsSignature)` — mesmo padrão de `transcriptCache`.
   Verificar: `Self._printChanges()` — publish de `tokenSaverThreadSavedTokens` não re-executa o body da coluna do transcript; contagem de `makeChatRowPaintContext` por tick de 33 ms == 0 quando o transcript não mudou.
@@ -142,22 +145,27 @@ Severidade: **P0** bloqueia main thread / hang visível; **P1** stutter mensurá
   Fazer: `BotsDeskLiveState: ObservableObject` (deskLiveTimeline, deskStreamEventCount, deskWorkLog, deskMessages, deskSendInFlight) observado só pelo desk/strip via reactive-scope como o do composer; `BotsRosterState` (publishedRoster, attentionStateByBot, lastPreviewByBot, activeBotCount) só pelo `BotsRosterList`; manter proxies públicos para testes. `deskTimelineItems` e `deskPaintsLiveTurnChrome` cacheados com dirty-flag nos setters de `deskMessages/deskWorkLog/deskLiveTimeline`, recomputados ≤1× por run-loop. Pré-computar `compose(turn)` por turno nos itens memoizados e passar como valor; `AgentChatLiveTurnView` `Equatable` (`turnId, items.count, finished, live, flags`) + `.equatable()`.
   Verificar: `_printChanges()` do roster durante stream == 0; contador de `BotsDeskFollowThrough.timeline` por token == 1 (hoje ≥3); os 26 testes de `BotsWindowTests` que já falham por nome continuam sendo os mesmos (baseline-diff).
 
-- [ ] **BT-04 · P1 · stream + idle-com-run — poll de 250 ms faz 3-4 leituras SQLite síncronas no main por tick, redundante com o push.**
+- [x] **BT-04 · P1 · stream + idle-com-run — poll de 250 ms faz 3-4 leituras SQLite síncronas no main por tick, redundante com o push.**
+  **FEITO (a7ef0c8c / PF-04)**: fallback 2 s; skip enquanto o push está fresco.
   `BotsWindow.swift:8562-8583` (`startDeskLiveTurnWatch`: `streamEventCursor` → `runRepo.streamEventCursor` `AgentRunCoordinator.swift:5287`, `linkedRun` → `runRepo.latestActive` 8620, `refreshPublishedIdentity` → `botStore.get` 7160; `Task` herda MainActor). O push `runCoordinator(didReceive:)` (9920) já aplica cada evento.
   Fazer: reconciliação por evento (`didChangeStatus`/`didFinish`, mudança de `deskTimelineRejoinToken`) + fallback lento de 2 s; leituras em `Task.detached`, hop ao MainActor só para atribuir.
   Verificar: contador de queries por segundo durante stream == 0 fora de transições.
 
 - [ ] **BT-06 · P1 · stream + switch + digitar — rail de threads ordena/filtra e copia o Set de threads ativas 3+N vezes por body** (`BotsWindow.swift:11866-11895`, `:4636-4650`, `:11905`). Calcular `live` e `rows` uma vez no topo de `deskThreadRail` e passar `running` para `deskThreadRow`; ou cachear `filteredDeskConversations` invalidado por `conversations`/query/status.
 
-- [ ] **CH-05 · P1 · load + stream — `AgentChatLiveTurnView.body` compõe o turno 2× por body com `contains` O(k²)** (`AgentChatLiveTurnChrome.swift` seção "Turn": `compose(turn)` + `workBlocks` e depois `shouldRenderFinalMessage(turn)` chama `compose` de novo; `deduplicatedAssistantItems`/`assistantTextsMatch` `:167-172`). Reusar a composição; hoistar para turnos finalizados no modelo da linha (`AgentCompletedWorkBlockGrowth` em `AgentChatUXPresentation.swift:927+` já existe e não é usado aqui).
+- [x] **CH-05 · P1 · load + stream — `AgentChatLiveTurnView.body` compõe o turno 2× por body com `contains` O(k²)**
+  **FEITO (f47714a8)**: `shouldRenderFinalMessage` reusa a composição do body. (`AgentChatLiveTurnChrome.swift` seção "Turn": `compose(turn)` + `workBlocks` e depois `shouldRenderFinalMessage(turn)` chama `compose` de novo; `deduplicatedAssistantItems`/`assistantTextsMatch` `:167-172`). Reusar a composição; hoistar para turnos finalizados no modelo da linha (`AgentCompletedWorkBlockGrowth` em `AgentChatUXPresentation.swift:927+` já existe e não é usado aqui).
 
-- [ ] **CH-06 · P1 · load + stream — header do `AgentChatToolGroupRow` re-deriva `AgentTimelineItemPresentation.make(for:)` para todos os membros por body** (`toolGroupSummary`; `AgentAppSurface.swift:9896-9920` faz `replacingOccurrences` + trim). Pré-computar o summary ao montar o bloco ou memoizar por `(id, streamingCount, failedCount, items.count)`. Nota: `AgentChatLiveToolRow.standardBody` chama `AgentTimelineItemPresentation.*` 6× por body (`AgentAppSurface.swift:9896-10470`) — mesma correção.
+- [x] **CH-06 · P1 · load + stream — header do `AgentChatToolGroupRow` re-deriva `AgentTimelineItemPresentation.make(for:)` para todos os membros por body**
+  **FEITO (f47714a8)**: `toolGroupSummary` memoizado por identidade dos membros. (`toolGroupSummary`; `AgentAppSurface.swift:9896-9920` faz `replacingOccurrences` + trim). Pré-computar o summary ao montar o bloco ou memoizar por `(id, streamingCount, failedCount, items.count)`. Nota: `AgentChatLiveToolRow.standardBody` chama `AgentTimelineItemPresentation.*` 6× por body (`AgentAppSurface.swift:9896-10470`) — mesma correção.
 
-- [ ] **CH-07 · P1 · stream + load + resize — `AgentLinkedInlineTextRepresentable` calcula o dirty-plan 2× por update com `AttributedString ==` completo** (`AgentLinkedInlineText.swift:230-247`, `:150`). Comparar primeiro `(sourceText, styleKey)`; `AttributedString ==` só como fallback; pular `apply` em `updateNSView` quando `sizeThatFits` já aplicou o mesmo `next` na mesma transação (token de transação).
+- [x] **CH-07 · P1 · stream + load + resize — `AgentLinkedInlineTextRepresentable` calcula o dirty-plan 2× por update com `AttributedString ==` completo**
+  **FEITO (82af6460)**: fingerprint antes de `AttributedString ==`. (`AgentLinkedInlineText.swift:230-247`, `:150`). Comparar primeiro `(sourceText, styleKey)`; `AttributedString ==` só como fallback; pular `apply` em `updateNSView` quando `sizeThatFits` já aplicou o mesmo `next` na mesma transação (token de transação).
 
 ## F5 — Idle e memória
 
-- [ ] **X-02 · P1 · idle — lista de threads recarregada em idle com 2 parses ISO8601 + decode de routing JSON por linha.**
+- [x] **X-02 · P1 · idle — lista de threads recarregada em idle com 2 parses ISO8601 + decode de routing JSON por linha.**
+  **FEITO (daace020 + 031f0538)**: índice v83; `unixepoch()` na list; `didChangeStatus` não relista.
   Amostra idle: 36 amostras em `AgentThreadRepository.list(workspaceId:)`, 47 em `LockedISO8601Formatter.date(from:)`, 26 em `parseDate`. `Sources/Persistence/Repositories.swift:862-930`: `ORDER BY t.updated_at DESC` sem índice em `(workspace_id, updated_at)` (só `idx_agent_threads_workspace`) + `parseDate` ×2 + `decodeRoutingConfiguration` por linha, 301 threads no DB ao vivo. Descobrir o chamador em idle (candidatos: `AgentAppSurface.swift:1182/1301` via `AgentWorkspaceRailReloadCoordinator`, `SidebarView.swift:830`) — instrumente `durableListCountForTesting` e registre quem dispara com o app parado.
   Fazer: (1) não recarregar a lista quando nenhum evento de thread ocorreu (gate por revisão/EventBus); (2) `CREATE INDEX idx_agent_threads_workspace_updated ON agent_threads(workspace_id, updated_at DESC, id DESC)` (Schema bump); (3) datas: manter `TEXT` mas parsear lazy ou usar `unixepoch` na query.
   Verificar: reamostra idle sem `AgentThreadRepository.list`; `EXPLAIN QUERY PLAN` usa o índice.
@@ -167,18 +175,25 @@ Severidade: **P0** bloqueia main thread / hang visível; **P1** stutter mensurá
   Fazer: backoff exponencial (100 ms → 5 s) com teto de tentativas e depois marcar o run `failed` com `error_message` explícito (hoje há 51 runs `failed/interrupted` com `error_message NULL` no DB); registrar o motivo via `AppLifecycleRecorder`.
   Verificar: teste de unidade que um `persistTerminalGraph` que falha sempre produz ≤ N tentativas e termina o run com mensagem; reamostra idle sem `handle(event:)`.
 
-- [ ] **AA-07 · P1 · memória — `paintedTimelineByThread` cresce sem limite na sessão** (`AgentAppSurface.swift:2017`, escrito em 2100/2415, nunca removido nem limpo em `dispose()` 1081-1150). LRU ≤3 timelines (ou só threads com run ativo); remover em `applyAuthoritativeThreadDeletions`.
+- [x] **AA-07 · P1 · memória — `paintedTimelineByThread` cresce sem limite na sessão**
+  **FEITO (031f0538)**: LRU ≤3; limpa no dispose e em deletes. (`AgentAppSurface.swift:2017`, escrito em 2100/2415, nunca removido nem limpo em `dispose()` 1081-1150). LRU ≤3 timelines (ou só threads com run ativo); remover em `applyAuthoritativeThreadDeletions`.
 
-- [ ] **BT-08 · P1 · idle — cada `BotsViewModel` (um por janela Bots) recarrega a tela Active Bots inteira a qualquer mudança de status de run, mesmo oculta** (`BotsWindow.swift:9953-9973` → `reloadActiveBotsScreen` 3743 → `listRecentFinished(limit: 200)` etc.; sem guard `screen == .activeBots`, ao contrário de `reload()` 3960). Guardar por destino e coalescer por run-loop.
+- [x] **BT-08 · P1 · idle — cada `BotsViewModel` (um por janela Bots) recarrega a tela Active Bots inteira a qualquer mudança de status de run, mesmo oculta**
+  **FEITO (a7ef0c8c / PF-04)**: `reloadActiveBotsScreen` é no-op fora do destino Active Bots. (`BotsWindow.swift:9953-9973` → `reloadActiveBotsScreen` 3743 → `listRecentFinished(limit: 200)` etc.; sem guard `screen == .activeBots`, ao contrário de `reload()` 3960). Guardar por destino e coalescer por run-loop.
 
 - [x] **CH-12 · P2 · idle — `TimelineView(AgentChatElapsedTickSchedule)` ignora `mode == .lowFrequency`** (`AgentChatLiveTurnChrome.swift` "Working status", `AgentChatSharedChrome.swift:895`). Devolver cadência de 5 s em low-frequency / janela ocluída.
   **FEITO (34ed4411)**: o schedule fixa a cadência de 5 s quando `mode == .lowFrequency`. Medido por teste: modo normal no 1º minuto → 1 s; lowFrequency → 5 s.
 
-- [ ] **AA-11 · P2 · load — loops de rehydrate chamam `timeline.apply` por registro, cada um disparando o didSet O(turnos)** (`AgentAppSurface.swift:3478-3480`, `3486-3506`, `3517`). Copiar para local, aplicar tudo, atribuir uma vez.
-- [ ] **AA-12 · P2 · switch + idle — `reloadTokenSaverThreadSavings` re-soma bytes de todas as mensagens no main** (`:1919-1922`, 6 call sites). Somar no Task off-main ou manter total incremental no didSet de `messages`.
-- [ ] **AA-14 · P2 · load + idle — `AgentChatLiveTurnView` montado com closures novas por linha em `AgentAppSurface.swift:15238-15259`**; `turnRenderCache` (12845-12860) não memoiza a composição. Coberto pela correção de CH-01/CH-05; só confirmar no lado do chamador.
-- [ ] **AA-15 · P2 · idle — rail deriva estado running e subtítulo por linha por passada** (`:13109-13125`, `trackedRunId` 5291-5294, `activeThreadCount` 3882). `runningThreadIds: Set` + `now` uma vez por passada.
-- [ ] **AA-16 · P2 · idle — `hasRunningWorkForChrome` varre `messages` e trava o coordinator por consulta** (`:3890-3899`, `7172-7176`; exposto como `AgentAppSurface.isBusy` 18287, pollado pelo host). Flag em didSet de `messages` + Set de runs vivos por callback.
+- [x] **AA-11 · P2 · load — loops de rehydrate chamam `timeline.apply` por registro, cada um disparando o didSet O(turnos)**
+  **FEITO (031f0538)**: aplica numa cópia local e atribui uma vez. (`AgentAppSurface.swift:3478-3480`, `3486-3506`, `3517`). Copiar para local, aplicar tudo, atribuir uma vez.
+- [x] **AA-12 · P2 · switch + idle — `reloadTokenSaverThreadSavings` re-soma bytes de todas as mensagens no main**
+  **FEITO (031f0538)**: soma UTF-8 no Task off-main. (`:1919-1922`, 6 call sites). Somar no Task off-main ou manter total incremental no didSet de `messages`.
+- [x] **AA-14 · P2 · load + idle — `AgentChatLiveTurnView` montado com closures novas por linha em `AgentAppSurface.swift:15238-15259`**
+  **FEITO (f47714a8)**: `.equatable()` no chamador; Equatable ignora closures.; `turnRenderCache` (12845-12860) não memoiza a composição. Coberto pela correção de CH-01/CH-05; só confirmar no lado do chamador.
+- [x] **AA-15 · P2 · idle — rail deriva estado running e subtítulo por linha por passada**
+  **FEITO (031f0538)**: `runningThreadIds` + `now` uma vez no LazyVStack. (`:13109-13125`, `trackedRunId` 5291-5294, `activeThreadCount` 3882). `runningThreadIds: Set` + `now` uma vez por passada.
+- [x] **AA-16 · P2 · idle — `hasRunningWorkForChrome` varre `messages` e trava o coordinator por consulta**
+  **FEITO (031f0538)**: flag no didSet de `messages`. (`:3890-3899`, `7172-7176`; exposto como `AgentAppSurface.isBusy` 18287, pollado pelo host). Flag em didSet de `messages` + Set de runs vivos por callback.
 - [ ] **BT-11 · P2** — `TimelineView` envolve o composer inteiro e `AnyView(deskRoutingControls)` é rebuildado a cada tick (`BotsWindow.swift:11966`). Escopar ao `Text` do label; `@ViewBuilder` genérico.
 - [ ] **BT-13 · P2** — busca do roster faz `lowercased()` ×4 por bot por tecla (`:3476-3490`). `range(of:options:.caseInsensitive)`.
 - [ ] **BT-14 · P2** — `overlayCachedHumanTextOntoPersistedTokenSaverUsers` O(n²) (`:8301-8320`). Dicionário por id.
