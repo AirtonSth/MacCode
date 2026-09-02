@@ -25,7 +25,7 @@ public enum AgentChatThreadRowStopChrome {
     }
 }
 
-public struct AgentChatThreadRow<Leading: View, Trailing: View>: View {
+public struct AgentChatThreadRow<Leading: View, Trailing: View>: View, Equatable {
     public let title: String
     public let subtitle: String
     public let unread: Bool
@@ -68,6 +68,16 @@ public struct AgentChatThreadRow<Leading: View, Trailing: View>: View {
         self.onStop = onStop
         self.leading = leading()
         self.trailing = trailing()
+    }
+
+    public static func == (lhs: AgentChatThreadRow<Leading, Trailing>, rhs: AgentChatThreadRow<Leading, Trailing>) -> Bool {
+        lhs.title == rhs.title
+            && lhs.subtitle == rhs.subtitle
+            && lhs.unread == rhs.unread
+            && lhs.selected == rhs.selected
+            && lhs.status == rhs.status
+            && lhs.identifier == rhs.identifier
+            && (lhs.onStop == nil) == (rhs.onStop == nil)
     }
 
     public var body: some View {

@@ -456,4 +456,49 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
         XCTAssertEqual(lowFrequency.next()?.timeIntervalSince(early), 5,
                        "an occluded/minimized strip must not tick every second")
     }
+
+    func test_shouldRenderFinalMessage_reusesComposition() {
+        // WHY (CH-05): body used to compose(turn) twice per paint with
+        // contains O(k²). Passing the already-built composition must match.
+        var turn = AssistantTurnSnapshot(turnId: "t-final")
+        turn.finished = true
+        turn.finalAssistantMessage = "Hello"
+        turn.items = [
+            AssistantItem(
+                id: "a1",
+                turnId: "t-final",
+                type: .assistantMessage,
+                state: .completed,
+                body: "Hello",
+                startedAtMs: 1
+            )
+        ]
+        let composition = AgentChatLiveTurnChrome.compose(turn)
+        XCTAssertEqual(
+            AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn),
+            AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn, composition: composition)
+        )
+    }
+
+    func test_liveTurnView_equatableIgnoresNewClosuresWhenValuesMatch() {
+        // WHY (CH-01): historical rows carry AnyView/closures; Equatable must
+        // skip body when value fields are unchanged.
+        let turn = AssistantTurnSnapshot(turnId: "t-eq")
+        let a = AgentChatLiveTurnView(turn: turn, live: false, hideAssistantOutput: false)
+        let b = AgentChatLiveTurnView(turn: turn, live: false, hideAssistantOutput: false)
+        XCTAssertEqual(a, b)
+        let c = AgentChatLiveTurnView(turn: turn, live: true, hideAssistantOutput: false)
+        XCTAssertNotEqual(a, c)
+    }
+
+    func test_toolGroupSummary_isMemoizedByMemberIdentity() {
+        let items = [
+            AssistantItem(id: "c1", turnId: "t", type: .commandExecution, state: .completed, body: "ls", startedAtMs: 1),
+            AssistantItem(id: "c2", turnId: "t", type: .commandExecution, state: .completed, body: "pwd", startedAtMs: 2)
+        ]
+        let first = AgentChatLiveTurnChrome.toolGroupSummary(items)
+        let second = AgentChatLiveTurnChrome.toolGroupSummary(items)
+        XCTAssertEqual(first, second)
+        XCTAssertFalse(first.isEmpty)
+    }
 }

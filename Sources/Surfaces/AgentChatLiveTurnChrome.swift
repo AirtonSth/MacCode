@@ -9,6 +9,9 @@ import SwiftUI
 /// Work so far (Thinking…/Thought + tools) → final markdown — from the linked
 /// thread's persisted stream events. A composer Thinking pill is not enough.
 public enum AgentChatLiveTurnChrome {
+    private static let toolGroupSummaryLock = NSLock()
+    private static var toolGroupSummaryMemo: [String: String] = [:]
+
     /// A split turn is still one turn: only its first chronological slice owns
     /// the shared Work/Worked heading, including after the turn finishes.
     public static func showsWorkHeader(for segment: AgentChatTurnSegmentation.TurnSegment) -> Bool {
@@ -214,11 +217,15 @@ public enum AgentChatLiveTurnChrome {
         items.reduce(0) { $0 + $1.body.utf8.count + ($1.output?.utf8.count ?? 0) }
     }
 
-    public static func shouldRenderFinalMessage(_ turn: AssistantTurnSnapshot) -> Bool {
+    public static func shouldRenderFinalMessage(
+        _ turn: AssistantTurnSnapshot,
+        composition: (activity: [AssistantItem], outside: [AssistantItem])? = nil
+    ) -> Bool {
         guard turn.finished else { return false }
         let final = turn.finalAssistantMessage?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !final.isEmpty else { return false }
-        return !compose(turn).outside.contains {
+        let outside = (composition ?? compose(turn)).outside
+        return !outside.contains {
             $0.type == .assistantMessage && assistantTextsMatch($0.body, final)
         }
     }
@@ -262,6 +269,15 @@ public enum AgentChatLiveTurnChrome {
     }
 
     public static func toolGroupSummary(_ items: [AssistantItem]) -> String {
+        let streamingCount = items.reduce(0) { $0 + ($1.state == .streaming ? 1 : 0) }
+        let failedCount = items.reduce(0) { $0 + ($1.state == .failed ? 1 : 0) }
+        let key = "\(items.count)|\(streamingCount)|\(failedCount)|" + items.map(\.id).joined(separator: ",")
+        toolGroupSummaryLock.lock()
+        if let cached = toolGroupSummaryMemo[key] {
+            toolGroupSummaryLock.unlock()
+            return cached
+        }
+        toolGroupSummaryLock.unlock()
         let noun: String = {
             let plural = items.count != 1
             switch Set(items.map(\.type)) {
@@ -271,16 +287,22 @@ public enum AgentChatLiveTurnChrome {
             default: return plural ? "commands" : "command"
             }
         }()
+        let value: String
         if items.contains(where: { AgentTimelineItemPresentation.showsLiveToolElapsed(for: $0)
             && AgentTimelineItemPresentation.isTaskWaitTool(for: $0) }) {
-            return "Waiting \(items.count) \(noun)…"
+            value = "Waiting \(items.count) \(noun)…"
+        } else if streamingCount > 0 {
+            value = "Running \(items.count) \(noun)…"
+        } else {
+            let verbs = Set(items.map { AgentTimelineItemPresentation.make(for: $0).verb })
+            let verb = verbs.count == 1 ? (verbs.first ?? "Ran") : "Ran"
+            value = "\(verb) \(items.count) \(noun)"
         }
-        if items.contains(where: { $0.state == .streaming }) {
-            return "Running \(items.count) \(noun)…"
-        }
-        let verbs = Set(items.map { AgentTimelineItemPresentation.make(for: $0).verb })
-        let verb = verbs.count == 1 ? (verbs.first ?? "Ran") : "Ran"
-        return "\(verb) \(items.count) \(noun)"
+        toolGroupSummaryLock.lock()
+        if toolGroupSummaryMemo.count > 256 { toolGroupSummaryMemo.removeAll(keepingCapacity: true) }
+        toolGroupSummaryMemo[key] = value
+        toolGroupSummaryLock.unlock()
+        return value
     }
 }
 
@@ -736,7 +758,7 @@ public struct AgentChatLiveItemRow: View {
 
 // MARK: - Turn
 
-public struct AgentChatLiveTurnView: View {
+public struct AgentChatLiveTurnView: View, Equatable {
     public let turn: AssistantTurnSnapshot
     public let live: Bool
     public let hideAssistantOutput: Bool
@@ -765,6 +787,20 @@ public struct AgentChatLiveTurnView: View {
         self.showsWorkHeader = showsWorkHeader
         self.renderFinal = renderFinal
         self.afterWork = afterWork
+    }
+
+    public static func == (lhs: AgentChatLiveTurnView, rhs: AgentChatLiveTurnView) -> Bool {
+        lhs.turn.turnId == rhs.turn.turnId
+            && lhs.live == rhs.live
+            && lhs.hideAssistantOutput == rhs.hideAssistantOutput
+            && lhs.showsWorkHeader == rhs.showsWorkHeader
+            && lhs.turn.finished == rhs.turn.finished
+            && lhs.turn.items.count == rhs.turn.items.count
+            && lhs.turn.finalAssistantMessage == rhs.turn.finalAssistantMessage
+            && lhs.turn.items.last?.body.utf8.count == rhs.turn.items.last?.body.utf8.count
+            && lhs.turn.items.last?.output?.utf8.count == rhs.turn.items.last?.output?.utf8.count
+            && (lhs.renderFinal == nil) == (rhs.renderFinal == nil)
+            && (lhs.afterWork == nil) == (rhs.afterWork == nil)
     }
 
     public var body: some View {
@@ -816,7 +852,7 @@ public struct AgentChatLiveTurnView: View {
                         expandedTools: $expandedTools
                     )
                 }
-                if AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn),
+                if AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn, composition: composition),
                    let final = turn.finalAssistantMessage {
                     if let renderFinal {
                         renderFinal(final)
