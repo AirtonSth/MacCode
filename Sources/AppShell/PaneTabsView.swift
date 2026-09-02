@@ -743,6 +743,9 @@ public final class PaneTabsView: NSObject {
     }
 
     func refreshBusyStates() {
+        // PF-13: hidden workspace windows still hosted pane controllers.
+        // Skip the busy walk when this pane's window is not visible.
+        if let window = contentArea.window, !window.isVisible { return }
         let running = Self.runningWorkspaceIDs(for: pane.surfaces, router: router)
         for desc in pane.surfaces {
             tabButtons[desc.id]?.setBusy(Self.isSurfaceBusy(desc, runningWorkspaceIDs: running, router: router))
