@@ -1147,6 +1147,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         pendingThreadReloadTask = nil
         timelineUpdateTickTask?.cancel()
         timelineUpdateTickTask = nil
+        softReselectDurableTask?.cancel()
+        softReselectDurableTask = nil
         threadDeletionUndoExpiryTask?.cancel()
         threadDeletionUndoExpiryTask = nil
         checkpointRevertUndoExpiryTask?.cancel()
@@ -2740,6 +2742,51 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         applyQueuedMessagesReload(next, for: selectedThreadId)
     }
 
+    private var softReselectDurableGeneration: UInt64 = 0
+    private var softReselectDurableTask: Task<Void, Never>?
+    private(set) var softReselectDurableRefreshCountForTesting = 0
+
+    /// PF-20: queue list, runStartedAt, and recoverable-context are SQLite/coordinator
+    /// reads. Soft reselect used to take them on MainActor behind the writer.
+    private func scheduleSoftReselectDurableRefresh(threadId: AgentThreadID) {
+        guard surfaceVisibility != .hidden else { return }
+        softReselectDurableGeneration &+= 1
+        let generation = softReselectDurableGeneration
+        let openGeneration = selectThreadOpenGeneration
+        let queuedRepo = queuedMessageRepo
+        let coordinator = coordinator
+        softReselectDurableRefreshCountForTesting += 1
+        softReselectDurableTask = Task.detached { [weak self] in
+            let queued = (try? queuedRepo?.list(threadId: threadId)) ?? []
+            let started = try? coordinator.runStartedAt(threadId: threadId)
+            let recoverable = coordinator.hasRecoverableContext(threadId: threadId)
+            await MainActor.run {
+                guard let self,
+                      self.softReselectDurableGeneration == generation,
+                      self.selectThreadOpenGeneration == openGeneration,
+                      self.selectedThreadId == threadId else { return }
+                self.applyQueuedMessagesReload(queued, for: threadId)
+                let nextStarted = AgentAppViewModel.resolvedRunStartedAt(
+                    current: self.runStartedAt,
+                    persisted: started
+                )
+                if Self.shouldAssignIfChanged(current: self.runStartedAt, next: nextStarted) {
+                    self.runStartedAt = nextStarted
+                }
+                if Self.shouldAssignIfChanged(
+                    current: self.selectedThreadHasRecoverableContext,
+                    next: recoverable
+                ) {
+                    self.selectedThreadHasRecoverableContext = recoverable
+                }
+            }
+        }
+    }
+
+    func waitForSoftReselectDurableRefreshForTesting() async {
+        await softReselectDurableTask?.value
+    }
+
     /// Queue rows fetched off-main by the thread open bundle (perf AA-02/AA-04):
     /// the queue list no longer costs a synchronous SQLite read before the
     /// first paint.
@@ -3729,7 +3776,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             "soft reselect thread=\(id.value.uuidString.prefix(8)) markRead=\(markRead) hasUnread=\(selectedThread.hasUnread) msgs=\(messages.count) turns=\(timeline.turns.count)"
         )
         publishInterestedThreadId(id)
-        reloadQueuedMessages()
+        scheduleSoftReselectDurableRefresh(threadId: id)
         let routing = selectedThread.effectiveRoutingConfiguration
         let manual = routing.manualSelection
         // Assign-if-changed: soft reselect re-entered on every host refresh / rail
@@ -3774,13 +3821,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             status = selectedThread.status
         }
         if let trackedRunId = trackedRunId(for: id) {
-            let nextStarted = AgentAppViewModel.resolvedRunStartedAt(
-                current: runStartedAt,
-                persisted: try? coordinator.runStartedAt(threadId: id)
-            )
-            if Self.shouldAssignIfChanged(current: runStartedAt, next: nextStarted) {
-                runStartedAt = nextStarted
-            }
             if Self.shouldAssignIfChanged(current: currentRunId, next: trackedRunId) {
                 currentRunId = trackedRunId
             }
@@ -3794,13 +3834,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             stopScheduledLivePoll()
         }
         normalizeInteractionModeForSelectedProvider()
-        let nextRecoverable = coordinator.hasRecoverableContext(threadId: id)
-        if Self.shouldAssignIfChanged(
-            current: selectedThreadHasRecoverableContext,
-            next: nextRecoverable
-        ) {
-            selectedThreadHasRecoverableContext = nextRecoverable
-        }
         // Only invoke mark-read when unread — otherwise every soft reselect
         // (rail re-click / host refresh) forced a coalesced rail reload for no reason.
         if markRead, selectedThread.hasUnread, let markThreadRead {

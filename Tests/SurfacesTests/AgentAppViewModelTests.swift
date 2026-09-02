@@ -9231,6 +9231,85 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(vm.composerState.focusTick, 2)
     }
 
+    @MainActor
+    func test_softReselect_readsQueueOffMainAndDropsHiddenAndStale() async throws {
+        // WHY: PF-20 — host refreshAgentSurfaces used to list the queue,
+        // runStartedAt, and recoverable context on MainActor behind the writer.
+        // Hidden tabs must skip the refresh; a thread switch must reject the stale apply.
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-soft-reselect-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let queuedMessageRepo = AgentQueuedMessageRepository(db: db)
+        let workspaceID = WorkspaceID()
+        let threadA = AgentThread(workspaceId: workspaceID, title: "A", provider: .codex, model: "gpt-5.5")
+        let threadB = AgentThread(workspaceId: workspaceID, title: "B", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(threadA)
+        try threadRepo.upsert(threadB)
+        try queuedMessageRepo.upsert(AgentQueuedMessage(threadId: threadA.id, text: "queued on A"))
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            draftRepo: AgentThreadDraftRepository(db: db),
+            queuedMessageRepo: queuedMessageRepo
+        )
+        installRunnableProviderFixtures(on: vm)
+        wireCanonicalThreadRead(vm, repo: threadRepo)
+
+        vm.selectThread(threadA.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        await vm.waitForSoftReselectDurableRefreshForTesting()
+        XCTAssertEqual(vm.queuedMessages.map(\.text), ["queued on A"])
+
+        PerfSwitchMetrics.resetForTesting()
+        let before = vm.softReselectDurableRefreshCountForTesting
+        for _ in 0..<20 {
+            vm.selectThread(threadA.id, markRead: false)
+        }
+        await vm.waitForSoftReselectDurableRefreshForTesting()
+        XCTAssertEqual(
+            vm.softReselectDurableRefreshCountForTesting,
+            before + 20,
+            "each visible soft reselect still schedules the off-main bundle"
+        )
+        XCTAssertEqual(vm.queuedMessages.map(\.text), ["queued on A"])
+        XCTAssertEqual(
+            PerfSwitchMetrics.mainThreadSyncCountForTesting(),
+            0,
+            "soft reselect must not performSync on the main thread"
+        )
+
+        vm.setVisibility(.hidden)
+        let hiddenBefore = vm.softReselectDurableRefreshCountForTesting
+        vm.selectThread(threadA.id, markRead: false)
+        XCTAssertEqual(
+            vm.softReselectDurableRefreshCountForTesting,
+            hiddenBefore,
+            "hidden Agent App tabs must not soft-reselect SQLite"
+        )
+        vm.setVisibility(.visible)
+
+        vm.selectThread(threadA.id, markRead: false)
+        vm.selectThread(threadB.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        await vm.waitForSoftReselectDurableRefreshForTesting()
+        XCTAssertEqual(vm.selectedThreadId, threadB.id)
+        XCTAssertTrue(
+            vm.queuedMessages.isEmpty,
+            "a stale A soft-reselect bundle must not land on B"
+        )
+    }
+
     // F5: the single-pass cap+budget that replaced `map(cap) + applyBodyBudget` on the
     // thread-open path must be byte-for-byte equivalent to the prior two-pass version.
     func test_cappedRowsWithinBudget_matchesMapThenBudgetComposition() {
