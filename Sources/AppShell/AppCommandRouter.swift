@@ -7682,12 +7682,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let panes: [[String: JSONValue]] = ws.layout.paneIDs().map { pid in
             let pane = ws.layout.find(paneID: pid)
             let count = pane?.surfaces.count ?? 0
+            let selectedSurfaceID = pane.flatMap { pane in
+                pane.selectedSurfaceID.flatMap { selected in
+                    pane.surfaces.contains(where: { $0.id == selected }) ? selected : nil
+                } ?? pane.surfaces.first?.id
+            }
             return [
                 "kind": .string("pane"),
                 "id": .string(pid.value.uuidString),
                 "surface_count": .number(Double(count)),
                 "surface_ids": .array((pane?.surfaces ?? []).map { .string($0.id.value.uuidString) }),
-                "selected_surface_id": pane?.selectedSurfaceID.map { .string($0.value.uuidString) } ?? .null,
+                "selected_surface_id": selectedSurfaceID.map { .string($0.value.uuidString) } ?? .null,
                 "mobile_group": .number(Double(mobileGroupByPane[pid] ?? 0))
             ]
         }

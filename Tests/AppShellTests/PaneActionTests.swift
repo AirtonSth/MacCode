@@ -737,6 +737,27 @@ final class PaneActionTests: XCTestCase {
                        "pane.list must expose the visible macOS tab so iOS opens the same tab when entering a workspace")
     }
 
+    func test_paneListRepairsDanglingSelectionForIOSWorkspaceOpen() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "ios-dangling-tab", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane) = ws.layout,
+              let firstSurfaceID = pane.surfaces.first?.id else {
+            return XCTFail("expected a workspace with a default surface")
+        }
+        ctx.state.workspaces[ws.id]?.layout = .pane(PaneNode(
+            id: pane.id,
+            surfaces: pane.surfaces,
+            selectedSurfaceID: SurfaceID()
+        ))
+
+        let row = try XCTUnwrap(try router.paneList(workspace: ws.id).first {
+            $0["kind"]?.stringValue == "pane"
+        })
+
+        XCTAssertEqual(row["selected_surface_id"]?.stringValue, firstSurfaceID.value.uuidString,
+                       "pane.list must not expose a persisted selection that is absent from surface_ids")
+    }
+
     func test_performReorderSurface_movesTabBeforeTargetInSamePane() throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "drag", cwd: NSTemporaryDirectory())
