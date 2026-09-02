@@ -482,6 +482,8 @@ public final class AgentThreadRepository {
     }
 
     let db: SQLiteDB
+    /// WAL reader used for UI chrome lists so they do not wait on the writer.
+    private let readDB: SQLiteDB
     // PERF: prepareForkIntent / getForkIntent allocated JSONEncoder (sortedKeys)
     // and JSONDecoder per fork admission/load. Shared pair under a short lock
     // (codecs are not thread-safe); sortedKeys formatting unchanged for wire
@@ -494,7 +496,15 @@ public final class AgentThreadRepository {
         return encoder
     }()
 
-    public init(db: SQLiteDB) { self.db = db }
+    public init(db: SQLiteDB) {
+        self.db = db
+        self.readDB = db
+    }
+
+    public init(db: SQLiteDB, readDB: SQLiteDB) {
+        self.db = db
+        self.readDB = readDB
+    }
 
     /// Live Agent App bindings are process state, not a new persistence model.
     /// Binding updates take this same lock before changing visible selection;
@@ -866,6 +876,7 @@ public final class AgentThreadRepository {
         // it does not override recency. Manual sort_order is retained for
         // reorder APIs but no longer drives the visible rail.
         // JOIN routing so a 20-thread rail is one statement, not 1+N.
+        // PF-30: WAL reader so the rail does not wait on stream writers.
         let columns = """
             t.id, t.project_id, t.workspace_id, t.title, t.provider, t.provider_instance_id, t.model, t.provider_thread_id, t.status, t.created_at, t.updated_at, t.diff_additions, t.diff_deletions, t.has_unread, t.color, t.pinned, t.sort_order, t.permission_mode, t.reasoning_effort, t.execution_mode, t.base_branch, t.worktree_path, t.service_tier, t.model_selection_json, t.interaction_mode, t.run_as_user_json, r.mode, r.configuration_json, r.revision
             """
@@ -874,59 +885,61 @@ public final class AgentThreadRepository {
         let sql = workspaceId == nil
             ? "SELECT \(columns) \(from) \(order);"
             : "SELECT \(columns) \(from) WHERE t.workspace_id = ? \(order);"
-        let st = try db.prepare(sql)
-        if let wid = workspaceId { try st.bind(1, wid.value.uuidString) }
-        var out: [AgentThread] = []
-        while try st.step() {
-            let id = AgentThreadID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID())
-            let pid = (st.columnText(1)).flatMap { UUID(uuidString: $0) }.map { ProjectID($0) }
-            let wid = (st.columnText(2)).flatMap { UUID(uuidString: $0) }.map { WorkspaceID($0) }
-            let provider = AgentProvider(rawValue: st.columnText(4) ?? "codex") ?? .codex
-            let model = st.columnText(6) ?? ""
-            let reasoningEffort = AgentReasoningEffort(rawValue: st.columnText(18) ?? "") ?? .medium
-            let serviceTier = AgentServiceTier(rawValue: st.columnText(22) ?? "") ?? .auto
-            let routingJSON = st.columnText(27)
-            let routing: AgentRoutingConfiguration?
-            if routingJSON != nil {
-                routing = try decodeRoutingConfiguration(
-                    json: routingJSON,
-                    storedMode: st.columnText(26),
-                    storedRevision: Int(st.columnInt64(28))
-                )
-            } else {
-                routing = nil
+        return try readDB.performSync { database in
+            let st = try database.prepare(sql)
+            if let wid = workspaceId { try st.bind(1, wid.value.uuidString) }
+            var out: [AgentThread] = []
+            while try st.step() {
+                let id = AgentThreadID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID())
+                let pid = (st.columnText(1)).flatMap { UUID(uuidString: $0) }.map { ProjectID($0) }
+                let wid = (st.columnText(2)).flatMap { UUID(uuidString: $0) }.map { WorkspaceID($0) }
+                let provider = AgentProvider(rawValue: st.columnText(4) ?? "codex") ?? .codex
+                let model = st.columnText(6) ?? ""
+                let reasoningEffort = AgentReasoningEffort(rawValue: st.columnText(18) ?? "") ?? .medium
+                let serviceTier = AgentServiceTier(rawValue: st.columnText(22) ?? "") ?? .auto
+                let routingJSON = st.columnText(27)
+                let routing: AgentRoutingConfiguration?
+                if routingJSON != nil {
+                    routing = try decodeRoutingConfiguration(
+                        json: routingJSON,
+                        storedMode: st.columnText(26),
+                        storedRevision: Int(st.columnInt64(28))
+                    )
+                } else {
+                    routing = nil
+                }
+                out.append(AgentThread(
+                    id: id,
+                    projectId: pid,
+                    workspaceId: wid,
+                    title: st.columnText(3) ?? "",
+                    provider: provider,
+                    providerInstanceId: st.columnText(5) ?? provider.rawValue,
+                    model: model,
+                    providerThreadId: st.columnText(7),
+                    status: AgentRunStatus(rawValue: st.columnText(8) ?? "") ?? .pending,
+                    createdAt: parseDate(st.columnText(9)),
+                    updatedAt: parseDate(st.columnText(10)),
+                    diffAdditions: Int(st.columnInt64(11)),
+                    diffDeletions: Int(st.columnInt64(12)),
+                    hasUnread: st.columnInt64(13) != 0,
+                    color: st.columnText(14),
+                    pinned: st.columnInt64(15) != 0,
+                    sortOrder: Int(st.columnInt64(16)),
+                    permissionMode: AgentPermissionMode(rawValue: st.columnText(17) ?? "") ?? .supervised,
+                    reasoningEffort: reasoningEffort,
+                    executionMode: AgentExecutionMode(rawValue: st.columnText(19) ?? "") ?? .local,
+                    baseBranch: st.columnText(20),
+                    worktreePath: st.columnText(21),
+                    serviceTier: serviceTier,
+                    modelSelection: decodeModelSelection(st.columnText(23), provider: provider, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
+                    interactionMode: AgentInteractionMode(rawValue: st.columnText(24) ?? "") ?? .default,
+                    runAsUser: decodeRunAsUser(st.columnText(25)),
+                    routingConfiguration: routing
+                ))
             }
-            out.append(AgentThread(
-                id: id,
-                projectId: pid,
-                workspaceId: wid,
-                title: st.columnText(3) ?? "",
-                provider: provider,
-                providerInstanceId: st.columnText(5) ?? provider.rawValue,
-                model: model,
-                providerThreadId: st.columnText(7),
-                status: AgentRunStatus(rawValue: st.columnText(8) ?? "") ?? .pending,
-                createdAt: parseDate(st.columnText(9)),
-                updatedAt: parseDate(st.columnText(10)),
-                diffAdditions: Int(st.columnInt64(11)),
-                diffDeletions: Int(st.columnInt64(12)),
-                hasUnread: st.columnInt64(13) != 0,
-                color: st.columnText(14),
-                pinned: st.columnInt64(15) != 0,
-                sortOrder: Int(st.columnInt64(16)),
-                permissionMode: AgentPermissionMode(rawValue: st.columnText(17) ?? "") ?? .supervised,
-                reasoningEffort: reasoningEffort,
-                executionMode: AgentExecutionMode(rawValue: st.columnText(19) ?? "") ?? .local,
-                baseBranch: st.columnText(20),
-                worktreePath: st.columnText(21),
-                serviceTier: serviceTier,
-                modelSelection: decodeModelSelection(st.columnText(23), provider: provider, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
-                interactionMode: AgentInteractionMode(rawValue: st.columnText(24) ?? "") ?? .default,
-                runAsUser: decodeRunAsUser(st.columnText(25)),
-                routingConfiguration: routing
-            ))
+            return out
         }
-        return out
     }
 
     /// IDs of threads whose persisted run state is active. The provider-session
@@ -1338,34 +1351,36 @@ public final class AgentThreadRepository {
         listChromeCallCountForTesting += 1
         guard !ids.isEmpty else { return [:] }
         let unique = Array(Set(ids))
-        var out: [AgentThreadID: ListChrome] = [:]
-        out.reserveCapacity(unique.count)
-        for start in stride(from: 0, to: unique.count, by: Self.chromeLookupBatchSize) {
-            let batch = unique[start..<min(start + Self.chromeLookupBatchSize, unique.count)]
-            let marks = Array(repeating: "?", count: batch.count).joined(separator: ",")
-            let st = try db.prepare(
-                "SELECT id, workspace_id, title, provider, model FROM agent_threads WHERE id IN (\(marks));"
-            )
-            defer { st.reset() }
-            for (index, id) in batch.enumerated() {
-                try st.bind(Int32(index + 1), id.value.uuidString)
-            }
-            while try st.step() {
-                let rawID = st.columnText(0) ?? ""
-                guard let uuid = UUID(uuidString: rawID) else { continue }
-                let id = AgentThreadID(uuid)
-                let workspaceId = (st.columnText(1)).flatMap { UUID(uuidString: $0) }.map { WorkspaceID($0) }
-                let provider = AgentProvider(rawValue: st.columnText(3) ?? "codex") ?? .codex
-                out[id] = ListChrome(
-                    id: id,
-                    workspaceId: workspaceId,
-                    title: st.columnText(2) ?? "",
-                    provider: provider,
-                    model: st.columnText(4) ?? ""
+        return try readDB.performSync { database in
+            var out: [AgentThreadID: ListChrome] = [:]
+            out.reserveCapacity(unique.count)
+            for start in stride(from: 0, to: unique.count, by: Self.chromeLookupBatchSize) {
+                let batch = unique[start..<min(start + Self.chromeLookupBatchSize, unique.count)]
+                let marks = Array(repeating: "?", count: batch.count).joined(separator: ",")
+                let st = try database.prepare(
+                    "SELECT id, workspace_id, title, provider, model FROM agent_threads WHERE id IN (\(marks));"
                 )
+                defer { st.reset() }
+                for (index, id) in batch.enumerated() {
+                    try st.bind(Int32(index + 1), id.value.uuidString)
+                }
+                while try st.step() {
+                    let rawID = st.columnText(0) ?? ""
+                    guard let uuid = UUID(uuidString: rawID) else { continue }
+                    let id = AgentThreadID(uuid)
+                    let workspaceId = (st.columnText(1)).flatMap { UUID(uuidString: $0) }.map { WorkspaceID($0) }
+                    let provider = AgentProvider(rawValue: st.columnText(3) ?? "codex") ?? .codex
+                    out[id] = ListChrome(
+                        id: id,
+                        workspaceId: workspaceId,
+                        title: st.columnText(2) ?? "",
+                        provider: provider,
+                        model: st.columnText(4) ?? ""
+                    )
+                }
             }
+            return out
         }
-        return out
     }
 
     public func get(id: AgentThreadID) throws -> AgentThread? {
@@ -1511,10 +1526,12 @@ public final class AgentThreadRepository {
     }
 
     public func count(workspaceId: WorkspaceID) throws -> Int {
-        let st = try db.prepare("SELECT COUNT(*) FROM agent_threads WHERE workspace_id = ?;")
-        try st.bind(1, workspaceId.value.uuidString)
-        guard try st.step() else { return 0 }
-        return Int(st.columnInt64(0))
+        try readDB.performSync { database in
+            let st = try database.prepare("SELECT COUNT(*) FROM agent_threads WHERE workspace_id = ?;")
+            try st.bind(1, workspaceId.value.uuidString)
+            guard try st.step() else { return 0 }
+            return Int(st.columnInt64(0))
+        }
     }
 
     /// Deletes oldest eligible threads until the workspace is at or below

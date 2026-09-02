@@ -55,7 +55,7 @@ public enum SQLiteError: Error, CustomStringConvertible {
 public final class SQLiteDB {
     fileprivate var handle: OpaquePointer?
     public let path: String
-    private let queue = DispatchQueue(label: "RemoteCode.SQLiteDB")
+    private let queue: DispatchQueue
     // Repository methods historically prepare and step statements off `queue`.
     // This recursive gate therefore spans every transaction and every statement
     // step, preventing a bare repository writer from entering a maintenance
@@ -312,6 +312,9 @@ public final class SQLiteDB {
 
     public init(path: String, readonly: Bool = false) throws {
         self.path = path
+        self.queue = DispatchQueue(
+            label: readonly ? "RemoteCode.SQLiteDB.read" : "RemoteCode.SQLiteDB"
+        )
         let dir = (path as NSString).deletingLastPathComponent
         if !readonly, !dir.isEmpty && path != ":memory:" {
             try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)

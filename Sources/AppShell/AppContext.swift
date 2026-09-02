@@ -311,6 +311,8 @@ public final class AppContext {
 
     public let channel: ReleaseChannel
     public let db: SQLiteDB
+    /// Readonly WAL connection for UI chrome reads (PF-30).
+    public let readDB: SQLiteDB
     public let bootstrapReport: BootstrapReport
     public let appSupportDirectory: URL
     public let projectRepo: ProjectRepository
@@ -802,8 +804,13 @@ public final class AppContext {
         self.bootstrapReport = rep
         self.appSupportDirectory = AppPaths.appSupportDirectory(for: channel, override: appSupportOverride)
         self.db = db
+        if db.path == ":memory:" {
+            self.readDB = db
+        } else {
+            self.readDB = try SQLiteDB(path: db.path, readonly: true)
+        }
         self.projectRepo = ProjectRepository(db: db)
-        self.threadRepo = AgentThreadRepository(db: db)
+        self.threadRepo = AgentThreadRepository(db: db, readDB: self.readDB)
         self.messageRepo = AgentMessageRepository(db: db)
         self.queuedMessageRepo = AgentQueuedMessageRepository(db: db)
         self.runRepo = AgentRunRepository(db: db)
