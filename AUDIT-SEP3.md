@@ -149,6 +149,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 84 (2026-09-03): `Sources/AppShell/` Pet popover grouping — reviewed (BotsWindow live/skill/routine/approval counts are single-filter counts, not multi-pass folds — no fix). FIXED: `PetPopoverGrouping.group` keyed headers via `order.filter` + `order.contains` + `compactMap` (3 key-list scans per popover render) — now folds named keys + Other flag in one loop, sorts in place, appends Other last; group order/membership identical (proof: 11/11 PetAttentionPresentationTests pass, incl. alphabetical-with-Other-last)
 
+- [x] Slice 85 (2026-09-03): `Sources/Surfaces/` StagingHelper path args — reviewed (`AgentAppSurface.refreshTokenSaverOptimizationStateFromTimeline` + `AgentRunCoordinator.captureCanonicalContextSnapshot` are Token Saver contract code, left untouched; AppCommandRouter env-keys filter+sort is a small per-instance snapshot, not a fold target). FIXED: `StagingHelper.pathArgs` copied the full changed-file list into a `Set` then filtered `selected` through it (O(all) set build + filter intermediate per validation) — now walks `all` once collecting selected members with reserved capacity, sorts in place, short-circuits empty inputs to nil; arg list identical (proof: 8/8 StagingHelperTests pass)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
