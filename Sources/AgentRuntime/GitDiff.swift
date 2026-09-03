@@ -387,7 +387,7 @@ public enum GitDiff {
             .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         let current = (head.isEmpty || head == "HEAD") ? nil : head
         let listed = run(["for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd: cwd).stdout
-        let locals = listed.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        let locals = nonEmptyLines(listed)
         return GitBranches(current: current, locals: locals)
     }
 
@@ -981,7 +981,16 @@ public enum GitDiff {
 
     private static func remoteNames(in cwd: String) -> [String] {
         let listed = run(["remote"], cwd: cwd).stdout
-        return listed.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        return nonEmptyLines(listed)
+    }
+
+    private static func nonEmptyLines(_ output: String) -> [String] {
+        var lines: [String] = []
+        for part in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            guard !part.isEmpty else { continue }
+            lines.append(String(part))
+        }
+        return lines
     }
 
     public static func isGit(_ cwd: String) -> Bool {
