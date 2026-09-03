@@ -266,7 +266,7 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         let parts = (String(data: data, encoding: .utf8) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .split(separator: " ")
-        let running = parts.first.map(String.init)?.lowercased() == "true"
+        let running = parts.first.map { $0.caseInsensitiveCompare("true") == .orderedSame } ?? false
         let image = parts.dropFirst().first.map(String.init) ?? ""
         let port = Int(parts.dropFirst(2).first.map(String.init) ?? "") ?? 0
         let networks = parts.dropFirst(3).first.map(String.init)?
