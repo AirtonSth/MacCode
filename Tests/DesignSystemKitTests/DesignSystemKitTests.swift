@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 import CoreGraphics
 @testable import DesignSystemKit
 
@@ -367,6 +368,35 @@ final class DSPanelTests: XCTestCase {
             slice.contains(".frame(maxWidth: .infinity, alignment: .leading)"),
             "dsPanel must expand to the proposed width before painting the surface"
         )
+    }
+}
+
+// MARK: - DS.NS.terminalFont memoization
+
+/// WHY: the terminal snapshot paints thousands of cells per frame; a per-cell
+/// NSFont(name:) lookup (font-manager round-trip) on the hot path would cost
+/// main-thread time on every repaint. Fonts are resolved once and memoized.
+final class DSTerminalFontTests: XCTestCase {
+
+    func test_regular_returnsSameInstance() {
+        let a = DS.NS.terminalFont()
+        let b = DS.NS.terminalFont()
+        XCTAssertTrue(a === b,
+                      "regular terminal font must be memoized — per-call NSFont(name:) lookups cost main-thread time per snapshot")
+    }
+
+    func test_bold_returnsSameInstance() {
+        let a = DS.NS.terminalFont(weight: .bold)
+        let b = DS.NS.terminalFont(weight: .bold)
+        XCTAssertTrue(a === b,
+                      "bold terminal font must be memoized — buildSnapshot asks for it once per bold cell")
+    }
+
+    func test_bold_resolvesBoldFace() {
+        let bold = DS.NS.terminalFont(weight: .bold)
+        let traits = NSFontManager.shared.traits(of: bold)
+        XCTAssertTrue(traits.contains(.boldFontMask) || bold.fontName.localizedCaseInsensitiveContains("bold"),
+                      "bold terminal font must resolve to a bold face so bold cells still paint distinctly")
     }
 }
 

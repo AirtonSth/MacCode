@@ -67,10 +67,32 @@ public enum DS {
         public static let terminalBG    = NSColor(hex: 0x20242E)
         public static let terminalFG    = NSColor(hex: 0xF2F2F2)
 
-        public static func terminalFont(weight: NSFont.Weight = .regular) -> NSFont {
-            if weight == .bold, let font = NSFont(name: "Menlo-Bold", size: 12) {
+        // Memoized: NSFont(name:) round-trips the font manager on every call.
+        private static let terminalRegularFont: NSFont = {
+            if let font = NSFont(name: "Menlo-Regular", size: 12) {
                 return font
             }
+            if let font = NSFont(name: "Menlo", size: 12) {
+                return font
+            }
+            return NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        }()
+        private static let terminalBoldFont: NSFont = {
+            if let font = NSFont(name: "Menlo-Bold", size: 12) {
+                return font
+            }
+            if let font = NSFont(name: "Menlo-Regular", size: 12) {
+                return font
+            }
+            if let font = NSFont(name: "Menlo", size: 12) {
+                return font
+            }
+            return NSFont.monospacedSystemFont(ofSize: 12, weight: .bold)
+        }()
+
+        public static func terminalFont(weight: NSFont.Weight = .regular) -> NSFont {
+            if weight == .bold { return terminalBoldFont }
+            if weight == .regular { return terminalRegularFont }
             if let font = NSFont(name: "Menlo-Regular", size: 12) {
                 return font
             }

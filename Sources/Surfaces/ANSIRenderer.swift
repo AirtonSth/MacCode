@@ -542,6 +542,7 @@ public final class ANSIRenderer {
     private func buildSnapshot() -> NSAttributedString {
         let out = NSMutableAttributedString()
         let font = DS.NS.terminalFont()
+        let boldFont = DS.NS.terminalFont(weight: .bold)
         let curRow = cursorRow
         let curCol = min(cursorCol, cols - 1)
         let allRows = usesAlternateScreen ? grid : scrollback + grid
@@ -571,7 +572,7 @@ public final class ANSIRenderer {
                 var attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: fg, .backgroundColor: bg]
                 if cell.underline { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
                 if cell.bold {
-                    attrs[.font] = DS.NS.terminalFont(weight: .bold)
+                    attrs[.font] = boldFont
                 }
                 out.append(NSAttributedString(string: String(cell.ch), attributes: attrs))
             }
