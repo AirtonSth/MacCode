@@ -965,8 +965,8 @@ public enum EventStreamFilter: Sendable, Equatable {
         filterHeader: String?,
         interestThreadHeader: String?
     ) -> EventStreamFilter {
-        let header = filterHeader?.lowercased() ?? ""
-        if header.contains("cellular-safe") {
+        let header = filterHeader ?? ""
+        if header.range(of: "cellular-safe", options: .caseInsensitive) != nil {
             // PERF: single-pass id set avoids the map + filter intermediates
             // on the connect path; retained ids identical.
             var ids = Set<String>()
@@ -976,7 +976,7 @@ public enum EventStreamFilter: Sendable, Equatable {
             }
             return .cellularSafe(interestThreadIds: ids)
         }
-        if header.contains("diagnostics") {
+        if header.range(of: "diagnostics", options: .caseInsensitive) != nil {
             return .diagnostics
         }
         return .full
