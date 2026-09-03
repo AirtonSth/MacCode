@@ -125,6 +125,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 72 (2026-09-03): `Sources/AppShell/` SSH pane derived stats — reviewed (TerminalSurface remainder left for its own slice). FIXED: `SSHPaneDerived.init(entries:)` ran filter + filter + compactMap/reduce (three traversals + two intermediates) per local/remote listing refresh — now one classifying loop with reserved directory buffer; directory list, file count, byte total identical (proof: 176/176 SSH-filtered tests)
 
+- [x] Slice 73 (2026-09-03): `Sources/Surfaces/` TerminalSurface read-text decision — reviewed. FIXED: `visibleLineCount` ran split + map(trim) + filter (two intermediate arrays), invoked twice per `shouldPreferRendererSnapshotForReadText` call — now counts non-blank lines in one loop over the split; visible counts and snapshot preference identical (proof: 16/16 TerminalRendererDivergence + TerminalReadTextSnapshot tests)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
