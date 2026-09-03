@@ -1416,21 +1416,116 @@ final class GrokACPProtocolTests: XCTestCase {
             encoding: .utf8
         )
         XCTAssertTrue(
-            adapter.contains("needsEffortBind") || adapter.contains("reasoningEffort: targetEffort"),
+            adapter.contains("modelEffortBind") || adapter.contains("setConfigOptionReasoningEffort"),
             "Adapter must re-bind effort when it changes even if model id is unchanged"
         )
     }
 
     /// WHY: ACP and CLI must send only values advertised by the effective
     /// account-default model (Grok 4.6), never stale shared-picker aliases.
+    /// Grok 4.6 advertises `minimal` (grok-build SELECTABLE_REASONING_EFFORTS).
     func test_wireReasoningEffortNormalizesForDefaultGrok46() {
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.ultracode), "xhigh")
-        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.minimal), "low")
+        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.minimal), "minimal")
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.low), "low")
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.medium), "medium")
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.high), "high")
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.xhigh), "xhigh")
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.max), "xhigh")
+        // grok-4.5 still remaps minimal → low (catalog omits minimal).
+        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.minimal, modelId: "grok-4.5"), "low")
+    }
+
+    /// WHY: effort-only rebinds must use session/set_config_option (not set_model)
+    /// so grok-build skips model-switch allowlist / prompt-rewrite (GROK-ACP-012).
+    func test_setConfigOptionParamsEncodeReasoningEffortValueShape() throws {
+        let params = GrokACPClient.setConfigOptionParams(
+            sessionId: "sid",
+            configId: "reasoning_effort",
+            valueId: "high"
+        )
+        XCTAssertEqual(params["sessionId"] as? String, "sid")
+        XCTAssertEqual(params["configId"] as? String, "reasoning_effort")
+        XCTAssertEqual((params["value"] as? [String: Any])?["value"] as? String, "high")
+    }
+
+    /// WHY: source-string checks would still pass if effort-only silently fell
+    /// back to set_model while leaving the helper present. This proves the
+    /// emitted method choice for effort-only vs model-change (GROK-ACP-012).
+    func test_modelEffortBindRoutesEffortOnlyToSetConfigOptionAndModelChangeToSetModel() {
+        // Same model, effort change → set_config_option with wire effort id.
+        let effortOnly = GrokACPClient.modelEffortBind(
+            requestModel: "grok-4.6",
+            sessionModel: "grok-4.6",
+            requestEffort: .high,
+            sessionEffort: .low
+        )
+        guard case let .setConfigOptionReasoningEffort(valueId, effort) = effortOnly else {
+            return XCTFail("effort-only must use set_config_option, got \(effortOnly)")
+        }
+        XCTAssertEqual(valueId, "high")
+        XCTAssertEqual(effort, .high)
+        let effortParams = GrokACPClient.setConfigOptionParams(
+            sessionId: "sid",
+            configId: "reasoning_effort",
+            valueId: valueId
+        )
+        XCTAssertEqual(effortParams["configId"] as? String, "reasoning_effort")
+        XCTAssertEqual((effortParams["value"] as? [String: Any])?["value"] as? String, "high")
+
+        // Model id change → set_model (optionally with effort meta).
+        let modelChange = GrokACPClient.modelEffortBind(
+            requestModel: "grok-4.5",
+            sessionModel: "grok-4.6",
+            requestEffort: .medium,
+            sessionEffort: .high
+        )
+        guard case let .setModel(modelId, reasoningEffort) = modelChange else {
+            return XCTFail("model change must use set_model, got \(modelChange)")
+        }
+        XCTAssertEqual(modelId, "grok-4.5")
+        XCTAssertEqual(reasoningEffort, .medium)
+
+        // No-op when model and effort already match.
+        let noop = GrokACPClient.modelEffortBind(
+            requestModel: "grok-4.6",
+            sessionModel: "grok-4.6",
+            requestEffort: .high,
+            sessionEffort: .high
+        )
+        XCTAssertEqual(noop, .none)
+    }
+
+    /// WHY: session/new|load advertise typed configOptions; ignoring them leaves
+    /// the host blind to agent-selectable efforts (GROK-ACP-013).
+    func test_openResultParsesConfigOptions() throws {
+        let result: [String: Any] = [
+            "sessionId": "sid-1",
+            "models": [
+                "currentModelId": "grok-4.6",
+                "availableModels": [
+                    ["modelId": "grok-4.6", "name": "Grok 4.6", "_meta": ["supportsReasoningEffort": true]],
+                ],
+            ] as [String: Any],
+            "modes": [
+                "currentModeId": "default",
+                "availableModes": [["id": "default", "name": "Default"]],
+            ] as [String: Any],
+            "configOptions": [
+                [
+                    "id": "reasoning_effort",
+                    "category": "thought_level",
+                    "options": [
+                        ["value": "minimal", "name": "Minimal"],
+                        ["value": "high", "name": "High"],
+                    ],
+                ],
+            ],
+        ]
+        let open = try GrokACPClient.openResult(result, fallbackSessionId: nil)
+        XCTAssertEqual(open.sessionId, "sid-1")
+        XCTAssertFalse(open.configOptions.isEmpty)
+        XCTAssertEqual(open.advertisedReasoningEffortIds, ["minimal", "high"])
     }
 
     /// WHY: warm reattach + prompt still paid full gateway replay unless

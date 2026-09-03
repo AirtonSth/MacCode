@@ -163,7 +163,7 @@ final class GrokRunnerArgsTests: XCTestCase {
             let a = GrokRunner.buildArgs(req(model: model, effort: effort))
             return a[a.index(after: a.firstIndex(of: "--reasoning-effort")!)]
         }
-        XCTAssertEqual(wire(.minimal), "low")
+        XCTAssertEqual(wire(.minimal), "minimal")
         XCTAssertEqual(wire(.low), "low")
         XCTAssertEqual(wire(.medium), "medium")
         XCTAssertEqual(wire(.high), "high")
@@ -171,6 +171,8 @@ final class GrokRunnerArgsTests: XCTestCase {
         XCTAssertEqual(wire(.max), "xhigh",
                        "Grok 4.6 does not advertise max; use its deepest supported level")
         XCTAssertEqual(wire(.ultracode), "xhigh")
+        XCTAssertEqual(wire(.minimal, model: "grok-4.5"), "low",
+                       "Grok 4.5 omits minimal; remap to low")
         XCTAssertEqual(wire(.xhigh, model: "grok-4.5"), "high")
         XCTAssertEqual(wire(.max, model: "grok-4.5"), "high",
                        "Grok 4.5 supports only low/medium/high")
