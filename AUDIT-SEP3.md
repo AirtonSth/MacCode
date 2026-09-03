@@ -213,6 +213,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 116 (2026-09-03): `Sources/SocketServer/` bearer-token split (auth header parse on the HTTP request path) — reviewed (header-line `split(separator: "\r\n")` + request-line `split(separator: " ")` stay untouched: bounded small parses with count/index guards, not a take-last fold). FIXED: `bearerToken` split the whole `Authorization` value on every space just to take `.last` (full scan + N substrings per request) — now `maxSplits: 1` splits at most once and takes the tail; tokens identical (`"Bearer <tok>"` → `<tok>`, single-token values pass through as before) (proof: 7/7 HybridHTTPWebSocketContractTests pass in production-base sandbox with patched file, incl. missing/invalid-bearer rejection)
 
+- [x] Slice 117 (2026-09-03): `Sources/DistillCore/` librarian span search (span-text only — verdicts, verdict order, and `[[rc:handle]]` recovery markers untouched; Token Saver ledger/savings unaffected) — reviewed (coordinator `observerRefs.compactMap.value.first` and bootstrap `helperExecutableNames.compactMap.first` are already-lazy/single-element lookups; FilesSurface drag-payload `compactMap.first` are small per-drop decodes). FIXED: `tokenSpan` + `parseAnswerSpan` fallback ran `parts.map(String.init).first(where:)` (materialised every token/line as String before the linear search, on the librarian span-resolution path) — now `.lazy.map` so String init + `source.contains` short-circuit at the first match; spans identical (proof: 28/28 LibrarianCatalogTests pass in production-base sandbox with patched file, 1 skipped)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
