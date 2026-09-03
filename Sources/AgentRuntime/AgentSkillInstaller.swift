@@ -2730,7 +2730,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             foundPaths.insert(relativePath)
         }
 
-        if let missing = allowed.subtracting(foundPaths).sorted().first {
+        // First missing in sorted order for a deterministic error — min over
+        // the difference, no sorted array over every missing file.
+        if let missing = allowed.subtracting(foundPaths).min() {
             throw RemoteCodeOrchestrateInstallError.missingRequiredFile(missing)
         }
         let actualDigest = Self.remoteCodeOrchestrateTreeDigest(found)
