@@ -15,7 +15,8 @@ public struct MaskingABHarness: Sendable {
         public init(solved: [Bool], turnCounts: [Int], retrieves: [Int]) {
             self.solved = solved; self.turnCounts = turnCounts; self.retrieves = retrieves
         }
-        var solveRate: Double { solved.isEmpty ? 0 : Double(solved.filter { $0 }.count) / Double(solved.count) }
+        // Single pass: count solved without a filter intermediate.
+        var solveRate: Double { solved.isEmpty ? 0 : Double(solved.reduce(0) { $0 + ($1 ? 1 : 0) }) / Double(solved.count) }
         var avgTurns: Double { turnCounts.isEmpty ? 0 : Double(turnCounts.reduce(0,+)) / Double(turnCounts.count) }
         var avgRetrieves: Double { retrieves.isEmpty ? 0 : Double(retrieves.reduce(0,+)) / Double(retrieves.count) }
     }
