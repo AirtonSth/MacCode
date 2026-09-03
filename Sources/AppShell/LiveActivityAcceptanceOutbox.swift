@@ -499,10 +499,12 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
 
     private static func newestRecord(
         in records: [LiveActivityAcceptanceRecord],
-        event: PrivateLiveActivityEvent
+        event: PrivateLiveActivityEvent,
+        sameSessionAs sessionAnchor: LiveActivitySyncDelivery? = nil
     ) -> LiveActivityAcceptanceRecord? {
         records.reduce(nil) { current, candidate in
             guard candidate.delivery.event == event else { return current }
+            if let sessionAnchor, !isSameSession(candidate.delivery, sessionAnchor) { return current }
             guard let current else { return candidate }
             if candidate.delivery.projection.revision > current.delivery.projection.revision {
                 return candidate
@@ -532,10 +534,9 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
             guard let current = newestLifecycleRecord(in: lane) else { continue }
             result.insert(current.recordID)
             if let start = newestRecord(
-                in: lane.filter {
-                    isSameSession($0.delivery, current.delivery)
-                },
-                event: .start
+                in: lane,
+                event: .start,
+                sameSessionAs: current.delivery
             ) {
                 // An update is not deliverable until its generation start has
                 // crossed the backend lifecycle barrier.
