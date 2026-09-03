@@ -10339,26 +10339,35 @@ public enum AgentComposerSuggestions {
             ? String(query.dropFirst()).lowercased()
             : query
         guard !normalizedQuery.isEmpty else { return unique }
-        return unique
-            .filter {
-                let value = $0.lowercased()
-                let bare = value.hasPrefix("/") || value.hasPrefix("$")
-                    ? String(value.dropFirst())
-                    : value
-                return bare.contains(normalizedQuery) || value.contains(normalizedQuery)
-            }
-            .sorted { lhs, rhs in
-                let l = lhs.lowercased()
-                let r = rhs.lowercased()
-                let lBare = l.hasPrefix("/") || l.hasPrefix("$") ? String(l.dropFirst()) : l
-                let rBare = r.hasPrefix("/") || r.hasPrefix("$") ? String(r.dropFirst()) : r
-                let lp = lBare.hasPrefix(normalizedQuery) || l.hasPrefix(normalizedQuery)
-                    || l.hasPrefix("/\(normalizedQuery)") || l.hasPrefix("$\(normalizedQuery)")
-                let rp = rBare.hasPrefix(normalizedQuery) || r.hasPrefix(normalizedQuery)
-                    || r.hasPrefix("/\(normalizedQuery)") || r.hasPrefix("$\(normalizedQuery)")
-                if lp != rp { return lp }
-                return lhs < rhs
-            }
+        // PERF: fold case once per row instead of per filter check plus twice
+        // per sort comparison on every composer keystroke; order identical.
+        struct RankedRow {
+            let raw: String
+            let folded: String
+            let bare: String
+            let prefixHit: Bool
+        }
+        var rows: [RankedRow] = []
+        rows.reserveCapacity(unique.count)
+        for value in unique {
+            let folded = value.lowercased()
+            let bare = folded.hasPrefix("/") || folded.hasPrefix("$")
+                ? String(folded.dropFirst())
+                : folded
+            guard bare.contains(normalizedQuery) || folded.contains(normalizedQuery) else { continue }
+            rows.append(RankedRow(
+                raw: value,
+                folded: folded,
+                bare: bare,
+                prefixHit: bare.hasPrefix(normalizedQuery) || folded.hasPrefix(normalizedQuery)
+                    || folded.hasPrefix("/\(normalizedQuery)") || folded.hasPrefix("$\(normalizedQuery)")
+            ))
+        }
+        rows.sort {
+            if $0.prefixHit != $1.prefixHit { return $0.prefixHit }
+            return $0.raw < $1.raw
+        }
+        return rows.map(\.raw)
     }
 }
 
