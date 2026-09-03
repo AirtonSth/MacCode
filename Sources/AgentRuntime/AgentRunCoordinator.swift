@@ -796,14 +796,13 @@ public enum TokenSaverExecutionReceiptSeam {
     }
 
     public static func containsDisallowedContent(_ text: String) -> Bool {
-        let lower = text.lowercased()
+        guard text.utf8.count <= maximumEncodedBytes else { return true }
         let markers = [
             "prompt", "transcript", "raw_output", "tool_output", "authorization",
             "password", "secret", "api_key", "private_key", "bootstrap_token",
             "sidecar_token", "sk-ant-", "sk-or-"
         ]
-        return text.utf8.count > maximumEncodedBytes
-            || markers.contains { lower.contains($0) }
+        return markers.contains { text.range(of: $0, options: .caseInsensitive) != nil }
     }
 
     fileprivate static func isValid(_ receipt: TokenSaverExecutionReceipt) -> Bool {
