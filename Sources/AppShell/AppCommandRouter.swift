@@ -205,7 +205,11 @@ public final class AgentAppReadGateway: @unchecked Sendable {
                     request.state = callback.state
                     request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
                     if callback.state == .stale, let reason = callback.staleReason {
-                        request.detail = [request.detail, reason].compactMap { $0 }.joined(separator: "\n")
+                        if let detail = request.detail {
+                            request.detail = detail + "\n" + reason
+                        } else {
+                            request.detail = reason
+                        }
                     }
                     requests.append(request)
                 case .userInput:
