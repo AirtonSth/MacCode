@@ -8764,6 +8764,50 @@ final class AgentAppViewModelTests: XCTestCase {
         )
     }
 
+    /// WHY: the 21/20 banner must self-heal. Pinned terminal history is not a
+    /// preferred victim, but overflow still drops the oldest so reload cannot
+    /// strand the rail with "Could not reload threads".
+    func test_reloadThreads_overCapFallsBackToOldestPinnedHistoryWithoutError() throws {
+        let (vm, threadRepo) = try makeVM()
+        var oldestPinned: AgentThread?
+        for index in 0..<AgentThreadRepository.maxThreadsPerWorkspace {
+            var thread = AgentThread(
+                workspaceId: vm.workspaceID,
+                title: "pinned \(index)",
+                provider: .codex,
+                model: "m"
+            )
+            thread.status = .completed
+            thread.pinned = true
+            thread.updatedAt = Date(timeIntervalSince1970: TimeInterval(index + 1))
+            try threadRepo.upsert(thread)
+            if index == 0 { oldestPinned = thread }
+        }
+        var running = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "running",
+            provider: .codex,
+            model: "m"
+        )
+        running.status = .running
+        running.updatedAt = Date(timeIntervalSince1970: 100)
+        try threadRepo.upsert(running)
+        XCTAssertEqual(try threadRepo.count(workspaceId: vm.workspaceID),
+                       AgentThreadRepository.maxThreadsPerWorkspace + 1)
+
+        vm.reloadThreads()
+
+        XCTAssertEqual(try threadRepo.count(workspaceId: vm.workspaceID),
+                       AgentThreadRepository.maxThreadsPerWorkspace)
+        XCTAssertNil(try threadRepo.get(id: try XCTUnwrap(oldestPinned).id),
+                     "overflow must drop the oldest pinned history row")
+        XCTAssertNotNil(try threadRepo.get(id: running.id),
+                        "the live run must survive overflow reclaim")
+        XCTAssertFalse(vm.statusMessage.contains("Could not reload threads"),
+                       "reload must self-heal instead of painting the capacity banner; got: \(vm.statusMessage)")
+        XCTAssertEqual(vm.threads.count, AgentThreadRepository.maxThreadsPerWorkspace)
+    }
+
     /// Deleted-many is the existing EventBus contract for multiple victims. It
     /// must apply every authoritative ID before any subscriber reload can fail.
     func test_deletedManyLifecycleEvent_evictsEveryVictim() throws {

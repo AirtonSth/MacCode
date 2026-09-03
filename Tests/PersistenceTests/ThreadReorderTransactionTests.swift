@@ -200,7 +200,7 @@ final class ThreadReorderTransactionTests: XCTestCase {
         XCTAssertNotNil(try repo.get(id: newerHistory.id))
         XCTAssertNotNil(try repo.get(id: created.id))
 
-        // Wipe reclaimable terminals; leave only live-bound + active runs.
+        // Wipe preferred terminals; leave only live-bound history + active runs.
         try repo.delete(id: newerHistory.id)
         try repo.delete(id: created.id)
         for index in 0..<2 {
@@ -209,19 +209,15 @@ final class ThreadReorderTransactionTests: XCTestCase {
             running.updatedAt = Date(timeIntervalSince1970: TimeInterval(10 + index))
             try repo.upsert(running)
         }
-        // liveBound + 2 running = 3; blocked create needs a victim but none eligible.
-        let blocked = AgentThread(workspaceId: wid, title: "blocked", provider: .codex, model: "m")
-        XCTAssertThrowsError(try repo.upsertEnforcingWorkspaceThreadLimit(blocked, limit: 3)) { error in
-            guard case let .workspaceLimitExceeded(_, _, _, diagnostics)? =
-                    error as? AgentThreadCapacityError else {
-                return XCTFail("expected capacity error with diagnostics")
-            }
-            XCTAssertGreaterThan(diagnostics.protectedCounts["surface_bound"] ?? 0, 0)
-            XCTAssertTrue(
-                (error as? AgentThreadCapacityError)?.description.contains("No reclaimable terminal thread") == true
-            )
-        }
-        XCTAssertNil(try repo.get(id: blocked.id))
+        // liveBound + 2 running = 3. Overflow must drop the oldest non-running
+        // row (the live-bound completed thread) instead of blocking create.
+        let overflowCreated = AgentThread(workspaceId: wid, title: "overflow created", provider: .codex, model: "m")
+        let overflowPruned = try repo.upsertEnforcingWorkspaceThreadLimit(overflowCreated, limit: 3)
+        XCTAssertEqual(overflowPruned, [liveBound.id],
+                       "oldest non-running row is reclaimed when only bound history remains")
+        XCTAssertNil(try repo.get(id: liveBound.id))
+        XCTAssertNotNil(try repo.get(id: overflowCreated.id))
+        XCTAssertEqual(try repo.count(workspaceId: wid), 3)
 
         repo.setLiveSurfaceBinding(surfaceID: surfaceID, threadID: nil)
         XCTAssertTrue(repo.liveSurfaceBoundThreadIDsForTesting.isEmpty)
@@ -320,10 +316,10 @@ final class ThreadReorderTransactionTests: XCTestCase {
         XCTAssertNotNil(try repo.get(id: created.id))
     }
 
-    /// WHY: when every possible victim owns user data or a worktree, the new row
-    /// must roll back as one transaction. Returning an empty victim list while
-    /// retaining the overflowing row would falsely report a successful cap pass.
-    func test_workspaceThreadLimitFailsAtomicallyWhenOnlyDraftAndWorktreeRowsRemain() throws {
+    /// WHY: when every preferred victim owns a draft or worktree, the cap must
+    /// still self-heal by dropping the oldest non-running row so reload/create
+    /// cannot strand the rail at 21/20.
+    func test_workspaceThreadLimitFallsBackToOldestWhenOnlyDraftAndWorktreeRowsRemain() throws {
         let db = try makeDB()
         let repo = AgentThreadRepository(db: db)
         let drafts = AgentThreadDraftRepository(db: db)
@@ -360,25 +356,21 @@ final class ThreadReorderTransactionTests: XCTestCase {
             text: "",
             attachments: [AgentAttachment(path: "/tmp/attachment.txt", kind: .file)]
         ))
-        let prospective = AgentThread(workspaceId: wid, title: "must roll back", provider: .codex, model: "m")
-        let originalIDs = Set([draft.id, cleanWorktree.id, dirtyWorktree.id])
+        let prospective = AgentThread(workspaceId: wid, title: "overflow created", provider: .codex, model: "m")
 
-        XCTAssertThrowsError(try repo.enforceWorkspaceThreadLimit(workspaceId: wid, limit: 2)) {
-            XCTAssertTrue($0 is AgentThreadCapacityError)
-        }
-        XCTAssertThrowsError(try repo.preflightWorkspaceThreadInsertion(
+        XCTAssertNoThrow(try repo.preflightWorkspaceThreadInsertion(
             workspaceId: wid,
             prospectiveThreadId: prospective.id,
             limit: 3
-        )) { XCTAssertTrue($0 is AgentThreadCapacityError) }
-        XCTAssertThrowsError(try repo.upsertEnforcingWorkspaceThreadLimit(prospective, limit: 3)) {
-            XCTAssertTrue($0 is AgentThreadCapacityError)
-        }
-
-        XCTAssertEqual(Set(try repo.list(workspaceId: wid).map(\.id)), originalIDs,
-                       "a protected-only cap failure must leave every original row untouched")
-        XCTAssertNil(try repo.get(id: prospective.id),
-                     "the rejected producer row must roll back with the failed cap transaction")
+        ))
+        let pruned = try repo.upsertEnforcingWorkspaceThreadLimit(prospective, limit: 3)
+        XCTAssertEqual(pruned, [draft.id],
+                       "oldest draft/worktree row is the overflow victim")
+        XCTAssertNil(try repo.get(id: draft.id))
+        XCTAssertNotNil(try repo.get(id: cleanWorktree.id))
+        XCTAssertNotNil(try repo.get(id: dirtyWorktree.id))
+        XCTAssertNotNil(try repo.get(id: prospective.id))
+        XCTAssertEqual(try repo.count(workspaceId: wid), 3)
     }
 
     /// WHY: selection is advisory. If an idle thread gains a durable draft in
@@ -617,6 +609,96 @@ final class ThreadReorderTransactionTests: XCTestCase {
                       "cap enforcement still reads persisted surface bindings from the snapshot")
         XCTAssertFalse(sawCorrelatedJsonTree,
                        "a per-candidate json_tree walk would hitch create/reload at 20 threads")
+    }
+
+    /// WHY: json_tree of the session snapshot treats every UUID text atom as a
+    /// bound thread. When that over-excludes the whole rail, overflow must still
+    /// drop the oldest non-running row so reload cannot paint a 21/20 hard fail.
+    func test_workspaceThreadLimitFallsBackToOldestWhenSnapshotListsEveryThread() throws {
+        let db = try makeDB()
+        let repo = AgentThreadRepository(db: db)
+        let wid = try makeWorkspace(db: db)
+        var created: [AgentThread] = []
+        for index in 0..<3 {
+            var thread = AgentThread(workspaceId: wid, title: "listed \(index)", provider: .codex, model: "m")
+            thread.status = .completed
+            thread.updatedAt = Date(timeIntervalSince1970: TimeInterval(index + 1))
+            try repo.upsert(thread)
+            created.append(thread)
+        }
+        let listed = created.map { "\"\($0.id.value.uuidString)\"" }.joined(separator: ",")
+        try db.execute("""
+            INSERT INTO session_snapshots(version, payload_json, created_at)
+            VALUES(1, '{"threads":[\(listed)]}', '2026-01-01T00:00:00Z');
+        """)
+
+        let incoming = AgentThread(workspaceId: wid, title: "new thread", provider: .codex, model: "m")
+        let pruned = try repo.upsertEnforcingWorkspaceThreadLimit(incoming, limit: 3)
+        XCTAssertEqual(pruned, [created[0].id],
+                       "overflow must reclaim the oldest row even when the snapshot lists every id")
+        XCTAssertNil(try repo.get(id: created[0].id))
+        XCTAssertNotNil(try repo.get(id: created[1].id))
+        XCTAssertNotNil(try repo.get(id: created[2].id))
+        XCTAssertNotNil(try repo.get(id: incoming.id))
+        XCTAssertEqual(try repo.count(workspaceId: wid), 3)
+    }
+
+    /// WHY: overflow must never kill an in-flight run. A workspace of only
+    /// running rows still fails closed so the live turn is not deleted.
+    func test_workspaceThreadLimitStillFailsWhenEveryRowIsRunning() throws {
+        let db = try makeDB()
+        let repo = AgentThreadRepository(db: db)
+        let wid = try makeWorkspace(db: db)
+        var runningIDs: [AgentThreadID] = []
+        for index in 0..<3 {
+            var thread = AgentThread(workspaceId: wid, title: "running \(index)", provider: .codex, model: "m")
+            thread.status = .running
+            thread.updatedAt = Date(timeIntervalSince1970: TimeInterval(index + 1))
+            try repo.upsert(thread)
+            runningIDs.append(thread.id)
+        }
+        let incoming = AgentThread(workspaceId: wid, title: "blocked", provider: .codex, model: "m")
+        XCTAssertThrowsError(try repo.upsertEnforcingWorkspaceThreadLimit(incoming, limit: 3)) { error in
+            XCTAssertTrue(error is AgentThreadCapacityError)
+            XCTAssertTrue(
+                (error as? AgentThreadCapacityError)?.description.contains("No reclaimable terminal thread") == true
+            )
+        }
+        XCTAssertNil(try repo.get(id: incoming.id))
+        XCTAssertEqual(Set(try repo.list(workspaceId: wid).map(\.id)), Set(runningIDs))
+    }
+
+    /// WHY: AppContext uses a WAL reader for `count`. Cap enforcement must
+    /// count on the writer so an in-transaction upsert of the 21st row is
+    /// visible; otherwise the cap thinks occupancy is still 20, skips reclaim,
+    /// and the 21/20 banner returns after commit.
+    func test_workspaceThreadLimitCountsWriterOccupancyOnFileBackedWAL() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-thread-cap-wal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("threads.sqlite").path
+        let writer = try SQLiteDB(path: path)
+        try Schema.migrate(writer)
+        let reader = try SQLiteDB(path: path, readonly: true)
+        let repo = AgentThreadRepository(db: writer, readDB: reader)
+        let wid = try makeWorkspace(db: writer)
+
+        var oldest: AgentThread?
+        for index in 0..<AgentThreadRepository.maxThreadsPerWorkspace {
+            var thread = AgentThread(workspaceId: wid, title: "wal \(index)", provider: .codex, model: "m")
+            thread.status = .completed
+            thread.updatedAt = Date(timeIntervalSince1970: TimeInterval(index + 1))
+            try repo.upsert(thread)
+            if index == 0 { oldest = thread }
+        }
+        let incoming = AgentThread(workspaceId: wid, title: "wal new", provider: .codex, model: "m")
+        let pruned = try repo.upsertEnforcingWorkspaceThreadLimit(incoming)
+        XCTAssertEqual(pruned, [try XCTUnwrap(oldest).id],
+                       "the in-transaction 21st row must be visible so the oldest history is reclaimed")
+        XCTAssertEqual(try repo.count(workspaceId: wid), AgentThreadRepository.maxThreadsPerWorkspace)
+        XCTAssertNil(try repo.get(id: try XCTUnwrap(oldest).id))
+        XCTAssertNotNil(try repo.get(id: incoming.id))
     }
 
     // MARK: - promoteToFront: final positions after transaction wrap

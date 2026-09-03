@@ -339,7 +339,7 @@ public enum AgentThreadCapacityError: Error, Equatable, CustomStringConvertible,
                 .map { "\($0.key)=\($0.value)" }
                 .joined(separator: ", ")
             let detail = categories.isEmpty ? "" : " Protected: \(categories)."
-            return "Agent thread capacity reached: \(actualCount) threads for a hard limit of \(limit). No reclaimable terminal thread is safe to remove (running, pinned, draft, worktree, or bound). Close or unpin a thread, then retry.\(detail)"
+            return "Agent thread capacity reached: \(actualCount) threads for a hard limit of \(limit). No reclaimable terminal thread is safe to remove (all remaining threads are running or in-flight fork recovery). Close a running thread, then retry.\(detail)"
         }
     }
 
@@ -598,11 +598,14 @@ public final class AgentThreadRepository {
         _ = try st.step()
     }
 
-    /// Hard workspace cap: reclaim oldest *terminal* threads (including those with
-    /// history) when over the limit. Protected and never auto-deleted:
-    /// running/pending, pinned, durable drafts, worktrees, recoverable fork
-    /// intents, and live surface bindings (excluded via the live-binding set).
-    /// Keep this predicate shared by preflight, selection, and the guarded DELETE.
+    /// Hard workspace cap: reclaim oldest terminal threads (including those with
+    /// history) when over the limit. Preferred victims skip running, pinned,
+    /// durable drafts, worktrees, and recoverable fork intents. Live and snapshot
+    /// bindings are excluded by the caller. If that set cannot satisfy the cap,
+    /// overflow reclaims the oldest non-running, non-fork row — including pinned,
+    /// drafts, worktrees, and bound history — so a full rail self-heals instead
+    /// of blocking reload/create. Keep each predicate shared by selection and
+    /// the matching guarded DELETE.
     private func workspaceThreadLimitEligibilityPredicate(candidateAlias: String) -> String {
         """
         -- Everything except an active run is reclaimable under the hard
@@ -628,6 +631,21 @@ public final class AgentThreadRepository {
                   END
               )
         )
+        AND NOT EXISTS (
+            SELECT 1 FROM agent_thread_fork_intents AS intent
+            WHERE intent.state IN ('prepared', 'provider_created', 'compensating')
+              AND (intent.source_thread_id = \(candidateAlias).id
+                   OR intent.child_thread_id = \(candidateAlias).id)
+        )
+        """
+    }
+
+    /// Last-resort cap victims: any non-running thread that is not part of an
+    /// in-flight fork. Oldest `updated_at` wins, including pinned / draft /
+    /// worktree / bound history.
+    private func workspaceThreadLimitOverflowPredicate(candidateAlias: String) -> String {
+        """
+        AND \(candidateAlias).status NOT IN ('running')
         AND NOT EXISTS (
             SELECT 1 FROM agent_thread_fork_intents AS intent
             WHERE intent.state IN ('prepared', 'provider_created', 'compensating')
@@ -752,7 +770,7 @@ public final class AgentThreadRepository {
         let cap = max(1, limit)
         try withLiveSurfaceBindingsLocked { liveBindings in
             try db.performSync { _ in
-                let total = try count(workspaceId: workspaceId)
+                let total = try countOnWriter(workspaceId: workspaceId)
                 let prospectiveExists: Bool
                 if let prospectiveThreadId {
                     prospectiveExists = try get(id: prospectiveThreadId)?.workspaceId == workspaceId
@@ -764,8 +782,6 @@ public final class AgentThreadRepository {
                 guard requiredVictims > 0 else { return }
 
                 var excludedIDs = excludedVictimIDs
-                    .union(liveBindings)
-                    .union(try persistedSurfaceBoundThreadIDs())
                 if let prospectiveThreadId { excludedIDs.insert(prospectiveThreadId) }
                 let excludedRawIDs = excludedIDs.map { $0.value.uuidString }.sorted()
                 let exclusion = excludedRawIDs.isEmpty
@@ -774,7 +790,7 @@ public final class AgentThreadRepository {
                 let statement = try db.prepare("""
                     SELECT COUNT(*) FROM agent_threads AS candidate
                     WHERE candidate.workspace_id = ?
-                      \(workspaceThreadLimitEligibilityPredicate(candidateAlias: "candidate"))
+                      \(workspaceThreadLimitOverflowPredicate(candidateAlias: "candidate"))
                       \(exclusion);
                 """)
                 try statement.bind(1, workspaceId.value.uuidString)
@@ -847,24 +863,45 @@ public final class AgentThreadRepository {
     ) throws -> [AgentThreadID] {
         try withLiveSurfaceBindingsLocked { liveBindings in
             let cap = max(1, limit)
-            let victims = try workspaceThreadLimitVictims(
+            let persistedBound = try persistedSurfaceBoundThreadIDs()
+            var deleted: [AgentThreadID] = []
+            let preferred = try workspaceThreadLimitVictims(
                 workspaceId: workspaceId,
                 limit: cap,
-                excluding: excludedThreadIDs
-                    .union(liveBindings)
-                    .union(try persistedSurfaceBoundThreadIDs())
+                excluding: excludedThreadIDs.union(liveBindings).union(persistedBound),
+                overflow: false
             )
-            for id in victims {
-                guard try deleteWorkspaceThreadLimitVictimIfStillEligible(id) else {
+            for id in preferred {
+                guard try deleteWorkspaceThreadLimitVictimIfStillEligible(id, overflow: false) else {
                     throw try workspaceThreadCapacityError(
                         workspaceId: workspaceId,
                         limit: cap,
-                        actualCount: try count(workspaceId: workspaceId),
+                        actualCount: try countOnWriter(workspaceId: workspaceId),
                         liveSurfaceBindings: liveBindings
                     )
                 }
+                deleted.append(id)
             }
-            let actualCount = try count(workspaceId: workspaceId)
+            if try countOnWriter(workspaceId: workspaceId) > cap {
+                let overflow = try workspaceThreadLimitVictims(
+                    workspaceId: workspaceId,
+                    limit: cap,
+                    excluding: excludedThreadIDs.union(Set(deleted)),
+                    overflow: true
+                )
+                for id in overflow {
+                    guard try deleteWorkspaceThreadLimitVictimIfStillEligible(id, overflow: true) else {
+                        throw try workspaceThreadCapacityError(
+                            workspaceId: workspaceId,
+                            limit: cap,
+                            actualCount: try countOnWriter(workspaceId: workspaceId),
+                            liveSurfaceBindings: liveBindings
+                        )
+                    }
+                    deleted.append(id)
+                }
+            }
+            let actualCount = try countOnWriter(workspaceId: workspaceId)
             guard actualCount <= cap else {
                 throw try workspaceThreadCapacityError(
                     workspaceId: workspaceId,
@@ -873,7 +910,7 @@ public final class AgentThreadRepository {
                     liveSurfaceBindings: liveBindings
                 )
             }
-            return victims
+            return deleted
         }
     }
 
@@ -1542,9 +1579,21 @@ public final class AgentThreadRepository {
         }
     }
 
+    /// Writer-visible occupancy for cap transactions. `count` uses the WAL
+    /// reader and cannot see the in-flight upsert/delete that the cap is
+    /// deciding, which rolled successful victim deletes back as a 21/20 miss.
+    private func countOnWriter(workspaceId: WorkspaceID) throws -> Int {
+        let st = try db.prepare("SELECT COUNT(*) FROM agent_threads WHERE workspace_id = ?;")
+        try st.bind(1, workspaceId.value.uuidString)
+        guard try st.step() else { return 0 }
+        return Int(st.columnInt64(0))
+    }
+
     /// Deletes oldest eligible threads until the workspace is at or below
-    /// `limit`. Never deletes `running`/`pending` threads. Prefers unpinned
-    /// oldest-first, then pinned non-active. Cascades messages via FK.
+    /// `limit`. Never deletes `running` threads or in-flight fork participants.
+    /// Prefers disposable unpinned history, then falls back to the oldest
+    /// non-running row (pinned, draft, worktree, or bound) so the rail self-heals.
+    /// Cascades messages via FK.
     /// - Returns: ids that were deleted.
     @discardableResult
     public func enforceWorkspaceThreadLimit(
@@ -1565,13 +1614,16 @@ public final class AgentThreadRepository {
     private func workspaceThreadLimitVictims(
         workspaceId: WorkspaceID,
         limit: Int,
-        excluding excludedThreadIDs: Set<AgentThreadID> = []
+        excluding excludedThreadIDs: Set<AgentThreadID> = [],
+        overflow: Bool
     ) throws -> [AgentThreadID] {
         let cap = max(1, limit)
-        let total = try count(workspaceId: workspaceId)
+        let total = try countOnWriter(workspaceId: workspaceId)
         guard total > cap else { return [] }
         let excess = total - cap
-        // Prefer pruning idle unpinned history; never touch active runs.
+        let predicate = overflow
+            ? workspaceThreadLimitOverflowPredicate(candidateAlias: "candidate")
+            : workspaceThreadLimitEligibilityPredicate(candidateAlias: "candidate")
         let excludedRawIDs = excludedThreadIDs.map { $0.value.uuidString }.sorted()
         let exclusion = excludedRawIDs.isEmpty
             ? ""
@@ -1579,7 +1631,7 @@ public final class AgentThreadRepository {
         let st = try db.prepare("""
             SELECT candidate.id FROM agent_threads AS candidate
             WHERE candidate.workspace_id = ?
-              \(workspaceThreadLimitEligibilityPredicate(candidateAlias: "candidate"))
+              \(predicate)
               \(exclusion)
             ORDER BY candidate.updated_at ASC, candidate.id ASC
             LIMIT ?;
@@ -1601,11 +1653,17 @@ public final class AgentThreadRepository {
     /// Victim selection is only advisory until this guarded DELETE executes.
     /// Recheck active status and recoverable fork participation so any change
     /// after selection aborts and rolls back the entire cap transaction.
-    private func deleteWorkspaceThreadLimitVictimIfStillEligible(_ id: AgentThreadID) throws -> Bool {
+    private func deleteWorkspaceThreadLimitVictimIfStillEligible(
+        _ id: AgentThreadID,
+        overflow: Bool
+    ) throws -> Bool {
+        let predicate = overflow
+            ? workspaceThreadLimitOverflowPredicate(candidateAlias: "agent_threads")
+            : workspaceThreadLimitEligibilityPredicate(candidateAlias: "agent_threads")
         let deletion = try db.prepare("""
             DELETE FROM agent_threads
             WHERE id = ?
-              \(workspaceThreadLimitEligibilityPredicate(candidateAlias: "agent_threads"));
+              \(predicate);
         """)
         try deletion.bind(1, id.value.uuidString)
         _ = try deletion.step()
