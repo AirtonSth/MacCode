@@ -83,6 +83,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 51 (2026-09-03): `Sources/AppShell/` Pet dest-attention projection — reviewed (unread-dedupe, unscoped-bot guard, enabled gating). FIXED: `projectDest` ran filter+map for the enabled set plus a second map for the lookup dictionary (two traversals + two intermediates per refresh) — now one pass builds both with reserved capacity; projected items identical
 
+- [x] Slice 52 (2026-09-03): `Sources/AgentRuntime/` git line-parse paths — reviewed (`branches` list, `remoteNames`; DistillCore crusher splits excluded by Token Saver contract). FIXED: `branches` + `remoteNames` each ran split+map+filter (three traversals + two intermediates per git listing) — now one shared `nonEmptyLines` single-pass helper; listings identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
