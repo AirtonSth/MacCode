@@ -115,6 +115,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 67 (2026-09-03): `Sources/AppShell/` Pet extended-reaction snap — reviewed (FilesSurface drag-payload combine left for its own slice). FIXED: reaction snap built per-cycle 2-element arrays via flatMap + map/filter intermediates + min scan — now direct best-tracking loop with earliest-cycle tie-break preserved; snapped duration identical (proof: AppShell build clean)
 
+- [x] Slice 68 (2026-09-03): `Sources/AppShell/` Pet EventBus reconcile — reviewed (`LiveActivitySummary` prefix-map + window-controller dock-nearest sites left for their own slice). FIXED: `reconcileActiveRunIDs` ran map+filter with one intermediate over the host run-ID set — now single-pass trim+insert; normalized set identical (proof: ghost-coding-pose reconcile test passes)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
