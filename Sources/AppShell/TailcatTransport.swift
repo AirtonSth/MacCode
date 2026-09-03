@@ -6,6 +6,11 @@ import SocketServer
 
 enum TailcatTransportContract {
     static let buildID = "tailcat-88929418b1a3f3c74904a3136d6a9e87b1b5b9bb+rcpatch1"
+    /// Catalog wire/capability version. Independent of `buildID` so a Tailcat
+    /// transport bump does not imply a catalog-protocol bump, and vice versa.
+    static let catalogProtocolVersion = 1
+    /// Canonicalization version for `admissionDigest`. Independent of `buildID`.
+    static let admissionDigestVersion = 1
     static let primaryDERPHost = "derp.remotecode.io"
     static let primaryDERPIPv4 = "82.25.69.175"
     static let primaryDERPPort: UInt16 = 444
@@ -14,6 +19,18 @@ enum TailcatTransportContract {
     static let pollInterval: TimeInterval = 15
     static let renewalInterval: TimeInterval = 5 * 60
     static let hostLease: TimeInterval = 15 * 60
+
+    static func applyCatalogHeaders(_ request: inout URLRequest) {
+        request.setValue(buildID, forHTTPHeaderField: "x-tailcat-transport-build-id")
+        request.setValue(
+            String(catalogProtocolVersion),
+            forHTTPHeaderField: "x-tailcat-catalog-protocol-version"
+        )
+        request.setValue(
+            String(admissionDigestVersion),
+            forHTTPHeaderField: "x-tailcat-admission-digest-version"
+        )
+    }
 }
 
 enum TailcatEndpointKind: String, Codable, Sendable {
@@ -57,6 +74,13 @@ struct TailcatAllowlistSnapshot: Codable, Equatable, Sendable {
         let data = (try? JSONEncoder.tailcatCanonical.encode(self)) ?? Data()
         return tailcatHexDigest(SHA256.hash(data: data))
     }
+
+    /// SHA-256 of admitted peers only (`clientId`, `nodePublic`, compatible
+    /// `transportBuildId`). Excludes display name, timestamps, lease, version,
+    /// epoch, and revision so lease renewal / rename cannot rotate transport.
+    var admissionDigest: String {
+        tailcatAdmissionDigest(clients: clients)
+    }
 }
 
 struct TailcatCatalogHost: Codable, Equatable, Sendable {
@@ -85,9 +109,21 @@ enum TailcatCatalogError: Error, Equatable {
     case invalidResponse
     case http(status: Int, code: String?)
 
-    var deniesSubscription: Bool {
+    /// HTTP 401 is an expired/invalid token, not a missing subscription.
+    var requiresReauthentication: Bool {
         guard case .http(let status, _) = self else { return false }
-        return status == 401 || status == 403
+        return status == 401
+    }
+
+    /// HTTP 403 is authorization/signature failure, not subscription.
+    var deniesAuthorization: Bool {
+        guard case .http(let status, _) = self else { return false }
+        return status == 403
+    }
+
+    /// Subscription is decided from the account session, never from 401/403.
+    var deniesSubscription: Bool {
+        false
     }
 
     var isConflict: Bool {
@@ -175,10 +211,7 @@ final class URLSessionTailcatCatalogAPI: TailcatCatalogAPI, @unchecked Sendable 
         request.timeoutInterval = 4
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        request.setValue(
-            TailcatTransportContract.buildID,
-            forHTTPHeaderField: "x-tailcat-transport-build-id"
-        )
+        TailcatTransportContract.applyCatalogHeaders(&request)
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw TailcatCatalogError.invalidResponse }
         guard (200..<300).contains(http.statusCode) else {
@@ -205,10 +238,7 @@ final class URLSessionTailcatCatalogAPI: TailcatCatalogAPI, @unchecked Sendable 
         request.timeoutInterval = 12
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        request.setValue(
-            TailcatTransportContract.buildID,
-            forHTTPHeaderField: "x-tailcat-transport-build-id"
-        )
+        TailcatTransportContract.applyCatalogHeaders(&request)
         if let ifMatch { request.setValue(ifMatch, forHTTPHeaderField: "If-Match") }
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -241,6 +271,30 @@ private extension JSONEncoder {
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         return encoder
     }()
+}
+
+private func tailcatAdmissionDigest(clients: [TailcatCatalogClient]) -> String {
+    struct Peer: Encodable {
+        let clientId: String
+        let nodePublic: String
+        let transportBuildId: String
+    }
+    let peers = clients
+        .filter { $0.transportBuildId == TailcatTransportContract.buildID }
+        .map {
+            Peer(
+                clientId: $0.clientId,
+                nodePublic: $0.nodePublic,
+                transportBuildId: $0.transportBuildId
+            )
+        }
+        .sorted {
+            if $0.clientId != $1.clientId { return $0.clientId < $1.clientId }
+            if $0.nodePublic != $1.nodePublic { return $0.nodePublic < $1.nodePublic }
+            return $0.transportBuildId < $1.transportBuildId
+        }
+    let data = (try? JSONEncoder.tailcatCanonical.encode(peers)) ?? Data()
+    return tailcatHexDigest(SHA256.hash(data: data))
 }
 
 /// PERF: nibble table instead of per-byte `String(format:)` — same fix as
@@ -435,10 +489,65 @@ struct TailcatSecureState: Codable, Equatable, Sendable {
     var accountID: String
     var allowlistEpoch: String
     var revision: Int64
+    /// Legacy full-client snapshot hash. Never reinterpreted as `admissionDigest`.
     var snapshotHash: String
+    /// Versioned admission digest. Optional so keychain records written before
+    /// this field still decode; new writes always dual-write both hashes.
+    var admissionDigest: String? = nil
     var eTag: String?
     var active: TailcatKeyVersion?
     var pending: TailcatKeyVersion?
+}
+
+enum TailcatAdmission {
+    static func needsRotation(
+        stored: TailcatSecureState?,
+        snapshot: TailcatAllowlistSnapshot,
+        accountID: String,
+        hostPresent: Bool,
+        eTagPresent: Bool,
+        runtimePresent: Bool
+    ) -> Bool {
+        guard let stored else { return true }
+        return stored.accountID != accountID
+            || stored.allowlistEpoch != snapshot.epoch
+            || stored.revision != snapshot.revision
+            || admittedPeersChanged(stored: stored, snapshot: snapshot)
+            || stored.phase != .active
+            || stored.active == nil
+            || !hostPresent
+            || !eTagPresent
+            || !runtimePresent
+    }
+
+    /// Missing stored digest is not treated as a peer change: never reinterpret
+    /// the legacy `snapshotHash` as the admission digest.
+    static func admittedPeersChanged(
+        stored: TailcatSecureState,
+        snapshot: TailcatAllowlistSnapshot
+    ) -> Bool {
+        guard let digest = stored.admissionDigest else { return false }
+        return digest != snapshot.admissionDigest
+    }
+
+    static func validate(
+        _ snapshot: TailcatAllowlistSnapshot,
+        stored: TailcatSecureState?,
+        accountID: String
+    ) throws {
+        guard let stored, stored.accountID == accountID else { return }
+        guard snapshot.epoch == stored.allowlistEpoch else { return }
+        if snapshot.revision < stored.revision {
+            throw TailcatCatalogError.invalidResponse
+        }
+        // Same revision + different legacy hash is lease/name noise when the
+        // admission digest matches (or the stored record is pre-digest).
+        if snapshot.revision == stored.revision,
+           let digest = stored.admissionDigest,
+           digest != snapshot.admissionDigest {
+            throw TailcatCatalogError.invalidResponse
+        }
+    }
 }
 
 protocol TailcatSecureStateStoring: Sendable {

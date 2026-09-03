@@ -5,6 +5,7 @@ import SocketServer
 enum TailcatRuntimeStatus: String, Equatable, Sendable {
     case off
     case requiresSubscription
+    case requiresReauthentication
     case checking
     case unavailable
     case active
@@ -17,6 +18,7 @@ enum TailcatRuntimeStatus: String, Equatable, Sendable {
         switch self {
         case .off: return "Off"
         case .requiresSubscription: return "Active subscription required"
+        case .requiresReauthentication: return "Sign in required"
         case .checking: return "Checking secure access…"
         case .unavailable: return "Unavailable — retrying securely"
         case .active: return "Available anywhere"
@@ -183,7 +185,12 @@ actor TailcatRuntimeSupervisor {
         do {
             let response = try await catalog.host(serverID: serverID, accessToken: session.accessToken)
             guard enabled, generation == operationGeneration else { return }
-            try validate(response.snapshot, accountID: session.user.id)
+            let stored = try loadSecureState()
+            try TailcatAdmission.validate(
+                response.snapshot,
+                stored: stored,
+                accountID: session.user.id
+            )
             lastBackendSuccess = now()
             currentETag = response.eTag
 
@@ -197,26 +204,33 @@ actor TailcatRuntimeSupervisor {
                 )
                 return
             }
-            let stored = try loadSecureState()
-            let needsRotation = stored?.accountID != session.user.id
-                || stored?.allowlistEpoch != response.snapshot.epoch
-                || stored?.revision != response.snapshot.revision
-                || stored?.snapshotHash != response.snapshot.hash
-                || stored?.phase != .active
-                || stored?.active == nil
-                || response.host == nil
-                || response.eTag == nil
-                || runtime == nil
+            let needsRotation = TailcatAdmission.needsRotation(
+                stored: stored,
+                snapshot: response.snapshot,
+                accountID: session.user.id,
+                hostPresent: response.host != nil,
+                eTagPresent: response.eTag != nil,
+                runtimePresent: runtime != nil
+            )
 
             currentSnapshot = response.snapshot
             if needsRotation {
                 await rotateAndPublish(snapshot: response.snapshot, session: session, eTag: response.eTag)
-            } else if let runtime, let eTag = response.eTag,
-                      now().timeIntervalSince(lastRenewal ?? .distantPast) >= TailcatTransportContract.renewalInterval {
-                await renew(runtime: runtime, session: session, eTag: eTag)
-            } else if runtime != nil {
-                statusHandler(.active)
+            } else {
+                try persistAdmissionFields(snapshot: response.snapshot)
+                if let runtime, let eTag = response.eTag,
+                   now().timeIntervalSince(lastRenewal ?? .distantPast) >= TailcatTransportContract.renewalInterval {
+                    await renew(runtime: runtime, session: session, eTag: eTag)
+                } else if runtime != nil {
+                    statusHandler(.active)
+                }
             }
+        } catch let error as TailcatCatalogError where error.requiresReauthentication {
+            guard enabled, generation == operationGeneration else { return }
+            statusHandler(.requiresReauthentication)
+        } catch let error as TailcatCatalogError where error.deniesAuthorization {
+            guard enabled, generation == operationGeneration else { return }
+            await revoke(clearKeys: true, status: .unavailable)
         } catch let error as TailcatCatalogError where error.deniesSubscription {
             guard enabled, generation == operationGeneration else { return }
             await revoke(clearKeys: true, status: .requiresSubscription)
@@ -227,15 +241,6 @@ actor TailcatRuntimeSupervisor {
             } else {
                 statusHandler(runtime == nil ? .unavailable : .active)
             }
-        }
-    }
-
-    private func validate(_ snapshot: TailcatAllowlistSnapshot, accountID: String) throws {
-        guard let stored = try loadSecureState(), stored.accountID == accountID else { return }
-        guard snapshot.epoch == stored.allowlistEpoch else { return }
-        if snapshot.revision < stored.revision { throw TailcatCatalogError.invalidResponse }
-        if snapshot.revision == stored.revision, snapshot.hash != stored.snapshotHash {
-            throw TailcatCatalogError.invalidResponse
         }
     }
 
@@ -266,6 +271,7 @@ actor TailcatRuntimeSupervisor {
                 allowlistEpoch: snapshot.epoch,
                 revision: snapshot.revision,
                 snapshotHash: snapshot.hash,
+                admissionDigest: snapshot.admissionDigest,
                 eTag: eTag,
                 active: old,
                 pending: keys
@@ -355,6 +361,7 @@ actor TailcatRuntimeSupervisor {
                 allowlistEpoch: snapshot.epoch,
                 revision: snapshot.revision,
                 snapshotHash: snapshot.hash,
+                admissionDigest: snapshot.admissionDigest,
                 eTag: published.eTag,
                 active: keys,
                 pending: nil
@@ -381,9 +388,17 @@ actor TailcatRuntimeSupervisor {
             currentETag = published.eTag
             if var stored = try loadSecureState() {
                 stored.eTag = published.eTag
+                if let snapshot = currentSnapshot {
+                    stored.snapshotHash = snapshot.hash
+                    stored.admissionDigest = snapshot.admissionDigest
+                }
                 try saveSecureState(stored)
             }
             statusHandler(.active)
+        } catch let error as TailcatCatalogError where error.requiresReauthentication {
+            statusHandler(.requiresReauthentication)
+        } catch let error as TailcatCatalogError where error.deniesAuthorization {
+            await revoke(clearKeys: true, status: .unavailable)
         } catch let error as TailcatCatalogError where error.deniesSubscription {
             await revoke(clearKeys: true, status: .requiresSubscription)
         } catch let error as TailcatCatalogError where error.isConflict {
@@ -413,6 +428,7 @@ actor TailcatRuntimeSupervisor {
                     allowlistEpoch: snapshot.epoch,
                     revision: snapshot.revision,
                     snapshotHash: snapshot.hash,
+                    admissionDigest: snapshot.admissionDigest,
                     eTag: eTag,
                     active: nil,
                     pending: nil
@@ -433,6 +449,16 @@ actor TailcatRuntimeSupervisor {
             }
         }
         statusHandler(status)
+    }
+
+    private func persistAdmissionFields(snapshot: TailcatAllowlistSnapshot) throws {
+        guard var stored = try loadSecureState() else { return }
+        let digest = snapshot.admissionDigest
+        let hash = snapshot.hash
+        guard stored.snapshotHash != hash || stored.admissionDigest != digest else { return }
+        stored.snapshotHash = hash
+        stored.admissionDigest = digest
+        try saveSecureState(stored)
     }
 
     private func loadSecureState() throws -> TailcatSecureState? {
