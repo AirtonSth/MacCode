@@ -5904,9 +5904,13 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func leftoverStoreFacts(for bot: BotDefinition) -> [String] {
-        ((try? botStore.listMemory(botID: bot.id)) ?? [])
-            .filter { $0.forgottenAt == nil && $0.trusted }
-            .map(\.content)
+        // PERF: single pass avoids the filter + map intermediate on the
+        // bot-mind write path; fact order identical.
+        ((try? botStore.listMemory(botID: bot.id)) ?? []).reduce(into: [String]()) { out, memory in
+            if memory.forgottenAt == nil && memory.trusted {
+                out.append(memory.content)
+            }
+        }
     }
 
     public func memoryFileTexts(for bot: BotDefinition) -> [BotMemoryFileText] {
