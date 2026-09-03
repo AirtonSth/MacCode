@@ -245,7 +245,7 @@ public enum AgentChatLiveTurnChrome {
         // Replay applies turnStarted with Date(), which dumps every historical
         // Worked block at "now". Item timestamps survive persist and keep
         // user → work → answer in conversation order.
-        if let ms = turn.items.map(\.startedAtMs).min(), ms > 0 {
+        if let ms = turn.items.min(by: { $0.startedAtMs < $1.startedAtMs })?.startedAtMs, ms > 0 {
             return Date(timeIntervalSince1970: TimeInterval(ms) / 1000)
         }
         if let ms = turn.startedAtMs {
