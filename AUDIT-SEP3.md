@@ -41,6 +41,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 - [x] Slice 29 (2026-09-03): browser-sync + agent-thread third pass — reviewed (nav dedupe intact, coalesced reloads, shared codecs). FIXED: `BrowserSurface.isSecureURL` copied the whole URL via `lowercased()` per nav-chrome sync — now 8-byte case-folded compare; verdict identical (note: first attempt used a non-existent `hasPrefix(caseInsensitive:)` API — build error, corrected to byte compare before commit)
 - [x] Slice 30 (2026-09-03): misc targets (`RC2CLI`, `RemoteCodeTreaty`, scheduled-task agent, distill service, `CSystem`) — reviewed (shared MCP codecs, nibble hex, one-shot encoders). FIXED: `BotUploadTarget` grant init copied the 64-byte sha256 via `lowercased()` per attachment grant — now in-place A-F fold; digest identical (note: first attempt wrote through read-only `withUTF8` — build error, corrected to byte array before commit)
 
+- [x] Slice 31 (2026-09-03): terminal-budget + queue-depth paths — reviewed (single-pass budget eviction, coalesced queue reloads). FIXED: `TerminalSurface.autoSubmitSavedSSHPasswordIfNeeded` copied the whole PTY chunk via `lowercased()` on every output arrival — now case-insensitive range scan; prompt verdicts identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
