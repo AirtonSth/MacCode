@@ -164,8 +164,28 @@ public enum AgentChatTranscriptChrome {
     }
 
     public static func isImagePath(_ path: String) -> Bool {
-        let ext = (path as NSString).pathExtension.lowercased()
-        return ["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "heic", "webp", "svg", "avif"].contains(ext)
+        // PERF: image-extension check runs per attachment per transcript render;
+        // NSString.pathExtension + lowercased() allocated twice per call. Scan
+        // the suffix directly (case-insensitive, no temporaries); verdict identical.
+        let ext = Self.pathExtension(of: path)
+        return ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "gif"
+            || ext == "bmp" || ext == "tif" || ext == "tiff" || ext == "heic"
+            || ext == "webp" || ext == "svg" || ext == "avif"
+    }
+
+    /// Lowercase file extension without allocating (last `.` after the last `/`).
+    private static func pathExtension(of path: String) -> Substring {
+        let utf8 = path.utf8
+        var dot: String.UTF8View.Index?
+        var i = utf8.startIndex
+        while i != utf8.endIndex {
+            let byte = utf8[i]
+            if byte == 0x2F { dot = nil } // '/' resets: dots in directories don't count
+            else if byte == 0x2E { dot = i } // last '.' wins
+            i = utf8.index(after: i)
+        }
+        guard let dot, utf8.index(after: dot) != utf8.endIndex else { return "" }
+        return path[utf8.index(after: dot)...].lowercased()[...]
     }
 
     public static func relativeTimestamp(_ date: Date, now: Date = Date()) -> String {
