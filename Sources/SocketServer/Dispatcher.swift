@@ -2222,20 +2222,27 @@ public final class JSONRPCDispatcher {
 
     /// HTTP-authoritative mutation identity.
     ///
-    /// Requires a non-empty `client_request_id` only. Legacy transport fields
-    /// (`connection_id`, `expected_host_id`, `expected_boot_epoch`) are optional
-    /// and never authorize or block — WS registry, host/boot freshness, and
-    /// connection ownership are not HTTP preconditions.
+    /// Requires a Stage 3-valid `client_request_id` (trim, length 8...128,
+    /// UUID/hex/dash/alnum/`_`). Legacy transport fields (`connection_id`,
+    /// `expected_host_id`, `expected_boot_epoch`) are optional and never
+    /// authorize or block — WS registry, host/boot freshness, and connection
+    /// ownership are not HTTP preconditions.
     private func mutationIdentity(
         params: [String: JSONValue],
         context: MutationRequestContext
     ) -> String? {
         _ = context
-        guard let clientRequestId = params["client_request_id"]?.stringValue,
-              !clientRequestId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard let raw = params["client_request_id"]?.stringValue,
+              let clientRequestId = MutationClientRequestID.validate(raw) else {
             return nil
         }
         return clientRequestId
+    }
+
+    /// Public wrapper over the Stage 3 `client_request_id` gate used by
+    /// `mutationIdentity` before receipt claim.
+    nonisolated public static func mutationClientRequestID(_ raw: String) -> String? {
+        MutationClientRequestID.validate(raw)
     }
 
     private func receiptFailure(
@@ -4681,6 +4688,17 @@ public final class JSONRPCDispatcher {
     ///     Also HTTP-only read methods that are intentionally excluded from
     ///     `readOnlyBatchMethods` (e.g. `agent.checkpoint.list`).
     ///   - "write": every other known (mutating) method.
+    ///   - "device-admin": HTTP device list/revoke only; not an RPC method
+    ///     grant. `write`/`file`/`read` must not inherit it.
+    nonisolated static let deviceAdminCapability = "device-admin"
+
+    /// HTTP device-admin admission. `"*"` keeps already-paired full-access
+    /// devices; a named `device-admin` grant is required otherwise.
+    nonisolated static func isAuthorizedDeviceAdmin(grantedCapabilities: String) -> Bool {
+        let granted = parseCapabilities(grantedCapabilities)
+        return granted.contains("*") || granted.contains(deviceAdminCapability)
+    }
+
     nonisolated static func requiredCapability(for method: String) -> String? {
         guard let namespace = method.split(separator: ".").first.map(String.init),
               knownMethodNamespaces.contains(namespace) else {

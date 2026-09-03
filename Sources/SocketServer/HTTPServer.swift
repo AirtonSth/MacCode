@@ -1192,6 +1192,78 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return (!loopbackOnly || remoteAuthenticated) && !authExemptV1Paths.contains(path)
     }
 
+    /// Admission for GET /v1/devices and POST /v1/devices/revoke.
+    ///
+    /// A presented bearer must hold `device-admin` or `*`. Generic `read`,
+    /// `write`, and `file` grants do not inherit device administration.
+    /// Tokenless loopback remains Mac-local; a missing remote bearer is 401.
+    enum DeviceAdminHTTPAdmission: Equatable, Sendable {
+        case allow
+        case unauthorized
+        case forbidden
+    }
+
+    nonisolated static func deviceAdminHTTPAdmission(
+        loopbackOnly: Bool,
+        presentedBearer: Bool,
+        grantedCapabilities: String?
+    ) -> DeviceAdminHTTPAdmission {
+        if presentedBearer {
+            guard let grantedCapabilities else { return .unauthorized }
+            return JSONRPCDispatcher.isAuthorizedDeviceAdmin(
+                grantedCapabilities: grantedCapabilities
+            ) ? .allow : .forbidden
+        }
+        return loopbackOnly ? .allow : .unauthorized
+    }
+
+    /// Writes 401/403/503 when device-admin is not admitted and returns the
+    /// live auth provider only after the grant check.
+    private func admittedDeviceAdminProvider(
+        fd: Int32,
+        presentedBearerToken: String?,
+        acceptEncoding: String?
+    ) -> DirectAuthProvider? {
+        guard let auth = auth else {
+            send(fd: fd, status: 503, contentType: "text/plain", body: Self.disabledBody)
+            return nil
+        }
+        let grants = presentedBearerToken.flatMap {
+            auth.authorizedRPCPrincipal(token: $0)?.grantedCapabilities
+        }
+        switch Self.deviceAdminHTTPAdmission(
+            loopbackOnly: bindLoopbackOnly,
+            presentedBearer: presentedBearerToken != nil,
+            grantedCapabilities: grants
+        ) {
+        case .allow:
+            return auth
+        case .unauthorized:
+            send(
+                fd: fd,
+                status: 401,
+                contentType: "text/plain",
+                body: Self.unauthorizedBody,
+                additionalHeaders: [
+                    "WWW-Authenticate": wwwAuthenticateHeaderValue(
+                        scheme: "Bearer",
+                        realm: "RC2"
+                    )
+                ]
+            )
+            return nil
+        case .forbidden:
+            send(
+                fd: fd,
+                status: 403,
+                contentType: "text/plain",
+                body: Self.forbiddenBody,
+                acceptEncoding: acceptEncoding
+            )
+            return nil
+        }
+    }
+
     /// Canonical host DTO from which both the public projection and the
     /// authenticated identity envelope are derived.
     struct HostCapabilitiesProjectionDTO {
@@ -1273,7 +1345,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "methods": ["fs.mkdir", "fs.workspace.list", "fs.workspace.read", "fs.workspace.preview_url", "fs.workspace.create_file", "fs.workspace.rename", "fs.workspace.delete", "files.tab.open", "files.tab.split", "files.state.get", "files.state.update", "files.edit.session", "files.edit.open", "files.edit.apply_patch", "files.edit.save", "files.edit.discard", "files.edit.close"]
             ],
             "bot": [
-                "queue_controls": ["remove", "update", "reorder", "force_now"]
+                "queue_controls": ["remove", "update", "reorder", "force_now"],
+                "linked_thread_v1": true
             ],
             "git": [
                 "read_only": false,
@@ -1384,6 +1457,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     private static let badContentLengthBody = Data("bad content length\n".utf8)
     private static let badEncodedBodyBody = Data("bad encoded body\n".utf8)
     private static let unauthorizedBody = Data("unauthorized\n".utf8)
+    private static let forbiddenBody = Data("forbidden\n".utf8)
     private static let okBody = Data("ok\n".utf8)
     private static let badRequestBody = Data("bad request\n".utf8)
     private static let unknownRequestBody = Data("unknown request\n".utf8)
@@ -3481,11 +3555,19 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 sendJSON(fd: fd, status: 410, body: pairingErrorPayload(code: "code_expired"), acceptEncoding: headers["accept-encoding"])
             }
         case ("GET", "/v1/devices"):
-            guard let auth = auth else { send(fd: fd, status: 503, contentType: "text/plain", body: Self.disabledBody); return }
+            guard let auth = admittedDeviceAdminProvider(
+                fd: fd,
+                presentedBearerToken: presentedBearerToken,
+                acceptEncoding: headers["accept-encoding"]
+            ) else { return }
             sendJSON(fd: fd, status: 200, body: ["devices": auth.listDevices()], acceptEncoding: headers["accept-encoding"])
         case ("POST", "/v1/devices/revoke"):
-            guard let auth = auth,
-                  let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
+            guard let auth = admittedDeviceAdminProvider(
+                fd: fd,
+                presentedBearerToken: presentedBearerToken,
+                acceptEncoding: headers["accept-encoding"]
+            ) else { return }
+            guard let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
                   let id = obj["id"] as? String else {
                 send(fd: fd, status: 400, contentType: "text/plain", body: Self.badRequestBody); return
             }
@@ -5610,6 +5692,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         case 206: return "Partial Content"
         case 400: return "Bad Request"
         case 401: return "Unauthorized"
+        case 403: return "Forbidden"
         case 404: return "Not Found"
         case 409: return "Conflict"
         case 410: return "Gone"

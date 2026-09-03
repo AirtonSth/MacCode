@@ -26,6 +26,7 @@ final class RPCContractParityTests: XCTestCase {
     private let executableRouteCatalog: Set<String> = [
         "GET /__rc2_static/*",
         "HEAD /__rc2_static/*",
+        "POST /v1/agent/attachment-uploads/v3/{uploadID}/prepare",
     ]
 
     func test_staticGrantExecutableRouteCatalogContainsGETAndHEAD() {
@@ -45,6 +46,22 @@ final class RPCContractParityTests: XCTestCase {
             DirectHTTPServer.staticFileHTTPMethods,
             ["GET", "HEAD"],
             "the executable method gate must match the route catalog"
+        )
+    }
+
+    func test_attachmentUploadV3PrepareRoute_isInExecutableCatalogAndParsed() {
+        XCTAssertTrue(
+            executableRouteCatalog.contains(
+                "POST /v1/agent/attachment-uploads/v3/{uploadID}/prepare"
+            ),
+            "P0.8: prepare must be in the executable HTTP route catalog"
+        )
+        let id = "11111111-1111-4111-8111-111111111111"
+        XCTAssertEqual(
+            DirectHTTPServer.attachmentUploadV3Route(
+                path: "/v1/agent/attachment-uploads/v3/\(id)/prepare"
+            ),
+            .prepare(uploadId: id)
         )
     }
 
