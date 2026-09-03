@@ -119,6 +119,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 69 (2026-09-03): `Sources/AppShell/` Pet Lock Screen copy — reviewed (window-controller dock-nearest sides left for their own slice). FIXED: `LiveActivitySummary.sanitized` collapsed multi-line model output via split+map+filter with two intermediates — now single-pass trim+join; collapsed line identical (proof: 23/23 LiveActivitySummaryTests)
 
+- [x] Slice 70 (2026-09-03): `Sources/AppShell/` Pet dock-avoid placement — reviewed (FilesSurface drag-payload combine left for its own slice). FIXED: `frameAvoidingDock` built candidates via compactMap then ran filter+map + min scan per route side — now single pass tracks nearest side/vertical routes; side preference and fail-closed fallback unchanged (proof: 23/23 PetPlacementTests)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
