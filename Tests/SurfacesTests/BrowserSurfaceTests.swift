@@ -55,8 +55,7 @@ final class BrowserSurfaceTests: XCTestCase {
         XCTAssertEqual(surface.descriptor.title, "Local file")
     }
 
-    func test_toolbarExposesOpenInDefaultBrowserButton() {
-        let surface = BrowserSurface(workspaceID: WorkspaceID(), initialURL: nil, title: "browser")
+    func test_toolbarExposesOpenInDefaultBrowserButton() {        let surface = BrowserSurface(workspaceID: WorkspaceID(), initialURL: nil, title: "browser")
 
         XCTAssertTrue(Self.containsButtonTooltip("Open in Default Browser", in: surface.view),
                       "browser toolbar needs a direct affordance for opening the current URL in the Mac default browser")
@@ -113,6 +112,32 @@ final class BrowserSurfaceTests: XCTestCase {
                        "the iOS mirror must receive the same URL that the toolbar shows")
         XCTAssertEqual(observed?.1, "My account")
         XCTAssertEqual(surface.descriptor.metadata["url"], "https://remotecode.io/account")
+    }
+
+    // SEP-3: url/title KVO, didFinish, and the SPA script payload all fire
+    // for one navigation. Repeats with identical url+title must not re-fan-out
+    // (snapshot-save schedule + BotBrowserStore write + EventBus publish),
+    // while any change must still reach the iOS mirror.
+    func test_repeatNavigationPublish_dedupesIdenticalValues() throws {
+        let surface = BrowserSurface(workspaceID: WorkspaceID(), initialURL: nil, title: "browser")
+        var fireCount = 0
+        surface.onNavigationChange = { _, _, _ in fireCount += 1 }
+        let url = try XCTUnwrap(URL(string: "https://example.com/docs"))
+
+        surface.publishNavigationChange(url: url, title: "Docs")
+        surface.publishNavigationChange(url: url, title: "Docs")
+        surface.publishNavigationChange(url: url, title: "Docs")
+        XCTAssertEqual(fireCount, 1,
+            "identical repeats must fan out once so snapshot saves and mirror publishes stay latest-wins")
+
+        surface.publishNavigationChange(url: url, title: "Docs v2")
+        XCTAssertEqual(fireCount, 2,
+            "a changed title must still emit host state for the iOS mirror")
+
+        let other = try XCTUnwrap(URL(string: "https://example.com/other"))
+        surface.publishNavigationChange(url: other, title: "Docs v2")
+        XCTAssertEqual(fireCount, 3,
+            "a changed URL must still emit host state for the iOS mirror")
     }
 
     private static func containsButtonTooltip(_ tooltip: String, in view: NSView) -> Bool {
