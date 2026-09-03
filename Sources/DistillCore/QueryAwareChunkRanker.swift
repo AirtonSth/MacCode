@@ -46,7 +46,7 @@ public struct QueryAwareChunkRanker: Sendable, Equatable {
         guard !chunks.isEmpty, !queryTerms.isEmpty else { return [] }
 
         let tokenized = chunks.map { tokens($0.text) }
-        let averageLength = max(1.0, Double(tokenized.map(\.count).reduce(0, +)) / Double(chunks.count))
+        let averageLength = max(1.0, Double(tokenized.reduce(0) { $0 + $1.count }) / Double(chunks.count))
         let documentFrequency = queryTerms.reduce(into: [String: Int]()) { frequencies, term in
             frequencies[term] = tokenized.filter { $0.contains(term) }.count
         }
