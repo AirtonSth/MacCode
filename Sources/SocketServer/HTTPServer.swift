@@ -4431,7 +4431,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     private static func bearerToken(from headers: [String: String]) -> String? {
         headers["authorization"]
-            .flatMap { $0.split(separator: " ").last.map(String.init) }
+            .flatMap { $0.split(separator: " ", maxSplits: 1).last.map(String.init) }
             ?? headers["x-rc2-token"]
     }
 
