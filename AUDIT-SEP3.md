@@ -49,6 +49,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 34 (2026-09-03): AgentRuntime stderr/coordinator remainder — reviewed (shared codecs/regexes, cached shell env). FIXED: `displayableStderr` built kept lines via split+map+filter with two intermediates — now single-pass append; text identical
 
+- [x] Slice 35 (2026-09-03): Persistence store remainder — reviewed (shared codecs, bound-before-store, one-shot ids). FIXED: `BotComputerActionStore.writeResult` rebuilt the array via `Array(suffix(32))` on every write — now trims only when over budget; retained newest identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
