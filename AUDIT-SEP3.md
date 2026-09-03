@@ -81,6 +81,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 50 (2026-09-03): `Sources/SocketServer/` response-codec path — reviewed (gzip-first policy, size gate, header parsing). FIXED: `preferredResponseCodec` built the Accept-Encoding token array + two contains passes per JSON response — now single short-circuit scan; verdicts identical
 
+- [x] Slice 51 (2026-09-03): `Sources/AppShell/` Pet dest-attention projection — reviewed (unread-dedupe, unscoped-bot guard, enabled gating). FIXED: `projectDest` ran filter+map for the enabled set plus a second map for the lookup dictionary (two traversals + two intermediates per refresh) — now one pass builds both with reserved capacity; projected items identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
