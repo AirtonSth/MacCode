@@ -45,6 +45,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 32 (2026-09-03): SSH surface second pass — reviewed (case-insensitive host filter, coalesced resize, bounded log). FIXED: `addTransferLog` rebuilt the array via `Array(suffix(200))` on every append — now trims only when over budget; contents identical
 
+- [x] Slice 33 (2026-09-03): SocketServer event-bus filter paths — reviewed (shared encoders, nibble hex, bounded caches). FIXED: `EventStreamFilter.parse` built the interest set via split+map+filter with two intermediates — now single-pass insert; ids identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
