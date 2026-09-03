@@ -71,6 +71,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 45 (2026-09-03): `Sources/Surfaces/` prompt-history record path — reviewed (bounded in-memory history, persisted store, error surface). FIXED: `recordPromptHistory` rebuilt the 200-entry array via `Array(suffix:)` on every sent prompt — now trims only when over budget; retained newest identical
 
+- [x] Slice 46 (2026-09-03): `Sources/DistillCore/` stack-trace classify path (contract-safe: no crushing math, gates, ledger, or savings touched) — reviewed (shared regex, never-inflate guard, router verdicts). FIXED: `looksLikeStackTrace` materialised every line as String + filter intermediate and always scanned to end — now lazy short-circuit scan at 5 frames; verdicts identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
