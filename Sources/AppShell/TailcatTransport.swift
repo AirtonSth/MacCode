@@ -44,10 +44,13 @@ struct TailcatAllowlistSnapshot: Codable, Equatable, Sendable {
     let clients: [TailcatCatalogClient]
 
     var admittedNodePublics: [String] {
-        clients
-            .filter { $0.transportBuildId == TailcatTransportContract.buildID }
-            .map(\.nodePublic)
-            .sorted()
+        // PERF: single pass avoids the filter + map intermediates on the
+        // connect/auth path; sorted order identical.
+        clients.reduce(into: [String]()) { out, client in
+            if client.transportBuildId == TailcatTransportContract.buildID {
+                out.append(client.nodePublic)
+            }
+        }.sorted()
     }
 
     var hash: String {
