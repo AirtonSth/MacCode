@@ -564,7 +564,9 @@ public enum BotBrainCompiler {
     }
 
     static func skillDescription(_ body: String) -> String {
-        let lines = body.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        // PERF: lazy split avoids materialising the whole body as [String]
+        // when the description sits in frontmatter near the top; same result.
+        let lines = body.split(separator: "\n", omittingEmptySubsequences: false).lazy.map(String.init)
         var inFrontmatter = false
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
