@@ -197,6 +197,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 108 (2026-09-03): `Sources/AgentRuntime/` Codex rollback lookup — reviewed (Claude adapter lastIndex rollback is a single already-optimal reverse scan; `parseSpec`/`ProjectScripts`/env-parse firstIndex scans are single small parses; shared ISO8601 formatters need no change). FIXED: `CodexAppServerAdapter.rollbackThread` scanned `completedTurnIds` for `toTurnId` twice on the hit path (existence check, then the same index again) — now reuses the first lookup and re-scans only after the refresh read; rollback target/turn count identical (proof: both rollback tests pass — history-instead-of-digits + recover-session-for-read-and-rollback)
 
+- [x] Slice 109 (2026-09-03): `Sources/AgentRuntime/` seed projection header (envelope-shape only — selector/ledger/savings math untouched) — reviewed (GrokACP failure-path case fold is a single already-shared `normalized` copy; parser map `lowercased()` switches and model-trim folds are small per-event/per-call parses; sidebar `String(format:)` token/byte/a11y copy is display text). FIXED: `TokenSaverContextSeedRuntime` project closure uppercased the format rawValue twice per non-human projection (once for `abi`, once for `effectiveEnvelope`) — now one header shared by both fields; envelope bytes identical (proof: 15/15 TokenSaverContextSeedRuntimeTests)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
