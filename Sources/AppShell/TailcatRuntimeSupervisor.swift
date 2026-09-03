@@ -37,6 +37,7 @@ public enum TailcatAccessDefaults {
 
 actor TailcatRuntimeSupervisor {
     typealias SessionProvider = @Sendable () -> PrivateAccountSession?
+    typealias TokenRefresh = @Sendable () async -> String?
     typealias StatusHandler = @Sendable (TailcatRuntimeStatus) -> Void
 
     private struct ActiveRuntime: Sendable {
@@ -51,6 +52,7 @@ actor TailcatRuntimeSupervisor {
     private let catalog: any TailcatCatalogAPI
     private let secureStore: any TailcatSecureStateStoring
     private let sessionProvider: SessionProvider
+    private let tokenRefresh: TokenRefresh?
     private let authenticator: TailcatRemoteConnectionAuthenticator
     private let listener: any TailcatLoopbackListening
     private let statusHandler: StatusHandler
@@ -69,6 +71,10 @@ actor TailcatRuntimeSupervisor {
     private var reconciling = false
     private var secureStateLoaded = false
     private var cachedSecureState: TailcatSecureState?
+#if DEBUG
+    private var pauseNextSuspend = false
+    private var suspendPause: CheckedContinuation<Void, Never>?
+#endif
 
     init(
         serverID: String,
@@ -77,6 +83,7 @@ actor TailcatRuntimeSupervisor {
         catalog: any TailcatCatalogAPI = URLSessionTailcatCatalogAPI(),
         secureStore: any TailcatSecureStateStoring = KeychainTailcatSecureStateStore(),
         sessionProvider: @escaping SessionProvider,
+        tokenRefresh: TokenRefresh? = nil,
         authenticator: TailcatRemoteConnectionAuthenticator,
         listener: any TailcatLoopbackListening,
         now: @escaping @Sendable () -> Date = { Date() },
@@ -89,6 +96,7 @@ actor TailcatRuntimeSupervisor {
         self.catalog = catalog
         self.secureStore = secureStore
         self.sessionProvider = sessionProvider
+        self.tokenRefresh = tokenRefresh
         self.authenticator = authenticator
         self.listener = listener
         self.now = now
@@ -110,22 +118,39 @@ actor TailcatRuntimeSupervisor {
             return
         }
         statusHandler(.checking)
-        let startedAt = now()
-        lastBackendSuccess = startedAt
-        guard automaticPolling, loopTask == nil else { return }
-        loopTask = Task { [weak self] in
-            guard let self else { return }
-            while !Task.isCancelled {
-                let startedAt = DispatchTime.now().uptimeNanoseconds
-                await self.requestReconcile()
-                let elapsed = DispatchTime.now().uptimeNanoseconds - startedAt
-                let interval = UInt64(TailcatTransportContract.pollInterval * 1_000_000_000)
-                if elapsed < interval {
-                    try? await Task.sleep(nanoseconds: interval - elapsed)
-                }
-            }
-        }
+        lastBackendSuccess = now()
+        startPollingLoopIfNeeded()
     }
+
+    /// Sleep: stop sockets/listener but keep identity, intention, published
+    /// host, and keys. A later `resume()` invalidates this generation so a
+    /// delayed suspend cannot disable after wake.
+    func suspend() async {
+        generation &+= 1
+        let operationGeneration = generation
+        loopTask?.cancel()
+        loopTask = nil
+        lastBackendSuccess = now()
+        let pending = beginStopRuntime()
+        await testingYieldIfNeeded()
+        await finishStopRuntime(pending)
+        guard generation == operationGeneration else { return }
+    }
+
+    /// Wake: revalidate account/lease/digest and restart with the same keys
+    /// when admission is unchanged. No-ops when the user has disabled access.
+    func resume() async {
+        generation &+= 1
+        let operationGeneration = generation
+        guard enabled else { return }
+        statusHandler(.checking)
+        lastBackendSuccess = now()
+        startPollingLoopIfNeeded()
+        guard enabled, generation == operationGeneration else { return }
+        await requestReconcile()
+    }
+
+    var isEnabled: Bool { enabled }
 
 #if DEBUG
     func reconcileNowForTesting() async {
@@ -133,6 +158,17 @@ actor TailcatRuntimeSupervisor {
     }
 
     var hasActiveRuntimeForTesting: Bool { runtime != nil }
+
+    func pauseNextSuspendForTesting() {
+        pauseNextSuspend = true
+    }
+
+    var isSuspendPausedForTesting: Bool { suspendPause != nil }
+
+    func continuePausedSuspendForTesting() {
+        suspendPause?.resume()
+        suspendPause = nil
+    }
 #endif
 
     func accountChanged() async {
@@ -162,6 +198,22 @@ actor TailcatRuntimeSupervisor {
         lastAccessToken = nil
     }
 
+    private func startPollingLoopIfNeeded() {
+        guard automaticPolling, loopTask == nil else { return }
+        loopTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                let startedAt = DispatchTime.now().uptimeNanoseconds
+                await self.requestReconcile()
+                let elapsed = DispatchTime.now().uptimeNanoseconds - startedAt
+                let interval = UInt64(TailcatTransportContract.pollInterval * 1_000_000_000)
+                if elapsed < interval {
+                    try? await Task.sleep(nanoseconds: interval - elapsed)
+                }
+            }
+        }
+    }
+
     private func requestReconcile() async {
         guard enabled else { return }
         reconcilePending = true
@@ -183,7 +235,11 @@ actor TailcatRuntimeSupervisor {
         }
         lastAccessToken = session.accessToken
         do {
-            let response = try await catalog.host(serverID: serverID, accessToken: session.accessToken)
+            let catalog = self.catalog
+            let serverID = self.serverID
+            let response = try await withAccessTokenRetry(accessToken: session.accessToken) { token in
+                try await catalog.host(serverID: serverID, accessToken: token)
+            }
             guard enabled, generation == operationGeneration else { return }
             let stored = try loadSecureState()
             try TailcatAdmission.validate(
@@ -215,7 +271,19 @@ actor TailcatRuntimeSupervisor {
 
             currentSnapshot = response.snapshot
             if needsRotation {
-                await rotateAndPublish(snapshot: response.snapshot, session: session, eTag: response.eTag)
+                let reusableKeys = runtime == nil
+                    ? Self.reusableKeys(
+                        stored: stored,
+                        snapshot: response.snapshot,
+                        accountID: session.user.id
+                    )
+                    : nil
+                await rotateAndPublish(
+                    snapshot: response.snapshot,
+                    session: session,
+                    eTag: response.eTag,
+                    reuseKeys: reusableKeys
+                )
             } else {
                 try persistAdmissionFields(snapshot: response.snapshot)
                 if let runtime, let eTag = response.eTag,
@@ -247,35 +315,41 @@ actor TailcatRuntimeSupervisor {
     private func rotateAndPublish(
         snapshot: TailcatAllowlistSnapshot,
         session: PrivateAccountSession,
-        eTag: String?
+        eTag: String?,
+        reuseKeys: TailcatKeyVersion? = nil
     ) async {
         let operationGeneration = generation
         await stopRuntime()
         statusHandler(.checking)
         do {
-            let stored = try loadSecureState()
-            // A crash may leave an old active key next to a publishing or
-            // revoked phase. Only an explicitly active record may carry that
-            // key forward while a replacement is published; fail-closed
-            // recovery always rotates away from non-active key material.
-            let old = stored?.phase == .active ? stored?.active : nil
-            let primaryKey = try await Task.detached { try self.bridge.generateKey() }.value
-            let fallbackKey = try await Task.detached { try self.bridge.generateKey() }.value
-            guard primaryKey != fallbackKey else {
-                throw TailcatBridgeError.rejected("server_key_collision")
+            let keys: TailcatKeyVersion
+            if let reuseKeys {
+                keys = reuseKeys
+            } else {
+                let stored = try loadSecureState()
+                // A crash may leave an old active key next to a publishing or
+                // revoked phase. Only an explicitly active record may carry that
+                // key forward while a replacement is published; fail-closed
+                // recovery always rotates away from non-active key material.
+                let old = stored?.phase == .active ? stored?.active : nil
+                let primaryKey = try await Task.detached { try self.bridge.generateKey() }.value
+                let fallbackKey = try await Task.detached { try self.bridge.generateKey() }.value
+                guard primaryKey != fallbackKey else {
+                    throw TailcatBridgeError.rejected("server_key_collision")
+                }
+                keys = TailcatKeyVersion(primary: primaryKey, fallback: fallbackKey)
+                try saveSecureState(TailcatSecureState(
+                    phase: .publishing,
+                    accountID: session.user.id,
+                    allowlistEpoch: snapshot.epoch,
+                    revision: snapshot.revision,
+                    snapshotHash: snapshot.hash,
+                    admissionDigest: snapshot.admissionDigest,
+                    eTag: eTag,
+                    active: old,
+                    pending: keys
+                ))
             }
-            let keys = TailcatKeyVersion(primary: primaryKey, fallback: fallbackKey)
-            try saveSecureState(TailcatSecureState(
-                phase: .publishing,
-                accountID: session.user.id,
-                allowlistEpoch: snapshot.epoch,
-                revision: snapshot.revision,
-                snapshotHash: snapshot.hash,
-                admissionDigest: snapshot.admissionDigest,
-                eTag: eTag,
-                active: old,
-                pending: keys
-            ))
 
             let listenerSecret = try Self.randomBytes(count: 32)
             let listenerID = try Self.randomBytes(count: 16)
@@ -341,13 +415,19 @@ actor TailcatRuntimeSupervisor {
                 await stopRuntime()
                 return
             }
-            let published = try await catalog.publishHost(
-                serverID: serverID,
-                displayName: displayName,
-                endpoints: started.endpoints,
-                accessToken: session.accessToken,
-                ifMatch: eTag
-            )
+            let catalog = self.catalog
+            let serverID = self.serverID
+            let displayName = self.displayName
+            let accessToken = lastAccessToken ?? session.accessToken
+            let published = try await withAccessTokenRetry(accessToken: accessToken) { token in
+                try await catalog.publishHost(
+                    serverID: serverID,
+                    displayName: displayName,
+                    endpoints: started.endpoints,
+                    accessToken: token,
+                    ifMatch: eTag
+                )
+            }
             guard enabled, generation == operationGeneration else {
                 await stopRuntime()
                 return
@@ -376,13 +456,19 @@ actor TailcatRuntimeSupervisor {
 
     private func renew(runtime: ActiveRuntime, session: PrivateAccountSession, eTag: String) async {
         do {
-            let published = try await catalog.publishHost(
-                serverID: serverID,
-                displayName: displayName,
-                endpoints: runtime.endpoints,
-                accessToken: session.accessToken,
-                ifMatch: eTag
-            )
+            let catalog = self.catalog
+            let serverID = self.serverID
+            let displayName = self.displayName
+            let accessToken = lastAccessToken ?? session.accessToken
+            let published = try await withAccessTokenRetry(accessToken: accessToken) { token in
+                try await catalog.publishHost(
+                    serverID: serverID,
+                    displayName: displayName,
+                    endpoints: runtime.endpoints,
+                    accessToken: token,
+                    ifMatch: eTag
+                )
+            }
             lastBackendSuccess = now()
             lastRenewal = now()
             currentETag = published.eTag
@@ -481,24 +567,97 @@ actor TailcatRuntimeSupervisor {
         secureStateLoaded = true
     }
 
-    private func stopRuntime() async {
+    private struct ClosingRuntime {
+        let primary: TailcatRunningServer?
+        let fallback: TailcatRunningServer?
+    }
+
+    private func beginStopRuntime() -> ClosingRuntime? {
         authenticator.removeAllContexts()
         listener.stop()
-        guard let runtime else { return }
+        guard let runtime else { return nil }
         self.runtime = nil
-        _ = await Task.detached {
-            if let primary = runtime.primary {
-                try? self.bridge.closeServer(handle: primary.handle)
+        return ClosingRuntime(primary: runtime.primary, fallback: runtime.fallback)
+    }
+
+    private func finishStopRuntime(_ pending: ClosingRuntime?) async {
+        guard let pending else { return }
+        let bridge = self.bridge
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global(qos: .utility).async {
+                if let primary = pending.primary {
+                    try? bridge.closeServer(handle: primary.handle)
+                }
+                if let fallback = pending.fallback {
+                    try? bridge.closeServer(handle: fallback.handle)
+                }
+                continuation.resume()
             }
-            if let fallback = runtime.fallback {
-                try? self.bridge.closeServer(handle: fallback.handle)
-            }
-        }.value
+        }
+    }
+
+    private func stopRuntime() async {
+        await finishStopRuntime(beginStopRuntime())
+    }
+
+    private func testingYieldIfNeeded() async {
+#if DEBUG
+        guard pauseNextSuspend else { return }
+        pauseNextSuspend = false
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            suspendPause = continuation
+        }
+#endif
     }
 
     private func deletePublishedHost(accessToken: String?) async {
         guard let accessToken else { return }
         try? await catalog.deleteHost(serverID: serverID, accessToken: accessToken)
+    }
+
+    /// Reuse stored identity keys after sleep when account, epoch, revision,
+    /// and admission digest are unchanged. Host/runtime absence is not a
+    /// rotation reason on wake — we republish the same keys.
+    private static func reusableKeys(
+        stored: TailcatSecureState?,
+        snapshot: TailcatAllowlistSnapshot,
+        accountID: String
+    ) -> TailcatKeyVersion? {
+        guard let stored,
+              stored.phase == .active,
+              let keys = stored.active,
+              stored.accountID == accountID,
+              stored.allowlistEpoch == snapshot.epoch,
+              stored.revision == snapshot.revision,
+              !TailcatAdmission.admittedPeersChanged(stored: stored, snapshot: snapshot)
+        else { return nil }
+        return keys
+    }
+
+    private func withAccessTokenRetry<T: Sendable>(
+        accessToken: String,
+        operation: @Sendable (String) async throws -> T
+    ) async throws -> T {
+        do {
+            return try await operation(accessToken)
+        } catch let error as TailcatCatalogError where error.requiresReauthentication {
+            guard let refreshed = await refreshedAccessToken(stale: accessToken) else {
+                throw error
+            }
+            lastAccessToken = refreshed
+            return try await operation(refreshed)
+        }
+    }
+
+    private func refreshedAccessToken(stale: String) async -> String? {
+        if let tokenRefresh {
+            guard let token = await tokenRefresh(), !token.isEmpty else { return nil }
+            return token
+        }
+        guard let token = sessionProvider()?.accessToken, token != stale, !token.isEmpty else {
+            return nil
+        }
+        return token
     }
 
     private static func randomBytes(count: Int) throws -> Data {

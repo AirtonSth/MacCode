@@ -1051,7 +1051,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         hangWatchdogAwakeState.value = .displaySleep
         lifecycleRecorder?.record("hang_watchdog_awake state=displaySleep")
         directAccessSupervisor?.suspend()
-        Task { await tailcatSupervisor?.shutdown() }
+        let supervisor = tailcatSupervisor
+        let previous = tailcatSettingTask
+        tailcatSettingTask = Task {
+            await previous?.value
+            await supervisor?.suspend()
+        }
     }
 
     @objc private func workspaceDidWake() {
@@ -1061,7 +1066,18 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let remoteEnabled = ((try? context.settingsRepo.get("remote_access_enabled")) ?? "0") == "1"
         do {
             try directAccessSupervisor?.resume(remoteEnabled: remoteEnabled)
-            configureTailcatAccess()
+            let supervisor = tailcatSupervisor
+            let previous = tailcatSettingTask
+            tailcatSettingTask = Task { [weak self] in
+                await previous?.value
+                await supervisor?.resume()
+                let enabled = await supervisor?.isEnabled ?? false
+                if !enabled {
+                    await MainActor.run {
+                        self?.configureTailcatAccess()
+                    }
+                }
+            }
         } catch {
             NSLog("Failed to restart HTTP server after wake: \(error)")
             recordServerStartupFailure("HTTP server", reason: error.localizedDescription)
