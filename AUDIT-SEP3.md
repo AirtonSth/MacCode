@@ -59,6 +59,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 39 (2026-09-03): SocketServer upload/HTTP remainder — reviewed (shared codecs, manual zero-pad, bounded caches). FIXED: `receivedBytes` chained compactMap+compactMap+reduce with three intermediates — now single-pass accumulate; total identical
 
+- [x] Slice 40 (2026-09-03): AgentRuntime installer remainder — reviewed (cached shell env, token/receipt paths, wrapper catalog). FIXED: `systemCommandSearchDirectories` built dirs via split+map+filter with two intermediates — now single-pass keep; directories identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
