@@ -171,6 +171,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 95 (2026-09-03): `Sources/DistillCore/` evidence source ranges (contract-safe: no crushing math, gates, ledger, or savings touched) — reviewed (JSONCrusher row-count/mean/variance folds kept: statistics over already-materialised arrays, not filter intermediates; `tokens` lowercased+split+filter+map is a small per-query tokenize; SocketServer/Persistence compactMap+Optional-chain hits are single-pass decodes). FIXED: `sourceRanges` ran filter then sorted (two traversals + one intermediate) over the selected line set on the evidence-pack path — now collects in-bounds indices in one reserved loop and sorts in place; ranges identical (proof: 16/16 EvidencePack-filtered tests pass)
 
+- [x] Slice 96 (2026-09-03): `Sources/Surfaces/` message-page mirror merge — reviewed (rail `knownLocalThreadIDs` Set+union+compactMap kept: small per-open snapshot merge; checkpoint diff `map+joined`, labels Set, rail target id Sets, FeedSurface title join are single-map joins, not folds). FIXED: `mergeLoadedMessagesWithInMemoryMirrors` built the loaded-id Set via map then filtered in-memory rows (two traversals + one intermediate) on the message-page load path — now folds the id set and same-thread mirrors in one pass with reserved capacity; merged rows identical (proof: `test_mergeLoadedMessagesPreservesInMemoryUserMirror` passes 1/1)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
