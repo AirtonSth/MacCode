@@ -217,6 +217,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 118 (2026-09-03): `Sources/AppShell/` fleet search (per-keystroke roster filter on the Bots screen; finished-roster/schedule filters use the same shape but are separate guarded renders, left for their own slices) — reviewed (Token Saver homogeneous-JSON verdict folds left untouched as contract code). FIXED: `fleet` lowercased all four bot text fields (`name`/`handle`/`title`/`description`) per bot per keystroke just for a case-insensitive contains (4 full-string copies per bot per keystroke) — now `range(of:options:.caseInsensitive)` scans in place with no copies; match sets identical (proof: 10/10 fleet/search/roster-filtered BotsWindowTests pass in production-base sandbox with patched file)
 
+- [x] Slice 119 (2026-09-03): `Sources/AppShell/` active-bot search (Active Bots screen per-keystroke filter; same `lowercased().contains` shape as Slice 118's `fleet`, incl. the optional `preview` field) — reviewed (`filteredFinishedBotItems` keeps its 2-field shape for its own slice; schedule-task filter keeps its 4-field shape for its own slice). FIXED: `filterActiveBotSearch` lowercased `title`/`handle`/`detail`/`preview` per row per keystroke (up to 4 full-string copies per row) — now `range(of:options:.caseInsensitive)` in place; match sets identical (proof: 10/10 active/finished/search-filtered BotsWindowTests pass in production-base sandbox with patched file)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
