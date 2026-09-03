@@ -387,10 +387,18 @@ enum AppDiagnostics {
     nonisolated static func aggregateProviderStats(
         processes: [ProviderRuntimeProcess]
     ) -> ProviderStats {
-        ProviderStats(
+        // Single pass: RSS total + orphan (ppid == 1) count together, no
+        // filter intermediate on the heartbeat path.
+        var totalRSSKB = 0
+        var orphanCount = 0
+        for process in processes {
+            totalRSSKB += process.rssKB
+            if process.ppid == 1 { orphanCount += 1 }
+        }
+        return ProviderStats(
             processCount: processes.count,
-            totalRSSKB: processes.reduce(0) { $0 + $1.rssKB },
-            orphanCount: processes.filter { $0.ppid == 1 }.count
+            totalRSSKB: totalRSSKB,
+            orphanCount: orphanCount
         )
     }
 
