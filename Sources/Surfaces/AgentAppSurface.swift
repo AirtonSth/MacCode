@@ -4066,11 +4066,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         inMemory: [AgentMessage],
         threadId: AgentThreadID
     ) -> [AgentMessage] {
-        let loadedIds = Set(loadedRows.map(\.id))
-        let mirrors = inMemory.filter { candidate in
-            candidate.threadId == threadId && !loadedIds.contains(candidate.id)
+        // Single pass: id set plus same-thread mirrors together, no filter
+        // intermediate on the message-page load path.
+        var loadedIds = Set<AgentMessageID>()
+        loadedIds.reserveCapacity(loadedRows.count)
+        var merged = loadedRows
+        for row in loadedRows {
+            loadedIds.insert(row.id)
         }
-        return loadedRows + mirrors
+        for candidate in inMemory where candidate.threadId == threadId {
+            if !loadedIds.contains(candidate.id) {
+                loadedIds.insert(candidate.id)
+                merged.append(candidate)
+            }
+        }
+        return merged
     }
 
     /// Shared UX for an outgoing user turn that is actually starting now:
