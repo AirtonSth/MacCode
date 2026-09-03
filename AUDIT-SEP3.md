@@ -103,6 +103,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 61 (2026-09-03): `Sources/AppShell/` pre-turn managed-bin prepend — reviewed (reaper selection already single-map, SSH options already folded elsewhere). FIXED: `providerPathWithManagedWrappers` built PATH parts via split+map+filter with two intermediates at 4 call sites per agent turn — now single-pass keep with empty segments preserved; joined PATH identical
 
+- [x] Slice 62 (2026-09-03): `Sources/AppShell/` split-layout ratio path — reviewed (`normalizedRatios`, collapsed set already direct). FIXED: `layoutByRatios` ran filter+map+reduce with two intermediates per layout pass in both vertical and horizontal branches on the resize/divider-drag path — now single-pass accumulate; pane frames identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
