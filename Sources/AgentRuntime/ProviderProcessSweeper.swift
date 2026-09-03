@@ -186,14 +186,20 @@ public enum ProviderProcessSweeper {
         of pid: Int32,
         in processes: [ProviderRuntimeProcess]
     ) -> [Int32] {
-        var pending = processes.filter { $0.ppid == pid }.map(\.pid)
+        var childrenByPPID: [Int32: [Int32]] = [:]
+        for process in processes {
+            childrenByPPID[process.ppid, default: []].append(process.pid)
+        }
+        var pending = childrenByPPID[pid] ?? []
         var seen = Set<Int32>()
         var result: [Int32] = []
 
         while let child = pending.popLast() {
             guard seen.insert(child).inserted else { continue }
             result.append(child)
-            pending.append(contentsOf: processes.filter { $0.ppid == child }.map(\.pid))
+            if let grandchildren = childrenByPPID[child] {
+                pending.append(contentsOf: grandchildren)
+            }
         }
 
         return result
