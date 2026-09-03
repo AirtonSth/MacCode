@@ -507,9 +507,14 @@ func fileOutDragInfo(absolutePath: String) -> FileOutDragInfo {
 }
 
 func fileOutCombinedDragPayload(fileTabPayload: String?, movePayload: String?) -> String? {
-    let payloads = [fileTabPayload, movePayload]
-        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-        .filter { !$0.isEmpty }
+    var payloads: [String] = []
+    payloads.reserveCapacity(2)
+    if let payload = fileTabPayload?.trimmingCharacters(in: .whitespacesAndNewlines), !payload.isEmpty {
+        payloads.append(payload)
+    }
+    if let payload = movePayload?.trimmingCharacters(in: .whitespacesAndNewlines), !payload.isEmpty {
+        payloads.append(payload)
+    }
     return payloads.isEmpty ? nil : payloads.joined(separator: "\n")
 }
 
