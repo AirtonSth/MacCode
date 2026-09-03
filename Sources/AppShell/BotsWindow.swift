@@ -5470,8 +5470,16 @@ public final class BotsViewModel: ObservableObject {
                 }
             }
             var seen = Set<AgentThreadID>()
-            let toStop = (sendWorks.compactMap(\.threadID) + threadIDs).filter {
-                seen.insert($0).inserted
+            seen.reserveCapacity(sendWorks.count + threadIDs.count)
+            var toStop: [AgentThreadID] = []
+            toStop.reserveCapacity(sendWorks.count + threadIDs.count)
+            for work in sendWorks {
+                if let threadID = work.threadID, seen.insert(threadID).inserted {
+                    toStop.append(threadID)
+                }
+            }
+            for threadID in threadIDs where seen.insert(threadID).inserted {
+                toStop.append(threadID)
             }
             let coordinator = self.context.coordinator
             let termination = Task {
