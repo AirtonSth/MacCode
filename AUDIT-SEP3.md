@@ -51,6 +51,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 35 (2026-09-03): Persistence store remainder — reviewed (shared codecs, bound-before-store, one-shot ids). FIXED: `BotComputerActionStore.writeResult` rebuilt the array via `Array(suffix(32))` on every write — now trims only when over budget; retained newest identical
 
+- [x] Slice 36 (2026-09-03): CoreModel BotBrain remainder — reviewed (mention paths, codecs, PATH handling). FIXED: `skillDescription` materialised the whole skill body as [String] before scanning — now lazy split; same result
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
