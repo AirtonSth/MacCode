@@ -2623,7 +2623,11 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
         transferLogs.append(line)
         // Keep a longer rolling history so transient errors don't scroll off
         // instantly; the log pane is scrollable (UX-MAC_SSH-010).
-        transferLogs = Array(transferLogs.suffix(Self.transferLogLimit))
+        // PERF: suffix cap only pays when over budget; steady-state appends
+        // skip the Array copy. Same retained contents.
+        if transferLogs.count > Self.transferLogLimit {
+            transferLogs.removeFirst(transferLogs.count - Self.transferLogLimit)
+        }
     }
 
     private static let transferLogLimit = 200
