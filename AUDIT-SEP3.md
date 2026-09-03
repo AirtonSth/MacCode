@@ -69,6 +69,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 44 (2026-09-03): `Sources/AppShell/` bots schedule-task filters — reviewed (search-scoped counts, status filtering). FIXED: `applyScheduleTaskFilters` ran two counting filters plus a third listing filter per keystroke — now one pass; counts/rows identical
 
+- [x] Slice 45 (2026-09-03): `Sources/Surfaces/` prompt-history record path — reviewed (bounded in-memory history, persisted store, error surface). FIXED: `recordPromptHistory` rebuilt the 200-entry array via `Array(suffix:)` on every sent prompt — now trims only when over budget; retained newest identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
