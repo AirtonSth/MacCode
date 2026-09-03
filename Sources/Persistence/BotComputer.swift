@@ -214,8 +214,10 @@ public struct BotComputerStore: Sendable {
             var results = try loadResults()
             results.removeAll { $0.id == result.id }
             results.append(result)
+            // PERF: cap only pays when over budget; steady-state writes skip
+            // the suffix copy. Same retained newest-32.
             if results.count > Self.maxRetainedResults {
-                results = Array(results.suffix(Self.maxRetainedResults))
+                results.removeFirst(results.count - Self.maxRetainedResults)
             }
             try writeJSON(results, to: resultsURL)
         }
