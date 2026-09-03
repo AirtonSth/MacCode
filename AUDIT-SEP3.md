@@ -27,6 +27,7 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 - [x] Slice 15 (2026-09-03): `Sources/AgentRuntime/` provider remainder — reviewed per-call codecs/regexes (orchestration/coordinator/transcript already shared). FIXED: `TokenSaverAccountUsageRefresher.grokBuildProductPercent` recompiled `[^a-z0-9]` regex per product row — now a shared static; slug identical
 - [x] Slice 16 (2026-09-03): `Sources/CoreModel/` + `DistillCore` remainder — reviewed per-call codecs/regexes (crushers/sanitizers already static). FIXED: `ComputerUseNativeHostBackend.stateToken` built SHA256 hex via 32× `String(format:)` per token (twice) — now nibble table; tokens identical
 - [x] Slice 17 (2026-09-03): browser-sync + agent-thread + terminal-budget paths — reviewed (nav dedupe, coalesced reloads, shared codecs). FIXED: `TerminalMemoryBudgetAuthority.enforceBudget` ran filter-then-min (two dictionary traversals + filtered intermediate per eviction) — now single-pass min; victim order identical
+- [x] Slice 18 (2026-09-03): AppShell Sidebar/palette second pass — reviewed (cached filters, busy caches, frecency paths). FIXED: `CommandPalette.sectioned` ran one `visible.filter` per category (N×C scans per keystroke) — now single-pass bucketing; section order/rows identical
 
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.

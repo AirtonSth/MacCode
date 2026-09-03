@@ -639,10 +639,16 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     /// optionally excluded so they aren't shown twice.
     private func sectioned(_ visible: [PaletteCommand], excludingRecent: Bool) -> [PaletteCommand] {
         let recent = excludingRecent ? Set(recentCommandIDs) : []
+        // PERF: one pass instead of allCases × filter (N×C scans per keystroke).
+        var buckets: [PaletteCategory: [PaletteCommand]] = [:]
+        buckets.reserveCapacity(PaletteCategory.allCases.count)
+        for cmd in visible where !recent.contains(cmd.id) {
+            buckets[cmd.category, default: []].append(cmd)
+        }
         var out: [PaletteCommand] = []
+        out.reserveCapacity(visible.count + PaletteCategory.allCases.count)
         for category in PaletteCategory.allCases {
-            let rows = visible.filter { $0.category == category && !recent.contains($0.id) }
-            guard !rows.isEmpty else { continue }
+            guard let rows = buckets[category], !rows.isEmpty else { continue }
             out.append(headerRow(id: "palette.section.\(category.rawValue.lowercased())", title: category.rawValue))
             out.append(contentsOf: rows)
         }
