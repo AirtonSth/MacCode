@@ -270,8 +270,9 @@ public enum AssistantAccountUsageParser {
                 range: matchedRange
             ),
             let percent = Double(matchedNS.substring(with: numberMatch.range)) else { continue }
-            let lower = matched.lowercased()
-            let used = (lower.contains("remaining") || lower.contains("left")) ? max(0, 100 - percent) : percent
+            let isRemaining = matched.range(of: "remaining", options: .caseInsensitive) != nil
+                || matched.range(of: "left", options: .caseInsensitive) != nil
+            let used = isRemaining ? max(0, 100 - percent) : percent
             // Also pick up session % when the modern one-liner is present.
             let session = firstPercent(in: text, regexes: [claudeLooseSessionRegex])
             return AssistantAccountUsage(
