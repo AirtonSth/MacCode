@@ -67,6 +67,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 43 (2026-09-03): `Sources/AppShell/` scheduled-tasks overview — reviewed (scoped refresh, deferred hydration, keystroke filtering). FIXED: `reloadTasks` ran two counting filters plus a third listing filter per keystroke/selection — now one pass derives active count and visible list; counts/rows identical
 
+- [x] Slice 44 (2026-09-03): `Sources/AppShell/` bots schedule-task filters — reviewed (search-scoped counts, status filtering). FIXED: `applyScheduleTaskFilters` ran two counting filters plus a third listing filter per keystroke — now one pass; counts/rows identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
