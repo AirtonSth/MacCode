@@ -1611,10 +1611,16 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             if !exact.isEmpty { return exact.map(LiveActivityAcceptanceTarget.v2) }
             // Stale ownership after Mac relaunch: still try the newest update token.
             // Persistence may round adjacent registrations to the same timestamp.
-            // In that tie, `upsert` order is the only remaining recency signal.
-            let newestTimestamp = preferred.map(\.updatedAt).max()
-            if let newestTimestamp,
-               let newest = preferred.last(where: { $0.updatedAt == newestTimestamp }) {
+            // In that tie, `upsert` order is the only remaining recency signal, so
+            // track the max timestamp in place and keep the LAST record at that
+            // max (later upsert order wins) — one pass, no temp array.
+            var newest: PrivatePushTargetRecord?
+            for record in preferred {
+                if newest == nil || record.updatedAt >= newest!.updatedAt {
+                    newest = record
+                }
+            }
+            if let newest {
                 return [.v2(newest)]
             }
             // No update token yet (iOS app never opened after remote start): use
