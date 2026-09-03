@@ -13,6 +13,16 @@ public enum AuthoritativePayloadRecovery {
     /// Owned trailer prefix so recovery detection cannot collide with provider content.
     public static let ownedTrailerToken = "rc_oversized_v1"
 
+    // PERF: these trailer/handle patterns recompiled on every oversized-row
+    // check (token-rate persist path). Compile once; NSRegularExpression
+    // matching is thread-safe.
+    private static let byteCountRegex = try! NSRegularExpression(
+        pattern: #"…\[truncated rc_oversized_v1 (\d+)→(\d+) bytes\]\[\[rc:[0-9a-fA-F]+\]\]\z"#
+    )
+    private static let handleStripRegex = try! NSRegularExpression(
+        pattern: #"\[\[rc:([0-9a-fA-F]+)\]\]"#
+    )
+
     /// Parse original byte count from an owned presentation trailer when present.
     /// Used for hot-replay admission so rehydrate cannot expand past the budget.
     /// `payload` may be a full row or only a trailing suffix (metadata path).
@@ -24,9 +34,7 @@ public enum AuthoritativePayloadRecovery {
     ) -> Int {
         let presentation = presentationFallback ?? payload.utf8.count
         // True suffix only (\\z). Mid-payload lookalikes are ignored.
-        let pattern = #"…\[truncated rc_oversized_v1 (\d+)→(\d+) bytes\]\[\[rc:[0-9a-fA-F]+\]\]\z"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(
+        guard let match = Self.byteCountRegex.firstMatch(
                 in: payload,
                 options: [],
                 range: NSRange(payload.startIndex..., in: payload)
@@ -171,10 +179,8 @@ public enum AuthoritativePayloadRecovery {
         from text: String,
         resolve: (String) -> Bool
     ) -> String {
-        let pattern = #"\[\[rc:([0-9a-fA-F]+)\]\]"#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
         let ns = text as NSString
-        let matches = regex.matches(in: text, range: NSRange(location: 0, length: ns.length))
+        let matches = Self.handleStripRegex.matches(in: text, range: NSRange(location: 0, length: ns.length))
         var result = text
         // Replace from end so ranges stay valid.
         for match in matches.reversed() {
