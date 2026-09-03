@@ -2104,7 +2104,12 @@ public final class AppContext {
             }
             let managedBin = installer.managedCLIBinURL.path
             let currentPath = baseEnvironment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
-            let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }
+            // PERF: single pass avoids the map + filter intermediates on the
+            // pre-turn env path; joined PATH identical.
+            var pathParts: [String] = []
+            for part in currentPath.split(separator: ":") where part != managedBin {
+                pathParts.append(String(part))
+            }
             env["PATH"] = ([managedBin] + pathParts).joined(separator: ":")
             env["RC_REMOTE_CODE_MANAGED_BIN"] = managedBin
         }
