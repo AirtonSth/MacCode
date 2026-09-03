@@ -681,22 +681,26 @@ final class TerminalMemoryBudgetAuthority {
         purgeReleasedOwners()
         var attempted = Set<UUID>()
         while retainedBytesForTesting > maxRetainedBytes {
-            guard let candidate = entries
-                .filter({ token, entry in
-                    !attempted.contains(token) && entry.owner != nil
-                })
-                .min(by: { lhs, rhs in
-                    let lhsPriority = lhs.value.priority()
-                    let rhsPriority = rhs.value.priority()
-                    if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
-                    return lhs.value.lastTouched < rhs.value.lastTouched
-                }) else {
+            // PERF: single pass instead of filter-then-min (two dictionary
+            // traversals per eviction). Entries are few; the win is avoiding
+            // the filtered intermediate on every pressure loop iteration.
+            var candidate: (key: UUID, value: Entry)?
+            for (token, entry) in entries {
+                guard !attempted.contains(token), entry.owner != nil else { continue }
+                guard let best = candidate else { candidate = (token, entry); continue }
+                let p = entry.priority()
+                let bp = best.value.priority()
+                if p < bp || (p == bp && entry.lastTouched < best.value.lastTouched) {
+                    candidate = (token, entry)
+                }
+            }
+            guard let victim = candidate else {
                 return
             }
-            attempted.insert(candidate.key)
-            let before = max(0, candidate.value.retainedBytes())
-            candidate.value.reclaim()
-            let after = max(0, candidate.value.retainedBytes())
+            attempted.insert(victim.key)
+            let before = max(0, victim.value.retainedBytes())
+            victim.value.reclaim()
+            let after = max(0, victim.value.retainedBytes())
             if after < before {
                 attempted.removeAll(keepingCapacity: true)
             }
@@ -2539,8 +2543,11 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     }
 
     private func autoSubmitSavedSSHPasswordIfNeeded(from data: Data) {
-        guard let raw = String(data: data, encoding: .utf8)?.lowercased(),
-              raw.contains("password:") || raw.contains("passphrase") else { return }
+        // PERF: case-insensitive scan avoids lowercased() copying the whole
+        // PTY chunk on every output arrival; same prompt verdicts.
+        guard let raw = String(data: data, encoding: .utf8),
+              raw.range(of: "password:", options: .caseInsensitive) != nil
+                || raw.range(of: "passphrase", options: .caseInsensitive) != nil else { return }
         passwordPromptCount += 1
         if let notice = Self.autoSubmitNotice(promptCount: passwordPromptCount) {
             appendString("\r\n" + notice + "\r\n")
@@ -3202,11 +3209,13 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     }
 
     private static func visibleLineCount(_ text: String) -> Int {
-        text
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .count
+        var count = 0
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            if !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                count += 1
+            }
+        }
+        return count
     }
 
     public func focus() {

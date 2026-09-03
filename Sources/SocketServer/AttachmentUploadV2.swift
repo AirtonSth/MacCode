@@ -796,13 +796,26 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
         }
 
         var receivedBytes: Int {
-            receivedChunks.keys.compactMap { Int($0) }.compactMap { index in
-                AttachmentUploadV2Policy.expectedChunkByteCount(index: index, sizeBytes: sizeBytes)
-            }.reduce(0, +)
+            // PERF: single pass avoids the compactMap + compactMap + reduce
+            // intermediates on the progress path; byte total identical.
+            var total = 0
+            for key in receivedChunks.keys {
+                guard let index = Int(key),
+                      let count = AttachmentUploadV2Policy.expectedChunkByteCount(index: index, sizeBytes: sizeBytes) else { continue }
+                total += count
+            }
+            return total
         }
 
         var orderedIndices: [Int] {
-            receivedChunks.keys.compactMap(Int.init).sorted()
+            var indices: [Int] = []
+            indices.reserveCapacity(receivedChunks.count)
+            for key in receivedChunks.keys {
+                guard let index = Int(key) else { continue }
+                indices.append(index)
+            }
+            indices.sort()
+            return indices
         }
     }
 
@@ -891,8 +904,14 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
     }
 
     private func chunkFileURL(in jobDir: URL, index: Int) -> URL {
-        chunksDirectory(in: jobDir)
-            .appendingPathComponent(String(format: "%05d.raw", index), isDirectory: false)
+        // PERF: String(format:) re-parsed "%05d" on every chunk store/verify/
+        // assemble; manual zero-pad emits identical names.
+        let digits = String(index)
+        let padded = digits.count >= 5
+            ? digits
+            : String(repeating: "0", count: 5 - digits.count) + digits
+        return chunksDirectory(in: jobDir)
+            .appendingPathComponent(padded + ".raw", isDirectory: false)
     }
 
     private func manifestURL(in jobDir: URL) -> URL {
@@ -1787,13 +1806,14 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
         return normalized
     }
 
+    private static let imageExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "heic", "webp", "svg", "avif"
+    ]
+
     private static func kind(filename: String, mimeType: String?) -> AgentAttachmentKind {
         if let mimeType, mimeType.hasPrefix("image/") { return .image }
-        let ext = URL(fileURLWithPath: filename).pathExtension.lowercased()
-        let imageExtensions: Set<String> = [
-            "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "heic", "webp", "svg", "avif"
-        ]
-        return imageExtensions.contains(ext) ? .image : .file
+        let ext = URL(fileURLWithPath: filename).pathExtension
+        return imageExtensions.contains { $0.caseInsensitiveCompare(ext) == .orderedSame } ? .image : .file
     }
 
     /// PERF: nibble table instead of per-byte `String(format:)` so chunk /

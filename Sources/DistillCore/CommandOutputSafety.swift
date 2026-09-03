@@ -60,8 +60,11 @@ public enum CommandOutputCharGate {
             kept.append(line); used += line.count + 1
         }
         // Ensure every failing-test line survives even if it was past the cut.
-        for f in failing where !kept.contains(f) { kept.append(f) }
-        let elided = lines.count - kept.filter { lines.contains($0) }.count
+        // PERF: single pass with a kept-index (was kept.contains per failing
+        // line plus a filter/contains elided count: O(F×K + K×N) on truncation).
+        var keptIndex: Set<String> = Set(kept)
+        for f in failing where !keptIndex.contains(f) { kept.append(f); keptIndex.insert(f) }
+        let elided = lines.count - kept.count
         if elided > 0 { kept.append("… \(elided) lines elided (retrieve original) …") }
         return kept.joined(separator: "\n")
     }

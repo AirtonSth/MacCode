@@ -1747,6 +1747,46 @@ final class AgentAppViewModelTests: XCTestCase {
                        "stale provider questions must reappear as read-only diagnostics after restart/reload")
     }
 
+    // SEP-3: the off-main open bundle shares one callback decoder under a
+    // lock instead of allocating per open. Seeded callbacks must decode into
+    // pending events exactly like the MainActor rehydrate path.
+    func test_gatherThreadOpenBundle_decodesPendingCallbacks() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-callback-bundle-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let callbackRepo = ProviderPendingCallbackRepository(db: db)
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(workspaceId: workspaceID, title: "callbacks", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        try callbackRepo.record(threadId: thread.id, request: AssistantPendingRequest(
+            id: "approval-9",
+            turnId: "turn-9",
+            kind: .commandExecution,
+            title: "Run command",
+            detail: "swift test",
+            createdAtMs: 9_000
+        ))
+        let coord = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                        threadRepo: threadRepo,
+                                        providers: [.codex: FakeProviderRunner(provider: .codex)])
+        let bundle = await AgentAppViewModel.gatherThreadOpenBundle(
+            threadId: thread.id,
+            coordinator: coord,
+            proposedPlanRepo: nil,
+            pendingCallbackRepo: callbackRepo,
+            checkpointRepo: nil,
+            planNotesStore: nil,
+            queuedMessageRepo: nil,
+            includeRunStartedAt: false
+        )
+        XCTAssertTrue(bundle.pendingCallbackEvents.contains {
+            if case .requestOpened(let req) = $0 { return req.id == "approval-9" }
+            return false
+        }, "off-main bundle must decode seeded approval callbacks via the shared decoder")
+    }
+
     func test_failedPendingCallbackResponsesBecomeStaleAndNonActionable() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-callback-fail-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()

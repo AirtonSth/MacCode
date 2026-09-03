@@ -3154,8 +3154,11 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             from: data
         )
         packageManifestDecodeLock.unlock()
-        guard let manifest = decodedManifest,
-              manifest.schemaVersion == 1,
+        guard let manifest = decodedManifest else { return false }
+        // Single map feeds both the sorted-allowlist compare and the
+        // duplicate-path check below; contents identical to two maps.
+        let manifestPaths = manifest.files.map(\.relativePath)
+        guard manifest.schemaVersion == 1,
               manifest.managedBy == "RemoteCode",
               manifest.skillID == pinned.skillID,
               manifest.sourceURL == pinned.sourceURL,
@@ -3163,8 +3166,8 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
               manifest.sourceTreeSHA256 == pinned.sourceTreeSHA256,
               manifest.localVersion == pinned.localVersion,
               URL(fileURLWithPath: manifest.installPath, isDirectory: true).standardizedFileURL == canonicalPackageURL,
-              manifest.files.map(\.relativePath).sorted() == pinned.allowedPaths,
-              Set(manifest.files.map(\.relativePath)).count == manifest.files.count,
+              manifestPaths.sorted() == pinned.allowedPaths,
+              Set(manifestPaths).count == manifest.files.count,
               AgentSkillInstaller.remoteCodeOrchestrateTreeDigest(manifest.files) == manifest.sourceTreeSHA256 else {
             return false
         }

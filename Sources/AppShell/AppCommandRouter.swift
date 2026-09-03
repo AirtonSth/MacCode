@@ -205,7 +205,11 @@ public final class AgentAppReadGateway: @unchecked Sendable {
                     request.state = callback.state
                     request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
                     if callback.state == .stale, let reason = callback.staleReason {
-                        request.detail = [request.detail, reason].compactMap { $0 }.joined(separator: "\n")
+                        if let detail = request.detail {
+                            request.detail = detail + "\n" + reason
+                        } else {
+                            request.detail = reason
+                        }
                     }
                     requests.append(request)
                 case .userInput:
@@ -847,15 +851,29 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             SurfaceRegistry.shared.setVisibleSurfaceIDs([])
             return
         }
-        var workspaceIDs = Set(ctx.state.windows.compactMap(\.selectedWorkspaceID))
-        if let detached = windowController?.detachedVisibleWorkspaceIDsForSurfaceReconciliation() {
-            workspaceIDs.formUnion(detached)
-        }
+        let workspaceIDs = visibleWorkspaceIDs()
         let visibleIDs = workspaceIDs.reduce(into: Set<SurfaceID>()) { ids, workspaceID in
             guard let ws = ctx.state.workspaces[workspaceID] else { return }
             ids.formUnion(selectedSurfaceIDs(in: ws.layout))
         }
         SurfaceRegistry.shared.setVisibleSurfaceIDs(visibleIDs)
+    }
+
+    /// Workspace IDs with a selected workspace across windows plus detached
+    /// visible ones. Single pass with a reserved set; no compactMap intermediate.
+    private func visibleWorkspaceIDs() -> Set<WorkspaceID> {
+        guard let ctx = context else { return [] }
+        var workspaceIDs = Set<WorkspaceID>()
+        workspaceIDs.reserveCapacity(ctx.state.windows.count)
+        for window in ctx.state.windows {
+            if let selected = window.selectedWorkspaceID {
+                workspaceIDs.insert(selected)
+            }
+        }
+        if let detached = windowController?.detachedVisibleWorkspaceIDsForSurfaceReconciliation() {
+            workspaceIDs.formUnion(detached)
+        }
+        return workspaceIDs
     }
 
     private func selectedSurfaceIDs(in node: LayoutNode) -> Set<SurfaceID> {
@@ -2098,11 +2116,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func repairSelectedTerminalFocus(reason: String) {
-        guard let ctx = context else { return }
-        var workspaceIDs = Set(ctx.state.windows.compactMap(\.selectedWorkspaceID))
-        if let detached = windowController?.detachedVisibleWorkspaceIDsForSurfaceReconciliation() {
-            workspaceIDs.formUnion(detached)
-        }
+        guard context != nil else { return }
+        let workspaceIDs = visibleWorkspaceIDs()
         for workspaceID in workspaceIDs {
             repairSelectedTerminalFocus(workspace: workspaceID, reason: reason)
         }
@@ -6902,8 +6917,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         var cleaned = TokenSaverExecutionReceiptSeam.scrub(env)
         let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
         if let path = cleaned["PATH"] {
-            let parts = path.split(separator: ":").map(String.init).filter { $0 != managedBin }
-            cleaned["PATH"] = parts.joined(separator: ":")
+            // PERF: single pass avoids the map + filter intermediates on the
+            // scrub path; joined PATH identical.
+            var kept: [String] = []
+            for part in path.split(separator: ":") where part != managedBin {
+                kept.append(String(part))
+            }
+            cleaned["PATH"] = kept.joined(separator: ":")
         }
         return cleaned
     }
@@ -6915,10 +6935,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     static func providerPathWithManagedWrappers(currentPath: String, managedBin: String) -> String {
         let trimmed = managedBin.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return currentPath }
-        let parts = currentPath
-            .split(separator: ":", omittingEmptySubsequences: false)
-            .map(String.init)
-            .filter { $0 != trimmed }
+        // PERF: single pass avoids the map + filter intermediates on the
+        // pre-turn PATH build; joined PATH identical (empty segments preserved).
+        var parts: [String] = []
+        for part in currentPath.split(separator: ":", omittingEmptySubsequences: false) where part != trimmed {
+            parts.append(String(part))
+        }
         return ([trimmed] + parts).joined(separator: ":")
     }
 
@@ -8676,8 +8698,34 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func fileType(for name: String) -> String {
-        let ext = (name as NSString).pathExtension
-        return ext.isEmpty ? "File" : "\(ext.uppercased()) File"
+        Self.fileTypeLabel(for: name)
+    }
+
+    /// Listing label matching NSString.pathExtension: a leading-dot basename
+    /// (`.png`, `foo/.png`) has no extension and is "File", not "PNG File".
+    nonisolated static func fileTypeLabel(for name: String) -> String {
+        // PERF: file listings call this per row; NSString.pathExtension +
+        // uppercased() allocated twice per file. Scan the suffix directly.
+        let utf8 = name.utf8
+        var componentStart = utf8.startIndex
+        var lastDot: String.UTF8View.Index?
+        var i = utf8.startIndex
+        while i != utf8.endIndex {
+            if utf8[i] == 0x2F {
+                let next = utf8.index(after: i)
+                componentStart = next
+                lastDot = nil
+            } else if utf8[i] == 0x2E {
+                lastDot = i
+            }
+            i = utf8.index(after: i)
+        }
+        guard let lastDot,
+              lastDot != componentStart,
+              utf8.index(after: lastDot) != utf8.endIndex else {
+            return "File"
+        }
+        return "\(name[utf8.index(after: lastDot)...].uppercased()) File"
     }
 
     private static let shortDateFormatter: DateFormatter = {

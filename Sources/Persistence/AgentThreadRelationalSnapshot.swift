@@ -137,8 +137,14 @@ public extension AgentThreadRepository {
         try db.performSync { database in
             try database.transaction {
                 try Self.restoreRelationalSnapshotInCurrentTransaction(snapshot, database: database)
-                let restoredIDs = Set(snapshot.threads.map(\.id))
-                let workspaceIDs = Set(snapshot.threads.compactMap(\.workspaceId)).sorted {
+                var restoredIDs = Set<AgentThreadID>()
+                restoredIDs.reserveCapacity(snapshot.threads.count)
+                var workspaceIDSet = Set<WorkspaceID>()
+                for thread in snapshot.threads {
+                    restoredIDs.insert(thread.id)
+                    if let workspaceId = thread.workspaceId { workspaceIDSet.insert(workspaceId) }
+                }
+                let workspaceIDs = workspaceIDSet.sorted {
                     $0.value.uuidString < $1.value.uuidString
                 }
                 var prunedThreadIDs: [AgentThreadID] = []

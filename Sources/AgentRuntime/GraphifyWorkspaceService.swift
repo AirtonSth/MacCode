@@ -1199,6 +1199,10 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         if !anyInFlight {
             activeRebuildCancelled = false
         }
+        // Collect non-empty display roots while dirtying rows — no map intermediate.
+        // Content unchanged for scheduleAsyncRootReKicks (order-insensitive kicks).
+        var kickedRoots: [String] = []
+        kickedRoots.reserveCapacity(schedules.count)
         for id in Array(schedules.keys) {
             guard var s = schedules[id] else { continue }
             // Keep rebuildCancelled on in-flight rows until they drain.
@@ -1208,11 +1212,14 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             s.dirtyGeneration = max(s.dirtyGeneration &+ 1, s.builtGeneration &+ 1)
             s.rerunRequested = true
             schedules[id] = s
+            if !s.displayRoot.isEmpty {
+                kickedRoots.append(s.displayRoot)
+            }
         }
-        roots = schedules.values.map(\.displayRoot).filter { !$0.isEmpty }
         // Treat as a new re-kick generation so stale async work aborts.
         pressureUnpauseGeneration &+= 1
         unpauseGeneration = pressureUnpauseGeneration
+        roots = kickedRoots
         lock.unlock()
         scheduleAsyncRootReKicks(roots: roots, unpauseGeneration: unpauseGeneration)
     }

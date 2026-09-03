@@ -315,8 +315,14 @@ public final class PetAttentionStore {
     }
 
     static func projectDest(_ dest: PetDestAttentionSnapshot) -> [PetAttentionItem] {
-        let enabled = Set(dest.bots.filter(\.notificationsEnabled).map(\.id))
-        let botsByID = Dictionary(uniqueKeysWithValues: dest.bots.map { ($0.id, $0) })
+        var enabled = Set<BotID>()
+        enabled.reserveCapacity(dest.bots.count)
+        var botsByID: [BotID: BotDefinition] = [:]
+        botsByID.reserveCapacity(dest.bots.count)
+        for bot in dest.bots {
+            botsByID[bot.id] = bot
+            if bot.notificationsEnabled { enabled.insert(bot.id) }
+        }
         var items: [PetAttentionItem] = []
         var coveredConversations = Set<BotConversationID>()
         var botsWithUnscopedAttention = Set<BotID>()

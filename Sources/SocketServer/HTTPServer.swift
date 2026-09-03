@@ -3537,9 +3537,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// C-07: true when the client sent `Connection: close` (HTTP/1.1 default
     /// is keep-alive when the header is absent or lists keep-alive).
     nonisolated static func httpClientRequestsClose(_ headers: [String: String]) -> Bool {
-        guard let raw = headers["connection"]?.lowercased() else { return false }
+        guard let raw = headers["connection"] else { return false }
         return raw.split(separator: ",").contains { token in
-            token.trimmingCharacters(in: .whitespaces) == "close"
+            token.trimmingCharacters(in: .whitespaces).caseInsensitiveCompare("close") == .orderedSame
         }
     }
 

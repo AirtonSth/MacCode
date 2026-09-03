@@ -329,11 +329,15 @@ public enum PetPopoverGrouping {
             buckets[key, default: []].append(item)
         }
         // Stable: named workspaces alphabetically, "Other" last, items keep input order.
-        let named = order.filter { $0 != unknownWorkspaceName }.sorted {
-            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        var named: [String] = []
+        named.reserveCapacity(order.count)
+        var hasUnknown = false
+        for key in order {
+            if key == unknownWorkspaceName { hasUnknown = true } else { named.append(key) }
         }
-        let keys = named + (order.contains(unknownWorkspaceName) ? [unknownWorkspaceName] : [])
-        return keys.compactMap { key in
+        named.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        if hasUnknown { named.append(unknownWorkspaceName) }
+        return named.compactMap { key in
             guard let groupItems = buckets[key], !groupItems.isEmpty else { return nil }
             return Group(name: key, items: groupItems)
         }

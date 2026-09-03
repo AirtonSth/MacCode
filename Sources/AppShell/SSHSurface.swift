@@ -2088,10 +2088,21 @@ private struct SSHPaneDerived {
     init() {}
 
     init(entries: [SSHFileEntry]) {
-        directories = entries.filter(\.isDirectory)
-        let files = entries.filter { !$0.isDirectory }
-        fileCount = files.count
-        totalBytes = files.compactMap { Int($0.size) }.reduce(0, +)
+        var dirs: [SSHFileEntry] = []
+        dirs.reserveCapacity(entries.count)
+        var count = 0
+        var bytes = 0
+        for entry in entries {
+            if entry.isDirectory {
+                dirs.append(entry)
+            } else {
+                count += 1
+                if let size = Int(entry.size) { bytes += size }
+            }
+        }
+        directories = dirs
+        fileCount = count
+        totalBytes = bytes
     }
 }
 
@@ -2623,7 +2634,11 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
         transferLogs.append(line)
         // Keep a longer rolling history so transient errors don't scroll off
         // instantly; the log pane is scrollable (UX-MAC_SSH-010).
-        transferLogs = Array(transferLogs.suffix(Self.transferLogLimit))
+        // PERF: suffix cap only pays when over budget; steady-state appends
+        // skip the Array copy. Same retained contents.
+        if transferLogs.count > Self.transferLogLimit {
+            transferLogs.removeFirst(transferLogs.count - Self.transferLogLimit)
+        }
     }
 
     private static let transferLogLimit = 200

@@ -137,11 +137,18 @@ enum LiveActivitySummary {
         guard !line.isEmpty else { return nil }
 
         // Collapse to a single line — a Lock Screen row is two lines of caption.
-        line = line
-            .split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
+        // PERF: single pass avoids the split + map + filter intermediates.
+        var collapsed = ""
+        for part in line.split(whereSeparator: \.isNewline) {
+            let trimmed = part.trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty {
+                if !collapsed.isEmpty {
+                    collapsed += " "
+                }
+                collapsed += trimmed
+            }
+        }
+        line = collapsed
         line = replaceAll(multiWhitespaceRegex, in: line, with: " ")
         guard !line.isEmpty else { return nil }
 

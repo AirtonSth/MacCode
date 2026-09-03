@@ -19,8 +19,11 @@ public enum StagingHelper {
     ///   - selected: the paths the user has checked / highlighted.
     ///   - all: the full list of paths that actually have changes (from `GitSummary`).
     public static func pathArgs(selected: Set<String>, all: [String]) -> [String]? {
-        let allSet = Set(all)
-        let valid = selected.filter { allSet.contains($0) }.sorted()
+        guard !selected.isEmpty, !all.isEmpty else { return nil }
+        var valid: [String] = []
+        valid.reserveCapacity(min(selected.count, all.count))
+        for path in all where selected.contains(path) { valid.append(path) }
+        valid.sort()
         return valid.isEmpty ? nil : valid
     }
 }

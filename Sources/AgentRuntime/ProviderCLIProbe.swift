@@ -598,13 +598,12 @@ public enum ProviderCLIProbe {
     }
 
     private static func updateAdvisory(from text: String) -> String? {
-        for rawLine in text.split(whereSeparator: \.isNewline).map(String.init) {
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            let lower = line.lowercased()
-            guard lower.contains("update available")
-                    || lower.contains("new version available")
-                    || lower.contains("newer version")
-                    || lower.contains("outdated") else { continue }
+        for rawLine in text.split(whereSeparator: \.isNewline).lazy {
+            let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.range(of: "update available", options: .caseInsensitive) != nil
+                    || line.range(of: "new version available", options: .caseInsensitive) != nil
+                    || line.range(of: "newer version", options: .caseInsensitive) != nil
+                    || line.range(of: "outdated", options: .caseInsensitive) != nil else { continue }
             return line.isEmpty ? nil : line
         }
         return nil

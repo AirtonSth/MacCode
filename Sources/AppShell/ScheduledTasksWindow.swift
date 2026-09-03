@@ -492,15 +492,29 @@ public final class ScheduledTasksViewModel: ObservableObject {
     private func reloadTasks() {
         do {
             let matching = try store.list(search: searchText)
+            // PERF: single pass derives counts + the status-filtered list
+            // instead of two counting filters plus a third listing filter.
+            var activeCount = 0
+            var visible: [ScheduledTask] = []
+            let showAll = statusFilter == .all
+            let wantActive = statusFilter == .active
+            if !showAll {
+                visible.reserveCapacity(matching.count)
+            }
+            for task in matching {
+                if task.isEnabled { activeCount += 1 }
+                if showAll || task.isEnabled == wantActive {
+                    if !showAll { visible.append(task) }
+                }
+            }
             filterCounts = (
                 all: matching.count,
-                active: matching.filter(\.isEnabled).count,
-                paused: matching.filter { !$0.isEnabled }.count
+                active: activeCount,
+                paused: matching.count - activeCount
             )
             switch statusFilter {
             case .all: tasks = matching
-            case .active: tasks = matching.filter(\.isEnabled)
-            case .paused: tasks = matching.filter { !$0.isEnabled }
+            case .active, .paused: tasks = visible
             }
             runCounts = try store.runCounts()
             // Overview is a full list; do not auto-select a task into the detail page.

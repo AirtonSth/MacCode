@@ -149,9 +149,14 @@ public enum ProviderProcessSweeper {
 
     public static func distillMCPMode(from command: String) -> String? {
         guard isRemoteCodeDistillService(command) else { return nil }
-        let parts = command.split(whereSeparator: \.isWhitespace).map(String.init)
-        guard parts.count >= 2, distillMCPArgvModes.contains(parts[1]) else { return nil }
-        return parts[1]
+        // Bounded split: only the argv mode (second token) is needed — no
+        // full whitespace split + String map over long command lines.
+        var tokens = command.split(whereSeparator: \.isWhitespace).makeIterator()
+        _ = tokens.next()
+        guard let mode = tokens.next(),
+              mode.count >= 2,
+              distillMCPArgvModes.contains(String(mode)) else { return nil }
+        return String(mode)
     }
 
     /// Distill MCP PIDs whose parent is gone (reparented to launchd / pid 1, or
@@ -186,14 +191,20 @@ public enum ProviderProcessSweeper {
         of pid: Int32,
         in processes: [ProviderRuntimeProcess]
     ) -> [Int32] {
-        var pending = processes.filter { $0.ppid == pid }.map(\.pid)
+        var childrenByPPID: [Int32: [Int32]] = [:]
+        for process in processes {
+            childrenByPPID[process.ppid, default: []].append(process.pid)
+        }
+        var pending = childrenByPPID[pid] ?? []
         var seen = Set<Int32>()
         var result: [Int32] = []
 
         while let child = pending.popLast() {
             guard seen.insert(child).inserted else { continue }
             result.append(child)
-            pending.append(contentsOf: processes.filter { $0.ppid == child }.map(\.pid))
+            if let grandchildren = childrenByPPID[child] {
+                pending.append(contentsOf: grandchildren)
+            }
         }
 
         return result

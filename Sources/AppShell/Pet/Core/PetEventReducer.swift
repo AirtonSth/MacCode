@@ -176,7 +176,15 @@ public struct PetEventReducer: Sendable {
     ) -> PetEventReduction {
         pendingTransientTimerDirective = nil
         let previousState = state
-        let normalized = Set(hostRunIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
+        // PERF: single pass avoids the map + filter intermediate on the
+        // EventBus reconcile path; normalized set identical.
+        var normalized = Set<String>()
+        for hostRunID in hostRunIDs {
+            let trimmed = hostRunID.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                normalized.insert(trimmed)
+            }
+        }
         let changed = normalized != activeRunIDs
         activeRunIDs = normalized
         if normalized.isEmpty {

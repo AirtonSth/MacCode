@@ -293,11 +293,17 @@ public enum LibrarianCatalog {
         if normalizedQuery.isEmpty {
             matches = exposedFunctions
         } else {
-            let exact = exposedFunctions.filter { $0.id.lowercased() == normalizedQuery }
-            let textual = exposedFunctions.filter {
-                $0.id.lowercased() != normalizedQuery
-                    && ($0.id.lowercased().contains(normalizedQuery)
-                        || $0.summary.lowercased().contains(normalizedQuery))
+            var exact: [LibrarianFunction] = []
+            var textual: [LibrarianFunction] = []
+            exact.reserveCapacity(exposedFunctions.count)
+            textual.reserveCapacity(exposedFunctions.count)
+            for fn in exposedFunctions {
+                if fn.id.compare(normalizedQuery, options: .caseInsensitive) == .orderedSame {
+                    exact.append(fn)
+                } else if fn.id.range(of: normalizedQuery, options: .caseInsensitive) != nil
+                    || fn.summary.range(of: normalizedQuery, options: .caseInsensitive) != nil {
+                    textual.append(fn)
+                }
             }
             matches = exact + textual
         }

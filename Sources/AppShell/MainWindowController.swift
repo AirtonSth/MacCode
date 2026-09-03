@@ -2504,10 +2504,12 @@ final class RatioSplitView: NSView {
         if isVertical {
             let fixed = min(bounds.width, CGFloat(collapsed.count) * collapsedExtent)
             let avail = max(0, bounds.width - dt * CGFloat(n - 1) - fixed)
-            let flexibleTotal = norm.indices
-                .filter { !collapsed.contains($0) }
-                .map { norm[$0] }
-                .reduce(0, +)
+            // PERF: single pass avoids the filter + map intermediates on the
+            // resize/divider-drag layout path; total identical.
+            var flexibleTotal: CGFloat = 0
+            for i in norm.indices where !collapsed.contains(i) {
+                flexibleTotal += norm[i]
+            }
             var x: CGFloat = 0
             for (i, sv) in subviews.enumerated() {
                 let w: CGFloat
@@ -2528,10 +2530,12 @@ final class RatioSplitView: NSView {
         } else {
             let fixed = min(bounds.height, CGFloat(collapsed.count) * collapsedExtent)
             let avail = max(0, bounds.height - dt * CGFloat(n - 1) - fixed)
-            let flexibleTotal = norm.indices
-                .filter { !collapsed.contains($0) }
-                .map { norm[$0] }
-                .reduce(0, +)
+            // PERF: single pass avoids the filter + map intermediates on the
+            // resize/divider-drag layout path; total identical.
+            var flexibleTotal: CGFloat = 0
+            for i in norm.indices where !collapsed.contains(i) {
+                flexibleTotal += norm[i]
+            }
             var y: CGFloat = bounds.height
             for (i, sv) in subviews.enumerated() {
                 let h: CGFloat

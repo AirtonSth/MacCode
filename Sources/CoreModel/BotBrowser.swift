@@ -88,7 +88,9 @@ public struct BotBrowserLoginPredicate: Equatable, Sendable {
     }
 
     public func hasAuthCookie(_ page: BotBrowserPageState) -> Bool {
-        page.cookies.keys.contains { Self.sufficientCookieNames.contains($0.lowercased()) }
+        page.cookies.keys.contains { key in
+            Self.sufficientCookieNames.contains { $0.caseInsensitiveCompare(key) == .orderedSame }
+        }
     }
 
     public func leftLoginPage(openedURL: String, currentURL: String) -> Bool {
@@ -107,15 +109,21 @@ public struct BotBrowserLoginPredicate: Equatable, Sendable {
     public func looksLikeLoginURL(_ raw: String) -> Bool {
         guard let url = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            return raw.lowercased().contains("/login") || raw.lowercased().contains("/signin")
+            return raw.range(of: "/login", options: .caseInsensitive) != nil || raw.range(of: "/signin", options: .caseInsensitive) != nil
         }
-        let host = (components.host ?? "").lowercased()
-        let path = components.path.lowercased()
-        if host.hasPrefix("login.") || host.hasPrefix("signin.") || host.hasPrefix("auth.") {
+        let host = components.host ?? ""
+        let path = components.path
+        if host.range(of: "login.", options: [.caseInsensitive, .anchored]) != nil
+            || host.range(of: "signin.", options: [.caseInsensitive, .anchored]) != nil
+            || host.range(of: "auth.", options: [.caseInsensitive, .anchored]) != nil {
             return true
         }
         let markers = ["/login", "/log-in", "/signin", "/sign-in", "/signup", "/sign-up", "/auth"]
-        return markers.contains { path == $0 || path.hasPrefix($0 + "/") || path.hasSuffix($0) }
+        return markers.contains {
+            $0.caseInsensitiveCompare(path) == .orderedSame
+                || path.range(of: $0 + "/", options: [.caseInsensitive, .anchored]) != nil
+                || path.range(of: $0, options: [.caseInsensitive, .anchored, .backwards]) != nil
+        }
     }
 }
 

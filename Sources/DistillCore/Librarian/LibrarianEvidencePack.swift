@@ -314,7 +314,14 @@ public struct LibrarianEvidencePack: Sendable, Equatable {
         lineIndices: Set<Int>,
         lines: [SourceLine]
     ) -> [Range<Int>] {
-        let sorted = lineIndices.filter(lines.indices.contains).sorted()
+        // Single pass: keep in-bounds indices in a reserved buffer, sort in
+        // place — no filter intermediate before the sort.
+        var sorted: [Int] = []
+        sorted.reserveCapacity(lineIndices.count)
+        for index in lineIndices where lines.indices.contains(index) {
+            sorted.append(index)
+        }
+        sorted.sort()
         guard let first = sorted.first else { return [] }
 
         var ranges: [Range<Int>] = []

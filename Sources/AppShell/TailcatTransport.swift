@@ -44,15 +44,18 @@ struct TailcatAllowlistSnapshot: Codable, Equatable, Sendable {
     let clients: [TailcatCatalogClient]
 
     var admittedNodePublics: [String] {
-        clients
-            .filter { $0.transportBuildId == TailcatTransportContract.buildID }
-            .map(\.nodePublic)
-            .sorted()
+        // PERF: single pass avoids the filter + map intermediates on the
+        // connect/auth path; sorted order identical.
+        clients.reduce(into: [String]()) { out, client in
+            if client.transportBuildId == TailcatTransportContract.buildID {
+                out.append(client.nodePublic)
+            }
+        }.sorted()
     }
 
     var hash: String {
         let data = (try? JSONEncoder.tailcatCanonical.encode(self)) ?? Data()
-        return Data(SHA256.hash(data: data)).map { String(format: "%02x", $0) }.joined()
+        return tailcatHexDigest(SHA256.hash(data: data))
     }
 }
 
@@ -230,11 +233,29 @@ final class URLSessionTailcatCatalogAPI: TailcatCatalogAPI, @unchecked Sendable 
 }
 
 private extension JSONEncoder {
-    static var tailcatCanonical: JSONEncoder {
+    // PERF: computed var allocated + configured an encoder per call (hash,
+    // allowlist check, keychain save). Share one; outputFormatting is
+    // immutable post-init and encode use is single-threaded per caller.
+    static let tailcatCanonical: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         return encoder
+    }()
+}
+
+/// PERF: nibble table instead of per-byte `String(format:)` — same fix as
+/// HostMutationContract/WorkspaceFileService hex digests, same CryptoKit
+/// lowercase hex contract.
+private let tailcatHexNibbleAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+private func tailcatHexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+    var out: [UInt8] = []
+    out.reserveCapacity(64)
+    for byte in digest {
+        out.append(tailcatHexNibbleAlphabet[Int(byte >> 4)])
+        out.append(tailcatHexNibbleAlphabet[Int(byte & 0x0f)])
     }
+    return String(bytes: out, encoding: .utf8) ?? ""
 }
 
 private struct TailcatAnyEncodable: Encodable {
@@ -327,8 +348,8 @@ final class LinkedTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable {
               let allowed = String(data: allowedData, encoding: .utf8) else {
             throw TailcatBridgeError.rejected("invalid_server_configuration")
         }
-        let secretHex = secret.map { String(format: "%02x", $0) }.joined()
-        let listenerHex = listenerID.map { String(format: "%02x", $0) }.joined()
+        let secretHex = tailcatHexDigest(secret)
+        let listenerHex = tailcatHexDigest(listenerID)
         let resultPointer = key.privateKey.withCString { privateValue in
             allowed.withCString { allowedValue in
                 secretHex.withCString { secretValue in

@@ -442,8 +442,8 @@ public struct WorkspaceFileService: Sendable {
         let modifiedAt = resourceValues?.contentModificationDate
         let isSymlink = resourceValues?.isSymbolicLink == true
         let identity: FileIdentity
+        let ext = url.pathExtension.lowercased()
         if isDirectory {
-            let ext = url.pathExtension.lowercased()
             identity = FileIdentity(
                 kind: "directory",
                 mime: "inode/directory",
@@ -465,7 +465,7 @@ public struct WorkspaceFileService: Sendable {
             "path": .string(url.path),
             "relative_path": .string(relativePath(root: root, url: url)),
             "type": .string(isDirectory ? "directory" : "file"),
-            "ext": .string(url.pathExtension.lowercased()),
+            "ext": .string(ext),
             "size": .number(Double(identity.size)),
             "modified_at": identity.modifiedAt.map { .number($0.timeIntervalSince1970) } ?? .null,
             "is_hidden": .bool(url.lastPathComponent.hasPrefix(".")),

@@ -622,7 +622,12 @@ public final class PaneTabsView: NSObject {
     }
 
     private static func surfaceIDs(excluding id: SurfaceID, in pane: PaneNode) -> [SurfaceID] {
-        pane.surfaces.map(\.id).filter { $0 != id }
+        var ids: [SurfaceID] = []
+        ids.reserveCapacity(pane.surfaces.count)
+        for surface in pane.surfaces where surface.id != id {
+            ids.append(surface.id)
+        }
+        return ids
     }
 
     private static func surfaceIDs(in pane: PaneNode, before id: SurfaceID) -> [SurfaceID] {

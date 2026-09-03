@@ -172,6 +172,13 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     /// is available (safe: frecency is best-effort, degrades to insertion order).
     private var frecencyStore: PaletteFrecencyStore?
 
+    /// SEP-3: per-open frecency snapshot. applyFilter runs on every keystroke
+    /// and frecencyRanked used to hit the settings SQLite DB on each pass;
+    /// load once per open (plus refresh on recordUse) and reuse in-memory.
+    /// Nil until the palette opens (tests calling rebuildCommands directly
+    /// fall back to a live store.load()).
+    private var frecencySnapshot: [PaletteFrecencyEntry]?
+
     /// QA-002: inspection seam - the ordered IDs currently visible (after
     /// filtering / sectioning) so unit tests can assert caps, ordering, and
     /// conditional inclusion without driving the NSPanel.
@@ -188,6 +195,10 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     /// Test-only counter proving a palette open performs one filter pass after
     /// rebuilding its catalog rather than two equivalent table reloads.
     private(set) var filterPassCountForTesting = 0
+
+    /// SEP-3 seam: whether a frecency snapshot is currently held (one DB load
+    /// per open, reused across keystrokes).
+    var hasFrecencySnapshotForTesting: Bool { frecencySnapshot != nil }
 
     public init(router: AppCommandRouter) {
         self.router = router
@@ -506,6 +517,8 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     private func loadRecentFromStore() {
         guard let store = resolvedFrecencyStore() else { return }
         let entries = store.load()
+        // SEP-3: snapshot for this open so every keystroke filters in-memory.
+        frecencySnapshot = entries
         let now = Date()
         let sorted = entries
             .filter { !$0.id.contains(".jump.") }
@@ -529,6 +542,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         all.removeAll(keepingCapacity: true)
         filtered.removeAll(keepingCapacity: true)
         nonRunnableRowIDs.removeAll(keepingCapacity: true)
+        frecencySnapshot = nil
         observedAgentVM = nil
         agentModelObserver = nil
         tableView.reloadData()
@@ -582,8 +596,15 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     /// relative order.  When no frecency data is available, returns `visible`
     /// unmodified so the default-view behavior is identical to pre-P2.
     private func frecencyRanked(_ visible: [PaletteCommand]) -> [PaletteCommand] {
-        guard let store = resolvedFrecencyStore() else { return visible }
-        let entries = store.load()
+        // SEP-3: serve from the per-open snapshot; fall back to a live load
+        // only when the palette was never opened (unit-test path).
+        let entries: [PaletteFrecencyEntry]
+        if let snap = frecencySnapshot {
+            entries = snap
+        } else {
+            guard let store = resolvedFrecencyStore() else { return visible }
+            entries = store.load()
+        }
         guard !entries.isEmpty else { return visible }
         let runnable = visible.filter { !nonRunnableRowIDs.contains($0.id) }
         let nonRunnable = visible.filter { nonRunnableRowIDs.contains($0.id) }
@@ -618,10 +639,16 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     /// optionally excluded so they aren't shown twice.
     private func sectioned(_ visible: [PaletteCommand], excludingRecent: Bool) -> [PaletteCommand] {
         let recent = excludingRecent ? Set(recentCommandIDs) : []
+        // PERF: one pass instead of allCases × filter (N×C scans per keystroke).
+        var buckets: [PaletteCategory: [PaletteCommand]] = [:]
+        buckets.reserveCapacity(PaletteCategory.allCases.count)
+        for cmd in visible where !recent.contains(cmd.id) {
+            buckets[cmd.category, default: []].append(cmd)
+        }
         var out: [PaletteCommand] = []
+        out.reserveCapacity(visible.count + PaletteCategory.allCases.count)
         for category in PaletteCategory.allCases {
-            let rows = visible.filter { $0.category == category && !recent.contains($0.id) }
-            guard !rows.isEmpty else { continue }
+            guard let rows = buckets[category], !rows.isEmpty else { continue }
             out.append(headerRow(id: "palette.section.\(category.rawValue.lowercased())", title: category.rawValue))
             out.append(contentsOf: rows)
         }
@@ -687,7 +714,12 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
             recentCommandIDs.removeLast(recentCommandIDs.count - recentLimit)
         }
         // P2: also persist frecency so ranking improves across launches.
-        resolvedFrecencyStore()?.recordUse(id: id)
+        if let store = resolvedFrecencyStore() {
+            store.recordUse(id: id)
+            // SEP-3: keep the per-open snapshot in sync so later keystrokes
+            // in this session rank with the just-recorded use.
+            frecencySnapshot = store.load()
+        }
     }
 
     // MARK: NSWindowDelegate - resign-key dismissal

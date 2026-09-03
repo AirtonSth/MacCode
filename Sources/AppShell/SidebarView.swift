@@ -659,12 +659,21 @@ public final class SidebarViewModel: ObservableObject {
     /// surface the completed dot. Uses the `busy` metadata that `listWorkspaces`
     /// already batch-computes (agent run / terminal job), so no extra DB work.
     private func updateCompletedWorkspaces(from list: [Workspace]) {
-        let nowBusy = Set(list.filter { $0.metadata["busy"] == "true" }.map(\.id))
+        var nowBusy = Set<WorkspaceID>()
+        nowBusy.reserveCapacity(list.count)
+        var existing = Set<WorkspaceID>()
+        existing.reserveCapacity(list.count)
+        for workspace in list {
+            existing.insert(workspace.id)
+            if workspace.metadata["busy"] == "true" {
+                nowBusy.insert(workspace.id)
+            }
+        }
         let next = Self.completedWorkspacesAfterReload(
             previousBusy: previousBusyWorkspaces,
             nowBusy: nowBusy,
             current: completedWorkspaces,
-            existing: Set(list.map(\.id)),
+            existing: existing,
             selected: selectedWorkspaceID)
         if next != completedWorkspaces {
             completedWorkspaces = next
@@ -2305,7 +2314,9 @@ public final class SidebarViewModel: ObservableObject {
     public func removeSelectedWorkspaces() {
         let ids = selectedWorkspaceIDs
         guard !ids.isEmpty else { return }
-        let names = workspaces.filter { ids.contains($0.id) }.map(\.name)
+        var names: [String] = []
+        names.reserveCapacity(ids.count)
+        for ws in workspaces where ids.contains(ws.id) { names.append(ws.name) }
         // :95 -- Route through workspacePrompter so tests can drive the decision.
         // The AppKitWorkspacePrompter default preserves the :15 sheet/runModal fallback.
         guard let prompter = workspacePrompter else { return }
@@ -5160,12 +5171,22 @@ public struct SidebarRootView: View {
     }
 
     private var accountInitials: String {
-        guard let email = vm.privateAccountUser?.email, let local = email.split(separator: "@").first else {
+        guard let email = vm.privateAccountUser?.email else {
             return "RC"
         }
-        let letters = local.filter(\.isLetter)
-        let prefix = letters.prefix(2)
-        return prefix.isEmpty ? "RC" : String(prefix).uppercased()
+        var local = email.prefix(while: { $0 != "@" })
+        if local.isEmpty {
+            local = email.split(separator: "@").first ?? ""
+        }
+        var initials = ""
+        initials.reserveCapacity(2)
+        for scalar in local {
+            if scalar.isLetter {
+                initials.append(scalar)
+                if initials.count == 2 { break }
+            }
+        }
+        return initials.isEmpty ? "RC" : initials.uppercased()
     }
 
     // MARK: Row accessibility helpers

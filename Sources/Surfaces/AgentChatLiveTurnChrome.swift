@@ -204,17 +204,28 @@ public enum AgentChatLiveTurnChrome {
 
     /// Keep a live in-memory apply when SQLite replay is still catching up.
     public static func isRicher(_ lhs: AssistantTimelineState, than rhs: AssistantTimelineState) -> Bool {
-        let lhsFinished = lhs.turns.filter(\.finished).count
-        let rhsFinished = rhs.turns.filter(\.finished).count
+        // PERF: single pass instead of filter×2 + flatMap×2 (four timeline
+        // walks per replay compare on the live-stream path).
+        var lhsFinished = 0, rhsFinished = 0
+        var lhsItems = 0, rhsItems = 0
+        var lhsWeight = 0, rhsWeight = 0
+        for turn in lhs.turns {
+            if turn.finished { lhsFinished += 1 }
+            for item in turn.items {
+                lhsItems += 1
+                lhsWeight += item.body.utf8.count + (item.output?.utf8.count ?? 0)
+            }
+        }
+        for turn in rhs.turns {
+            if turn.finished { rhsFinished += 1 }
+            for item in turn.items {
+                rhsItems += 1
+                rhsWeight += item.body.utf8.count + (item.output?.utf8.count ?? 0)
+            }
+        }
         if rhsFinished > lhsFinished { return false }
-        let lhsItems = lhs.turns.flatMap(\.items)
-        let rhsItems = rhs.turns.flatMap(\.items)
-        if lhsItems.count != rhsItems.count { return lhsItems.count > rhsItems.count }
-        return liveTextWeight(lhsItems) > liveTextWeight(rhsItems)
-    }
-
-    private static func liveTextWeight(_ items: [AssistantItem]) -> Int {
-        items.reduce(0) { $0 + $1.body.utf8.count + ($1.output?.utf8.count ?? 0) }
+        if lhsItems != rhsItems { return lhsItems > rhsItems }
+        return lhsWeight > rhsWeight
     }
 
     public static func shouldRenderFinalMessage(
@@ -234,7 +245,7 @@ public enum AgentChatLiveTurnChrome {
         // Replay applies turnStarted with Date(), which dumps every historical
         // Worked block at "now". Item timestamps survive persist and keep
         // user → work → answer in conversation order.
-        if let ms = turn.items.map(\.startedAtMs).min(), ms > 0 {
+        if let ms = turn.items.min(by: { $0.startedAtMs < $1.startedAtMs })?.startedAtMs, ms > 0 {
             return Date(timeIntervalSince1970: TimeInterval(ms) / 1000)
         }
         if let ms = turn.startedAtMs {
@@ -269,9 +280,22 @@ public enum AgentChatLiveTurnChrome {
     }
 
     public static func toolGroupSummary(_ items: [AssistantItem]) -> String {
-        let streamingCount = items.reduce(0) { $0 + ($1.state == .streaming ? 1 : 0) }
-        let failedCount = items.reduce(0) { $0 + ($1.state == .failed ? 1 : 0) }
-        let key = "\(items.count)|\(streamingCount)|\(failedCount)|" + items.map(\.id).joined(separator: ",")
+        // Single pass feeds the memo key plus the noun/verb classification
+        // below; counts, key, and verdicts identical to the reduce/map scans.
+        var streamingCount = 0
+        var failedCount = 0
+        var ids: [String] = []
+        ids.reserveCapacity(items.count)
+        var types = Set<AssistantItemType>()
+        var verbs = Set<String>()
+        for item in items {
+            if item.state == .streaming { streamingCount += 1 }
+            if item.state == .failed { failedCount += 1 }
+            ids.append(item.id)
+            types.insert(item.type)
+            verbs.insert(AgentTimelineItemPresentation.make(for: item).verb)
+        }
+        let key = "\(items.count)|\(streamingCount)|\(failedCount)|" + ids.joined(separator: ",")
         toolGroupSummaryLock.lock()
         if let cached = toolGroupSummaryMemo[key] {
             toolGroupSummaryLock.unlock()
@@ -280,7 +304,7 @@ public enum AgentChatLiveTurnChrome {
         toolGroupSummaryLock.unlock()
         let noun: String = {
             let plural = items.count != 1
-            switch Set(items.map(\.type)) {
+            switch types {
             case [.fileChange]: return plural ? "files" : "file"
             case [.webSearch]: return plural ? "searches" : "search"
             case [.imageView]: return plural ? "images" : "image"
@@ -294,7 +318,6 @@ public enum AgentChatLiveTurnChrome {
         } else if streamingCount > 0 {
             value = "Running \(items.count) \(noun)…"
         } else {
-            let verbs = Set(items.map { AgentTimelineItemPresentation.make(for: $0).verb })
             let verb = verbs.count == 1 ? (verbs.first ?? "Ran") : "Ran"
             value = "\(verb) \(items.count) \(noun)"
         }

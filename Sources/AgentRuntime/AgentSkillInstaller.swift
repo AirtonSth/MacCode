@@ -1872,7 +1872,13 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             environmentPath: ProcessInfo.processInfo.environment["PATH"],
             homeDirectory: home
         )
-        return joined.split(separator: ":").map(String.init).filter { !$0.isEmpty && $0 != managed }
+        // PERF: single pass avoids the map + filter intermediates on the
+        // install path; kept directories identical.
+        var kept: [String] = []
+        for part in joined.split(separator: ":") where !part.isEmpty && part != managed {
+            kept.append(String(part))
+        }
+        return kept
     }
 
     private func commandExistsOnSystem(_ command: String, searchDirectories: [String]) -> Bool {
@@ -2724,7 +2730,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             foundPaths.insert(relativePath)
         }
 
-        if let missing = allowed.subtracting(foundPaths).sorted().first {
+        // First missing in sorted order for a deterministic error — min over
+        // the difference, no sorted array over every missing file.
+        if let missing = allowed.subtracting(foundPaths).min() {
             throw RemoteCodeOrchestrateInstallError.missingRequiredFile(missing)
         }
         let actualDigest = Self.remoteCodeOrchestrateTreeDigest(found)

@@ -17,6 +17,24 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertEqual(try LinkedTailcatBridge().buildID(), TailcatTransportContract.buildID)
     }
 
+    // SEP-3: hash moved from per-byte String(format:) to a nibble table.
+    // Pin the CryptoKit lowercase-hex contract + determinism (change
+    // detection compares hashes across polls).
+    func testAllowlistSnapshotHash_isStableLowercaseHex() {
+        let a = makeSnapshot(epoch: "epoch-hex", revision: 3, peers: [peer(0xaa)])
+        let b = makeSnapshot(epoch: "epoch-hex", revision: 3, peers: [peer(0xaa)])
+        XCTAssertEqual(a.hash, b.hash,
+            "identical snapshots must hash identically for poll change detection")
+        XCTAssertEqual(a.hash.count, 64,
+            "SHA-256 hex digest must be 64 chars")
+        XCTAssertEqual(a.hash, a.hash.lowercased(),
+            "digest must be lowercase hex (CryptoKit contract)")
+        XCTAssertTrue(a.hash.allSatisfy(\.isHexDigit),
+            "digest must contain only hex digits")
+        XCTAssertNotEqual(a.hash, makeSnapshot(epoch: "epoch-hex", revision: 4, peers: [peer(0xaa)]).hash,
+            "revision change must change the hash")
+    }
+
     func testCatalogBootstrapsMissingHostWithoutETagThenPublishesWithoutIfMatch() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [TailcatCatalogURLProtocol.self]

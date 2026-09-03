@@ -49,7 +49,8 @@ public enum FaithfulnessGate {
             let words = salientWords(in: line)
             guard !words.isEmpty else { continue }
             if words.allSatisfy({ !compressedLower.contains($0) }) {
-                return .rejected("missing salient word: \(words.sorted().first ?? "")")
+                // min() == sorted().first for the rejection token; avoids a full sort.
+                return .rejected("missing salient word: \(words.min() ?? "")")
             }
         }
 

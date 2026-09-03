@@ -154,8 +154,10 @@ public final class ClaudeCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
     }
 
     private func pruneReadableEvents(threadId: AgentThreadID) {
-        guard let stream = events[threadId], stream.count > maxReadableEvents else { return }
-        events[threadId] = Array(stream.suffix(maxReadableEvents))
+        guard let count = events[threadId]?.count, count > maxReadableEvents else { return }
+        // PERF: drop the oldest prefix in place instead of rebuilding the
+        // whole readable window via Array(suffix:) on every appended event.
+        events[threadId]?.removeFirst(count - maxReadableEvents)
     }
 
     /// Called under lock after a thread finishes. Evicts oldest eligible threads when over cap.

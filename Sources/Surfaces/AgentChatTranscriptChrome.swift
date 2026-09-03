@@ -72,7 +72,11 @@ public enum AgentChatTranscriptChrome {
                 result = String(result.dropLast(suffix.count))
             }
         }
-        let legacyNames = attachments.map(\.displayName).filter { !$0.isEmpty }
+        var legacyNames: [String] = []
+        legacyNames.reserveCapacity(attachments.count)
+        for attachment in attachments where !attachment.displayName.isEmpty {
+            legacyNames.append(attachment.displayName)
+        }
         if !legacyNames.isEmpty {
             let legacy = "📎 " + legacyNames.joined(separator: ", ")
             if result == legacy {
@@ -164,8 +168,39 @@ public enum AgentChatTranscriptChrome {
     }
 
     public static func isImagePath(_ path: String) -> Bool {
-        let ext = (path as NSString).pathExtension.lowercased()
-        return ["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "heic", "webp", "svg", "avif"].contains(ext)
+        // PERF: image-extension check runs per attachment per transcript render;
+        // NSString.pathExtension + lowercased() allocated twice per call. Scan
+        // the suffix directly (case-insensitive, no temporaries); verdict identical.
+        let ext = Self.pathExtension(of: path)
+        return ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "gif"
+            || ext == "bmp" || ext == "tif" || ext == "tiff" || ext == "heic"
+            || ext == "webp" || ext == "svg" || ext == "avif"
+    }
+
+    /// Lowercase file extension matching NSString.pathExtension: last `.` after
+    /// the last `/`, except a leading-dot basename (`.png`, `foo/.png`) has none.
+    private static func pathExtension(of path: String) -> Substring {
+        let utf8 = path.utf8
+        var componentStart = utf8.startIndex
+        var lastDot: String.UTF8View.Index?
+        var i = utf8.startIndex
+        while i != utf8.endIndex {
+            let byte = utf8[i]
+            if byte == 0x2F {
+                let next = utf8.index(after: i)
+                componentStart = next
+                lastDot = nil
+            } else if byte == 0x2E {
+                lastDot = i
+            }
+            i = utf8.index(after: i)
+        }
+        guard let lastDot,
+              lastDot != componentStart,
+              utf8.index(after: lastDot) != utf8.endIndex else {
+            return ""
+        }
+        return path[utf8.index(after: lastDot)...].lowercased()[...]
     }
 
     public static func relativeTimestamp(_ date: Date, now: Date = Date()) -> String {

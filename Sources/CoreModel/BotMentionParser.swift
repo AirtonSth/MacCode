@@ -22,8 +22,10 @@ public enum BotMentionParser {
         return bots.filter { bot in
             if bot.id == excluding { return false }
             if needle.isEmpty { return true }
-            return bot.handle.lowercased().hasPrefix(needle)
-                || bot.name.lowercased().contains(needle)
+            // SEP-3: case-insensitive match without per-bot lowercased()
+            // allocs on every keystroke (needle is already lowercase).
+            return bot.handle.range(of: needle, options: [.caseInsensitive, .anchored]) != nil
+                || bot.name.range(of: needle, options: .caseInsensitive) != nil
         }
     }
 
@@ -57,13 +59,14 @@ public enum BotMentionParser {
         in bots: [BotDefinition],
         excluding: BotID?
     ) -> BotDefinition? {
-        let needle = token.lowercased()
         if let handle = BotHandle.normalize(token),
            let exact = bots.first(where: { $0.id != excluding && $0.handle == handle }) {
             return exact
         }
+        // SEP-3: case-insensitive compare without per-call lowercased()
+        // copies (token needle + per-bot name allocs per resolve).
         return bots.first { bot in
-            bot.id != excluding && bot.name.lowercased() == needle
+            bot.id != excluding && bot.name.caseInsensitiveCompare(token) == .orderedSame
         }
     }
 

@@ -586,9 +586,18 @@ public enum CapacitySemanticHarness {
             }
         }
 
-        let completed = nodes.filter { $0.status == .completed }.count
-        let cancelled = nodes.filter { $0.status == .cancelled }.count
-        let failed = nodes.filter { $0.status == .failed }.count
+        // Single pass: terminal-status tallies together, no filter intermediates.
+        var completed = 0
+        var cancelled = 0
+        var failed = 0
+        for node in nodes {
+            switch node.status {
+            case .completed: completed += 1
+            case .cancelled: cancelled += 1
+            case .failed: failed += 1
+            case .waiting, .active: break
+            }
+        }
         let rejoinOK = nodes.filter { $0.kind == .nested }.allSatisfy { node in
             switch node.status {
             case .completed:

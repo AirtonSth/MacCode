@@ -149,7 +149,14 @@ public final class TailcatRemoteConnectionAuthenticator: @unchecked Sendable {
     }
 
     private static func nodePublicBytes(_ value: String) -> Data? {
-        let hex = value.split(separator: ":", maxSplits: 1).last.map(String.init) ?? value
+        // Bounded suffix take: only the 64 hex chars after the first ":" are
+        // needed — no split array over the whole node public string.
+        let hex: Substring
+        if let colon = value.firstIndex(of: ":") {
+            hex = value[value.index(after: colon)...]
+        } else {
+            hex = value[...]
+        }
         guard hex.count == 64 else { return nil }
         var bytes: [UInt8] = []
         bytes.reserveCapacity(32)

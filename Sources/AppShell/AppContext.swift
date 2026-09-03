@@ -70,11 +70,16 @@ public enum TokenSaverLaneKillSwitch: Sendable {
 
     public static func parseLaneList(_ raw: String?) -> Set<String> {
         guard let raw else { return [] }
-        return Set(
-            raw.split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-        )
+        // PERF: single pass avoids the split + map + filter intermediates on
+        // the lane-resolution path; parsed set identical.
+        var out = Set<String>()
+        for part in raw.split(separator: ",") {
+            let lane = part.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !lane.isEmpty {
+                out.insert(lane)
+            }
+        }
+        return out
     }
 
     /// Read optional `disabled_lanes` / `enabled_lanes` from DistillCLIState.json
@@ -87,10 +92,15 @@ public enum TokenSaverLaneKillSwitch: Sendable {
         }
         func set(from key: String) -> Set<String> {
             if let arr = obj[key] as? [String] {
-                return Set(
-                    arr.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                        .filter { !$0.isEmpty }
-                )
+                // PERF: single pass, matching parseLaneList above.
+                var out = Set<String>()
+                for raw in arr {
+                    let lane = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !lane.isEmpty {
+                        out.insert(lane)
+                    }
+                }
+                return out
             }
             if let s = obj[key] as? String {
                 return parseLaneList(s)
@@ -2104,7 +2114,12 @@ public final class AppContext {
             }
             let managedBin = installer.managedCLIBinURL.path
             let currentPath = baseEnvironment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
-            let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }
+            // PERF: single pass avoids the map + filter intermediates on the
+            // pre-turn env path; joined PATH identical.
+            var pathParts: [String] = []
+            for part in currentPath.split(separator: ":") where part != managedBin {
+                pathParts.append(String(part))
+            }
             env["PATH"] = ([managedBin] + pathParts).joined(separator: ":")
             env["RC_REMOTE_CODE_MANAGED_BIN"] = managedBin
         }

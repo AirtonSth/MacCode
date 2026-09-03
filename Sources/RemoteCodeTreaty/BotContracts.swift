@@ -227,13 +227,20 @@ public struct BotUploadTarget: Codable, Equatable, Sendable {
               digest.allSatisfy(\.isHexDigit),
               let size = object["size_bytes"]?.intValue,
               size > 0 else { return nil }
+        // PERF: 64 ASCII hex bytes; lowercased() copied the whole digest per
+        // grant. Fold case in place (A-F only; digits pass through); same value.
+        var foldedBytes = Array(digest.utf8)
+        for i in foldedBytes.indices where foldedBytes[i] >= 0x41 && foldedBytes[i] <= 0x46 {
+            foldedBytes[i] |= 0x20
+        }
+        let folded = String(bytes: foldedBytes, encoding: .utf8) ?? digest
         self.init(
             botID: botID,
             conversationID: conversationID,
             attachmentID: attachmentID,
             filename: filename,
             kind: kind,
-            digest: digest.lowercased(),
+            digest: folded,
             size: size,
             mimeType: object["mime_type"]?.stringValue
         )

@@ -2399,6 +2399,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     // MARK: Off-main thread open bundle (perf AA-02/AA-03/AA-04)
 
+    /// Shared decoder for the off-main bundle path (see gatherThreadOpenBundle).
+    private static let bundleCallbackDecodeLock = NSLock()
+    private static let bundleCallbackDecoder = JSONDecoder()
+
     /// Everything a full thread open needs from SQLite + JSON decode + replay
     /// CPU, gathered in one detached pass. The open path used to run 8-10
     /// synchronous SQLite reads on the MainActor between click and first paint
@@ -2445,23 +2449,31 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             if let pendingCallbackRepo {
                 // Mirror of rehydratePendingCallbacks' decode, off-main.
+                // SEP-3: share one decoder under a lock instead of allocating
+                // per thread open (JSONDecoder is not thread-safe; this runs
+                // in Task.detached, unlike the MainActor rehydrate path).
                 let callbacks = (try? pendingCallbackRepo.listVisible(threadId: threadId)) ?? []
                 var events: [AssistantEvent] = []
-                let decoder = JSONDecoder()
                 for callback in callbacks {
                     guard let data = callback.payloadJSON.data(using: .utf8) else { continue }
                     switch callback.kind {
                     case .approval:
-                        guard var request = try? decoder.decode(
+                        Self.bundleCallbackDecodeLock.lock()
+                        let request = try? Self.bundleCallbackDecoder.decode(
                             AssistantPendingRequest.self, from: data
-                        ) else { continue }
+                        )
+                        Self.bundleCallbackDecodeLock.unlock()
+                        guard var request else { continue }
                         request.state = callback.state
                         request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
                         events.append(.requestOpened(request))
                     case .userInput:
-                        guard var request = try? decoder.decode(
+                        Self.bundleCallbackDecodeLock.lock()
+                        let userRequest = try? Self.bundleCallbackDecoder.decode(
                             AssistantUserInputRequest.self, from: data
-                        ) else { continue }
+                        )
+                        Self.bundleCallbackDecodeLock.unlock()
+                        guard var request = userRequest else { continue }
                         request.state = callback.state
                         request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
                         events.append(.userInputRequested(request))
@@ -4054,11 +4066,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         inMemory: [AgentMessage],
         threadId: AgentThreadID
     ) -> [AgentMessage] {
-        let loadedIds = Set(loadedRows.map(\.id))
-        let mirrors = inMemory.filter { candidate in
-            candidate.threadId == threadId && !loadedIds.contains(candidate.id)
+        // Single pass: id set plus same-thread mirrors together, no filter
+        // intermediate on the message-page load path.
+        var loadedIds = Set<AgentMessageID>()
+        loadedIds.reserveCapacity(loadedRows.count)
+        var merged = loadedRows
+        for row in loadedRows {
+            loadedIds.insert(row.id)
         }
-        return loadedRows + mirrors
+        for candidate in inMemory where candidate.threadId == threadId {
+            if !loadedIds.contains(candidate.id) {
+                loadedIds.insert(candidate.id)
+                merged.append(candidate)
+            }
+        }
+        return merged
     }
 
     /// Shared UX for an outgoing user turn that is actually starting now:
@@ -4175,8 +4197,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 contentLimit: AssistantTimelineState.liveTextLimit
             )
             let rows = payload.page?.rows ?? []
-            let userIds = rows.filter { $0.role == .user }.map(\.id)
-            let assistantIds = rows.filter { $0.role == .assistant }.map(\.id)
+            // PERF: single pass instead of two filter+map traversals over the
+            // history page; id sets identical (roles are disjoint).
+            var userIds: [AgentMessageID] = []
+            var assistantIds: [AgentMessageID] = []
+            userIds.reserveCapacity(rows.count)
+            assistantIds.reserveCapacity(rows.count)
+            for row in rows {
+                if row.role == .user { userIds.append(row.id) }
+                else if row.role == .assistant { assistantIds.append(row.id) }
+            }
             if !userIds.isEmpty {
                 payload.userRCW1Requests = (try? repository.rcw1RequestTranslations(
                     threadId: threadId,
@@ -5398,8 +5428,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// never carries a false fallback warning.
     public var displayedModelListIsFallback: Bool {
         guard availableModelsAreFallback else { return false }
-        return modelOptionsForSelectedProvider.map(\.id)
-            == availableModels.filter { $0.provider == provider }.map(\.id)
+        let options = modelOptionsForSelectedProvider
+        var count = 0
+        for model in availableModels where model.provider == provider {
+            guard count < options.count, options[count].id == model.id else { return false }
+            count += 1
+        }
+        return count == options.count
     }
 
     public var supportedReasoningEffortsForSelectedModel: [AgentReasoningEffort] {
@@ -8363,7 +8398,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private func recordPromptHistory(_ text: String) {
         guard !text.isEmpty else { return }
         promptHistory.append(text)
-        promptHistory = Array(promptHistory.suffix(PromptHistoryStore.limit))
+        // PERF: trim only when over budget instead of rebuilding the 200-entry
+        // array via Array(suffix:) on every sent prompt.
+        if promptHistory.count > PromptHistoryStore.limit {
+            promptHistory.removeFirst(promptHistory.count - PromptHistoryStore.limit)
+        }
         promptHistoryStore?.save(promptHistory, workspaceID: workspaceID)
         // NOTE: call promptHistoryStore?.search(workspaceID:query:limit:) from a
         // search field in the composer to surface filtered history to the user.
@@ -10139,12 +10178,23 @@ public enum AgentComposerSuggestions {
         // `max(limit, commandCount)` cap starved skills to ZERO whenever commands
         // already filled `limit` (e.g. Claude's built-ins + `/mcp`), hiding every
         // project/user skill on a bare `/`; skills must always get room.
+        var commandNames: [String] = []
+        var skillNames: [String] = []
+        commandNames.reserveCapacity(candidates.count)
+        skillNames.reserveCapacity(candidates.count)
+        for candidate in candidates {
+            switch candidate.kind {
+            case .slashCommand: commandNames.append(candidate.bare)
+            case .skill: skillNames.append(candidate.bare)
+            default: break
+            }
+        }
         let commandBares = ranked(
-            candidates.filter { $0.kind == .slashCommand }.map(\.bare),
+            commandNames,
             query: query
         )
         let skillBares = ranked(
-            candidates.filter { $0.kind == .skill }.map(\.bare),
+            skillNames,
             query: query
         )
         var seenBareKind = Set<String>()
@@ -10315,26 +10365,35 @@ public enum AgentComposerSuggestions {
             ? String(query.dropFirst()).lowercased()
             : query
         guard !normalizedQuery.isEmpty else { return unique }
-        return unique
-            .filter {
-                let value = $0.lowercased()
-                let bare = value.hasPrefix("/") || value.hasPrefix("$")
-                    ? String(value.dropFirst())
-                    : value
-                return bare.contains(normalizedQuery) || value.contains(normalizedQuery)
-            }
-            .sorted { lhs, rhs in
-                let l = lhs.lowercased()
-                let r = rhs.lowercased()
-                let lBare = l.hasPrefix("/") || l.hasPrefix("$") ? String(l.dropFirst()) : l
-                let rBare = r.hasPrefix("/") || r.hasPrefix("$") ? String(r.dropFirst()) : r
-                let lp = lBare.hasPrefix(normalizedQuery) || l.hasPrefix(normalizedQuery)
-                    || l.hasPrefix("/\(normalizedQuery)") || l.hasPrefix("$\(normalizedQuery)")
-                let rp = rBare.hasPrefix(normalizedQuery) || r.hasPrefix(normalizedQuery)
-                    || r.hasPrefix("/\(normalizedQuery)") || r.hasPrefix("$\(normalizedQuery)")
-                if lp != rp { return lp }
-                return lhs < rhs
-            }
+        // PERF: fold case once per row instead of per filter check plus twice
+        // per sort comparison on every composer keystroke; order identical.
+        struct RankedRow {
+            let raw: String
+            let folded: String
+            let bare: String
+            let prefixHit: Bool
+        }
+        var rows: [RankedRow] = []
+        rows.reserveCapacity(unique.count)
+        for value in unique {
+            let folded = value.lowercased()
+            let bare = folded.hasPrefix("/") || folded.hasPrefix("$")
+                ? String(folded.dropFirst())
+                : folded
+            guard bare.contains(normalizedQuery) || folded.contains(normalizedQuery) else { continue }
+            rows.append(RankedRow(
+                raw: value,
+                folded: folded,
+                bare: bare,
+                prefixHit: bare.hasPrefix(normalizedQuery) || folded.hasPrefix(normalizedQuery)
+                    || folded.hasPrefix("/\(normalizedQuery)") || folded.hasPrefix("$\(normalizedQuery)")
+            ))
+        }
+        rows.sort {
+            if $0.prefixHit != $1.prefixHit { return $0.prefixHit }
+            return $0.raw < $1.raw
+        }
+        return rows.map(\.raw)
     }
 }
 

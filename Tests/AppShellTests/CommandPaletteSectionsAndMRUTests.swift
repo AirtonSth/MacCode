@@ -268,6 +268,26 @@ final class CommandPaletteSectionsAndMRUTests: XCTestCase {
         palette.toggle()
     }
 
+    // MARK: - SEP-3: frecency snapshot is per-open, not per-keystroke
+
+    /// WHY: frecencyRanked used to hit the settings SQLite DB on every
+    /// keystroke (applyFilter -> frecencyRanked -> store.load). With the
+    /// per-open snapshot the filter path must not consult the DB again:
+    /// hiding clears the snapshot and the next open re-snapshots.
+    func test_frecencySnapshot_loadsOncePerOpenAndClearsOnHide() throws {
+        let (_, _, palette) = try make()
+        XCTAssertFalse(palette.hasFrecencySnapshotForTesting,
+            "no snapshot before the palette opens (tests calling rebuildCommands use live load)")
+
+        palette.toggle() // open: loadRecentFromStore snapshots
+        XCTAssertTrue(palette.hasFrecencySnapshotForTesting,
+            "opening the palette must snapshot frecency so keystrokes filter in-memory")
+
+        palette.toggle() // hide: snapshot released with the command arrays
+        XCTAssertFalse(palette.hasFrecencySnapshotForTesting,
+            "hiding the palette must release the snapshot so the next open re-reads frecency")
+    }
+
     // MARK: - T033: allCommandIDsForTesting and commandIDsForTesting are consistent
 
     /// WHY: commandIDsForTesting (filtered) with an empty query must be a

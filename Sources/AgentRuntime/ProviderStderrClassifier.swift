@@ -3,9 +3,14 @@ import CoreModel
 
 enum ProviderStderrClassifier {
     static func displayableStderr(_ raw: String, provider: AgentProvider) -> String? {
-        let kept = raw.split(whereSeparator: \.isNewline)
-            .map(String.init)
-            .filter { shouldDisplay(line: $0, provider: provider) }
+        // PERF: single pass avoids the map + filter intermediates on the
+        // stderr path; kept text identical.
+        var kept: [String] = []
+        kept.reserveCapacity(8)
+        for part in raw.split(whereSeparator: \.isNewline) {
+            let line = String(part)
+            if shouldDisplay(line: line, provider: provider) { kept.append(line) }
+        }
         let text = kept.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
         return text.isEmpty ? nil : text
     }

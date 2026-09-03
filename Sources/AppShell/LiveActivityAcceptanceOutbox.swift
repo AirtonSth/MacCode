@@ -280,22 +280,28 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
                 guard let oldestSession = lane.min(by: {
                     Self.isOrderedBefore($0.delivery, $1.delivery)
                 }) else { return nil }
-                let session = lane.filter {
-                    Self.isSameSession($0.delivery, oldestSession.delivery)
+                // Single pass over the lane: oldest session's terminal (max
+                // revision), start (min revision), and overall max. Strict
+                // comparisons keep filter+max (last maximal) / filter+min
+                // (first minimal) tie behavior; no filter intermediates.
+                var terminal: LiveActivityAcceptanceRecord?
+                var start: LiveActivityAcceptanceRecord?
+                var overall: LiveActivityAcceptanceRecord?
+                for record in lane where Self.isSameSession(record.delivery, oldestSession.delivery) {
+                    let revision = record.delivery.projection.revision
+                    if record.delivery.event == .end,
+                       terminal.map({ $0.delivery.projection.revision < revision }) ?? true {
+                        terminal = record
+                    }
+                    if record.delivery.event == .start,
+                       start.map({ revision < $0.delivery.projection.revision }) ?? true {
+                        start = record
+                    }
+                    if overall.map({ $0.delivery.projection.revision < revision }) ?? true {
+                        overall = record
+                    }
                 }
-                if let terminal = session
-                    .filter({ $0.delivery.event == .end })
-                    .max(by: { $0.delivery.projection.revision < $1.delivery.projection.revision }) {
-                    return terminal
-                }
-                if let start = session
-                    .filter({ $0.delivery.event == .start })
-                    .min(by: { $0.delivery.projection.revision < $1.delivery.projection.revision }) {
-                    return start
-                }
-                return session.max(by: {
-                    $0.delivery.projection.revision < $1.delivery.projection.revision
-                })
+                return terminal ?? start ?? overall
             }
         }
     }
@@ -499,10 +505,12 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
 
     private static func newestRecord(
         in records: [LiveActivityAcceptanceRecord],
-        event: PrivateLiveActivityEvent
+        event: PrivateLiveActivityEvent,
+        sameSessionAs sessionAnchor: LiveActivitySyncDelivery? = nil
     ) -> LiveActivityAcceptanceRecord? {
         records.reduce(nil) { current, candidate in
             guard candidate.delivery.event == event else { return current }
+            if let sessionAnchor, !isSameSession(candidate.delivery, sessionAnchor) { return current }
             guard let current else { return candidate }
             if candidate.delivery.projection.revision > current.delivery.projection.revision {
                 return candidate
@@ -532,10 +540,9 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
             guard let current = newestLifecycleRecord(in: lane) else { continue }
             result.insert(current.recordID)
             if let start = newestRecord(
-                in: lane.filter {
-                    isSameSession($0.delivery, current.delivery)
-                },
-                event: .start
+                in: lane,
+                event: .start,
+                sameSessionAs: current.delivery
             ) {
                 // An update is not deliverable until its generation start has
                 // crossed the backend lifecycle barrier.
@@ -561,9 +568,16 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
     ) -> Set<String> {
         var result = Set<String>()
         for lane in Dictionary(grouping: records, by: { $0.target.laneIdentity }).values {
-            if let terminal = lane
-                .filter({ $0.delivery.event == .end })
-                .max(by: { recordIsOrderedBefore($0, $1) }) {
+            // Single pass: newest terminal end per lane, no filter intermediate.
+            var terminal: LiveActivityAcceptanceRecord?
+            for record in lane where record.delivery.event == .end {
+                if let current = terminal {
+                    if recordIsOrderedBefore(current, record) { terminal = record }
+                } else {
+                    terminal = record
+                }
+            }
+            if let terminal {
                 result.insert(terminal.recordID)
             }
         }

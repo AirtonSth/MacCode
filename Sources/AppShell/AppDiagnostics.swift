@@ -240,7 +240,13 @@ public actor ManagedProviderAdmissionGate {
         pendingAdmissionDates = pendingAdmissionDates.filter {
             now.timeIntervalSince($0.value) < reservationLifetime
         }
-        let currentRootPIDs = Set(scan.providerProcesses.compactMap(\.pgid).filter { $0 > 0 })
+        var currentRootPIDs = Set<pid_t>()
+        currentRootPIDs.reserveCapacity(scan.providerProcesses.count)
+        for process in scan.providerProcesses {
+            if let pgid = process.pgid, pgid > 0 {
+                currentRootPIDs.insert(pgid)
+            }
+        }
         residentRootByKey = residentRootByKey.filter { currentRootPIDs.contains($0.value) }
         let appearedRootPIDs = currentRootPIDs.subtracting(lastProviderRootPIDs).sorted()
         let pendingKeys = pendingAdmissionDates.sorted {
@@ -381,10 +387,18 @@ enum AppDiagnostics {
     nonisolated static func aggregateProviderStats(
         processes: [ProviderRuntimeProcess]
     ) -> ProviderStats {
-        ProviderStats(
+        // Single pass: RSS total + orphan (ppid == 1) count together, no
+        // filter intermediate on the heartbeat path.
+        var totalRSSKB = 0
+        var orphanCount = 0
+        for process in processes {
+            totalRSSKB += process.rssKB
+            if process.ppid == 1 { orphanCount += 1 }
+        }
+        return ProviderStats(
             processCount: processes.count,
-            totalRSSKB: processes.reduce(0) { $0 + $1.rssKB },
-            orphanCount: processes.filter { $0.ppid == 1 }.count
+            totalRSSKB: totalRSSKB,
+            orphanCount: orphanCount
         )
     }
 

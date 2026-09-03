@@ -470,7 +470,9 @@ public extension CommandRouting {
             guard expectedBodyRevision == 1 else {
                 throw AgentMessageBodyChunkError.bodyRevisionConflict
             }
-            guard expectedBodySHA256?.lowercased() == digest else {
+            let accepted = expectedBodySHA256 == digest
+                || expectedBodySHA256?.lowercased() == digest
+            guard accepted else {
                 throw AgentMessageBodyChunkError.bodyDigestMismatch
             }
         }
@@ -4605,8 +4607,9 @@ public final class JSONRPCDispatcher {
         default:
             // Heuristic: provider binaries (codex/claude/git) report
             // "missing"/"not found" via untyped errors; classify those.
-            let lowered = verbose.lowercased()
-            if lowered.contains("missingbinary") || lowered.contains("binary not found") || lowered.contains("executable not found") {
+            if verbose.range(of: "missingbinary", options: .caseInsensitive) != nil
+                || verbose.range(of: "binary not found", options: .caseInsensitive) != nil
+                || verbose.range(of: "executable not found", options: .caseInsensitive) != nil {
                 NSLog("[RC2.Dispatch] %@ missing binary: %@", method, verbose)
                 return JSONRPCError(code: -32012, message: "A required command-line tool is not installed.",
                                     data: .object(["domain": .string("binary"), "detail": .string(verbose)]))

@@ -432,6 +432,33 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
         XCTAssertTrue(source.contains("AgentChatTranscriptChrome.displayUserLine("))
     }
 
+    func test_isImagePath_preservesNSStringPathExtensionForLeadingDotBasenames() {
+        // WHY: Foundation NSString.pathExtension treats `.png` and `foo/.png`
+        // as dotfiles with no extension. The allocation-free scanner must not
+        // classify them as images, while photo.PNG and ordinary multi-dot
+        // names keep case-insensitive extension behavior.
+        XCTAssertFalse(
+            AgentChatTranscriptChrome.isImagePath(".png"),
+            ".png is a leading-dot basename with no extension — not an image"
+        )
+        XCTAssertFalse(
+            AgentChatTranscriptChrome.isImagePath("foo/.png"),
+            "foo/.png is a leading-dot basename with no extension — not an image"
+        )
+        XCTAssertTrue(
+            AgentChatTranscriptChrome.isImagePath("photo.PNG"),
+            "photo.PNG must stay an image under case-insensitive extension matching"
+        )
+        XCTAssertTrue(
+            AgentChatTranscriptChrome.isImagePath("archive.backup.png"),
+            "ordinary multi-dot names must still use the last extension"
+        )
+        XCTAssertFalse(
+            AgentChatTranscriptChrome.isImagePath("notes.tar.gz"),
+            "a non-image last extension must not be classified as an image"
+        )
+    }
+
     private func firstTextView(in view: NSView) -> NSTextView? {
         if let textView = view as? NSTextView {
             return textView

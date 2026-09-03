@@ -7566,7 +7566,22 @@ public final class AgentTurnCheckpointRepository {
             }
             let truncated = rows.count > limit
             let pageRows = Array(rows.prefix(limit))
-            let items = pageRows.map(\.summary)
+            // PERF: one pass builds the four parallel arrays instead of four
+            // separate map traversals over the page.
+            var items: [AgentTurnCheckpointSummary] = []
+            var filesTruncated: [Bool] = []
+            var listMetadata: [AgentTurnCheckpointListWireProjection.Capture] = []
+            var completedAtTokens: [String] = []
+            items.reserveCapacity(pageRows.count)
+            filesTruncated.reserveCapacity(pageRows.count)
+            listMetadata.reserveCapacity(pageRows.count)
+            completedAtTokens.reserveCapacity(pageRows.count)
+            for row in pageRows {
+                items.append(row.summary)
+                filesTruncated.append(row.filesTruncated)
+                listMetadata.append(row.listMetadata)
+                completedAtTokens.append(row.completedAtToken)
+            }
             let nextBefore: AgentTurnCheckpointCursor? = {
                 guard truncated, let last = pageRows.last else { return nil }
                 return AgentTurnCheckpointCursor(
@@ -7578,9 +7593,9 @@ public final class AgentTurnCheckpointRepository {
             }()
             return AgentTurnCheckpointPage(
                 items: items,
-                filesTruncated: pageRows.map(\.filesTruncated),
-                listMetadata: pageRows.map(\.listMetadata),
-                completedAtTokens: pageRows.map(\.completedAtToken),
+                filesTruncated: filesTruncated,
+                listMetadata: listMetadata,
+                completedAtTokens: completedAtTokens,
                 truncated: truncated,
                 nextBefore: nextBefore,
                 catalogRevision: catalogRevision

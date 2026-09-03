@@ -406,7 +406,7 @@ public final class SnapshotChunkTransferCache: @unchecked Sendable {
         guard record.ownerFingerprint == ownerFingerprint else {
             throw SnapshotChunkTransferFailure.identityMismatch
         }
-        let normalizedDigest = digest.lowercased()
+        let normalizedDigest = digest == record.digest ? digest : digest.lowercased()
         guard record.snapshotId == snapshotId,
               record.digest == normalizedDigest else {
             throw SnapshotChunkTransferFailure.commitMismatch
@@ -431,12 +431,13 @@ public final class SnapshotChunkTransferCache: @unchecked Sendable {
 
     @discardableResult
     private func evictExpiredLocked(now: UInt64) -> [SnapshotChunkTransferRecord] {
-        let expired = transfers.values.filter { now >= $0.expiresAtNanoseconds }
+        // Single pass: collect expired ids and drop them inline, avoiding the
+        // filter intermediate plus a second key lookup per record in removeLocked.
         var removed: [SnapshotChunkTransferRecord] = []
-        for record in expired {
-            if let dropped = removeLocked(transferId: record.transferId) {
-                removed.append(dropped)
-            }
+        for (transferId, record) in transfers where now >= record.expiresAtNanoseconds {
+            removed.append(record)
+            transfers.removeValue(forKey: transferId)
+            totalCachedBytes = max(0, totalCachedBytes - record.totalBytes)
         }
         return removed
     }

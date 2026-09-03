@@ -448,13 +448,14 @@ public enum HostMutationContract {
     private static let directions: Set<String> = ["right", "down", "left", "up"]
 
     private static func isSurfaceType(_ value: String) -> Bool {
+        let lower = value.lowercased()
         let normalized: String
-        switch value.lowercased() {
+        switch lower {
         case "agent", "agent_app", "agentapp": normalized = "agentApp"
         case "rightsidebartool", "right_sidebar_tool", "diff", "git": normalized = "rightSidebarTool"
         case "filepreview", "file_preview": normalized = "filePreview"
         case "files", "file_browser", "filebrowser": normalized = "files"
-        case "terminal", "ssh", "browser", "markdown": normalized = value.lowercased()
+        case "terminal", "ssh", "browser", "markdown": normalized = lower
         default: normalized = value
         }
         return ["terminal", "ssh", "browser", "agentApp", "files", "markdown", "filePreview", "rightSidebarTool"].contains(normalized)

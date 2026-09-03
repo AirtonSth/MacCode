@@ -196,6 +196,21 @@ final class DiffPanelHistoryPaginationTests: XCTestCase {
                       "a non-matching filter must produce an empty list so the empty state is shown")
     }
 
+    // SEP-3: the query trim moved from per-commit (inside
+    // commitMatchesFilter) to once per filter pass in filteredCommits.
+    // A padded query must still match like its trimmed form.
+    @MainActor
+    func test_filteredCommits_paddedQuery_matchesTrimmed() {
+        let vm = DiffPanelViewModel(cwd: "/tmp")
+        vm.commits = [
+            GitCommit(hash: "a", shortHash: "a", author: "x", date: "2026-01-01", subject: "feat: pagination"),
+            GitCommit(hash: "b", shortHash: "b", author: "x", date: "2026-01-02", subject: "fix: crash"),
+        ]
+        vm.historyFilter = "  pagination  "
+        XCTAssertEqual(vm.filteredCommits.map(\.hash), ["a"],
+            "padded filter must behave like the trimmed query")
+    }
+
     // MARK: - amendLastCommit reset behaviour
 
     @MainActor

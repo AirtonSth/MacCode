@@ -2,8 +2,16 @@ import Foundation
 
 public enum StackTraceCrusher {
     public static func looksLikeStackTrace(_ text: String) -> Bool {
-        let lines = text.split(whereSeparator: \.isNewline).map(String.init)
-        let frameCount = lines.filter(isStackFrame).count
+        // PERF: lazy scan avoids materialising every line as String plus a
+        // filter intermediate; only frame classification runs per line.
+        // Short-circuit at 5 — crush verdicts need no exact count above that.
+        var frameCount = 0
+        for line in text.split(whereSeparator: \.isNewline) {
+            if isStackFrame(String(line)) {
+                frameCount += 1
+                if frameCount >= 5 { break }
+            }
+        }
         return frameCount >= 3 && (
             text.contains("Traceback (most recent call last)") ||
             text.contains("Caused by:") ||

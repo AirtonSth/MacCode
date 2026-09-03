@@ -1785,20 +1785,22 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     // anchor; dropping it reorders Lazy rows mid-stream. Also drops orphaned translations.
     private mutating func trimTurnItems(at idx: Int) {
         guard turns[idx].items.count > Self.liveTurnItemLimit else { return }
-        let first = turns[idx].items[0]
-        let rest = Array(turns[idx].items.dropFirst())
+        // PERF: single pass over the live array — drop the oldest non-anchor
+        // items in place instead of copying the tail twice (dropFirst + suffix).
         let keepRest = Self.liveTurnItemLimit - 1
-        let dropFromRest = max(0, rest.count - keepRest)
-        if dropFromRest > 0, !sr1TranslationsByItemId.isEmpty {
-            for item in rest.prefix(dropFromRest) {
-                sr1TranslationsByItemId.removeValue(forKey: item.id)
-                sr1TranslationsByItemId.removeValue(forKey: Self.tokenSaverTimelineItemTranslationKey(
-                    turnId: turns[idx].turnId,
-                    itemId: item.id
-                ))
+        let dropFromRest = turns[idx].items.count - 1 - keepRest
+        if dropFromRest > 0 {
+            if !sr1TranslationsByItemId.isEmpty {
+                for item in turns[idx].items[1..<(1 + dropFromRest)] {
+                    sr1TranslationsByItemId.removeValue(forKey: item.id)
+                    sr1TranslationsByItemId.removeValue(forKey: Self.tokenSaverTimelineItemTranslationKey(
+                        turnId: turns[idx].turnId,
+                        itemId: item.id
+                    ))
+                }
             }
+            turns[idx].items.removeSubrange(1..<(1 + dropFromRest))
         }
-        turns[idx].items = [first] + Array(rest.suffix(keepRest))
     }
 
     private mutating func trimPendingRequests() {

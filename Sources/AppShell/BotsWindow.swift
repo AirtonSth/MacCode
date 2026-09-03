@@ -3522,10 +3522,10 @@ public final class BotsViewModel: ObservableObject {
             filtered = bots
         } else {
             filtered = bots.filter { bot in
-                bot.name.lowercased().contains(query)
-                    || bot.handle.lowercased().contains(query)
-                    || bot.title.lowercased().contains(query)
-                    || bot.description.lowercased().contains(query)
+                bot.name.range(of: query, options: .caseInsensitive) != nil
+                    || bot.handle.range(of: query, options: .caseInsensitive) != nil
+                    || bot.title.range(of: query, options: .caseInsensitive) != nil
+                    || bot.description.range(of: query, options: .caseInsensitive) != nil
             }
         }
         var result = filtered.sorted { lhs, rhs in
@@ -3596,7 +3596,7 @@ public final class BotsViewModel: ObservableObject {
         let query = activeBotsSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !query.isEmpty else { return finishedBotItems }
         return finishedBotItems.filter {
-            $0.title.lowercased().contains(query) || $0.detail.lowercased().contains(query)
+            $0.title.range(of: query, options: .caseInsensitive) != nil || $0.detail.range(of: query, options: .caseInsensitive) != nil
         }
     }
 
@@ -3604,10 +3604,10 @@ public final class BotsViewModel: ObservableObject {
         let query = activeBotsSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !query.isEmpty else { return items }
         return items.filter {
-            $0.title.lowercased().contains(query)
-                || $0.handle.lowercased().contains(query)
-                || $0.detail.lowercased().contains(query)
-                || ($0.preview?.lowercased().contains(query) ?? false)
+            $0.title.range(of: query, options: .caseInsensitive) != nil
+                || $0.handle.range(of: query, options: .caseInsensitive) != nil
+                || $0.detail.range(of: query, options: .caseInsensitive) != nil
+                || ($0.preview?.range(of: query, options: .caseInsensitive) != nil)
         }
     }
 
@@ -3739,24 +3739,37 @@ public final class BotsViewModel: ObservableObject {
             searched = scheduleTaskSource
         } else {
             searched = scheduleTaskSource.filter { item in
-                item.name.lowercased().contains(query)
-                    || item.botName.lowercased().contains(query)
-                    || item.prompt.lowercased().contains(query)
-                    || item.scheduleNote.lowercased().contains(query)
+                item.name.range(of: query, options: .caseInsensitive) != nil
+                    || item.botName.range(of: query, options: .caseInsensitive) != nil
+                    || item.prompt.range(of: query, options: .caseInsensitive) != nil
+                    || item.scheduleNote.range(of: query, options: .caseInsensitive) != nil
+            }
+        }
+        // PERF: single pass derives counts + the status-filtered list
+        // instead of two counting filters plus a third listing filter.
+        var activeCount = 0
+        var visible: [BotScheduleTaskItem] = []
+        let showAll = scheduleTaskStatusFilter == .all
+        let wantActive = scheduleTaskStatusFilter == .active
+        if !showAll {
+            visible.reserveCapacity(searched.count)
+        }
+        for item in searched {
+            if item.isEnabled { activeCount += 1 }
+            if showAll || item.isEnabled == wantActive {
+                if !showAll { visible.append(item) }
             }
         }
         scheduleTaskFilterCounts = (
             all: searched.count,
-            active: searched.filter(\.isEnabled).count,
-            paused: searched.filter { !$0.isEnabled }.count
+            active: activeCount,
+            paused: searched.count - activeCount
         )
         switch scheduleTaskStatusFilter {
         case .all:
             scheduleTaskItems = searched
-        case .active:
-            scheduleTaskItems = searched.filter(\.isEnabled)
-        case .paused:
-            scheduleTaskItems = searched.filter { !$0.isEnabled }
+        case .active, .paused:
+            scheduleTaskItems = visible
         }
     }
 
@@ -5457,8 +5470,16 @@ public final class BotsViewModel: ObservableObject {
                 }
             }
             var seen = Set<AgentThreadID>()
-            let toStop = (sendWorks.compactMap(\.threadID) + threadIDs).filter {
-                seen.insert($0).inserted
+            seen.reserveCapacity(sendWorks.count + threadIDs.count)
+            var toStop: [AgentThreadID] = []
+            toStop.reserveCapacity(sendWorks.count + threadIDs.count)
+            for work in sendWorks {
+                if let threadID = work.threadID, seen.insert(threadID).inserted {
+                    toStop.append(threadID)
+                }
+            }
+            for threadID in threadIDs where seen.insert(threadID).inserted {
+                toStop.append(threadID)
             }
             let coordinator = self.context.coordinator
             let termination = Task {
@@ -5891,9 +5912,13 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func leftoverStoreFacts(for bot: BotDefinition) -> [String] {
-        ((try? botStore.listMemory(botID: bot.id)) ?? [])
-            .filter { $0.forgottenAt == nil && $0.trusted }
-            .map(\.content)
+        // PERF: single pass avoids the filter + map intermediate on the
+        // bot-mind write path; fact order identical.
+        ((try? botStore.listMemory(botID: bot.id)) ?? []).reduce(into: [String]()) { out, memory in
+            if memory.forgottenAt == nil && memory.trusted {
+                out.append(memory.content)
+            }
+        }
     }
 
     public func memoryFileTexts(for bot: BotDefinition) -> [BotMemoryFileText] {
@@ -6455,8 +6480,12 @@ public final class BotsViewModel: ObservableObject {
             var previews: [BotID: String] = lastPreviewByBot
             var updated: [BotID: Date] = lastUpdatedByBot
             let live = Set(bots.map(\.id))
-            previews = previews.filter { live.contains($0.key) }
-            updated = updated.filter { live.contains($0.key) }
+            // Single pass: drop preview/update entries for removed bots
+            // together, no second dictionary traversal.
+            for key in previews.keys where !live.contains(key) {
+                previews.removeValue(forKey: key)
+                updated.removeValue(forKey: key)
+            }
             for bot in bots {
                 if let last = messagesByBot[bot.id]?.last, !last.text.isEmpty {
                     previews[bot.id] = last.text
@@ -6936,8 +6965,13 @@ public final class BotsViewModel: ObservableObject {
     /// Prefetch provider · model for linked threads so first rail paint
     /// does not compile N 26-column + routing `get`s.
     private func prefetchDeskThreadRailRouting(for conversations: [BotConversation]) {
-        let missing = conversations.compactMap(\.linkedAgentThreadID).filter {
-            deskThreadRailRoutingCache[$0] == nil
+        var missing: [AgentThreadID] = []
+        missing.reserveCapacity(conversations.count)
+        for conversation in conversations {
+            if let threadID = conversation.linkedAgentThreadID,
+               deskThreadRailRoutingCache[threadID] == nil {
+                missing.append(threadID)
+            }
         }
         guard !missing.isEmpty else { return }
         let chrome = (try? context.threadRepo.listChrome(ids: missing)) ?? [:]
@@ -11606,7 +11640,11 @@ public struct BotsRootView: View {
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.warning)
                 .fixedSize(horizontal: false, vertical: true)
-            let skills = receipt.layers.filter { $0.kind == .skill && $0.included }.map(\.text)
+            let skills = receipt.layers.reduce(into: [String]()) { partial, layer in
+                if layer.kind == .skill && layer.included {
+                    partial.append(layer.text)
+                }
+            }
             Text(skills.isEmpty ? "No enabled skills." : "Skills: \(skills.joined(separator: ", "))")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)

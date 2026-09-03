@@ -70,6 +70,9 @@ public final class ANSIRenderer {
             }
             return out
         }
+
+        subscript(rowAt slot: Int) -> [Cell] { buf[slot] }
+        var headSlot: Int { head }
     }
 
     public private(set) var rows: Int
@@ -542,11 +545,24 @@ public final class ANSIRenderer {
     private func buildSnapshot() -> NSAttributedString {
         let out = NSMutableAttributedString()
         let font = DS.NS.terminalFont()
+        let boldFont = DS.NS.terminalFont(weight: .bold)
         let curRow = cursorRow
         let curCol = min(cursorCol, cols - 1)
-        let allRows = usesAlternateScreen ? grid : scrollback + grid
-        let cursorRenderedRow = usesAlternateScreen ? curRow : scrollbackCount + curRow
-        for (i, row) in allRows.enumerated() {
+        let useScrollback = !usesAlternateScreen
+        let sbCount = useScrollback ? scrollbackCount : 0
+        let totalRows = sbCount + grid.count
+        let cursorRenderedRow = usesAlternateScreen ? curRow : sbCount + curRow
+        // Row accessor avoids materialising the 10k-row scrollback ring into
+        // a temporary [[Cell]] (`scrollback + grid` allocated the whole array
+        // on every uncached repaint).
+        func row(at i: Int) -> [Cell] {
+            if i < sbCount {
+                return _scrollbackRing[rowAt: (_scrollbackRing.headSlot + i) % _scrollbackRing.capacity]
+            }
+            return grid[i - sbCount]
+        }
+        for i in 0..<totalRows {
+            let row = row(at: i)
             // Trim trailing empties to keep lines tidy.
             var endCol = row.count - 1
             while endCol >= 0, row[endCol].ch == " " && row[endCol].bg == NSColor.clear { endCol -= 1 }
@@ -554,7 +570,7 @@ public final class ANSIRenderer {
             // so a caret at end-of-line / on a blank line still shows.
             if showCursor, cursorVisible, i == cursorRenderedRow { endCol = max(endCol, curCol) }
             if endCol < 0 {
-                if i < allRows.count - 1 { out.append(NSAttributedString(string: "\n")) }
+                if i < totalRows - 1 { out.append(NSAttributedString(string: "\n")) }
                 continue
             }
             for c in 0...endCol {
@@ -571,11 +587,11 @@ public final class ANSIRenderer {
                 var attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: fg, .backgroundColor: bg]
                 if cell.underline { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
                 if cell.bold {
-                    attrs[.font] = DS.NS.terminalFont(weight: .bold)
+                    attrs[.font] = boldFont
                 }
                 out.append(NSAttributedString(string: String(cell.ch), attributes: attrs))
             }
-            if i < allRows.count - 1 { out.append(NSAttributedString(string: "\n")) }
+            if i < totalRows - 1 { out.append(NSAttributedString(string: "\n")) }
         }
         return out
     }
@@ -598,10 +614,19 @@ public final class ANSIRenderer {
     }
 
     private func buildANSISnapshot(includeScrollback: Bool) -> String {
-        let allRows = usesAlternateScreen || !includeScrollback ? grid : scrollback + grid
+        let useScrollback = includeScrollback && !usesAlternateScreen
+        let sbCount = useScrollback ? scrollbackCount : 0
+        let totalRows = sbCount + grid.count
+        func row(at i: Int) -> [Cell] {
+            if i < sbCount {
+                return _scrollbackRing[rowAt: (_scrollbackRing.headSlot + i) % _scrollbackRing.capacity]
+            }
+            return grid[i - sbCount]
+        }
         var out = ""
         var currentStyle: ANSIStyle?
-        for (i, row) in allRows.enumerated() {
+        for i in 0..<totalRows {
+            let row = row(at: i)
             var endCol = row.count - 1
             while endCol >= 0, row[endCol].ch == " " && row[endCol].bg == NSColor.clear { endCol -= 1 }
             if endCol >= 0 {
@@ -615,7 +640,7 @@ public final class ANSIRenderer {
                     out.append(cell.ch)
                 }
             }
-            if i < allRows.count - 1 {
+            if i < totalRows - 1 {
                 out.append("\n")
             }
         }
