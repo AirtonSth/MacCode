@@ -53,6 +53,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 36 (2026-09-03): CoreModel BotBrain remainder — reviewed (mention paths, codecs, PATH handling). FIXED: `skillDescription` materialised the whole skill body as [String] before scanning — now lazy split; same result
 
+- [x] Slice 37 (2026-09-03): Surfaces message-page remainder — reviewed (bounded projections, capped diffs, coalesced filters). FIXED: `loadMessagePageOffMain` ran two filter+map traversals over the history page for user/assistant ids — now single-pass bucketing; id sets identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
