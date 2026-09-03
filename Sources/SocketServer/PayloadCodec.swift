@@ -81,12 +81,16 @@ public struct PayloadCodec: Sendable, Equatable {
     /// 3G uplink; smaller bodies win. Returns nil when the client advertises
     /// no supported encoding.
     public static func preferredResponseCodec(acceptEncoding: String?) -> PayloadCodec? {
-        let accepted = acceptEncoding?
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() } ?? []
-        if accepted.contains(gzip.wireName) { return .gzip }
-        if accepted.contains(lzfse.wireName) { return .lzfse }
-        return nil
+        // PERF: short-circuit scan avoids the map array + two contains passes
+        // per JSON response; gzip-first policy unchanged.
+        guard let acceptEncoding else { return nil }
+        var sawLZFSE = false
+        for token in acceptEncoding.split(separator: ",") {
+            let normalized = token.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if normalized == gzip.wireName { return .gzip }
+            if normalized == lzfse.wireName { sawLZFSE = true }
+        }
+        return sawLZFSE ? .lzfse : nil
     }
 
     /// Size-gated variant of `preferredResponseCodec` (C-23 — one policy).
