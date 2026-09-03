@@ -1370,6 +1370,9 @@ final class ActiveWebSocketConnectionRegistry: @unchecked Sendable {
         /// keep an entry after same-owner replace but lose authority so
         /// `ownerFingerprint(for:)` fails closed while `hasConnection` stays true.
         var isHybridAuthority: Bool
+        /// Accepted TCP descriptor. Revoke must `SHUT_RDWR` this fd; the
+        /// session owner still performs the final `Darwin.close`.
+        let socketFD: Int32
     }
 
     private let lock = NSLock()
@@ -1378,7 +1381,8 @@ final class ActiveWebSocketConnectionRegistry: @unchecked Sendable {
     func insert(
         _ connectionID: String,
         ownerFingerprint: String,
-        watermark: ConnectionSequenceWatermark
+        watermark: ConnectionSequenceWatermark,
+        socketFD: Int32 = -1
     ) {
         lock.lock()
         // One hybrid-authority connection per owner. A replacement WS supersedes
@@ -1395,7 +1399,8 @@ final class ActiveWebSocketConnectionRegistry: @unchecked Sendable {
         entries[connectionID] = Entry(
             ownerFingerprint: ownerFingerprint,
             watermark: watermark,
-            isHybridAuthority: true
+            isHybridAuthority: true,
+            socketFD: socketFD
         )
         lock.unlock()
     }
@@ -1434,5 +1439,111 @@ final class ActiveWebSocketConnectionRegistry: @unchecked Sendable {
 
     func remove(_ connectionID: String) {
         lock.lock(); entries.removeValue(forKey: connectionID); lock.unlock()
+    }
+
+    func ownerFingerprints() -> Set<String> {
+        lock.lock(); defer { lock.unlock() }
+        return Set(entries.values.map(\.ownerFingerprint))
+    }
+
+    /// Shut down one connection's socket and drop its registry entry.
+    /// Returns the fd so the session owner can `Darwin.close` it. Does not
+    /// `close(2)` here: another thread may still hold the descriptor.
+    @discardableResult
+    func close(_ connectionID: String) -> Int32? {
+        lock.lock()
+        let entry = entries.removeValue(forKey: connectionID)
+        lock.unlock()
+        guard let entry else { return nil }
+        Self.shutdownSocket(entry.socketFD)
+        return entry.socketFD >= 0 ? entry.socketFD : nil
+    }
+
+    /// Shut down every physically live socket for `ownerFingerprint`,
+    /// including demoted same-owner predecessors. Skips `except` so a
+    /// revoke request can still write its 200. Returns shutdown fds.
+    @discardableResult
+    func close(ownedBy ownerFingerprint: String, except descriptor: Int32 = -1) -> [Int32] {
+        lock.lock()
+        let matching = entries.filter { _, entry in
+            guard entry.ownerFingerprint == ownerFingerprint else { return false }
+            if descriptor >= 0, entry.socketFD == descriptor { return false }
+            return true
+        }
+        for key in matching.keys {
+            entries.removeValue(forKey: key)
+        }
+        lock.unlock()
+        var fds: [Int32] = []
+        fds.reserveCapacity(matching.count)
+        for entry in matching.values {
+            Self.shutdownSocket(entry.socketFD)
+            if entry.socketFD >= 0 {
+                fds.append(entry.socketFD)
+            }
+        }
+        return fds
+    }
+
+    private static func shutdownSocket(_ fd: Int32) {
+        guard fd >= 0 else { return }
+        _ = Darwin.shutdown(fd, SHUT_RDWR)
+    }
+}
+
+/// HTTP keep-alive sessions keyed by accepted fd and durable owner fingerprint.
+/// Revoke shuts these down so a revoked bearer cannot send or receive on the
+/// still-open TCP connection after credential invalidation.
+final class ActiveHTTPOwnerConnectionRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var ownerByDescriptor: [Int32: String] = [:]
+
+    func bind(_ descriptor: Int32, ownerFingerprint: String) {
+        guard descriptor >= 0, !ownerFingerprint.isEmpty else { return }
+        lock.lock()
+        ownerByDescriptor[descriptor] = ownerFingerprint
+        lock.unlock()
+    }
+
+    func unbind(_ descriptor: Int32) {
+        lock.lock()
+        ownerByDescriptor.removeValue(forKey: descriptor)
+        lock.unlock()
+    }
+
+    func ownerFingerprint(for descriptor: Int32) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return ownerByDescriptor[descriptor]
+    }
+
+    func ownerFingerprints() -> Set<String> {
+        lock.lock(); defer { lock.unlock() }
+        return Set(ownerByDescriptor.values)
+    }
+
+    func descriptors(ownedBy ownerFingerprint: String) -> [Int32] {
+        lock.lock(); defer { lock.unlock() }
+        return ownerByDescriptor.compactMap { fd, owner in
+            owner == ownerFingerprint ? fd : nil
+        }
+    }
+
+    /// Shut down every HTTP socket bound to `ownerFingerprint` except the
+    /// revoke request's own fd. Session defer still `Darwin.close`s.
+    @discardableResult
+    func close(ownedBy ownerFingerprint: String, except descriptor: Int32 = -1) -> [Int32] {
+        lock.lock()
+        let fds = ownerByDescriptor.compactMap { fd, owner -> Int32? in
+            guard owner == ownerFingerprint, fd != descriptor else { return nil }
+            return fd
+        }
+        for fd in fds {
+            ownerByDescriptor.removeValue(forKey: fd)
+        }
+        lock.unlock()
+        for fd in fds {
+            _ = Darwin.shutdown(fd, SHUT_RDWR)
+        }
+        return fds
     }
 }

@@ -1389,6 +1389,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     private static let unknownRequestBody = Data("unknown request\n".utf8)
     private static let disabledBody = Data("disabled\n".utf8)
     private static let tooManyOutstandingPairingBody = Data("too many outstanding pairing requests\n".utf8)
+    private static let channelCloseFailedBody = Data("channel close failed\n".utf8)
 
     /// Pure helper: search `buf` for the CRLFCRLF header terminator starting
     /// at byte index `from`. The caller must pass
@@ -1433,6 +1434,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// Secret-free HTTP/RPC phase aggregates (admit/read/encode/write).
     public let requestPhaseMetrics = HTTPRequestPhaseMetrics()
     private let activeWebSocketConnections = ActiveWebSocketConnectionRegistry()
+    private let activeHTTPOwnerConnections = ActiveHTTPOwnerConnectionRegistry()
     /// TTL/memory-bounded cache for opt-in resumable `sync.snapshot` chunks.
     let snapshotChunkTransfers = SnapshotChunkTransferCache()
     private let receiveTimeoutSeconds: Int
@@ -1958,6 +1960,35 @@ public final class DirectHTTPServer: @unchecked Sendable {
         acceptedSockets.shutdown(scope: .tailcat)
     }
 
+    private func trackedOwnerFingerprints() -> Set<String> {
+        activeWebSocketConnections.ownerFingerprints()
+            .union(activeHTTPOwnerConnections.ownerFingerprints())
+    }
+
+    /// Shut down every HTTP and WebSocket socket for `ownerFingerprint` except
+    /// the in-flight revoke request. Does not `close(2)` — the session owner
+    /// still holds the descriptor. Returns false when any owner channel remains.
+    @discardableResult
+    private func closeOwnerChannels(
+        ownerFingerprint: String,
+        exceptDescriptor: Int32
+    ) -> Bool {
+        _ = activeWebSocketConnections.close(
+            ownedBy: ownerFingerprint,
+            except: exceptDescriptor
+        )
+        _ = activeHTTPOwnerConnections.close(
+            ownedBy: ownerFingerprint,
+            except: exceptDescriptor
+        )
+        if activeWebSocketConnections.hasConnection(ownedBy: ownerFingerprint) {
+            return false
+        }
+        let leftoverHTTP = activeHTTPOwnerConnections.descriptors(ownedBy: ownerFingerprint)
+            .filter { $0 != exceptDescriptor }
+        return leftoverHTTP.isEmpty
+    }
+
     /// C-07: HTTP keep-alive session. Serves request after request on one TCP
     /// connection until idle `SO_RCVTIMEO`, peer close, protocol error, client
     /// `Connection: close`, or WebSocket upgrade. `ownsClose` is false only when
@@ -1978,6 +2009,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         defer {
             if ownsClose && !handedOff {
                 if let s = subID { EventBus.shared.unsubscribe(s) }
+                activeHTTPOwnerConnections.unbind(fd)
                 acceptedSockets.close(fd)
             }
         }
@@ -2462,7 +2494,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                          additionalHeaders: ["WWW-Authenticate": wwwAuthenticateHeaderValue(scheme: "Bearer", realm: "RC2")]); return
                 }
             }
-            let webSocketOwnerFingerprint = Self.connectionOwnerFingerprint(
+            let webSocketOwnerFingerprint = presentedBearerToken.flatMap { token in
+                auth?.authorizedOwnerFingerprint(token: token)
+            } ?? Self.connectionOwnerFingerprint(
                 token: presentedBearerToken
             )
             performWSHandshake(fd: fd, key: key)
@@ -2561,7 +2595,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             activeWebSocketConnections.insert(
                 connectionId,
                 ownerFingerprint: webSocketOwnerFingerprint,
-                watermark: sequenceWatermark
+                watermark: sequenceWatermark,
+                socketFD: fd
             )
             defer { activeWebSocketConnections.remove(connectionId) }
             guard let welcomeData = try? welcome.encoded(),
@@ -3090,6 +3125,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
         let requestOwnerFingerprint = Self.connectionOwnerFingerprint(
             token: presentedBearerToken
         )
+        if let token = presentedBearerToken,
+           let owner = auth?.authorizedOwnerFingerprint(token: token) {
+            activeHTTPOwnerConnections.bind(fd, ownerFingerprint: owner)
+        }
         // A valid bearer on a trusted loopback connection still carries its
         // persisted scopes. Tokenless/invalid-token loopback remains the
         // existing trusted-local full-access path.
@@ -3450,8 +3489,35 @@ public final class DirectHTTPServer: @unchecked Sendable {
                   let id = obj["id"] as? String else {
                 send(fd: fd, status: 400, contentType: "text/plain", body: Self.badRequestBody); return
             }
+            let inactiveBefore = trackedOwnerFingerprints().filter {
+                !auth.isAuthorizedOwnerFingerprintActive($0)
+            }
             auth.revokeDevice(id)
+            let deactivated = trackedOwnerFingerprints().filter { fingerprint in
+                !auth.isAuthorizedOwnerFingerprintActive(fingerprint)
+                    && !inactiveBefore.contains(fingerprint)
+            }
+            var closeFailed = false
+            for owner in deactivated {
+                if !closeOwnerChannels(ownerFingerprint: owner, exceptDescriptor: fd) {
+                    closeFailed = true
+                }
+            }
+            if closeFailed {
+                send(
+                    fd: fd,
+                    status: 500,
+                    contentType: "text/plain",
+                    body: Self.channelCloseFailedBody,
+                    acceptEncoding: headers["accept-encoding"]
+                )
+                return
+            }
             sendJSON(fd: fd, status: 200, body: ["revoked": id], acceptEncoding: headers["accept-encoding"])
+            if let owner = activeHTTPOwnerConnections.ownerFingerprint(for: fd),
+               deactivated.contains(owner) {
+                return
+            }
         case ("GET", "/v1/discovery"):
             let body: [String: Any] = [
                 "server_id": serverId,                                  // GAP-2: stable, persisted
