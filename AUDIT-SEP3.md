@@ -135,6 +135,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 77 (2026-09-03): `Sources/AppShell/` SettingsWindow account initials — reviewed (Persistence hits all Token Saver contract code, left untouched). FIXED: `accountInitials` ran split + filter + prefix + uppercased (three intermediates) on every account-row render — now takes the local part up to `@` and collects the first two letters in one loop with a single uppercase; initials identical (proof: 15/15 old-vs-new equivalence cases incl. `@`-leading + Unicode edges match, 11/11 settings-filtered tests pass)
 
+- [x] Slice 78 (2026-09-03): `Sources/Surfaces/` composer suggestion partition — reviewed (CoreModel multi-pass hits all Token Saver/wire-protocol contract code, left untouched). FIXED: `AgentComposerSuggestions.suggestions` partitioned candidates via filter+map twice (four traversals + four intermediates) per composer keystroke — now splits command/skill bares in one loop with reserved buffers (bot kind still skipped); ranked lists identical (proof: 30/30 ComposerSuggestionPopupTests pass)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
