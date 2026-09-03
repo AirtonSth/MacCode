@@ -99,6 +99,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 59 (2026-09-03): `Sources/AppShell/` sidebar completed-dot reload — reviewed (batch-computed busy metadata, pure transition, selected-workspace exclusion). FIXED: `updateCompletedWorkspaces` built nowBusy via filter+map+Set and existing via map+Set (four traversals + three intermediates per reload) — now one pass builds both sets with reserved capacity; dot transitions identical
 
+- [x] Slice 60 (2026-09-03): `Sources/AppShell/` bot brain capabilities card — reviewed (receipt meta/source/effective already direct; coordinator assistantIds excluded — Token Saver snapshot path). FIXED: `brainCapabilities` ran filter+map for included skill texts (two traversals + one intermediate per inspector render) — now one `reduce(into:)` pass; first attempt used a `for` loop that ViewBuilder rejects (build error), corrected before commit; skill list identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
