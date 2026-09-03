@@ -179,6 +179,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 99 (2026-09-03): `Sources/SocketServer/` node-public hex take — reviewed (PayloadCodec accept-encoding short-circuit scan, GitDiff line count, EventBus seq Set+loop are already single-pass; Dispatcher namespace split+map is a small per-method parse; Contract lazy compactMap+map(contains) are single-element lookups). FIXED: `nodePublicBytes` split the node public string and mapped the tail to a new String just to read the hex after the first colon on the Tailcat auth path — now takes the suffix Substring directly (first-colon semantics preserved — first attempt used lastIndex and diverged on multi-colon inputs, caught by equivalence check before commit); bytes identical (proof: 8/8 old-vs-new equivalence incl. multi-colon edges + 29/29 Tailcat-filtered tests pass)
 
+- [x] Slice 100 (2026-09-03): `Sources/AgentRuntime/` orchestrate first-missing — reviewed (TerminalTransitionLedger suffix trims, Claude/Codex adapter suffix/prefix windows, Dispatcher event-limit suffix are bounded-window takes, not sorts; routineUpsert double-list read reverted — save-then-list chain needs the fresh row, single extra read stands; ActiveThreads reserveCapacity-only tweak reverted — no traversal saved). FIXED: `collectSourceTree` sorted the whole missing-file difference just to throw the first entry on the install-verify path — now `min()` over the difference for the same deterministic error; verdict identical (proof: 18/18 OrchestrateInstall + ResourceBundle tests pass)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
