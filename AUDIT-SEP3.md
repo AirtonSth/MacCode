@@ -101,6 +101,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 60 (2026-09-03): `Sources/AppShell/` bot brain capabilities card — reviewed (receipt meta/source/effective already direct; coordinator assistantIds excluded — Token Saver snapshot path). FIXED: `brainCapabilities` ran filter+map for included skill texts (two traversals + one intermediate per inspector render) — now one `reduce(into:)` pass; first attempt used a `for` loop that ViewBuilder rejects (build error), corrected before commit; skill list identical
 
+- [x] Slice 61 (2026-09-03): `Sources/AppShell/` pre-turn managed-bin prepend — reviewed (reaper selection already single-map, SSH options already folded elsewhere). FIXED: `providerPathWithManagedWrappers` built PATH parts via split+map+filter with two intermediates at 4 call sites per agent turn — now single-pass keep with empty segments preserved; joined PATH identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
