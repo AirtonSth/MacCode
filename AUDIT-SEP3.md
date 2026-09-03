@@ -79,6 +79,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 49 (2026-09-03): `Sources/Surfaces/` composer rank path — reviewed (deduped catalogs, per-kind budgets, prefix ranking). FIXED: `ranked` lowercased per row in filter + twice per sort comparison per keystroke — now folds keys once in a single pass; suggestion order identical
 
+- [x] Slice 50 (2026-09-03): `Sources/SocketServer/` response-codec path — reviewed (gzip-first policy, size gate, header parsing). FIXED: `preferredResponseCodec` built the Accept-Encoding token array + two contains passes per JSON response — now single short-circuit scan; verdicts identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
