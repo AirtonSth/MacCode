@@ -97,6 +97,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 58 (2026-09-03): `Sources/AgentRuntime/` process-tree walk — reviewed (sweep accounting, stale-ledger fallback, ownership kill-set; all callers order-insensitive via Set/signalling). FIXED: `descendants(of:in:)` re-scanned the whole process table per tree level (O(levels×P) filter+map per lookup) — now one pass builds a ppid→pids index, then walks with O(1) child lookups; descendant sets identical
 
+- [x] Slice 59 (2026-09-03): `Sources/AppShell/` sidebar completed-dot reload — reviewed (batch-computed busy metadata, pure transition, selected-workspace exclusion). FIXED: `updateCompletedWorkspaces` built nowBusy via filter+map+Set and existing via map+Set (four traversals + three intermediates per reload) — now one pass builds both sets with reserved capacity; dot transitions identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
