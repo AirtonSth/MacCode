@@ -57,6 +57,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 38 (2026-09-03): AppShell router remainder — reviewed (shared codecs, canonical encoder, snapshot paths). FIXED: `scrubTokenSaverEnvironment` built PATH parts via split+map+filter with two intermediates — now single-pass keep; joined PATH identical
 
+- [x] Slice 39 (2026-09-03): SocketServer upload/HTTP remainder — reviewed (shared codecs, manual zero-pad, bounded caches). FIXED: `receivedBytes` chained compactMap+compactMap+reduce with three intermediates — now single-pass accumulate; total identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
