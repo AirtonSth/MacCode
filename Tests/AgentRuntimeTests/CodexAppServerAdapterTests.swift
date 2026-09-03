@@ -28,18 +28,18 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                        "a Codex release without threadSource cannot reconcile a lost fork response and must fail closed")
     }
 
-    func test_currentServerRequestInventoryMatchesGeneratedCodexSchema_0_150_1() throws {
+    func test_currentServerRequestInventoryMatchesGeneratedCodexSchema_0_152_1() throws {
         // WHY: a hand-copied expectation can drift in lockstep with the switch.
         // Read the checked-in projection generated from ServerRequest.json so a
         // schema upgrade introduces a failing ownership decision by default.
-        // 0.150 restored currentTime/read; inventory must own that callback.
+        // 0.152.1 still includes currentTime/read; inventory must own that callback.
         let fixture = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
-            .appendingPathComponent("Fixtures/CodexAppServer/ServerRequestMethods-0.150.1.json")
+            .appendingPathComponent("Fixtures/CodexAppServer/ServerRequestMethods-0.152.1.json")
         let data = try Data(contentsOf: fixture)
         let schema = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(schema["generatedBy"] as? String,
-                       "codex-cli 0.150.1 app-server generate-json-schema --experimental")
+                       "codex-cli 0.152.1 app-server generate-json-schema --experimental")
         let variants = try XCTUnwrap(schema["oneOf"] as? [[String: Any]])
         let schemaMethods = Set(variants.compactMap { variant -> String? in
             let properties = variant["properties"] as? [String: Any]
@@ -109,7 +109,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
 
         let version = try runCodex(codex, arguments: ["--version"])
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        XCTAssertEqual(version, "codex-cli 0.150.1",
+        XCTAssertEqual(version, "codex-cli 0.152.1",
                        "the checked-in projection must be regenerated deliberately when the release Codex version changes")
         _ = try runCodex(codex, arguments: [
             "app-server", "generate-json-schema", "--experimental", "--out", output.path
@@ -1533,13 +1533,19 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )) { event in Task { await sink.record(event) } }
 
         var seenRequestIds = Set<String>()
+        var nextRpcId = 40
         func decision(
             method: String,
             response: AgentProviderRequestResponse,
             itemId: String
         ) async throws -> [String: Any] {
+            // Each interactive decision needs a unique JSON-RPC request id.
+            // Pending cards are keyed by that wire id (CODEX-APP-005); reusing
+            // one id makes later requestOpened events look already-handled.
+            nextRpcId += 1
+            let rpcId = "rpc-\(nextRpcId)"
             let responseTask = Task {
-                try await client.serverRequestHandler?("rpc-4", method, [
+                try await client.serverRequestHandler?(rpcId, method, [
                     "threadId": "codex-thread-1",
                     "turnId": "turn-app-server-1",
                     "itemId": itemId,
@@ -2744,6 +2750,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "item/plan/delta"))
         XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "item/mcpToolCall/progress"))
         XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "thread/realtime/transcript/delta"))
+        XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "thread/realtime/item/transcript/delta"))
         XCTAssertFalse(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "thread/realtime/outputAudio/delta"))
         XCTAssertTrue(CodexAppServerAdapter.shouldEmitProviderRuntime(for: "item/started"),
                       "item start is lifecycle and still needs the raw provider payload")
@@ -3474,6 +3481,104 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                       "semantic notification mapping must remain additive to raw provider event capture")
     }
 
+    func test_realtimeItemLifecycleNotificationsProjectStartedDeltaAndCompleted() async throws {
+        // WHY: Codex 0.152.1 emits per-item realtime lifecycle on
+        // thread/realtime/item/started|transcript/delta|completed. Ignoring that
+        // path drops streaming transcript from the Agent App (CODEX-APP-008).
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "realtime item path"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("thread/realtime/item/started", [
+            "threadId": "codex-thread-1",
+            "item": [
+                "id": "rt-item-2",
+                "realtimeSessionId": "rt-1",
+                "type": "transcriptSegment",
+                "role": "assistant",
+                "text": ""
+            ]
+        ])
+        client.notificationHandler?("thread/realtime/item/transcript/delta", [
+            "threadId": "codex-thread-1",
+            "itemId": "rt-item-2",
+            "delta": "Hello "
+        ])
+        client.notificationHandler?("thread/realtime/item/completed", [
+            "threadId": "codex-thread-1",
+            "item": [
+                "id": "rt-item-2",
+                "realtimeSessionId": "rt-1",
+                "type": "transcriptSegment",
+                "role": "assistant",
+                "text": "Hello world"
+            ]
+        ])
+        client.notificationHandler?("thread.realtime.item.started", [
+            "threadId": "codex-thread-1",
+            "item": [
+                "id": "rt-item-dotted",
+                "realtimeSessionId": "rt-1",
+                "type": "transcriptSegment",
+                "role": "assistant",
+                "text": ""
+            ]
+        ])
+
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let events = await sink.snapshot()
+        XCTAssertTrue(
+            events.contains {
+                if case .itemStarted(let item) = $0 {
+                    return item.id == "rt-item-2"
+                        && item.state == .streaming
+                        && item.summary == "Realtime item added"
+                }
+                return false
+            },
+            "thread/realtime/item/started must project a streaming timeline item"
+        )
+        XCTAssertTrue(
+            events.contains {
+                if case .itemDelta(let itemId, let body, _, let summary) = $0 {
+                    return itemId == "rt-item-2" && body == "Hello " && summary == "Realtime transcript"
+                }
+                return false
+            },
+            "thread/realtime/item/transcript/delta must reuse the realtime transcript delta projection"
+        )
+        XCTAssertTrue(
+            events.contains {
+                if case .itemCompleted(let itemId, let state) = $0 {
+                    return itemId == "rt-item-2" && state == .completed
+                }
+                return false
+            },
+            "thread/realtime/item/completed must close the realtime item"
+        )
+        XCTAssertTrue(
+            events.contains {
+                if case .itemStarted(let item) = $0 {
+                    return item.id == "rt-item-dotted" && item.state == .streaming
+                }
+                return false
+            },
+            "dotted thread.realtime.item.started must alias onto the same projection"
+        )
+    }
+
     func test_secondGoalUpdateReplacesGoalDetailInsteadOfAppending() async throws {
         // WHY: the app-server re-sends thread/goal/updated with the FULL goal
         // state on every progress tick. The single goal transcript row must
@@ -3723,6 +3828,77 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             },
             "int requestId resolved must match pending key String(99)"
         )
+    }
+
+    func test_threadClosedSettlesPendingApprovalAndRemovesSession() async throws {
+        // WHY: Codex 0.152.1 emits thread/closed (and thread/reverted) when the
+        // server drops a thread. Leaving sessions[threadId] + pending approvals
+        // hung keeps a zombie Codex run in Agent App (CODEX-APP-009).
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "needs approval then close"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("rpc-closed-1", "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-closed-1",
+                "command": "echo hi"
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        XCTAssertEqual(request.id, "rpc-closed-1")
+        XCTAssertTrue(adapter.hasSession(threadId: threadId))
+
+        client.notificationHandler?("thread/closed", [
+            "threadId": "codex-thread-1"
+        ])
+
+        let rawResponse = try await responseTask.value
+        let response = try XCTUnwrap(rawResponse as? [String: Any])
+        XCTAssertEqual(response["decision"] as? String, "cancel",
+                       "thread/closed must settle pending approvals with the cancel-safe dialect")
+        XCTAssertFalse(adapter.hasSession(threadId: threadId),
+                       "thread/closed must drop the local provider handle so the next turn starts cleanly")
+        XCTAssertTrue(client.didStop,
+                      "thread/closed must stop the app-server client for the dropped thread")
+
+        let events = await sink.snapshot()
+        XCTAssertTrue(
+            events.contains {
+                if case .error(let message, let recoverable) = $0 {
+                    return recoverable && message == "Codex thread closed."
+                }
+                return false
+            },
+            "thread/closed must emit a recoverable note so the UI is not a silent zombie"
+        )
+        XCTAssertTrue(
+            events.contains {
+                if case .requestResolved(let id, let state) = $0 {
+                    return id == request.id && state == .cancelled
+                }
+                return false
+            },
+            "thread/closed must cancel the pending approval card"
+        )
+        let finish = await sink.finish
+        XCTAssertEqual(finish?.0, .cancelled,
+                       "an in-flight turn whose Codex thread closed must not stay running")
     }
 
     func test_hookCompletedNestedRunStatusMapsToTerminalStates() async throws {

@@ -138,7 +138,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         let capabilities: GrokACPInitializeResult
         let mapper: GrokACPEventMapper
         var model: String
-        /// Last effort bound via `session/set_model` `_meta.reasoningEffort`.
+        /// Last effort bound via `session/set_config_option` or `set_model` meta.
         var reasoningEffort: AgentReasoningEffort?
         let availableModeIDs: Set<String>
         let planModeID: String?
@@ -881,21 +881,32 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
 
         do {
             let model = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
-            let targetModel = model.isEmpty ? session.model : model
-            let targetEffort = request.reasoningEffort.flatMap {
-                GrokRunner.normalizedReasoningEffort($0, model: targetModel)
-            }
-            let needsModelBind = !model.isEmpty && model != session.model
-            let needsEffortBind = targetEffort != session.reasoningEffort
-            if needsModelBind || needsEffortBind {
+            switch GrokACPClient.modelEffortBind(
+                requestModel: request.model,
+                sessionModel: session.model,
+                requestEffort: request.reasoningEffort,
+                sessionEffort: session.reasoningEffort
+            ) {
+            case .none:
+                break
+            case let .setModel(modelId, reasoningEffort):
                 try await session.client.setModel(
                     sessionId: session.providerThreadId,
-                    modelId: targetModel,
-                    reasoningEffort: targetEffort
+                    modelId: modelId,
+                    reasoningEffort: reasoningEffort
                 )
                 synchronized {
-                    if needsModelBind { session.model = model }
-                    session.reasoningEffort = targetEffort
+                    if !model.isEmpty { session.model = model }
+                    session.reasoningEffort = reasoningEffort
+                }
+            case let .setConfigOptionReasoningEffort(valueId, effort):
+                try await session.client.setConfigOption(
+                    sessionId: session.providerThreadId,
+                    configId: "reasoning_effort",
+                    valueId: valueId
+                )
+                synchronized {
+                    session.reasoningEffort = effort
                 }
             }
             let requestedMode: String?

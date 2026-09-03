@@ -80,7 +80,9 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
 /// runtime and nested CLI middleware. Keeping normalization in CoreModel avoids
 /// the two launch paths silently emitting different, unsupported wire values.
 public enum GrokReasoningPolicy {
-    public static let grok46Efforts: [AgentReasoningEffort] = [.low, .medium, .high, .xhigh]
+    /// Matches grok-build `SELECTABLE_REASONING_EFFORTS` / session `reasoning_effort`
+    /// config options for Grok 4.6 (includes agent-advertised `minimal`).
+    public static let grok46Efforts: [AgentReasoningEffort] = [.minimal, .low, .medium, .high, .xhigh]
     public static let grok45Efforts: [AgentReasoningEffort] = [.low, .medium, .high]
 
     public static func supportedEfforts(for model: String) -> [AgentReasoningEffort] {
@@ -101,6 +103,7 @@ public enum GrokReasoningPolicy {
         guard let deepest = supported.last else { return .medium }
         switch effort {
         case .minimal:
+            if supported.contains(.minimal) { return .minimal }
             return supported.contains(.low) ? .low : (supported.first ?? deepest)
         case .low, .medium, .high, .xhigh:
             return supported.contains(effort) ? effort : deepest

@@ -171,7 +171,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case mcpElicitation(requestedSchema: [String: Any]?)
     }
 
-    /// Server-to-client methods in the Codex 0.150.1 app-server schema. Keep the
+    /// Server-to-client methods in the Codex 0.152.1 app-server schema. Keep the
     /// inventory explicit so a protocol upgrade cannot silently fall through as
     /// an unknown callback with no ownership decision.
     static let currentServerRequestMethods: Set<String> = [
@@ -1414,6 +1414,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             events.append(runtimeEvent(method: method, payload: payload))
         }
         var finished: AgentRunEvent?
+        var dropProviderHandle = false
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         func appendCompletedTool(summary: String, output: String?) {
             let turnId = activeTurnId(threadId: threadId) ?? ""
@@ -1814,22 +1815,25 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 output: Self.realtimeDetail(from: payload),
                 startedAtMs: now
             )))
-        case "thread/realtime/itemAdded", "thread.realtime.item-added":
+        case "thread/realtime/itemAdded", "thread.realtime.item-added",
+             "thread/realtime/item/started", "thread.realtime.item.started":
             let item = payload["item"] as? [String: Any] ?? payload
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
             let itemId = string(item, "id") ?? string(payload, "itemId") ?? string(payload, "item_id") ?? "realtime-item-\(UUID().uuidString)"
             let rawType = string(item, "type") ?? string(payload, "type") ?? "realtime"
+            let streaming = method.contains("started")
             events.append(.itemStarted(item: AssistantItem(
                 id: itemId,
                 turnId: turnId,
                 type: Self.assistantItemType(for: rawType),
-                state: .completed,
+                state: streaming ? .streaming : .completed,
                 summary: "Realtime item added",
                 output: Self.body(for: item, type: rawType) ?? Self.jsonString(item),
                 startedAtMs: now,
-                finishedAtMs: now
+                finishedAtMs: streaming ? nil : now
             )))
-        case "thread/realtime/transcript/delta", "thread.realtime.transcript.delta":
+        case "thread/realtime/transcript/delta", "thread.realtime.transcript.delta",
+             "thread/realtime/item/transcript/delta", "thread.realtime.item.transcript.delta":
             let turnId = activeTurnId(threadId: threadId) ?? ""
             let itemId = string(payload, "itemId") ?? string(payload, "item_id") ?? string(payload, "responseId") ?? string(payload, "response_id") ?? "realtime-transcript-\(turnId.isEmpty ? UUID().uuidString : turnId)"
             let delta = string(payload, "delta") ?? string(payload, "text") ?? ""
@@ -1840,6 +1844,15 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             if let text = string(payload, "text") ?? string(payload, "transcript"), !text.isEmpty {
                 events.append(.itemDelta(itemId: itemId, bodyAppend: text, outputAppend: nil, summary: "Realtime transcript"))
             }
+            events.append(.itemCompleted(itemId: itemId, finalState: .completed))
+        case "thread/realtime/item/completed", "thread.realtime.item.completed":
+            let item = payload["item"] as? [String: Any] ?? [:]
+            let itemId = string(item, "id")
+                ?? string(payload, "itemId")
+                ?? string(payload, "item_id")
+                ?? string(payload, "responseId")
+                ?? string(payload, "response_id")
+                ?? "realtime-transcript-\(UUID().uuidString)"
             events.append(.itemCompleted(itemId: itemId, finalState: .completed))
         case "thread/realtime/outputAudio/delta", "thread.realtime.audio.delta":
             let turnId = activeTurnId(threadId: threadId) ?? ""
@@ -1858,6 +1871,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             let itemId = string(payload, "realtimeSessionId") ?? string(payload, "realtime_session_id") ?? "realtime-closed-\(UUID().uuidString)"
             let reason = string(payload, "reason") ?? string(payload, "message") ?? "closed"
             events.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .tool, state: .completed, summary: "Realtime session closed", output: reason, startedAtMs: now, finishedAtMs: now)))
+        case "thread/closed", "thread.closed", "thread/reverted", "thread.reverted":
+            // Server dropped this thread. Settle hangable callbacks with the
+            // same cancel dialect as serverRequest/resolved, drop the local
+            // provider handle, and tell the UI the session is gone.
+            let action = method.contains("reverted") ? "reverted" : "closed"
+            events.append(.error(message: "Codex thread \(action).", recoverable: true))
+            dropProviderHandle = true
         case "fs/changed", "fs.changed":
             let turnId = activeTurnId(threadId: threadId) ?? ""
             let itemId = "fs-changed-\(turnId.isEmpty ? UUID().uuidString : turnId)"
@@ -1965,7 +1985,20 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             break
         }
         emit(events, threadId: threadId)
-        if let finished {
+        if dropProviderHandle {
+            if let session = removeSession(threadId: threadId) {
+                settlePendingCallbacks(session: session)
+                session.client.stop()
+                if session.status == .running {
+                    session.onEvent?(.status(.cancelled))
+                    session.onEvent?(.finished(
+                        .cancelled,
+                        finalMessage: nil,
+                        providerThreadId: publishedDestination(session)
+                    ))
+                }
+            }
+        } else if let finished {
             // PERF: use onEventCallback to avoid a second full-Session copy for the terminal event.
             SessionEventEmitter(onEvent: onEventCallback(threadId: threadId))
                 .broadcastEvent(finished)
