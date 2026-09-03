@@ -159,6 +159,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 89 (2026-09-03): `Sources/AgentRuntime/` orchestration package verify — reviewed (Graphify roots/env paths are Token Saver-gated contract-adjacent, left untouched; thread-id/model-id/pid joins are single-map joins, not folds). FIXED: `verifyInstalledPackage` mapped `manifest.files` to relative paths twice (sorted allowlist compare + duplicate Set check) in the install-verify guard — now maps once into a local reused by both; verdicts identical (proof: 18/18 RemoteCodeOrchestrateInstallTests + AgentRuntimeResourceBundleTests pass, incl. pinned-manifest digest)
 
+- [x] Slice 90 (2026-09-03): `Sources/Surfaces/` tool group summary — reviewed (CoreModel hits are all Token Saver/wire-protocol contract code, left untouched; remaining Surfaces hits are single-map joins, not folds). FIXED: `AgentChatLiveTurnChrome.toolGroupSummary` scanned `items` up to 5× on a memo miss (2 reduces + id map for the key, type map+Set for the noun, verb map+Set for the finished copy) on the live-turn render path — now one loop builds counts, ids, types, and verbs together; memo key, copy, and cache semantics identical (proof: 51/51 ToolRowPresentationTests pass, incl. count/verb/noun + live-waiting asserts)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
