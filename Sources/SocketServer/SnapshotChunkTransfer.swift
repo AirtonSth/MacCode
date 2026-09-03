@@ -406,7 +406,7 @@ public final class SnapshotChunkTransferCache: @unchecked Sendable {
         guard record.ownerFingerprint == ownerFingerprint else {
             throw SnapshotChunkTransferFailure.identityMismatch
         }
-        let normalizedDigest = digest.lowercased()
+        let normalizedDigest = digest == record.digest ? digest : digest.lowercased()
         guard record.snapshotId == snapshotId,
               record.digest == normalizedDigest else {
             throw SnapshotChunkTransferFailure.commitMismatch
