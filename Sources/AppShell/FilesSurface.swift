@@ -1173,15 +1173,18 @@ final class FilesViewModel: ObservableObject {
     /// only the surrounding tree structure is new (P1).
     private func mapEntries(_ result: JSONValue?) -> [FileEntry] {
         let values = result?.objectValue?["entries"]?.arrayValue ?? []
-        return values.compactMap(FileEntry.init(value:)).map { entry in
-            var entry = entry
+        var entries: [FileEntry] = []
+        entries.reserveCapacity(values.count)
+        for value in values {
+            guard var entry = FileEntry(value: value) else { continue }
             if !entry.isDirectory {
                 entry.dragPayload = FileTabDragPayload.encode(workspaceID: workspaceID, sourceSurfaceID: surfaceID, path: entry.relativePath)
             }
             // All entries (files and directories) can be dragged to move them into a folder.
             entry.moveDragPayload = SidebarMoveDragPayload.encode(workspaceID: workspaceID, relativePath: entry.relativePath)
-            return entry
+            entries.append(entry)
         }
+        return entries
     }
 
     /// Fetch the entries directly under `relativePath` (security-scoped `fsWorkspaceList`), mapped
