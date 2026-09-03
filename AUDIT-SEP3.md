@@ -147,6 +147,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 83 (2026-09-03): `Sources/AppShell/` BotsDeskFollowThrough message partition — reviewed (Token Saver lane counts left untouched — display-adjacent; visible-message/live-turn filters are per-row predicate scans, not multi-pass folds). FIXED: `composeConversationOrder` scanned `messages` twice (user filter + non-user filter) before sorting on the desk timeline path — now partitions in one loop with reserved buffers, then sorts each side; order identical (proof: 3/3 BotsDeskChatFlowTests pass)
 
+- [x] Slice 84 (2026-09-03): `Sources/AppShell/` Pet popover grouping — reviewed (BotsWindow live/skill/routine/approval counts are single-filter counts, not multi-pass folds — no fix). FIXED: `PetPopoverGrouping.group` keyed headers via `order.filter` + `order.contains` + `compactMap` (3 key-list scans per popover render) — now folds named keys + Other flag in one loop, sorts in place, appends Other last; group order/membership identical (proof: 11/11 PetAttentionPresentationTests pass, incl. alphabetical-with-Other-last)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
