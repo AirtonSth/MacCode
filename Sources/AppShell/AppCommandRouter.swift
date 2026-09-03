@@ -6920,10 +6920,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     static func providerPathWithManagedWrappers(currentPath: String, managedBin: String) -> String {
         let trimmed = managedBin.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return currentPath }
-        let parts = currentPath
-            .split(separator: ":", omittingEmptySubsequences: false)
-            .map(String.init)
-            .filter { $0 != trimmed }
+        // PERF: single pass avoids the map + filter intermediates on the
+        // pre-turn PATH build; joined PATH identical (empty segments preserved).
+        var parts: [String] = []
+        for part in currentPath.split(separator: ":", omittingEmptySubsequences: false) where part != trimmed {
+            parts.append(String(part))
+        }
         return ([trimmed] + parts).joined(separator: ":")
     }
 
