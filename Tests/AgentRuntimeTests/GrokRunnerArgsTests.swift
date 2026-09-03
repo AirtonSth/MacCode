@@ -163,7 +163,8 @@ final class GrokRunnerArgsTests: XCTestCase {
             let a = GrokRunner.buildArgs(req(model: model, effort: effort))
             return a[a.index(after: a.firstIndex(of: "--reasoning-effort")!)]
         }
-        XCTAssertEqual(wire(.minimal), "minimal")
+        XCTAssertEqual(wire(.minimal), "low",
+                       "Grok 4.6 live catalog omits minimal; remap to low")
         XCTAssertEqual(wire(.low), "low")
         XCTAssertEqual(wire(.medium), "medium")
         XCTAssertEqual(wire(.high), "high")
