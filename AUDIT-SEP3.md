@@ -63,6 +63,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 41 (2026-09-03): `Sources/Persistence/` checkpoint-page remainder — reviewed (shared codecs, keyset pagination, bounded caps). FIXED: `listCheckpointSummaries` built items/filesTruncated/listMetadata/completedAtTokens via four separate map traversals — now one pass with reserveCapacity; page content identical
 
+- [x] Slice 42 (2026-09-03): `Sources/AppShell/` pre-turn env remainder — reviewed (shared router codecs, canonical encoder, PATH handling). FIXED: `agentEnvironmentForRun` built PATH parts via split+map+filter with two intermediates on every agent turn — now single-pass keep; joined PATH identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
