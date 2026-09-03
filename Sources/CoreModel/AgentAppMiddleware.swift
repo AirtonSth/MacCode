@@ -223,18 +223,16 @@ public enum AgentAppMiddlewareWorkflow {
         }
         let workspaceID = try resolveWorkspaceID(request.workspaceID, call: call)
         let model = try resolveModel(request.model, provider: request.provider, call: call)
+        let title = request.title ?? "Subagent · \(displayName(request.provider))"
         var createParams: [String: AgentAppRPCValue] = [
             "workspace_id": .string(workspaceID),
-            "title": .string(request.title ?? "Subagent · \(displayName(request.provider))"),
+            "title": .string(title),
             "provider": .string(request.provider.rawValue),
             "model": .string(model),
             "permission_mode": .string(request.permissionMode.rawValue),
             "reasoning_effort": .string(request.reasoningEffort.rawValue),
             "service_tier": .string(request.serviceTier.rawValue)
         ]
-        if request.title == nil {
-            createParams["title"] = .string("Subagent · \(displayName(request.provider))")
-        }
         if let parentRunID = request.parentRunID,
            let parentThreadID = request.parentThreadID,
            let subagentNodeID = request.subagentNodeID,
