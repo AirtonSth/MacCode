@@ -470,7 +470,9 @@ public extension CommandRouting {
             guard expectedBodyRevision == 1 else {
                 throw AgentMessageBodyChunkError.bodyRevisionConflict
             }
-            guard expectedBodySHA256?.lowercased() == digest else {
+            let accepted = expectedBodySHA256 == digest
+                || expectedBodySHA256?.lowercased() == digest
+            guard accepted else {
                 throw AgentMessageBodyChunkError.bodyDigestMismatch
             }
         }
