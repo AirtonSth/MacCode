@@ -157,6 +157,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 88 (2026-09-03): `Sources/Persistence/` snapshot restore id sets — reviewed (remaining `.map`/`.flatMap` hits are Optional chains, static lets, or Token Saver ledger paths — no multi-pass folds). FIXED: `restoreEnforcingWorkspaceThreadLimit` scanned `snapshot.threads` twice (map+Set for restored IDs, compactMap+Set+sorted for workspace IDs) inside the restore transaction — now folds both sets in one reserved loop, then sorts workspace IDs; victims and order identical (proof: 22/23 deletion/undo + routing tests pass; `test_deleteAndUndoIncludesTerminalForkIntentWithoutRetainingDeletedTranscript` fails identically on clean baseline — pre-existing)
 
+- [x] Slice 89 (2026-09-03): `Sources/AgentRuntime/` orchestration package verify — reviewed (Graphify roots/env paths are Token Saver-gated contract-adjacent, left untouched; thread-id/model-id/pid joins are single-map joins, not folds). FIXED: `verifyInstalledPackage` mapped `manifest.files` to relative paths twice (sorted allowlist compare + duplicate Set check) in the install-verify guard — now maps once into a local reused by both; verdicts identical (proof: 18/18 RemoteCodeOrchestrateInstallTests + AgentRuntimeResourceBundleTests pass, incl. pinned-manifest digest)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
