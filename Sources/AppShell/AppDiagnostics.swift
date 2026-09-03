@@ -240,7 +240,13 @@ public actor ManagedProviderAdmissionGate {
         pendingAdmissionDates = pendingAdmissionDates.filter {
             now.timeIntervalSince($0.value) < reservationLifetime
         }
-        let currentRootPIDs = Set(scan.providerProcesses.compactMap(\.pgid).filter { $0 > 0 })
+        var currentRootPIDs = Set<pid_t>()
+        currentRootPIDs.reserveCapacity(scan.providerProcesses.count)
+        for process in scan.providerProcesses {
+            if let pgid = process.pgid, pgid > 0 {
+                currentRootPIDs.insert(pgid)
+            }
+        }
         residentRootByKey = residentRootByKey.filter { currentRootPIDs.contains($0.value) }
         let appearedRootPIDs = currentRootPIDs.subtracting(lastProviderRootPIDs).sorted()
         let pendingKeys = pendingAdmissionDates.sorted {
