@@ -808,7 +808,14 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
         }
 
         var orderedIndices: [Int] {
-            receivedChunks.keys.compactMap(Int.init).sorted()
+            var indices: [Int] = []
+            indices.reserveCapacity(receivedChunks.count)
+            for key in receivedChunks.keys {
+                guard let index = Int(key) else { continue }
+                indices.append(index)
+            }
+            indices.sort()
+            return indices
         }
     }
 
