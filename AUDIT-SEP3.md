@@ -65,6 +65,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 42 (2026-09-03): `Sources/AppShell/` pre-turn env remainder — reviewed (shared router codecs, canonical encoder, PATH handling). FIXED: `agentEnvironmentForRun` built PATH parts via split+map+filter with two intermediates on every agent turn — now single-pass keep; joined PATH identical
 
+- [x] Slice 43 (2026-09-03): `Sources/AppShell/` scheduled-tasks overview — reviewed (scoped refresh, deferred hydration, keystroke filtering). FIXED: `reloadTasks` ran two counting filters plus a third listing filter per keystroke/selection — now one pass derives active count and visible list; counts/rows identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
