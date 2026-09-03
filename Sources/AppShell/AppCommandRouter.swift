@@ -6902,8 +6902,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         var cleaned = TokenSaverExecutionReceiptSeam.scrub(env)
         let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
         if let path = cleaned["PATH"] {
-            let parts = path.split(separator: ":").map(String.init).filter { $0 != managedBin }
-            cleaned["PATH"] = parts.joined(separator: ":")
+            // PERF: single pass avoids the map + filter intermediates on the
+            // scrub path; joined PATH identical.
+            var kept: [String] = []
+            for part in path.split(separator: ":") where part != managedBin {
+                kept.append(String(part))
+            }
+            cleaned["PATH"] = kept.joined(separator: ":")
         }
         return cleaned
     }
