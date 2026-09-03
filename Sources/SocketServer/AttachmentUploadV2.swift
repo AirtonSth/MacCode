@@ -1806,13 +1806,14 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
         return normalized
     }
 
+    private static let imageExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "heic", "webp", "svg", "avif"
+    ]
+
     private static func kind(filename: String, mimeType: String?) -> AgentAttachmentKind {
         if let mimeType, mimeType.hasPrefix("image/") { return .image }
-        let ext = URL(fileURLWithPath: filename).pathExtension.lowercased()
-        let imageExtensions: Set<String> = [
-            "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "heic", "webp", "svg", "avif"
-        ]
-        return imageExtensions.contains(ext) ? .image : .file
+        let ext = URL(fileURLWithPath: filename).pathExtension
+        return imageExtensions.contains { $0.caseInsensitiveCompare(ext) == .orderedSame } ? .image : .file
     }
 
     /// PERF: nibble table instead of per-byte `String(format:)` so chunk /
