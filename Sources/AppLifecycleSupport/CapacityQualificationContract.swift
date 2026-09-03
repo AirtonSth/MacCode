@@ -549,7 +549,11 @@ public struct CapacityQualificationArtifact: Sendable, Codable, Equatable {
             }
         }
         // Physical tier set must exactly equal physically executed claims (or both empty).
-        let claimed = Set(manifest.hardwareTier.filter(\.physicallyExecuted).map(\.tierName))
+        var claimed = Set<String>()
+        claimed.reserveCapacity(manifest.hardwareTier.count)
+        for tier in manifest.hardwareTier where tier.physicallyExecuted {
+            claimed.insert(tier.tierName)
+        }
         let reported = Set(physicallyExecutedTier)
         if claimed != reported {
             throw CapacityContractError.invalidWorkload("physical tier set mismatch claimed=\(claimed.sorted()) reported=\(reported.sorted())")
