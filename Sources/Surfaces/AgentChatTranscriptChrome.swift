@@ -72,7 +72,11 @@ public enum AgentChatTranscriptChrome {
                 result = String(result.dropLast(suffix.count))
             }
         }
-        let legacyNames = attachments.map(\.displayName).filter { !$0.isEmpty }
+        var legacyNames: [String] = []
+        legacyNames.reserveCapacity(attachments.count)
+        for attachment in attachments where !attachment.displayName.isEmpty {
+            legacyNames.append(attachment.displayName)
+        }
         if !legacyNames.isEmpty {
             let legacy = "📎 " + legacyNames.joined(separator: ", ")
             if result == legacy {
