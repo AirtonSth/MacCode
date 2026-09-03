@@ -796,9 +796,15 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
         }
 
         var receivedBytes: Int {
-            receivedChunks.keys.compactMap { Int($0) }.compactMap { index in
-                AttachmentUploadV2Policy.expectedChunkByteCount(index: index, sizeBytes: sizeBytes)
-            }.reduce(0, +)
+            // PERF: single pass avoids the compactMap + compactMap + reduce
+            // intermediates on the progress path; byte total identical.
+            var total = 0
+            for key in receivedChunks.keys {
+                guard let index = Int(key),
+                      let count = AttachmentUploadV2Policy.expectedChunkByteCount(index: index, sizeBytes: sizeBytes) else { continue }
+                total += count
+            }
+            return total
         }
 
         var orderedIndices: [Int] {
