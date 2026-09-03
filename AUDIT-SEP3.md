@@ -207,6 +207,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 113 (2026-09-03): `Sources/DistillCore/` ranker average length (score-math only — BM25 formula, query terms, boosts, sort order untouched; Token Saver savings/ledger unaffected) — reviewed (per-chunk `tokens()` splits and `documentFrequency` per-term filters are inherent BM25 inputs over already-materialised arrays, left untouched). FIXED: `rank` built a throwaway `[Int]` of token counts via `tokenized.map(\.count)` just to sum them for `averageLength` (one traversal + one intermediate per rank call on the retrieval-rank path) — now folds counts inline with a single reduce; average and all downstream scores identical (proof: 3/3 QueryAwareChunkRankerTests pass in production-base sandbox with patched file, incl. BM25 order + embedding promotion + deterministic tie-breaks)
 
+- [x] Slice 114 (2026-09-03): `Sources/AppShell/` acceptance-target newest pick (push-token routing to iOS Live Activity — browser-parity-adjacent fallback chain order preserved exactly) — reviewed (masker `map(turnIndex).max` remains library-only/off-path, left untouched as before). FIXED: `acceptanceTargets` ran `preferred.map(\.updatedAt).max()` then `last(where:)` (two traversals + one temp timestamp array on the stale-ownership fallback after Mac relaunch) — now one loop tracks the max timestamp keeping the LAST record at the max, preserving the upsert-order tie-break; picks identical (proof: 50/50 LiveActivitySyncCoordinatorTests pass in production-base sandbox with patched file)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
