@@ -1872,7 +1872,13 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             environmentPath: ProcessInfo.processInfo.environment["PATH"],
             homeDirectory: home
         )
-        return joined.split(separator: ":").map(String.init).filter { !$0.isEmpty && $0 != managed }
+        // PERF: single pass avoids the map + filter intermediates on the
+        // install path; kept directories identical.
+        var kept: [String] = []
+        for part in joined.split(separator: ":") where !part.isEmpty && part != managed {
+            kept.append(String(part))
+        }
+        return kept
     }
 
     private func commandExistsOnSystem(_ command: String, searchDirectories: [String]) -> Bool {
