@@ -3402,8 +3402,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         guard isAssistantMessageItem(item, type: type) else { return false }
         let phase = (string(item, "phase") ?? string(item, "phaseType") ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        return phase == "final_answer" || phase == "finalanswer"
+        return phase.caseInsensitiveCompare("final_answer") == .orderedSame
+            || phase.caseInsensitiveCompare("finalanswer") == .orderedSame
     }
 
     /// Authoritative turn terminal check from a thread/read response.
