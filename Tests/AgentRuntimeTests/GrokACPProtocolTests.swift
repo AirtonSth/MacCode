@@ -1416,8 +1416,12 @@ final class GrokACPProtocolTests: XCTestCase {
             encoding: .utf8
         )
         XCTAssertTrue(
-            adapter.contains("modelEffortBind") || adapter.contains("setConfigOptionReasoningEffort"),
+            adapter.contains("modelEffortBind"),
             "Adapter must re-bind effort when it changes even if model id is unchanged"
+        )
+        XCTAssertFalse(
+            adapter.contains("setConfigOptionReasoningEffort") || adapter.contains("session.client.setConfigOption"),
+            "Live grok 1.0.13 rejects session/set_config_option with Invalid params; effort-only must use set_model"
         )
     }
 
@@ -1436,57 +1440,54 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.minimal, modelId: "grok-4.5"), "low")
     }
 
-    /// WHY: effort-only rebinds must use session/set_config_option (not set_model)
-    /// so grok-build skips model-switch allowlist / prompt-rewrite (GROK-ACP-012).
-    func test_setConfigOptionParamsEncodeReasoningEffortValueShape() throws {
-        let params = GrokACPClient.setConfigOptionParams(
-            sessionId: "sid",
-            configId: "reasoning_effort",
-            valueId: "high"
+    /// WHY: Image #1 Agent App Grok send died at start with
+    /// `Grok ACP RPC error: Invalid params`. New threads always carry a
+    /// composer effort (default medium) while `Session.reasoningEffort` is
+    /// nil, so the first prompt is an effort-only bind. Live grok 1.0.13
+    /// rejects `session/set_config_option` (`-32602` nested `{value:{value:}}`,
+    /// `-32601` ACP string value) and accepts `session/set_model` +
+    /// `_meta.reasoningEffort` for the same model id.
+    func test_modelEffortBindRoutesEffortOnlyToSetModelNotSetConfigOption() {
+        let firstTurn = GrokACPClient.modelEffortBind(
+            requestModel: "grok-4.6",
+            sessionModel: "grok-4.6",
+            requestEffort: .medium,
+            sessionEffort: nil
         )
-        XCTAssertEqual(params["sessionId"] as? String, "sid")
-        XCTAssertEqual(params["configId"] as? String, "reasoning_effort")
-        XCTAssertEqual((params["value"] as? [String: Any])?["value"] as? String, "high")
-    }
+        guard case let .setModel(firstModel, firstEffort) = firstTurn else {
+            return XCTFail("first-turn effort bind must use set_model, got \(firstTurn)")
+        }
+        XCTAssertEqual(firstModel, "grok-4.6")
+        XCTAssertEqual(firstEffort, .medium)
 
-    /// WHY: source-string checks would still pass if effort-only silently fell
-    /// back to set_model while leaving the helper present. This proves the
-    /// emitted method choice for effort-only vs model-change (GROK-ACP-012).
-    func test_modelEffortBindRoutesEffortOnlyToSetConfigOptionAndModelChangeToSetModel() {
-        // Same model, effort change → set_config_option with wire effort id.
         let effortOnly = GrokACPClient.modelEffortBind(
             requestModel: "grok-4.6",
             sessionModel: "grok-4.6",
             requestEffort: .high,
             sessionEffort: .low
         )
-        guard case let .setConfigOptionReasoningEffort(valueId, effort) = effortOnly else {
-            return XCTFail("effort-only must use set_config_option, got \(effortOnly)")
+        guard case let .setModel(modelId, reasoningEffort) = effortOnly else {
+            return XCTFail("effort-only must use set_model, got \(effortOnly)")
         }
-        XCTAssertEqual(valueId, "high")
-        XCTAssertEqual(effort, .high)
-        let effortParams = GrokACPClient.setConfigOptionParams(
-            sessionId: "sid",
-            configId: "reasoning_effort",
-            valueId: valueId
+        XCTAssertEqual(modelId, "grok-4.6")
+        XCTAssertEqual(reasoningEffort, .high)
+        XCTAssertEqual(
+            GrokACPClient.wireReasoningEffort(.high, modelId: modelId),
+            "high"
         )
-        XCTAssertEqual(effortParams["configId"] as? String, "reasoning_effort")
-        XCTAssertEqual((effortParams["value"] as? [String: Any])?["value"] as? String, "high")
 
-        // Model id change → set_model (optionally with effort meta).
         let modelChange = GrokACPClient.modelEffortBind(
             requestModel: "grok-4.5",
             sessionModel: "grok-4.6",
             requestEffort: .medium,
             sessionEffort: .high
         )
-        guard case let .setModel(modelId, reasoningEffort) = modelChange else {
+        guard case let .setModel(changedModel, changedEffort) = modelChange else {
             return XCTFail("model change must use set_model, got \(modelChange)")
         }
-        XCTAssertEqual(modelId, "grok-4.5")
-        XCTAssertEqual(reasoningEffort, .medium)
+        XCTAssertEqual(changedModel, "grok-4.5")
+        XCTAssertEqual(changedEffort, .medium)
 
-        // No-op when model and effort already match.
         let noop = GrokACPClient.modelEffortBind(
             requestModel: "grok-4.6",
             sessionModel: "grok-4.6",

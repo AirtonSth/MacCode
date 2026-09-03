@@ -138,7 +138,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         let capabilities: GrokACPInitializeResult
         let mapper: GrokACPEventMapper
         var model: String
-        /// Last effort bound via `session/set_config_option` or `set_model` meta.
+        /// Last effort bound via `session/set_model` `_meta.reasoningEffort`.
         var reasoningEffort: AgentReasoningEffort?
         let availableModeIDs: Set<String>
         let planModeID: String?
@@ -898,15 +898,6 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 synchronized {
                     if !model.isEmpty { session.model = model }
                     session.reasoningEffort = reasoningEffort
-                }
-            case let .setConfigOptionReasoningEffort(valueId, effort):
-                try await session.client.setConfigOption(
-                    sessionId: session.providerThreadId,
-                    configId: "reasoning_effort",
-                    valueId: valueId
-                )
-                synchronized {
-                    session.reasoningEffort = effort
                 }
             }
             let requestedMode: String?

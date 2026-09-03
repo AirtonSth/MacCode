@@ -783,7 +783,8 @@ public final class GrokACPClient: @unchecked Sendable {
     /// `reasoningEffort` is the ACP `_meta.reasoningEffort` wire value (grok-build
     /// `REASONING_EFFORT_META_KEY`). Omit when the host has nothing to bind.
     /// Values are mapped via `wireReasoningEffort` before the wire call.
-    /// Prefer `setConfigOption` for effort-only changes (no model id change).
+    /// Effort-only rebinds use the same method: live grok 1.0.13 rejects
+    /// `session/set_config_option` (`-32602 Invalid params` / `-32601`).
     func setModel(
         sessionId: String,
         modelId: String,
@@ -797,26 +798,15 @@ public final class GrokACPClient: @unchecked Sendable {
         _ = try await requestJSONObject(method: "session/set_model", params: params, timeout: 15)
     }
 
-    /// ACP `session/set_config_option` params (grok-build session config options).
-    /// Value shape is `{ "value": "<id>" }` per agent-mode docs.
-    static func setConfigOptionParams(
-        sessionId: String,
-        configId: String,
-        valueId: String
-    ) -> JSONObject {
-        [
-            "sessionId": sessionId,
-            "configId": configId,
-            "value": ["value": valueId],
-        ]
-    }
-
     /// Pure routing for model/effort binds before a prompt.
-    /// Effort-only → `session/set_config_option`; model change → `session/set_model`.
+    /// Live grok 1.0.13 `session/set_config_option` is not a working bind
+    /// path (`-32602` on `{value:{value:}}`, `-32601` on the ACP string
+    /// value). Effort-only therefore uses `session/set_model` +
+    /// `_meta.reasoningEffort`, which the same agent accepts without a
+    /// model-id change.
     enum ModelEffortBind: Equatable {
         case none
         case setModel(modelId: String, reasoningEffort: AgentReasoningEffort?)
-        case setConfigOptionReasoningEffort(valueId: String, effort: AgentReasoningEffort)
     }
 
     static func modelEffortBind(
@@ -836,29 +826,10 @@ public final class GrokACPClient: @unchecked Sendable {
             return .setModel(modelId: targetModel, reasoningEffort: targetEffort)
         }
         if needsEffortBind, let targetEffort,
-           let wireEffort = wireReasoningEffort(targetEffort, modelId: targetModel) {
-            return .setConfigOptionReasoningEffort(valueId: wireEffort, effort: targetEffort)
+           wireReasoningEffort(targetEffort, modelId: targetModel) != nil {
+            return .setModel(modelId: targetModel, reasoningEffort: targetEffort)
         }
         return .none
-    }
-
-    /// Effort-only (and other typed) session config updates without a model switch.
-    /// Use `configId: "reasoning_effort"` instead of `setModel` when the model id
-    /// is unchanged (avoids allowlist / prompt-rewrite path).
-    func setConfigOption(
-        sessionId: String,
-        configId: String,
-        valueId: String
-    ) async throws {
-        _ = try await requestJSONObject(
-            method: "session/set_config_option",
-            params: Self.setConfigOptionParams(
-                sessionId: sessionId,
-                configId: configId,
-                valueId: valueId
-            ),
-            timeout: 15
-        )
     }
 
     func setMode(sessionId: String, modeId: String) async throws {
