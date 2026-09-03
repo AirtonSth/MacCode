@@ -258,7 +258,8 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             throw ClaudeForkReconciliationError.invalidForkResult(childId: childId)
         }
         let reconciled = try await forkMarkerMatches(marker)
-        guard reconciled.count == 1, reconciled.first?.sessionId == childId else {
+        // Single-element check — avoids count + first double scan on this path.
+        guard reconciled.count == 1, reconciled[reconciled.startIndex].sessionId == childId else {
             var cleanupTargets = reconciled
             if !cleanupTargets.contains(where: { $0.sessionId == childId }) {
                 cleanupTargets.append(ClaudeSDKSessionRecord(sessionId: childId, customTitle: marker))
