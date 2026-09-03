@@ -47,6 +47,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 33 (2026-09-03): SocketServer event-bus filter paths — reviewed (shared encoders, nibble hex, bounded caches). FIXED: `EventStreamFilter.parse` built the interest set via split+map+filter with two intermediates — now single-pass insert; ids identical
 
+- [x] Slice 34 (2026-09-03): AgentRuntime stderr/coordinator remainder — reviewed (shared codecs/regexes, cached shell env). FIXED: `displayableStderr` built kept lines via split+map+filter with two intermediates — now single-pass append; text identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
