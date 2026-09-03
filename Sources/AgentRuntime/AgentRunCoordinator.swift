@@ -3146,17 +3146,22 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // claim a still-pending permit after Stop is recorded.
         _ = pendingStart?.invalidateAcceptance()
         _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
-        let reservedForThread = reservedProviderStarts.filter { $0.value == threadId }
         // Per-run cancel tokens so one Stop cancels every reserved run. Do not
         // arm thread-level pendingThreadStops for reservation-only gaps — a
         // fresh resend reserved after Stop must not consume a stale thread stop.
-        for runId in reservedForThread.keys {
+        // PERF: single pass — collect this thread's runs, then move them (was
+        // filter + re-filter: two full scans plus two intermediate dictionaries).
+        var stoppedRunIds: [AgentRunID] = []
+        for (runId, owner) in reservedProviderStarts where owner == threadId {
+            stoppedRunIds.append(runId)
+        }
+        for runId in stoppedRunIds {
+            reservedProviderStarts.removeValue(forKey: runId)
             cancelledProviderStartRuns[runId] = threadId
         }
         if pendingStart != nil {
             pendingThreadStops.insert(threadId)
         }
-        reservedProviderStarts = reservedProviderStarts.filter { $0.value != threadId }
         lock.unlock()
     }
 
@@ -3197,9 +3202,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// Test/telemetry: residual cancellation/reservation bookkeeping for a thread.
     public func residualProviderStartBookkeepingCount(threadId: AgentThreadID) -> Int {
         lock.lock(); defer { lock.unlock() }
-        let reserved = reservedProviderStarts.values.filter { $0 == threadId }.count
-        let cancelled = cancelledProviderStartRuns.values.filter { $0 == threadId }.count
-        return reserved + cancelled
+        // PERF: one pass per map (was two filter intermediates); count only.
+        var count = 0
+        for owner in reservedProviderStarts.values where owner == threadId { count += 1 }
+        for owner in cancelledProviderStartRuns.values where owner == threadId { count += 1 }
+        return count
     }
 
     @discardableResult

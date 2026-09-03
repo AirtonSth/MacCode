@@ -31,6 +31,7 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 - [x] Slice 19 (2026-09-03): Surfaces composer/live-turn second pass — reviewed (dedup paths, chrome helpers). FIXED: `AgentChatLiveTurnChrome.isRicher` walked both timelines 4× (filter×2 + flatMap×2 + weight reduce) per replay compare on the live-stream path — now one pass per side; verdict identical
 - [x] Slice 20 (2026-09-03): Persistence recovery/payload second pass — reviewed (bound-before-store, shared codecs). FIXED: `AuthoritativePayloadRecovery.authoritativeByteCount`/`stripUnresolvedHandles` recompiled trailer/handle regexes per call on the token-rate persist path — now shared statics; matches identical
 - [x] Slice 21 (2026-09-03): `Sources/SocketServer/` dispatcher/HTTP remainder — reviewed (shared codecs, static bodies, nibble-table hex, bounded caches). FIXED: `AttachmentUploadV2Store.chunkFileURL` re-parsed `String(format: "%05d.raw")` per chunk store/verify/assemble — now manual zero-pad; names identical
+- [x] Slice 22 (2026-09-03): `Sources/AgentRuntime/` orchestration/coordinator second pass — reviewed (shared codecs/regexes, cached shell env, token/receipt paths). FIXED: `AgentRunCoordinator.cancelPreparation` ran two full `reservedProviderStarts.filter` passes + two intermediates on the Stop path — now single-pass move to cancel tokens; `residualProviderStartBookkeepingCount` counts in place (was two filter intermediates); semantics identical
 
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
