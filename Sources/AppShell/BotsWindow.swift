@@ -3522,10 +3522,10 @@ public final class BotsViewModel: ObservableObject {
             filtered = bots
         } else {
             filtered = bots.filter { bot in
-                bot.name.lowercased().contains(query)
-                    || bot.handle.lowercased().contains(query)
-                    || bot.title.lowercased().contains(query)
-                    || bot.description.lowercased().contains(query)
+                bot.name.range(of: query, options: .caseInsensitive) != nil
+                    || bot.handle.range(of: query, options: .caseInsensitive) != nil
+                    || bot.title.range(of: query, options: .caseInsensitive) != nil
+                    || bot.description.range(of: query, options: .caseInsensitive) != nil
             }
         }
         var result = filtered.sorted { lhs, rhs in
