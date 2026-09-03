@@ -145,6 +145,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 82 (2026-09-03): `Sources/AppShell/` SidebarView batch-remove names — reviewed (filteredWorkspaces cache-first keystroke path, shift-range identity set, reorder/filter rules already single-pass). FIXED: `removeSelectedWorkspaces` built confirm-dialog `names` via filter + map (2 traversals + 1 intermediate per batch remove) — now one loop with reserved capacity; names identical (proof: 7/7 WorkspacePromptingSeamTests pass)
 
+- [x] Slice 83 (2026-09-03): `Sources/AppShell/` BotsDeskFollowThrough message partition — reviewed (Token Saver lane counts left untouched — display-adjacent; visible-message/live-turn filters are per-row predicate scans, not multi-pass folds). FIXED: `composeConversationOrder` scanned `messages` twice (user filter + non-user filter) before sorting on the desk timeline path — now partitions in one loop with reserved buffers, then sorts each side; order identical (proof: 3/3 BotsDeskChatFlowTests pass)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
