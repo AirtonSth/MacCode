@@ -139,6 +139,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 79 (2026-09-03): `Sources/AppShell/` AppCommandRouter visible workspace IDs — reviewed (SocketServer/provider/RC2CLI/treaty hits all correct single-pass idioms; DistillCore/MLX hits contract-sensitive, left untouched). FIXED: `reconcileSurfaceVisibility` + `repairSelectedTerminalFocus` each built the workspace set via compactMap + Set with a duplicated 4-line stanza — now share one `visibleWorkspaceIDs()` reserved-set single-pass helper; coverage identical (proof: behavior-asserting reconciliation tests pass — keeps-selected-visible, drops-closed-window, fresh-selected-visible; 4 byte-count timing failures verified identical on clean baseline)
 
+- [x] Slice 80 (2026-09-03): `Sources/Surfaces/` model-picker fallback compare — reviewed. FIXED: `displayedModelListIsFallback` built two mapped id arrays (3 traversals + 2 intermediates) per picker render — now compares element-wise with early exit; verdict identical (proof: 10/10 AgentAppModelPickerFixes tests)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
