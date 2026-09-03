@@ -187,6 +187,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 103 (2026-09-03): `Sources/DistillCore/` masking A/B arm (computation-only change — no crushing math, gates, ledger, or savings touched) — reviewed (CCR/Librarian/ranker tokenize split+filter+map are small per-query parses; `NLIFaithfulnessGate` claim split is a small per-gate parse; near-duplicate block split is a per-candidate parse). FIXED: `MaskingABHarness.Arm.solveRate` ran `solved.filter { $0 }.count` (one traversal + one intermediate per evaluate) — now a counting reduce; rate identical (proof: 4/4 MaskingABHarnessTests)
 
+- [x] Slice 104 (2026-09-03): `Sources/CoreModel/` host-queue admission — reviewed (Token Saver image-audit count, best-of-three eligible map, `AgentTypes` probe trim+filter are small per-decision parses, left untouched; AppLifecycleSupport/DesignSystemKit map+sorted hits are one-shot/static snapshots). FIXED: `createTicket` counted queue tickets via directory-listing `filter` + `.count` (one traversal + one intermediate per ticket creation) — now a counting reduce over the listing; quota verdict identical (proof: 9/9 ComputerUseHostQueueTests)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
