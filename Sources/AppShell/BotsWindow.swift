@@ -6949,8 +6949,13 @@ public final class BotsViewModel: ObservableObject {
     /// Prefetch provider · model for linked threads so first rail paint
     /// does not compile N 26-column + routing `get`s.
     private func prefetchDeskThreadRailRouting(for conversations: [BotConversation]) {
-        let missing = conversations.compactMap(\.linkedAgentThreadID).filter {
-            deskThreadRailRoutingCache[$0] == nil
+        var missing: [AgentThreadID] = []
+        missing.reserveCapacity(conversations.count)
+        for conversation in conversations {
+            if let threadID = conversation.linkedAgentThreadID,
+               deskThreadRailRoutingCache[threadID] == nil {
+                missing.append(threadID)
+            }
         }
         guard !missing.isEmpty else { return }
         let chrome = (try? context.threadRepo.listChrome(ids: missing)) ?? [:]
