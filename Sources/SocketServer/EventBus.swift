@@ -967,12 +967,13 @@ public enum EventStreamFilter: Sendable, Equatable {
     ) -> EventStreamFilter {
         let header = filterHeader?.lowercased() ?? ""
         if header.contains("cellular-safe") {
-            let ids = Set(
-                (interestThreadHeader ?? "")
-                    .split(separator: ",")
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }
-            )
+            // PERF: single-pass id set avoids the map + filter intermediates
+            // on the connect path; retained ids identical.
+            var ids = Set<String>()
+            for part in (interestThreadHeader ?? "").split(separator: ",") {
+                let id = part.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !id.isEmpty { ids.insert(id) }
+            }
             return .cellularSafe(interestThreadIds: ids)
         }
         if header.contains("diagnostics") {
