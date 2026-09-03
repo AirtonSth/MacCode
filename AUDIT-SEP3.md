@@ -177,6 +177,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 98 (2026-09-03): `Sources/AgentRuntime/` distill MCP argv mode — reviewed (CheckpointRevertUndo path Sets, `orphanDistillMCPPIDs` live-pid Set+compactMap, adapter child-id map+sorted, coordinator pid join, Graphify roots join are single-pass snapshot joins, not folds; Token Saver-gated Graphify paths untouched). FIXED: `distillMCPMode` split the whole command on whitespace and mapped every token to String just to read argv[1] on the provider sweep path — now an iterator takes only the first two tokens and materialises the mode only; modes identical (proof: 24/24 Sweeper-filtered tests pass)
 
+- [x] Slice 99 (2026-09-03): `Sources/SocketServer/` node-public hex take — reviewed (PayloadCodec accept-encoding short-circuit scan, GitDiff line count, EventBus seq Set+loop are already single-pass; Dispatcher namespace split+map is a small per-method parse; Contract lazy compactMap+map(contains) are single-element lookups). FIXED: `nodePublicBytes` split the node public string and mapped the tail to a new String just to read the hex after the first colon on the Tailcat auth path — now takes the suffix Substring directly (first-colon semantics preserved — first attempt used lastIndex and diverged on multi-colon inputs, caught by equivalence check before commit); bytes identical (proof: 8/8 old-vs-new equivalence incl. multi-colon edges + 29/29 Tailcat-filtered tests pass)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
