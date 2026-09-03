@@ -3385,7 +3385,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case "userMessage", "user_message":
             return true
         case "message":
-            return string(item, "role")?.lowercased() == "user"
+            return string(item, "role")?.caseInsensitiveCompare("user") == .orderedSame
         default:
             return false
         }
