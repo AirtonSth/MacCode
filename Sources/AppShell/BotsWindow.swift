@@ -3745,18 +3745,31 @@ public final class BotsViewModel: ObservableObject {
                     || item.scheduleNote.lowercased().contains(query)
             }
         }
+        // PERF: single pass derives counts + the status-filtered list
+        // instead of two counting filters plus a third listing filter.
+        var activeCount = 0
+        var visible: [BotScheduleTaskItem] = []
+        let showAll = scheduleTaskStatusFilter == .all
+        let wantActive = scheduleTaskStatusFilter == .active
+        if !showAll {
+            visible.reserveCapacity(searched.count)
+        }
+        for item in searched {
+            if item.isEnabled { activeCount += 1 }
+            if showAll || item.isEnabled == wantActive {
+                if !showAll { visible.append(item) }
+            }
+        }
         scheduleTaskFilterCounts = (
             all: searched.count,
-            active: searched.filter(\.isEnabled).count,
-            paused: searched.filter { !$0.isEnabled }.count
+            active: activeCount,
+            paused: searched.count - activeCount
         )
         switch scheduleTaskStatusFilter {
         case .all:
             scheduleTaskItems = searched
-        case .active:
-            scheduleTaskItems = searched.filter(\.isEnabled)
-        case .paused:
-            scheduleTaskItems = searched.filter { !$0.isEnabled }
+        case .active, .paused:
+            scheduleTaskItems = visible
         }
     }
 
