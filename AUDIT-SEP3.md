@@ -73,6 +73,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 46 (2026-09-03): `Sources/DistillCore/` stack-trace classify path (contract-safe: no crushing math, gates, ledger, or savings touched) — reviewed (shared regex, never-inflate guard, router verdicts). FIXED: `looksLikeStackTrace` materialised every line as String + filter intermediate and always scanned to end — now lazy short-circuit scan at 5 frames; verdicts identical
 
+- [x] Slice 47 (2026-09-03): `Sources/CoreModel/` live-timeline trim path — reviewed (turn/item caps, sort-anchor retention, translation pruning). FIXED: `trimTurnItems` copied the 5k-item tail twice (dropFirst + suffix) plus a fresh rebuilt array per over-budget append — now in-place subrange drop; anchor/newest/pruning identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
