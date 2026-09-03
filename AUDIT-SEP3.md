@@ -153,6 +153,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 86 (2026-09-03): `Sources/AppShell/` FilesSurface entry mapping — reviewed. FIXED: `mapEntries` decoded entries via `compactMap` then attached file-m/tab + move drag payloads in a second `map` (2 traversals + 1 intermediate per directory load and lazy subtree fetch) — now decodes and attaches payloads in one loop with reserved capacity; rows identical (proof: 21/21 FilesDragOutTests + FilesRecycleTests pass)
 
+- [x] Slice 87 (2026-09-03): `Sources/SocketServer/` upload manifest ordered indices — reviewed (RCWireProtocol goal join, Token Saver crusher/runtime/catalog/coordinator/surface paths, AppCommandRouter env-keys snapshot, KeybindingConfig modifier parse, CapacitySemanticHarness sim queue are contract/small-input, left untouched). FIXED: `Manifest.orderedIndices` parsed chunk keys via `compactMap(Int.init)` + `sorted` (2 traversals + 1 intermediate per upload status on the chunk path, mirroring the Slice 21 `receivedBytes` single-pass style) — now collects parsed indices in one reserved loop and sorts in place; index list identical (proof: 12/12 AttachmentUploadV3Tests pass)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
