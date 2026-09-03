@@ -273,8 +273,15 @@ enum BotsDeskFollowThrough {
         workLog: [BotDeskWorkLogRow],
         liveTurns: [BotDeskTimelineItem]
     ) -> [BotDeskTimelineItem] {
-        let users = messages.filter { $0.role == .user }.sorted { $0.createdAt < $1.createdAt }
-        let assistants = messages.filter { $0.role != .user }.sorted { $0.createdAt < $1.createdAt }
+        var users: [BotDeskMessage] = []
+        var assistants: [BotDeskMessage] = []
+        users.reserveCapacity(messages.count)
+        assistants.reserveCapacity(messages.count)
+        for message in messages {
+            if message.role == .user { users.append(message) } else { assistants.append(message) }
+        }
+        users.sort { $0.createdAt < $1.createdAt }
+        assistants.sort { $0.createdAt < $1.createdAt }
         let logs = workLog.sorted { $0.createdAt < $1.createdAt }
         let turns = liveTurns.sorted { $0.createdAt < $1.createdAt }
         if users.isEmpty {
