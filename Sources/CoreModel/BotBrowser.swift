@@ -107,7 +107,7 @@ public struct BotBrowserLoginPredicate: Equatable, Sendable {
     public func looksLikeLoginURL(_ raw: String) -> Bool {
         guard let url = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            return raw.lowercased().contains("/login") || raw.lowercased().contains("/signin")
+            return raw.range(of: "/login", options: .caseInsensitive) != nil || raw.range(of: "/signin", options: .caseInsensitive) != nil
         }
         let host = (components.host ?? "").lowercased()
         let path = components.path.lowercased()
