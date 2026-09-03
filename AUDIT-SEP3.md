@@ -155,6 +155,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 87 (2026-09-03): `Sources/SocketServer/` upload manifest ordered indices — reviewed (RCWireProtocol goal join, Token Saver crusher/runtime/catalog/coordinator/surface paths, AppCommandRouter env-keys snapshot, KeybindingConfig modifier parse, CapacitySemanticHarness sim queue are contract/small-input, left untouched). FIXED: `Manifest.orderedIndices` parsed chunk keys via `compactMap(Int.init)` + `sorted` (2 traversals + 1 intermediate per upload status on the chunk path, mirroring the Slice 21 `receivedBytes` single-pass style) — now collects parsed indices in one reserved loop and sorts in place; index list identical (proof: 12/12 AttachmentUploadV3Tests pass)
 
+- [x] Slice 88 (2026-09-03): `Sources/Persistence/` snapshot restore id sets — reviewed (remaining `.map`/`.flatMap` hits are Optional chains, static lets, or Token Saver ledger paths — no multi-pass folds). FIXED: `restoreEnforcingWorkspaceThreadLimit` scanned `snapshot.threads` twice (map+Set for restored IDs, compactMap+Set+sorted for workspace IDs) inside the restore transaction — now folds both sets in one reserved loop, then sorts workspace IDs; victims and order identical (proof: 22/23 deletion/undo + routing tests pass; `test_deleteAndUndoIncludesTerminalForkIntentWithoutRetainingDeletedTranscript` fails identically on clean baseline — pre-existing)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
