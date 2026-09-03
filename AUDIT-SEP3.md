@@ -109,6 +109,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 64 (2026-09-03): `Sources/AppShell/` Tailcat allowlist snapshot — reviewed (`leftoverStoreFacts` bot-mind write path left for its own slice). FIXED: `admittedNodePublics` ran filter+map (two traversals + one intermediate) before sorting on the connect/auth path — now one `reduce(into:)` pass; sorted order identical (proof: AppShell build clean)
 
+- [x] Slice 65 (2026-09-03): `Sources/AppShell/` bot-mind write path — reviewed (FilesSurface drag-payload two-payload combine left for its own slice). FIXED: `leftoverStoreFacts` ran filter+map (two traversals + one intermediate) over the bot memory list — now one `reduce(into:)` pass; fact order identical (proof: AppShell build clean)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
