@@ -117,6 +117,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 68 (2026-09-03): `Sources/AppShell/` Pet EventBus reconcile — reviewed (`LiveActivitySummary` prefix-map + window-controller dock-nearest sites left for their own slice). FIXED: `reconcileActiveRunIDs` ran map+filter with one intermediate over the host run-ID set — now single-pass trim+insert; normalized set identical (proof: ghost-coding-pose reconcile test passes)
 
+- [x] Slice 69 (2026-09-03): `Sources/AppShell/` Pet Lock Screen copy — reviewed (window-controller dock-nearest sides left for their own slice). FIXED: `LiveActivitySummary.sanitized` collapsed multi-line model output via split+map+filter with two intermediates — now single-pass trim+join; collapsed line identical (proof: 23/23 LiveActivitySummaryTests)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
