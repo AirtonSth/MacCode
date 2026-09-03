@@ -195,6 +195,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 107 (2026-09-03): `Sources/DistillCore/` gate rejection token (message-string only — gate accept/reject verdicts untouched) — reviewed (transcript-learner Set+sorted providers, TOON field joins, `AgentAppSurface` prefix-capped key digests, turn-entry defensive sorts are small/sorted-output paths). FIXED: `FaithfulnessGate.validate` sorted the salient-word set just to name the first word in the rejection message — now `min()` for the same deterministic token (proof: 3/3 TokenSaverNeverListFailOpenTests; nearest assert checks `.accepted` only, message shape unchanged)
 
+- [x] Slice 108 (2026-09-03): `Sources/AgentRuntime/` Codex rollback lookup — reviewed (Claude adapter lastIndex rollback is a single already-optimal reverse scan; `parseSpec`/`ProjectScripts`/env-parse firstIndex scans are single small parses; shared ISO8601 formatters need no change). FIXED: `CodexAppServerAdapter.rollbackThread` scanned `completedTurnIds` for `toTurnId` twice on the hit path (existence check, then the same index again) — now reuses the first lookup and re-scans only after the refresh read; rollback target/turn count identical (proof: both rollback tests pass — history-instead-of-digits + recover-session-for-read-and-rollback)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
