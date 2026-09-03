@@ -87,6 +87,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 53 (2026-09-03): `Sources/AppLifecycleSupport/` capacity-contract validate path — reviewed (required-metric set already static; variance/mismatch guards intact). FIXED: physical-tier claim set ran filter+map+Set (three traversals + two intermediates per validate) — now one pass inserts executed tier names with reserved capacity; mismatch verdicts identical
 
+- [x] Slice 54 (2026-09-03): `Sources/AppShell/` desk thread-rail prefetch — reviewed (cache-first prefetch, single batched `listChrome`, rail fallback routing). FIXED: `prefetchDeskThreadRailRouting` ran compactMap+filter (two traversals + one ID intermediate per desk reload) — now one pass appends uncached linked IDs with reserved capacity; fetched ID list identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
