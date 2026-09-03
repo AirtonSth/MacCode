@@ -181,6 +181,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 100 (2026-09-03): `Sources/AgentRuntime/` orchestrate first-missing — reviewed (TerminalTransitionLedger suffix trims, Claude/Codex adapter suffix/prefix windows, Dispatcher event-limit suffix are bounded-window takes, not sorts; routineUpsert double-list read reverted — save-then-list chain needs the fresh row, single extra read stands; ActiveThreads reserveCapacity-only tweak reverted — no traversal saved). FIXED: `collectSourceTree` sorted the whole missing-file difference just to throw the first entry on the install-verify path — now `min()` over the difference for the same deterministic error; verdict identical (proof: 18/18 OrchestrateInstall + ResourceBundle tests pass)
 
+- [x] Slice 101 (2026-09-03): `Sources/Surfaces/` hold-summary counts — reviewed (`aggregateSurfaceSnapshot` filter+3 reduces kept: compactMap over mixed surfaces already bounds the terminal list, single filter+extremum shape; BotsWindow skill/routine enabled counts are per-row inspector predicates, not hot folds). FIXED: `AgentBackgroundHoldSummary.shellCount`/`agentCount` each ran a filter over `tasks` (two traversals + two intermediates per pill render, and `nounLabel` reads both) — now one loop splits agent/shell via a shared `counts` helper; counts and pill copy identical (proof: 40/40 AgentChatUXPresentationTests)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
