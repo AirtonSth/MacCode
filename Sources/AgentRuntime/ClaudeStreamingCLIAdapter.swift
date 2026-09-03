@@ -1744,10 +1744,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                     ?? "Claude tool"
                 let toolUseID = (request["tool_use_id"] as? String)
                     ?? (request["toolUseId"] as? String)
-                let normalized = toolName
-                    .replacingOccurrences(of: "_", with: "")
-                    .replacingOccurrences(of: "-", with: "")
-                    .lowercased()
+                let normalized = String(toolName.lazy.filter { $0 != "_" && $0 != "-" }).lowercased()
                 if normalized == "askuserquestion" || normalized == "askuser" {
                     lock.lock()
                     session.pendingControlUserInputs[requestId] = .askUserQuestion(toolUseID: toolUseID)
