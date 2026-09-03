@@ -2159,6 +2159,100 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_deskStreamObserverDropsUnmatchedThreadBeforeMainHop() async throws {
+        // WHY: every Bots window observes the coordinator. Stream events for
+        // other threads must not hop to MainActor or mutate the selected desk.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let threadA = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(threadA)
+        let conversation = BotConversation(
+            botID: bot.id,
+            title: "Standup",
+            linkedAgentThreadID: threadA.id
+        )
+        try context.botStore.upsertConversation(conversation)
+        vm.openDesk(bot)
+        vm.selectDeskThread(conversation.id)
+        XCTAssertEqual(vm.selectedConversation?.linkedAgentThreadID, threadA.id)
+        XCTAssertEqual(vm.screen, .desk)
+
+        let unmatched = AssistantEvent.turnStarted(turnId: "t-unmatched")
+        let runID = AgentRunID()
+        let threadB = AgentThreadID()
+        vm.resetDeskStreamMainHopCountForTesting()
+        for _ in 0..<500 {
+            vm.runCoordinator(
+                context.coordinator,
+                didReceive: unmatched,
+                run: runID,
+                threadId: threadB
+            )
+        }
+        XCTAssertEqual(vm.deskStreamMainHopCountForTesting, 0)
+        XCTAssertEqual(vm.applyIncomingDeskEventCountForTesting, 0)
+        XCTAssertTrue(vm.deskLiveTimeline.turns.isEmpty)
+
+        let matched = AssistantEvent.turnStarted(turnId: "t-matched")
+        vm.runCoordinator(
+            context.coordinator,
+            didReceive: matched,
+            run: runID,
+            threadId: threadA.id
+        )
+        XCTAssertEqual(vm.deskStreamMainHopCountForTesting, 1)
+        for _ in 0..<40 {
+            if vm.applyIncomingDeskEventCountForTesting == 1 { break }
+            await Task.yield()
+        }
+        XCTAssertEqual(vm.applyIncomingDeskEventCountForTesting, 1)
+        XCTAssertEqual(vm.deskLiveTimeline.turns.first?.turnId, "t-matched")
+    }
+
+    func test_deskLiveTurnWatchDoesNotPollOnQuarterSecondCadenceWhilePushIsFlowing() async throws {
+        // WHY: didReceive already paints Desk. A 250ms SQLite poll on MainActor
+        // must not run while the selected thread is receiving push events.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        try context.runRepo.upsert(AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: Date()
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Standup", linkedAgentThreadID: thread.id)
+        )
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.deskRunIsLive)
+        let watchApplies = vm.deskLiveTurnWatchApplyCountForTesting
+        let replayFetches = vm.deskLiveReplayFetchCountForTesting
+        vm.runCoordinator(
+            context.coordinator,
+            didReceive: .turnStarted(turnId: "t-push"),
+            run: AgentRunID(),
+            threadId: thread.id
+        )
+        for _ in 0..<40 {
+            if vm.applyIncomingDeskEventCountForTesting >= 1 { break }
+            await Task.yield()
+        }
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertEqual(vm.deskLiveTurnWatchApplyCountForTesting, watchApplies)
+        XCTAssertEqual(
+            vm.deskLiveReplayFetchCountForTesting,
+            replayFetches,
+            "pushing live events must not trigger the 250ms fallback poll"
+        )
+    }
+
     func test_deskLiveObserverWatermarkDoesNotReplayTheDurableCopy_becauseTheEventAlreadyPainted() throws {
         // WHY: coordinator observers paint stream events immediately. Once the same
         // ordered prefix reaches SQLite, the 250 ms watcher must advance its durable
@@ -3468,6 +3562,40 @@ final class BotsWindowTests: XCTestCase {
             beforeLeave,
             "leaving for Workspaces must invalidate offscreen Active Bots hydration"
         )
+    }
+
+    func test_reloadActiveBotsScreenNoopsWhenScreenIsDesk() throws {
+        // WHY: Active Bots hydration is a SQLite pass. Desk must not pay it
+        // when a run-status broadcast asks to refresh the offscreen roster.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertEqual(vm.screen, .desk)
+        let before = vm.activeBotsHydrationCountForTesting
+        vm.reloadActiveBotsScreen()
+        XCTAssertEqual(vm.activeBotsHydrationCountForTesting, before)
+        XCTAssertEqual(vm.screen, .desk)
+    }
+
+    func test_didChangeStatusSkipsConversationLinkedWhenThreadHasNoBot() async throws {
+        // WHY: every agent thread broadcasts status. Threads with no bot must
+        // not hit SQLite conversationLinked or reload Active Bots.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(piper)
+        let before = context.botStore.conversationLinkedQueryCountForTesting
+        let hydration = vm.activeBotsHydrationCountForTesting
+        vm.runCoordinator(
+            context.coordinator,
+            didChangeStatus: .running,
+            runId: AgentRunID(),
+            threadId: AgentThreadID()
+        )
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(context.botStore.conversationLinkedQueryCountForTesting, before)
+        XCTAssertEqual(vm.activeBotsHydrationCountForTesting, hydration)
     }
 
     func test_openActiveBotItemOpensDesk() throws {

@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import CoreModel
+import Persistence
 import SocketServer
 import Surfaces
 import DesignSystemKit
@@ -56,6 +57,9 @@ public final class PaneTabsView: NSObject {
         return b
     }()
     private var tabButtons: [SurfaceID: PaneTabButton] = [:]
+    /// PF-11: keep each tab's surface view mounted and toggle `isHidden`
+    /// instead of removeFromSuperview/addSubview on every click.
+    private var mountedContentViews: [SurfaceID: NSView] = [:]
     // PERF: ordered SurfaceIDs currently rendered in the strip. The diff
     // seam (`PaneTabsView.diffTabs`) compares this against the fresh pane
     // order to patch the strip in place instead of rebuilding it.
@@ -269,30 +273,47 @@ public final class PaneTabsView: NSObject {
         tabScrollView.scrollDocumentViewToVisible(tab)
     }
 
+    /// Test seam: views currently parented in the pane content area, in order.
+    var contentAreaSubviewsForTesting: [NSView] { contentArea.subviews }
+
+    /// Test seam: whether a previously selected tab's view stayed mounted and hidden.
+    func isMountedContentHiddenForTesting(_ id: SurfaceID) -> Bool? {
+        mountedContentViews[id]?.isHidden
+    }
+
     @discardableResult
     private func installSelectedContent(selectedID: SurfaceID?, in pane: PaneNode) -> Bool {
-        let selectedView = selectedID.flatMap { SurfaceRegistry.shared.surface($0)?.view }
-        if let selectedView,
-           contentArea.subviews.count == 1,
-           contentArea.subviews.first === selectedView {
-            return false
+        defer {
+            PerfSwitchMetrics.endTabSwitchInstall()
+            CATransaction.setCompletionBlock {
+                PerfSwitchMetrics.endTabSwitchCommitted()
+            }
         }
-
-        for subview in contentArea.subviews {
+        let liveIDs = Set(pane.surfaces.map(\.id))
+        var removedClosed = false
+        for (id, view) in mountedContentViews where !liveIDs.contains(id) {
+            view.removeFromSuperview()
+            mountedContentViews.removeValue(forKey: id)
+            removedClosed = true
+        }
+        let mountedSet = Set(mountedContentViews.values.map { ObjectIdentifier($0) })
+        for subview in contentArea.subviews where !mountedSet.contains(ObjectIdentifier(subview)) {
             subview.removeFromSuperview()
         }
         pendingMissingSurfaceID = nil
 
-        if let selectedView {
-            selectedView.removeFromSuperview()
-            selectedView.translatesAutoresizingMaskIntoConstraints = false
-            contentArea.addSubview(selectedView)
-            NSLayoutConstraint.activate([
-                selectedView.topAnchor.constraint(equalTo: contentArea.topAnchor),
-                selectedView.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
-                selectedView.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
-                selectedView.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor)
-            ])
+        let selectedView = selectedID.flatMap { SurfaceRegistry.shared.surface($0)?.view }
+        if let selectedID, let selectedView {
+            pinMountedContent(selectedID, view: selectedView)
+            var changed = removedClosed
+            for (id, view) in mountedContentViews {
+                let hide = id != selectedID
+                if view.isHidden != hide {
+                    view.isHidden = hide
+                    changed = true
+                }
+            }
+            return changed
         } else if pane.surfaces.isEmpty {
             let label = NSTextField(labelWithString: "Empty pane \u{2014} use + to add a surface")
             label.textColor = DS.NS.textTertiary
@@ -339,6 +360,23 @@ public final class PaneTabsView: NSObject {
             ])
         }
         return true
+    }
+
+    private func pinMountedContent(_ id: SurfaceID, view: NSView) {
+        if mountedContentViews[id] === view, view.superview === contentArea {
+            return
+        }
+        view.removeFromSuperview()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.isHidden = false
+        contentArea.addSubview(view)
+        NSLayoutConstraint.activate([
+            view.topAnchor.constraint(equalTo: contentArea.topAnchor),
+            view.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+            view.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor)
+        ])
+        mountedContentViews[id] = view
     }
 
     /// Test seam: the live button bound to `id` (nil if none), so the
@@ -705,6 +743,9 @@ public final class PaneTabsView: NSObject {
     }
 
     func refreshBusyStates() {
+        // PF-13: hidden workspace windows still hosted pane controllers.
+        // Skip the busy walk when this pane's window is not visible.
+        if let window = contentArea.window, !window.isVisible { return }
         let running = Self.runningWorkspaceIDs(for: pane.surfaces, router: router)
         for desc in pane.surfaces {
             tabButtons[desc.id]?.setBusy(Self.isSurfaceBusy(desc, runningWorkspaceIDs: running, router: router))

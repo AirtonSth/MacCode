@@ -18,9 +18,9 @@ final class AgentAppMemoryR6CapTests: XCTestCase {
         XCTAssertEqual(AgentAppViewModel.fullLoadBodyBudgetBytes, 128 * 1024)
     }
 
-    func test_markdownCacheCostLimits_are128KiB() {
-        XCTAssertEqual(AgentMessageMarkdown.blocksCacheCostLimit, 128 * 1_024)
-        XCTAssertEqual(AgentMessageMarkdown.inlineCacheCostLimit, 128 * 1_024)
+    func test_markdownCacheCostLimits_are4MiB() {
+        XCTAssertEqual(AgentMessageMarkdown.blocksCacheCostLimit, 4 * 1_024 * 1_024)
+        XCTAssertEqual(AgentMessageMarkdown.inlineCacheCostLimit, 4 * 1_024 * 1_024)
     }
 
     func test_assistantTextDedupeCacheCostLimit_is128KiB() {

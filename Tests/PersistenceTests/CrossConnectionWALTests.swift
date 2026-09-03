@@ -18,6 +18,40 @@ final class CrossConnectionWALTests: XCTestCase {
         return dir.appendingPathComponent("shared.sqlite").path
     }
 
+    func test_listChromeOnReadConnection_doesNotWaitForOpenWriterTransaction() throws {
+        // WHY: PF-30 — UI listChrome used the writer connection, so Pet/chrome
+        // reads blocked on NSRecursiveLock behind stream batches.
+        let path = makeFilePath()
+        let writer = try SQLiteDB(path: path)
+        try Schema.migrate(writer)
+        let reader = try SQLiteDB(path: path, readonly: true)
+        let repo = AgentThreadRepository(db: writer, readDB: reader)
+        let thread = AgentThread(title: "chrome", provider: .codex, model: "gpt-5")
+        try repo.upsert(thread)
+
+        let started = DispatchSemaphore(value: 0)
+        let hold = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            writer.performSync { db in
+                try? db.execute("BEGIN IMMEDIATE;")
+                started.signal()
+                hold.wait()
+                try? db.execute("COMMIT;")
+            }
+        }
+        started.wait()
+        let t0 = DispatchTime.now()
+        let chrome = try repo.listChrome(ids: [thread.id])
+        let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000.0
+        hold.signal()
+        XCTAssertEqual(chrome[thread.id]?.title, "chrome")
+        XCTAssertLessThan(
+            ms,
+            5,
+            "a WAL reader must return chrome without waiting for the writer's open transaction (took \(ms)ms)"
+        )
+    }
+
     func test_writesOnOneConnectionAreVisibleToTheOther() throws {
         let path = makeFilePath()
         let connA = try SQLiteDB(path: path)

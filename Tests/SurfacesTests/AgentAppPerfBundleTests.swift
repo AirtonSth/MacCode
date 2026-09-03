@@ -1819,8 +1819,8 @@ final class AgentAppPerfBundleTests: XCTestCase {
                        "second identical finished parse must hit cache")
         XCTAssertTrue(AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 100, cache: true))
         XCTAssertFalse(AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 100, cache: false))
-        XCTAssertFalse(AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 100_000, cache: true),
-                       "over-band texts must not pin every intermediate length")
+        XCTAssertTrue(AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 100_000, cache: true),
+                       "finished large replies must cache so a conversation switch does not reparse")
         #else
         // Release: policy helper still testable without store counters.
         XCTAssertTrue(AgentMessageMarkdown.shouldStoreMarkdownCache(textUTF8Count: 100, cache: true))

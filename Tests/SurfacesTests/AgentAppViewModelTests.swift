@@ -9211,6 +9211,155 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(vm.prompt, "hi", "the prompt proxy still reads/writes the composer text")
     }
 
+    @MainActor
+    func test_focusTick_publishesComposerStateNotViewModel() throws {
+        // WHY: PF-12 — tab focus used to bump a @Published on the 78-field VM
+        // and rebuild AgentAppView. Focus belongs on the composer object.
+        let (vm, _) = try makeVM()
+        var vmEmissions = 0
+        var composerEmissions = 0
+        let vmSub = vm.objectWillChange.sink { _ in vmEmissions += 1 }
+        let composerSub = vm.composerState.objectWillChange.sink { _ in composerEmissions += 1 }
+        defer { vmSub.cancel(); composerSub.cancel() }
+
+        vm.focusTick &+= 1
+        vm.focusTick &+= 1
+
+        XCTAssertEqual(vmEmissions, 0, "focus() must not rebuild the Agent App transcript")
+        XCTAssertGreaterThanOrEqual(composerEmissions, 2, "the composer must still observe focusTick")
+        XCTAssertEqual(vm.focusTick, 2)
+        XCTAssertEqual(vm.composerState.focusTick, 2)
+    }
+
+    @MainActor
+    func test_softReselect_readsQueueOffMainAndDropsHiddenAndStale() async throws {
+        // WHY: PF-20 — host refreshAgentSurfaces used to list the queue,
+        // runStartedAt, and recoverable context on MainActor behind the writer.
+        // Hidden tabs must skip the refresh; a thread switch must reject the stale apply.
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-soft-reselect-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let queuedMessageRepo = AgentQueuedMessageRepository(db: db)
+        let workspaceID = WorkspaceID()
+        let threadA = AgentThread(workspaceId: workspaceID, title: "A", provider: .codex, model: "gpt-5.5")
+        let threadB = AgentThread(workspaceId: workspaceID, title: "B", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(threadA)
+        try threadRepo.upsert(threadB)
+        try queuedMessageRepo.upsert(AgentQueuedMessage(threadId: threadA.id, text: "queued on A"))
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            draftRepo: AgentThreadDraftRepository(db: db),
+            queuedMessageRepo: queuedMessageRepo
+        )
+        installRunnableProviderFixtures(on: vm)
+        wireCanonicalThreadRead(vm, repo: threadRepo)
+
+        vm.selectThread(threadA.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        await vm.waitForSoftReselectDurableRefreshForTesting()
+        XCTAssertEqual(vm.queuedMessages.map(\.text), ["queued on A"])
+
+        PerfSwitchMetrics.resetForTesting()
+        let before = vm.softReselectDurableRefreshCountForTesting
+        for _ in 0..<20 {
+            vm.selectThread(threadA.id, markRead: false)
+        }
+        await vm.waitForSoftReselectDurableRefreshForTesting()
+        XCTAssertEqual(
+            vm.softReselectDurableRefreshCountForTesting,
+            before + 20,
+            "each visible soft reselect still schedules the off-main bundle"
+        )
+        XCTAssertEqual(vm.queuedMessages.map(\.text), ["queued on A"])
+        XCTAssertEqual(
+            PerfSwitchMetrics.mainThreadSyncCountForTesting(),
+            0,
+            "soft reselect must not performSync on the main thread"
+        )
+
+        vm.setVisibility(.hidden)
+        let hiddenBefore = vm.softReselectDurableRefreshCountForTesting
+        vm.selectThread(threadA.id, markRead: false)
+        XCTAssertEqual(
+            vm.softReselectDurableRefreshCountForTesting,
+            hiddenBefore,
+            "hidden Agent App tabs must not soft-reselect SQLite"
+        )
+        vm.setVisibility(.visible)
+
+        vm.selectThread(threadA.id, markRead: false)
+        vm.selectThread(threadB.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        await vm.waitForSoftReselectDurableRefreshForTesting()
+        XCTAssertEqual(vm.selectedThreadId, threadB.id)
+        XCTAssertTrue(
+            vm.queuedMessages.isEmpty,
+            "a stale A soft-reselect bundle must not land on B"
+        )
+    }
+
+    @MainActor
+    func test_paintedTimelineByThread_evictsLRUAndDeletedThreads() throws {
+        // WHY (AA-07): paintedTimelineByThread grew for every thread visited
+        // in the session. Cap at 3 plus the selected/live run, and drop
+        // deleted ids.
+        let (vm, repo) = try makeVM()
+        var ids: [AgentThreadID] = []
+        for index in 0..<5 {
+            let thread = AgentThread(
+                workspaceId: vm.workspaceID,
+                title: "t\(index)",
+                provider: .codex,
+                model: "gpt-5.5"
+            )
+            try repo.upsert(thread)
+            ids.append(thread.id)
+            vm.selectThread(thread.id)
+        }
+        XCTAssertLessThanOrEqual(
+            vm.paintedTimelineCountForTesting,
+            3,
+            "visiting 5 threads must not keep every painted timeline"
+        )
+
+        vm.selectThread(ids[0])
+        XCTAssertLessThanOrEqual(vm.paintedTimelineCountForTesting, 3)
+    }
+
+    @MainActor
+    func test_didChangeStatus_doesNotReloadThreadList() throws {
+        // WHY (X-02): every run status hop used to list the workspace rail
+        // (ISO parse × N) in idle with 5 runs.
+        let (vm, repo) = try makeVM()
+        let thread = AgentThread(workspaceId: vm.workspaceID, title: "live", provider: .codex, model: "gpt-5.5")
+        try repo.upsert(thread)
+        vm.selectThread(thread.id)
+        let before = repo.durableListCountForTesting
+        vm.runCoordinator(
+            vm.coordinator,
+            didChangeStatus: .running,
+            runId: AgentRunID(),
+            threadId: thread.id
+        )
+        XCTAssertEqual(
+            repo.durableListCountForTesting,
+            before,
+            "status-only events must patch the in-memory rail, not re-list SQLite"
+        )
+    }
+
     // F5: the single-pass cap+budget that replaced `map(cap) + applyBodyBudget` on the
     // thread-open path must be byte-for-byte equivalent to the prior two-pass version.
     func test_cappedRowsWithinBudget_matchesMapThenBudgetComposition() {
@@ -9288,6 +9437,151 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(bots.contains { $0.name == "Rio" },
                       "a bot created after the cache must appear in the next catalog read")
         XCTAssertEqual(botStore.listQueryCountForTesting, 2)
+    }
+
+    func test_hiddenSurface_coalescesStreamPublishesAndStopsTicks() async throws {
+        // WHY: PF-10 — a hidden Agent App tab with a live run used to flush and
+        // tick at 30 Hz. Hidden must keep reducing so reveal matches a tab that
+        // stayed visible, but must not publish every token or schedule ticks.
+        let (hidden, hiddenRepo) = try makeVM()
+        let (visible, visibleRepo) = try makeVM()
+        let hiddenThread = AgentThread(
+            workspaceId: hidden.workspaceID,
+            title: "live",
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running
+        )
+        let visibleThread = AgentThread(
+            workspaceId: visible.workspaceID,
+            title: "live",
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running
+        )
+        try hiddenRepo.upsert(hiddenThread)
+        try visibleRepo.upsert(visibleThread)
+        hidden.selectThread(hiddenThread.id)
+        visible.selectThread(visibleThread.id)
+        await hidden.waitForSelectThreadHydrationForTesting()
+        await visible.waitForSelectThreadHydrationForTesting()
+
+        hidden.hiddenTimelinePublishIntervalForTesting = 3_600
+        hidden.setVisibility(.hidden)
+        XCTAssertTrue(hidden.isHiddenFromSurface)
+
+        pumpStream(on: hidden, threadId: hiddenThread.id, run: AgentRunID(), deltas: 200)
+        pumpStream(on: visible, threadId: visibleThread.id, run: AgentRunID(), deltas: 200)
+        await settleStream(hidden)
+        await settleStream(visible)
+
+        XCTAssertEqual(
+            hidden.timelineTickScheduleCountForTesting,
+            0,
+            "hidden surfaces must not arm the 33 ms transcript tick"
+        )
+        XCTAssertLessThanOrEqual(
+            hidden.hiddenTimelinePublishCountForTesting,
+            1,
+            "hidden stream must coalesce publishes to at most one per interval"
+        )
+        XCTAssertGreaterThan(
+            visible.timelineTickScheduleCountForTesting,
+            0,
+            "the visible twin must still tick so the comparison is honest"
+        )
+
+        hidden.setVisibility(.visible)
+        XCTAssertEqual(
+            hidden.timeline.turns.map(\.turnId),
+            visible.timeline.turns.map(\.turnId),
+            "revealing a hidden tab must match a surface that stayed visible"
+        )
+        XCTAssertEqual(
+            hidden.timeline.turns.map { $0.items.map(\.body) },
+            visible.timeline.turns.map { $0.items.map(\.body) }
+        )
+    }
+
+    func test_hiddenSurface_dropsStaleStreamAfterThreadSwitch() async throws {
+        // WHY: hide → switch thread → show must not paint the leaving thread.
+        let (vm, repo) = try makeVM()
+        let first = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "first",
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running
+        )
+        let second = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "second",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        try repo.upsert(first)
+        try repo.upsert(second)
+        vm.selectThread(first.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        vm.setVisibility(.hidden)
+        pumpStream(on: vm, threadId: first.id, run: AgentRunID(), deltas: 20)
+        await settleStream(vm)
+        vm.selectThread(second.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        vm.setVisibility(.visible)
+        XCTAssertFalse(
+            vm.timeline.turns.contains { turn in
+                turn.items.contains { $0.body.contains("hidden-delta") }
+            },
+            "a thread switch while hidden must drop the leaving thread's coalesced stream"
+        )
+    }
+
+    private func pumpStream(
+        on vm: AgentAppViewModel,
+        threadId: AgentThreadID,
+        run: AgentRunID,
+        deltas: Int
+    ) {
+        vm.runCoordinator(
+            vm.coordinator,
+            didReceive: .turnStarted(turnId: "turn-hidden"),
+            run: run,
+            threadId: threadId
+        )
+        vm.runCoordinator(
+            vm.coordinator,
+            didReceive: .itemStarted(
+                item: AssistantItem(
+                    id: "asst",
+                    turnId: "turn-hidden",
+                    type: .assistantMessage,
+                    startedAtMs: 1
+                )
+            ),
+            run: run,
+            threadId: threadId
+        )
+        for _ in 0..<deltas {
+            vm.runCoordinator(
+                vm.coordinator,
+                didReceive: .itemDelta(
+                    itemId: "asst",
+                    bodyAppend: "hidden-delta",
+                    outputAppend: nil,
+                    summary: nil
+                ),
+                run: run,
+                threadId: threadId
+            )
+        }
+    }
+
+    private func settleStream(_ vm: AgentAppViewModel) async {
+        for _ in 0..<40 {
+            await Task.yield()
+            if !vm.timeline.turns.isEmpty { return }
+        }
     }
 }
 

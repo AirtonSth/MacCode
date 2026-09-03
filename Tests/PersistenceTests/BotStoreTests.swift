@@ -327,6 +327,40 @@ final class BotStoreTests: XCTestCase {
         XCTAssertEqual(try store.conversationsLinked(to: []), [:])
     }
 
+    func test_cachedBotID_tracksLinkedThreadWithoutSQLiteLookup() throws {
+        // WHY: run-status broadcasts must not SQLite-lookup threads that never
+        // belonged to a bot. Upsert and conversation reads fill an in-memory map.
+        let bot = try store.create(
+            name: "Piper", title: "Scout", description: "", provider: .grok
+        )
+        let threadID = AgentThreadID()
+        let conversation = BotConversation(
+            botID: bot.id,
+            title: "Live conversation",
+            linkedAgentThreadID: threadID
+        )
+        let queries = store.conversationLinkedQueryCountForTesting
+        try store.upsertConversation(conversation)
+        XCTAssertEqual(store.cachedBotID(linkedTo: threadID), bot.id)
+        XCTAssertNil(store.cachedBotID(linkedTo: AgentThreadID()))
+        XCTAssertEqual(store.conversationLinkedQueryCountForTesting, queries)
+
+        let other = BotStore(db: db)
+        XCTAssertNil(other.cachedBotID(linkedTo: threadID))
+        _ = try other.listConversations(botID: bot.id)
+        XCTAssertEqual(other.cachedBotID(linkedTo: threadID), bot.id)
+        XCTAssertEqual(other.conversationLinkedQueryCountForTesting, 0)
+
+        var cleared = conversation
+        cleared.linkedAgentThreadID = nil
+        try store.upsertConversation(cleared)
+        XCTAssertNil(store.cachedBotID(linkedTo: threadID))
+        XCTAssertEqual(store.conversationLinkedQueryCountForTesting, queries)
+
+        _ = try store.conversationLinked(to: threadID)
+        XCTAssertEqual(store.conversationLinkedQueryCountForTesting, queries + 1)
+    }
+
     func test_conversationsLinked_chunksAboveSafeSQLiteVariableBound_becauseActiveRunsAreUnbounded() throws {
         // WHY: Active thread snapshots have no cardinality cap. A batch wider
         // than SQLite's safe bind-variable budget must split without losing a

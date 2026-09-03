@@ -113,6 +113,33 @@ final class AgentLinkedInlineTextTests: XCTestCase {
         XCTAssertFalse(plan.heightDirty)
     }
 
+    func test_updatePlan_matchingFingerprintSkipsAttributedEqualityWhenDirtyKeyDiffers() {
+        // WHY (CH-07): AttributedString == is the expensive path. A fingerprint
+        // mismatch must mark storage dirty without requiring a full compare.
+        let font = NSFont.systemFont(ofSize: 13)
+        let previous = AgentLinkedInlineTextAppliedState(
+            attributed: AttributedString("Hello"),
+            font: font,
+            textColor: DS.NS.text,
+            lineSpacing: 5,
+            maximumNumberOfLines: nil,
+            lineFragmentPadding: 0,
+            sourceFingerprint: 1
+        )
+        let next = AgentLinkedInlineTextAppliedState(
+            attributed: AttributedString("Hello!"),
+            font: font,
+            textColor: DS.NS.text,
+            lineSpacing: 5,
+            maximumNumberOfLines: nil,
+            lineFragmentPadding: 0,
+            sourceFingerprint: 2
+        )
+        let plan = AgentLinkedInlineTextUpdatePlan.make(previous: previous, next: next)
+        XCTAssertTrue(plan.storageDirty)
+        XCTAssertTrue(plan.heightDirty)
+    }
+
     func test_updatePlan_sameCharactersDifferentLinkDestination_marksStorageDirty() {
         var first = AttributedString("docs")
         first.link = URL(string: "https://example.com/a")

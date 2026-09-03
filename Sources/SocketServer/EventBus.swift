@@ -919,10 +919,15 @@ enum AgentItemDeltaCoalescingIdentity {
 }
 
 public enum EventStreamFilter: Sendable, Equatable {
+    /// Default stream. Admits iOS-mirrored kinds (`workspace.*`, `surface.*`,
+    /// `agent.thread.*`, `agent.item.*`, `agent.run.*`, …) but not
+    /// `agent.provider_runtime.event`.
     case full
     /// Cellular volume filter. Optional interest thread ids drop high-volume
     /// agent deltas for other threads (fail open when interest is empty).
     case cellularSafe(interestThreadIds: Set<String> = [])
+    /// Explicit diagnostics stream, including `agent.provider_runtime.event`.
+    case diagnostics
     /// Local in-process subscribers that only care about specific kind prefixes
     /// (e.g. Agent App surfaces: `agent.thread.` / `agent.message.queue`).
     case kindPrefixes([String])
@@ -954,20 +959,26 @@ public enum EventStreamFilter: Sendable, Equatable {
     }
 
     /// Parse filter + optional interest header (`thread-a,thread-b`).
+    /// Mixed `cellular-safe` + `diagnostics` stays cellular-safe; diagnostics
+    /// only wins when the header is diagnostics (not mixed).
     public static func parse(
         filterHeader: String?,
         interestThreadHeader: String?
     ) -> EventStreamFilter {
-        guard filterHeader?.lowercased().contains("cellular-safe") == true else {
-            return .full
+        let header = filterHeader?.lowercased() ?? ""
+        if header.contains("cellular-safe") {
+            let ids = Set(
+                (interestThreadHeader ?? "")
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+            )
+            return .cellularSafe(interestThreadIds: ids)
         }
-        let ids = Set(
-            (interestThreadHeader ?? "")
-                .split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-        )
-        return .cellularSafe(interestThreadIds: ids)
+        if header.contains("diagnostics") {
+            return .diagnostics
+        }
+        return .full
     }
 
     /// Mid-session interest control wire type (client → host over live WS).
@@ -992,12 +1003,15 @@ public enum EventStreamFilter: Sendable, Equatable {
         return Set(ids)
     }
 
-    /// Apply mid-session interest onto an existing filter. Full filters stay
-    /// full (fail open — interest only gates cellular-safe admissions).
+    /// Apply mid-session interest onto an existing filter. Full and diagnostics
+    /// filters stay themselves (fail open — interest only gates cellular-safe
+    /// admissions).
     public func applyingInterestThreadIds(_ ids: Set<String>) -> EventStreamFilter {
         switch self {
         case .full:
             return .full
+        case .diagnostics:
+            return .diagnostics
         case .cellularSafe:
             return .cellularSafe(interestThreadIds: ids)
         case .kindPrefixes(let prefixes):
@@ -1046,9 +1060,13 @@ public enum EventStreamFilter: Sendable, Equatable {
     }
 
     public func map(_ event: EventBus.Event) -> EventBus.Event? {
+        if event.kind == RemoteCodeEventKind.agentProviderRuntimeEvent.rawValue,
+           !admitsProviderRuntimeEvent {
+            return nil
+        }
         guard let known = event.knownEvent else {
             switch self {
-            case .full:
+            case .full, .diagnostics:
                 return event
             case .kindPrefixes(let prefixes):
                 return prefixes.contains { event.kind == $0 || event.kind.hasPrefix($0) }
@@ -1064,8 +1082,11 @@ public enum EventStreamFilter: Sendable, Equatable {
     }
 
     public func map(_ event: EventBus.KnownEvent) -> EventBus.KnownEvent? {
+        if event.kind == .agentProviderRuntimeEvent, !admitsProviderRuntimeEvent {
+            return nil
+        }
         switch self {
-        case .full:
+        case .full, .diagnostics:
             return event
         case .kindPrefixes(let prefixes):
             for prefix in prefixes {
@@ -1096,6 +1117,13 @@ public enum EventStreamFilter: Sendable, Equatable {
             guard classification.reducerRequired || classification.priority == .critical else { return nil }
             return event
         }
+    }
+
+    /// `agent.provider_runtime.event` is diagnostics-only so Pet/Bots and the
+    /// default iOS WS filter do not hop for ~5 Hz provider traces.
+    private var admitsProviderRuntimeEvent: Bool {
+        if case .diagnostics = self { return true }
+        return false
     }
 
     private static func isGeometryOnlyTerminalOutput(_ event: EventBus.KnownEvent) -> Bool {

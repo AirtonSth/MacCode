@@ -3,6 +3,25 @@ import CoreModel
 import SocketServer
 
 public enum PetEventDecoder {
+    /// Kinds the decoder maps to useful pet domain events. High-rate noise
+    /// (`agent.item.delta`, layout, token usage, …) is intentionally absent.
+    public static let acceptedKinds: Set<String> = [
+        "agent.run.started", "agent.run.finished", "agent.run.error",
+        "agent.turn.started",
+        "agent.item.started", "agent.item.completed",
+        "agent.context.compaction",
+        "agent.request.opened", "agent.request.resolved",
+        "agent.user_input.requested", "agent.user_input.resolved",
+        "git.checkout", "git.branch_created", "git.commit", "git.push", "git.deliver",
+        "project.script_started", "project.script.finished",
+        "agent.provider.updated",
+        "ssh.transfer.started", "ssh.transfer.completed", "ssh.transfer.failed",
+        "ssh.session.updated",
+        "surface.browser",
+        "files.edit.opened", "files.edit.patch_applied", "files.edit.saved",
+        "files.edit.conflict", "files.edit.discarded", "files.edit.closed",
+    ]
+
     public static func decode(_ event: EventBus.Event) -> PetDomainEvent? {
         guard case .object(let payload) = event.payload else { return nil }
 

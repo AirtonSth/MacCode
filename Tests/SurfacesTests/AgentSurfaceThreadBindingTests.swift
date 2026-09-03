@@ -121,6 +121,7 @@ final class AgentSurfaceThreadBindingTests: XCTestCase {
         vm.onSelectedThreadChanged = { observed.append($0) }
 
         vm.selectThread(t.id)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
 
         XCTAssertEqual(observed, [t.id],
             "Selecting a thread must notify the host so it can persist the per-surface binding.")

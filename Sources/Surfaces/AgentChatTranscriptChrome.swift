@@ -263,7 +263,7 @@ public struct AgentChatStatusCard: View {
     }
 }
 
-public struct AgentChatUserBubble: View {
+public struct AgentChatUserBubble: View, Equatable {
     public let text: String
     public let createdAt: Date
     public var columnWidth: CGFloat = 10_000
@@ -344,6 +344,17 @@ public struct AgentChatUserBubble: View {
         .frame(maxWidth: .infinity, alignment: .trailing)
     }
 
+    public static func == (lhs: AgentChatUserBubble, rhs: AgentChatUserBubble) -> Bool {
+        lhs.text == rhs.text
+            && lhs.createdAt == rhs.createdAt
+            && lhs.columnWidth == rhs.columnWidth
+            && lhs.accessibilityIdentifier == rhs.accessibilityIdentifier
+            && lhs.roleIdentifier == rhs.roleIdentifier
+            && lhs.copyIdentifier == rhs.copyIdentifier
+            && (lhs.header != nil) == (rhs.header != nil)
+            && (lhs.belowBubble != nil) == (rhs.belowBubble != nil)
+    }
+
     private func bubbleLabel(textWidth: CGFloat) -> some View {
         AgentSelectablePlainText(text: text, fontSize: 13, textColor: DS.NS.text)
             .frame(width: textWidth, alignment: .leading)
@@ -356,7 +367,7 @@ public struct AgentChatUserBubble: View {
     }
 }
 
-public struct AgentChatAssistantReply: View {
+public struct AgentChatAssistantReply: View, Equatable {
     public let text: String
     public var roleIdentifier: String = "bots.desk.role.assistant"
     public var copyIdentifier: String? = nil
@@ -403,6 +414,13 @@ public struct AgentChatAssistantReply: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    public static func == (lhs: AgentChatAssistantReply, rhs: AgentChatAssistantReply) -> Bool {
+        lhs.text == rhs.text
+            && lhs.roleIdentifier == rhs.roleIdentifier
+            && lhs.copyIdentifier == rhs.copyIdentifier
+            && (lhs.content != nil) == (rhs.content != nil)
     }
 }
 

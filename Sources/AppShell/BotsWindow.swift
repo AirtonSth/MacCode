@@ -3052,6 +3052,7 @@ public final class BotsViewModel: ObservableObject {
             }
             persistScreen()
             router?.windowController?.refreshBotsChromeTitle()
+            publishInterestedDeskThreadID()
         }
     }
     @Published public var activeBotsTab: ActiveBotsTab = .active
@@ -3162,6 +3163,21 @@ public final class BotsViewModel: ObservableObject {
     public private(set) var deskStopRunIssuedCountForTesting = 0
     /// Test seam: how many times Desk actually decoded stream events.
     public private(set) var deskLiveReplayFetchCountForTesting = 0
+    /// Test seam: MainActor Tasks scheduled from the coordinator stream observer.
+    public var deskStreamMainHopCountForTesting: Int {
+        interestedDeskThread.hopCountValue()
+    }
+    public func resetDeskStreamMainHopCountForTesting() {
+        interestedDeskThread.resetHopCount()
+    }
+    /// Test seam: `applyIncomingDeskEvent` entries, including unmatched guards.
+    public private(set) var applyIncomingDeskEventCountForTesting = 0
+    /// Test seam: fallback live-turn poll bodies that hit coordinator/run SQLite.
+    public private(set) var deskLiveTurnWatchApplyCountForTesting = 0
+    private var lastDeskStreamPushAt: Date?
+    /// Cross-thread mirror of the selected desk `linkedAgentThreadID` so
+    /// nonisolated stream delivery can drop other threads without a MainActor hop.
+    private let interestedDeskThread = InterestedDeskThreadBox()
     /// Test seams: persisted suffix work used to confirm an observer watermark.
     public private(set) var deskLiveIncrementalDecodeEventCountForTesting = 0
     public private(set) var deskLiveIncrementalDecodeBytesForTesting: Int64 = 0
@@ -3249,6 +3265,7 @@ public final class BotsViewModel: ObservableObject {
                previousThreadID != selectedConversation?.linkedAgentThreadID {
                 clearDeskObservedEvents(threadID: previousThreadID)
             }
+            publishInterestedDeskThreadID()
         }
     }
     @Published public private(set) var attentionItems: [BotAttentionItem] = []
@@ -3432,6 +3449,7 @@ public final class BotsViewModel: ObservableObject {
         if !deskRoutingHydrated {
             applyDeskRouting(for: selectedConversation)
         }
+        publishInterestedDeskThreadID()
         context.coordinator.addObserver(self)
     }
 
@@ -3775,6 +3793,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func reloadActiveBotsScreen() {
+        guard screen.resolvedDestination == .activeBots else { return }
         activeBotsHydrationCountForTesting += 1
         settleTerminalWorkingConversations()
         let liveBots = liveWorkingBots()
@@ -4748,6 +4767,7 @@ public final class BotsViewModel: ObservableObject {
         captureDeskRouting()
         resetTokenSaverFooterSnapshot()
         selectedConversation = conversation
+        publishInterestedDeskThreadID()
         selectedConversationByBot[conversation.botID] = conversation.id
         applyDeskRouting(
             for: conversation,
@@ -4793,6 +4813,18 @@ public final class BotsViewModel: ObservableObject {
         restoreDeskLiveTurn(botID: conversation.botID)
         reloadTokenSaverThreadSavings()
         deskTimelineRejoinToken &+= 1
+    }
+
+    private func publishInterestedDeskThreadID() {
+        if screen.resolvedDestination == .desk {
+            interestedDeskThread.set(selectedConversation?.linkedAgentThreadID)
+        } else {
+            interestedDeskThread.set(nil)
+        }
+    }
+
+    nonisolated private func currentInterestedDeskThreadID() -> AgentThreadID? {
+        interestedDeskThread.get()
     }
 
     private func performThreadFreshness(
@@ -8563,9 +8595,11 @@ public final class BotsViewModel: ObservableObject {
         runId: AgentRunID? = nil,
         threadId: AgentThreadID
     ) {
+        applyIncomingDeskEventCountForTesting += 1
         guard screen == .desk,
               selectedConversation?.linkedAgentThreadID == threadId
         else { return }
+        lastDeskStreamPushAt = Date()
         var next = deskLiveTimeline
         next.apply(event)
         next.enforceAggregateHotTextBudget()
@@ -8612,8 +8646,15 @@ public final class BotsViewModel: ObservableObject {
         deskLiveTurnWatch?.cancel()
         deskLiveTurnWatch = Task { [weak self] in
             while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard let self else { return }
                 guard self.selectedBotID == botID, self.screen == .desk else { return }
+                guard self.selectedConversation?.linkedAgentThreadID == threadID else { return }
+                if let lastPush = self.lastDeskStreamPushAt,
+                   Date().timeIntervalSince(lastPush) < 1 {
+                    continue
+                }
+                self.deskLiveTurnWatchApplyCountForTesting += 1
                 if self.applyDeskLiveReplay(botID: botID, threadID: threadID) {
                     self.refreshPublishedIdentity(for: botID)
                 }
@@ -8628,7 +8669,6 @@ public final class BotsViewModel: ObservableObject {
                     }
                     return
                 }
-                try? await Task.sleep(nanoseconds: 250_000_000)
             }
         }
     }
@@ -9780,6 +9820,15 @@ public final class BotsViewModel: ObservableObject {
     /// Active Bots from the stale attention flag.
     private func adoptLinkedRunTerminal(runId: AgentRunID, threadId: AgentThreadID) {
         settledTerminalRunIDByThread[threadId] = runId
+        if botStore.cachedBotID(linkedTo: threadId) == nil {
+            if screen == .desk,
+               let botID = selectedBotID,
+               selectedConversation?.linkedAgentThreadID == threadId {
+                restoreDeskWorkLog(botID: botID)
+                restoreDeskLiveTurn(botID: botID)
+            }
+            return
+        }
         guard let conversation = try? botStore.conversationLinked(to: threadId) else {
             if screen == .desk,
                let botID = selectedBotID,
@@ -9992,6 +10041,44 @@ extension BotsViewModel: BotPeerHandoffAuthorityObserver {
     }
 }
 
+/// Lock-protected selected desk-thread mirror for stream filtering.
+/// Safe from coordinator background threads and the main actor.
+final class InterestedDeskThreadBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: AgentThreadID?
+    private var hopCount = 0
+
+    func set(_ id: AgentThreadID?) {
+        lock.lock()
+        value = id
+        lock.unlock()
+    }
+
+    func get() -> AgentThreadID? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func incrementHopCount() {
+        lock.lock()
+        hopCount += 1
+        lock.unlock()
+    }
+
+    func hopCountValue() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return hopCount
+    }
+
+    func resetHopCount() {
+        lock.lock()
+        hopCount = 0
+        lock.unlock()
+    }
+}
+
 extension BotsViewModel: AgentRunObserver {
     nonisolated public func runCoordinator(
         _ c: AgentRunCoordinator,
@@ -9999,6 +10086,8 @@ extension BotsViewModel: AgentRunObserver {
         run: AgentRunID,
         threadId: AgentThreadID
     ) {
+        guard currentInterestedDeskThreadID() == threadId else { return }
+        interestedDeskThread.incrementHopCount()
         Task { @MainActor [weak self] in
             self?.applyIncomingDeskEvent(event, runId: run, threadId: threadId)
         }
@@ -10037,13 +10126,23 @@ extension BotsViewModel: AgentRunObserver {
                 self.refreshActiveBotCount()
                 return
             }
-            if let conversation = try? self.botStore.conversationLinked(to: threadId) {
-                self.reloadActiveBotsScreen()
-                self.refreshPublishedIdentity(for: conversation.botID)
+            guard let botID = self.botStore.cachedBotID(linkedTo: threadId) else {
+                if self.screen == .desk,
+                   let selectedBotID = self.selectedBotID,
+                   self.selectedConversation?.linkedAgentThreadID == threadId {
+                    self.restoreDeskWorkLog(botID: selectedBotID)
+                }
+                return
             }
-            guard self.screen == .desk, let botID = self.selectedBotID else { return }
+            if self.screen.resolvedDestination == .activeBots {
+                self.reloadActiveBotsScreen()
+            } else {
+                self.refreshActiveBotCount()
+            }
+            self.refreshPublishedIdentity(for: botID)
+            guard self.screen == .desk, let selectedBotID = self.selectedBotID else { return }
             guard self.selectedConversation?.linkedAgentThreadID == threadId else { return }
-            self.restoreDeskWorkLog(botID: botID)
+            self.restoreDeskWorkLog(botID: selectedBotID)
         }
     }
 }

@@ -648,10 +648,11 @@ public final class SidebarViewModel: ObservableObject {
         if nextActiveCount != activeThreadCount {
             activeThreadCount = nextActiveCount
         }
-        // Peek the account blob so save+reload stays synchronous (Insomnia /
-        // Token Saver tests). Unchanged JSON must not decode or assign
-        // `@Published` — that rebuilt the sidebar on every refreshFromState.
-        reloadPrivateAccount()
+        // PF-13: the account blob is peeked once at mount. Later rereads are
+        // driven by `.rc2PrivateAccountChanged`, not every refreshFromState.
+        if !didPeekPrivateAccountJSON {
+            reloadPrivateAccount()
+        }
     }
 
     /// UX-SIDEBAR-COMPLETED-DOT: detect workspaces whose action just finished and

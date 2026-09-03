@@ -1637,7 +1637,7 @@ final class GhosttyTerminalView: NSView {
         let onScreen = window?.occlusionState.contains(.visible) ?? false
         return Self.canRender(
             visibleInUI: visibleInUI,
-            isHidden: isHidden,
+            isHidden: isHiddenOrHasHiddenAncestor,
             hasNonEmptyBounds: bounds.width > 0 && bounds.height > 0,
             windowPresent: window != nil,
             windowVisible: window?.isVisible ?? false,

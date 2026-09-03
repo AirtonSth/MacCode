@@ -253,6 +253,66 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         )
     }
 
+    func test_animationFrameDidChange_reusesCachedDockPlacementWithoutHitTesting() throws {
+        // WHY: pose-size changes used to hit-test the Dock on every animation
+        // frame. Placement is stable across sprite envelopes; cache it.
+        let db = try database()
+        let atlas = try PetAtlas.bundled()
+        let model = PetViewModel(settings: AppSettings(petEnabled: true))
+        model.setFrame(try atlas.canonicalFrame(for: .idle))
+        let controller = PetWindowController(
+            model: model,
+            placementStore: PetPlacementStore(repository: SettingsRepository(db: db))
+        )
+        var providerCalls = 0
+        controller.dockFrameProviderForTests = { screen in
+            providerCalls += 1
+            return Self.centeredDockFrame(for: screen)
+        }
+        defer { controller.stop() }
+
+        controller.show()
+        let panel = try XCTUnwrap(controller.petPanelForTests)
+        XCTAssertTrue(panel.isVisible)
+        let afterPlacement = controller.dockFrameProviderCallCountForTests
+        XCTAssertGreaterThanOrEqual(afterPlacement, 1)
+        XCTAssertEqual(providerCalls, afterPlacement)
+
+        let idle = try atlas.canonicalFrame(for: .idle)
+        let sleeping = try atlas.canonicalFrame(for: .sleeping)
+        for index in 0..<50 {
+            model.setFrame(index.isMultiple(of: 2) ? sleeping : idle)
+            let frame = panel.frame
+            panel.setFrame(
+                CGRect(x: frame.minX, y: frame.minY, width: frame.width + 3, height: frame.height + 3),
+                display: false
+            )
+            controller.animationFrameDidChange()
+        }
+
+        XCTAssertLessThanOrEqual(
+            controller.dockFrameProviderCallCountForTests - afterPlacement,
+            1,
+            "pose-size changes must not hit-test the Dock on the animation-frame path"
+        )
+        XCTAssertLessThanOrEqual(providerCalls - afterPlacement, 1)
+
+        let beforeInvalidate = controller.dockFrameProviderCallCountForTests
+        controller.invalidateDockPlacementCacheForTests()
+        let frame = panel.frame
+        panel.setFrame(
+            CGRect(x: frame.minX, y: frame.minY, width: frame.width + 3, height: frame.height + 3),
+            display: false
+        )
+        controller.animationFrameDidChange()
+        XCTAssertEqual(
+            controller.dockFrameProviderCallCountForTests,
+            beforeInvalidate + 1,
+            "visibleFrame / cache invalidation must miss once and rebuild placement"
+        )
+        XCTAssertEqual(providerCalls, beforeInvalidate + 1)
+    }
+
     func test_visualEnvelopePreservesEverySupportedPetScale() throws {
         let db = try database()
         let atlas = try PetAtlas.bundled()
@@ -748,6 +808,65 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         )
         XCTAssertEqual(context.threadRepo.listChromeCallCountForTesting, chromeBefore + 1)
         XCTAssertEqual(controller.activeThreadDurableLookupCountForTesting, 8)
+    }
+
+    func test_itemCompletedBurst_doesNotRelistCachedActiveThreadChrome() async throws {
+        // WHY: every agent.item.* used to listChrome the active set on MainActor.
+        // Chrome is stable across item completions until the thread leaves or is renamed.
+        let directory = NSTemporaryDirectory() + "RC2PetChromeCache-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspace = try router.createWorkspace(name: "Pet", cwd: NSTemporaryDirectory())
+        var threadIDs: [AgentThreadID] = []
+        for index in 0..<2 {
+            let thread = AgentThread(
+                workspaceId: workspace.id,
+                title: "cached-\(index)",
+                provider: .codex,
+                model: "gpt-5",
+                status: .running
+            )
+            try context.threadRepo.upsert(thread)
+            threadIDs.append(thread.id)
+        }
+        SettingsStore(db: context.db).save(AppSettings(petEnabled: true, petReadyCounterEnabled: false))
+        let controller = try PetController(context: context, router: router, openSettings: { _ in false })
+        controller.start()
+        defer { controller.stop() }
+
+        controller.applyActiveThreadIDsForTests(threadIDs)
+        let chromeAfterCache = context.threadRepo.listChromeCallCountForTesting
+        let lookupsAfterCache = controller.activeThreadDurableLookupCountForTesting
+        XCTAssertEqual(controller.modelForTests.activeThreads.count, 2)
+
+        for index in 0..<100 {
+            let threadID = threadIDs[index % threadIDs.count]
+            EventBus.shared.publish(kind: .agentItemCompleted, payload: .object([
+                "thread_id": .string(threadID.value.uuidString),
+                "item_id": .string("item-\(index)")
+            ]))
+        }
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        XCTAssertLessThanOrEqual(
+            context.threadRepo.listChromeCallCountForTesting - chromeAfterCache,
+            2,
+            "cached chrome must not listChrome once per item.completed"
+        )
+        XCTAssertLessThanOrEqual(
+            controller.activeThreadDurableLookupCountForTesting - lookupsAfterCache,
+            2,
+            "cached chrome must not re-count durable lookups once per item.completed"
+        )
+        XCTAssertNotEqual(
+            context.threadRepo.listChromeCallCountForTesting - chromeAfterCache,
+            100
+        )
+        XCTAssertNotEqual(
+            controller.activeThreadDurableLookupCountForTesting - lookupsAfterCache,
+            100
+        )
     }
 
     func test_firstProjection_listChrome_fasterThanDurableGets() throws {
@@ -1298,6 +1417,47 @@ final class PetWindowAndLifecycleTests: XCTestCase {
             controller.handledEventCountForTests,
             0,
             "High-rate reducer noise must be discarded before dispatching work to MainActor."
+        )
+    }
+
+    func test_providerRuntimeEventsArePrefilteredBeforeMainActor() async throws {
+        // WHY: Codex/Grok runtime telemetry is ~30 Hz and never maps to a pet
+        // domain event. It must die in the EventBus subscriber, not on MainActor.
+        let directory = NSTemporaryDirectory() + "RC2PetRuntimePrefilter-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        SettingsStore(db: context.db).save(AppSettings(petEnabled: false))
+        let controller = try PetController(context: context, router: router, openSettings: { _ in false })
+        defer { controller.stop() }
+        controller.start()
+
+        XCTAssertTrue(PetController.isPrefilteredNoiseKind("agent.provider_runtime.event"))
+        XCTAssertTrue(PetController.isPrefilteredNoiseKind("token_saver.digest"))
+        XCTAssertTrue(PetController.isPrefilteredNoiseKind("agent.item.delta"))
+        XCTAssertFalse(PetController.isPrefilteredNoiseKind("agent.item.completed"))
+
+        for _ in 0..<100 {
+            EventBus.shared.publish(kind: .agentProviderRuntimeEvent, payload: .object([
+                "method": .string("session/update")
+            ]))
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(
+            controller.handledEventCountForTests,
+            0,
+            "provider_runtime.event must be discarded before MainActor handle"
+        )
+
+        EventBus.shared.publish(kind: .agentItemCompleted, payload: .object([
+            "thread_id": .string(UUID().uuidString),
+            "item_id": .string("item-1")
+        ]))
+        try await Task.sleep(nanoseconds: 80_000_000)
+        XCTAssertEqual(
+            controller.handledEventCountForTests,
+            1,
+            "a useful item.completed must still reach handle after the prefilter"
         )
     }
 

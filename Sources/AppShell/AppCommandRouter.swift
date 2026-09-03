@@ -610,7 +610,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             guard let agent = s as? AgentAppSurface,
                   resolvedWorkspace == nil || agent.viewModel.workspaceID == resolvedWorkspace! else { continue }
             workspacesNeedingRailReload.insert(agent.viewModel.workspaceID)
-            if reloadTranscriptIfSelected, agent.viewModel.selectedThreadId == thread {
+            if reloadTranscriptIfSelected,
+               agent.viewModel.selectedThreadId == thread,
+               !agent.viewModel.isHiddenFromSurface {
                 agent.viewModel.selectThread(thread, markRead: false)
             }
         }
@@ -2059,6 +2061,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func focusSurface(workspace: WorkspaceID, surface: SurfaceID) throws {
+        PerfSwitchMetrics.beginTabSwitch(surfaceID: surface.value.uuidString)
         if let ws = context?.state.workspaces[workspace],
            let paneID = ws.layout.paneIDs().first(where: { paneID in
                ws.layout.find(paneID: paneID)?.surfaces.contains(where: { $0.id == surface }) == true
@@ -2068,6 +2071,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             // Already the focused surface in the focused pane -- no state mutation needed.
             windowController?.focusSurface(surface)
             publishSurfaceFocused(workspace: workspace, surface: surface)
+            PerfSwitchMetrics.endTabSwitchInstall()
+            CATransaction.setCompletionBlock {
+                PerfSwitchMetrics.endTabSwitchCommitted()
+            }
             return
         }
         try context?.apply(.focusSurface(workspace, surface))

@@ -123,6 +123,19 @@ final class PetEventDecoderTests: XCTestCase {
         }
     }
 
+    func test_acceptedKinds_includesItemCompletedAndExcludesProviderRuntimeEvent() {
+        XCTAssertTrue(
+            PetEventDecoder.acceptedKinds.contains("agent.item.completed"),
+            "item.completed must remain a useful pet domain event"
+        )
+        XCTAssertFalse(
+            PetEventDecoder.acceptedKinds.contains("agent.provider_runtime.event"),
+            "provider runtime telemetry must not be treated as a useful pet event"
+        )
+        XCTAssertFalse(PetEventDecoder.acceptedKinds.contains("token_saver.digest"))
+        XCTAssertFalse(PetEventDecoder.acceptedKinds.contains("agent.item.delta"))
+    }
+
     func test_terminalRecorderEventClassification_usesBooleanOutcomeAndNeverRawFields() {
         let workspaceID = WorkspaceID(UUID())
         let surfaceID = SurfaceID(UUID())
