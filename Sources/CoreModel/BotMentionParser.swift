@@ -59,13 +59,14 @@ public enum BotMentionParser {
         in bots: [BotDefinition],
         excluding: BotID?
     ) -> BotDefinition? {
-        let needle = token.lowercased()
         if let handle = BotHandle.normalize(token),
            let exact = bots.first(where: { $0.id != excluding && $0.handle == handle }) {
             return exact
         }
+        // SEP-3: case-insensitive compare without per-call lowercased()
+        // copies (token needle + per-bot name allocs per resolve).
         return bots.first { bot in
-            bot.id != excluding && bot.name.lowercased() == needle
+            bot.id != excluding && bot.name.caseInsensitiveCompare(token) == .orderedSame
         }
     }
 
