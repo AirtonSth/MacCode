@@ -121,6 +121,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 70 (2026-09-03): `Sources/AppShell/` Pet dock-avoid placement — reviewed (FilesSurface drag-payload combine left for its own slice). FIXED: `frameAvoidingDock` built candidates via compactMap then ran filter+map + min scan per route side — now single pass tracks nearest side/vertical routes; side preference and fail-closed fallback unchanged (proof: 23/23 PetPlacementTests)
 
+- [x] Slice 71 (2026-09-03): `Sources/AppShell/` FilesSurface drag-payload combine — reviewed (SSH/terminal remainder sites left for their own slice). FIXED: `fileOutCombinedDragPayload` built a 2-element optional array then ran compactMap + filter (two traversals + two intermediates) per sidebar drag — now trims/appends each payload directly with reserveCapacity(2); combined payload identical (proof: 14/14 FilesDragOutTests)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
