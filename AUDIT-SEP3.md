@@ -175,6 +175,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 97 (2026-09-03): `Sources/AppShell/` fleet preview prune — reviewed (TokenSaverDailyEconomy filter+map+reduce kept: Token Saver Week-total contract code, left untouched; BotsWindow dest/roster/live id Sets, ScheduledTasks weekday join, checkpoint patch join are single-map joins, not folds). FIXED: `reloadFleet` pruned `lastPreviewByBot` + `lastUpdatedByBot` with two filter traversals + two intermediates per fleet reload — now drops removed-bot entries from both maps in one pass over stale keys; previews identical (proof: 417/418 fleet-filtered tests pass; 1 P95 timing failure `test_peerHandoffMutation…P95` fails identically on clean baseline p95=51.4ms vs 50ms budget — pre-existing/environmental)
 
+- [x] Slice 98 (2026-09-03): `Sources/AgentRuntime/` distill MCP argv mode — reviewed (CheckpointRevertUndo path Sets, `orphanDistillMCPPIDs` live-pid Set+compactMap, adapter child-id map+sorted, coordinator pid join, Graphify roots join are single-pass snapshot joins, not folds; Token Saver-gated Graphify paths untouched). FIXED: `distillMCPMode` split the whole command on whitespace and mapped every token to String just to read argv[1] on the provider sweep path — now an iterator takes only the first two tokens and materialises the mode only; modes identical (proof: 24/24 Sweeper-filtered tests pass)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
