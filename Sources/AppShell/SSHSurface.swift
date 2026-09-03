@@ -2088,10 +2088,21 @@ private struct SSHPaneDerived {
     init() {}
 
     init(entries: [SSHFileEntry]) {
-        directories = entries.filter(\.isDirectory)
-        let files = entries.filter { !$0.isDirectory }
-        fileCount = files.count
-        totalBytes = files.compactMap { Int($0.size) }.reduce(0, +)
+        var dirs: [SSHFileEntry] = []
+        dirs.reserveCapacity(entries.count)
+        var count = 0
+        var bytes = 0
+        for entry in entries {
+            if entry.isDirectory {
+                dirs.append(entry)
+            } else {
+                count += 1
+                if let size = Int(entry.size) { bytes += size }
+            }
+        }
+        directories = dirs
+        fileCount = count
+        totalBytes = bytes
     }
 }
 
