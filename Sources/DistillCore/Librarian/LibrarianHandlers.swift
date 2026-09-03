@@ -627,7 +627,7 @@ enum LibrarianHandlers {
         }
         if looksLikeChainOfThought(trimmed) { return nil }
         let span = tokenSpan(in: source, from: trimmed)
-            ?? source.split(whereSeparator: \.isNewline).map(String.init).first(where: { trimmed.contains($0) && $0.count > 8 })
+            ?? source.split(whereSeparator: \.isNewline).lazy.map(String.init).first(where: { trimmed.contains($0) && $0.count > 8 })
             ?? ""
         return span.isEmpty ? nil : (trimmed, span)
     }
@@ -646,7 +646,7 @@ enum LibrarianHandlers {
         let parts = answer.split { ch in
             !(ch.isLetter || ch.isNumber || ch == "_" || ch == "." || ch == ":" || ch == "/")
         }
-        return parts.map(String.init).first(where: { $0.count >= 2 && source.contains($0) })
+        return parts.lazy.map(String.init).first(where: { $0.count >= 2 && source.contains($0) })
     }
 
     private static func extractJSONObject(_ raw: String) -> String {
