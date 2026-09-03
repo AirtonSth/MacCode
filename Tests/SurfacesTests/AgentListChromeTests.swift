@@ -8,6 +8,12 @@ final class AgentListChromeTests: XCTestCase {
         let chrome = try source("Sources/Surfaces/AgentListChrome.swift")
         XCTAssertTrue(chrome.contains("struct AgentListFilterChip"))
         XCTAssertTrue(chrome.contains("struct AgentListSearchField"))
+        XCTAssertTrue(chrome.contains("autofocus: Bool = false"),
+                      "search owns optional autofocus so overview screens do not fork the field")
+        XCTAssertTrue(chrome.contains(".focused($focused)"),
+                      "autofocus must bind FocusState onto the TextField")
+        XCTAssertTrue(chrome.contains("if autofocus { focused = true }"),
+                      "opening an autofocus overview must claim the field without a click")
         XCTAssertTrue(chrome.contains("struct AgentListFooterBar"))
         XCTAssertTrue(chrome.contains("struct AgentKillSwitchControl"))
         XCTAssertTrue(chrome.contains("struct AgentOverviewCard"))

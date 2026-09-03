@@ -837,7 +837,8 @@ public struct ScheduledTasksRootView: View {
             text: $vm.searchText,
             placeholder: "Search tasks",
             identifier: "scheduledTasks.search",
-            accessibilityLabel: "Search tasks"
+            accessibilityLabel: "Search tasks",
+            autofocus: true
         )
     }
 

@@ -63,17 +63,21 @@ public struct AgentListSearchField: View {
     public let placeholder: String
     public let identifier: String
     public let accessibilityLabel: String
+    public let autofocus: Bool
+    @FocusState private var focused: Bool
 
     public init(
         text: Binding<String>,
         placeholder: String,
         identifier: String,
-        accessibilityLabel: String
+        accessibilityLabel: String,
+        autofocus: Bool = false
     ) {
         self._text = text
         self.placeholder = placeholder
         self.identifier = identifier
         self.accessibilityLabel = accessibilityLabel
+        self.autofocus = autofocus
     }
 
     public var body: some View {
@@ -84,6 +88,7 @@ public struct AgentListSearchField: View {
             TextField(placeholder, text: $text)
                 .textFieldStyle(.plain)
                 .foregroundColor(DS.Palette.text)
+                .focused($focused)
                 .accessibilityLabel(accessibilityLabel)
                 .accessibilityIdentifier(identifier)
         }
@@ -95,6 +100,9 @@ public struct AgentListSearchField: View {
             RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
                 .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
         )
+        .onAppear {
+            if autofocus { focused = true }
+        }
     }
 }
 

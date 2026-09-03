@@ -71,6 +71,18 @@ final class ScheduledTasksWindowTests: XCTestCase {
                       "sidebar must track Schedule Tasks selection so workspace rows can fully deselect")
     }
 
+    func test_overviewSearchFieldAutofocusesOnOpen_becauseTypingMustStartWithoutAClick() throws {
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
+        let searchStart = try XCTUnwrap(source.range(of: "private var searchField"))
+        let searchEnd = try XCTUnwrap(source.range(of: "private func shortProviderModel"))
+        let search = String(source[searchStart.lowerBound..<searchEnd.lowerBound])
+        XCTAssertTrue(search.contains("AgentListSearchField("),
+                      "overview search must stay on the shared AgentListSearchField")
+        XCTAssertTrue(search.contains("autofocus: true"),
+                      "opening Schedule Tasks must focus Search tasks so the user can type immediately")
+        XCTAssertTrue(search.contains("identifier: \"scheduledTasks.search\""))
+    }
+
     func test_editorDoesNotForceUnwrapPublishedDraft_becauseSaveClearsItDuringRender() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
         XCTAssertFalse(source.contains("vm.editorDraft!"))
