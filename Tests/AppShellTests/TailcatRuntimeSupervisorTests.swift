@@ -811,16 +811,42 @@ actor FakeTailcatCatalog: TailcatCatalogAPI {
     private var snapshot: TailcatAllowlistSnapshot
     private var unavailable = false
     private var hostError: Error?
+    private var unauthorizedTokens: Set<String> = []
+    private var holdNextHost = false
+    private var hostHold: CheckedContinuation<Void, Never>?
     private(set) var lastPublish: Publish?
     private(set) var deleteAccessTokens: [String] = []
+    private(set) var hostAccessTokens: [String] = []
+    private(set) var publishAccessTokens: [String] = []
 
     init(snapshot: TailcatAllowlistSnapshot) { self.snapshot = snapshot }
 
     func setUnavailable(_ unavailable: Bool) { self.unavailable = unavailable }
     func setSnapshot(_ snapshot: TailcatAllowlistSnapshot) { self.snapshot = snapshot }
     func setHostError(_ error: Error?) { self.hostError = error }
+    func setUnauthorizedTokens(_ tokens: Set<String>) { unauthorizedTokens = tokens }
+
+    var isHoldingHost: Bool { hostHold != nil }
+
+    func holdNextHostCall() { holdNextHost = true }
+
+    func releaseHostCall() {
+        holdNextHost = false
+        hostHold?.resume()
+        hostHold = nil
+    }
 
     func host(serverID: String, accessToken: String) async throws -> TailcatHostSnapshot {
+        hostAccessTokens.append(accessToken)
+        if holdNextHost {
+            holdNextHost = false
+            await withCheckedContinuation { continuation in
+                hostHold = continuation
+            }
+        }
+        if unauthorizedTokens.contains(accessToken) {
+            throw TailcatCatalogError.http(status: 401, code: "unauthorized")
+        }
         if let hostError { throw hostError }
         if unavailable { throw URLError(.notConnectedToInternet) }
         return TailcatHostSnapshot(host: hostValue(serverID: serverID, version: 1), snapshot: snapshot, eTag: "\"1\"")
@@ -833,6 +859,7 @@ actor FakeTailcatCatalog: TailcatCatalogAPI {
         accessToken: String,
         ifMatch: String?
     ) async throws -> TailcatPublishedHost {
+        publishAccessTokens.append(accessToken)
         if unavailable { throw URLError(.notConnectedToInternet) }
         lastPublish = Publish(endpoints: endpoints, ifMatch: ifMatch)
         return TailcatPublishedHost(host: hostValue(serverID: serverID, version: 2, endpoints: endpoints), eTag: "\"2\"")
