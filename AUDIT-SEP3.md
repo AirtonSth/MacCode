@@ -137,6 +137,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 78 (2026-09-03): `Sources/Surfaces/` composer suggestion partition — reviewed (CoreModel multi-pass hits all Token Saver/wire-protocol contract code, left untouched). FIXED: `AgentComposerSuggestions.suggestions` partitioned candidates via filter+map twice (four traversals + four intermediates) per composer keystroke — now splits command/skill bares in one loop with reserved buffers (bot kind still skipped); ranked lists identical (proof: 30/30 ComposerSuggestionPopupTests pass)
 
+- [x] Slice 79 (2026-09-03): `Sources/AppShell/` AppCommandRouter visible workspace IDs — reviewed (SocketServer/provider/RC2CLI/treaty hits all correct single-pass idioms; DistillCore/MLX hits contract-sensitive, left untouched). FIXED: `reconcileSurfaceVisibility` + `repairSelectedTerminalFocus` each built the workspace set via compactMap + Set with a duplicated 4-line stanza — now share one `visibleWorkspaceIDs()` reserved-set single-pass helper; coverage identical (proof: behavior-asserting reconciliation tests pass — keeps-selected-visible, drops-closed-window, fresh-selected-visible; 4 byte-count timing failures verified identical on clean baseline)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
