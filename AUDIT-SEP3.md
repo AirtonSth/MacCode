@@ -61,6 +61,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 40 (2026-09-03): AgentRuntime installer remainder — reviewed (cached shell env, token/receipt paths, wrapper catalog). FIXED: `systemCommandSearchDirectories` built dirs via split+map+filter with two intermediates — now single-pass keep; directories identical
 
+- [x] Slice 41 (2026-09-03): `Sources/Persistence/` checkpoint-page remainder — reviewed (shared codecs, keyset pagination, bounded caps). FIXED: `listCheckpointSummaries` built items/filesTruncated/listMetadata/completedAtTokens via four separate map traversals — now one pass with reserveCapacity; page content identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
