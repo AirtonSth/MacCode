@@ -865,9 +865,11 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                 region: pixelScope.region,
                 pixelsDigest: contentDigest
             )
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-            guard let data = try? encoder.encode(envelope) else {
+            let encoder = Self.pixelTokenEncoder
+            Self.pixelTokenCodecLock.lock()
+            let data = try? encoder.encode(envelope)
+            Self.pixelTokenCodecLock.unlock()
+            guard let data else {
                 return ""
             }
             return "native-pixel-v1:" + data.base64EncodedString()
@@ -880,11 +882,27 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         return Self.hexDigest(SHA256.hash(data: Data(material.utf8)))
     }
 
+    // PERF: pixel state tokens allocate codecs per observation/mutation race
+    // check. JSONEncoder/Decoder are not thread-safe — share one sortedKeys
+    // encoder + decoder under a short lock; wire JSON unchanged.
+    private static let pixelTokenCodecLock = NSLock()
+    private static let pixelTokenEncoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
+    private static let pixelTokenDecoder = JSONDecoder()
+
     private static func decodePixelToken(_ token: String) -> PixelTokenEnvelope? {
         let prefix = "native-pixel-v1:"
         guard token.hasPrefix(prefix),
-              let data = Data(base64Encoded: String(token.dropFirst(prefix.count))),
-              let envelope = try? JSONDecoder().decode(PixelTokenEnvelope.self, from: data),
+              let data = Data(base64Encoded: String(token.dropFirst(prefix.count))) else {
+            return nil
+        }
+        pixelTokenCodecLock.lock()
+        let envelope = try? pixelTokenDecoder.decode(PixelTokenEnvelope.self, from: data)
+        pixelTokenCodecLock.unlock()
+        guard let envelope = envelope,
               envelope.version == 1,
               envelope.targetPID > 0,
               envelope.targetWindowID > 0,
