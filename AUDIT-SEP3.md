@@ -167,6 +167,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 93 (2026-09-03): `Sources/AppShell/` outbox candidate picks — reviewed (BotsWindow `inMemoryStartedAtForLiveBot` filter+min kept: single filter+extremum over one bot's handoffs per Active Bots row, not a fold; capsule collision filter kept: 2 traversals over a handful of snapshots per capsule render). FIXED: `candidates` built a session filter intermediate plus terminal/start filter intermediates per lane (up to 4 traversals); `neededTerminalBarrierIDs` ran filter+max per lane — now both track best terminal/start/overall in one lane pass with filter+max/min tie behavior preserved; picks identical (proof: 102/102 LiveActivity-filtered tests pass)
 
+- [x] Slice 94 (2026-09-03): `Sources/AppShell/` provider stats aggregation — reviewed (CoreModel `TokenSaverBestOfThreeSelector` eligible-format filter+map kept: Token Saver decision copy, contract-adjacent; `aggregateSurfaceSnapshot` filter+3 reduces kept: compactMap over mixed surfaces already bounds the terminal list, single filter+extremum shape; JS bridge map+filter+join is tool-output text join, not a fold). FIXED: `aggregateProviderStats` ran reduce for RSS plus filter for orphans (two traversals + one intermediate) on the diagnostics heartbeat path — now one loop accumulates RSS total and orphan count together; stats identical (proof: 20/20 DiagnosticsHeartbeat-filtered tests pass)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
