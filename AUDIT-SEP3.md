@@ -129,6 +129,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 74 (2026-09-03): `Sources/AppShell/` AppCommandRouter pending callbacks — reviewed. FIXED: `listPendingCallbacks` built a 2-element optional array + compactMap + joined intermediates per stale approval callback — now appends the stale reason onto the existing detail directly; combined detail identical (proof: 12/12 directly-related callback tests pass; 1 unrelated `AgentAppViewModelTests.test_failedPendingCallbackResponsesBecomeStaleAndNonActionable` failure verified pre-existing on clean baseline)
 
+- [x] Slice 75 (2026-09-03): `Sources/AppShell/` AppDelegate pet server-failure ID — reviewed (SettingsWindow + AgentRuntime/Persistence remainders left for later slices). FIXED: `petServerFailureID` copied the name via `lowercased()`, built a mapped `[Character]` array, then reduced char-by-char into the slug — now appends each mapped character once into a reserved buffer; notification row IDs identical (proof: 6/6 NotificationPetProjectionEventTests pass)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
