@@ -526,6 +526,34 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                       "Plan mode must travel as app-server collaborationMode, not only as prompt text")
     }
 
+    func test_turnStartParams_emptyModelUsesBuiltInDefaultInCollaborationMode() throws {
+        // WHY: top-level model is omitted for account-default, but upstream
+        // Settings.model is required inside collaborationMode. A stale gpt-5.5
+        // hardcode overrode the account default and disagreed with
+        // AgentDefaultModelSelection.codexBuiltInDefault.
+        for empty in ["", "  ", "default", "Default"] {
+            let params = CodexAppServerClient.turnStartParams(
+                providerThreadId: "thread-default-model",
+                for: AgentRunRequest(
+                    threadId: AgentThreadID(),
+                    provider: .codex,
+                    model: empty,
+                    cwd: "/tmp",
+                    prompt: "hello"
+                )
+            )
+            XCTAssertNil(params["model"], "empty/default must omit top-level model (\(empty))")
+            let collaboration = try XCTUnwrap(params["collaborationMode"] as? [String: Any])
+            let settings = try XCTUnwrap(collaboration["settings"] as? [String: Any])
+            XCTAssertEqual(
+                settings["model"] as? String,
+                AgentDefaultModelSelection.codexBuiltInDefault,
+                "collaborationMode.settings.model must use codexBuiltInDefault for empty model (\(empty))"
+            )
+            XCTAssertNotEqual(settings["model"] as? String, "gpt-5.5")
+        }
+    }
+
     func test_startTurnClampsMinimalReasoningToLowForAppServerToolsAndCompaction() async throws {
         let script = try makeFakeAppServerPeer()
         let client = try CodexAppServerClient(
