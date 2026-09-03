@@ -91,6 +91,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 55 (2026-09-03): `Sources/Surfaces/` transcript display-decoration strip — reviewed (modern decoration strip first, legacy 📎 suffix fallback, `[Image #N]` marker preservation). FIXED: `promptByRemovingDisplayDecorations` ran map+filter for legacy names (two traversals + one name intermediate per retry/re-render) — now one pass collects non-empty display names with reserved capacity; stripped prompts identical
 
+- [x] Slice 56 (2026-09-03): `Sources/AppShell/` provider-admission governor — reviewed (reservation expiry, resident-root pruning, appeared-PID pairing). FIXED: `decide` built `currentRootPIDs` via compactMap+filter+Set (three traversals + two intermediates per admission decision) — now one pass inserts positive pgids with reserved capacity; admission verdicts identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
