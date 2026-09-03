@@ -199,6 +199,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 109 (2026-09-03): `Sources/AgentRuntime/` seed projection header (envelope-shape only — selector/ledger/savings math untouched) — reviewed (GrokACP failure-path case fold is a single already-shared `normalized` copy; parser map `lowercased()` switches and model-trim folds are small per-event/per-call parses; sidebar `String(format:)` token/byte/a11y copy is display text). FIXED: `TokenSaverContextSeedRuntime` project closure uppercased the format rawValue twice per non-human projection (once for `abi`, once for `effectiveEnvelope`) — now one header shared by both fields; envelope bytes identical (proof: 15/15 TokenSaverContextSeedRuntimeTests)
 
+- [x] Slice 110 (2026-09-03): `Sources/AgentRuntime/` Claude fork-reconcile guard — reviewed (elicitation enum `contains(where:)` and ownership tmp-prefix `contains(where:)` are single small scans; harness `contains(where:)` loop conditions are cheapest-form exits; marker `contains(where:)` lists are single failure-path scans). FIXED: `forkThread` reconcile guard evaluated `reconciled.count == 1` then `reconciled.first?.sessionId` (count scan + optional first access on the fork path) — now indexes `startIndex` directly under the count guard; reconcile verdict identical (proof: fork-retry-reuse + duplicate-marker-cleanup tests pass)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
