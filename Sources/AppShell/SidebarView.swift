@@ -5171,12 +5171,22 @@ public struct SidebarRootView: View {
     }
 
     private var accountInitials: String {
-        guard let email = vm.privateAccountUser?.email, let local = email.split(separator: "@").first else {
+        guard let email = vm.privateAccountUser?.email else {
             return "RC"
         }
-        let letters = local.filter(\.isLetter)
-        let prefix = letters.prefix(2)
-        return prefix.isEmpty ? "RC" : String(prefix).uppercased()
+        var local = email.prefix(while: { $0 != "@" })
+        if local.isEmpty {
+            local = email.split(separator: "@").first ?? ""
+        }
+        var initials = ""
+        initials.reserveCapacity(2)
+        for scalar in local {
+            if scalar.isLetter {
+                initials.append(scalar)
+                if initials.count == 2 { break }
+            }
+        }
+        return initials.isEmpty ? "RC" : initials.uppercased()
     }
 
     // MARK: Row accessibility helpers
