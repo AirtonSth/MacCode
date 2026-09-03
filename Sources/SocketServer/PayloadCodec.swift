@@ -67,10 +67,10 @@ public struct PayloadCodec: Sendable, Equatable {
     }
 
     public static func codec(for wireName: String) throws -> PayloadCodec {
-        let normalized = wireName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if normalized == lzfse.wireName { return .lzfse }
-        if normalized == gzip.wireName { return .gzip }
-        if normalized == identity.wireName { return .identity }
+        let trimmed = wireName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.caseInsensitiveCompare(lzfse.wireName) == .orderedSame { return .lzfse }
+        if trimmed.caseInsensitiveCompare(gzip.wireName) == .orderedSame { return .gzip }
+        if trimmed.caseInsensitiveCompare(identity.wireName) == .orderedSame { return .identity }
         throw PayloadCodecError.unsupported(wireName)
     }
 
