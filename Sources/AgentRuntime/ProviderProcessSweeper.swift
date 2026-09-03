@@ -149,9 +149,14 @@ public enum ProviderProcessSweeper {
 
     public static func distillMCPMode(from command: String) -> String? {
         guard isRemoteCodeDistillService(command) else { return nil }
-        let parts = command.split(whereSeparator: \.isWhitespace).map(String.init)
-        guard parts.count >= 2, distillMCPArgvModes.contains(parts[1]) else { return nil }
-        return parts[1]
+        // Bounded split: only the argv mode (second token) is needed — no
+        // full whitespace split + String map over long command lines.
+        var tokens = command.split(whereSeparator: \.isWhitespace).makeIterator()
+        _ = tokens.next()
+        guard let mode = tokens.next(),
+              mode.count >= 2,
+              distillMCPArgvModes.contains(String(mode)) else { return nil }
+        return String(mode)
     }
 
     /// Distill MCP PIDs whose parent is gone (reparented to launchd / pid 1, or
