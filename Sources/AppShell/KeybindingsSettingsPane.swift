@@ -121,13 +121,18 @@ public enum KeybindingConflictDetector {
     /// Key-token extraction: normalize() returns `(mods + rest).joined("+")`.
     /// We re-normalize the chord defensively, split on "+", filter out the five
     /// recognized modifier tokens, and take the remainder as the key token.
+    private static let modifierTokens: Set<String> = ["mod", "ctrl", "alt", "opt", "shift"]
+
     public static func isNonCharacterKey(_ chord: String) -> Bool {
         let normalized = KeybindingConfig.normalize(chord)
-        let modifierSet: Set<String> = ["mod", "ctrl", "alt", "opt", "shift"]
-        let parts = normalized.split(separator: "+").map(String.init)
-        let keyTokens = parts.filter { !modifierSet.contains($0) }
-        // A well-formed chord has exactly one key token after modifiers.
-        guard let token = keyTokens.first else { return false }
+        // PERF: single pass avoids the split + map + filter intermediates on
+        // the per-row render path; key token identical.
+        var token: String?
+        for part in normalized.split(separator: "+") where !modifierTokens.contains(String(part)) {
+            token = String(part)
+            break
+        }
+        guard let token else { return false }
         return nonCharacterKeyTokens.contains(token)
     }
 
