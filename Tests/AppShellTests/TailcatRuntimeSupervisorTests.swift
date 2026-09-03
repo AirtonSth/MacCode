@@ -6,6 +6,18 @@ import XCTest
 final class TailcatRuntimeSupervisorTests: XCTestCase {
     func testExactTransportContractAndLinkedBridgeBuildID() throws {
         XCTAssertEqual(TailcatTransportContract.buildID, "tailcat-88929418b1a3f3c74904a3136d6a9e87b1b5b9bb+rcpatch1")
+        XCTAssertEqual(TailcatTransportContract.catalogProtocolVersion, 1)
+        XCTAssertEqual(TailcatTransportContract.admissionDigestVersion, 1)
+        XCTAssertNotEqual(
+            String(TailcatTransportContract.catalogProtocolVersion),
+            TailcatTransportContract.buildID,
+            "catalog protocol is a capability independent of the Tailcat transport build"
+        )
+        XCTAssertNotEqual(
+            String(TailcatTransportContract.admissionDigestVersion),
+            TailcatTransportContract.buildID,
+            "admission digest version is a capability independent of the Tailcat transport build"
+        )
         XCTAssertEqual(TailcatTransportContract.primaryDERPHost, "derp.remotecode.io")
         XCTAssertEqual(TailcatTransportContract.primaryDERPIPv4, "82.25.69.175")
         XCTAssertEqual(TailcatTransportContract.primaryDERPPort, 444)
@@ -62,8 +74,28 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertEqual(requests[0].url?.path, "/v1/private/tailcat/hosts/server-1")
         XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Authorization"), "Bearer access-token")
         XCTAssertEqual(requests[0].value(forHTTPHeaderField: "x-tailcat-transport-build-id"), TailcatTransportContract.buildID)
+        XCTAssertEqual(
+            requests[0].value(forHTTPHeaderField: "x-tailcat-catalog-protocol-version"),
+            String(TailcatTransportContract.catalogProtocolVersion)
+        )
+        XCTAssertEqual(
+            requests[0].value(forHTTPHeaderField: "x-tailcat-admission-digest-version"),
+            String(TailcatTransportContract.admissionDigestVersion)
+        )
         XCTAssertEqual(requests[1].httpMethod, "PUT")
         XCTAssertNil(requests[1].value(forHTTPHeaderField: "If-Match"))
+        XCTAssertEqual(
+            requests[1].value(forHTTPHeaderField: "x-tailcat-transport-build-id"),
+            TailcatTransportContract.buildID
+        )
+        XCTAssertEqual(
+            requests[1].value(forHTTPHeaderField: "x-tailcat-catalog-protocol-version"),
+            String(TailcatTransportContract.catalogProtocolVersion)
+        )
+        XCTAssertEqual(
+            requests[1].value(forHTTPHeaderField: "x-tailcat-admission-digest-version"),
+            String(TailcatTransportContract.admissionDigestVersion)
+        )
         let body = try XCTUnwrap(requests[1].httpBody)
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         XCTAssertEqual(Set(json.keys), ["displayName", "endpoints"])
@@ -76,6 +108,14 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertEqual(
             requests[2].value(forHTTPHeaderField: "x-tailcat-transport-build-id"),
             TailcatTransportContract.buildID
+        )
+        XCTAssertEqual(
+            requests[2].value(forHTTPHeaderField: "x-tailcat-catalog-protocol-version"),
+            String(TailcatTransportContract.catalogProtocolVersion)
+        )
+        XCTAssertEqual(
+            requests[2].value(forHTTPHeaderField: "x-tailcat-admission-digest-version"),
+            String(TailcatTransportContract.admissionDigestVersion)
         )
         XCTAssertEqual(requests[3].httpMethod, "GET")
         XCTAssertEqual(requests[3].url?.path, "/v1/private/tailcat/hosts/server-1")
@@ -599,7 +639,7 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
     }
 }
 
-private final class FakeTailcatStatuses: @unchecked Sendable {
+final class FakeTailcatStatuses: @unchecked Sendable {
     private let lock = NSLock()
     private var statuses: [TailcatRuntimeStatus] = []
 
@@ -632,7 +672,7 @@ private final class FakeTailcatClock: @unchecked Sendable {
     }
 }
 
-private final class FakeTailcatStore: TailcatSecureStateStoring, @unchecked Sendable {
+final class FakeTailcatStore: TailcatSecureStateStoring, @unchecked Sendable {
     private let lock = NSLock()
     private var stored: TailcatSecureState?
     private var loads = 0
@@ -666,7 +706,7 @@ private func waitSynchronously(timeout: TimeInterval, until condition: () -> Boo
     return condition()
 }
 
-private final class FakeTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable {
+final class FakeTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable {
     struct StartCall: Sendable {
         let key: TailcatBridgeKey
         let allowedNodePublics: [String]
@@ -753,7 +793,7 @@ private final class FakeTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable
     }
 }
 
-private final class FakeTailcatListener: TailcatLoopbackListening, @unchecked Sendable {
+final class FakeTailcatListener: TailcatLoopbackListening, @unchecked Sendable {
     private let lock = NSLock()
     private var stops = 0
 
@@ -762,22 +802,26 @@ private final class FakeTailcatListener: TailcatLoopbackListening, @unchecked Se
     func stop() { lock.withLock { stops += 1 } }
 }
 
-private actor FakeTailcatCatalog: TailcatCatalogAPI {
+actor FakeTailcatCatalog: TailcatCatalogAPI {
     struct Publish: Sendable {
         let endpoints: [TailcatCatalogEndpoint]
         let ifMatch: String?
     }
 
-    private let snapshot: TailcatAllowlistSnapshot
+    private var snapshot: TailcatAllowlistSnapshot
     private var unavailable = false
+    private var hostError: Error?
     private(set) var lastPublish: Publish?
     private(set) var deleteAccessTokens: [String] = []
 
     init(snapshot: TailcatAllowlistSnapshot) { self.snapshot = snapshot }
 
     func setUnavailable(_ unavailable: Bool) { self.unavailable = unavailable }
+    func setSnapshot(_ snapshot: TailcatAllowlistSnapshot) { self.snapshot = snapshot }
+    func setHostError(_ error: Error?) { self.hostError = error }
 
     func host(serverID: String, accessToken: String) async throws -> TailcatHostSnapshot {
+        if let hostError { throw hostError }
         if unavailable { throw URLError(.notConnectedToInternet) }
         return TailcatHostSnapshot(host: hostValue(serverID: serverID, version: 1), snapshot: snapshot, eTag: "\"1\"")
     }
