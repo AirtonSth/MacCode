@@ -8676,8 +8676,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func fileType(for name: String) -> String {
-        let ext = (name as NSString).pathExtension
-        return ext.isEmpty ? "File" : "\(ext.uppercased()) File"
+        // PERF: file listings call this per row; NSString.pathExtension +
+        // uppercased() allocated twice per file. Scan the suffix directly.
+        let utf8 = name.utf8
+        var dot: String.UTF8View.Index?
+        var i = utf8.startIndex
+        while i != utf8.endIndex {
+            if utf8[i] == 0x2F { dot = nil } else if utf8[i] == 0x2E { dot = i }
+            i = utf8.index(after: i)
+        }
+        guard let dot, utf8.index(after: dot) != utf8.endIndex else { return "File" }
+        return "\(name[utf8.index(after: dot)...].uppercased()) File"
     }
 
     private static let shortDateFormatter: DateFormatter = {
