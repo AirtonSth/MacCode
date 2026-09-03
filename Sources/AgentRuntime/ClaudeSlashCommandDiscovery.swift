@@ -65,7 +65,7 @@ public enum ClaudeSlashCommandDiscovery {
             at: commandsDir, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]
         ) else { return [] }
         return entries.compactMap { url in
-            guard url.pathExtension.lowercased() == "md" else { return nil }
+            guard url.pathExtension.caseInsensitiveCompare("md") == .orderedSame else { return nil }
             let name = url.deletingPathExtension().lastPathComponent
             return name.isEmpty ? nil : name
         }
