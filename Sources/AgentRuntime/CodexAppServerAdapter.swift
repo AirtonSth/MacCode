@@ -874,13 +874,16 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         guard var snapshot = sessionSnapshot(threadId: threadId) else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
-        if snapshot.completedTurnIds.firstIndex(of: toTurnId) == nil {
+        // Reuse the first lookup — only re-scan after the refresh read.
+        var targetIndex = snapshot.completedTurnIds.firstIndex(of: toTurnId)
+        if targetIndex == nil {
             _ = try? await readThread(threadId: threadId)
             if let refreshed = sessionSnapshot(threadId: threadId) {
                 snapshot = refreshed
+                targetIndex = snapshot.completedTurnIds.firstIndex(of: toTurnId)
             }
         }
-        guard let targetIndex = snapshot.completedTurnIds.firstIndex(of: toTurnId) else {
+        guard let targetIndex else {
             throw AgentProviderAdapterError.unsupported("Codex app-server rollback target is not in completed turn history: \(toTurnId)")
         }
         let numTurns = snapshot.completedTurnIds.distance(from: targetIndex, to: snapshot.completedTurnIds.endIndex) - 1
