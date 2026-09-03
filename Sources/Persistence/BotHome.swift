@@ -238,11 +238,20 @@ public struct BotHome: Sendable {
         return files
     }
 
+    // PERF: memory-path guard recompiled its regex via range(of:options:
+    // .regularExpression) on every bot Files write admission. Compile once.
+    private static let writableMemoryDateRegex = try! NSRegularExpression(
+        pattern: #"^memory/[0-9]{4}-[0-9]{2}-[0-9]{2}(?:-[A-Za-z0-9][A-Za-z0-9-]*)?\.md$"#
+    )
+
     public static func isWritableMemoryPath(_ relativePath: String) -> Bool {
         let path = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
         if path == memoryName || path == userMemoryName { return true }
-        let pattern = #"^memory/[0-9]{4}-[0-9]{2}-[0-9]{2}(?:-[A-Za-z0-9][A-Za-z0-9-]*)?\.md$"#
-        return path.range(of: pattern, options: .regularExpression) != nil
+        return writableMemoryDateRegex.firstMatch(
+            in: path,
+            options: [],
+            range: NSRange(path.startIndex..., in: path)
+        ) != nil
     }
 
     public static func isWritableSkillPath(_ relativePath: String) -> Bool {
