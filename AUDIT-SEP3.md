@@ -43,6 +43,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 31 (2026-09-03): terminal-budget + queue-depth paths — reviewed (single-pass budget eviction, coalesced queue reloads). FIXED: `TerminalSurface.autoSubmitSavedSSHPasswordIfNeeded` copied the whole PTY chunk via `lowercased()` on every output arrival — now case-insensitive range scan; prompt verdicts identical
 
+- [x] Slice 32 (2026-09-03): SSH surface second pass — reviewed (case-insensitive host filter, coalesced resize, bounded log). FIXED: `addTransferLog` rebuilt the array via `Array(suffix(200))` on every append — now trims only when over budget; contents identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
