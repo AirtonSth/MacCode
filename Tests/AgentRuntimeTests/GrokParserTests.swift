@@ -305,4 +305,17 @@ final class GrokParserTests: XCTestCase {
             return false
         }, "cancelled end must seal open tools as cancelled, not completed")
     }
+
+    // SEP-3: normalizeStopReason compiles its camelCase regex once. A camelCase
+    // multi-word reason must still snake_case before classification.
+    func test_end_camelCaseStopReason_normalizesBeforeClassify() {
+        let parser = GrokParser()
+        var events: [AssistantEvent] = []
+        events += parser.parseLine(#"{"type":"tool_call","toolCallId":"tc-camel","name":"shell"}"#)
+        events += parser.parseLine(#"{"type":"end","stopReason":"maxTokens"}"#)
+        XCTAssertTrue(events.contains {
+            if case .itemCompleted("tc-camel", .completed) = $0 { return true }
+            return false
+        }, "camelCase maxTokens must normalize to max_tokens and seal as completed")
+    }
 }

@@ -352,12 +352,14 @@ public final class GrokParser {
     }
 
     /// `EndTurn` → `end_turn`, `max_tokens` stays, so classifier can match ACP ids.
+    // SEP-3: compile once — replacingOccurrences(options: .regularExpression)
+    // recompiled on every call (same PERF pattern as ClaudeParser.whitespaceRegex).
+    private static let camelBoundaryRegex = try! NSRegularExpression(pattern: "([a-z0-9])([A-Z])")
     private static func normalizeStopReason(_ stopReason: String) -> String {
         let trimmed = stopReason.trimmingCharacters(in: .whitespacesAndNewlines)
-        let snake = trimmed.replacingOccurrences(
-            of: "([a-z0-9])([A-Z])",
-            with: "$1_$2",
-            options: .regularExpression
+        let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+        let snake = Self.camelBoundaryRegex.stringByReplacingMatches(
+            in: trimmed, range: range, withTemplate: "$1_$2"
         )
         return snake.lowercased()
     }

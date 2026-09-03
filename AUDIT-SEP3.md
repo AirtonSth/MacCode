@@ -14,7 +14,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 - [x] Slice 4 (2026-09-03): `Sources/CoreModel/` — reviewed WrappedCommandCatalog (static sets), AgentTypes Grok policy (clean), codecs/regexes (all shared), RCWireProtocol, turn-boundary logic, TabColor/Schedule/Session/Graphify (clean). FIXED: BotMentionParser.suggestions lowercased handle+name per bot per keystroke — now allocation-free case-insensitive range match, semantics identical (9567ad5a)
 - [x] Slice 5 (2026-09-03): `Sources/SocketServer/` — reviewed EventBus (shared codecs/locks), WebSocketEventBatcher/OutboundQueue (coalescing, FIFO, serial writer), PayloadCodec (streaming caps), metrics/redactor (clean). FIXED: BrowserSurface.publishNavigationChange fanned out persist+EventBus on every KVO/didFinish/script repeat — now dedupes identical url+title, every change still emits (commit pending)
 - [ ] `Sources/DistillCore/` + Token Saver stack (no formula/display changes)
-- [ ] `Sources/AgentRuntime/` + providers (Claude/Codex/Grok parity)
+- [x] Slice 5 (2026-09-03): `Sources/SocketServer/` — reviewed EventBus (shared codecs/locks), WebSocketEventBatcher/OutboundQueue (coalescing, FIFO, serial writer), PayloadCodec (streaming caps), metrics/redactor (clean). FIXED: BrowserSurface.publishNavigationChange fanned out persist+EventBus on every KVO/didFinish/script repeat — now dedupes identical url+title, every change still emits (016deaba)
+- [x] Slice 6 (2026-09-03): `Sources/AgentRuntime/` — reviewed parsers (Claude/Codex lowercased-switch, compiled regexes), stderr classifier, pipe drain, login-shell cache, orchestration codecs (all shared). FIXED: GrokParser.normalizeStopReason recompiled its camelCase regex per call — now compiled once (commit pending)
 - [ ] `Sources/SocketServer/` (event bus, dispatcher, browser sync parity)
 - [ ] `Sources/AppLifecycleSupport/`, `DesignSystemKit/`, `RC2CLI/`, misc targets
 
