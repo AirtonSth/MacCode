@@ -659,12 +659,21 @@ public final class SidebarViewModel: ObservableObject {
     /// surface the completed dot. Uses the `busy` metadata that `listWorkspaces`
     /// already batch-computes (agent run / terminal job), so no extra DB work.
     private func updateCompletedWorkspaces(from list: [Workspace]) {
-        let nowBusy = Set(list.filter { $0.metadata["busy"] == "true" }.map(\.id))
+        var nowBusy = Set<WorkspaceID>()
+        nowBusy.reserveCapacity(list.count)
+        var existing = Set<WorkspaceID>()
+        existing.reserveCapacity(list.count)
+        for workspace in list {
+            existing.insert(workspace.id)
+            if workspace.metadata["busy"] == "true" {
+                nowBusy.insert(workspace.id)
+            }
+        }
         let next = Self.completedWorkspacesAfterReload(
             previousBusy: previousBusyWorkspaces,
             nowBusy: nowBusy,
             current: completedWorkspaces,
-            existing: Set(list.map(\.id)),
+            existing: existing,
             selected: selectedWorkspaceID)
         if next != completedWorkspaces {
             completedWorkspaces = next
