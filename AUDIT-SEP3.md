@@ -193,6 +193,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 106 (2026-09-03): `Sources/DistillCore/` Librarian probe summary (summary-text only — no crushing math, gates, ledger, or savings touched) — reviewed (CCR/ranker tokenize splits, `NLIFaithfulnessGate` claim split, near-duplicate block split, search-line splits are small per-query/per-gate parses; TOON/contract joins are single-map joins; `FaithfulnessGate` sorted+first is a smallest-word pick over a short salient list). FIXED: `LibrarianProbe.summary` built `Set(rows.map(\.id))` just to count unique ids after the tally loop (one traversal + two intermediates per summary) — now counts unique ids inline during the tally loop; summary text identical (proof: 28/28 LibrarianCatalogTests, 1 skipped)
 
+- [x] Slice 107 (2026-09-03): `Sources/DistillCore/` gate rejection token (message-string only — gate accept/reject verdicts untouched) — reviewed (transcript-learner Set+sorted providers, TOON field joins, `AgentAppSurface` prefix-capped key digests, turn-entry defensive sorts are small/sorted-output paths). FIXED: `FaithfulnessGate.validate` sorted the salient-word set just to name the first word in the rejection message — now `min()` for the same deterministic token (proof: 3/3 TokenSaverNeverListFailOpenTests; nearest assert checks `.accepted` only, message shape unchanged)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
