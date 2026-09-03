@@ -327,6 +327,66 @@ final class ScrollPinPolicyTests: XCTestCase {
         XCTAssertFalse(follower.contains("updateConstraintsForSubtreeIfNeeded()"))
     }
 
+    /// Pin/FAB `@State` must not mutate during `NSHostingView.beginTransaction`.
+    /// A live Agent App session crashed on macOS 26.6.2 in
+    /// `ScrollEnvironmentStorage.properties` →
+    /// `swift_isUniquelyReferenced_nonNull_native` because bounds/frame
+    /// notifications and `updateNSView` wrote SwiftUI state re-entrantly.
+    func test_timelineFollowerDefersPinCallbacksOffSwiftUIGraphUpdate() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/Surfaces/AgentChatTimelineChrome.swift"),
+            encoding: .utf8
+        )
+        let start = try XCTUnwrap(source.range(of: "struct AgentChatTimelineScrollFollower"))
+        let follower = String(source[start.lowerBound...])
+        let containerStart = try XCTUnwrap(source.range(of: "public var body: some View {"))
+        let container = String(source[containerStart.lowerBound..<start.lowerBound])
+
+        XCTAssertTrue(source.contains("enum AgentChatScrollGraphHop"))
+        XCTAssertTrue(follower.contains("AgentChatScrollGraphHop.afterCurrentUpdate"))
+        XCTAssertFalse(
+            follower.contains("onReturnedToBottom?()"),
+            "pin-return must not fire SwiftUI state synchronously from AppKit"
+        )
+        XCTAssertFalse(
+            follower.contains("onScrolledAway?()"),
+            "pin-detach must not fire SwiftUI state synchronously from AppKit"
+        )
+        XCTAssertTrue(
+            follower.contains("AgentChatScrollGraphHop.afterCurrentUpdate { [weak view] in"),
+            "updateNSView must hop attach() off the current graph transaction"
+        )
+        XCTAssertTrue(
+            container.contains(".overlay(alignment: .bottomTrailing)"),
+            "FAB must overlay the ScrollView so toggling it does not recreate ScrollEnvironmentStorage"
+        )
+        XCTAssertFalse(
+            container.contains("ZStack(alignment: .bottomTrailing)"),
+            "conditional ZStack sibling of ScrollView recreates scroll observation storage"
+        )
+    }
+
+    func test_graphHopDoesNotRunDuringTheCurrentTurn() {
+        var ranDuringCurrentTurn = false
+        AgentChatScrollGraphHop.afterCurrentUpdate {
+            ranDuringCurrentTurn = true
+        }
+        XCTAssertFalse(
+            ranDuringCurrentTurn,
+            "afterCurrentUpdate must hop past NSHostingView.beginTransaction"
+        )
+        let arrived = expectation(description: "graph hop")
+        AgentChatScrollGraphHop.afterCurrentUpdate {
+            arrived.fulfill()
+        }
+        wait(for: [arrived], timeout: 1)
+        XCTAssertTrue(ranDuringCurrentTurn)
+    }
+
     /// Expanded work rows are already bounded by `paintSlice`. Nesting another
     /// lazy stack inside the transcript's lazy stack makes SwiftUI repeatedly
     /// re-place self-sizing linked-text rows while the user scrolls, which can

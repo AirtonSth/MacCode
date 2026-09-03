@@ -25,6 +25,23 @@ public enum AgentChatTimelineScrollChrome {
     public static let scrollDownButtonBottomInset: CGFloat = 22
 }
 
+/// Hop off the current AttributeGraph transaction before touching SwiftUI
+/// `@State` or the SwiftUI-backed `NSScrollView` offset.
+///
+/// WHY: macOS 26 SwiftUI stores scroll clipping in `@Observable`
+/// `ScrollEnvironmentStorage`. `NSViewRepresentable.updateNSView` and
+/// `NSView.boundsDidChangeNotification` run re-entrantly while
+/// `NSHostingView.beginTransaction` is already in
+/// `ObservationRegistrar.access` for
+/// `isScrollViewTransformClippingEnabled`. Nested CoW on that access list
+/// SIGSEGVs in `swift_isUniquelyReferenced_nonNull_native` (fault
+/// `0x4036…0008` on the main run-loop observer).
+enum AgentChatScrollGraphHop {
+    static func afterCurrentUpdate(_ work: @escaping () -> Void) {
+        DispatchQueue.main.async(execute: work)
+    }
+}
+
 /// Shared Agent App / Desk timeline viewport: pin, FAB, BOTTOM sentinel,
 /// and AppKit follow. Callers own the rows.
 public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: View>: View {
@@ -68,56 +85,59 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
 
     public var body: some View {
         ScrollViewReader { proxy in
-            ZStack(alignment: .bottomTrailing) {
-                GeometryReader { viewport in
-                    let columnWidth = max(0, viewport.size.width - columnGutter)
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 0) {
-                            AgentChatTimelineScrollFollower(
-                                slack: AgentChatTimelineScrollChrome.bottomRevealSlack,
-                                pinned: sticksToBottom,
-                                pinForceToken: pinForceToken,
-                                onScrolledAway: onScrolledAway,
-                                onReturnedToBottom: onReturnedToBottom
-                            )
-                            .frame(width: 1, height: 1)
-                            .opacity(0.001)
-                            .allowsHitTesting(false)
-                            .accessibilityHidden(true)
+            GeometryReader { viewport in
+                let columnWidth = max(0, viewport.size.width - columnGutter)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        AgentChatTimelineScrollFollower(
+                            slack: AgentChatTimelineScrollChrome.bottomRevealSlack,
+                            pinned: sticksToBottom,
+                            pinForceToken: pinForceToken,
+                            onScrolledAway: onScrolledAway,
+                            onReturnedToBottom: onReturnedToBottom
+                        )
+                        .frame(width: 1, height: 1)
+                        .opacity(0.001)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
 
-                            content(columnWidth)
+                        content(columnWidth)
 
-                            Color.clear
-                                .frame(height: 1)
-                                .id(AgentChatTimelineScrollChrome.bottomAnchorID)
-                        }
-                        .padding(.horizontal, horizontalPadding)
-                        .padding(.vertical, verticalPadding)
-                        .frame(width: viewport.size.width, alignment: .leading)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        Color.clear
+                            .frame(height: 1)
+                            .id(AgentChatTimelineScrollChrome.bottomAnchorID)
                     }
-                    .background(DS.Palette.bg)
+                    .padding(.horizontal, horizontalPadding)
+                    .padding(.vertical, verticalPadding)
+                    .frame(width: viewport.size.width, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                if showScrollDownButton {
-                    Button {
-                        rejoin(proxy)
-                    } label: {
-                        Image(systemName: "arrow.down")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundColor(.white)
-                            .frame(width: 44, height: 44)
-                            .background(DS.Palette.accent)
-                            .clipShape(Circle())
-                            .shadow(color: .black.opacity(0.25), radius: 10, x: 0, y: 4)
+                .background(DS.Palette.bg)
+                // FAB must not be a conditional ZStack sibling of the
+                // ScrollView: inserting/removing that sibling recreates
+                // SwiftUI's ScrollEnvironmentStorage while AttributeGraph
+                // still tracks `isScrollViewTransformClippingEnabled`.
+                .overlay(alignment: .bottomTrailing) {
+                    if showScrollDownButton {
+                        Button {
+                            rejoin(proxy)
+                        } label: {
+                            Image(systemName: "arrow.down")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundColor(.white)
+                                .frame(width: 44, height: 44)
+                                .background(DS.Palette.accent)
+                                .clipShape(Circle())
+                                .shadow(color: .black.opacity(0.25), radius: 10, x: 0, y: 4)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Scroll to latest message")
+                        .accessibilityIdentifier(scrollToBottomIdentifier)
+                        .help("Scroll to latest message")
+                        .padding(.trailing, 14)
+                        .padding(.bottom, AgentChatTimelineScrollChrome.scrollDownButtonBottomInset)
+                        .transition(.opacity.combined(with: .scale(scale: 0.94)))
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Scroll to latest message")
-                    .accessibilityIdentifier(scrollToBottomIdentifier)
-                    .help("Scroll to latest message")
-                    .padding(.trailing, 14)
-                    .padding(.bottom, AgentChatTimelineScrollChrome.scrollDownButtonBottomInset)
-                    .zIndex(1)
-                    .transition(.opacity.combined(with: .scale(scale: 0.94)))
                 }
             }
             .onAppear { rejoin(proxy) }
@@ -237,7 +257,9 @@ struct AgentChatTimelineScrollFollower: NSViewRepresentable {
             onScrolledAway: onScrolledAway,
             onReturnedToBottom: onReturnedToBottom
         )
-        view.attach()
+        AgentChatScrollGraphHop.afterCurrentUpdate { [weak view] in
+            view?.attach()
+        }
     }
 
     final class FollowerView: NSView {
@@ -375,7 +397,9 @@ struct AgentChatTimelineScrollFollower: NSViewRepresentable {
                 self.handleScroll()
             }
             lastOriginY = clip.bounds.origin.y
-            handleScroll()
+            AgentChatScrollGraphHop.afterCurrentUpdate { [weak self] in
+                self?.handleScroll()
+            }
         }
 
         private var isUserOwnedScroll: Bool {
@@ -481,6 +505,12 @@ struct AgentChatTimelineScrollFollower: NSViewRepresentable {
         }
 
         private func scrollToBottom() {
+            AgentChatScrollGraphHop.afterCurrentUpdate { [weak self] in
+                self?.performScrollToBottom()
+            }
+        }
+
+        private func performScrollToBottom() {
             guard let scroll = scrollView, let doc = scroll.documentView else { return }
             let visible = scroll.contentView.bounds.height
             let content = max(doc.bounds.height, doc.frame.height)
@@ -499,11 +529,13 @@ struct AgentChatTimelineScrollFollower: NSViewRepresentable {
             guard atBottom != lastAtBottom else { return }
             lastAtBottom = atBottom
             pinned = atBottom
-            if atBottom {
-                onReturnedToBottom?()
-            } else {
+            if !atBottom {
                 cancelPendingSnap()
-                onScrolledAway?()
+            }
+            let callback = atBottom ? onReturnedToBottom : onScrolledAway
+            AgentChatScrollGraphHop.afterCurrentUpdate { [weak self] in
+                guard self != nil else { return }
+                callback?()
             }
         }
     }
