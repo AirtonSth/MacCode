@@ -107,6 +107,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 63 (2026-09-03): `Sources/AppShell/` keybindings conflict pane — reviewed (conflict lookup already per-row direct). FIXED: `isNonCharacterKey` ran split+map+filter plus a fresh 5-element modifier Set per call on the per-row render path — now static set + single short-circuit scan; key token identical (proof: 16/16 KeybindingConflictTests)
 
+- [x] Slice 64 (2026-09-03): `Sources/AppShell/` Tailcat allowlist snapshot — reviewed (`leftoverStoreFacts` bot-mind write path left for its own slice). FIXED: `admittedNodePublics` ran filter+map (two traversals + one intermediate) before sorting on the connect/auth path — now one `reduce(into:)` pass; sorted order identical (proof: AppShell build clean)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
