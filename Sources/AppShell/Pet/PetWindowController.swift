@@ -141,37 +141,37 @@ enum PetScreenGeometry {
             CGPoint(x: clamped.minX, y: dockFrame.minY - clamped.height),
             CGPoint(x: clamped.minX, y: dockFrame.maxY)
         ]
-        let candidates = candidateOrigins.enumerated().compactMap { index, origin -> (Int, CGRect)? in
+        // PERF: single pass tracks the nearest side-route and nearest
+        // above/below-route directly, avoiding the compactMap + filter + map
+        // intermediates and the duplicate min scans.
+        func distance(_ frame: CGRect) -> CGFloat {
+            hypot(frame.minX - clamped.minX, frame.minY - clamped.minY)
+        }
+        var nearestSide: (distance: CGFloat, frame: CGRect)?
+        var nearestVertical: (distance: CGFloat, frame: CGRect)?
+        for (index, origin) in candidateOrigins.enumerated() {
             let candidate = PetPlacement.clamped(
                 frame: CGRect(origin: origin, size: clamped.size),
                 to: placementFrame
             )
-            return candidate.intersection(dockFrame).area == 0
-                ? (index, candidate)
-                : nil
-        }
-
-        func nearest(_ frames: [CGRect]) -> CGRect? {
-            frames.min { lhs, rhs in
-                let lhsDistance = hypot(
-                    lhs.minX - clamped.minX,
-                    lhs.minY - clamped.minY
-                )
-                let rhsDistance = hypot(
-                    rhs.minX - clamped.minX,
-                    rhs.minY - clamped.minY
-                )
-                return lhsDistance < rhsDistance
+            guard candidate.intersection(dockFrame).area == 0 else { continue }
+            let entry = (distance: distance(candidate), frame: candidate)
+            if index < 2 {
+                if nearestSide == nil || entry.distance < nearestSide!.distance {
+                    nearestSide = entry
+                }
+            } else if nearestVertical == nil || entry.distance < nearestVertical!.distance {
+                nearestVertical = entry
             }
         }
 
         // Prefer a left/right route so a corner anchor can share the Dock's
         // bottom edge whenever there is horizontal room. Move above/below
         // only when neither side can contain the panel.
-        if let nearest = nearest(candidates.filter { $0.0 < 2 }.map { $0.1 }) {
+        if let nearest = nearestSide?.frame {
             return nearest
         }
-        if let nearest = nearest(candidates.filter { $0.0 >= 2 }.map { $0.1 }) {
+        if let nearest = nearestVertical?.frame {
             return nearest
         }
 
