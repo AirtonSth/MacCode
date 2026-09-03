@@ -185,6 +185,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 102 (2026-09-03): `Sources/AgentRuntime/` harness summary tallies — reviewed (BotsWindow live/active/approval counts are per-row small-set predicates; `AppContext` marker filter+contains is a 6-element heuristics scan; `AnthropicModelDiscovery` display-name fold is a small per-id parse). FIXED: `CapacitySemanticHarness.run` summary ran three status filters over `nodes` (three traversals + three intermediates per sim run) — now one switch loop tallies completed/cancelled/failed; result identical (proof: 11/11 CapacitySemanticHarnessTests)
 
+- [x] Slice 103 (2026-09-03): `Sources/DistillCore/` masking A/B arm (computation-only change — no crushing math, gates, ledger, or savings touched) — reviewed (CCR/Librarian/ranker tokenize split+filter+map are small per-query parses; `NLIFaithfulnessGate` claim split is a small per-gate parse; near-duplicate block split is a per-candidate parse). FIXED: `MaskingABHarness.Arm.solveRate` ran `solved.filter { $0 }.count` (one traversal + one intermediate per evaluate) — now a counting reduce; rate identical (proof: 4/4 MaskingABHarnessTests)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
