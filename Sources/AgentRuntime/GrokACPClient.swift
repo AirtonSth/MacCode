@@ -392,12 +392,29 @@ struct GrokACPSessionOpenResult {
     let currentModelId: String?
     let availableModes: [GrokACPSessionMode]
     let currentModeId: String?
+    /// Typed ACP `configOptions` from session/new|load (model + reasoning_effort).
+    let configOptions: [[String: Any]]
 
     var planModeId: String? {
         availableModes.first {
             $0.id.caseInsensitiveCompare("plan") == .orderedSame
                 || $0.name.caseInsensitiveCompare("plan") == .orderedSame
         }?.id
+    }
+
+    /// Effort ids advertised on the `reasoning_effort` config option, when present.
+    var advertisedReasoningEffortIds: [String] {
+        guard let option = configOptions.first(where: {
+            (($0["id"] as? String) ?? ($0["configId"] as? String)) == "reasoning_effort"
+        }) else { return [] }
+        let values = option["options"] as? [[String: Any]]
+            ?? option["values"] as? [[String: Any]]
+            ?? []
+        return values.compactMap { raw -> String? in
+            let id = (raw["value"] as? String) ?? (raw["id"] as? String)
+            let trimmed = id?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return trimmed.isEmpty ? nil : trimmed
+        }
     }
 }
 
@@ -766,6 +783,7 @@ public final class GrokACPClient: @unchecked Sendable {
     /// `reasoningEffort` is the ACP `_meta.reasoningEffort` wire value (grok-build
     /// `REASONING_EFFORT_META_KEY`). Omit when the host has nothing to bind.
     /// Values are mapped via `wireReasoningEffort` before the wire call.
+    /// Prefer `setConfigOption` for effort-only changes (no model id change).
     func setModel(
         sessionId: String,
         modelId: String,
@@ -777,6 +795,70 @@ public final class GrokACPClient: @unchecked Sendable {
             params["_meta"] = ["reasoningEffort": wireEffort]
         }
         _ = try await requestJSONObject(method: "session/set_model", params: params, timeout: 15)
+    }
+
+    /// ACP `session/set_config_option` params (grok-build session config options).
+    /// Value shape is `{ "value": "<id>" }` per agent-mode docs.
+    static func setConfigOptionParams(
+        sessionId: String,
+        configId: String,
+        valueId: String
+    ) -> JSONObject {
+        [
+            "sessionId": sessionId,
+            "configId": configId,
+            "value": ["value": valueId],
+        ]
+    }
+
+    /// Pure routing for model/effort binds before a prompt.
+    /// Effort-only → `session/set_config_option`; model change → `session/set_model`.
+    enum ModelEffortBind: Equatable {
+        case none
+        case setModel(modelId: String, reasoningEffort: AgentReasoningEffort?)
+        case setConfigOptionReasoningEffort(valueId: String, effort: AgentReasoningEffort)
+    }
+
+    static func modelEffortBind(
+        requestModel: String,
+        sessionModel: String,
+        requestEffort: AgentReasoningEffort?,
+        sessionEffort: AgentReasoningEffort?
+    ) -> ModelEffortBind {
+        let model = requestModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetModel = model.isEmpty ? sessionModel : model
+        let targetEffort = requestEffort.flatMap {
+            GrokRunner.normalizedReasoningEffort($0, model: targetModel)
+        }
+        let needsModelBind = !model.isEmpty && model != sessionModel
+        let needsEffortBind = targetEffort != sessionEffort
+        if needsModelBind {
+            return .setModel(modelId: targetModel, reasoningEffort: targetEffort)
+        }
+        if needsEffortBind, let targetEffort,
+           let wireEffort = wireReasoningEffort(targetEffort, modelId: targetModel) {
+            return .setConfigOptionReasoningEffort(valueId: wireEffort, effort: targetEffort)
+        }
+        return .none
+    }
+
+    /// Effort-only (and other typed) session config updates without a model switch.
+    /// Use `configId: "reasoning_effort"` instead of `setModel` when the model id
+    /// is unchanged (avoids allowlist / prompt-rewrite path).
+    func setConfigOption(
+        sessionId: String,
+        configId: String,
+        valueId: String
+    ) async throws {
+        _ = try await requestJSONObject(
+            method: "session/set_config_option",
+            params: Self.setConfigOptionParams(
+                sessionId: sessionId,
+                configId: configId,
+                valueId: valueId
+            ),
+            timeout: 15
+        )
     }
 
     func setMode(sessionId: String, modeId: String) async throws {
@@ -1118,12 +1200,14 @@ public final class GrokACPClient: @unchecked Sendable {
             }
             return GrokACPSessionMode(id: id, name: name, description: raw["description"] as? String)
         }
+        let configOptions = (result["configOptions"] as? [JSONObject]) ?? []
         return GrokACPSessionOpenResult(
             sessionId: sessionId,
             models: models,
             currentModelId: state?["currentModelId"] as? String,
             availableModes: availableModes,
-            currentModeId: modeState?["currentModeId"] as? String
+            currentModeId: modeState?["currentModeId"] as? String,
+            configOptions: configOptions
         )
     }
 
