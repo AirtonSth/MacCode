@@ -2543,8 +2543,11 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     }
 
     private func autoSubmitSavedSSHPasswordIfNeeded(from data: Data) {
-        guard let raw = String(data: data, encoding: .utf8)?.lowercased(),
-              raw.contains("password:") || raw.contains("passphrase") else { return }
+        // PERF: case-insensitive scan avoids lowercased() copying the whole
+        // PTY chunk on every output arrival; same prompt verdicts.
+        guard let raw = String(data: data, encoding: .utf8),
+              raw.range(of: "password:", options: .caseInsensitive) != nil
+                || raw.range(of: "passphrase", options: .caseInsensitive) != nil else { return }
         passwordPromptCount += 1
         if let notice = Self.autoSubmitNotice(promptCount: passwordPromptCount) {
             appendString("\r\n" + notice + "\r\n")
