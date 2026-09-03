@@ -898,10 +898,12 @@ public final class DiffPanelViewModel: ObservableObject {
 
     /// The history list filtered by `historyFilter`. Computed so the view
     /// derives its list without a separate @Published property that could
-    /// diverge from `commits`.
+    /// diverge from `commits`. SEP-3: trim the query once here instead of
+    /// per commit inside commitMatchesFilter (one alloc per keystroke
+    /// instead of one per row); match semantics unchanged.
     public var filteredCommits: [GitCommit] {
-        let q = historyFilter
-        guard !q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return commits }
+        let q = historyFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return commits }
         return commits.filter { Self.commitMatchesFilter($0, query: q) }
     }
 

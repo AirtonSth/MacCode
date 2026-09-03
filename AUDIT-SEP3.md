@@ -17,7 +17,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 ## Flags (pre-existing, NOT from Sep-3 slices)
 - `AgentAppViewModelTests.test_selectThreadRehydratesPersistedStaleCallbacksIntoTimeline` fails identically on pure origin/production (verified in temp worktree, since removed): stale callbacks never reach the timeline. Needs a main-agent triage; Sep-3 does not touch that path.
-- [ ] Agent-thread flows (`AppCommandRouter` thread open/switch/send paths)
+- [x] Slice 9 (2026-09-03): Agent-thread open path (`AgentAppSurface.gatherThreadOpenBundle`, `AppCommandRouter.open/selectAgentThread`) — reviewed (cache-first, coalesced reloads). FIXED: off-main bundle allocated JSONDecoder per thread open — now shared static under lock, mirroring MainActor rehydrate path (bbf028ed)
+- [x] Slice 10 (2026-09-03): `Sources/Surfaces/` big files (DiffPanel, SubagentActivity, composer, terminal stack, AgentAppSurface) + `AppLifecycleSupport`/`DesignSystemKit`/SocketServer remainder — reviewed (capped diffs, bounded projections, static tokens, coalesced sync). FIXED: DiffPanel filteredCommits trimmed the query per commit per keystroke — now once per pass, semantics identical (commit pending)
 - [ ] `Sources/AppLifecycleSupport/`, `DesignSystemKit/`, misc targets (`RC2CLI`, `CSystem`, treaty/scheduled-task agent)
 
 ## Invariants (every slice)
