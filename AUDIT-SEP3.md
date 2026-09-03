@@ -183,6 +183,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 101 (2026-09-03): `Sources/Surfaces/` hold-summary counts — reviewed (`aggregateSurfaceSnapshot` filter+3 reduces kept: compactMap over mixed surfaces already bounds the terminal list, single filter+extremum shape; BotsWindow skill/routine enabled counts are per-row inspector predicates, not hot folds). FIXED: `AgentBackgroundHoldSummary.shellCount`/`agentCount` each ran a filter over `tasks` (two traversals + two intermediates per pill render, and `nounLabel` reads both) — now one loop splits agent/shell via a shared `counts` helper; counts and pill copy identical (proof: 40/40 AgentChatUXPresentationTests)
 
+- [x] Slice 102 (2026-09-03): `Sources/AgentRuntime/` harness summary tallies — reviewed (BotsWindow live/active/approval counts are per-row small-set predicates; `AppContext` marker filter+contains is a 6-element heuristics scan; `AnthropicModelDiscovery` display-name fold is a small per-id parse). FIXED: `CapacitySemanticHarness.run` summary ran three status filters over `nodes` (three traversals + three intermediates per sim run) — now one switch loop tallies completed/cancelled/failed; result identical (proof: 11/11 CapacitySemanticHarnessTests)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
