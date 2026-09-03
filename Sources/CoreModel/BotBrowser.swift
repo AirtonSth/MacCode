@@ -111,13 +111,19 @@ public struct BotBrowserLoginPredicate: Equatable, Sendable {
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
             return raw.range(of: "/login", options: .caseInsensitive) != nil || raw.range(of: "/signin", options: .caseInsensitive) != nil
         }
-        let host = (components.host ?? "").lowercased()
-        let path = components.path.lowercased()
-        if host.hasPrefix("login.") || host.hasPrefix("signin.") || host.hasPrefix("auth.") {
+        let host = components.host ?? ""
+        let path = components.path
+        if host.range(of: "login.", options: [.caseInsensitive, .anchored]) != nil
+            || host.range(of: "signin.", options: [.caseInsensitive, .anchored]) != nil
+            || host.range(of: "auth.", options: [.caseInsensitive, .anchored]) != nil {
             return true
         }
         let markers = ["/login", "/log-in", "/signin", "/sign-in", "/signup", "/sign-up", "/auth"]
-        return markers.contains { path == $0 || path.hasPrefix($0 + "/") || path.hasSuffix($0) }
+        return markers.contains {
+            $0.caseInsensitiveCompare(path) == .orderedSame
+                || path.range(of: $0 + "/", options: [.caseInsensitive, .anchored]) != nil
+                || path.range(of: $0, options: [.caseInsensitive, .anchored, .backwards]) != nil
+        }
     }
 }
 
