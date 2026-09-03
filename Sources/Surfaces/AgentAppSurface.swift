@@ -5418,8 +5418,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// never carries a false fallback warning.
     public var displayedModelListIsFallback: Bool {
         guard availableModelsAreFallback else { return false }
-        return modelOptionsForSelectedProvider.map(\.id)
-            == availableModels.filter { $0.provider == provider }.map(\.id)
+        let options = modelOptionsForSelectedProvider
+        var count = 0
+        for model in availableModels where model.provider == provider {
+            guard count < options.count, options[count].id == model.id else { return false }
+            count += 1
+        }
+        return count == options.count
     }
 
     public var supportedReasoningEffortsForSelectedModel: [AgentReasoningEffort] {
