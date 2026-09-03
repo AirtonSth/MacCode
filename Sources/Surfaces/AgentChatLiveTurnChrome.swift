@@ -204,17 +204,28 @@ public enum AgentChatLiveTurnChrome {
 
     /// Keep a live in-memory apply when SQLite replay is still catching up.
     public static func isRicher(_ lhs: AssistantTimelineState, than rhs: AssistantTimelineState) -> Bool {
-        let lhsFinished = lhs.turns.filter(\.finished).count
-        let rhsFinished = rhs.turns.filter(\.finished).count
+        // PERF: single pass instead of filter×2 + flatMap×2 (four timeline
+        // walks per replay compare on the live-stream path).
+        var lhsFinished = 0, rhsFinished = 0
+        var lhsItems = 0, rhsItems = 0
+        var lhsWeight = 0, rhsWeight = 0
+        for turn in lhs.turns {
+            if turn.finished { lhsFinished += 1 }
+            for item in turn.items {
+                lhsItems += 1
+                lhsWeight += item.body.utf8.count + (item.output?.utf8.count ?? 0)
+            }
+        }
+        for turn in rhs.turns {
+            if turn.finished { rhsFinished += 1 }
+            for item in turn.items {
+                rhsItems += 1
+                rhsWeight += item.body.utf8.count + (item.output?.utf8.count ?? 0)
+            }
+        }
         if rhsFinished > lhsFinished { return false }
-        let lhsItems = lhs.turns.flatMap(\.items)
-        let rhsItems = rhs.turns.flatMap(\.items)
-        if lhsItems.count != rhsItems.count { return lhsItems.count > rhsItems.count }
-        return liveTextWeight(lhsItems) > liveTextWeight(rhsItems)
-    }
-
-    private static func liveTextWeight(_ items: [AssistantItem]) -> Int {
-        items.reduce(0) { $0 + $1.body.utf8.count + ($1.output?.utf8.count ?? 0) }
+        if lhsItems != rhsItems { return lhsItems > rhsItems }
+        return lhsWeight > rhsWeight
     }
 
     public static func shouldRenderFinalMessage(

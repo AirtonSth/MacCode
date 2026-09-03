@@ -28,6 +28,7 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 - [x] Slice 16 (2026-09-03): `Sources/CoreModel/` + `DistillCore` remainder — reviewed per-call codecs/regexes (crushers/sanitizers already static). FIXED: `ComputerUseNativeHostBackend.stateToken` built SHA256 hex via 32× `String(format:)` per token (twice) — now nibble table; tokens identical
 - [x] Slice 17 (2026-09-03): browser-sync + agent-thread + terminal-budget paths — reviewed (nav dedupe, coalesced reloads, shared codecs). FIXED: `TerminalMemoryBudgetAuthority.enforceBudget` ran filter-then-min (two dictionary traversals + filtered intermediate per eviction) — now single-pass min; victim order identical
 - [x] Slice 18 (2026-09-03): AppShell Sidebar/palette second pass — reviewed (cached filters, busy caches, frecency paths). FIXED: `CommandPalette.sectioned` ran one `visible.filter` per category (N×C scans per keystroke) — now single-pass bucketing; section order/rows identical
+- [x] Slice 19 (2026-09-03): Surfaces composer/live-turn second pass — reviewed (dedup paths, chrome helpers). FIXED: `AgentChatLiveTurnChrome.isRicher` walked both timelines 4× (filter×2 + flatMap×2 + weight reduce) per replay compare on the live-stream path — now one pass per side; verdict identical
 
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
