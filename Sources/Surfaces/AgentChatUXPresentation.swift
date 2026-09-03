@@ -221,10 +221,21 @@ public struct AgentBackgroundHoldSummary: Sendable, Equatable {
 
     public var isEmpty: Bool { tasks.isEmpty }
 
+    // Single pass: agent/shell split together, no filter intermediate.
+    // nounLabel reads both counts, so the old pair scanned tasks twice.
+    private var counts: (agent: Int, shell: Int) {
+        var agent = 0
+        var shell = 0
+        for task in tasks {
+            if task.kind == .agent { agent += 1 } else { shell += 1 }
+        }
+        return (agent, shell)
+    }
+
     /// Unknown kinds use shell wording so older id-only snapshots still match
     /// the Claude CLI's `1 shell` status line.
-    public var shellCount: Int { tasks.filter { $0.kind != .agent }.count }
-    public var agentCount: Int { tasks.filter { $0.kind == .agent }.count }
+    public var shellCount: Int { counts.shell }
+    public var agentCount: Int { counts.agent }
 
     public var nounLabel: String {
         var parts: [String] = []
