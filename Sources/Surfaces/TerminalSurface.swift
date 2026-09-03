@@ -681,22 +681,26 @@ final class TerminalMemoryBudgetAuthority {
         purgeReleasedOwners()
         var attempted = Set<UUID>()
         while retainedBytesForTesting > maxRetainedBytes {
-            guard let candidate = entries
-                .filter({ token, entry in
-                    !attempted.contains(token) && entry.owner != nil
-                })
-                .min(by: { lhs, rhs in
-                    let lhsPriority = lhs.value.priority()
-                    let rhsPriority = rhs.value.priority()
-                    if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
-                    return lhs.value.lastTouched < rhs.value.lastTouched
-                }) else {
+            // PERF: single pass instead of filter-then-min (two dictionary
+            // traversals per eviction). Entries are few; the win is avoiding
+            // the filtered intermediate on every pressure loop iteration.
+            var candidate: (key: UUID, value: Entry)?
+            for (token, entry) in entries {
+                guard !attempted.contains(token), entry.owner != nil else { continue }
+                guard let best = candidate else { candidate = (token, entry); continue }
+                let p = entry.priority()
+                let bp = best.value.priority()
+                if p < bp || (p == bp && entry.lastTouched < best.value.lastTouched) {
+                    candidate = (token, entry)
+                }
+            }
+            guard let victim = candidate else {
                 return
             }
-            attempted.insert(candidate.key)
-            let before = max(0, candidate.value.retainedBytes())
-            candidate.value.reclaim()
-            let after = max(0, candidate.value.retainedBytes())
+            attempted.insert(victim.key)
+            let before = max(0, victim.value.retainedBytes())
+            victim.value.reclaim()
+            let after = max(0, victim.value.retainedBytes())
             if after < before {
                 attempted.removeAll(keepingCapacity: true)
             }
