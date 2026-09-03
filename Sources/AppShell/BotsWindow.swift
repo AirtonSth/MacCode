@@ -3739,10 +3739,10 @@ public final class BotsViewModel: ObservableObject {
             searched = scheduleTaskSource
         } else {
             searched = scheduleTaskSource.filter { item in
-                item.name.lowercased().contains(query)
-                    || item.botName.lowercased().contains(query)
-                    || item.prompt.lowercased().contains(query)
-                    || item.scheduleNote.lowercased().contains(query)
+                item.name.range(of: query, options: .caseInsensitive) != nil
+                    || item.botName.range(of: query, options: .caseInsensitive) != nil
+                    || item.prompt.range(of: query, options: .caseInsensitive) != nil
+                    || item.scheduleNote.range(of: query, options: .caseInsensitive) != nil
             }
         }
         // PERF: single pass derives counts + the status-filtered list
