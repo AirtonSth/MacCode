@@ -215,6 +215,165 @@ final class ConnectionLifecyclePhase0Tests: XCTestCase {
         XCTAssertEqual(registry.count, 0)
     }
 
+    func test_acceptedSocketRegistryCapsTailcatToReserveOrdinarySlots() throws {
+        // WHY: the shared 64-descriptor budget must still leave LAN room.
+        // Tailcat stops at 48 so at least 16 ordinary slots remain. The 8/6
+        // fixture is the same policy (reserve 2 of 8, as 16 of 64).
+        XCTAssertEqual(AcceptedSocketRegistry.defaultMaximumDescriptors, 64)
+        XCTAssertEqual(AcceptedSocketRegistry.defaultTailcatMaximumDescriptors, 48)
+        XCTAssertEqual(AcceptedSocketRegistry.defaultOrdinaryReserveDescriptors, 16)
+        XCTAssertEqual(
+            AcceptedSocketRegistry.defaultMaximumDescriptors
+                - AcceptedSocketRegistry.defaultOrdinaryReserveDescriptors,
+            AcceptedSocketRegistry.defaultTailcatMaximumDescriptors
+        )
+
+        var pairs: [[Int32]] = []
+        for _ in 0..<16 {
+            var descriptors: [Int32] = [0, 0]
+            XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)
+            pairs.append(descriptors)
+        }
+        defer {
+            for descriptors in pairs { Darwin.close(descriptors[1]) }
+        }
+
+        let registry = AcceptedSocketRegistry(
+            maximumDescriptors: 8,
+            tailcatMaximumDescriptors: 6
+        )
+        let generation = registry.activate()
+
+        for index in 0..<6 {
+            guard case .accepted = registry.register(
+                pairs[index][0],
+                generation: generation,
+                scope: .tailcat
+            ) else {
+                XCTFail("Tailcat must be admitted until its reserved cap")
+                return
+            }
+        }
+        XCTAssertEqual(registry.count, 6)
+
+        guard case let .atCapacity(tailcatActive, tailcatLimit, firstTailcatDiagnostic) = registry.register(
+            pairs[6][0],
+            generation: generation,
+            scope: .tailcat
+        ) else {
+            XCTFail("the first Tailcat beyond the Tailcat cap must be rejected while global room remains")
+            return
+        }
+        XCTAssertEqual(tailcatActive, 6)
+        XCTAssertEqual(tailcatLimit, 6)
+        XCTAssertTrue(firstTailcatDiagnostic)
+        XCTAssertEqual(registry.count, 6)
+        XCTAssertTrue(waitForPeerClosure(pairs[6][1], timeout: 0.25))
+
+        guard case let .atCapacity(_, _, repeatedTailcatDiagnostic) = registry.register(
+            pairs[7][0],
+            generation: generation,
+            scope: .tailcat
+        ) else {
+            XCTFail("a sustained Tailcat excess must remain rejected")
+            return
+        }
+        XCTAssertFalse(repeatedTailcatDiagnostic,
+                       "repeated Tailcat rejects must not flood diagnostics while still at the Tailcat cap")
+        XCTAssertTrue(waitForPeerClosure(pairs[7][1], timeout: 0.25))
+
+        XCTAssertFalse(
+            registry.register(pairs[8][0], scope: .tailcat),
+            "HTTPServer.registerTailcatConnection's Bool API must also deny at the Tailcat cap"
+        )
+        XCTAssertTrue(waitForPeerClosure(pairs[8][1], timeout: 0.25))
+        XCTAssertEqual(registry.count, 6)
+
+        guard case .accepted = registry.register(
+            pairs[9][0],
+            generation: generation,
+            scope: .ordinary
+        ) else {
+            XCTFail("ordinary/LAN must still be admitted after Tailcat is at its cap")
+            return
+        }
+        guard case .accepted = registry.register(
+            pairs[10][0],
+            generation: generation
+        ) else {
+            XCTFail("ordinary/LAN must fill the reserved remainder up to the global cap")
+            return
+        }
+        XCTAssertEqual(registry.count, 8)
+
+        guard case let .atCapacity(globalActive, globalLimit, firstGlobalDiagnostic) = registry.register(
+            pairs[11][0],
+            generation: generation
+        ) else {
+            XCTFail("the global cap must remain a hard stop for ordinary/LAN")
+            return
+        }
+        XCTAssertEqual(globalActive, 8)
+        XCTAssertEqual(globalLimit, 8)
+        XCTAssertTrue(
+            firstGlobalDiagnostic,
+            "Tailcat saturation must not suppress the first global-cap diagnostic"
+        )
+        XCTAssertTrue(waitForPeerClosure(pairs[11][1], timeout: 0.25))
+
+        XCTAssertFalse(registry.register(pairs[12][0], scope: .tailcat))
+        XCTAssertTrue(waitForPeerClosure(pairs[12][1], timeout: 0.25))
+        XCTAssertEqual(registry.count, 8)
+
+        XCTAssertTrue(registry.close(pairs[9][0]))
+        XCTAssertEqual(registry.count, 7)
+        guard case .accepted = registry.register(
+            pairs[13][0],
+            generation: generation,
+            scope: .ordinary
+        ) else {
+            XCTFail("releasing an ordinary slot below the global cap must admit the next LAN descriptor")
+            return
+        }
+        XCTAssertEqual(registry.count, 8)
+
+        XCTAssertTrue(registry.close(pairs[0][0]))
+        XCTAssertEqual(registry.count, 7)
+        guard case .accepted = registry.register(
+            pairs[14][0],
+            generation: generation,
+            scope: .tailcat
+        ) else {
+            XCTFail("releasing a Tailcat slot below the Tailcat cap must admit the next Tailcat descriptor")
+            return
+        }
+        XCTAssertEqual(registry.count, 8)
+
+        guard case let .atCapacity(_, _, rearmedTailcatDiagnostic) = registry.register(
+            pairs[15][0],
+            generation: generation,
+            scope: .tailcat
+        ) else {
+            XCTFail("refilling the Tailcat cap must reject the next Tailcat descriptor")
+            return
+        }
+        XCTAssertTrue(rearmedTailcatDiagnostic,
+                      "a new Tailcat saturation episode may publish one new diagnostic")
+        XCTAssertTrue(waitForPeerClosure(pairs[15][1], timeout: 0.25))
+        XCTAssertEqual(registry.count, 8)
+
+        registry.shutdownAll()
+        XCTAssertTrue(registry.close(pairs[1][0]))
+        XCTAssertTrue(registry.close(pairs[2][0]))
+        XCTAssertTrue(registry.close(pairs[3][0]))
+        XCTAssertTrue(registry.close(pairs[4][0]))
+        XCTAssertTrue(registry.close(pairs[5][0]))
+        XCTAssertTrue(registry.close(pairs[10][0]))
+        XCTAssertTrue(registry.close(pairs[13][0]))
+        XCTAssertTrue(registry.close(pairs[14][0]))
+        XCTAssertEqual(registry.count, 0)
+    }
+
     @MainActor
     func test_acceptedSocketLimitBoundsIdlePartialAndWebSocketClientsAndReleasesEveryDescriptor() throws {
         // WHY: the receive timeout bounded each handler's lifetime, but an
