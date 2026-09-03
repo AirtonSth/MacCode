@@ -143,6 +143,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 81 (2026-09-03): `Sources/AppShell/` BotsWindow desk-stop dedupe — reviewed. FIXED: `stopLiveRuns` built `toStop` via compactMap + concat + filter (3 traversals + 3 intermediates per stop) — now one pass folds send-work IDs then discovered IDs with reserved buffers; order (send first, first-occurrence dedupe) and verdicts identical (proof: 10/10 desk-stop tests pass; 1 full-suite P95 timing failure `test_peerHandoffMutation…P95` verified identical on clean baseline — pre-existing/environmental)
 
+- [x] Slice 82 (2026-09-03): `Sources/AppShell/` SidebarView batch-remove names — reviewed (filteredWorkspaces cache-first keystroke path, shift-range identity set, reorder/filter rules already single-pass). FIXED: `removeSelectedWorkspaces` built confirm-dialog `names` via filter + map (2 traversals + 1 intermediate per batch remove) — now one loop with reserved capacity; names identical (proof: 7/7 WorkspacePromptingSeamTests pass)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
