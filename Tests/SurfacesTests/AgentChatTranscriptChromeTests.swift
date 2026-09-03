@@ -48,6 +48,29 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
         )
     }
 
+    /// Nested SwiftUI ScrollView inside the transcript reads the parent's
+    /// Observable `ScrollEnvironmentStorage` (`isScrollViewTransformClippingEnabled`)
+    /// and SIGSEGVs when the outer storage is mid-update on macOS 26.
+    func test_transcriptImageStripDoesNotNestSwiftUIScrollView() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        let start = try XCTUnwrap(source.range(of: "private struct AgentTranscriptImageThumbStrip"))
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "// MARK: - ThreadMarkdownFormatter")?.lowerBound ?? rest.endIndex
+        let slice = String(rest[..<end])
+        XCTAssertTrue(slice.contains("AgentTranscriptImageThumb("))
+        XCTAssertFalse(
+            slice.contains("ScrollView("),
+            "image citations must not nest a SwiftUI ScrollView in the transcript"
+        )
+    }
+
     func test_statusCardIsFullWidthOnItsOwnLine_becauseRunHeadersAreNotBubbles() throws {
         // WHY: Supervised-run / work-log panels hugged content next to a
         // timestamp gutter. System cards must span the transcript column.

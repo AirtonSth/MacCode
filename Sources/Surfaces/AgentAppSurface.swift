@@ -11206,19 +11206,22 @@ private struct AgentTranscriptImageThumbStrip: View {
     var accessibilityPrefix: String = "agent.image.strip"
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(alignment: .top, spacing: DS.Space.sm) {
-                ForEach(Array(presentations.enumerated()), id: \.element.id) { index, presentation in
-                    AgentTranscriptImageThumb(
-                        url: presentation.resourceURL,
-                        displayName: presentation.displayName,
-                        style: .strip,
-                        accessibilityID: "\(accessibilityPrefix).\(index)"
-                    )
-                }
+        // Do not nest a SwiftUI ScrollView inside the transcript ScrollView.
+        // Inner ScrollView reads the parent's Observable
+        // `ScrollEnvironmentStorage.isScrollViewTransformClippingEnabled`
+        // and SIGSEGVs when the outer storage is mid-update (macOS 26).
+        HStack(alignment: .top, spacing: DS.Space.sm) {
+            ForEach(Array(presentations.enumerated()), id: \.element.id) { index, presentation in
+                AgentTranscriptImageThumb(
+                    url: presentation.resourceURL,
+                    displayName: presentation.displayName,
+                    style: .strip,
+                    accessibilityID: "\(accessibilityPrefix).\(index)"
+                )
             }
-            .padding(.vertical, 2)
         }
+        .padding(.vertical, 2)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(presentations.count) image preview\(presentations.count == 1 ? "" : "s")")
     }
