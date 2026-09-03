@@ -123,6 +123,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 71 (2026-09-03): `Sources/AppShell/` FilesSurface drag-payload combine — reviewed (SSH/terminal remainder sites left for their own slice). FIXED: `fileOutCombinedDragPayload` built a 2-element optional array then ran compactMap + filter (two traversals + two intermediates) per sidebar drag — now trims/appends each payload directly with reserveCapacity(2); combined payload identical (proof: 14/14 FilesDragOutTests)
 
+- [x] Slice 72 (2026-09-03): `Sources/AppShell/` SSH pane derived stats — reviewed (TerminalSurface remainder left for its own slice). FIXED: `SSHPaneDerived.init(entries:)` ran filter + filter + compactMap/reduce (three traversals + two intermediates) per local/remote listing refresh — now one classifying loop with reserved directory buffer; directory list, file count, byte total identical (proof: 176/176 SSH-filtered tests)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
