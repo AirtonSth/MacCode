@@ -141,6 +141,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 80 (2026-09-03): `Sources/Surfaces/` model-picker fallback compare — reviewed. FIXED: `displayedModelListIsFallback` built two mapped id arrays (3 traversals + 2 intermediates) per picker render — now compares element-wise with early exit; verdict identical (proof: 10/10 AgentAppModelPickerFixes tests)
 
+- [x] Slice 81 (2026-09-03): `Sources/AppShell/` BotsWindow desk-stop dedupe — reviewed. FIXED: `stopLiveRuns` built `toStop` via compactMap + concat + filter (3 traversals + 3 intermediates per stop) — now one pass folds send-work IDs then discovered IDs with reserved buffers; order (send first, first-occurrence dedupe) and verdicts identical (proof: 10/10 desk-stop tests pass; 1 full-suite P95 timing failure `test_peerHandoffMutation…P95` verified identical on clean baseline — pre-existing/environmental)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
