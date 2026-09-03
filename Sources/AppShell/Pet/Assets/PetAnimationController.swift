@@ -153,15 +153,23 @@ final class PetAnimationController {
         let frameMilliseconds = 1_000.0 / Double(row.fps)
         let cycleMilliseconds = frameMilliseconds * Double(row.frames)
         let maximumCycles = Int(ceil(Double(allowed.upperBound) / cycleMilliseconds)) + 1
-        let candidates = (1...maximumCycles).flatMap { cycle -> [Int64] in
+        // PERF: single pass avoids the per-cycle 2-element arrays plus the
+        // map + filter intermediates on the reaction-snap path.
+        var best: Int64?
+        var bestDistance = Int64.max
+        for cycle in 1...maximumCycles {
             let boundary = Double(cycle) * cycleMilliseconds
-            return [boundary - frameMilliseconds / 2, boundary + frameMilliseconds / 2]
-                .map { Int64($0.rounded()) }
-                .filter(allowed.contains)
+            for edge in [boundary - frameMilliseconds / 2, boundary + frameMilliseconds / 2] {
+                let candidate = Int64(edge.rounded())
+                guard allowed.contains(candidate) else { continue }
+                let distance = abs(candidate - requested)
+                if distance < bestDistance {
+                    bestDistance = distance
+                    best = candidate
+                }
+            }
         }
-        return candidates.min {
-            abs($0 - requested) < abs($1 - requested)
-        } ?? requested
+        return best ?? requested
     }
 
     private var shouldAnimate: Bool {
