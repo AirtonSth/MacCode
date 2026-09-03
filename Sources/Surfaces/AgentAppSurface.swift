@@ -10163,12 +10163,23 @@ public enum AgentComposerSuggestions {
         // `max(limit, commandCount)` cap starved skills to ZERO whenever commands
         // already filled `limit` (e.g. Claude's built-ins + `/mcp`), hiding every
         // project/user skill on a bare `/`; skills must always get room.
+        var commandNames: [String] = []
+        var skillNames: [String] = []
+        commandNames.reserveCapacity(candidates.count)
+        skillNames.reserveCapacity(candidates.count)
+        for candidate in candidates {
+            switch candidate.kind {
+            case .slashCommand: commandNames.append(candidate.bare)
+            case .skill: skillNames.append(candidate.bare)
+            default: break
+            }
+        }
         let commandBares = ranked(
-            candidates.filter { $0.kind == .slashCommand }.map(\.bare),
+            commandNames,
             query: query
         )
         let skillBares = ranked(
-            candidates.filter { $0.kind == .skill }.map(\.bare),
+            skillNames,
             query: query
         )
         var seenBareKind = Set<String>()
