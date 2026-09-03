@@ -2,6 +2,15 @@ import Foundation
 import CoreModel
 
 enum LibrarianHandlers {
+    // SEP-3: compile once — these transforms run per tool-output handler
+    // invocation and each rebuilt its NSRegularExpression per call.
+    private static let errorSitePattern = try! NSRegularExpression(pattern: #"([\w./-]+\.\w+):(\d+)"#)
+    private static let embeddedBlobPattern = try! NSRegularExpression(pattern: #"(data:[^;]+;base64,[A-Za-z0-9+/]{80,}={0,2})"#)
+    private static let secretRedactPattern = try! NSRegularExpression(pattern: #"(?i)((?:api[_-]?key|secret|password|token|bearer)\s*[:=]\s*)(\S+)"#)
+    private static let ansiEscapePattern = try! NSRegularExpression(pattern: #"\u001B\[[0-9;]*[A-Za-z]"#)
+    private static let hexAliasPattern = try! NSRegularExpression(pattern: #"\b[0-9a-fA-F]{32,}\b"#)
+    private static let svgPathPattern = try! NSRegularExpression(pattern: #"\s[dD]="[^"]{80,}""#)
+
     static func run(
         _ request: LibrarianRequest,
         function: LibrarianFunction,
@@ -387,7 +396,7 @@ enum LibrarianHandlers {
     }
 
     private static func errorSiteQuote(_ resolved: Resolved) -> LibrarianHandlerOutput {
-        let pattern = try! NSRegularExpression(pattern: #"([\w./-]+\.\w+):(\d+)"#)
+        let pattern = Self.errorSitePattern
         let ns = resolved.text as NSString
         var quotes: [String] = []
         for match in pattern.matches(in: resolved.text, range: NSRange(location: 0, length: ns.length)).prefix(8) {
@@ -424,7 +433,7 @@ enum LibrarianHandlers {
     }
 
     private static func embeddedBlobCrush(_ input: String, handle: String) -> String? {
-        let pattern = try! NSRegularExpression(pattern: #"(data:[^;]+;base64,[A-Za-z0-9+/]{80,}={0,2})"#)
+        let pattern = Self.embeddedBlobPattern
         let ns = input as NSString
         let range = NSRange(location: 0, length: ns.length)
         guard pattern.firstMatch(in: input, range: range) != nil else { return nil }
@@ -438,13 +447,13 @@ enum LibrarianHandlers {
     }
 
     private static func secretRedact(_ input: String) -> String {
-        let pattern = try! NSRegularExpression(pattern: #"(?i)((?:api[_-]?key|secret|password|token|bearer)\s*[:=]\s*)(\S+)"#)
+        let pattern = Self.secretRedactPattern
         let range = NSRange(input.startIndex..<input.endIndex, in: input)
         return pattern.stringByReplacingMatches(in: input, range: range, withTemplate: "$1***")
     }
 
     private static func stripANSI(_ input: String) -> String {
-        let pattern = try! NSRegularExpression(pattern: #"\u001B\[[0-9;]*[A-Za-z]"#)
+        let pattern = Self.ansiEscapePattern
         let range = NSRange(input.startIndex..<input.endIndex, in: input)
         return pattern.stringByReplacingMatches(in: input, range: range, withTemplate: "")
     }
@@ -456,7 +465,7 @@ enum LibrarianHandlers {
     }
 
     private static func aliasIdentifiers(_ input: String) -> String? {
-        let pattern = try! NSRegularExpression(pattern: #"\b[0-9a-fA-F]{32,}\b"#)
+        let pattern = Self.hexAliasPattern
         let ns = input as NSString
         let matches = pattern.matches(in: input, range: NSRange(location: 0, length: ns.length))
         guard !matches.isEmpty else { return nil }
@@ -474,7 +483,7 @@ enum LibrarianHandlers {
 
     private static func svgCrush(_ input: String) -> String? {
         guard input.contains("<svg") else { return nil }
-        let pattern = try! NSRegularExpression(pattern: #"\s[dD]="[^"]{80,}""#)
+        let pattern = Self.svgPathPattern
         let range = NSRange(input.startIndex..<input.endIndex, in: input)
         let text = pattern.stringByReplacingMatches(in: input, range: range, withTemplate: " d=\"…\"")
         return text.utf8.count < input.utf8.count ? text : nil
