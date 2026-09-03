@@ -4187,8 +4187,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 contentLimit: AssistantTimelineState.liveTextLimit
             )
             let rows = payload.page?.rows ?? []
-            let userIds = rows.filter { $0.role == .user }.map(\.id)
-            let assistantIds = rows.filter { $0.role == .assistant }.map(\.id)
+            // PERF: single pass instead of two filter+map traversals over the
+            // history page; id sets identical (roles are disjoint).
+            var userIds: [AgentMessageID] = []
+            var assistantIds: [AgentMessageID] = []
+            userIds.reserveCapacity(rows.count)
+            assistantIds.reserveCapacity(rows.count)
+            for row in rows {
+                if row.role == .user { userIds.append(row.id) }
+                else if row.role == .assistant { assistantIds.append(row.id) }
+            }
             if !userIds.isEmpty {
                 payload.userRCW1Requests = (try? repository.rcw1RequestTranslations(
                     threadId: threadId,
