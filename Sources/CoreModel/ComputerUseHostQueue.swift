@@ -402,10 +402,11 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
         }
 
         cleanupStaleTickets(in: directory)
+        // Single pass: count ticket- entries without a filter intermediate.
         let ticketCount = (try? FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: nil
-        ).filter { $0.lastPathComponent.hasPrefix("ticket-") }.count) ?? 0
+        ).reduce(0) { $0 + ($1.lastPathComponent.hasPrefix("ticket-") ? 1 : 0) }) ?? 0
         guard ticketCount < Self.maximumTicketsPerTarget else {
             throw ComputerUseHostQueueError.queueFull(targetPID)
         }
