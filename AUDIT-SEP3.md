@@ -173,6 +173,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 96 (2026-09-03): `Sources/Surfaces/` message-page mirror merge — reviewed (rail `knownLocalThreadIDs` Set+union+compactMap kept: small per-open snapshot merge; checkpoint diff `map+joined`, labels Set, rail target id Sets, FeedSurface title join are single-map joins, not folds). FIXED: `mergeLoadedMessagesWithInMemoryMirrors` built the loaded-id Set via map then filtered in-memory rows (two traversals + one intermediate) on the message-page load path — now folds the id set and same-thread mirrors in one pass with reserved capacity; merged rows identical (proof: `test_mergeLoadedMessagesPreservesInMemoryUserMirror` passes 1/1)
 
+- [x] Slice 97 (2026-09-03): `Sources/AppShell/` fleet preview prune — reviewed (TokenSaverDailyEconomy filter+map+reduce kept: Token Saver Week-total contract code, left untouched; BotsWindow dest/roster/live id Sets, ScheduledTasks weekday join, checkpoint patch join are single-map joins, not folds). FIXED: `reloadFleet` pruned `lastPreviewByBot` + `lastUpdatedByBot` with two filter traversals + two intermediates per fleet reload — now drops removed-bot entries from both maps in one pass over stale keys; previews identical (proof: 417/418 fleet-filtered tests pass; 1 P95 timing failure `test_peerHandoffMutation…P95` fails identically on clean baseline p95=51.4ms vs 50ms budget — pre-existing/environmental)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
