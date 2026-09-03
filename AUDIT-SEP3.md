@@ -215,6 +215,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 117 (2026-09-03): `Sources/DistillCore/` librarian span search (span-text only — verdicts, verdict order, and `[[rc:handle]]` recovery markers untouched; Token Saver ledger/savings unaffected) — reviewed (coordinator `observerRefs.compactMap.value.first` and bootstrap `helperExecutableNames.compactMap.first` are already-lazy/single-element lookups; FilesSurface drag-payload `compactMap.first` are small per-drop decodes). FIXED: `tokenSpan` + `parseAnswerSpan` fallback ran `parts.map(String.init).first(where:)` (materialised every token/line as String before the linear search, on the librarian span-resolution path) — now `.lazy.map` so String init + `source.contains` short-circuit at the first match; spans identical (proof: 28/28 LibrarianCatalogTests pass in production-base sandbox with patched file, 1 skipped)
 
+- [x] Slice 118 (2026-09-03): `Sources/AppShell/` fleet search (per-keystroke roster filter on the Bots screen; finished-roster/schedule filters use the same shape but are separate guarded renders, left for their own slices) — reviewed (Token Saver homogeneous-JSON verdict folds left untouched as contract code). FIXED: `fleet` lowercased all four bot text fields (`name`/`handle`/`title`/`description`) per bot per keystroke just for a case-insensitive contains (4 full-string copies per bot per keystroke) — now `range(of:options:.caseInsensitive)` scans in place with no copies; match sets identical (proof: 10/10 fleet/search/roster-filtered BotsWindowTests pass in production-base sandbox with patched file)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
