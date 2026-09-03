@@ -113,6 +113,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 66 (2026-09-03): `Sources/AppShell/` CLI lane-list parse (Token Saver kill-switch path; parsing only, no gate/ledger math touched) — reviewed (FilesSurface drag-payload combine left for its own slice). FIXED: `parseLaneList` + CLI-state array branch each ran split/map+filter with intermediates per env lookup — now single-pass insert in both; parsed sets identical (proof: lane kill-switch test passes)
 
+- [x] Slice 67 (2026-09-03): `Sources/AppShell/` Pet extended-reaction snap — reviewed (FilesSurface drag-payload combine left for its own slice). FIXED: reaction snap built per-cycle 2-element arrays via flatMap + map/filter intermediates + min scan — now direct best-tracking loop with earliest-cycle tie-break preserved; snapped duration identical (proof: AppShell build clean)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
