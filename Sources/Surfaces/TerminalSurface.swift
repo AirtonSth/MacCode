@@ -3209,11 +3209,13 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     }
 
     private static func visibleLineCount(_ text: String) -> Int {
-        text
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .count
+        var count = 0
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            if !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                count += 1
+            }
+        }
+        return count
     }
 
     public func focus() {
