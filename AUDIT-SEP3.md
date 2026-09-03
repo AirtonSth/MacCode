@@ -55,6 +55,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 37 (2026-09-03): Surfaces message-page remainder — reviewed (bounded projections, capped diffs, coalesced filters). FIXED: `loadMessagePageOffMain` ran two filter+map traversals over the history page for user/assistant ids — now single-pass bucketing; id sets identical
 
+- [x] Slice 38 (2026-09-03): AppShell router remainder — reviewed (shared codecs, canonical encoder, snapshot paths). FIXED: `scrubTokenSaverEnvironment` built PATH parts via split+map+filter with two intermediates — now single-pass keep; joined PATH identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
