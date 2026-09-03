@@ -108,15 +108,19 @@ public enum LibrarianProbe {
         var byRuntime: [String: Int] = [:]
         var generate = 0
         var nonGenerate = 0
+        // Count unique ids inline — no Set(rows.map) intermediate.
+        var seenIDs = Set<String>()
+        var uniqueIDs = 0
         for row in rows {
             byStatus[row.status, default: 0] += 1
             byRuntime[row.runtime, default: 0] += 1
             if row.generateCalled { generate += 1 } else { nonGenerate += 1 }
+            if seenIDs.insert(row.id).inserted { uniqueIDs += 1 }
         }
         let statusLine = byStatus.keys.sorted().map { "\($0)=\(byStatus[$0] ?? 0)" }.joined(separator: " ")
         let runtimeLine = byRuntime.keys.sorted().map { "\($0)=\(byRuntime[$0] ?? 0)" }.joined(separator: " ")
         return """
-        n=\(rows.count) unique=\(Set(rows.map(\.id)).count)
+        n=\(rows.count) unique=\(uniqueIDs)
         status \(statusLine)
         runtime \(runtimeLine)
         generate_called=\(generate) generate_not_called=\(nonGenerate)
