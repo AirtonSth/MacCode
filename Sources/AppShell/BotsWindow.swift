@@ -3596,7 +3596,7 @@ public final class BotsViewModel: ObservableObject {
         let query = activeBotsSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !query.isEmpty else { return finishedBotItems }
         return finishedBotItems.filter {
-            $0.title.lowercased().contains(query) || $0.detail.lowercased().contains(query)
+            $0.title.range(of: query, options: .caseInsensitive) != nil || $0.detail.range(of: query, options: .caseInsensitive) != nil
         }
     }
 
