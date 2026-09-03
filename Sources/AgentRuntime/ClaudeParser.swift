@@ -674,7 +674,7 @@ public final class ClaudeParser {
     private func authStatusEvents(from obj: [String: Any], now: Int64) -> [AssistantEvent] {
         let status = stringValue(obj["status"]) ?? stringValue(obj["state"]) ?? "updated"
         let message = stringValue(obj["message"]) ?? "Claude auth \(status)"
-        if boolValue(obj["authenticated"]) == false || status.lowercased().contains("fail") {
+        if boolValue(obj["authenticated"]) == false || status.range(of: "fail", options: .caseInsensitive) != nil {
             return [
                 .error(message: message, recoverable: true)
             ] + completedRuntimeItem(id: stringValue(obj["id"]) ?? "claude-auth-\(now)", type: .error, summary: "Claude auth", body: message, now: now)
