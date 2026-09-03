@@ -131,6 +131,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 75 (2026-09-03): `Sources/AppShell/` AppDelegate pet server-failure ID — reviewed (SettingsWindow + AgentRuntime/Persistence remainders left for later slices). FIXED: `petServerFailureID` copied the name via `lowercased()`, built a mapped `[Character]` array, then reduced char-by-char into the slug — now appends each mapped character once into a reserved buffer; notification row IDs identical (proof: 6/6 NotificationPetProjectionEventTests pass)
 
+- [x] Slice 76 (2026-09-03): `Sources/AgentRuntime/` Claude control-channel tool-name match — reviewed (Persistence multi-pass hits all contract-sensitive Token Saver/Graphify paths, left untouched). FIXED: `trackControlChannelMeta` copied the tool name twice via `replacingOccurrences` + a `lowercased()` copy per `can_use_tool` request — now lazy `_`/`-` filter in one pass before the single lowercase; ask-user routing identical (proof: 12/12 old-vs-new equivalence cases match + debug sandbox build clean; CLI-adapter suite failures verified pre-existing/environmental on clean baseline)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
