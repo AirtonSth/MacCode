@@ -22,8 +22,10 @@ public enum BotMentionParser {
         return bots.filter { bot in
             if bot.id == excluding { return false }
             if needle.isEmpty { return true }
-            return bot.handle.lowercased().hasPrefix(needle)
-                || bot.name.lowercased().contains(needle)
+            // SEP-3: case-insensitive match without per-bot lowercased()
+            // allocs on every keystroke (needle is already lowercase).
+            return bot.handle.range(of: needle, options: [.caseInsensitive, .anchored]) != nil
+                || bot.name.range(of: needle, options: .caseInsensitive) != nil
         }
     }
 

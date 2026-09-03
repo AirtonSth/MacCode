@@ -149,8 +149,36 @@ final class BotMentionParserTests: XCTestCase {
         XCTAssertFalse(BotPeerTranscript.isHostHopUserText(ask))
     }
 
-    func test_visibleCaptionsDistinguishMentionFromActualDelegation() {
-        XCTAssertEqual(BotPeerTranscript.toCaption(name: "Quinn"), "To Quinn")
+    func test_suggestions_matchCaseInsensitivelyWithoutAllocating() {
+        // WHY: suggestions() runs per keystroke; SEP-3 removed the per-bot
+        // lowercased() allocs. Matching semantics must stay identical,
+        // including mixed-case legacy handles and names.
+        let lower = BotDefinition(handle: "quinn", name: "Quinn", title: "", description: "")
+        let legacy = BotDefinition(handle: "Old_Handle", name: "CRM CONTROLLER", title: "", description: "")
+        let bots = [lower, legacy]
+        XCTAssertEqual(
+            BotMentionParser.suggestions(query: "QU", bots: bots, excluding: nil).map(\.id),
+            [lower.id],
+            "uppercase query must prefix-match lowercase handle"
+        )
+        XCTAssertEqual(
+            BotMentionParser.suggestions(query: "old_", bots: bots, excluding: nil).map(\.id),
+            [legacy.id],
+            "lowercase query must prefix-match mixed-case legacy handle"
+        )
+        XCTAssertEqual(
+            BotMentionParser.suggestions(query: "crm", bots: bots, excluding: nil).map(\.id),
+            [legacy.id],
+            "query must substring-match uppercase name"
+        )
+        XCTAssertEqual(
+            BotMentionParser.suggestions(query: "", bots: bots, excluding: lower.id).map(\.id),
+            [legacy.id],
+            "empty query keeps all except excluded"
+        )
+    }
+
+    func test_visibleCaptionsDistinguishMentionFromActualDelegation() {        XCTAssertEqual(BotPeerTranscript.toCaption(name: "Quinn"), "To Quinn")
         XCTAssertEqual(BotPeerTranscript.fromCaption(name: "Quinn"), "From Quinn")
         XCTAssertEqual(BotPeerTranscript.mentionedCaption(name: "Quinn"), "Mentions Quinn")
         XCTAssertEqual(BotPeerTranscript.mentionedCaption(for: BotDefinition(
