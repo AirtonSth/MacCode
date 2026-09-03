@@ -19,22 +19,34 @@ final class AcceptedSocketRegistry: @unchecked Sendable {
     }
 
     static let defaultMaximumDescriptors = 64
+    static let defaultOrdinaryReserveDescriptors = 16
+    static let defaultTailcatMaximumDescriptors = 48
 
     private let lock = NSLock()
     private var descriptors: [Int32: Entry] = [:]
     private var accepting = true
     private var generation: UInt64 = 1
     private var capacityDiagnosticArmed = true
+    private var tailcatCapacityDiagnosticArmed = true
+    private var tailcatCount = 0
     private let maximumDescriptors: Int
+    private let tailcatMaximumDescriptors: Int
     private let shutdownDescriptor: @Sendable (Int32) -> Void
 
     init(
         maximumDescriptors: Int = AcceptedSocketRegistry.defaultMaximumDescriptors,
+        tailcatMaximumDescriptors: Int? = nil,
         shutdownDescriptor: @escaping @Sendable (Int32) -> Void = {
             _ = Darwin.shutdown($0, SHUT_RDWR)
         }
     ) {
-        self.maximumDescriptors = max(1, maximumDescriptors)
+        let globalCap = max(1, maximumDescriptors)
+        self.maximumDescriptors = globalCap
+        let reservedTailcatCap = max(0, globalCap - Self.defaultOrdinaryReserveDescriptors)
+        self.tailcatMaximumDescriptors = min(
+            globalCap,
+            max(0, tailcatMaximumDescriptors ?? reservedTailcatCap)
+        )
         self.shutdownDescriptor = shutdownDescriptor
     }
 
@@ -49,6 +61,7 @@ final class AcceptedSocketRegistry: @unchecked Sendable {
         generation &+= 1
         accepting = true
         capacityDiagnosticArmed = true
+        tailcatCapacityDiagnosticArmed = true
         let activatedGeneration = generation
         lock.unlock()
         return activatedGeneration
@@ -92,8 +105,21 @@ final class AcceptedSocketRegistry: @unchecked Sendable {
                 limit: maximumDescriptors,
                 shouldPublishDiagnostic: shouldPublishDiagnostic
             )
+        } else if scope == .tailcat && tailcatCount >= tailcatMaximumDescriptors {
+            // Deny Tailcat before it can consume the ordinary/LAN reserve,
+            // even when the global descriptor budget still has room.
+            let shouldPublishDiagnostic = tailcatCapacityDiagnosticArmed
+            tailcatCapacityDiagnosticArmed = false
+            result = .atCapacity(
+                active: tailcatCount,
+                limit: tailcatMaximumDescriptors,
+                shouldPublishDiagnostic: shouldPublishDiagnostic
+            )
         } else {
             descriptors[descriptor] = Entry(generation: generation, scope: scope)
+            if scope == .tailcat {
+                tailcatCount += 1
+            }
             result = .accepted
         }
         lock.unlock()
@@ -121,9 +147,20 @@ final class AcceptedSocketRegistry: @unchecked Sendable {
     @discardableResult
     func closeWithoutClosing(_ descriptor: Int32) -> Bool {
         lock.lock()
-        let owned = descriptors.removeValue(forKey: descriptor) != nil
-        if owned, descriptors.count < maximumDescriptors {
-            capacityDiagnosticArmed = true
+        let owned: Bool
+        if let entry = descriptors.removeValue(forKey: descriptor) {
+            owned = true
+            if entry.scope == .tailcat {
+                tailcatCount -= 1
+            }
+            if descriptors.count < maximumDescriptors {
+                capacityDiagnosticArmed = true
+            }
+            if tailcatCount < tailcatMaximumDescriptors {
+                tailcatCapacityDiagnosticArmed = true
+            }
+        } else {
+            owned = false
         }
         lock.unlock()
         return owned
@@ -133,6 +170,7 @@ final class AcceptedSocketRegistry: @unchecked Sendable {
         lock.lock()
         accepting = false
         capacityDiagnosticArmed = true
+        tailcatCapacityDiagnosticArmed = true
         // Keep the registry lock through every shutdown. A handler's `close`
         // cannot release and recycle a numeric descriptor between this loop's
         // ownership snapshot and the syscall, so shutdown can never target an
