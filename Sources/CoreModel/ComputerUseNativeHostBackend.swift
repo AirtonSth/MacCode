@@ -327,6 +327,19 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         case geometry
     }
 
+    // PERF: nibble table instead of per-byte String(format:) — same lowercase hex.
+    private static let hexAlphabet: [UInt8] = Array("0123456789abcdef".utf8)
+
+    private static func hexDigest<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in digest {
+            out.append(Self.hexAlphabet[Int(byte >> 4)])
+            out.append(Self.hexAlphabet[Int(byte & 0x0f)])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
+    }
+
     private struct PixelScope: Equatable {
         let fullImageSize: [Int]
         let region: [Int]?
@@ -834,9 +847,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         let height = String(describing: window.bounds.size.height)
         let accessibility = String(accessibilityPermission)
         let screenCapture = String(screenCapturePermission)
-        let contentDigest = SHA256.hash(data: Data(content.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
+        let contentDigest = Self.hexDigest(SHA256.hash(data: Data(content.utf8)))
         if kind == .pixel {
             guard let pixelScope else { return "" }
             let bounds: [Double] = [
@@ -866,9 +877,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             originX, originY, width, height, accessibility, screenCapture,
             kind.rawValue, contentDigest,
         ].joined(separator: "|")
-        return SHA256.hash(data: Data(material.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
+        return Self.hexDigest(SHA256.hash(data: Data(material.utf8)))
     }
 
     private static func decodePixelToken(_ token: String) -> PixelTokenEnvelope? {
