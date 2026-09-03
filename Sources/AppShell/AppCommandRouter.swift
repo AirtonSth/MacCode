@@ -851,15 +851,29 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             SurfaceRegistry.shared.setVisibleSurfaceIDs([])
             return
         }
-        var workspaceIDs = Set(ctx.state.windows.compactMap(\.selectedWorkspaceID))
-        if let detached = windowController?.detachedVisibleWorkspaceIDsForSurfaceReconciliation() {
-            workspaceIDs.formUnion(detached)
-        }
+        let workspaceIDs = visibleWorkspaceIDs()
         let visibleIDs = workspaceIDs.reduce(into: Set<SurfaceID>()) { ids, workspaceID in
             guard let ws = ctx.state.workspaces[workspaceID] else { return }
             ids.formUnion(selectedSurfaceIDs(in: ws.layout))
         }
         SurfaceRegistry.shared.setVisibleSurfaceIDs(visibleIDs)
+    }
+
+    /// Workspace IDs with a selected workspace across windows plus detached
+    /// visible ones. Single pass with a reserved set; no compactMap intermediate.
+    private func visibleWorkspaceIDs() -> Set<WorkspaceID> {
+        guard let ctx = context else { return [] }
+        var workspaceIDs = Set<WorkspaceID>()
+        workspaceIDs.reserveCapacity(ctx.state.windows.count)
+        for window in ctx.state.windows {
+            if let selected = window.selectedWorkspaceID {
+                workspaceIDs.insert(selected)
+            }
+        }
+        if let detached = windowController?.detachedVisibleWorkspaceIDsForSurfaceReconciliation() {
+            workspaceIDs.formUnion(detached)
+        }
+        return workspaceIDs
     }
 
     private func selectedSurfaceIDs(in node: LayoutNode) -> Set<SurfaceID> {
@@ -2102,11 +2116,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func repairSelectedTerminalFocus(reason: String) {
-        guard let ctx = context else { return }
-        var workspaceIDs = Set(ctx.state.windows.compactMap(\.selectedWorkspaceID))
-        if let detached = windowController?.detachedVisibleWorkspaceIDsForSurfaceReconciliation() {
-            workspaceIDs.formUnion(detached)
-        }
+        guard context != nil else { return }
+        let workspaceIDs = visibleWorkspaceIDs()
         for workspaceID in workspaceIDs {
             repairSelectedTerminalFocus(workspace: workspaceID, reason: reason)
         }
