@@ -33,10 +33,13 @@ public struct TokenSaverHumanContextSeedPreparer: TokenSaverContextSeedPreparing
             target: target,
             counter: nil,
             project: { format, payload in
-                TokenSaverContextSeedBuilder.ProjectedEnvelope(
+                // Single uppercased header shared by both fields (rawValues are
+                // fixed lowercase, so one copy yields identical ABI text).
+                let header = format == .human ? "" : "\(format.rawValue.uppercased()) ABI"
+                return TokenSaverContextSeedBuilder.ProjectedEnvelope(
                     payload: payload,
-                    abi: format == .human ? "" : "\(format.rawValue.uppercased()) ABI",
-                    effectiveEnvelope: format == .human ? payload : "\(format.rawValue.uppercased()) ABI\n\(payload)"
+                    abi: header,
+                    effectiveEnvelope: format == .human ? payload : "\(header)\n\(payload)"
                 )
             }
         ) else {
