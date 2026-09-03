@@ -127,6 +127,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 73 (2026-09-03): `Sources/Surfaces/` TerminalSurface read-text decision — reviewed. FIXED: `visibleLineCount` ran split + map(trim) + filter (two intermediate arrays), invoked twice per `shouldPreferRendererSnapshotForReadText` call — now counts non-blank lines in one loop over the split; visible counts and snapshot preference identical (proof: 16/16 TerminalRendererDivergence + TerminalReadTextSnapshot tests)
 
+- [x] Slice 74 (2026-09-03): `Sources/AppShell/` AppCommandRouter pending callbacks — reviewed. FIXED: `listPendingCallbacks` built a 2-element optional array + compactMap + joined intermediates per stale approval callback — now appends the stale reason onto the existing detail directly; combined detail identical (proof: 12/12 directly-related callback tests pass; 1 unrelated `AgentAppViewModelTests.test_failedPendingCallbackResponsesBecomeStaleAndNonActionable` failure verified pre-existing on clean baseline)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
