@@ -25,6 +25,21 @@ final class MarkdownRenderTests: XCTestCase {
         XCTAssertTrue(html.contains("<a href=\"https://x.y\">foo</a>"))
     }
 
+    // SEP-3: "#hashtag" is a paragraph per CommonMark (space/tab/EOL required
+    // after the run). The preview used to paint it as <h1>, mangling tags,
+    // channels, and issue refs in READMEs.
+    @MainActor func test_hashtagWithoutSpace_isNotHeading() {
+        let html = MarkdownSurface.renderHTML(markdown: "#hashtag\n\n####### too many\n\n# ok")
+        XCTAssertFalse(html.contains("<h1>hashtag</h1>"),
+            "'#hashtag' must stay a paragraph, not a heading")
+        XCTAssertTrue(html.contains("<p>#hashtag</p>"),
+            "'#hashtag' must render as paragraph text")
+        XCTAssertFalse(html.contains("<h7") || html.contains("too many</h"),
+            "7+ hashes must stay a paragraph, not a heading")
+        XCTAssertTrue(html.contains("<h1>ok</h1>"),
+            "'# ok' with a space must still render as a heading")
+    }
+
     // UX-016 / L17 ordering fix: the scroll-offset must be stored BEFORE blanking.
     // This test pins the decoder used inside the completion handler; if the
     // type-switch is ever broken the offset silently stays 0, breaking restore.

@@ -211,9 +211,16 @@ public final class MarkdownSurface: NSObject, Surface, WKNavigationDelegate {
 
     private nonisolated static func headingLevel(_ line: String) -> Int? {
         var n = 0
-        for ch in line { if ch == "#" { n += 1 } else { break } }
-        if n >= 1 && n <= 6 { return n }
-        return nil
+        var idx = line.startIndex
+        while idx < line.endIndex, line[idx] == "#" {
+            n += 1
+            idx = line.index(after: idx)
+        }
+        // SEP-3: CommonMark requires a space/tab (or EOL) after the run —
+        // "#hashtag" and "####### x" are paragraphs, not headings.
+        guard (1...6).contains(n) else { return nil }
+        guard idx == line.endIndex || line[idx] == " " || line[idx] == "\t" else { return nil }
+        return n
     }
 
     private nonisolated static func escape(_ s: String) -> String {

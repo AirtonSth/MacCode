@@ -4,7 +4,8 @@ Goal: lighter, more fluid, zero errors across all Sources areas.
 One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refactor, swift-concurrency (local clones under ~/Swift-Agent-Skills/local).
 
 ## Coverage
-- [x] Slice 1 (2026-09-03): `Sources/AppShell/CommandPalette*.swift`, `PaletteFrecency.swift`, `ClosedTabRingBuffer.swift` — FIXED: per-open frecency snapshot (commit pending)
+- [x] Slice 1 (2026-09-03): `Sources/AppShell/CommandPalette*.swift`, `PaletteFrecency.swift`, `ClosedTabRingBuffer.swift` — FIXED: per-open frecency snapshot (e9d2642f)
+- [x] Slice 2 (2026-09-03): `Sources/Surfaces/` render paths — reviewed AgentChatTimelineChrome (fresh prod SIGSEGV rework, untouched), BrowserSurface (cached UA, KVO gates, bounded Google-refresh, untouched), AgentChatLiveTurnChrome (memoized, untouched), AgentChatUXPresentation (paint windows/NSCache, untouched), FeedSurface (ingest gate/precomputed keys, untouched). FIXED: MarkdownSurface.headingLevel painted `#hashtag` as `<h1>` — now requires space/tab/EOL (commit pending)
 - [ ] `Sources/Surfaces/` (AgentAppSurface, transcript/timeline chrome, markdown cache, terminal, browser)
 - [ ] `Sources/AppShell/` rest (windows, controllers, pet, sidebar, pane tabs)
 - [ ] `Sources/Persistence/` (repos, SQLite, snapshot, attachments)
