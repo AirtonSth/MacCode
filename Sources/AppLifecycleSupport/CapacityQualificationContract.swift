@@ -197,6 +197,10 @@ public struct CapacityQualificationManifest: Sendable, Codable, Equatable {
     }()
     private static let sharedDecoder = JSONDecoder()
     private static let codecLock = NSLock()
+    /// All required metric keys as a set (allCases.map built per validate call).
+    private static let requiredMetricNames: Set<String> = Set(
+        CapacityRequiredMetricKey.allCases.map(\.rawValue)
+    )
     private static func decodeManifest(from data: Data) throws -> CapacityQualificationManifest {
         Self.codecLock.lock()
         defer { Self.codecLock.unlock() }
@@ -315,10 +319,11 @@ public struct CapacityQualificationManifest: Sendable, Codable, Equatable {
         }
         _ = maxTokens
         _ = maxSpend
-        let required = Set(CapacityRequiredMetricKey.allCases.map(\.rawValue))
+        // PERF: validate() ran allCases.map twice per manifest validation
+        // (Set build + required check). Share one static set; membership identical.
         let declared = Set(requiredMetrics)
-        if !required.isSubset(of: declared) {
-            let missing = required.subtracting(declared).sorted().joined(separator: ",")
+        if !Self.requiredMetricNames.isSubset(of: declared) {
+            let missing = Self.requiredMetricNames.subtracting(declared).sorted().joined(separator: ",")
             throw CapacityContractError.missingRequiredField("requiredMetrics:\(missing)")
         }
         for tier in hardwareTier where tier.physicallyExecuted {
