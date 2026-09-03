@@ -280,9 +280,22 @@ public enum AgentChatLiveTurnChrome {
     }
 
     public static func toolGroupSummary(_ items: [AssistantItem]) -> String {
-        let streamingCount = items.reduce(0) { $0 + ($1.state == .streaming ? 1 : 0) }
-        let failedCount = items.reduce(0) { $0 + ($1.state == .failed ? 1 : 0) }
-        let key = "\(items.count)|\(streamingCount)|\(failedCount)|" + items.map(\.id).joined(separator: ",")
+        // Single pass feeds the memo key plus the noun/verb classification
+        // below; counts, key, and verdicts identical to the reduce/map scans.
+        var streamingCount = 0
+        var failedCount = 0
+        var ids: [String] = []
+        ids.reserveCapacity(items.count)
+        var types = Set<AssistantItemType>()
+        var verbs = Set<String>()
+        for item in items {
+            if item.state == .streaming { streamingCount += 1 }
+            if item.state == .failed { failedCount += 1 }
+            ids.append(item.id)
+            types.insert(item.type)
+            verbs.insert(AgentTimelineItemPresentation.make(for: item).verb)
+        }
+        let key = "\(items.count)|\(streamingCount)|\(failedCount)|" + ids.joined(separator: ",")
         toolGroupSummaryLock.lock()
         if let cached = toolGroupSummaryMemo[key] {
             toolGroupSummaryLock.unlock()
@@ -291,7 +304,7 @@ public enum AgentChatLiveTurnChrome {
         toolGroupSummaryLock.unlock()
         let noun: String = {
             let plural = items.count != 1
-            switch Set(items.map(\.type)) {
+            switch types {
             case [.fileChange]: return plural ? "files" : "file"
             case [.webSearch]: return plural ? "searches" : "search"
             case [.imageView]: return plural ? "images" : "image"
@@ -305,7 +318,6 @@ public enum AgentChatLiveTurnChrome {
         } else if streamingCount > 0 {
             value = "Running \(items.count) \(noun)…"
         } else {
-            let verbs = Set(items.map { AgentTimelineItemPresentation.make(for: $0).verb })
             let verb = verbs.count == 1 ? (verbs.first ?? "Ran") : "Ran"
             value = "\(verb) \(items.count) \(noun)"
         }
