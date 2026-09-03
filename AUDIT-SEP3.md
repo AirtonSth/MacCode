@@ -75,6 +75,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 47 (2026-09-03): `Sources/CoreModel/` live-timeline trim path — reviewed (turn/item caps, sort-anchor retention, translation pruning). FIXED: `trimTurnItems` copied the 5k-item tail twice (dropFirst + suffix) plus a fresh rebuilt array per over-budget append — now in-place subrange drop; anchor/newest/pruning identical
 
+- [x] Slice 48 (2026-09-03): `Sources/AgentRuntime/` CLI-adapter prune paths — reviewed (readable-event window, session eviction, rollback retention). FIXED: `pruneReadableEvents` rebuilt the whole readable window via `Array(suffix:)` on every appended event — now in-place prefix drop; retained newest identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
