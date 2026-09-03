@@ -1427,10 +1427,11 @@ final class GrokACPProtocolTests: XCTestCase {
 
     /// WHY: ACP and CLI must send only values advertised by the effective
     /// account-default model (Grok 4.6), never stale shared-picker aliases.
-    /// Grok 4.6 advertises `minimal` (grok-build SELECTABLE_REASONING_EFFORTS).
+    /// Live grok 1.0.13 grok-4.6 ads omit `minimal`; static fallback matches.
     func test_wireReasoningEffortNormalizesForDefaultGrok46() {
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.ultracode), "xhigh")
-        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.minimal), "minimal")
+        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.minimal), "low",
+                       "Grok 4.6 live catalog omits minimal; remap to low")
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.low), "low")
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.medium), "medium")
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.high), "high")
@@ -1438,6 +1439,34 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.max), "xhigh")
         // grok-4.5 still remaps minimal → low (catalog omits minimal).
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.minimal, modelId: "grok-4.5"), "low")
+    }
+
+    /// WHY: Live grok-4.6 lists efforts as xhigh→…→low with default:true on high.
+    /// Schedulers use `.first`; preserving agent order would seed Extra High.
+    func test_modelDescriptorsPrefersDefaultAndStableOrder() {
+        let models = GrokACPClient.modelDescriptors(from: [
+            "availableModels": [[
+                "modelId": "grok-4.6",
+                "name": "Grok 4.6",
+                "_meta": [
+                    "supportsReasoningEffort": true,
+                    "reasoningEffort": "xhigh",
+                    "reasoningEfforts": [
+                        ["id": "xhigh", "value": "xhigh", "default": false],
+                        ["id": "high", "value": "high", "default": true],
+                        ["id": "medium", "value": "medium", "default": false],
+                        ["id": "low", "value": "low", "default": false],
+                    ],
+                ],
+            ] as [String: Any]],
+        ])
+        let model = try! XCTUnwrap(models.first)
+        XCTAssertEqual(model.supportedReasoningEfforts.first, .high)
+        XCTAssertEqual(model.supportedReasoningEfforts, [.high, .low, .medium, .xhigh])
+        XCTAssertEqual(
+            GrokACPClient.seededReasoningEffort(models: models, currentModelId: "grok-4.6"),
+            .high
+        )
     }
 
     /// WHY: Image #1 Agent App Grok send died at start with

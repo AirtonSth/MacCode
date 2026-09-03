@@ -1188,15 +1188,55 @@ public final class GrokACPClient: @unchecked Sendable {
             guard let id = raw["modelId"] as? String, !id.isEmpty else { return nil }
             let metadata = raw["_meta"] as? JSONObject ?? [:]
             let efforts = metadata["reasoningEfforts"] as? [JSONObject] ?? []
-            let supported = efforts.compactMap { ($0["value"] as? String).flatMap(AgentReasoningEffort.init(rawValue:)) }
+            let parsed = parseReasoningEffortCatalog(
+                entries: efforts,
+                currentRaw: metadata["reasoningEffort"] as? String
+            )
             return AgentModelDescriptor(
                 id: id,
                 label: raw["name"] as? String ?? id,
                 provider: .grok,
-                supportsReasoning: metadata["supportsReasoningEffort"] as? Bool ?? !supported.isEmpty,
-                supportedReasoningEfforts: supported,
+                supportsReasoning: metadata["supportsReasoningEffort"] as? Bool ?? !parsed.ordered.isEmpty,
+                supportedReasoningEfforts: parsed.ordered,
                 supportsCustomModel: false
             )
         }
+    }
+
+    /// Stable effort order with preferred default first so `.first` consumers
+    /// (schedulers, drafts) match the agent-advertised default rather than
+    /// the raw ACP array order (live grok-4.6 lists `xhigh` first).
+    static func parseReasoningEffortCatalog(
+        entries: [JSONObject],
+        currentRaw: String?
+    ) -> (ordered: [AgentReasoningEffort], preferred: AgentReasoningEffort?) {
+        var seen: [AgentReasoningEffort] = []
+        var flaggedDefault: AgentReasoningEffort?
+        for entry in entries {
+            let raw = ((entry["value"] as? String) ?? (entry["id"] as? String))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard let effort = AgentReasoningEffort(rawValue: raw) else { continue }
+            if !seen.contains(effort) { seen.append(effort) }
+            if flaggedDefault == nil, (entry["default"] as? Bool) == true {
+                flaggedDefault = effort
+            }
+        }
+        let current = currentRaw.flatMap { AgentReasoningEffort(rawValue: $0) }
+        let preferred = flaggedDefault
+            ?? (current.flatMap { seen.contains($0) ? $0 : nil })
+            ?? (seen.contains(.high) ? .high : seen.first)
+        guard let preferred else { return ([], nil) }
+        let rest = AgentReasoningEffort.allCases.filter { seen.contains($0) && $0 != preferred }
+        return ([preferred] + rest, preferred)
+    }
+
+    /// Seed session effort from the opened model catalog (current / default).
+    static func seededReasoningEffort(
+        models: [AgentModelDescriptor],
+        currentModelId: String?
+    ) -> AgentReasoningEffort? {
+        let trimmed = currentModelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let match = models.first { $0.id == trimmed } ?? models.first
+        return match?.supportedReasoningEfforts.first
     }
 }
