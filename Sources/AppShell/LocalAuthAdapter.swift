@@ -307,8 +307,21 @@ public final class LocalAuthAdapter: DirectAuthProvider {
 
     public func createPairingCode() -> String? {
         guard let p = try? repo.createPairingCode() else { return nil }
-        auditLoud(actor: "system", action: "pairing.create", detail: p.code)
+        // SEC-001: audit_log.detail is rendered in Settings and the code stays
+        // valid for ten minutes — persist result + opaque id, never the code
+        // or the bearer redeem will mint.
+        auditLoud(actor: "system", action: "pairing.create", detail: Self.pairingCreateAuditDetail())
         return p.code
+    }
+
+    /// `pairing.create` detail: result + random UUID, never the six-digit code.
+    /// Skip UUIDs with a six-digit run so detail cannot substring-match a code.
+    nonisolated static func pairingCreateAuditDetail() -> String {
+        var correlationId = UUID().uuidString
+        while correlationId.range(of: #"\d{6}"#, options: .regularExpression) != nil {
+            correlationId = UUID().uuidString
+        }
+        return "created corr=\(correlationId)"
     }
 
     public func redeemPairingCode(_ code: String, deviceName: String) -> (deviceId: String, token: String)? {
