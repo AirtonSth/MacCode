@@ -1104,8 +1104,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     static func petServerFailureID(server: String) -> String {
-        let stableServer = server.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" }
-            .reduce(into: "") { $0.append($1) }
+        var stableServer = ""
+        stableServer.reserveCapacity(server.count)
+        for scalar in server.lowercased() {
+            stableServer.append(scalar.isLetter || scalar.isNumber ? scalar : "-")
+        }
         return "pet.server-failure.\(stableServer)"
     }
 
