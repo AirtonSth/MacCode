@@ -2314,7 +2314,9 @@ public final class SidebarViewModel: ObservableObject {
     public func removeSelectedWorkspaces() {
         let ids = selectedWorkspaceIDs
         guard !ids.isEmpty else { return }
-        let names = workspaces.filter { ids.contains($0.id) }.map(\.name)
+        var names: [String] = []
+        names.reserveCapacity(ids.count)
+        for ws in workspaces where ids.contains(ws.id) { names.append(ws.name) }
         // :95 -- Route through workspacePrompter so tests can drive the decision.
         // The AppKitWorkspacePrompter default preserves the :15 sheet/runModal fallback.
         guard let prompter = workspacePrompter else { return }
