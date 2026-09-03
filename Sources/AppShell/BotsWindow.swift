@@ -11624,7 +11624,11 @@ public struct BotsRootView: View {
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.warning)
                 .fixedSize(horizontal: false, vertical: true)
-            let skills = receipt.layers.filter { $0.kind == .skill && $0.included }.map(\.text)
+            let skills = receipt.layers.reduce(into: [String]()) { partial, layer in
+                if layer.kind == .skill && layer.included {
+                    partial.append(layer.text)
+                }
+            }
             Text(skills.isEmpty ? "No enabled skills." : "Skills: \(skills.joined(separator: ", "))")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
