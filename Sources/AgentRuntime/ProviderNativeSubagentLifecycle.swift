@@ -22,9 +22,12 @@ struct ProviderNativeSubagentUpdate: Equatable {
 /// Converts provider-owned child lifecycle notifications into the same
 /// content-free identity/status contract used by nested provider CLI receipts.
 enum ProviderNativeSubagentLifecycle {
-    private static let codexCollaborationTools = Set([
-        "spawnagent", "wait", "sendinput", "closeagent",
-    ])
+    private static func isCodexCollaborationTool(_ summary: String) -> Bool {
+        summary.caseInsensitiveCompare("spawnagent") == .orderedSame
+            || summary.caseInsensitiveCompare("wait") == .orderedSame
+            || summary.caseInsensitiveCompare("sendinput") == .orderedSame
+            || summary.caseInsensitiveCompare("closeagent") == .orderedSame
+    }
 
     /// Cheap event-shape guard for the coordinator's event hot path. It avoids
     /// repository reads for ordinary text/tool/token events while leaving exact
@@ -35,7 +38,7 @@ enum ProviderNativeSubagentLifecycle {
             return runtimeEvent.provider == .grok && isGrokSubagentMethod(runtimeEvent.method)
         case .itemDelta(_, _, let outputAppend, let summary):
             guard outputAppend != nil, let summary else { return false }
-            return codexCollaborationTools.contains(summary.lowercased())
+            return isCodexCollaborationTool(summary)
         default:
             return false
         }
@@ -52,7 +55,7 @@ enum ProviderNativeSubagentLifecycle {
             guard parentProvider == .codex,
                   let outputAppend,
                   let summary,
-                  codexCollaborationTools.contains(summary.lowercased()) else {
+                  isCodexCollaborationTool(summary) else {
                 return []
             }
             return codexUpdates(from: outputAppend)
