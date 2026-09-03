@@ -189,6 +189,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 104 (2026-09-03): `Sources/CoreModel/` host-queue admission — reviewed (Token Saver image-audit count, best-of-three eligible map, `AgentTypes` probe trim+filter are small per-decision parses, left untouched; AppLifecycleSupport/DesignSystemKit map+sorted hits are one-shot/static snapshots). FIXED: `createTicket` counted queue tickets via directory-listing `filter` + `.count` (one traversal + one intermediate per ticket creation) — now a counting reduce over the listing; quota verdict identical (proof: 9/9 ComputerUseHostQueueTests)
 
+- [x] Slice 105 (2026-09-03): `Sources/AgentRuntime/` Graphify resume re-kick (collection-only change — Graphify env/injection/gating untouched, Token Saver contract intact) — reviewed (fork-reconcile sorted id lists are small error-path snapshots; helper-locator compactMap+first and observer compactMap+first are lazy single-element lookups; run-error pid join and live-wave join are single-map joins). FIXED: `resumeAfterDisable` ran the dirty-marking loop plus a separate `map`+`filter` over `schedules.values` for re-kick roots (two traversals + one intermediate per resume; first two attempts hit `let roots` redeclaration build errors, corrected by assigning the outer `let`) — now collects non-empty roots inside the dirty pass; kick set identical (proof: 21/21 GraphifyWorkspaceServiceTests)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
