@@ -891,8 +891,14 @@ public final class AttachmentUploadV2Store: @unchecked Sendable {
     }
 
     private func chunkFileURL(in jobDir: URL, index: Int) -> URL {
-        chunksDirectory(in: jobDir)
-            .appendingPathComponent(String(format: "%05d.raw", index), isDirectory: false)
+        // PERF: String(format:) re-parsed "%05d" on every chunk store/verify/
+        // assemble; manual zero-pad emits identical names.
+        let digits = String(index)
+        let padded = digits.count >= 5
+            ? digits
+            : String(repeating: "0", count: 5 - digits.count) + digits
+        return chunksDirectory(in: jobDir)
+            .appendingPathComponent(padded + ".raw", isDirectory: false)
     }
 
     private func manifestURL(in jobDir: URL) -> URL {
