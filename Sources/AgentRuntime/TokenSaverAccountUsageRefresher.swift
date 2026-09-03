@@ -511,6 +511,9 @@ public enum AssistantAccountUsageParser {
         return nil
     }
 
+    // PERF: product-name slugify recompiled `[^a-z0-9]` on every product row.
+    private static let productSlugRegex = try! NSRegularExpression(pattern: "[^a-z0-9]")
+
     /// Grok's Usage UI labels the weekly bar "Grok Build". Prefer that product
     /// row when the live credits payload includes `productUsage`.
     private static func grokBuildProductPercent(from config: [String: Any]) -> Double? {
@@ -518,9 +521,8 @@ public enum AssistantAccountUsageParser {
             ?? config["product_usage"] as? [[String: Any]]
             ?? []
         for row in rows {
-            let name = (string(row["product"]) ?? string(row["name"]) ?? "")
-                .lowercased()
-                .replacingOccurrences(of: "[^a-z0-9]", with: "", options: .regularExpression)
+            let raw = (string(row["product"]) ?? string(row["name"]) ?? "").lowercased()
+            let name = replaceAll(productSlugRegex, in: raw, with: "")
             guard name == "grokbuild" || name == "grokcli" else { continue }
             return double(row["usagePercent"]) ?? double(row["usage_percent"])
         }

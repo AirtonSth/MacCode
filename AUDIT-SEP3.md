@@ -24,6 +24,7 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 - [x] Slice 12 (2026-09-03): `Sources/Persistence/` second pass — reviewed per-call codecs (most already shared/locked). FIXED: `BotRemoteControlAuthority.runAsUserObject` allocated a fresh `JSONEncoder` per call on bot routing/authoring paths — now shared static under a short lock (JSONEncoder not thread-safe); wire JSON unchanged
 - [x] Slice 13 (2026-09-03): `Sources/Surfaces/` terminal snapshot path + `SocketServer` remainder — reviewed (codecs per-connection by design, transcript chrome formatters shared, merge paths O(N)). FIXED: `ANSIRenderer.buildSnapshot`/`buildANSISnapshot` materialised the 10k-row scrollback ring via `scrollback + grid` on every uncached repaint — now index the ring in place; output identical
 - [x] Slice 14 (2026-09-03): `Sources/AppShell/` big-file second pass — reviewed per-call codecs/formatters (router/delegate/context mostly shared). FIXED: `JSONEncoder.tailcatCanonical` computed-var allocated + configured an encoder per call (hash, allowlist, keychain save) — now a shared static; bytes unchanged
+- [x] Slice 15 (2026-09-03): `Sources/AgentRuntime/` provider remainder — reviewed per-call codecs/regexes (orchestration/coordinator/transcript already shared). FIXED: `TokenSaverAccountUsageRefresher.grokBuildProductPercent` recompiled `[^a-z0-9]` regex per product row — now a shared static; slug identical
 
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
