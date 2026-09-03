@@ -85,6 +85,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 52 (2026-09-03): `Sources/AgentRuntime/` git line-parse paths — reviewed (`branches` list, `remoteNames`; DistillCore crusher splits excluded by Token Saver contract). FIXED: `branches` + `remoteNames` each ran split+map+filter (three traversals + two intermediates per git listing) — now one shared `nonEmptyLines` single-pass helper; listings identical
 
+- [x] Slice 53 (2026-09-03): `Sources/AppLifecycleSupport/` capacity-contract validate path — reviewed (required-metric set already static; variance/mismatch guards intact). FIXED: physical-tier claim set ran filter+map+Set (three traversals + two intermediates per validate) — now one pass inserts executed tier names with reserved capacity; mismatch verdicts identical
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
