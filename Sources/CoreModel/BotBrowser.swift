@@ -88,7 +88,9 @@ public struct BotBrowserLoginPredicate: Equatable, Sendable {
     }
 
     public func hasAuthCookie(_ page: BotBrowserPageState) -> Bool {
-        page.cookies.keys.contains { Self.sufficientCookieNames.contains($0.lowercased()) }
+        page.cookies.keys.contains { key in
+            Self.sufficientCookieNames.contains { $0.caseInsensitiveCompare(key) == .orderedSame }
+        }
     }
 
     public func leftLoginPage(openedURL: String, currentURL: String) -> Bool {
