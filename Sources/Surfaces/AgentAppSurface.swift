@@ -8383,7 +8383,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private func recordPromptHistory(_ text: String) {
         guard !text.isEmpty else { return }
         promptHistory.append(text)
-        promptHistory = Array(promptHistory.suffix(PromptHistoryStore.limit))
+        // PERF: trim only when over budget instead of rebuilding the 200-entry
+        // array via Array(suffix:) on every sent prompt.
+        if promptHistory.count > PromptHistoryStore.limit {
+            promptHistory.removeFirst(promptHistory.count - PromptHistoryStore.limit)
+        }
         promptHistoryStore?.save(promptHistory, workspaceID: workspaceID)
         // NOTE: call promptHistoryStore?.search(workspaceID:query:limit:) from a
         // search field in the composer to surface filtered history to the user.
