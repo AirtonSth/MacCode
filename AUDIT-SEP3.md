@@ -219,6 +219,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 119 (2026-09-03): `Sources/AppShell/` active-bot search (Active Bots screen per-keystroke filter; same `lowercased().contains` shape as Slice 118's `fleet`, incl. the optional `preview` field) — reviewed (`filteredFinishedBotItems` keeps its 2-field shape for its own slice; schedule-task filter keeps its 4-field shape for its own slice). FIXED: `filterActiveBotSearch` lowercased `title`/`handle`/`detail`/`preview` per row per keystroke (up to 4 full-string copies per row) — now `range(of:options:.caseInsensitive)` in place; match sets identical (proof: 10/10 active/finished/search-filtered BotsWindowTests pass in production-base sandbox with patched file)
 
+- [x] Slice 120 (2026-09-03): `Sources/AppShell/` finished-bot filter (Finished screen 2-field search; last of the BotsWindow `lowercased().contains(query)` trio after Slices 118–119; schedule-task filter deferred to its own slice) — reviewed (query itself stays lowercased once per call — single small copy, not per-row). FIXED: `filteredFinishedBotItems` lowercased `title`/`detail` per row per keystroke (2 full-string copies per row) — now `range(of:options:.caseInsensitive)` in place; match sets identical (proof: 10/10 finished/active/search-filtered BotsWindowTests pass in production-base sandbox with patched file)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
