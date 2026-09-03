@@ -133,6 +133,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 76 (2026-09-03): `Sources/AgentRuntime/` Claude control-channel tool-name match — reviewed (Persistence multi-pass hits all contract-sensitive Token Saver/Graphify paths, left untouched). FIXED: `trackControlChannelMeta` copied the tool name twice via `replacingOccurrences` + a `lowercased()` copy per `can_use_tool` request — now lazy `_`/`-` filter in one pass before the single lowercase; ask-user routing identical (proof: 12/12 old-vs-new equivalence cases match + debug sandbox build clean; CLI-adapter suite failures verified pre-existing/environmental on clean baseline)
 
+- [x] Slice 77 (2026-09-03): `Sources/AppShell/` SettingsWindow account initials — reviewed (Persistence hits all Token Saver contract code, left untouched). FIXED: `accountInitials` ran split + filter + prefix + uppercased (three intermediates) on every account-row render — now takes the local part up to `@` and collects the first two letters in one loop with a single uppercase; initials identical (proof: 15/15 old-vs-new equivalence cases incl. `@`-leading + Unicode edges match, 11/11 settings-filtered tests pass)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
