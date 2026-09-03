@@ -6480,8 +6480,12 @@ public final class BotsViewModel: ObservableObject {
             var previews: [BotID: String] = lastPreviewByBot
             var updated: [BotID: Date] = lastUpdatedByBot
             let live = Set(bots.map(\.id))
-            previews = previews.filter { live.contains($0.key) }
-            updated = updated.filter { live.contains($0.key) }
+            // Single pass: drop preview/update entries for removed bots
+            // together, no second dictionary traversal.
+            for key in previews.keys where !live.contains(key) {
+                previews.removeValue(forKey: key)
+                updated.removeValue(forKey: key)
+            }
             for bot in bots {
                 if let last = messagesByBot[bot.id]?.last, !last.text.isEmpty {
                     previews[bot.id] = last.text
