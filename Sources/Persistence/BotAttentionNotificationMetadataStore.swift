@@ -42,6 +42,10 @@ public struct BotAttentionNotificationMetadata: Codable, Equatable, Sendable {
 public final class BotAttentionNotificationMetadataStore: @unchecked Sendable {
     private static let key = "bot.attention.notification_metadata"
     private static let lock = NSLock()
+    // SEP-3: reuse one codec pair instead of allocating per call
+    // (codecs are not thread-safe; all use already holds Self.lock).
+    private static let decoder = JSONDecoder()
+    private static let encoder = JSONEncoder()
     private let repo: SettingsRepository
 
     public init(db: SQLiteDB) {
@@ -53,7 +57,7 @@ public final class BotAttentionNotificationMetadataStore: @unchecked Sendable {
         defer { Self.lock.unlock() }
         var values = loadUnlocked()
         values[metadata.notificationID] = metadata
-        let data = try JSONEncoder().encode(values)
+        let data = try Self.encoder.encode(values)
         guard let json = String(data: data, encoding: .utf8) else { return }
         try repo.set(Self.key, json)
     }
@@ -73,7 +77,7 @@ public final class BotAttentionNotificationMetadataStore: @unchecked Sendable {
     private func loadUnlocked() -> [String: BotAttentionNotificationMetadata] {
         guard let json = try? repo.get(Self.key),
               let data = json.data(using: .utf8),
-              let values = try? JSONDecoder().decode(
+              let values = try? Self.decoder.decode(
                   [String: BotAttentionNotificationMetadata].self,
                   from: data
               ) else {

@@ -19,6 +19,10 @@ public struct BotAttentionPushBinding: Codable, Equatable, Sendable {
 public final class BotAttentionPushBindingStore: @unchecked Sendable {
     private static let key = "bot.attention.push_bindings"
     private static let lock = NSLock()
+    // SEP-3: reuse one codec pair instead of allocating per call
+    // (codecs are not thread-safe; all use already holds Self.lock).
+    private static let decoder = JSONDecoder()
+    private static let encoder = JSONEncoder()
     private let repo: SettingsRepository
 
     public init(db: SQLiteDB) {
@@ -34,7 +38,7 @@ public final class BotAttentionPushBindingStore: @unchecked Sendable {
         defer { Self.lock.unlock() }
         var values = loadUnlocked().filter { !($0.hostID == hostID && $0.deviceID == deviceID) }
         values.append(BotAttentionPushBinding(profileID: profileID, hostID: hostID, deviceID: deviceID))
-        let data = try JSONEncoder().encode(values)
+        let data = try Self.encoder.encode(values)
         guard let json = String(data: data, encoding: .utf8) else { return }
         try repo.set(Self.key, json)
     }
@@ -56,7 +60,7 @@ public final class BotAttentionPushBindingStore: @unchecked Sendable {
     private func loadUnlocked() -> [BotAttentionPushBinding] {
         guard let json = try? repo.get(Self.key),
               let data = json.data(using: .utf8),
-              let values = try? JSONDecoder().decode([BotAttentionPushBinding].self, from: data) else {
+              let values = try? Self.decoder.decode([BotAttentionPushBinding].self, from: data) else {
             return []
         }
         return values

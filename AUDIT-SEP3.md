@@ -5,7 +5,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 ## Coverage
 - [x] Slice 1 (2026-09-03): `Sources/AppShell/CommandPalette*.swift`, `PaletteFrecency.swift`, `ClosedTabRingBuffer.swift` — FIXED: per-open frecency snapshot (e9d2642f)
-- [x] Slice 2 (2026-09-03): `Sources/Surfaces/` render paths — reviewed AgentChatTimelineChrome (fresh prod SIGSEGV rework, untouched), BrowserSurface (cached UA, KVO gates, bounded Google-refresh, untouched), AgentChatLiveTurnChrome (memoized, untouched), AgentChatUXPresentation (paint windows/NSCache, untouched), FeedSurface (ingest gate/precomputed keys, untouched). FIXED: MarkdownSurface.headingLevel painted `#hashtag` as `<h1>` — now requires space/tab/EOL (commit pending)
+- [x] Slice 2 (2026-09-03): `Sources/Surfaces/` render paths — reviewed AgentChatTimelineChrome (fresh prod SIGSEGV rework, untouched), BrowserSurface (cached UA, KVO gates, bounded Google-refresh, untouched), AgentChatLiveTurnChrome (memoized, untouched), AgentChatUXPresentation (paint windows/NSCache, untouched), FeedSurface (ingest gate/precomputed keys, untouched). FIXED: MarkdownSurface.headingLevel painted `#hashtag` as `<h1>` — now requires space/tab/EOL (3c7da16b)
+- [x] Slice 3 (2026-09-03): `Sources/Persistence/` — reviewed Repositories (one-shot lists, writer-side occupancy, gateway off MainActor), list gateways, PromptHistory/Settings/TokenSaver codecs (shared, untouched). FIXED: BotAttentionPushBindingStore + BotAttentionNotificationMetadataStore allocated JSONEncoder/Decoder per call — now shared static pairs under existing lock (commit pending)
 - [ ] `Sources/Surfaces/` (AgentAppSurface, transcript/timeline chrome, markdown cache, terminal, browser)
 - [ ] `Sources/AppShell/` rest (windows, controllers, pet, sidebar, pane tabs)
 - [ ] `Sources/Persistence/` (repos, SQLite, snapshot, attachments)
