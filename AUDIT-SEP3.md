@@ -211,6 +211,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 115 (2026-09-03): `Sources/SocketServer/` chunk-transfer expiry sweep (browser snapshot-chunk path; byte accounting and eviction order preserved) — reviewed (insert-path oldest-drop `min(by:)` is a single already-in-place scan; `pending.values.map(sequence)` + `nilKeyQueue.map(sequence)` are failure-path concatenations, not folds). FIXED: `evictExpiredLocked` ran `transfers.values.filter` (full scan + temp array) then `removeLocked` per expired record (second key lookup + byte adjust each) on every insert/fetch — now drops expired entries inline in the single sweep, adjusting `totalCachedBytes` directly; evicted sets and byte totals identical (proof: 17/17 SnapshotChunkTransferTests pass in production-base sandbox with patched file)
 
+- [x] Slice 116 (2026-09-03): `Sources/SocketServer/` bearer-token split (auth header parse on the HTTP request path) — reviewed (header-line `split(separator: "\r\n")` + request-line `split(separator: " ")` stay untouched: bounded small parses with count/index guards, not a take-last fold). FIXED: `bearerToken` split the whole `Authorization` value on every space just to take `.last` (full scan + N substrings per request) — now `maxSplits: 1` splits at most once and takes the tail; tokens identical (`"Bearer <tok>"` → `<tok>`, single-token values pass through as before) (proof: 7/7 HybridHTTPWebSocketContractTests pass in production-base sandbox with patched file, incl. missing/invalid-bearer rejection)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
