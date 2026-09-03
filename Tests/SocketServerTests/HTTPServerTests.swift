@@ -1679,6 +1679,51 @@ final class HTTPServerTests: XCTestCase {
     }
 
     @MainActor
+    func test_authenticatedCapabilities_acceptsRepeatedAuthorizationSpaces_extractsExactToken() throws {
+        // WHY: Authorization: Bearer followed by one or more spaces then
+        // good-token was accepted before the maxSplits:1 scan. Extra spaces
+        // must not become part of the token — StubAuth verifies the exact
+        // string "good-token", so 200 proves extraction, 401 would mean the
+        // leftover spaces were kept.
+        let port = UInt16.random(in: 33000...44000)
+        let auth = StubAuth()
+        let s = DirectHTTPServer(
+            port: port,
+            loopbackOnly: true,
+            dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+            auth: auth,
+            serverId: "auth-spaces-server",
+            bootEpoch: 1
+        )
+        try s.start()
+        defer { s.stop() }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        let fd = try connectLocalhost(port: port)
+        defer { Darwin.close(fd) }
+        let request = """
+        GET /v1/capabilities/authenticated HTTP/1.1\r
+        Host: 127.0.0.1:\(port)\r
+        Authorization: Bearer  good-token\r
+        Connection: close\r
+        \r
+
+        """
+        try writeAll(fd: fd, data: Data(request.utf8))
+        let response = try readFullHTTPResponse(fd: fd, timeout: 4)
+
+        XCTAssertTrue(
+            response.hasPrefix("HTTP/1.1 200"),
+            "Bearer followed by repeated spaces must extract exactly good-token, not a leading-space token"
+        )
+        XCTAssertEqual(
+            auth.verificationCount,
+            1,
+            "the repeated-space bearer must be verified once against the exact token"
+        )
+    }
+
+    @MainActor
     func test_systemCapabilitiesUsesSameInjectedAttachmentCapability() async {
         // WHY: marker-absent iOS hosts use authenticated system.capabilities as
         // the attachment authority. It must receive the same store-dependent

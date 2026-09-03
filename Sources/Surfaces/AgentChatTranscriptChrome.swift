@@ -177,19 +177,30 @@ public enum AgentChatTranscriptChrome {
             || ext == "webp" || ext == "svg" || ext == "avif"
     }
 
-    /// Lowercase file extension without allocating (last `.` after the last `/`).
+    /// Lowercase file extension matching NSString.pathExtension: last `.` after
+    /// the last `/`, except a leading-dot basename (`.png`, `foo/.png`) has none.
     private static func pathExtension(of path: String) -> Substring {
         let utf8 = path.utf8
-        var dot: String.UTF8View.Index?
+        var componentStart = utf8.startIndex
+        var lastDot: String.UTF8View.Index?
         var i = utf8.startIndex
         while i != utf8.endIndex {
             let byte = utf8[i]
-            if byte == 0x2F { dot = nil } // '/' resets: dots in directories don't count
-            else if byte == 0x2E { dot = i } // last '.' wins
+            if byte == 0x2F {
+                let next = utf8.index(after: i)
+                componentStart = next
+                lastDot = nil
+            } else if byte == 0x2E {
+                lastDot = i
+            }
             i = utf8.index(after: i)
         }
-        guard let dot, utf8.index(after: dot) != utf8.endIndex else { return "" }
-        return path[utf8.index(after: dot)...].lowercased()[...]
+        guard let lastDot,
+              lastDot != componentStart,
+              utf8.index(after: lastDot) != utf8.endIndex else {
+            return ""
+        }
+        return path[utf8.index(after: lastDot)...].lowercased()[...]
     }
 
     public static func relativeTimestamp(_ date: Date, now: Date = Date()) -> String {

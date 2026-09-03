@@ -179,3 +179,32 @@ final class FileExtensionIconTests: XCTestCase {
             ".svg vector graphics must use paintpalette to differ from raster photos")
     }
 }
+
+final class AppCommandRouterFileTypeLabelTests: XCTestCase {
+    func test_fileTypeLabel_preservesNSStringPathExtensionForLeadingDotBasenames() {
+        // WHY: local/SSH listings used NSString.pathExtension. A leading-dot
+        // basename (`.png`, `foo/.png`) has no extension and must stay "File",
+        // not "PNG File". photo.PNG and ordinary multi-dot names keep the
+        // prior case-insensitive last-extension label.
+        XCTAssertEqual(
+            AppCommandRouter.fileTypeLabel(for: ".png"),
+            "File",
+            ".png is a leading-dot basename with no extension"
+        )
+        XCTAssertEqual(
+            AppCommandRouter.fileTypeLabel(for: "foo/.png"),
+            "File",
+            "foo/.png is a leading-dot basename with no extension"
+        )
+        XCTAssertEqual(
+            AppCommandRouter.fileTypeLabel(for: "photo.PNG"),
+            "PNG File",
+            "photo.PNG must keep case-insensitive PNG File labeling"
+        )
+        XCTAssertEqual(
+            AppCommandRouter.fileTypeLabel(for: "archive.tar.gz"),
+            "GZ File",
+            "ordinary multi-dot names must still use the last extension"
+        )
+    }
+}

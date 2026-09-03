@@ -8698,17 +8698,34 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func fileType(for name: String) -> String {
+        Self.fileTypeLabel(for: name)
+    }
+
+    /// Listing label matching NSString.pathExtension: a leading-dot basename
+    /// (`.png`, `foo/.png`) has no extension and is "File", not "PNG File".
+    nonisolated static func fileTypeLabel(for name: String) -> String {
         // PERF: file listings call this per row; NSString.pathExtension +
         // uppercased() allocated twice per file. Scan the suffix directly.
         let utf8 = name.utf8
-        var dot: String.UTF8View.Index?
+        var componentStart = utf8.startIndex
+        var lastDot: String.UTF8View.Index?
         var i = utf8.startIndex
         while i != utf8.endIndex {
-            if utf8[i] == 0x2F { dot = nil } else if utf8[i] == 0x2E { dot = i }
+            if utf8[i] == 0x2F {
+                let next = utf8.index(after: i)
+                componentStart = next
+                lastDot = nil
+            } else if utf8[i] == 0x2E {
+                lastDot = i
+            }
             i = utf8.index(after: i)
         }
-        guard let dot, utf8.index(after: dot) != utf8.endIndex else { return "File" }
-        return "\(name[utf8.index(after: dot)...].uppercased()) File"
+        guard let lastDot,
+              lastDot != componentStart,
+              utf8.index(after: lastDot) != utf8.endIndex else {
+            return "File"
+        }
+        return "\(name[utf8.index(after: lastDot)...].uppercased()) File"
     }
 
     private static let shortDateFormatter: DateFormatter = {
