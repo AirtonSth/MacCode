@@ -1,67 +1,22 @@
 {
-  "generatedBy": "codex-cli 0.150.1 app-server generate-json-schema --experimental",
+  "generatedBy": "codex-cli 0.152.1 app-server generate-json-schema --experimental",
   "sourceFile": "ServerRequest.json",
-  "sourceSHA256": "5f0d59338bd620480c52e112a1b3edc3f24f2dc74172b3f4e166732c867e1fc1",
+  "sourceSHA256": "38bb1c9dbb1dda2a688a7c8712b04319fe6ee2ed28b54acd2f5fd341d25567ff",
   "oneOf": [
     {
       "properties": {
         "method": {
           "enum": [
-            "item/commandExecution/requestApproval"
-          ]
-        }
-      }
-    },
-    {
-      "properties": {
-        "method": {
-          "enum": [
-            "item/fileChange/requestApproval"
-          ]
-        }
-      }
-    },
-    {
-      "properties": {
-        "method": {
-          "enum": [
-            "item/tool/requestUserInput"
-          ]
-        }
-      }
-    },
-    {
-      "properties": {
-        "method": {
-          "enum": [
-            "mcpServer/elicitation/request"
-          ]
-        }
-      }
-    },
-    {
-      "properties": {
-        "method": {
-          "enum": [
-            "item/permissions/requestApproval"
-          ]
-        }
-      }
-    },
-    {
-      "properties": {
-        "method": {
-          "enum": [
-            "item/tool/call"
-          ]
-        }
-      }
-    },
-    {
-      "properties": {
-        "method": {
-          "enum": [
             "account/chatgptAuthTokens/refresh"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "applyPatchApproval"
           ]
         }
       }
@@ -88,7 +43,7 @@
       "properties": {
         "method": {
           "enum": [
-            "applyPatchApproval"
+            "execCommandApproval"
           ]
         }
       }
@@ -97,7 +52,52 @@
       "properties": {
         "method": {
           "enum": [
-            "execCommandApproval"
+            "item/commandExecution/requestApproval"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "item/fileChange/requestApproval"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "item/permissions/requestApproval"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "item/tool/call"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "item/tool/requestUserInput"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "mcpServer/elicitation/request"
           ]
         }
       }
