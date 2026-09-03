@@ -644,8 +644,17 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     /// Returns true iff `s` uses the https scheme. Used by the security
     /// indicator (UX-MAC_BROWSER-133). Pure: no I/O, no side effects.
     /// Marked `nonisolated` so tests invoke it without a MainActor context.
+    /// PERF: indicator refreshes on every nav chrome sync; lowercased() copied
+    /// the whole URL per check. Prefix-scan is allocation-free; verdict identical.
     nonisolated static func isSecureURL(_ s: String) -> Bool {
-        s.lowercased().hasPrefix("https://")
+        // "https://" is 8 ASCII bytes; fold case per byte without copying.
+        let bytes = Array(s.utf8.prefix(8))
+        guard bytes.count == 8 else { return false }
+        let want: [UInt8] = [0x68, 0x74, 0x74, 0x70, 0x73, 0x3A, 0x2F, 0x2F] // https://
+        for (b, w) in zip(bytes, want) {
+            if b | 0x20 != w { return false }
+        }
+        return true
     }
 
     /// Updates the lock/insecure glyph beside the address bar to reflect the
