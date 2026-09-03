@@ -93,6 +93,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 56 (2026-09-03): `Sources/AppShell/` provider-admission governor — reviewed (reservation expiry, resident-root pruning, appeared-PID pairing). FIXED: `decide` built `currentRootPIDs` via compactMap+filter+Set (three traversals + two intermediates per admission decision) — now one pass inserts positive pgids with reserved capacity; admission verdicts identical
 
+- [x] Slice 57 (2026-09-03): `Sources/AppShell/` pane close-others seam — reviewed (single `closeSurfaces` batch, sibling before/after helpers already single-map). FIXED: `surfaceIDs(excluding:in:)` ran map+filter (two traversals + one ID intermediate per close-others) — now one pass collects surviving IDs with reserved capacity; closed set identical. (Also probed: rail `runningThreadIds` O(T×R) scan — reverted, needs broader redesign, not a one-line fold; `test_saveLatestProposedPlanWritesMarkdownFile` crash reproduces on clean tree, pre-existing.)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
