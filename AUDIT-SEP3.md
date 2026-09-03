@@ -209,6 +209,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 114 (2026-09-03): `Sources/AppShell/` acceptance-target newest pick (push-token routing to iOS Live Activity — browser-parity-adjacent fallback chain order preserved exactly) — reviewed (masker `map(turnIndex).max` remains library-only/off-path, left untouched as before). FIXED: `acceptanceTargets` ran `preferred.map(\.updatedAt).max()` then `last(where:)` (two traversals + one temp timestamp array on the stale-ownership fallback after Mac relaunch) — now one loop tracks the max timestamp keeping the LAST record at the max, preserving the upsert-order tie-break; picks identical (proof: 50/50 LiveActivitySyncCoordinatorTests pass in production-base sandbox with patched file)
 
+- [x] Slice 115 (2026-09-03): `Sources/SocketServer/` chunk-transfer expiry sweep (browser snapshot-chunk path; byte accounting and eviction order preserved) — reviewed (insert-path oldest-drop `min(by:)` is a single already-in-place scan; `pending.values.map(sequence)` + `nilKeyQueue.map(sequence)` are failure-path concatenations, not folds). FIXED: `evictExpiredLocked` ran `transfers.values.filter` (full scan + temp array) then `removeLocked` per expired record (second key lookup + byte adjust each) on every insert/fetch — now drops expired entries inline in the single sweep, adjusting `totalCachedBytes` directly; evicted sets and byte totals identical (proof: 17/17 SnapshotChunkTransferTests pass in production-base sandbox with patched file)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
