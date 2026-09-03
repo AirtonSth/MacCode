@@ -2900,8 +2900,16 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return left == right
     }
 
+    private static let runAsUserEncoder = JSONEncoder()
+    private static let runAsUserCodecLock = NSLock()
+
     private static func runAsUserObject(_ user: AgentRunAsUser) -> Any {
-        guard let data = try? JSONEncoder().encode(user),
+        // PERF: share one encoder under a short lock (JSONEncoder is not
+        // thread-safe) instead of allocating per call.
+        Self.runAsUserCodecLock.lock()
+        let data = try? Self.runAsUserEncoder.encode(user)
+        Self.runAsUserCodecLock.unlock()
+        guard let data,
               let object = try? JSONSerialization.jsonObject(with: data) else {
             return [String: Any]()
         }
