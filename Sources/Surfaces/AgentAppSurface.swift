@@ -2399,6 +2399,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     // MARK: Off-main thread open bundle (perf AA-02/AA-03/AA-04)
 
+    /// Shared decoder for the off-main bundle path (see gatherThreadOpenBundle).
+    private static let bundleCallbackDecodeLock = NSLock()
+    private static let bundleCallbackDecoder = JSONDecoder()
+
     /// Everything a full thread open needs from SQLite + JSON decode + replay
     /// CPU, gathered in one detached pass. The open path used to run 8-10
     /// synchronous SQLite reads on the MainActor between click and first paint
@@ -2445,23 +2449,31 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             if let pendingCallbackRepo {
                 // Mirror of rehydratePendingCallbacks' decode, off-main.
+                // SEP-3: share one decoder under a lock instead of allocating
+                // per thread open (JSONDecoder is not thread-safe; this runs
+                // in Task.detached, unlike the MainActor rehydrate path).
                 let callbacks = (try? pendingCallbackRepo.listVisible(threadId: threadId)) ?? []
                 var events: [AssistantEvent] = []
-                let decoder = JSONDecoder()
                 for callback in callbacks {
                     guard let data = callback.payloadJSON.data(using: .utf8) else { continue }
                     switch callback.kind {
                     case .approval:
-                        guard var request = try? decoder.decode(
+                        Self.bundleCallbackDecodeLock.lock()
+                        let request = try? Self.bundleCallbackDecoder.decode(
                             AssistantPendingRequest.self, from: data
-                        ) else { continue }
+                        )
+                        Self.bundleCallbackDecodeLock.unlock()
+                        guard var request else { continue }
                         request.state = callback.state
                         request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
                         events.append(.requestOpened(request))
                     case .userInput:
-                        guard var request = try? decoder.decode(
+                        Self.bundleCallbackDecodeLock.lock()
+                        let userRequest = try? Self.bundleCallbackDecoder.decode(
                             AssistantUserInputRequest.self, from: data
-                        ) else { continue }
+                        )
+                        Self.bundleCallbackDecodeLock.unlock()
+                        guard var request = userRequest else { continue }
                         request.state = callback.state
                         request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
                         events.append(.userInputRequested(request))
