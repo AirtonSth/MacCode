@@ -191,6 +191,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 105 (2026-09-03): `Sources/AgentRuntime/` Graphify resume re-kick (collection-only change — Graphify env/injection/gating untouched, Token Saver contract intact) — reviewed (fork-reconcile sorted id lists are small error-path snapshots; helper-locator compactMap+first and observer compactMap+first are lazy single-element lookups; run-error pid join and live-wave join are single-map joins). FIXED: `resumeAfterDisable` ran the dirty-marking loop plus a separate `map`+`filter` over `schedules.values` for re-kick roots (two traversals + one intermediate per resume; first two attempts hit `let roots` redeclaration build errors, corrected by assigning the outer `let`) — now collects non-empty roots inside the dirty pass; kick set identical (proof: 21/21 GraphifyWorkspaceServiceTests)
 
+- [x] Slice 106 (2026-09-03): `Sources/DistillCore/` Librarian probe summary (summary-text only — no crushing math, gates, ledger, or savings touched) — reviewed (CCR/ranker tokenize splits, `NLIFaithfulnessGate` claim split, near-duplicate block split, search-line splits are small per-query/per-gate parses; TOON/contract joins are single-map joins; `FaithfulnessGate` sorted+first is a smallest-word pick over a short salient list). FIXED: `LibrarianProbe.summary` built `Set(rows.map(\.id))` just to count unique ids after the tally loop (one traversal + two intermediates per summary) — now counts unique ids inline during the tally loop; summary text identical (proof: 28/28 LibrarianCatalogTests, 1 skipped)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
