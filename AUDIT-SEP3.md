@@ -151,6 +151,8 @@ One bounded fix per fire. Skills: swiftui-performance-audit, swiftui-view-refact
 
 - [x] Slice 85 (2026-09-03): `Sources/Surfaces/` StagingHelper path args — reviewed (`AgentAppSurface.refreshTokenSaverOptimizationStateFromTimeline` + `AgentRunCoordinator.captureCanonicalContextSnapshot` are Token Saver contract code, left untouched; AppCommandRouter env-keys filter+sort is a small per-instance snapshot, not a fold target). FIXED: `StagingHelper.pathArgs` copied the full changed-file list into a `Set` then filtered `selected` through it (O(all) set build + filter intermediate per validation) — now walks `all` once collecting selected members with reserved capacity, sorts in place, short-circuits empty inputs to nil; arg list identical (proof: 8/8 StagingHelperTests pass)
 
+- [x] Slice 86 (2026-09-03): `Sources/AppShell/` FilesSurface entry mapping — reviewed. FIXED: `mapEntries` decoded entries via `compactMap` then attached file-m/tab + move drag payloads in a second `map` (2 traversals + 1 intermediate per directory load and lazy subtree fetch) — now decodes and attaches payloads in one loop with reserved capacity; rows identical (proof: 21/21 FilesDragOutTests + FilesRecycleTests pass)
+
 ## Invariants (every slice)
 - Token Saver counting/display contract untouched.
 - Browser parity (macOS <-> iOS host-state sync) intact.
