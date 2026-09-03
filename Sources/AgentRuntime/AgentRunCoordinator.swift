@@ -8854,14 +8854,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         private var items: [StreamWriteItem] = []
         /// Running total so flush decisions do not re-reduce utf8 lengths each tick.
         private(set) var encodedByteCount: Int = 0
+        /// Running max so seq allocation skips the per-call map+max scan.
+        private(set) var highestSeq: Int = 0
 
         var isEmpty: Bool { items.isEmpty }
         var count: Int { items.count }
-        var highestSeq: Int { items.map(\.seq).max() ?? 0 }
 
         mutating func append(_ item: StreamWriteItem) {
             items.append(item)
             encodedByteCount += item.encodedByteCount
+            if item.seq > highestSeq { highestSeq = item.seq }
         }
 
         func snapshot() -> [StreamWriteItem] {
@@ -8884,7 +8886,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 encodedByteCount -= item.encodedByteCount
             }
             items.removeFirst(committed.count)
-            if items.isEmpty { encodedByteCount = 0 }
+            if items.isEmpty {
+                encodedByteCount = 0
+                highestSeq = 0
+            }
             return true
         }
 
@@ -8892,6 +8897,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             let snapshot = items
             items.removeAll(keepingCapacity: true)
             encodedByteCount = 0
+            highestSeq = 0
             return snapshot
         }
     }
