@@ -230,11 +230,14 @@ final class URLSessionTailcatCatalogAPI: TailcatCatalogAPI, @unchecked Sendable 
 }
 
 private extension JSONEncoder {
-    static var tailcatCanonical: JSONEncoder {
+    // PERF: computed var allocated + configured an encoder per call (hash,
+    // allowlist check, keychain save). Share one; outputFormatting is
+    // immutable post-init and encode use is single-threaded per caller.
+    static let tailcatCanonical: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         return encoder
-    }
+    }()
 }
 
 /// PERF: nibble table instead of per-byte `String(format:)` — same fix as
