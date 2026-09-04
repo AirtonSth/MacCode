@@ -456,21 +456,30 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func conversationList(params: [String: Any]) throws -> [String: Any] {
         let bot = try requireBot(params)
+        let botID = id(bot)
         let rows = try store.listConversations(botID: bot.id).map { conversation in
             var row: [String: Any] = [
                 "id": conversation.id.value.uuidString.lowercased(),
                 "title": conversation.title,
-                "bot_id": bot.id.value.uuidString.lowercased(),
+                "bot_id": botID,
                 "updated_at": conversation.updatedAt.timeIntervalSince1970,
             ]
-            if let threadID = conversation.linkedAgentThreadID {
+            let conversationID = conversation.id.value.uuidString.lowercased()
+            if let identity = liveConversationIdentity(
+                botID: botID,
+                conversationID: conversationID,
+                storedThreadID: conversation.linkedAgentThreadID
+            ) {
+                row["linked_agent_thread_id"] = identity.threadID
+                row["run_id"] = identity.runID
+            } else if let threadID = conversation.linkedAgentThreadID {
                 row["linked_agent_thread_id"] = threadID.value.uuidString.lowercased()
             }
             return row
         }
         return [
             "conversations": rows,
-            "selected_id": selectedConversation[id(bot)] as Any,
+            "selected_id": selectedConversation[botID] as Any,
         ]
     }
 
@@ -993,6 +1002,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 payload["conversation_id"] = conversationID
             }
             payload["routing"] = routing
+            payload["client_request_id"] = requestID
             let payloadJSON = jsonString(payload) ?? "{}"
             let stored = try store.enqueueQueuedFollowUp(
                 BotQueuedFollowUpRecord(
@@ -2952,12 +2962,79 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             if let conversationID = record.conversationID {
                 item["conversation_id"] = conversationID
             }
-            if let data = record.payloadJSON.data(using: .utf8),
-               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let attachments = object["attachments"] {
+            let payload = record.payloadJSON.data(using: .utf8).flatMap {
+                try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+            } ?? [:]
+            if let attachments = payload["attachments"] {
                 item["attachments"] = attachments
             }
+            if let requestID = nonemptyIdentity(payload["client_request_id"] as? String) {
+                item["client_request_id"] = requestID
+            }
+            // Pass through identities bound to THIS queue row. Never copy the
+            // blocking live run: that is a different send.
+            if let runID = nonemptyIdentity(payload["run_id"] as? String) {
+                item["run_id"] = runID
+            }
+            if let threadID = nonemptyIdentity(payload["thread_id"] as? String)
+                ?? queuedConversationThreadID(record.conversationID) {
+                item["thread_id"] = threadID
+            }
             return item
+        }
+    }
+
+    private func nonemptyIdentity(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func queuedConversationThreadID(_ conversationID: String?) -> String? {
+        guard let conversationID,
+              let uuid = UUID(uuidString: conversationID),
+              let conversation = try? store.conversation(id: BotConversationID(uuid)),
+              let threadID = conversation.linkedAgentThreadID else { return nil }
+        return threadID.value.uuidString.lowercased()
+    }
+
+    /// Live execution for this conversation: in-memory send first, then a
+    /// pending/running `agent_runs` row on the stored thread. Does not invent
+    /// a run after the live turn has settled.
+    private func liveConversationIdentity(
+        botID: String,
+        conversationID: String,
+        storedThreadID: AgentThreadID?
+    ) -> (runID: String, threadID: String)? {
+        if let live = liveRuns[botID],
+           live["conversation_id"] as? String == conversationID,
+           let runID = nonemptyIdentity(live["run_id"] as? String) {
+            let threadID = nonemptyIdentity(live["thread_id"] as? String)
+                ?? storedThreadID?.value.uuidString.lowercased()
+            if let threadID { return (runID, threadID) }
+        }
+        guard let storedThreadID,
+              let runID = activeRunID(for: storedThreadID) else { return nil }
+        return (runID, storedThreadID.value.uuidString.lowercased())
+    }
+
+    private func activeRunID(for threadID: AgentThreadID) -> String? {
+        let raw = threadID.value.uuidString.lowercased()
+        do {
+            return try db.performSync { database -> String? in
+                let statement = try database.prepare("""
+                    SELECT id FROM agent_runs
+                    WHERE thread_id = ? COLLATE NOCASE
+                      AND status IN ('pending', 'running')
+                    ORDER BY started_at DESC
+                    LIMIT 1;
+                    """)
+                defer { statement.reset() }
+                try statement.bind(1, raw)
+                guard try statement.step() else { return nil }
+                return nonemptyIdentity(statement.columnText(0))
+            }
+        } catch {
+            return nil
         }
     }
 
