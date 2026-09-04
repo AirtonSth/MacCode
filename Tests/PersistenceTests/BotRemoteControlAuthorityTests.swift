@@ -3528,6 +3528,73 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "Conversations without a first run have no thread yet; the key must be absent, not fabricated"
         )
         XCTAssertNotNil(linkedRow["updated_at"] as? Double)
+        XCTAssertNil(
+            linkedRow["run_id"],
+            "A stored thread without a live/pending run must not invent run_id"
+        )
+    }
+
+    /// WHY: iOS queued promotion must see host run+thread on the conversation
+    /// that is actually running, and must not treat the blocking live run as
+    /// a queued follow-up's identity on the queue list.
+    func test_conversationListAndQueueEmitLiveRunWithoutCopyingItOntoQueuedItems() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "queue-run-create",
+            "name": "Queue Run",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let conversation = try authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "queue-run-conversation",
+            "bot_id": botID,
+            "title": "Live",
+        ])
+        let conversationID = try XCTUnwrap(
+            (conversation["readback"] as? [String: Any])?["conversation_id"] as? String
+        )
+        let runID = UUID().uuidString.lowercased()
+        let threadID = UUID().uuidString.lowercased()
+        authority.onSend = { _, _, _, _, _ in
+            [
+                "bot_id": botID,
+                "conversation_id": conversationID,
+                "thread_id": threadID,
+                "run_id": runID,
+                "enqueued": true,
+                "queued_follow_up": false,
+            ]
+        }
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "queue-run-live",
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "text": "live",
+        ])
+        authority.onSend = nil
+        let queued = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "queue-run-follow",
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "text": "follow up",
+        ])
+        let queuedReadback = try XCTUnwrap(queued["readback"] as? [String: Any])
+        let queue = try XCTUnwrap(queuedReadback["queue"] as? [[String: Any]])
+        let item = try XCTUnwrap(queue.first)
+        XCTAssertEqual(item["conversation_id"] as? String, conversationID)
+        XCTAssertEqual(item["client_request_id"] as? String, "queue-run-follow")
+        XCTAssertNil(
+            item["run_id"],
+            "queue rows must not copy the blocking live run_id"
+        )
+        XCTAssertNil(
+            item["thread_id"],
+            "queue rows must not copy a live thread until this conversation stores one"
+        )
+
+        let listed = try authority.dispatch(method: "bot.conversation.list", params: ["bot_id": botID])
+        let rows = try XCTUnwrap(listed["conversations"] as? [[String: Any]])
+        let row = try XCTUnwrap(rows.first { $0["id"] as? String == conversationID })
+        XCTAssertEqual(row["run_id"] as? String, runID)
+        XCTAssertEqual(row["linked_agent_thread_id"] as? String, threadID)
     }
 
     /// WHY: an iOS retry must never overwrite bytes through a stale projection.
