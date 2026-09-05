@@ -4,6 +4,30 @@ import SocketServer
 @testable import AppShell
 
 final class BotRuntimeEvidenceProjectorTests: XCTestCase {
+    /// WHY: the Agent run can publish before the completed Bot receipt returns;
+    /// retained exact events must be reconciled once binding becomes authoritative.
+    func test_reconcilesRetainedEventsPublishedBeforeBindingWithoutDuplicateReplay() throws {
+        let bus = EventBus(recentLimit: 8)
+        var terminals: [BotRuntimeEvidenceProjector.TerminalEvidence] = []
+        let projector = BotRuntimeEvidenceProjector(eventBus: bus) { terminals.append($0) }
+
+        var projected: [EventBus.Event] = []
+        let token = bus.subscribe(since: bus.currentSeq) { event in
+            if event.kind.hasPrefix("bot.run.") { projected.append(event) }
+        }
+        defer { bus.unsubscribe(token) }
+
+        bus.publish(kind: .agentItemDelta, payload: agentPayload())
+        bus.publish(kind: .agentRunCompleted, payload: agentPayload())
+
+        let receipt = sendReceipt()
+        XCTAssertTrue(projector.registerCompletedSend(receipt))
+        XCTAssertTrue(projector.registerCompletedSend(receipt))
+
+        XCTAssertEqual(projected.map(\.kind), ["bot.run.stream", "bot.run.completed"])
+        XCTAssertEqual(terminals, [.init(botID: "bot-a", runID: "run-a", failed: false)])
+    }
+
     /// WHY: generic Agent events must never advance iOS Bot state unless an
     /// exact completed send receipt first bound their full runtime identity.
     func test_projectsStrictlyOrderedExactStreamAndTerminalEvidence() throws {
