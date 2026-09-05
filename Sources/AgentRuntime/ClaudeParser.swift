@@ -1,6 +1,14 @@
 import Foundation
 import CoreModel
 
+/// Inbound CLI `control_response` for a host `control_request` (interrupt receipt).
+struct ClaudeControlResponseReceipt: Equatable, Sendable {
+    let requestId: String
+    let success: Bool
+    let cancelled: [String]
+    let stillQueued: [String]
+}
+
 /// Parser for Anthropic Claude CLI streaming output.
 /// Maps stream events into the same normalized AssistantEvent model.
 /// Supported events:
@@ -351,7 +359,7 @@ public final class ClaudeParser {
                ) {
                 break
             }
-            if isError {
+            if isError, !Self.isHostInterruptResult(obj) {
                 let msg = resultText
                     ?? (obj["error"] as? [String: Any])?["message"] as? String
                     ?? "claude run failed"
@@ -476,6 +484,11 @@ public final class ClaudeParser {
                     }
                 }
             }
+        case "control_response":
+            // Inbound receipts (interrupt_receipt_v1, permission answers echoed
+            // on stdout). Adapter matches pending interrupt request_id. Do not
+            // emit a hard error or a new AssistantEvent case.
+            break
         case "control_cancel_request":
             // CLAUDE-CLI-008: CLI cancelled an in-flight control request — drop both
             // approval and user-input pending UI for that request_id.
@@ -1035,6 +1048,48 @@ public final class ClaudeParser {
             ?? (origin["type"] as? String)
             ?? ""
         return kind == "task-notification"
+    }
+
+    /// Host-driven interrupt completion. CLI 2.1.x returns `is_error: true` with
+    /// `terminal_reason: aborted_streaming` after a control interrupt; that is a
+    /// cancelled turn, not a hard provider failure.
+    static func isHostInterruptResult(_ obj: [String: Any]) -> Bool {
+        (obj["terminal_reason"] as? String) == "aborted_streaming"
+    }
+
+    /// Parse an inbound stdout `control_response` (interrupt receipt).
+    static func controlResponseReceipt(from obj: [String: Any]) -> ClaudeControlResponseReceipt? {
+        guard (obj["type"] as? String) == "control_response" else { return nil }
+        let envelope = obj["response"] as? [String: Any] ?? [:]
+        let requestId = textValue(envelope["request_id"])
+            ?? textValue(obj["request_id"])
+            ?? textValue(obj["requestId"])
+        guard let requestId, !requestId.isEmpty else { return nil }
+        let subtype = textValue(envelope["subtype"]) ?? ""
+        let inner = envelope["response"] as? [String: Any] ?? [:]
+        let cancelled = stringArray(inner["cancelled"])
+        let stillQueued = stringArray(inner["still_queued"])
+        return ClaudeControlResponseReceipt(
+            requestId: requestId,
+            success: subtype == "success",
+            cancelled: cancelled,
+            stillQueued: stillQueued
+        )
+    }
+
+    private static func textValue(_ value: Any?) -> String? {
+        switch value {
+        case let string as String:
+            return string
+        case let number as NSNumber:
+            return number.stringValue
+        default:
+            return nil
+        }
+    }
+
+    private static func stringArray(_ value: Any?) -> [String] {
+        (value as? [Any])?.compactMap { textValue($0) } ?? []
     }
 
     private func planMarkdown(from payload: Any?) -> String? {

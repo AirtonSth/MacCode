@@ -29,6 +29,83 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         let request = try XCTUnwrap(object["request"] as? [String: Any])
         XCTAssertEqual(request["subtype"] as? String, "interrupt",
                        "stream-json interrupt request.subtype must be interrupt")
+        XCTAssertNil(request["cancel_queued"],
+                     "cancel_queued must be omitted unless interrupt_cancel_queued_v1 is advertised")
+    }
+
+    /// CLAUDE-INT-001: advertised interrupt_cancel_queued_v1 requires cancel_queued true.
+    func test_controlInterruptLine_includesCancelQueuedWhenRequested() throws {
+        let data = ClaudeStreamingCLIAdapter.controlInterruptLine(cancelQueued: true)
+        let stripped = data.last == 0x0A ? data.dropLast() : data
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(stripped)) as? [String: Any]
+        )
+        XCTAssertEqual(object["type"] as? String, "control_request")
+        let request = try XCTUnwrap(object["request"] as? [String: Any])
+        XCTAssertEqual(request["subtype"] as? String, "interrupt")
+        let cancelQueued = request["cancel_queued"] as? Bool
+            ?? (request["cancel_queued"] as? NSNumber)?.boolValue
+        XCTAssertEqual(cancelQueued, true,
+                       "interrupt_cancel_queued_v1 must set request.cancel_queued true")
+        let requestId = try XCTUnwrap(
+            ClaudeStreamingCLIAdapter.controlRequestId(fromInterruptLine: data)
+        )
+        XCTAssertEqual(object["request_id"] as? String, requestId)
+    }
+
+    func test_initCapabilities_fromSystemInitFixture() {
+        let object: [String: Any] = [
+            "type": "system",
+            "subtype": "init",
+            "capabilities": [
+                "interrupt_receipt_v1",
+                "interrupt_cancel_queued_v1",
+                "msg_lifecycle_v1"
+            ]
+        ]
+        let caps = ClaudeStreamingCLIAdapter.initCapabilities(from: object)
+        XCTAssertEqual(
+            caps,
+            ["interrupt_receipt_v1", "interrupt_cancel_queued_v1", "msg_lifecycle_v1"]
+        )
+        XCTAssertNil(
+            ClaudeStreamingCLIAdapter.initCapabilities(from: ["type": "assistant"]),
+            "non-init lines must not be treated as a capabilities snapshot"
+        )
+    }
+
+    /// CLAUDE-INT-002: only a successful receipt for the pending interrupt cancels the grace kill.
+    func test_shouldCancelInterruptGraceKill_onlyOnMatchingSuccessfulReceipt() {
+        XCTAssertTrue(
+            ClaudeStreamingCLIAdapter.shouldCancelInterruptGraceKill(
+                pendingRequestId: "3ad25933-b695-4e02-9b43-0ad5c0cf0fcd",
+                receiptRequestId: "3ad25933-b695-4e02-9b43-0ad5c0cf0fcd",
+                receiptSuccess: true
+            )
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldCancelInterruptGraceKill(
+                pendingRequestId: "pending-1",
+                receiptRequestId: "other-id",
+                receiptSuccess: true
+            ),
+            "permission or unrelated control_response must not cancel the interrupt kill"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldCancelInterruptGraceKill(
+                pendingRequestId: "pending-1",
+                receiptRequestId: "pending-1",
+                receiptSuccess: false
+            ),
+            "failed interrupt receipt must keep the grace kill fallback"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldCancelInterruptGraceKill(
+                pendingRequestId: nil,
+                receiptRequestId: "pending-1",
+                receiptSuccess: true
+            )
+        )
     }
 
     /// The line must be newline-terminated so the Claude CLI's line reader
@@ -347,7 +424,10 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         """.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
 
-        let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
+        let adapter = ClaudeStreamingCLIAdapter(
+            binaryNameOverride: script.path,
+            interruptGracePeriod: 0.05
+        )
         let threadId = AgentThreadID()
         let sink = EventSink()
         _ = try await adapter.sendTurn(AgentRunRequest(
@@ -371,6 +451,13 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
 
         try adapter.interruptTurn(threadId: threadId)
 
+        // EPIPE fails the write and stopSession is synchronous. If the write
+        // still reports success (parent still holds the pipe read end), the
+        // short grace kill removes the session.
+        let goneDeadline = Date().addingTimeInterval(1)
+        while Date() < goneDeadline && adapter.hasSession(threadId: threadId) {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
         XCTAssertFalse(adapter.hasSession(threadId: threadId),
                        "closed stdin must trigger the kill fallback and remove the session")
     }
