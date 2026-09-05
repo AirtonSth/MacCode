@@ -68,6 +68,9 @@ enum AgentMessageMarkdown {
     /// Test-only: successful setObject admissions (not lookups).
     nonisolated(unsafe) static var blocksCacheStoreCountForTesting = 0
     nonisolated(unsafe) static var inlineCacheStoreCountForTesting = 0
+    /// Character-index advances while mapping regex matches onto AttributedString.
+    /// Distance-from-start is O(matches × len); a monotonic cursor is O(len).
+    nonisolated(unsafe) static var linkIndexAdvanceCountForTesting = 0
     #endif
 
     /// Whether a source string is eligible to occupy NSCache.
@@ -445,13 +448,6 @@ enum AgentMessageMarkdown {
         let text = String(attributed.characters)
         guard text.contains("/") || text.contains(".") else { return attributed }
 
-        func attributedRange(_ range: Range<String.Index>) -> Range<AttributedString.Index>? {
-            let startOffset = text.distance(from: text.startIndex, to: range.lowerBound)
-            let length = text.distance(from: range.lowerBound, to: range.upperBound)
-            guard let start = attributed.characters.index(attributed.startIndex, offsetBy: startOffset, limitedBy: attributed.endIndex),
-                  let end = attributed.characters.index(start, offsetBy: length, limitedBy: attributed.endIndex) else { return nil }
-            return start..<end
-        }
         func hasExistingLink(_ range: Range<AttributedString.Index>) -> Bool {
             attributed[range].runs.contains { $0.link != nil }
         }
@@ -464,19 +460,23 @@ enum AgentMessageMarkdown {
         }
 
         var claimed: [Range<String.Index>] = []
+        var planned: [(Range<String.Index>, URL)] = []
         let fullRange = NSRange(text.startIndex..., in: text)
+        // Convert indices on the immutable source. Mutating link attributes
+        // invalidates a CharacterView held by the cursor.
+        var cursor = MonotonicCharacterCursor(text: text, attributed: attributed)
 
         for match in urlRegex.matches(in: text, range: fullRange) {
             guard let raw = Range(match.range, in: text) else { continue }
             let range = trimmingTrailingPunctuation(text, raw)
-            guard !range.isEmpty, let ar = attributedRange(range), !hasExistingLink(ar) else { continue }
+            guard !range.isEmpty else { continue }
             let token = String(text[range])
             guard let url = normalizedWebURL(token) else { continue }
             if url.isFileURL {
                 guard let fileLink = fileLinkURL(for: url.path) else { continue }
-                markLink(ar, url: fileLink)
+                planned.append((range, fileLink))
             } else {
-                markLink(ar, url: url)
+                planned.append((range, url))
             }
             claimed.append(range)
         }
@@ -485,10 +485,9 @@ enum AgentMessageMarkdown {
             guard let raw = Range(match.range, in: text) else { continue }
             let range = trimmingTrailingPunctuation(text, raw)
             guard !range.isEmpty,
-                  !claimed.contains(where: { $0.overlaps(range) }),
-                  let ar = attributedRange(range), !hasExistingLink(ar) else { continue }
+                  !claimed.contains(where: { $0.overlaps(range) }) else { continue }
             guard let fileLink = fileLinkURL(for: String(text[range])) else { continue }
-            markLink(ar, url: fileLink)
+            planned.append((range, fileLink))
             claimed.append(range)
         }
 
@@ -496,23 +495,23 @@ enum AgentMessageMarkdown {
         // mutating link attributes while iterating `runs` would invalidate them.
         let codeStringRanges: [Range<String.Index>] = attributed.runs
             .filter { $0.inlinePresentationIntent?.contains(.code) == true }
-            .compactMap { run in
-                let startOffset = attributed.characters.distance(from: attributed.startIndex, to: run.range.lowerBound)
-                let length = attributed.characters.distance(from: run.range.lowerBound, to: run.range.upperBound)
-                guard let start = text.index(text.startIndex, offsetBy: startOffset, limitedBy: text.endIndex),
-                      let end = text.index(start, offsetBy: length, limitedBy: text.endIndex) else { return nil }
-                return start..<end
-            }
+            .compactMap { cursor.stringRange(for: $0.range) }
         for codeRange in codeStringRanges {
             let nsRange = NSRange(codeRange, in: text)
             for match in bareFilenameRegex.matches(in: text, range: nsRange) {
                 guard let range = Range(match.range, in: text),
-                      !claimed.contains(where: { $0.overlaps(range) }),
-                      let ar = attributedRange(range), !hasExistingLink(ar) else { continue }
+                      !claimed.contains(where: { $0.overlaps(range) }) else { continue }
                 guard let fileLink = fileLinkURL(for: String(text[range])) else { continue }
-                markLink(ar, url: fileLink)
+                planned.append((range, fileLink))
                 claimed.append(range)
             }
+        }
+
+        planned.sort { $0.0.lowerBound < $1.0.lowerBound }
+        cursor = MonotonicCharacterCursor(text: text, attributed: attributed)
+        for (range, url) in planned {
+            guard let ar = cursor.attributedRange(for: range), !hasExistingLink(ar) else { continue }
+            markLink(ar, url: url)
         }
         return attributed
     }
@@ -599,6 +598,140 @@ enum AgentMessageMarkdown {
     }
 }
 
+/// Walks `String` and `AttributedString` characters forward together.
+/// Total cost for a sorted sequence of ranges is O(len), not O(matches × len).
+private struct MonotonicCharacterCursor {
+    let text: String
+    let attributed: AttributedString
+    private var stringIndex: String.Index
+    private var attrIndex: AttributedString.Index
+
+    init(text: String, attributed: AttributedString) {
+        self.text = text
+        self.attributed = attributed
+        self.stringIndex = text.startIndex
+        self.attrIndex = attributed.startIndex
+    }
+
+    mutating func attributedRange(for range: Range<String.Index>) -> Range<AttributedString.Index>? {
+        guard let start = advanceString(to: range.lowerBound),
+              let end = advanceString(to: range.upperBound) else { return nil }
+        return start..<end
+    }
+
+    mutating func stringRange(for range: Range<AttributedString.Index>) -> Range<String.Index>? {
+        guard let start = advanceAttr(to: range.lowerBound),
+              let end = advanceAttr(to: range.upperBound) else { return nil }
+        return start..<end
+    }
+
+    private mutating func rewind() {
+        stringIndex = text.startIndex
+        attrIndex = attributed.startIndex
+    }
+
+    private mutating func noteAdvance() {
+        #if DEBUG
+        AgentMessageMarkdown.linkIndexAdvanceCountForTesting &+= 1
+        #endif
+    }
+
+    private mutating func advanceString(to target: String.Index) -> AttributedString.Index? {
+        if target < stringIndex { rewind() }
+        let characters = attributed.characters
+        while stringIndex < target {
+            guard stringIndex < text.endIndex, attrIndex < characters.endIndex else { return nil }
+            stringIndex = text.index(after: stringIndex)
+            attrIndex = characters.index(after: attrIndex)
+            noteAdvance()
+        }
+        return attrIndex
+    }
+
+    private mutating func advanceAttr(to target: AttributedString.Index) -> String.Index? {
+        if target < attrIndex { rewind() }
+        let characters = attributed.characters
+        while attrIndex < target {
+            guard stringIndex < text.endIndex, attrIndex < characters.endIndex else { return nil }
+            stringIndex = text.index(after: stringIndex)
+            attrIndex = characters.index(after: attrIndex)
+            noteAdvance()
+        }
+        return stringIndex
+    }
+}
+
+/// IMP-010 / CH-13: hover and copy chrome are per-block `@State`.
+/// Keeping them on `AgentMessageMarkdownView` rebuilt every sibling on hover.
+struct AgentMessageMarkdownCodeBlockView: View, Equatable {
+    let text: String
+    @State private var hovered = false
+    @State private var copied = false
+
+    #if DEBUG
+    nonisolated(unsafe) static var bodyCountForTesting = 0
+    #endif
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.text == rhs.text
+    }
+
+    var body: some View {
+        #if DEBUG
+        let _ = Self.bumpBodyCountForTesting()
+        #endif
+        ZStack(alignment: .topTrailing) {
+            AgentSelectablePlainText(
+                text: text.isEmpty ? " " : text,
+                fontSize: 11,
+                monospaced: true,
+                textColor: DS.NS.text
+            )
+            .padding(DS.Space.md)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(DS.Palette.surface)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+
+            if hovered {
+                Button(action: {
+                    AgentMessageMarkdown.copyCodeToPasteboard(text)
+                    copied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                        copied = false
+                    }
+                }) {
+                    Text(copied ? "Copied" : "Copy")
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .padding(.horizontal, DS.Space.sm)
+                        .padding(.vertical, DS.Space.xxs)
+                        .background(DS.Palette.surfaceRaised)
+                        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                }
+                .buttonStyle(.plain)
+                .help("Copy code to clipboard")
+                .padding(DS.Space.sm)
+                .transition(.opacity)
+            }
+        }
+        .onHover { inside in
+            withAnimation(.easeInOut(duration: 0.12)) {
+                hovered = inside
+            }
+        }
+    }
+
+    #if DEBUG
+    private static func bumpBodyCountForTesting() {
+        bodyCountForTesting &+= 1
+    }
+    #endif
+}
+
 public struct AgentMessageMarkdownView: View {
     let text: String
     var compact: Bool = false
@@ -606,19 +739,20 @@ public struct AgentMessageMarkdownView: View {
     /// so growing partial bodies cannot thrash occupancy (R4-B).
     var cacheResults: Bool = true
 
+    #if DEBUG
+    nonisolated(unsafe) static var bodyCountForTesting = 0
+    #endif
+
     public init(text: String, compact: Bool = false, cacheResults: Bool = true) {
         self.text = text
         self.compact = compact
         self.cacheResults = cacheResults
     }
 
-    /// IMP-010: tracks which code block (by enumeration offset) is hovered.
-    @State private var hoveredCode: Int? = nil
-    /// IMP-010: tracks which code block most recently had its copy action triggered,
-    /// so the button can show transient "Copied" feedback.
-    @State private var copiedCode: Int? = nil
-
     public var body: some View {
+        #if DEBUG
+        let _ = Self.bumpBodyCountForTesting()
+        #endif
         let groups = AgentMessageMarkdown.selectionGroups(
             from: AgentMessageMarkdown.blocks(from: text, cache: cacheResults)
         )
@@ -634,7 +768,7 @@ public struct AgentMessageMarkdownView: View {
                 // live streaming group on every token.
                 Group {
                     if group.count == 1, let block = group.first, isIsolatedBlock(block) {
-                        blockView(block, index: index)
+                        blockView(block)
                     } else {
                         // Perf CH-04: only the last group of a live row can still
                         // grow; earlier groups parse (and cache) like finished
@@ -687,7 +821,7 @@ public struct AgentMessageMarkdownView: View {
     }
 
     @ViewBuilder
-    private func blockView(_ block: AgentMessageMarkdownBlock, index: Int) -> some View {
+    private func blockView(_ block: AgentMessageMarkdownBlock) -> some View {
         switch block.kind {
         case .paragraph:
             linkedInline(block.text, lineSpacing: compact ? 3 : 5)
@@ -763,53 +897,8 @@ public struct AgentMessageMarkdownView: View {
             .padding(.leading, DS.Space.xs)
 
         case .code:
-            // IMP-010: wrap code block in ZStack so a copy button can be
-            // overlaid in the top-right corner without altering layout.
-            ZStack(alignment: .topTrailing) {
-                AgentSelectablePlainText(
-                    text: block.text.isEmpty ? " " : block.text,
-                    fontSize: 11,
-                    monospaced: true,
-                    textColor: DS.NS.text
-                )
-                    .padding(DS.Space.md)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(DS.Palette.surface)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                        .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-
-                // IMP-010: copy button — visible when this code block is hovered.
-                if hoveredCode == index {
-                    Button(action: {
-                        AgentMessageMarkdown.copyCodeToPasteboard(block.text)
-                        copiedCode = index
-                        // Reset feedback after 1.2 s to match MarkdownSurface JS pattern.
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                            if copiedCode == index { copiedCode = nil }
-                        }
-                    }) {
-                        Text(copiedCode == index ? "Copied" : "Copy")
-                            .font(DS.Font.caption2)
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .padding(.horizontal, DS.Space.sm)
-                            .padding(.vertical, DS.Space.xxs)
-                            .background(DS.Palette.surfaceRaised)
-                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                            .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-                    }
-                    .buttonStyle(.plain)
-                    .help("Copy code to clipboard")
-                    .padding(DS.Space.sm)
-                    .transition(.opacity)
-                }
-            }
-            .onHover { inside in
-                withAnimation(.easeInOut(duration: 0.12)) {
-                    hoveredCode = inside ? index : nil
-                }
-            }
+            AgentMessageMarkdownCodeBlockView(text: block.text)
+                .equatable()
         }
     }
 
@@ -821,6 +910,12 @@ public struct AgentMessageMarkdownView: View {
         default: return 13
         }
     }
+
+    #if DEBUG
+    private static func bumpBodyCountForTesting() {
+        bodyCountForTesting &+= 1
+    }
+    #endif
 }
 
 /// UX-MAC_AGENT-006: monospace diff preview for approval requests, colorizing

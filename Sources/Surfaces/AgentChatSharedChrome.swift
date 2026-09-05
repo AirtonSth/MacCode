@@ -810,10 +810,21 @@ public struct AgentChatAttachmentChips: View {
         self.stripIdentifier = stripIdentifier
     }
 
+    /// Stable SwiftUI identity for composer chips.
+    /// WHY: `id: \.self` remounts the thumbnail `.task` when sizeBytes/sha256 fill in.
+    static func chipIdentity(_ attachment: AgentAttachment) -> String {
+        attachment.path
+    }
+
+    /// Path is the file; metadata-only changes must not remount the chip.
+    static func wouldRemountChip(from old: AgentAttachment, to new: AgentAttachment) -> Bool {
+        chipIdentity(old) != chipIdentity(new)
+    }
+
     public var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(spacing: DS.Space.sm) {
-                ForEach(attachments, id: \.self) { attachment in
+                ForEach(attachments, id: \.path) { attachment in
                     HStack(spacing: DS.Space.xs) {
                         if AgentChatTranscriptChrome.isImagePath(attachment.path) {
                             AgentChatAttachmentThumbnail(path: attachment.path)

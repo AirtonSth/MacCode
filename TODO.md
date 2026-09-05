@@ -94,8 +94,10 @@ Severidade: **P0** bloqueia main thread / hang visível; **P1** stutter mensurá
   **FEITO (f22856fc)**: `updateNSView` só relayout quando texto externo foi aplicado ou a largura mudou; `textDidChange` mantém a passada única. Medido por teste (NSTextView real): 1 tecla → exatamente 1 layout; update externo sem mudança → 0; largura mudou → relayout.
 
 - [ ] **CH-11 · P2 · digitar — `AgentChatComposerBar` aloca `suggestions.map(\.id)` e `Array(enumerated())` por body** (`AgentChatTranscriptChrome.swift:552`, `AgentComposerChrome.swift:630`); 12 closures recriadas e reatribuídas ao `NSTextView` por body (`AgentComposerTextEditor.swift:117-125`). Tornar `AgentComposerSuggestion` `Equatable` e observar o array; iterar `indices`.
+  **PARCIAL (worker-2)**: identity thrash done — `onChange(of: suggestions)` + `ForEach(suggestions)` (2 → 0 extra Arrays/body). Still open: stabilize the 12 `NSTextView` closures in `AgentComposerTextEditor.updateNSView`. Testes: `AgentComposerTypingHotspotTests`.
 
 - [ ] **AA-13 · P2 · digitar — 2 publishes por tecla e sugestões sem memo.** `AgentComposerTextEditor.swift:220, 260` → `vm.composerCursorOffset = $0` (`AgentAppSurface.swift:16380`) publica sem checar igualdade; `composerSuggestions` (`:5031-5040`) recalculado por body (inclui AA-01). Atribuir `cursorOffset` só se mudou; memoizar por `(prompt, cursorOffset, snapshot.id, botsSignature)`.
+  **PARCIAL (worker-2)**: caret equality done — duplicate caret publishes 2 → 1 (identical reassignment 65 → 1). Still open: memoize `composerSuggestions` by `(prompt, cursorOffset, snapshot.id, botsSignature)`. Testes: `AgentComposerTypingHotspotTests`.
 
 - [ ] **BT-10 · P2 · digitar — `composerSuggestions` dos Bots faz 2 `stat` no disco por body** (`BotsWindow.swift:7339-7349`: fingerprint de `claudeSlashCatalogRevision` ANTES do TTL de 1 s). Checar TTL primeiro; curto-circuito quando o token do caret não começa com `/` ou `@`.
 
@@ -200,10 +202,13 @@ Severidade: **P0** bloqueia main thread / hang visível; **P1** stutter mensurá
 - [ ] **BT-15 · P2** — `selectedBot` cai em `botStore.get` no body enquanto o id não está em `bots` (`:3472-3474`; lido em 11008, 12132, 12182…). Memoizar o fallback.
 - [ ] **BT-16 · P2** — `MacOSLocalUserCatalog.listEligibleUsers()` (`getpwent`) em todo `init` do VM, 3 janelas (`:3111`). Começar vazio; carregar off-main em `refreshAvailableRunAsUsers()` (já ligado a `onAppear` 12015).
 - [ ] **BT-17 · P2** — tasks que começam com `sleep` herdando MainActor (`:2914`, `:8562`, `:1842`). `Task.detached`/`@concurrent` para a espera, `MainActor.run` para a mutação.
-- [ ] **CH-13 · P2** — `hoveredCode` `@State` dentro de `AgentMessageMarkdownView` invalida a mensagem toda no hover (`AgentMessageMarkdown.swift:587, 770-774`). Subview `CodeBlockView` com seu próprio `@State`.
-- [ ] **CH-14 · P2** — `applyingDetectedLinks` O(matches × len) por `String.Index.distance` (`:~420-427`). Cursor monotônico.
+- [x] **CH-13 · P2** — `hoveredCode` `@State` dentro de `AgentMessageMarkdownView` invalida a mensagem toda no hover (`AgentMessageMarkdown.swift:587, 770-774`). Subview `CodeBlockView` com seu próprio `@State`.
+  **FEITO (worker-1)**: `AgentMessageMarkdownCodeBlockView` owns `@State hovered/copied` + `.equatable()`. Parent body count stays 0 when the code-block body evaluates. Hover invalidation: N sibling groups → 1 code-block body. Testes: `AgentChromePerfGapTests`.
+- [x] **CH-14 · P2** — `applyingDetectedLinks` O(matches × len) por `String.Index.distance` (`:~420-427`). Cursor monotônico.
+  **FEITO (worker-1)**: `MonotonicCharacterCursor` maps regex matches in O(len). 200 URLs / 21,890 chars: index steps 4,387,590 → 21,889; hotspot median 1.783 ms → 1.144 ms (5 warmed samples). Testes: `AgentChromePerfGapTests`.
 - [ ] **CH-15 · P2** — `SubagentIdentityAvatarView` varre `bots` com `BotHandle.normalize` por avatar (`SubagentActivity.swift:~520`, `:1146`, `:200-209`). Dicionário por handle normalizado; `compactAvatarItems` no init.
-- [ ] **CH-16 · P2** — `AgentChatAttachmentChips` `ForEach(id: \.self)` (`AgentChatSharedChrome.swift:806`) remonta e cancela a thumbnail quando o struct muda. `id: \.path`.
+- [x] **CH-16 · P2** — `AgentChatAttachmentChips` `ForEach(id: \.self)` (`AgentChatSharedChrome.swift:806`) remonta e cancela a thumbnail quando o struct muda. `id: \.path`.
+  **FEITO (worker-1)**: `ForEach(attachments, id: \.path)`. Metadata fill (`sizeBytes`/`sha256`) remounts: 1 → 0. Testes: `AgentChromePerfGapTests`.
 - [ ] **CH-17 · P2** — `AgentSystemStripPresentation.collapse` `enumerated().sorted` (`AgentChatUXPresentation.swift:54-63`). Desprezível; só se passar por perto.
 
 ## F6 — Suíte de testes (skill swift-testing-expert)

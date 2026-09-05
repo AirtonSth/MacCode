@@ -70,7 +70,15 @@ struct TimelineItemIndex: Sendable, Equatable {
 @MainActor
 public final class AgentComposerState: ObservableObject {
     @Published public var prompt: String = ""
-    @Published public var cursorOffset: Int? = nil
+    /// AA-13: `@Published` fires even when the value is unchanged. The editor
+    /// reports the caret from both `textDidChange` and selection changes, so
+    /// an identical UTF-16 offset must not republish the composer subtree.
+    public var cursorOffset: Int? = nil {
+        willSet {
+            guard newValue != cursorOffset else { return }
+            objectWillChange.send()
+        }
+    }
     /// PF-12: focusing the composer must not republish the 78-field Agent App VM.
     @Published public var focusTick: Int = 0
 }
@@ -339,6 +347,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // the endIndex anchor so programmatic prompt mutations (tests, /clear) work.
     // Keep the public proxy so existing vm.composerCursorOffset call sites stay
     // unchanged while cursor updates publish only through composerState.
+    // Equality is enforced on `AgentComposerState.cursorOffset` (AA-13).
     public var composerCursorOffset: Int? {
         get { composerState.cursorOffset }
         set { composerState.cursorOffset = newValue }
