@@ -102,6 +102,43 @@ final class EventBusFloodStressTests: XCTestCase {
             "incomplete terminal/agent state after reconnect")
     }
 
+    /// Replay sizing reads a cache that publish/trim mutate under the EventBus lock.
+    /// Concurrent readers and publishers must complete without corrupting that cache.
+    func test_recentEventsConcurrentWithPublishKeepsReplayOrdered() {
+        let bus = EventBus(recentLimit: 64, recentByteLimit: 64 * 1_024)
+        for index in 0..<64 {
+            bus.publishRawForTesting(
+                kind: "replay.seed.\(index)",
+                payload: .string(String(repeating: "s", count: 200))
+            )
+        }
+
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "eventbus.replay-race", attributes: .concurrent)
+        for worker in 0..<8 {
+            group.enter()
+            queue.async {
+                defer { group.leave() }
+                for index in 0..<256 {
+                    if worker == 0 {
+                        bus.publishRawForTesting(
+                            kind: "replay.publish.\(index)",
+                            payload: .string(String(repeating: "p", count: 200))
+                        )
+                    } else {
+                        _ = bus.recentEvents(since: 0, maxBytes: 4 * 1_024)
+                    }
+                }
+            }
+        }
+
+        XCTAssertEqual(group.wait(timeout: .now() + 10), .success,
+                       "concurrent replay sizing and publish must not deadlock")
+        let result = bus.recentEvents(since: 0, maxBytes: 4 * 1_024)
+        XCTAssertEqual(result.events.map(\.seq), result.events.map(\.seq).sorted(),
+                       "replay events must remain sequence ordered during concurrent publish")
+    }
+
     func test_defaultRingKeepsContiguousPrefixAcrossDERPCatchUpRace() {
         let bus = EventBus()
         let chunk = String(repeating: "z", count: 32 * 1_024)
