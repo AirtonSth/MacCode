@@ -164,6 +164,70 @@ final class BotsWindowTests: XCTestCase {
         router.sendAgentMessageResolvedAttachmentsProbeForTesting = nil
     }
 
+    /// WHY: The iOS BotRemoteHostState fixture returns a conversation row as
+    /// `readback.id`, while the real paired host authority returns its typed
+    /// mutation readback as `readback.conversation_id`. Exercise the actual
+    /// public HTTP RPC serialization seam so the fixture cannot redefine the
+    /// host wire contract.
+    func test_pairedBotConversationCreateHTTPSerializesCanonicalConversationIDReceipt() async throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let bot = try vm.create(name: "Schema Probe", title: "Receipt")
+        let botID = bot.id.value.uuidString.lowercased()
+        let requestID = "schema-probe-create"
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let server = DirectHTTPServer(
+            port: UInt16.random(in: 33_000...44_000),
+            loopbackOnly: true,
+            dispatcher: dispatcher,
+            bootEpoch: 1
+        )
+        let request = try JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0",
+            "id": "schema-probe-rpc",
+            "method": "bot.conversation.create",
+            "params": [
+                "client_request_id": requestID,
+                "bot_id": botID,
+                "title": "Receipt",
+            ],
+        ])
+
+        let responseData = await server.dispatchRPC(bodyData: request)
+        let response = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: responseData) as? [String: Any]
+        )
+        let result = try XCTUnwrap(response["result"] as? [String: Any])
+        let readback = try XCTUnwrap(result["readback"] as? [String: Any])
+        let conversationID = try XCTUnwrap(readback["conversation_id"] as? String)
+        XCTAssertEqual(Set(result.keys), ["request_id", "receipt_id", "status", "bot_id", "readback"])
+        XCTAssertEqual(Set(readback.keys), ["conversation_id", "title"])
+        XCTAssertNil(readback["id"])
+        XCTAssertEqual(result["request_id"] as? String, requestID)
+        XCTAssertEqual(result["status"] as? String, "completed")
+        XCTAssertEqual(result["bot_id"] as? String, botID)
+
+        let statusRequest = try JSONSerialization.data(withJSONObject: [
+            "jsonrpc": "2.0",
+            "id": "schema-probe-status",
+            "method": "bot.receipt.status",
+            "params": ["client_request_id": requestID],
+        ])
+        let statusData = await server.dispatchRPC(bodyData: statusRequest)
+        let statusResponse = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: statusData) as? [String: Any]
+        )
+        let statusResult = try XCTUnwrap(statusResponse["result"] as? [String: Any])
+        XCTAssertEqual(statusResult as NSDictionary, result as NSDictionary)
+        XCTAssertEqual(
+            (statusResult["readback"] as? [String: Any])?["conversation_id"] as? String,
+            conversationID
+        )
+    }
+
     func test_deskSendWithImageShowsLiteralImageMarker_becauseBotsMustMatchAgentApp() async throws {
         // WHY: a one-image Desk turn must paint `[Image #1]` through the same
         // displayUserLine Agent App uses — not a 📎 filename.

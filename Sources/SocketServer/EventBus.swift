@@ -1075,8 +1075,13 @@ public enum EventStreamFilter: Sendable, Equatable {
                     ? event
                     : nil
             case .cellularSafe:
-                // Future unknown events are sequence-bearing but do not alter a
-                // known projection. Preserve them for forward-compatible clients.
+                // Future unknown non-diagnostic events are sequence-bearing but
+                // do not alter a known projection. Preserve them for
+                // forward-compatible clients while keeping volume diagnostics
+                // out of the cellular stream.
+                if event.kind.hasPrefix("diagnostic.") || event.kind.hasPrefix("metrics.") {
+                    return nil
+                }
                 return event
             }
         }
