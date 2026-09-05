@@ -4,7 +4,8 @@ import SocketServer
 import RemoteCodeTreaty
 
 /// Projects Agent runtime events only after a completed Bot send receipt binds
-/// one authenticated host/Bot/conversation/request/run/thread tuple.
+/// one authenticated host/Bot/conversation/request/run/thread tuple, then
+/// reconciles matching events retained before that binding became available.
 final class BotRuntimeEvidenceProjector: @unchecked Sendable {
     struct TerminalEvidence: Equatable {
         let botID: String
@@ -25,6 +26,7 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
     private let onTerminal: (TerminalEvidence) -> Void
     private let lock = NSLock()
     private var bindingsByRunID: [String: Binding] = [:]
+    private var lastProjectedSequenceByRunID: [String: Int64] = [:]
     private var subscriptionID: UUID?
 
     init(
@@ -81,6 +83,22 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
         lock.lock()
         bindingsByRunID[binding.runID] = binding
         lock.unlock()
+
+        let replaySubscriptionID = eventBus.subscribe(since: 0) { [weak self] event in
+            self?.receive(event)
+        }
+        eventBus.unsubscribe(replaySubscriptionID)
+
+        let oldestRetainedSequence = eventBus.recentEvents(since: 0, maxBytes: nil).events.first?.seq
+        lock.lock()
+        if let oldestRetainedSequence {
+            lastProjectedSequenceByRunID = lastProjectedSequenceByRunID.filter {
+                $0.value >= oldestRetainedSequence
+            }
+        } else {
+            lastProjectedSequenceByRunID.removeAll()
+        }
+        lock.unlock()
         return true
     }
 
@@ -106,6 +124,11 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
             lock.unlock()
             return
         }
+        if lastProjectedSequenceByRunID[runID].map({ $0 >= event.seq }) == true {
+            lock.unlock()
+            return
+        }
+        lastProjectedSequenceByRunID[runID] = event.seq
         if projectedKind == .botRunCompleted || projectedKind == .botRunFailed {
             bindingsByRunID.removeValue(forKey: runID)
         }

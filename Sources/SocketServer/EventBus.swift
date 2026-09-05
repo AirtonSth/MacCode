@@ -614,12 +614,13 @@ public final class EventBus: @unchecked Sendable {
     }
 
     public func recentEvents(since: Int64, maxBytes: Int?) -> RecentEventsResult {
-        lock.lock()
+        // Keep ring selection and encoded-size cache access under one lock.
+        // encodedSize(_:) populates a shared dictionary that publish/trim also mutate.
+        lock.lock(); defer { lock.unlock() }
         let currentLastSeq = lastSeq
         let candidates = recent.filter { $0.seq > since }
         let replayFloor = replayFloorLocked()
         let replayExpired = since < replayFloor
-        lock.unlock()
 
         guard let maxBytes, maxBytes > 0 else {
             return RecentEventsResult(lastSeq: currentLastSeq,
