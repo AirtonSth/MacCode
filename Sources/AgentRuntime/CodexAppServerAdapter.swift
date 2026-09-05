@@ -149,6 +149,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let itemId: String?
         let kind: AssistantRequestKind
         let responseKind: PendingApprovalResponseKind
+        let proposedExecpolicyAmendment: [String]?
+        let proposedNetworkPolicyAmendments: [[String: Any]]?
+        let availableDecisions: [Any]?
+        let networkApprovalContext: [String: Any]?
     }
 
     private enum PendingApprovalResponseKind {
@@ -171,7 +175,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case mcpElicitation(requestedSchema: [String: Any]?)
     }
 
-    /// Server-to-client methods in the Codex 0.152.1 app-server schema. Keep the
+    /// Server-to-client methods in the Codex 0.153.2 app-server schema. Keep the
     /// inventory explicit so a protocol upgrade cannot silently fall through as
     /// an unknown callback with no ownership decision.
     static let currentServerRequestMethods: Set<String> = [
@@ -517,7 +521,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let providerResponse: [String: Any]
         switch pending.responseKind {
         case .legacyDecision:
-            let decision = Self.codexDecision(response, kind: pending.kind)
+            let decision = Self.codexDecision(response, pending: pending)
             payload["decision"] = decision
             if response == .approveForSession {
                 do {
@@ -1295,7 +1299,11 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 kind: kind,
                 responseKind: isPermissionsRequest
                     ? .permissions(requested: requestedPermissions ?? [:])
-                    : .legacyDecision
+                    : .legacyDecision,
+                proposedExecpolicyAmendment: Self.jsonStringArray(payload, "proposedExecpolicyAmendment"),
+                proposedNetworkPolicyAmendments: Self.jsonObjectArray(payload, "proposedNetworkPolicyAmendments"),
+                availableDecisions: Self.jsonArray(payload, "availableDecisions"),
+                networkApprovalContext: Self.jsonObject(payload, "networkApprovalContext")
             ))
             emit([
                 runtimeEvent(method: method, payload: payload),
@@ -1303,7 +1311,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                     id: requestId,
                     turnId: turnId,
                     kind: kind,
-                    title: Self.approvalTitle(for: kind),
+                    title: isPermissionsRequest ? "Permissions approval" : Self.approvalTitle(for: kind),
                     detail: Self.approvalDetailString(from: payload),
                     createdAtMs: now
                 ))
@@ -2684,15 +2692,57 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         payload[key] as? String
     }
 
+    private static func jsonValue(_ payload: [String: Any], _ key: String) -> Any? {
+        guard let value = payload[key], !(value is NSNull) else { return nil }
+        return value
+    }
+
+    private static func jsonArray(_ payload: [String: Any], _ key: String) -> [Any]? {
+        jsonValue(payload, key) as? [Any]
+    }
+
+    private static func jsonStringArray(_ payload: [String: Any], _ key: String) -> [String]? {
+        jsonValue(payload, key) as? [String]
+    }
+
+    private static func jsonObjectArray(_ payload: [String: Any], _ key: String) -> [[String: Any]]? {
+        jsonArray(payload, key)?.compactMap(jsonObjectValue)
+    }
+
+    private static func jsonObject(_ payload: [String: Any], _ key: String) -> [String: Any]? {
+        jsonObjectValue(jsonValue(payload, key))
+    }
+
+    private static func jsonObjectValue(_ value: Any?) -> [String: Any]? {
+        guard let value, !(value is NSNull) else { return nil }
+        if let object = value as? [String: Any] {
+            return object
+        }
+        return jsonRoundTrip(value) as? [String: Any]
+    }
+
+    private static func jsonRoundTrip(_ value: Any) -> Any? {
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data)
+    }
+
     /// Map a UI approval response to the Codex decision dialect for `kind`.
     ///
     /// Codex 0.146 splits dialects:
     /// - `item/commandExecution|fileChange|fileRead/...` → accept/acceptForSession/decline/cancel
+    ///   (commandExecution approve may return an offered amendment object)
     /// - legacy `applyPatchApproval` / `execCommandApproval` → ReviewDecision
     ///   (`approved` / `approved_for_session` / `{denied:{rejection}}` / `abort`)
-    private static func codexDecision(_ response: AgentProviderRequestResponse, kind: AssistantRequestKind) -> Any {
-        if usesReviewDecisionDialect(kind) {
+    private static func codexDecision(
+        _ response: AgentProviderRequestResponse,
+        pending: PendingApproval
+    ) -> Any {
+        if usesReviewDecisionDialect(pending.kind) {
             return reviewDecision(response)
+        }
+        if pending.kind == .commandExecution {
+            return commandExecutionDecision(response, pending: pending)
         }
         return acceptDecision(response)
     }
@@ -2717,6 +2767,58 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case .cancel:
             return "cancel"
         }
+    }
+
+    private static func commandExecutionDecision(
+        _ response: AgentProviderRequestResponse,
+        pending: PendingApproval
+    ) -> Any {
+        switch response {
+        case .approve:
+            return commandExecutionApproveDecision(pending)
+        default:
+            return acceptDecision(response)
+        }
+    }
+
+    /// Emit an amendment object only when Codex offered that arm, or when
+    /// `availableDecisions` is omitted/null and exactly one proposal kind is present.
+    private static func commandExecutionApproveDecision(_ pending: PendingApproval) -> Any {
+        if let decisions = pending.availableDecisions {
+            let exec = firstObjectDecision(in: decisions, key: "acceptWithExecpolicyAmendment")
+            let network = firstObjectDecision(in: decisions, key: "applyNetworkPolicyAmendment")
+            switch (exec, network) {
+            case (let object?, nil):
+                return object
+            case (nil, let object?):
+                return object
+            default:
+                return "accept"
+            }
+        }
+
+        let execRules = pending.proposedExecpolicyAmendment ?? []
+        let networkAmendments = pending.proposedNetworkPolicyAmendments ?? []
+        let hasExec = !execRules.isEmpty
+        let hasSingleNetwork = networkAmendments.count == 1
+        switch (hasExec, hasSingleNetwork) {
+        case (true, false):
+            let body: [String: Any] = ["execpolicy_amendment": execRules]
+            return ["acceptWithExecpolicyAmendment": body]
+        case (false, true):
+            let body: [String: Any] = ["network_policy_amendment": networkAmendments[0]]
+            return ["applyNetworkPolicyAmendment": body]
+        default:
+            return "accept"
+        }
+    }
+
+    private static func firstObjectDecision(in decisions: [Any], key: String) -> [String: Any]? {
+        for item in decisions {
+            guard let object = jsonObjectValue(item), object[key] != nil else { continue }
+            return object
+        }
+        return nil
     }
 
     private static func reviewDecision(_ response: AgentProviderRequestResponse) -> Any {
@@ -2851,6 +2953,16 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             }
             if let file = approvalValue(candidate, keys: ["path", "file"]) {
                 fields.append(("File", file))
+            }
+            if let context = jsonObject(candidate, "networkApprovalContext") {
+                if let host = string(context, "host")?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !host.isEmpty {
+                    fields.append(("Host", host))
+                }
+                if let proto = string(context, "protocol")?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !proto.isEmpty {
+                    fields.append(("Protocol", proto))
+                }
             }
             if let reason = approvalValue(candidate, keys: ["reason", "description", "summary"]) {
                 fields.append(("Reason", reason))

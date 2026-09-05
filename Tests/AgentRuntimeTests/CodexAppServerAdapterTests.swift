@@ -28,18 +28,18 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                        "a Codex release without threadSource cannot reconcile a lost fork response and must fail closed")
     }
 
-    func test_currentServerRequestInventoryMatchesGeneratedCodexSchema_0_152_1() throws {
+    func test_currentServerRequestInventoryMatchesGeneratedCodexSchema_0_153_2() throws {
         // WHY: a hand-copied expectation can drift in lockstep with the switch.
         // Read the checked-in projection generated from ServerRequest.json so a
         // schema upgrade introduces a failing ownership decision by default.
-        // 0.152.1 still includes currentTime/read; inventory must own that callback.
+        // 0.153.2 still includes currentTime/read; inventory must own that callback.
         let fixture = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
-            .appendingPathComponent("Fixtures/CodexAppServer/ServerRequestMethods-0.152.1.json")
+            .appendingPathComponent("Fixtures/CodexAppServer/ServerRequestMethods-0.153.2.json")
         let data = try Data(contentsOf: fixture)
         let schema = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(schema["generatedBy"] as? String,
-                       "codex-cli 0.152.1 app-server generate-json-schema --experimental")
+                       "codex-cli 0.153.2 app-server generate-json-schema --experimental")
         let variants = try XCTUnwrap(schema["oneOf"] as? [[String: Any]])
         let schemaMethods = Set(variants.compactMap { variant -> String? in
             let properties = variant["properties"] as? [String: Any]
@@ -109,7 +109,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
 
         let version = try runCodex(codex, arguments: ["--version"])
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        XCTAssertEqual(version, "codex-cli 0.152.1",
+        XCTAssertEqual(version, "codex-cli 0.153.2",
                        "the checked-in projection must be regenerated deliberately when the release Codex version changes")
         _ = try runCodex(codex, arguments: [
             "app-server", "generate-json-schema", "--experimental", "--out", output.path
@@ -1657,6 +1657,99 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(response["decision"] as? String, "accept")
     }
 
+    func test_commandExecutionApproveEmitsExecpolicyObjectWhenAvailableDecisionsListsIt() async throws {
+        // WHY: Approving a command that offered acceptWithExecpolicyAmendment
+        // must persist the rule. String accept still runs the command once.
+        let execObject: [String: Any] = [
+            "acceptWithExecpolicyAmendment": [
+                "execpolicy_amendment": ["git:*"]
+            ]
+        ]
+        let result = try await commandExecutionApprovalResult(params: [
+            "command": "git status",
+            "proposedExecpolicyAmendment": ["git:*"],
+            "availableDecisions": ["accept", execObject, "decline", "cancel"]
+        ], response: .approve)
+        let decision = try XCTUnwrap(result["decision"] as? [String: Any])
+        let amendment = try XCTUnwrap(decision["acceptWithExecpolicyAmendment"] as? [String: Any])
+        XCTAssertEqual(amendment["execpolicy_amendment"] as? [String], ["git:*"])
+    }
+
+    func test_commandExecutionApproveKeepsStringAcceptWhenAvailableDecisionsOmitsAmendment() async throws {
+        // WHY: Inventing acceptWithExecpolicyAmendment when availableDecisions
+        // omits that arm can be rejected by Codex (0.146-class dialect miss).
+        let result = try await commandExecutionApprovalResult(params: [
+            "command": "git status",
+            "proposedExecpolicyAmendment": ["git:*"],
+            "availableDecisions": ["accept", "acceptForSession", "decline", "cancel"]
+        ], response: .approve)
+        XCTAssertEqual(result["decision"] as? String, "accept")
+    }
+
+    func test_commandExecutionApproveEmitsExecpolicyObjectWhenAvailableDecisionsOmittedAndSingleProposal() async throws {
+        // WHY: README fallback: if availableDecisions is omitted and exactly one
+        // proposal kind is present, persist that amendment on approve.
+        let result = try await commandExecutionApprovalResult(params: [
+            "command": "npm test",
+            "proposedExecpolicyAmendment": ["npm:*"]
+        ], response: .approve)
+        let decision = try XCTUnwrap(result["decision"] as? [String: Any])
+        let amendment = try XCTUnwrap(decision["acceptWithExecpolicyAmendment"] as? [String: Any])
+        XCTAssertEqual(amendment["execpolicy_amendment"] as? [String], ["npm:*"])
+    }
+
+    func test_commandExecutionApproveKeepsStringAcceptWhenAvailableDecisionsNullAndMultipleProposalKinds() async throws {
+        // WHY: Two proposal kinds without a chooser must not invent which
+        // amendment object to send. String accept remains schema-valid.
+        let result = try await commandExecutionApprovalResult(params: [
+            "command": "curl https://api.github.com",
+            "proposedExecpolicyAmendment": ["curl:*"],
+            "proposedNetworkPolicyAmendments": [
+                ["action": "allow", "host": "api.github.com"]
+            ],
+            "availableDecisions": NSNull()
+        ], response: .approve)
+        XCTAssertEqual(result["decision"] as? String, "accept")
+    }
+
+    func test_commandExecutionApproveEmitsNetworkObjectWhenAvailableDecisionsOmittedAndSingleNetworkProposal() async throws {
+        // WHY: A single proposedNetworkPolicyAmendments entry is the network
+        // analogue of the execpolicy fallback when availableDecisions is omitted.
+        let result = try await commandExecutionApprovalResult(params: [
+            "command": "curl https://api.github.com",
+            "proposedNetworkPolicyAmendments": [
+                ["action": "allow", "host": "api.github.com"]
+            ]
+        ], response: .approve)
+        let decision = try XCTUnwrap(result["decision"] as? [String: Any])
+        let wrapper = try XCTUnwrap(decision["applyNetworkPolicyAmendment"] as? [String: Any])
+        let amendment = try XCTUnwrap(wrapper["network_policy_amendment"] as? [String: Any])
+        XCTAssertEqual(amendment["action"] as? String, "allow")
+        XCTAssertEqual(amendment["host"] as? String, "api.github.com")
+    }
+
+    func test_commandExecutionApproveEmitsListedNetworkObjectFromAvailableDecisions() async throws {
+        // WHY: When Codex lists applyNetworkPolicyAmendment, Approve must echo
+        // that offered object rather than string accept.
+        let networkObject: [String: Any] = [
+            "applyNetworkPolicyAmendment": [
+                "network_policy_amendment": [
+                    "action": "allow",
+                    "host": "example.com"
+                ]
+            ]
+        ]
+        let result = try await commandExecutionApprovalResult(params: [
+            "command": "curl https://example.com",
+            "availableDecisions": ["accept", networkObject, "decline"]
+        ], response: .approve)
+        let decision = try XCTUnwrap(result["decision"] as? [String: Any])
+        let wrapper = try XCTUnwrap(decision["applyNetworkPolicyAmendment"] as? [String: Any])
+        let amendment = try XCTUnwrap(wrapper["network_policy_amendment"] as? [String: Any])
+        XCTAssertEqual(amendment["host"] as? String, "example.com")
+        XCTAssertEqual(amendment["action"] as? String, "allow")
+    }
+
     func test_approveForSessionSettingsFailureSettlesProviderContinuation() async throws {
         let client = MockCodexAppServerClient(
             autoComplete: false,
@@ -1715,6 +1808,8 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
         let request = try await waitForApproval(in: sink)
         XCTAssertEqual(request.kind, .dynamic)
+        XCTAssertEqual(request.title, "Permissions approval",
+                       "sandbox grant cards must not reuse the generic Provider approval title")
         try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .decline(nil))
         let rawResponse = try await responseTask.value
         let response = try XCTUnwrap(rawResponse as? [String: Any])
@@ -1982,6 +2077,45 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         let rawResponse = try await responseTask.value
         let response = try XCTUnwrap(rawResponse as? [String: Any])
         XCTAssertEqual(response["decision"] as? String, "decline")
+    }
+
+    func test_approvalDetailIncludesNetworkApprovalContextHostAndProtocol() async throws {
+        // WHY: Network-managed command prompts include networkApprovalContext;
+        // omitting host/protocol leaves the card without the destination identity.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "network"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("rpc-network-detail", "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-network",
+                "command": "curl https://api.github.com",
+                "networkApprovalContext": [
+                    "host": "api.github.com",
+                    "protocol": "https"
+                ]
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        XCTAssertEqual(request.detail, """
+        Command: curl https://api.github.com
+        Host: api.github.com
+        Protocol: https
+        """)
+
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .decline(nil))
+        _ = try await responseTask.value
     }
 
     func test_adapterBridgesAppServerFileReadApprovalRequest() async throws {
@@ -4589,6 +4723,42 @@ private func deleteRealCodexThreads(_ threadIds: [String], binary: String) async
 
 private enum CodexAdapterTestWaitError: Error {
     case timedOut(String)
+}
+
+private func commandExecutionApprovalResult(
+    params: [String: Any],
+    response: AgentProviderRequestResponse
+) async throws -> [String: Any] {
+    let client = MockCodexAppServerClient(autoComplete: false)
+    let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+        client.notificationHandler = notificationHandler
+        client.serverRequestHandler = serverRequestHandler
+        return client
+    }
+    let threadId = AgentThreadID()
+    let sink = EventSink()
+    _ = try await adapter.sendTurn(AgentRunRequest(
+        threadId: threadId, provider: .codex, model: "gpt-5.5",
+        cwd: "/tmp/remotecode-app-server-adapter", prompt: "cmd"
+    )) { event in Task { await sink.record(event) } }
+
+    var payload: [String: Any] = [
+        "threadId": "codex-thread-1",
+        "turnId": "turn-app-server-1",
+        "itemId": "cmd-amendment",
+        "startedAtMs": 1
+    ]
+    payload.merge(params) { _, new in new }
+    let data = try JSONSerialization.data(withJSONObject: payload)
+    let schemaParams = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+    let responseTask = Task {
+        try await client.serverRequestHandler?("rpc-amendment", "item/commandExecution/requestApproval", schemaParams)
+    }
+    let request = try await waitForApproval(in: sink)
+    try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: response)
+    let raw = try await responseTask.value
+    return try XCTUnwrap(raw as? [String: Any])
 }
 
 private func waitForApproval(in sink: EventSink) async throws -> AssistantPendingRequest {
