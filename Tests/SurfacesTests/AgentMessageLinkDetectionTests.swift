@@ -1,3 +1,6 @@
+import AppKit
+import DesignSystemKit
+import SwiftUI
 import XCTest
 @testable import Surfaces
 
@@ -98,5 +101,105 @@ final class AgentMessageLinkDetectionTests: XCTestCase {
     func test_foreignScheme_isNotAFileLink() {
         XCTAssertNil(AgentMessageMarkdown.filePath(fromFileLink: URL(string: "https://example.com?path=/etc/passwd")!),
                      "only the custom scheme may carry file mentions — web URLs must never be interpreted as local paths")
+    }
+
+    // MARK: UTF-16 / emoji index conversion
+
+    /// WHY: NSRange is UTF-16. A cursor that walks Character vs UTF-16 must still
+    /// land on the same token when a scalar (emoji) precedes the match; dropping
+    /// or shifting the link here would be a silent detection-semantic change.
+    func test_urlAndPathAfterEmoji_keepTheSameTokens() {
+        XCTAssertEqual(
+            links(in: "see 🎉 https://example.com/guide now").map(\.url.absoluteString),
+            ["https://example.com/guide"]
+        )
+        XCTAssertEqual(
+            filePaths(in: "fixed 👩‍💻 in Sources/CoreModel/Reducer.swift today"),
+            ["Sources/CoreModel/Reducer.swift"]
+        )
+        XCTAssertEqual(
+            filePaths(in: "edit `Package.swift` after 🎉"),
+            ["Package.swift"]
+        )
+    }
+
+    /// WHY: `applyingDetectedLinks` round-trips the whole value through AppKit
+    /// `NSAttributedString`. Link counts alone do not prove inline-code
+    /// font/background or authored-link runs survive that bridge.
+    func test_applyingDetectedLinks_preservesInlineCodeAndAuthoredLinks_andLinksUnicodePrefixedMatch() throws {
+        let markdown = "see [the docs](https://example.com/docs) and `Package.swift` plus **bold** 🎉 https://example.com/guide"
+        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        var source = try AttributedString(markdown: markdown, options: options)
+        let codeRanges = source.runs
+            .filter { $0.inlinePresentationIntent?.contains(.code) == true }
+            .map(\.range)
+        XCTAssertFalse(codeRanges.isEmpty, "fixture must include an inline-code run to style")
+        for range in codeRanges {
+            source[range].font = DS.Font.monoSmall
+            source[range].backgroundColor = DS.Palette.surfaceOverlay
+            source[range].foregroundColor = DS.Palette.accent
+        }
+
+        func runText(_ value: AttributedString, _ run: AttributedString.Runs.Run) -> String {
+            String(value.characters[run.range])
+        }
+        let beforeCode = try XCTUnwrap(source.runs.first {
+            $0.inlinePresentationIntent?.contains(.code) == true && runText(source, $0) == "Package.swift"
+        })
+        XCTAssertEqual(beforeCode.font, DS.Font.monoSmall)
+        XCTAssertEqual(beforeCode.backgroundColor, DS.Palette.surfaceOverlay)
+        let beforeAuthored = try XCTUnwrap(source.runs.first {
+            $0.link?.absoluteString == "https://example.com/docs"
+        })
+        let beforeBold = source.runs.first {
+            $0.inlinePresentationIntent?.contains(.stronglyEmphasized) == true && runText(source, $0) == "bold"
+        }
+
+        let after = AgentMessageMarkdown.applyingDetectedLinks(to: source)
+        let afterCode = try XCTUnwrap(after.runs.first {
+            $0.inlinePresentationIntent?.contains(.code) == true && runText(after, $0) == "Package.swift"
+        })
+        XCTAssertEqual(afterCode.font, beforeCode.font, "inline-code font must survive the NSAttributedString round-trip")
+        XCTAssertEqual(
+            afterCode.backgroundColor,
+            beforeCode.backgroundColor,
+            "inline-code background must survive the round-trip"
+        )
+        XCTAssertEqual(
+            after.runs.first { $0.link?.absoluteString == "https://example.com/docs" }?.link,
+            beforeAuthored.link,
+            "authored markdown links must keep their author-chosen target"
+        )
+        if let beforeBold {
+            XCTAssertTrue(
+                after.runs.contains {
+                    $0.inlinePresentationIntent == beforeBold.inlinePresentationIntent
+                        && runText(after, $0) == "bold"
+                },
+                "unrelated styled runs such as bold must survive the round-trip"
+            )
+        }
+        XCTAssertEqual(
+            after.runs.compactMap(\.link).compactMap(AgentMessageMarkdown.filePath(fromFileLink:)).first { $0 == "Package.swift" },
+            "Package.swift"
+        )
+
+        let rendered = AgentLinkedInlineTextRepresentable.makeNSAttributedString(
+            attributed: after,
+            font: .systemFont(ofSize: 13),
+            textColor: DS.NS.text,
+            lineSpacing: 0
+        )
+        func link(at token: String) -> URL? {
+            let range = (rendered.string as NSString).range(of: token)
+            guard range.location != NSNotFound else { return nil }
+            return rendered.attribute(.link, at: range.location, effectiveRange: nil) as? URL
+        }
+        XCTAssertEqual(link(at: "the docs")?.absoluteString, "https://example.com/docs")
+        XCTAssertEqual(link(at: "https://example.com/guide")?.absoluteString, "https://example.com/guide")
+        XCTAssertEqual(
+            AgentMessageMarkdown.filePath(fromFileLink: try XCTUnwrap(link(at: "Package.swift"))),
+            "Package.swift"
+        )
     }
 }
