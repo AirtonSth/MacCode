@@ -254,8 +254,18 @@ public final class ClaudeParser {
             // CLAUDE-AUTH-001: unauthenticated CLI 2.1.x emits a synthetic
             // assistant envelope (`error: authentication_failed`) instead of
             // `auth_status`. Treat it as recoverable failure, not assistant text.
+            // Live logged-out streams often end here with no `result`, so also
+            // complete the turn or `inFlightRunId` stays set and blocks retry.
             if type == "assistant", Self.isAuthenticationFailedAssistantEnvelope(obj) {
+                ensureTurn(&out)
                 out.append(contentsOf: authenticationFailedAssistantEvents(from: obj, now: now))
+                if let tid = currentTurnId {
+                    out.append(.turnCompleted(turnId: tid, finalMessage: nil))
+                    currentTurnId = nil
+                    resetAssistantBodyDedupState()
+                    indexToAssistantBody = [:]
+                    exitPlanToolIds.removeAll()
+                }
                 break
             }
             ensureTurn(&out)

@@ -303,7 +303,15 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         // This lets the Claude CLI finish writing and close cleanly, preserving
         // the warm session for potential resumption. Fall back to process kill
         // only if the stdin write fails (pipe closed, process already dead, etc.).
+        // Publish pendingInterruptRequestId before the write becomes visible so a
+        // fast control_response cannot race past an empty pending id.
         let line = Self.controlInterruptLine(cancelQueued: cancelQueued)
+        let requestId = Self.controlRequestId(fromInterruptLine: line)
+        lock.lock()
+        session.pendingInterruptRequestId = requestId
+        session.interruptKillWorkItem?.cancel()
+        session.interruptKillWorkItem = nil
+        lock.unlock()
         let didSend = session.writeQueue.sync {
             (try? GuardedStdinWrite.write(line,
                                           to: session.stdinPipe.fileHandleForWriting,
@@ -311,13 +319,15 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                                           notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) })) != nil
         }
         if !didSend {
+            lock.lock()
+            if session.pendingInterruptRequestId == requestId {
+                session.pendingInterruptRequestId = nil
+            }
+            lock.unlock()
             try stopSession(threadId: threadId)
             return
         }
-        let requestId = Self.controlRequestId(fromInterruptLine: line)
         lock.lock()
-        session.pendingInterruptRequestId = requestId
-        session.interruptKillWorkItem?.cancel()
         let killWork = DispatchWorkItem { [weak self, weak session] in
             guard let self, let session else { return }
             self.lock.lock()

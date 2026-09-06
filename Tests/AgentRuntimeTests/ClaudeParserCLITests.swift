@@ -190,6 +190,10 @@ final class ClaudeParserCLITests: XCTestCase {
             if case .itemDelta(_, let body, _, _) = $0 { return body?.contains("Not logged in") == true }
             return false
         }, "auth-failed body must not stream as assistant deltas")
+        XCTAssertTrue(evs.contains {
+            if case .turnCompleted = $0 { return true }
+            return false
+        }, "auth-failed envelope with no result must still complete the turn")
     }
 
     func test_toolUseBlock_becomesToolItem() {
