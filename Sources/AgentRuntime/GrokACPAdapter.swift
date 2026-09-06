@@ -763,6 +763,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             )
             mapper.setCurrentModeId(opened.currentModeId)
             mapper.setPlanReviewModeId(planModeID)
+            let seededEffort = GrokACPClient.seededReasoningEffort(
+                models: opened.models,
+                currentModelId: opened.currentModelId
+            )
             let session = Session(
                 threadId: request.threadId,
                 providerThreadId: opened.sessionId,
@@ -770,6 +774,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 capabilities: capabilities,
                 mapper: mapper,
                 model: opened.currentModelId ?? request.model,
+                reasoningEffort: seededEffort,
                 availableModeIDs: availableModeIDs,
                 planModeID: planModeID,
                 mode: opened.currentModeId,
