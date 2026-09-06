@@ -740,6 +740,8 @@ function pushPrompt(text, attachments = [], turnContext = undefined) {
   }
   const message = {
     type: 'user',
+    uuid: randomUUID(),
+    origin: { kind: 'human' },
     message: {
       role: 'user',
       content,
