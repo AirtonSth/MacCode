@@ -241,6 +241,31 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertLessThan(agentIdx, effortIdx, "AgentArgs flags must follow `agent`")
     }
 
+    func test_glmFlashPreservesMaxAtLaunchAndSessionBinding() throws {
+        let model = "glm-5.3-flash"
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .grok,
+            model: model,
+            cwd: "/tmp",
+            prompt: "hello",
+            permissionMode: .fullAccess,
+            reasoningEffort: .max
+        )
+        XCTAssertEqual(
+            try GrokACPClient.launchArguments(for: request),
+            ["agent", "--model", model, "--reasoning-effort", "max", "--no-leader", "stdio"]
+        )
+        XCTAssertEqual(
+            GrokACPClient.modelEffortBind(
+                requestModel: model, sessionModel: model,
+                requestEffort: .max, sessionEffort: nil
+            ),
+            .setModel(modelId: model, reasoningEffort: .max)
+        )
+        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.max, modelId: model), "max")
+    }
+
     func test_regularACPLaunchEmptyModelOmitsModelFlagAndMatchesEffortSemantics() throws {
         // WHY: empty model means account default (Grok 4.6). Do not emit --model;
         // still emit --reasoning-effort when effort is set, matching

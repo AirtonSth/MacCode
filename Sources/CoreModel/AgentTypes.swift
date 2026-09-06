@@ -89,6 +89,7 @@ public enum GrokReasoningPolicy {
         let id = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if id.isEmpty || id.hasPrefix("grok-4.6") { return grok46Efforts }
         if id.hasPrefix("grok-4.5") { return grok45Efforts }
+        if id == "glm-5.3-flash" { return [.low, .high, .max] }
         if id.hasPrefix("grok-composer") { return [] }
         // A custom/future model has no observable reasoning contract. Fail
         // closed instead of guessing that it inherits a known model's limits.
