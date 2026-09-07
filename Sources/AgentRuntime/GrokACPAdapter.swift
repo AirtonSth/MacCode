@@ -765,7 +765,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             mapper.setPlanReviewModeId(planModeID)
             let seededEffort = GrokACPClient.seededReasoningEffort(
                 models: opened.models,
-                currentModelId: opened.currentModelId
+                currentModelId: opened.currentModelId,
+                currentEffortRaw: opened.currentReasoningEffortRaw
             )
             let session = Session(
                 threadId: request.threadId,
