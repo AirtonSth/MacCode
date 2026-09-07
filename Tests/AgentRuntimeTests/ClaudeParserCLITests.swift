@@ -111,6 +111,91 @@ final class ClaudeParserCLITests: XCTestCase {
         }, "a non-success result must emit a loud error, not silently complete")
     }
 
+    /// CLAUDE-INT-003: host interrupt `aborted_streaming` is a cancelled completion,
+    /// not a hard provider error (SDK bridge parity).
+    func test_abortedStreamingResult_doesNotEmitHardError() throws {
+        let liveResult = #"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_streaming","result":"","session_id":"388003a9-918d-4850-9190-fdbe2ea6ab53","errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"]}"#
+        let obj = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(liveResult.utf8)) as? [String: Any]
+        )
+        XCTAssertTrue(ClaudeParser.isHostInterruptResult(obj))
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"388003a9-918d-4850-9190-fdbe2ea6ab53"}"#,
+            liveResult
+        ])
+        XCTAssertFalse(evs.contains {
+            if case .error(_, let recoverable) = $0 { return !recoverable }
+            return false
+        }, "aborted_streaming must not surface as a hard error on Stop")
+        XCTAssertTrue(evs.contains {
+            if case .turnCompleted = $0 { return true }
+            return false
+        }, "interrupted result still completes the turn so the host can mark cancelled")
+    }
+
+    /// CLAUDE-INT-002: inbound interrupt receipt is parseable and is not an error event.
+    func test_controlResponseReceipt_parsesLiveInterruptReceipt() throws {
+        let line = #"{"type":"control_response","response":{"subtype":"success","request_id":"3ad25933-b695-4e02-9b43-0ad5c0cf0fcd","response":{"still_queued":[],"cancelled":[]}}}"#
+        let obj = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+        )
+        let receipt = try XCTUnwrap(ClaudeParser.controlResponseReceipt(from: obj))
+        XCTAssertEqual(receipt.requestId, "3ad25933-b695-4e02-9b43-0ad5c0cf0fcd")
+        XCTAssertTrue(receipt.success)
+        XCTAssertEqual(receipt.cancelled, [])
+        XCTAssertEqual(receipt.stillQueued, [])
+        let evs = collect([line])
+        XCTAssertFalse(evs.contains {
+            if case .error = $0 { return true }
+            return false
+        }, "inbound control_response must not emit an error event")
+        XCTAssertNil(
+            ClaudeParser.controlResponseReceipt(from: ["type": "control_request"]),
+            "outbound control_request is not a receipt"
+        )
+    }
+
+    /// CLAUDE-AUTH-001: live unauthenticated CLI 2.1.258 emits a synthetic
+    /// assistant envelope, not `auth_status`. That must fail recoverable, not
+    /// render as a successful assistant reply.
+    func test_authenticationFailedAssistantEnvelope_isRecoverableError() throws {
+        let live = #"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Not logged in · Please run /login"}]},"error":"authentication_failed","is_api_error_message":true,"uuid":"9d8248d5-c007-45f9-a2ae-5b0cebb67ec3"}"#
+        let obj = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(live.utf8)) as? [String: Any]
+        )
+        XCTAssertTrue(ClaudeParser.isAuthenticationFailedAssistantEnvelope(obj))
+        XCTAssertFalse(
+            ClaudeParser.isAuthenticationFailedAssistantEnvelope(
+                ["type": "assistant", "message": ["content": [["type": "text", "text": "pong"]]]]
+            ),
+            "normal assistant text must not be classified as authentication failure"
+        )
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"adf68b25-91dc-4dea-ad48-6b2d4b1c03f0"}"#,
+            live
+        ])
+        XCTAssertTrue(evs.contains {
+            if case .error(let message, let recoverable) = $0 {
+                return recoverable && message.contains("Not logged in")
+            }
+            return false
+        }, "authentication_failed assistant envelope must be a recoverable error")
+        XCTAssertFalse(evs.contains {
+            if case .itemStarted(let item) = $0 {
+                return item.type == .assistantMessage
+            }
+            return false
+        }, "synthetic auth assistant text must not render as an assistant reply")
+        XCTAssertFalse(evs.contains {
+            if case .itemDelta(_, let body, _, _) = $0 { return body?.contains("Not logged in") == true }
+            return false
+        }, "auth-failed body must not stream as assistant deltas")
+        XCTAssertTrue(evs.contains {
+            if case .turnCompleted = $0 { return true }
+            return false
+        }, "auth-failed envelope with no result must still complete the turn")
+    }
+
     func test_toolUseBlock_becomesToolItem() {
         let evs = collect([
             #"{"type":"system","subtype":"init","session_id":"s4"}"#,

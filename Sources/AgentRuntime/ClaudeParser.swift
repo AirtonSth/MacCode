@@ -1,6 +1,14 @@
 import Foundation
 import CoreModel
 
+/// Inbound CLI `control_response` for a host `control_request` (interrupt receipt).
+struct ClaudeControlResponseReceipt: Equatable, Sendable {
+    let requestId: String
+    let success: Bool
+    let cancelled: [String]
+    let stillQueued: [String]
+}
+
 /// Parser for Anthropic Claude CLI streaming output.
 /// Maps stream events into the same normalized AssistantEvent model.
 /// Supported events:
@@ -243,6 +251,23 @@ public final class ClaudeParser {
             // `claude --print --output-format stream-json` emits whole
             // messages, NOT Anthropic-API deltas: {type:"assistant",
             // message:{content:[{type:"text",text:…}|{type:"tool_use",…}]}}.
+            // CLAUDE-AUTH-001: unauthenticated CLI 2.1.x emits a synthetic
+            // assistant envelope (`error: authentication_failed`) instead of
+            // `auth_status`. Treat it as recoverable failure, not assistant text.
+            // Live logged-out streams often end here with no `result`, so also
+            // complete the turn or `inFlightRunId` stays set and blocks retry.
+            if type == "assistant", Self.isAuthenticationFailedAssistantEnvelope(obj) {
+                ensureTurn(&out)
+                out.append(contentsOf: authenticationFailedAssistantEvents(from: obj, now: now))
+                if let tid = currentTurnId {
+                    out.append(.turnCompleted(turnId: tid, finalMessage: nil))
+                    currentTurnId = nil
+                    resetAssistantBodyDedupState()
+                    indexToAssistantBody = [:]
+                    exitPlanToolIds.removeAll()
+                }
+                break
+            }
             ensureTurn(&out)
             let msg = obj["message"] as? [String: Any] ?? [:]
             // `--replay-user-messages` echoes the host's own prompt back as a
@@ -351,7 +376,7 @@ public final class ClaudeParser {
                ) {
                 break
             }
-            if isError {
+            if isError, !Self.isHostInterruptResult(obj) {
                 let msg = resultText
                     ?? (obj["error"] as? [String: Any])?["message"] as? String
                     ?? "claude run failed"
@@ -476,6 +501,11 @@ public final class ClaudeParser {
                     }
                 }
             }
+        case "control_response":
+            // Inbound receipts (interrupt_receipt_v1, permission answers echoed
+            // on stdout). Adapter matches pending interrupt request_id. Do not
+            // emit a hard error or a new AssistantEvent case.
+            break
         case "control_cancel_request":
             // CLAUDE-CLI-008: CLI cancelled an in-flight control request — drop both
             // approval and user-input pending UI for that request_id.
@@ -686,6 +716,25 @@ public final class ClaudeParser {
             body: message,
             now: now
         )
+    }
+
+    private func authenticationFailedAssistantEvents(from obj: [String: Any], now: Int64) -> [AssistantEvent] {
+        let msg = obj["message"] as? [String: Any] ?? [:]
+        let content = msg["content"] as? [[String: Any]] ?? []
+        let bodyText = content.compactMap { block -> String? in
+            guard (block["type"] as? String) == "text" else { return nil }
+            let text = block["text"] as? String ?? ""
+            return text.isEmpty ? nil : text
+        }.joined(separator: "\n")
+        let message = bodyText.isEmpty
+            ? (stringValue(obj["error"]) ?? "Claude authentication failed")
+            : bodyText
+        let id = stringValue(obj["uuid"])
+            ?? stringValue(msg["id"])
+            ?? "claude-auth-failed-\(now)"
+        return [
+            .error(message: message, recoverable: true)
+        ] + completedRuntimeItem(id: id, type: .error, summary: "Claude auth", body: message, now: now)
     }
 
     private func rateLimitEvents(from obj: [String: Any], now: Int64) -> [AssistantEvent] {
@@ -1035,6 +1084,58 @@ public final class ClaudeParser {
             ?? (origin["type"] as? String)
             ?? ""
         return kind == "task-notification"
+    }
+
+    /// Host-driven interrupt completion. CLI 2.1.x returns `is_error: true` with
+    /// `terminal_reason: aborted_streaming` after a control interrupt; that is a
+    /// cancelled turn, not a hard provider failure.
+    static func isHostInterruptResult(_ obj: [String: Any]) -> Bool {
+        (obj["terminal_reason"] as? String) == "aborted_streaming"
+    }
+
+    /// Unauthenticated stream-json paints a synthetic assistant with
+    /// `error: authentication_failed` / `is_api_error_message` instead of `auth_status`.
+    static func isAuthenticationFailedAssistantEnvelope(_ obj: [String: Any]) -> Bool {
+        guard (obj["type"] as? String) == "assistant" else { return false }
+        if (obj["is_api_error_message"] as? Bool) == true { return true }
+        if let flag = obj["is_api_error_message"] as? NSNumber, flag.boolValue { return true }
+        if let error = obj["error"] as? String, error == "authentication_failed" { return true }
+        return false
+    }
+
+    /// Parse an inbound stdout `control_response` (interrupt receipt).
+    static func controlResponseReceipt(from obj: [String: Any]) -> ClaudeControlResponseReceipt? {
+        guard (obj["type"] as? String) == "control_response" else { return nil }
+        let envelope = obj["response"] as? [String: Any] ?? [:]
+        let requestId = textValue(envelope["request_id"])
+            ?? textValue(obj["request_id"])
+            ?? textValue(obj["requestId"])
+        guard let requestId, !requestId.isEmpty else { return nil }
+        let subtype = textValue(envelope["subtype"]) ?? ""
+        let inner = envelope["response"] as? [String: Any] ?? [:]
+        let cancelled = stringArray(inner["cancelled"])
+        let stillQueued = stringArray(inner["still_queued"])
+        return ClaudeControlResponseReceipt(
+            requestId: requestId,
+            success: subtype == "success",
+            cancelled: cancelled,
+            stillQueued: stillQueued
+        )
+    }
+
+    private static func textValue(_ value: Any?) -> String? {
+        switch value {
+        case let string as String:
+            return string
+        case let number as NSNumber:
+            return number.stringValue
+        default:
+            return nil
+        }
+    }
+
+    private static func stringArray(_ value: Any?) -> [String] {
+        (value as? [Any])?.compactMap { textValue($0) } ?? []
     }
 
     private func planMarkdown(from payload: Any?) -> String? {
