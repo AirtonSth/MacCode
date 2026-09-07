@@ -485,6 +485,33 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         XCTAssertFalse(adapter.hasSession(threadId: threadId),
                        "closed stdin must trigger the kill fallback and remove the session")
     }
+
+    /// CLAUDE-INT-002: do not schedule grace kill after a receipt cleared the pending id.
+    func test_shouldScheduleInterruptGraceKill_onlyWhilePendingOwnsWorkItem() {
+        XCTAssertTrue(
+            ClaudeStreamingCLIAdapter.shouldScheduleInterruptGraceKill(
+                pendingRequestId: "pending-1",
+                scheduledRequestId: "pending-1",
+                killWorkStillInstalled: true
+            )
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldScheduleInterruptGraceKill(
+                pendingRequestId: nil,
+                scheduledRequestId: "pending-1",
+                killWorkStillInstalled: true
+            ),
+            "receipt-cleared pending must not schedule the grace kill"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldScheduleInterruptGraceKill(
+                pendingRequestId: "pending-1",
+                scheduledRequestId: "pending-1",
+                killWorkStillInstalled: false
+            ),
+            "cancelled work item must not be rescheduled"
+        )
+    }
 }
 
 private actor EventSink {

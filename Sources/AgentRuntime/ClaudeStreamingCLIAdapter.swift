@@ -303,14 +303,26 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         // This lets the Claude CLI finish writing and close cleanly, preserving
         // the warm session for potential resumption. Fall back to process kill
         // only if the stdin write fails (pipe closed, process already dead, etc.).
-        // Publish pendingInterruptRequestId before the write becomes visible so a
-        // fast control_response cannot race past an empty pending id.
+        // Publish pendingInterruptRequestId AND the grace-kill work item before the
+        // stdin write becomes visible so a fast control_response can cancel the
+        // same work item (CLAUDE-INT-002 race).
         let line = Self.controlInterruptLine(cancelQueued: cancelQueued)
-        let requestId = Self.controlRequestId(fromInterruptLine: line)
+        guard let requestId = Self.controlRequestId(fromInterruptLine: line), !requestId.isEmpty else {
+            // Malformed interrupt payload — fall back to hard stop.
+            try stopSession(threadId: threadId)
+            return
+        }
+        let killWork = DispatchWorkItem { [weak self, weak session] in
+            guard let self, let session else { return }
+            self.lock.lock()
+            let stillRunning = self.sessions[threadId] === session && session.inFlightRunId != nil
+            self.lock.unlock()
+            if stillRunning { try? self.stopSession(threadId: threadId) }
+        }
         lock.lock()
         session.pendingInterruptRequestId = requestId
         session.interruptKillWorkItem?.cancel()
-        session.interruptKillWorkItem = nil
+        session.interruptKillWorkItem = killWork
         lock.unlock()
         let didSend = session.writeQueue.sync {
             (try? GuardedStdinWrite.write(line,
@@ -323,24 +335,29 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             if session.pendingInterruptRequestId == requestId {
                 session.pendingInterruptRequestId = nil
             }
+            if session.interruptKillWorkItem === killWork {
+                session.interruptKillWorkItem?.cancel()
+                session.interruptKillWorkItem = nil
+            }
             lock.unlock()
             try stopSession(threadId: threadId)
             return
         }
+        // Schedule only while this interrupt is still pending. A receipt that
+        // arrived during the write already cleared pending + cancelled killWork.
         lock.lock()
-        let killWork = DispatchWorkItem { [weak self, weak session] in
-            guard let self, let session else { return }
-            self.lock.lock()
-            let stillRunning = self.sessions[threadId] === session && session.inFlightRunId != nil
-            self.lock.unlock()
-            if stillRunning { try? self.stopSession(threadId: threadId) }
-        }
-        session.interruptKillWorkItem = killWork
-        lock.unlock()
-        DispatchQueue.global(qos: .utility).asyncAfter(
-            deadline: .now() + interruptGracePeriod,
-            execute: killWork
+        let stillPending = Self.shouldScheduleInterruptGraceKill(
+            pendingRequestId: session.pendingInterruptRequestId,
+            scheduledRequestId: requestId,
+            killWorkStillInstalled: session.interruptKillWorkItem === killWork
         )
+        lock.unlock()
+        if stillPending {
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + interruptGracePeriod,
+                execute: killWork
+            )
+        }
     }
 
     /// Pure decision: should the next sendTurn emit a "resuming session..."
@@ -448,7 +465,17 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     }
 
     /// Cancel the grace kill only for a successful receipt matching the pending interrupt.
-    nonisolated static func shouldCancelInterruptGraceKill(
+    /// After a successful interrupt stdin write, schedule the grace kill only if
+    /// this request is still pending and still owns the pre-installed work item.
+    nonisolated static func shouldScheduleInterruptGraceKill(
+        pendingRequestId: String?,
+        scheduledRequestId: String,
+        killWorkStillInstalled: Bool
+    ) -> Bool {
+        pendingRequestId == scheduledRequestId && killWorkStillInstalled
+    }
+
+        nonisolated static func shouldCancelInterruptGraceKill(
         pendingRequestId: String?,
         receiptRequestId: String?,
         receiptSuccess: Bool

@@ -989,4 +989,17 @@ final class ClaudeParserCLITests: XCTestCase {
             return false
         }, "stream_event unwrap must copy parent_tool_use_id onto nested blocks")
     }
+    /// CLAUDE-AUTH-001: bare is_api_error_message without authentication_failed is not auth.
+    func test_isApiErrorMessageAlone_isNotAuthenticationFailure() throws {
+        let rateLimit = #"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Rate limited"}]},"error":"rate_limit","is_api_error_message":true}"#
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(rateLimit.utf8)) as? [String: Any])
+        XCTAssertFalse(
+            ClaudeParser.isAuthenticationFailedAssistantEnvelope(obj),
+            "non-auth API error envelopes must not be classified as authentication failure"
+        )
+        let auth = #"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Not logged in · Please run /login"}]},"error":"authentication_failed","is_api_error_message":true}"#
+        let authObj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(auth.utf8)) as? [String: Any])
+        XCTAssertTrue(ClaudeParser.isAuthenticationFailedAssistantEnvelope(authObj))
+    }
+
 }
