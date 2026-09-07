@@ -1,5 +1,5 @@
 {
-  "generatedBy": "codex-cli 0.152.1 app-server generate-json-schema --experimental",
+  "generatedBy": "codex-cli 0.153.2 app-server generate-json-schema --experimental",
   "sourceFile": "ServerRequest.json",
   "sourceSHA256": "38bb1c9dbb1dda2a688a7c8712b04319fe6ee2ed28b54acd2f5fd341d25567ff",
   "oneOf": [

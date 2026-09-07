@@ -28,18 +28,18 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                        "a Codex release without threadSource cannot reconcile a lost fork response and must fail closed")
     }
 
-    func test_currentServerRequestInventoryMatchesGeneratedCodexSchema_0_152_1() throws {
+    func test_currentServerRequestInventoryMatchesGeneratedCodexSchema_0_153_2() throws {
         // WHY: a hand-copied expectation can drift in lockstep with the switch.
         // Read the checked-in projection generated from ServerRequest.json so a
         // schema upgrade introduces a failing ownership decision by default.
-        // 0.152.1 still includes currentTime/read; inventory must own that callback.
+        // 0.153.2 still includes currentTime/read; inventory must own that callback.
         let fixture = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
-            .appendingPathComponent("Fixtures/CodexAppServer/ServerRequestMethods-0.152.1.json")
+            .appendingPathComponent("Fixtures/CodexAppServer/ServerRequestMethods-0.153.2.json")
         let data = try Data(contentsOf: fixture)
         let schema = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(schema["generatedBy"] as? String,
-                       "codex-cli 0.152.1 app-server generate-json-schema --experimental")
+                       "codex-cli 0.153.2 app-server generate-json-schema --experimental")
         let variants = try XCTUnwrap(schema["oneOf"] as? [[String: Any]])
         let schemaMethods = Set(variants.compactMap { variant -> String? in
             let properties = variant["properties"] as? [String: Any]
@@ -109,7 +109,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
 
         let version = try runCodex(codex, arguments: ["--version"])
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        XCTAssertEqual(version, "codex-cli 0.152.1",
+        XCTAssertEqual(version, "codex-cli 0.153.2",
                        "the checked-in projection must be regenerated deliberately when the release Codex version changes")
         _ = try runCodex(codex, arguments: [
             "app-server", "generate-json-schema", "--experimental", "--out", output.path
@@ -1655,6 +1655,183 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         let raw = try await responseTask.value
         let response = try XCTUnwrap(raw as? [String: Any])
         XCTAssertEqual(response["decision"] as? String, "accept")
+    }
+
+    func test_commandExecutionApproveEmitsExecpolicyAmendmentWhenOffered() async throws {
+        // WHY: Codex offers acceptWithExecpolicyAmendment on command-execution
+        // cards. A string accept drops the persist-amendment path even when the
+        // user taps Approve (CODEX-APP-004). Do not invent the payload.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "cmd"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("rpc-execpolicy", "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-execpolicy",
+                "command": "git status",
+                "proposedExecpolicyAmendment": ["git", "status"],
+                "availableDecisions": [
+                    "accept",
+                    ["acceptWithExecpolicyAmendment": ["execpolicy_amendment": ["git", "status"]]],
+                    "cancel"
+                ]
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approve)
+        let raw = try await responseTask.value
+        let response = try XCTUnwrap(raw as? [String: Any])
+        let decision = try XCTUnwrap(response["decision"] as? [String: Any])
+        let amendment = try XCTUnwrap(decision["acceptWithExecpolicyAmendment"] as? [String: Any])
+        XCTAssertEqual(amendment["execpolicy_amendment"] as? [String], ["git", "status"])
+    }
+
+    func test_commandExecutionApproveEmitsAllowNetworkAmendmentWhenOffered() async throws {
+        // WHY: Network persist-allow is an object decision. Plain Approve should
+        // emit applyNetworkPolicyAmendment when that offer is present and allow.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "cmd"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("rpc-net-allow", "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-net-allow",
+                "command": "curl https://example.com",
+                "proposedNetworkPolicyAmendments": [
+                    ["host": "example.com", "action": "allow"]
+                ]
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approve)
+        let raw = try await responseTask.value
+        let response = try XCTUnwrap(raw as? [String: Any])
+        let decision = try XCTUnwrap(response["decision"] as? [String: Any])
+        let amendment = try XCTUnwrap(decision["applyNetworkPolicyAmendment"] as? [String: Any])
+        let rule = try XCTUnwrap(amendment["network_policy_amendment"] as? [String: Any])
+        XCTAssertEqual(rule["host"] as? String, "example.com")
+        XCTAssertEqual(rule["action"] as? String, "allow")
+    }
+
+    func test_commandExecutionApproveDoesNotInventAmendmentWhenAvailableDecisionsAreAcceptOnly() async throws {
+        // WHY: availableDecisions is the allow-list. A proposed execpolicy must
+        // not be sent when Codex only offered accept.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "cmd"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("rpc-no-invent", "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-no-invent",
+                "command": "git status",
+                "proposedExecpolicyAmendment": ["git", "status"],
+                "availableDecisions": ["accept", "cancel"]
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approve)
+        let raw = try await responseTask.value
+        let response = try XCTUnwrap(raw as? [String: Any])
+        XCTAssertEqual(response["decision"] as? String, "accept")
+    }
+
+    func test_commandExecutionApproveIgnoresDenyNetworkAmendment() async throws {
+        // WHY: applyNetworkPolicyAmendment with deny completes the command as
+        // declined. Approve must keep string accept rather than auto-applying deny.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "cmd"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("rpc-net-deny", "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-net-deny",
+                "command": "curl https://evil.example",
+                "proposedNetworkPolicyAmendments": [
+                    ["host": "evil.example", "action": "deny"]
+                ]
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approve)
+        let raw = try await responseTask.value
+        let response = try XCTUnwrap(raw as? [String: Any])
+        XCTAssertEqual(response["decision"] as? String, "accept")
+    }
+
+    func test_applyPatchApproveKeepsReviewDecisionWhenAmendmentFieldsPresent() async throws {
+        // WHY: ReviewDecision methods do not accept CommandExecutionApprovalDecision
+        // objects. Stray amendment fields on applyPatchApproval must not leak.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "patch"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("rpc-patch-amend", "applyPatchApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "patch-amend",
+                "command": "apply_patch",
+                "proposedExecpolicyAmendment": ["git", "status"]
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approve)
+        let raw = try await responseTask.value
+        let response = try XCTUnwrap(raw as? [String: Any])
+        XCTAssertEqual(response["decision"] as? String, "approved")
     }
 
     func test_approveForSessionSettingsFailureSettlesProviderContinuation() async throws {

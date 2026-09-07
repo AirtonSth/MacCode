@@ -149,6 +149,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let itemId: String?
         let kind: AssistantRequestKind
         let responseKind: PendingApprovalResponseKind
+        let availableDecisions: [Any]
+        let proposedExecpolicyAmendment: [String]
+        let proposedNetworkPolicyAmendments: [[String: Any]]
     }
 
     private enum PendingApprovalResponseKind {
@@ -171,7 +174,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case mcpElicitation(requestedSchema: [String: Any]?)
     }
 
-    /// Server-to-client methods in the Codex 0.152.1 app-server schema. Keep the
+    /// Server-to-client methods in the Codex 0.153.2 app-server schema. Keep the
     /// inventory explicit so a protocol upgrade cannot silently fall through as
     /// an unknown callback with no ownership decision.
     static let currentServerRequestMethods: Set<String> = [
@@ -522,7 +525,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let providerResponse: [String: Any]
         switch pending.responseKind {
         case .legacyDecision:
-            let decision = Self.codexDecision(response, kind: pending.kind)
+            let decision = Self.codexDecision(response, pending: pending)
             payload["decision"] = decision
             if response == .approveForSession {
                 do {
@@ -1300,7 +1303,16 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 kind: kind,
                 responseKind: isPermissionsRequest
                     ? .permissions(requested: requestedPermissions ?? [:])
-                    : .legacyDecision
+                    : .legacyDecision,
+                availableDecisions: Self.payloadMixedArray(
+                    payload, camel: "availableDecisions", snake: "available_decisions"
+                ),
+                proposedExecpolicyAmendment: Self.payloadStringArray(
+                    payload, camel: "proposedExecpolicyAmendment", snake: "proposed_execpolicy_amendment"
+                ),
+                proposedNetworkPolicyAmendments: Self.payloadObjectArray(
+                    payload, camel: "proposedNetworkPolicyAmendments", snake: "proposed_network_policy_amendments"
+                )
             ))
             emit([
                 runtimeEvent(method: method, payload: payload),
@@ -2695,11 +2707,16 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     /// - `item/commandExecution|fileChange|fileRead/...` → accept/acceptForSession/decline/cancel
     /// - legacy `applyPatchApproval` / `execCommandApproval` → ReviewDecision
     ///   (`approved` / `approved_for_session` / `{denied:{rejection}}` / `abort`)
-    private static func codexDecision(_ response: AgentProviderRequestResponse, kind: AssistantRequestKind) -> Any {
-        if usesReviewDecisionDialect(kind) {
+    /// Command-execution Approve may return an offered amendment object instead
+    /// of string accept when Codex included that offer on the request.
+    private static func codexDecision(
+        _ response: AgentProviderRequestResponse,
+        pending: PendingApproval
+    ) -> Any {
+        if usesReviewDecisionDialect(pending.kind) {
             return reviewDecision(response)
         }
-        return acceptDecision(response)
+        return acceptDecision(response, pending: pending)
     }
 
     private static func usesReviewDecisionDialect(_ kind: AssistantRequestKind) -> Bool {
@@ -2711,9 +2728,15 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
     }
 
-    private static func acceptDecision(_ response: AgentProviderRequestResponse) -> String {
+    private static func acceptDecision(
+        _ response: AgentProviderRequestResponse,
+        pending: PendingApproval
+    ) -> Any {
         switch response {
         case .approve:
+            if let amendment = offeredCommandExecutionApproveDecision(pending) {
+                return amendment
+            }
             return "accept"
         case .approveForSession:
             return "acceptForSession"
@@ -2722,6 +2745,102 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case .cancel:
             return "cancel"
         }
+    }
+
+    /// Auto-select an offered command-execution amendment on plain Approve.
+    /// Never invent payloads that were not on the request. Deny network rules
+    /// are not an Approve of the command.
+    private static func offeredCommandExecutionApproveDecision(_ pending: PendingApproval) -> Any? {
+        guard pending.kind == .commandExecution else { return nil }
+        if !pending.availableDecisions.isEmpty {
+            for raw in pending.availableDecisions {
+                if let execpolicy = execpolicyAmendmentDecision(
+                    from: raw,
+                    proposed: pending.proposedExecpolicyAmendment
+                ) {
+                    return execpolicy
+                }
+            }
+            for raw in pending.availableDecisions {
+                if let network = allowNetworkAmendmentDecision(from: raw) {
+                    return network
+                }
+            }
+            return nil
+        }
+        if !pending.proposedExecpolicyAmendment.isEmpty {
+            return [
+                "acceptWithExecpolicyAmendment": [
+                    "execpolicy_amendment": pending.proposedExecpolicyAmendment
+                ]
+            ]
+        }
+        if let rule = pending.proposedNetworkPolicyAmendments.first(where: isAllowNetworkRule) {
+            return [
+                "applyNetworkPolicyAmendment": [
+                    "network_policy_amendment": rule
+                ]
+            ]
+        }
+        return nil
+    }
+
+    private static func execpolicyAmendmentDecision(from raw: Any, proposed: [String]) -> [String: Any]? {
+        guard let object = raw as? [String: Any],
+              object["acceptWithExecpolicyAmendment"] != nil else {
+            return nil
+        }
+        let inner = object["acceptWithExecpolicyAmendment"] as? [String: Any] ?? [:]
+        let listed = stringArray(inner["execpolicy_amendment"])
+        let commands = listed.isEmpty ? proposed : listed
+        guard !commands.isEmpty else { return nil }
+        return [
+            "acceptWithExecpolicyAmendment": [
+                "execpolicy_amendment": commands
+            ]
+        ]
+    }
+
+    private static func allowNetworkAmendmentDecision(from raw: Any) -> [String: Any]? {
+        guard let object = raw as? [String: Any],
+              let inner = object["applyNetworkPolicyAmendment"] as? [String: Any] else {
+            return nil
+        }
+        let rule = (inner["network_policy_amendment"] as? [String: Any]) ?? inner
+        guard isAllowNetworkRule(rule) else { return nil }
+        return [
+            "applyNetworkPolicyAmendment": [
+                "network_policy_amendment": rule
+            ]
+        ]
+    }
+
+    private static func isAllowNetworkRule(_ rule: [String: Any]) -> Bool {
+        guard let host = rule["host"] as? String, !host.isEmpty else { return false }
+        guard let action = rule["action"] as? String else { return false }
+        return action.caseInsensitiveCompare("allow") == .orderedSame
+    }
+
+    private static func payloadMixedArray(_ payload: [String: Any], camel: String, snake: String) -> [Any] {
+        let raw = payload[camel] ?? payload[snake]
+        return raw as? [Any] ?? []
+    }
+
+    private static func payloadStringArray(_ payload: [String: Any], camel: String, snake: String) -> [String] {
+        stringArray(payload[camel] ?? payload[snake])
+    }
+
+    private static func payloadObjectArray(_ payload: [String: Any], camel: String, snake: String) -> [[String: Any]] {
+        let raw = payload[camel] ?? payload[snake]
+        if let objects = raw as? [[String: Any]] { return objects }
+        guard let mixed = raw as? [Any] else { return [] }
+        return mixed.compactMap { $0 as? [String: Any] }
+    }
+
+    private static func stringArray(_ raw: Any?) -> [String] {
+        if let strings = raw as? [String] { return strings }
+        guard let mixed = raw as? [Any] else { return [] }
+        return mixed.compactMap { $0 as? String }
     }
 
     private static func reviewDecision(_ response: AgentProviderRequestResponse) -> Any {
