@@ -390,6 +390,8 @@ struct GrokACPSessionOpenResult {
     let sessionId: String
     let models: [AgentModelDescriptor]
     let currentModelId: String?
+    /// Live `_meta.reasoningEffort` for the current model (may differ from option default).
+    let currentReasoningEffortRaw: String?
     let availableModes: [GrokACPSessionMode]
     let currentModeId: String?
     /// Typed ACP `configOptions` from session/new|load (model + reasoning_effort).
@@ -1172,10 +1174,15 @@ public final class GrokACPClient: @unchecked Sendable {
             return GrokACPSessionMode(id: id, name: name, description: raw["description"] as? String)
         }
         let configOptions = (result["configOptions"] as? [JSONObject]) ?? []
+        let currentModelId = state?["currentModelId"] as? String
         return GrokACPSessionOpenResult(
             sessionId: sessionId,
             models: models,
-            currentModelId: state?["currentModelId"] as? String,
+            currentModelId: currentModelId,
+            currentReasoningEffortRaw: currentReasoningEffortRaw(
+                from: state,
+                currentModelId: currentModelId
+            ),
             availableModes: availableModes,
             currentModeId: modeState?["currentModeId"] as? String,
             configOptions: configOptions
@@ -1226,17 +1233,40 @@ public final class GrokACPClient: @unchecked Sendable {
             ?? (current.flatMap { seen.contains($0) ? $0 : nil })
             ?? (seen.contains(.high) ? .high : seen.first)
         guard let preferred else { return ([], nil) }
-        let rest = AgentReasoningEffort.allCases.filter { seen.contains($0) && $0 != preferred }
+        // Keep agent-advertised relative order after lifting the preferred default.
+        let rest = seen.filter { $0 != preferred }
         return ([preferred] + rest, preferred)
     }
 
-    /// Seed session effort from the opened model catalog (current / default).
+    /// Raw `_meta.reasoningEffort` for the current (or first) model in an ACP models state.
+    static func currentReasoningEffortRaw(
+        from state: JSONObject?,
+        currentModelId: String?
+    ) -> String? {
+        let rawModels = state?["availableModels"] as? [JSONObject] ?? []
+        let trimmed = currentModelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let match = rawModels.first { ($0["modelId"] as? String) == trimmed } ?? rawModels.first
+        let metadata = match?["_meta"] as? JSONObject ?? [:]
+        let raw = (metadata["reasoningEffort"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return raw.isEmpty ? nil : raw
+    }
+
+    /// Seed session effort from live current when advertised; else preferred default (`.first`).
     static func seededReasoningEffort(
         models: [AgentModelDescriptor],
-        currentModelId: String?
+        currentModelId: String?,
+        currentEffortRaw: String? = nil
     ) -> AgentReasoningEffort? {
         let trimmed = currentModelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let match = models.first { $0.id == trimmed } ?? models.first
-        return match?.supportedReasoningEfforts.first
+        let supported = match?.supportedReasoningEfforts ?? []
+        if let raw = currentEffortRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty,
+           let current = AgentReasoningEffort(rawValue: raw),
+           supported.contains(current) {
+            return current
+        }
+        return supported.first
     }
 }

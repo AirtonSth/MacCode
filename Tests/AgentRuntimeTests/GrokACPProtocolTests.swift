@@ -1486,12 +1486,29 @@ final class GrokACPProtocolTests: XCTestCase {
             ] as [String: Any]],
         ])
         let model = try! XCTUnwrap(models.first)
+        // 015: advertised default leads `.first` consumers / drafts.
         XCTAssertEqual(model.supportedReasoningEfforts.first, .high)
-        XCTAssertEqual(model.supportedReasoningEfforts, [.high, .low, .medium, .xhigh])
+        // Preserve agent-relative order after lifting preferred (not CaseIterable scramble).
+        XCTAssertEqual(model.supportedReasoningEfforts, [.high, .xhigh, .medium, .low])
+        // 017: seed tracks live current so first-turn default/high still binds.
         XCTAssertEqual(
-            GrokACPClient.seededReasoningEffort(models: models, currentModelId: "grok-4.6"),
-            .high
+            GrokACPClient.seededReasoningEffort(
+                models: models,
+                currentModelId: "grok-4.6",
+                currentEffortRaw: "xhigh"
+            ),
+            .xhigh
         )
+        let bindDefaultWhileCurrentXhigh = GrokACPClient.modelEffortBind(
+            requestModel: "grok-4.6",
+            sessionModel: "grok-4.6",
+            requestEffort: .high,
+            sessionEffort: .xhigh
+        )
+        guard case let .setModel(_, boundEffort) = bindDefaultWhileCurrentXhigh else {
+            return XCTFail("request high with session xhigh must bind, got \(bindDefaultWhileCurrentXhigh)")
+        }
+        XCTAssertEqual(boundEffort, .high)
     }
 
     /// WHY: Image #1 Agent App Grok send died at start with
