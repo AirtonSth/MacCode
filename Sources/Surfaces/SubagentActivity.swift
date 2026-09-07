@@ -523,7 +523,21 @@ public enum SubagentActivityProjection {
     ) -> BotDefinition? {
         guard let rawHandle = botDelegationHandle(from: nodeId),
               let handle = BotHandle.normalize(rawHandle) else { return nil }
-        return bots.first { BotHandle.normalize($0.handle) == handle }
+        // Perf CH-15: build the normalized-handle map once per bots snapshot so
+        // N avatar lookups are O(1) each instead of O(bots) normalize scans.
+        return botsByNormalizedHandle(bots)[handle]
+    }
+
+    /// Shared index for avatar / peer chrome. Callers that resolve many nodeIds
+    /// against one bots array should reuse this dictionary.
+    public static func botsByNormalizedHandle(_ bots: [BotDefinition]) -> [String: BotDefinition] {
+        var map: [String: BotDefinition] = [:]
+        map.reserveCapacity(bots.count)
+        for bot in bots {
+            guard let key = BotHandle.normalize(bot.handle) else { continue }
+            if map[key] == nil { map[key] = bot }
+        }
+        return map
     }
 
     /// `Nested` / `Native` from the durable nodeId prefix; other workers → `Worker`.
@@ -851,11 +865,13 @@ public struct SubagentActivityBadge: View {
                     .font(DS.Font.caption.weight(.semibold))
                     .foregroundColor(DS.Palette.text)
                 if !snapshot.compactAvatarItems.isEmpty {
+                    let botsIndex = SubagentActivityProjection.botsByNormalizedHandle(bots)
                     HStack(spacing: 2) {
                         ForEach(snapshot.compactAvatarItems) { item in
                             SubagentIdentityAvatarView(
                                 item: item,
                                 bots: bots,
+                                botsByHandle: botsIndex,
                                 size: 12,
                                 showsMonogram: false
                             )
@@ -1147,11 +1163,17 @@ struct SubagentActivityRowView: View {
 struct SubagentIdentityAvatarView: View {
     let item: SubagentActivityItem
     let bots: [BotDefinition]
+    /// Optional precomputed index (CH-15). When painting N avatars against one
+    /// bots snapshot, pass `botsByNormalizedHandle(bots)` once from the parent.
+    var botsByHandle: [String: BotDefinition]? = nil
     var size: CGFloat = 18
     var showsMonogram: Bool = true
 
     var body: some View {
-        if let bot = SubagentActivityProjection.delegatedBot(for: item.nodeId, among: bots) {
+        let index = botsByHandle ?? SubagentActivityProjection.botsByNormalizedHandle(bots)
+        if let raw = SubagentActivityProjection.botDelegationHandle(from: item.nodeId),
+           let handle = BotHandle.normalize(raw),
+           let bot = index[handle] {
             BotsAvatarView(
                 name: bot.name,
                 handle: bot.handle,

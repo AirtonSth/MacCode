@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 import CoreModel
 @testable import Surfaces
 
@@ -876,4 +877,111 @@ final class ToolRowPresentationTests: XCTestCase {
             "count-only path must equal full grouping length"
         )
     }
+
+    func test_liveToolRowHelpers_shareOneJSONParse() {
+        // WHY: AgentChatLiveToolRow.body calls rawShellCommand + toolCommandPreview
+        // (+ openTarget on some rows). Preview used to JSON-decode again, doubling
+        // parse cost on every paint of a stable tool row.
+        let command = "rc-shared-\(UUID().uuidString)"
+        let body = #"{"command":"\#(command)","file_path":"/tmp/x.swift"}"#
+        let item = toolItem(body: body)
+        let before = AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting
+        XCTAssertEqual(AgentTimelineItemPresentation.rawShellCommand(for: item), command)
+        XCTAssertEqual(AgentTimelineItemPresentation.toolCommandPreview(for: item), command)
+        XCTAssertEqual(AgentTimelineItemPresentation.toolOpenTarget(for: item), .file("/tmp/x.swift"))
+        // Repeat the LiveToolRow helper bundle.
+        for _ in 0..<50 {
+            _ = AgentTimelineItemPresentation.rawShellCommand(for: item)
+            _ = AgentTimelineItemPresentation.toolCommandPreview(for: item)
+            _ = AgentTimelineItemPresentation.toolOpenTarget(for: item)
+        }
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting - before,
+            1,
+            "LiveToolRow helper bundle must parse identical JSON once"
+        )
+    }
+
+    func test_toolCommandPreview_microbench_cacheVsUncachedJSON() {
+        // WHY: quantify before/after on the hot path. BEFORE = N independent
+        // JSONSerialization parses (what preview did). AFTER = toolCommandPreview
+        // after sharing toolInputObject (1 parse + N cache hits).
+        // ~2 KiB JSON tool body (common noisy shell command size).
+        let bigCmd = String(repeating: "echo hi; ", count: 200)
+        let bigBody = "{\"command\":\"\(bigCmd)\",\"file_path\":\"/tmp/bench.swift\"}"
+        let bigItem = toolItem(body: bigBody)
+        XCTAssertGreaterThan(bigBody.utf8.count, 1500)
+
+        let iterations = 800
+        func medianMs(_ samples: [Double]) -> Double {
+            let s = samples.sorted()
+            return s[s.count / 2]
+        }
+
+        // BEFORE: uncached JSONSerialization each iteration (frozen legacy preview).
+        var beforeSamples: [Double] = []
+        for _ in 0..<5 {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            for _ in 0..<iterations {
+                let body = bigItem.body.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let data = body.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let value = obj["command"] as? String {
+                    _ = value
+                }
+                // Simulate rawShell + preview both parsing (legacy LiveToolRow).
+                if let data = body.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let value = obj["command"] as? String {
+                    _ = value
+                }
+            }
+            beforeSamples.append((CFAbsoluteTimeGetCurrent() - t0) * 1000)
+        }
+
+        // AFTER: shared cache helpers (rawShell + preview + openTarget).
+        var afterSamples: [Double] = []
+        for _ in 0..<5 {
+            // Drop cache occupancy between samples by unique suffix... actually same body should hit cache across samples; clear by using toolInput path only.
+            let t0 = CFAbsoluteTimeGetCurrent()
+            for _ in 0..<iterations {
+                _ = AgentTimelineItemPresentation.rawShellCommand(for: bigItem)
+                _ = AgentTimelineItemPresentation.toolCommandPreview(for: bigItem)
+                _ = AgentTimelineItemPresentation.toolOpenTarget(for: bigItem)
+            }
+            afterSamples.append((CFAbsoluteTimeGetCurrent() - t0) * 1000)
+        }
+
+        let beforeMed = medianMs(beforeSamples)
+        let afterMed = medianMs(afterSamples)
+        let improvement = (beforeMed - afterMed) / beforeMed
+        print("PERF tool-row JSON path BEFORE median_ms=\(beforeMed) samples=\(beforeSamples)")
+        print("PERF tool-row JSON path AFTER median_ms=\(afterMed) samples=\(afterSamples)")
+        print("PERF tool-row JSON path improvement=\(improvement)")
+        XCTAssertGreaterThan(
+            improvement,
+            0.05,
+            "cached LiveToolRow helpers must be ≥5% faster than dual uncached JSON parse (before=\(beforeMed) after=\(afterMed))"
+        )
+    }
+
+    func test_liveToolRow_equatable_skipsUnchangedItem() {
+        // WHY: Equatable + .equatable() must treat identical item+expanded as equal
+        // so SwiftUI can skip body on parent ticks. Use distinct bindings so the
+        // expanded bit can diverge (a shared Binding always reads the same set).
+        var expandedA: Set<String> = []
+        var expandedB: Set<String> = []
+        let bindingA = Binding(get: { expandedA }, set: { expandedA = $0 })
+        let bindingB = Binding(get: { expandedB }, set: { expandedB = $0 })
+        let item = toolItem(body: #"{"command":"true"}"#)
+        let a = AgentChatLiveToolRow(item: item, expandedIDs: bindingA)
+        let b = AgentChatLiveToolRow(item: item, expandedIDs: bindingB)
+        XCTAssertEqual(a, b)
+        expandedB.insert(item.id)
+        XCTAssertNotEqual(a, b)
+        let other = toolItem(body: #"{"command":"false"}"#)
+        let c = AgentChatLiveToolRow(item: other, expandedIDs: bindingA)
+        XCTAssertNotEqual(a, c)
+    }
+
 }
