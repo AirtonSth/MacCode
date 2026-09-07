@@ -149,7 +149,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let itemId: String?
         let kind: AssistantRequestKind
         let responseKind: PendingApprovalResponseKind
-        let availableDecisions: [Any]
+        /// `nil` means the field was absent on the request; empty means Codex
+        /// sent an authoritative empty allow-list (do not fall back to proposals).
+        let availableDecisions: [Any]?
         let proposedExecpolicyAmendment: [String]
         let proposedNetworkPolicyAmendments: [[String: Any]]
     }
@@ -1299,7 +1301,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 responseKind: isPermissionsRequest
                     ? .permissions(requested: requestedPermissions ?? [:])
                     : .legacyDecision,
-                availableDecisions: Self.payloadMixedArray(
+                availableDecisions: Self.payloadOptionalMixedArray(
                     payload, camel: "availableDecisions", snake: "available_decisions"
                 ),
                 proposedExecpolicyAmendment: Self.payloadStringArray(
@@ -2747,8 +2749,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     /// are not an Approve of the command.
     private static func offeredCommandExecutionApproveDecision(_ pending: PendingApproval) -> Any? {
         guard pending.kind == .commandExecution else { return nil }
-        if !pending.availableDecisions.isEmpty {
-            for raw in pending.availableDecisions {
+        if let availableDecisions = pending.availableDecisions {
+            // Present allow-list is authoritative, including an empty array.
+            for raw in availableDecisions {
                 if let execpolicy = execpolicyAmendmentDecision(
                     from: raw,
                     proposed: pending.proposedExecpolicyAmendment
@@ -2756,7 +2759,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                     return execpolicy
                 }
             }
-            for raw in pending.availableDecisions {
+            for raw in availableDecisions {
                 if let network = allowNetworkAmendmentDecision(from: raw) {
                     return network
                 }
@@ -2817,6 +2820,16 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     }
 
     private static func payloadMixedArray(_ payload: [String: Any], camel: String, snake: String) -> [Any] {
+        payloadOptionalMixedArray(payload, camel: camel, snake: snake) ?? []
+    }
+
+    /// Distinguishes a missing field (`nil`) from an explicit empty array (`[]`).
+    private static func payloadOptionalMixedArray(
+        _ payload: [String: Any],
+        camel: String,
+        snake: String
+    ) -> [Any]? {
+        guard payload[camel] != nil || payload[snake] != nil else { return nil }
         let raw = payload[camel] ?? payload[snake]
         return raw as? [Any] ?? []
     }

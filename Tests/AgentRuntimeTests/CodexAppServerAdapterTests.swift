@@ -1768,6 +1768,41 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(response["decision"] as? String, "accept")
     }
 
+    func test_commandExecutionApproveDoesNotInventAmendmentWhenAvailableDecisionsExplicitlyEmpty() async throws {
+        // WHY: Upstream treats Some([]) as an authoritative empty allow-list.
+        // Collapsing that with an absent field would fall back to proposals and
+        // emit an amendment Codex did not offer.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "cmd"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("rpc-empty-allowlist", "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-empty-allowlist",
+                "command": "git status",
+                "proposedExecpolicyAmendment": ["git", "status"],
+                "availableDecisions": [] as [Any]
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approve)
+        let raw = try await responseTask.value
+        let response = try XCTUnwrap(raw as? [String: Any])
+        XCTAssertEqual(response["decision"] as? String, "accept")
+        XCTAssertNil(response["decision"] as? [String: Any])
+    }
+
     func test_commandExecutionApproveIgnoresDenyNetworkAmendment() async throws {
         // WHY: applyNetworkPolicyAmendment with deny completes the command as
         // declined. Approve must keep string accept rather than auto-applying deny.
