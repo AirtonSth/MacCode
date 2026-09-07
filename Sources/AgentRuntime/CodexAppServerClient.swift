@@ -948,10 +948,14 @@ public final class CodexAppServerClient: @unchecked Sendable {
     }
 
     private static func collaborationMode(for request: AgentRunRequest, normalizedModel model: String?) -> JSONObject {
+        // Upstream Settings.model is required. Empty/default request model means
+        // "account default" at the top-level turn/start field, but collaborationMode
+        // still needs a concrete model — use the same built-in default as the rest
+        // of the Agent App (not a stale gpt-5.5 hardcode).
         return [
             "mode": request.interactionMode.rawValue,
             "settings": [
-                "model": model ?? "gpt-5.5",
+                "model": model ?? AgentDefaultModelSelection.codexBuiltInDefault,
                 "reasoning_effort": appServerReasoningEffort(for: request.reasoningEffort).rawValue,
                 "developer_instructions": developerInstructions(
                     for: request.interactionMode,

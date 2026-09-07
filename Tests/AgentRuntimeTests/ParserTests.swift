@@ -71,6 +71,53 @@ final class CodexParserTests: XCTestCase {
                        "agent_message item must become the turn's final reply")
     }
 
+    func test_realExecSchema_nestedItemStartedAndAggregatedOutput() {
+        // WHY: openai/codex emits item.started with nested `item`, and
+        // command_execution output lives in aggregated_output (not `output`).
+        let p = CodexParser()
+        var state = AssistantTimelineState()
+        for l in [
+            #"{"type":"thread.started","thread_id":"t-nested"}"#,
+            #"{"type":"turn.started"}"#,
+            #"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"bash -lc ls","aggregated_output":"","status":"in_progress"}}"#,
+            #"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"bash -lc ls","aggregated_output":"README.md\nSources","status":"completed"}}"#,
+            #"{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"rm -rf /","aggregated_output":"","status":"declined"}}"#,
+            #"{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Listed the repo."}}"#,
+            #"{"type":"turn.completed","usage":{"input_tokens":24763,"cached_input_tokens":24448,"cache_write_input_tokens":12,"output_tokens":122,"reasoning_output_tokens":0}}"#
+        ] { for ev in p.parseLine(l) { state.apply(ev) } }
+
+        let command = state.turns[0].items.first { $0.id == "item_1" }
+        XCTAssertEqual(command?.type, .commandExecution)
+        XCTAssertEqual(command?.output, "README.md\nSources",
+                       "aggregated_output must become the command item output")
+        XCTAssertEqual(command?.state, .completed)
+
+        let declined = state.turns[0].items.first { $0.id == "item_2" }
+        XCTAssertEqual(declined?.state, .cancelled,
+                       "declined command_execution must map to cancelled like app-server")
+
+        XCTAssertEqual(state.turns[0].finalAssistantMessage, "Listed the repo.")
+        XCTAssertEqual(state.tokenUsage?.inputTokens, 24763)
+        XCTAssertEqual(state.tokenUsage?.cacheReadInputTokens, 24448)
+        XCTAssertEqual(state.tokenUsage?.uncachedInputTokens, 24763 - 24448)
+        XCTAssertEqual(state.tokenUsage?.cacheCreationInputTokens, 12,
+                       "cache_write_input_tokens maps to cache creation bucket")
+        XCTAssertEqual(state.tokenUsage?.outputTokens, 122)
+    }
+
+    func test_realExecSchema_itemUpdatedTodoList() {
+        let p = CodexParser()
+        var state = AssistantTimelineState()
+        state.apply(.turnStarted(turnId: "turn-1"))
+        let events = p.parseLine(#"{"type":"item.updated","item":{"id":"todo-1","type":"todo_list","text":"Working","plan":[{"step":"Inspect","status":"completed"},{"step":"Patch","status":"in_progress"}]}}"#)
+        for event in events { state.apply(event) }
+        XCTAssertEqual(state.activePlan?.steps.map(\.title), ["Inspect", "Patch"])
+        XCTAssertTrue(events.contains {
+            if case .itemStarted(let item) = $0 { return item.id == "todo-1" && item.type == .plan }
+            return false
+        }, "item.updated nested todo_list must surface as a plan item")
+    }
+
     func test_turnFailed_isLoudError() {
         let p = CodexParser()
         let evs = p.parseLine(#"{"type":"turn.failed","error":{"message":"model blocked"}}"#)

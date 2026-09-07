@@ -47,9 +47,15 @@ public final class CodexParser {
             currentTurnId = tid
             assembled = ""
             return [.turnStarted(turnId: tid)]
-        case "item.started":
+        case "item.started", "item.updated":
+            // Real `codex exec --json` nests the payload under `item`
+            // (openai/codex exec_events ItemStartedEvent / ItemUpdatedEvent).
+            // Legacy synthetic fixtures keep flat item_id/item_type.
+            if let item = obj["item"] as? [String: Any] {
+                return eventsForNestedItem(item, now: now, terminal: false)
+            }
             let id = obj["item_id"] as? String ?? obj["id"] as? String ?? UUID().uuidString
-            let turnId = obj["turn_id"] as? String ?? ""
+            let turnId = obj["turn_id"] as? String ?? currentTurnId ?? ""
             let kind = (obj["item_type"] as? String) ?? (obj["kind"] as? String) ?? "assistantMessage"
             let it = AssistantItem(
                 id: id, turnId: turnId,
@@ -75,32 +81,9 @@ public final class CodexParser {
             return out
         case "item.completed":
             // Real `codex exec --json`: the payload is a nested `item`
-            // {id,type,text}. agent_message carries the assistant reply.
+            // {id,type,text|aggregated_output,...}. agent_message carries the reply.
             if let item = obj["item"] as? [String: Any] {
-                let iid = item["id"] as? String ?? UUID().uuidString
-                let kind = (item["type"] as? String) ?? "agent_message"
-                let text = item["text"] as? String
-                    ?? item["output"] as? String
-                    ?? item["command"] as? String ?? ""
-                let tt = mapItemType(kind)
-                var out: [AssistantEvent] = []
-                ensureTurn(&out)
-                let turnId = currentTurnId ?? ""
-                switch tt {
-                case .assistantMessage:
-                    assembled += (assembled.isEmpty ? "" : "\n") + text
-                    out.append(.itemStarted(item: AssistantItem(id: iid, turnId: turnId, type: .assistantMessage, state: .streaming, summary: nil, body: "", startedAtMs: now)))
-                    out.append(.itemDelta(itemId: iid, bodyAppend: text, outputAppend: nil, summary: nil))
-                    out.append(.itemCompleted(itemId: iid, finalState: .completed))
-                case .tool:
-                    let summary = item["command"] as? String ?? item["name"] as? String ?? kind
-                    out.append(.itemStarted(item: AssistantItem(id: iid, turnId: turnId, type: .tool, state: .completed, summary: summary, body: "", output: text, progress: Self.progressValue(item), startedAtMs: now)))
-                    out.append(.itemCompleted(itemId: iid, finalState: .completed))
-                default: // reasoning / plan
-                    out.append(.itemStarted(item: AssistantItem(id: iid, turnId: turnId, type: tt, state: .streaming, summary: nil, body: text, progress: Self.progressValue(item), startedAtMs: now)))
-                    out.append(.itemCompleted(itemId: iid, finalState: .completed))
-                }
-                return out
+                return eventsForNestedItem(item, now: now, terminal: true)
             }
             // Legacy synthetic schema.
             let id = obj["item_id"] as? String ?? obj["id"] as? String ?? ""
@@ -114,12 +97,17 @@ public final class CodexParser {
             // agent_message text; fall back to legacy fields.
             let final = (obj["final_message"] as? String ?? obj["message"] as? String)
                 ?? (assembled.isEmpty ? nil : assembled)
+            var out: [AssistantEvent] = []
+            if let usage = tokenUsage(from: obj["usage"] as? [String: Any]) {
+                out.append(.tokenUsage(usage))
+            }
             currentTurnId = nil
             // Reset the agent_message accumulator so a subsequent turn (even one
             // that arrives without a turn.started) does not bleed this turn's text
             // into its own final message (was: doubled transcript in the mirror).
             assembled = ""
-            return [.turnCompleted(turnId: tid, finalMessage: final)]
+            out.append(.turnCompleted(turnId: tid, finalMessage: final))
+            return out
         case "request.opened":
             let id = obj["request_id"] as? String ?? obj["id"] as? String ?? UUID().uuidString
             let kind = mapRequestKind(obj["request_type"] as? String ?? obj["kind"] as? String ?? "")
@@ -211,6 +199,134 @@ public final class CodexParser {
             || lowered.hasPrefix("audio.")
             || lowered.contains("audio_delta")
             || lowered.contains("realtime")
+    }
+
+    /// Project a nested `codex exec --json` ThreadItem into Assistant events.
+    /// `terminal` true = item.completed (or final snapshot); false = started/updated.
+    private func eventsForNestedItem(
+        _ item: [String: Any],
+        now: Int64,
+        terminal: Bool
+    ) -> [AssistantEvent] {
+        let iid = item["id"] as? String ?? UUID().uuidString
+        let kind = (item["type"] as? String) ?? "agent_message"
+        let text = Self.itemText(from: item)
+        let tt = mapItemType(kind)
+        let wireState = Self.itemState(for: item["status"] as? String)
+        let finalState: AssistantItemState = terminal
+            ? (wireState == .streaming ? .completed : wireState)
+            : wireState
+        var out: [AssistantEvent] = []
+        ensureTurn(&out)
+        let turnId = currentTurnId ?? ""
+        switch tt {
+        case .assistantMessage:
+            if terminal, !text.isEmpty {
+                assembled += (assembled.isEmpty ? "" : "\n") + text
+            }
+            out.append(.itemStarted(item: AssistantItem(
+                id: iid, turnId: turnId, type: .assistantMessage,
+                state: terminal ? finalState : .streaming,
+                summary: nil, body: terminal ? "" : text, startedAtMs: now
+            )))
+            if terminal, !text.isEmpty {
+                out.append(.itemDelta(itemId: iid, bodyAppend: text, outputAppend: nil, summary: nil))
+            }
+            if terminal {
+                out.append(.itemCompleted(itemId: iid, finalState: finalState))
+            }
+        case .commandExecution, .tool, .mcpToolCall, .dynamicToolCall, .collabToolCall:
+            let summary = item["command"] as? String
+                ?? item["name"] as? String
+                ?? item["tool"] as? String
+                ?? kind
+            out.append(.itemStarted(item: AssistantItem(
+                id: iid, turnId: turnId, type: tt,
+                state: finalState,
+                summary: summary, body: "", output: text,
+                progress: Self.progressValue(item), startedAtMs: now,
+                finishedAtMs: terminal ? now : nil
+            )))
+            if terminal {
+                out.append(.itemCompleted(itemId: iid, finalState: finalState))
+            }
+        default: // reasoning / plan / file_change / …
+            if tt == .plan, let plan = activePlan(from: item, now: now) {
+                out.append(.activePlanUpdated(plan))
+            }
+            out.append(.itemStarted(item: AssistantItem(
+                id: iid, turnId: turnId, type: tt,
+                state: terminal ? finalState : .streaming,
+                summary: item["command"] as? String ?? item["name"] as? String,
+                body: text, progress: Self.progressValue(item), startedAtMs: now,
+                finishedAtMs: terminal ? now : nil
+            )))
+            if terminal {
+                out.append(.itemCompleted(itemId: iid, finalState: finalState))
+            }
+        }
+        return out
+    }
+
+    private static func itemText(from item: [String: Any]) -> String {
+        // Prefer command_execution.aggregated_output (openai/codex ThreadItem).
+        if let aggregated = item["aggregated_output"] as? String, !aggregated.isEmpty {
+            return aggregated
+        }
+        if let text = item["text"] as? String, !text.isEmpty { return text }
+        if let output = item["output"] as? String, !output.isEmpty { return output }
+        if let command = item["command"] as? String, !command.isEmpty { return command }
+        if let changes = item["changes"] {
+            if let data = try? JSONSerialization.data(withJSONObject: changes),
+               let s = String(data: data, encoding: .utf8) {
+                return s
+            }
+        }
+        return ""
+    }
+
+    /// Mirror CodexAppServerAdapter.itemState for exec JSONL status strings.
+    private static func itemState(for status: String?) -> AssistantItemState {
+        let normalized = status?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "_", with: "")
+            .lowercased()
+        switch normalized {
+        case "completed", "succeeded", "success", "approved":
+            return .completed
+        case "failed", "blocked", "timedout", "errored", "error":
+            return .failed
+        case "cancelled", "canceled", "declined", "decline", "denied", "deny",
+             "stopped", "aborted", "interrupted":
+            return .cancelled
+        default:
+            return .streaming
+        }
+    }
+
+    private func tokenUsage(from usage: [String: Any]?) -> AssistantTokenUsage? {
+        guard let usage else { return nil }
+        let input = usage["input_tokens"] as? Int ?? usage["inputTokens"] as? Int ?? 0
+        let output = usage["output_tokens"] as? Int ?? usage["outputTokens"] as? Int ?? 0
+        let cached = usage["cached_input_tokens"] as? Int
+            ?? usage["cachedInputTokens"] as? Int
+            ?? 0
+        let cacheWrite = usage["cache_write_input_tokens"] as? Int
+            ?? usage["cacheWriteInputTokens"] as? Int
+            ?? 0
+        let total = usage["total_tokens"] as? Int ?? (input + output)
+        return AssistantTokenUsage(
+            inputTokens: input,
+            outputTokens: output,
+            totalTokens: total,
+            contextWindow: usage["context_window"] as? Int ?? usage["contextWindow"] as? Int,
+            compactsAutomatically: usage["compacts_automatically"] as? Bool
+                ?? usage["compactsAutomatically"] as? Bool,
+            uncachedInputTokens: max(0, input - cached),
+            cacheCreationInputTokens: cacheWrite,
+            cacheReadInputTokens: cached,
+            semantics: .cumulative
+        )
     }
 
     private func mapItemType(_ s: String) -> AssistantItemType {
