@@ -618,7 +618,7 @@ public struct AgentChatComposerBar: View {
             .padding(.bottom, DS.Space.xs)
             .accessibilityLabel(placeholder)
             .accessibilityIdentifier(composerIdentifier)
-            .onChange(of: suggestions.map(\.id)) { _ in
+            .onChange(of: suggestions) { _ in
                 suggestionSelectedIndex = ComposerSuggestionNavigation.reset()
             }
             if ComposerSuggestionNavigation.isOpen(

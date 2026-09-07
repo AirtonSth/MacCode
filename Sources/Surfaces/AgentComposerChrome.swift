@@ -604,6 +604,20 @@ public struct AgentQueuedHeader: View {
 
 // MARK: - Suggestion panel
 
+/// CH-11: cheap suggestion observation. `AgentComposerSuggestion` is already
+/// Equatable, so SwiftUI can `onChange(of: suggestions)` without allocating
+/// `map(\.id)` or `Array(enumerated())` on every composer body.
+enum ComposerSuggestionObservation {
+    static let extraArrayAllocationsPerBody = 0
+
+    static func shouldResetHighlight(
+        from previous: [AgentComposerSuggestion],
+        to current: [AgentComposerSuggestion]
+    ) -> Bool {
+        previous != current
+    }
+}
+
 public struct AgentComposerSuggestionPanel: View {
     public let suggestions: [AgentComposerSuggestion]
     public let highlightedIndex: Int?
@@ -624,11 +638,12 @@ public struct AgentComposerSuggestionPanel: View {
 
     public var body: some View {
         let layout = ComposerSuggestionPlacement.layout(suggestionCount: suggestions.count)
+        let highlightedID = Self.highlightedSuggestionID(in: suggestions, index: highlightedIndex)
         VStack(spacing: 0) {
             ScrollView(.vertical, showsIndicators: suggestions.count > layout.maxVisibleRows) {
                 VStack(spacing: 0) {
-                    ForEach(Array(suggestions.enumerated()), id: \.element.id) { index, suggestion in
-                        row(suggestion, highlighted: index == highlightedIndex)
+                    ForEach(suggestions) { suggestion in
+                        row(suggestion, highlighted: suggestion.id == highlightedID)
                             .frame(height: layout.rowHeight)
                     }
                 }
@@ -646,6 +661,16 @@ public struct AgentComposerSuggestionPanel: View {
         .padding(.bottom, DS.Space.xs)
         .accessibilityIdentifier(identifier)
         .allowsHitTesting(true)
+    }
+
+    /// CH-11: highlight without `Array(enumerated())`. Identity stays on
+    /// `AgentComposerSuggestion.id`; the index is only a lookup.
+    public static func highlightedSuggestionID(
+        in suggestions: [AgentComposerSuggestion],
+        index: Int?
+    ) -> String? {
+        guard let index, suggestions.indices.contains(index) else { return nil }
+        return suggestions[index].id
     }
 
     private func row(_ suggestion: AgentComposerSuggestion, highlighted: Bool) -> some View {
