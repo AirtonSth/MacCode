@@ -1097,8 +1097,9 @@ public final class ClaudeParser {
     /// `error: authentication_failed` / `is_api_error_message` instead of `auth_status`.
     static func isAuthenticationFailedAssistantEnvelope(_ obj: [String: Any]) -> Bool {
         guard (obj["type"] as? String) == "assistant" else { return false }
-        if (obj["is_api_error_message"] as? Bool) == true { return true }
-        if let flag = obj["is_api_error_message"] as? NSNumber, flag.boolValue { return true }
+        // Require the authentication discriminator. Bare is_api_error_message is
+        // also used for rate limits / invalid_request / server errors and must
+        // not complete the turn as "Claude auth".
         if let error = obj["error"] as? String, error == "authentication_failed" { return true }
         return false
     }
