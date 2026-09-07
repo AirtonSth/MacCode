@@ -523,9 +523,9 @@ public enum SubagentActivityProjection {
     ) -> BotDefinition? {
         guard let rawHandle = botDelegationHandle(from: nodeId),
               let handle = BotHandle.normalize(rawHandle) else { return nil }
-        // Perf CH-15: build the normalized-handle map once per bots snapshot so
-        // N avatar lookups are O(1) each instead of O(bots) normalize scans.
-        return botsByNormalizedHandle(bots)[handle]
+        // Single lookup stays linear. For N avatars against one bots snapshot,
+        // callers must reuse `botsByNormalizedHandle` (compact strip does).
+        return bots.first { BotHandle.normalize($0.handle) == handle }
     }
 
     /// Shared index for avatar / peer chrome. Callers that resolve many nodeIds
@@ -1170,10 +1170,15 @@ struct SubagentIdentityAvatarView: View {
     var showsMonogram: Bool = true
 
     var body: some View {
-        let index = botsByHandle ?? SubagentActivityProjection.botsByNormalizedHandle(bots)
-        if let raw = SubagentActivityProjection.botDelegationHandle(from: item.nodeId),
-           let handle = BotHandle.normalize(raw),
-           let bot = index[handle] {
+        let bot: BotDefinition? = {
+            if let index = botsByHandle {
+                guard let raw = SubagentActivityProjection.botDelegationHandle(from: item.nodeId),
+                      let handle = BotHandle.normalize(raw) else { return nil }
+                return index[handle]
+            }
+            return SubagentActivityProjection.delegatedBot(for: item.nodeId, among: bots)
+        }()
+        if let bot {
             BotsAvatarView(
                 name: bot.name,
                 handle: bot.handle,
