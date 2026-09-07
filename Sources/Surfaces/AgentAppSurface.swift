@@ -12699,17 +12699,20 @@ public struct AgentAppView: View {
             index = end
         }
 
-        var priorTurns: [AssistantTurnSnapshot] = []
-        priorTurns.reserveCapacity(visibleEntries.count)
+        var previousNormalizedFinals = Set<String>()
+        previousNormalizedFinals.reserveCapacity(visibleEntries.count)
         var hideAssistantOutputByTurnId: [String: Bool] = [:]
         hideAssistantOutputByTurnId.reserveCapacity(visibleEntries.count)
         for entry in visibleEntries {
             guard case .turn(let turn) = entry else { continue }
             hideAssistantOutputByTurnId[turn.turnId] = AgentChatLiveTurnChrome.shouldHideAssistantOutput(
                 turn,
-                previousTurns: priorTurns
+                previousNormalizedFinals: previousNormalizedFinals
             )
-            priorTurns.append(turn)
+            AgentChatLiveTurnChrome.insertNormalizedAssistantFinals(
+                from: turn,
+                into: &previousNormalizedFinals
+            )
         }
         return ChatRowPaintContext(
             peerGroupHeadersByRowID: groupHeaders,
@@ -12799,7 +12802,79 @@ public struct AgentAppView: View {
 
     /// Single paint-order gate: time order, then final-after-Work-so-far.
     nonisolated static func paintOrderedTranscriptEntries(_ entries: [TranscriptEntry]) -> [TranscriptEntry] {
-        ensuringFinalAnswersFollowTurns(ensuringTranscriptOrder(entries))
+        #if DEBUG
+        TranscriptPaintOrderedProbe.increment()
+        #endif
+        return ensuringFinalAnswersFollowTurns(ensuringTranscriptOrder(entries))
+    }
+
+    #if DEBUG
+    enum TranscriptPaintOrderedProbe {
+        private static let lock = NSLock()
+        nonisolated(unsafe) private static var count = 0
+
+        static var callCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return count
+        }
+
+        static func reset() {
+            lock.lock()
+            count = 0
+            lock.unlock()
+        }
+
+        static func increment() {
+            lock.lock()
+            count += 1
+            lock.unlock()
+        }
+    }
+    #endif
+
+    /// Conversation-column paint: order the full merged transcript once, then
+    /// window and reveal from that ordered list. Do not re-run
+    /// `placingMatchingFinalsAfterTurns` on already-ordered subsets.
+    nonisolated static func transcriptColumnPaint(
+        mergedEntries: [TranscriptEntry],
+        status: AgentRunStatus,
+        runStartedAt: Date?,
+        revealCount: Int
+    ) -> (
+        all: [TranscriptEntry],
+        visible: [TranscriptEntry],
+        paint: [TranscriptEntry]
+    ) {
+        let allEntries = paintOrderedTranscriptEntries(mergedEntries)
+        let visible = visibleTranscriptWindow(
+            entries: allEntries,
+            status: status,
+            runStartedAt: runStartedAt
+        )
+        let hiddenCount = hiddenTranscriptCount(
+            totalCount: allEntries.count,
+            visibleCount: visible.count
+        )
+        let revealed = min(max(0, revealCount), hiddenCount)
+        if revealed > 0 {
+            let older = hiddenTranscriptRevealWindow(
+                allItems: allEntries,
+                visibleWindow: visible,
+                revealCount: revealed
+            )
+            // Visible can be a filtered non-suffix (running / no-user / time-cutoff
+            // after matching finals have moved). Concatenating older+visible can
+            // put a durable final back above its Work-so-far turn. Select the
+            // union by id while keeping allEntries relative order.
+            var paintIDs = Set(visible.map(\.id))
+            paintIDs.reserveCapacity(visible.count + older.count)
+            for entry in older {
+                paintIDs.insert(entry.id)
+            }
+            return (allEntries, visible, allEntries.filter { paintIDs.contains($0.id) })
+        }
+        return (allEntries, visible, visible)
     }
 
     /// Only honor `latestLiveTurnId` when it sits in the recent eager tail.
@@ -14082,14 +14157,14 @@ public struct AgentAppView: View {
             scrollToBottomIdentifier: "agent.timeline.scrollToBottom",
             accessibilityIdentifier: "agent.timeline"
         ) { timelineColumnWidth in
-                        let allEntries = Self.paintOrderedTranscriptEntries(transcriptEntries)
-                        let entries = Self.paintOrderedTranscriptEntries(
-                            Self.visibleTranscriptWindow(
-                                entries: allEntries,
-                                status: vm.status,
-                                runStartedAt: vm.runStartedAt
-                            )
+                        let columnPaint = Self.transcriptColumnPaint(
+                            mergedEntries: transcriptEntries,
+                            status: vm.status,
+                            runStartedAt: vm.runStartedAt,
+                            revealCount: vm.transcriptHistoryRevealCount
                         )
+                        let allEntries = columnPaint.all
+                        let entries = columnPaint.visible
                         let hiddenCount = Self.hiddenTranscriptCount(
                             totalCount: allEntries.count,
                             visibleCount: entries.count
@@ -14098,17 +14173,7 @@ public struct AgentAppView: View {
                             vm.transcriptHistoryRevealCount,
                             hiddenCount
                         )
-                        let paintSequence: [TranscriptEntry] = {
-                            if revealedHiddenCount > 0 {
-                                let older = Self.hiddenTranscriptRevealWindow(
-                                    allItems: allEntries,
-                                    visibleWindow: entries,
-                                    revealCount: revealedHiddenCount
-                                )
-                                return Self.paintOrderedTranscriptEntries(older + entries)
-                            }
-                            return entries
-                        }()
+                        let paintSequence = columnPaint.paint
                         let latestLiveId = paintSequence.reversed().compactMap { entry -> String? in
                             if case .turn(let turn) = entry, !turn.finished { return turn.turnId }
                             return nil

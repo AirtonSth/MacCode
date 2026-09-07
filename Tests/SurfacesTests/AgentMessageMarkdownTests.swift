@@ -254,4 +254,167 @@ final class AgentMessageMarkdownTests: XCTestCase {
         ])
         XCTAssertEqual(groups[2][0].text, "Final paragraph.")
     }
+
+    // MARK: - R9 markdown link/hover residuals (#4, #5)
+
+    /// ~20 KiB of prose with 50 URL + 50 path tokens so `applyingDetectedLinks`
+    /// is measured on a stream-like last paragraph, not a toy string.
+    static func linkHeavyFixture(minUTF8: Int = 20 * 1024) -> String {
+        var chunks: [String] = []
+        chunks.reserveCapacity(100)
+        for i in 0..<50 {
+            chunks.append("Visit https://example.com/item/\(i)/page now.")
+            chunks.append("See Sources/Module\(i)/File\(i).swift for the change.")
+        }
+        var text = chunks.joined(separator: " ")
+        if text.utf8.count < minUTF8 {
+            let pad = minUTF8 - text.utf8.count
+            text += String(repeating: " lorem", count: pad / 6 + 1)
+        }
+        return text
+    }
+
+    static func linkCount(in attributed: AttributedString) -> Int {
+        attributed.runs.reduce(0) { $0 + ($1.link == nil ? 0 : 1) }
+    }
+
+    private func median(_ values: [Double]) -> Double {
+        let sorted = values.sorted()
+        let n = sorted.count
+        precondition(n > 0)
+        if n % 2 == 1 { return sorted[n / 2] }
+        return (sorted[n / 2 - 1] + sorted[n / 2]) / 2
+    }
+
+    func test_linkHeavyFixture_has20KiBAndAtLeast50Matches() {
+        let text = Self.linkHeavyFixture()
+        XCTAssertGreaterThanOrEqual(text.utf8.count, 20 * 1024,
+                                    "stream-tail fixture must be ~20 KiB so distance() cost is visible")
+        let attributed = AgentMessageMarkdown.applyingDetectedLinks(to: AttributedString(text))
+        let matches = Self.linkCount(in: attributed)
+        XCTAssertGreaterThanOrEqual(matches, 50,
+                                    "fixture must contain ≥50 path/URL links; got \(matches)")
+        XCTAssertEqual(matches, 100,
+                       "50 URL + 50 path tokens must all linkify — a cursor bug that drops matches fails here")
+    }
+
+    /// WHY: hover used to live on the parent and re-enter `blocks(from:)` for the
+    /// whole message. After the first finished parse, a cache-hit lookup is still
+    /// a parent-body cost; hover isolation must keep lookup/compute at 0.
+    func test_finishedMultiGroupMessage_secondParseIsCacheHit() {
+        var md = ""
+        for i in 0..<10 {
+            md += "Paragraph \(i) with some prose about the change.\n\n```swift\nlet value\(i) = \(i)\n```\n\n"
+        }
+        let groups = AgentMessageMarkdown.selectionGroups(from: AgentMessageMarkdown.blocks(from: md))
+        XCTAssertGreaterThanOrEqual(groups.count, 10,
+                                    "finished answer must have many groups so parent invalidation is expensive")
+        AgentMessageMarkdown.blocksComputeCountForTesting = 0
+        AgentMessageMarkdown.blocksLookupCountForTesting = 0
+        _ = AgentMessageMarkdown.blocks(from: md)
+        XCTAssertEqual(AgentMessageMarkdown.blocksComputeCountForTesting, 0,
+                       "finished identical text must not re-tokenize")
+        XCTAssertEqual(AgentMessageMarkdown.blocksLookupCountForTesting, 1,
+                       "a parent body pass still looks up; hover must not cause this call")
+    }
+
+    func test_markdownView_isEquatableOnTextCompactAndCacheFlag() {
+        let a = AgentMessageMarkdownView(text: "same body", compact: false, cacheResults: true)
+        let b = AgentMessageMarkdownView(text: "same body", compact: false, cacheResults: true)
+        let otherText = AgentMessageMarkdownView(text: "other", compact: false, cacheResults: true)
+        let otherCompact = AgentMessageMarkdownView(text: "same body", compact: true, cacheResults: true)
+        let otherCache = AgentMessageMarkdownView(text: "same body", compact: false, cacheResults: false)
+        XCTAssertEqual(a, b, "identical text/compact/cacheResults must compare equal so SwiftUI can skip body")
+        XCTAssertNotEqual(a, otherText)
+        XCTAssertNotEqual(a, otherCompact)
+        XCTAssertNotEqual(a, otherCache)
+    }
+
+    /// WHY: hovering Copy used to flip parent @State and re-enter body, which
+    /// called `blocks(from:)` for every group. Child chrome has no path to that parse.
+    func test_codeBlockCopyChrome_hoverPathDoesNotCallBlocksFrom() {
+        var md = ""
+        for i in 0..<10 {
+            md += "Paragraph \(i) with some prose about the change.\n\n```swift\nlet value\(i) = \(i)\n```\n\n"
+        }
+        _ = AgentMessageMarkdown.blocks(from: md)
+        AgentMessageMarkdown.blocksLookupCountForTesting = 0
+        AgentMessageMarkdown.blocksComputeCountForTesting = 0
+        let chrome = CodeBlockCopyChrome(text: "let value0 = 0")
+        XCTAssertEqual(chrome.text, "let value0 = 0")
+        XCTAssertEqual(
+            AgentMessageMarkdown.blocksLookupCountForTesting, 0,
+            "Copy hover lives on CodeBlockCopyChrome; it must not call blocks(from:)"
+        )
+        XCTAssertEqual(
+            AgentMessageMarkdown.blocksComputeCountForTesting, 0,
+            "hover enter/leave must not re-tokenize a finished multi-group message"
+        )
+    }
+
+    /// WHY: `@State hoveredCode` on `AgentMessageMarkdownView` invalidates every
+    /// group. Copy chrome must own hover/copied so parent body (and `blocks(from:)`)
+    /// does not re-run on enter/leave.
+    func test_hoverStateLivesOnCodeBlockCopyChrome_notParent() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/Surfaces/AgentMessageMarkdown.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertFalse(
+            source.contains("@State private var hoveredCode"),
+            "parent hover @State re-runs blocks(from:) for every group on Copy enter/leave"
+        )
+        XCTAssertFalse(
+            source.contains("@State private var copiedCode"),
+            "copied feedback @State on the parent has the same whole-message invalidation"
+        )
+        XCTAssertTrue(
+            source.contains("struct CodeBlockCopyChrome"),
+            "Copy hover/copied must live on a child view"
+        )
+        XCTAssertTrue(
+            source.contains("@State private var hovered"),
+            "CodeBlockCopyChrome must own hovered @State"
+        )
+    }
+
+    /// Microbench for issue #4. Prints raw medians; the ≥5% target is recorded in
+    /// `loops-out/20260906-agent-app-memperf-r9-markdown/performance-proof.md`
+    /// from HEAD vs patched runs (not a hardcoded CI baseline).
+    func test_applyingDetectedLinks_microbench_20KiB_50matches_300iters() {
+        let text = Self.linkHeavyFixture()
+        let source = AttributedString(text)
+        let warmup = 2
+        let samplesN = 5
+        let iterations = 300
+        for _ in 0..<warmup {
+            _ = AgentMessageMarkdown.applyingDetectedLinks(to: source)
+        }
+        var samples: [Double] = []
+        samples.reserveCapacity(samplesN)
+        for _ in 0..<samplesN {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            var lastCount = 0
+            for _ in 0..<iterations {
+                let result = AgentMessageMarkdown.applyingDetectedLinks(to: source)
+                lastCount = Self.linkCount(in: result)
+            }
+            samples.append((CFAbsoluteTimeGetCurrent() - t0) * 1000)
+            XCTAssertEqual(lastCount, 100, "bench must keep 100 links; index conversion must not drop matches")
+        }
+        let med = median(samples)
+        let raw = samples.map { String(format: "%.3f", $0) }.joined(separator: ",")
+        NSLog(
+            "[perf-proof] applyingDetectedLinks utf8=%d matches=100 warmup=%d n=%d iters=%d samples_ms=%@ median_ms=%.3f",
+            text.utf8.count, warmup, samplesN, iterations, raw, med
+        )
+        if let out = ProcessInfo.processInfo.environment["AGENT_MARKDOWN_BENCH_OUT"], !out.isEmpty {
+            let line = "median_ms=\(med) samples_ms=\(raw) utf8=\(text.utf8.count) matches=100 warmup=\(warmup) n=\(samplesN) iters=\(iterations)\n"
+            FileManager.default.createFile(atPath: out, contents: Data(line.utf8))
+        }
+        XCTAssertGreaterThan(med, 0)
+        XCTAssertEqual(samples.count, samplesN)
+    }
 }

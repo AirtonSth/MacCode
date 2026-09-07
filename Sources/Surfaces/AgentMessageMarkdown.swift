@@ -65,6 +65,9 @@ enum AgentMessageMarkdown {
     // unit test can prove repeated renders of identical content hit the cache.
     nonisolated(unsafe) static var blocksComputeCountForTesting = 0
     nonisolated(unsafe) static var inlineComputeCountForTesting = 0
+    /// Test-only: every `blocks(from:)` entry, including cache hits. Hover isolation
+    /// must not increment this after the first parent body evaluation.
+    nonisolated(unsafe) static var blocksLookupCountForTesting = 0
     /// Test-only: successful setObject admissions (not lookups).
     nonisolated(unsafe) static var blocksCacheStoreCountForTesting = 0
     nonisolated(unsafe) static var inlineCacheStoreCountForTesting = 0
@@ -86,6 +89,9 @@ enum AgentMessageMarkdown {
     }
 
     static func blocks(from text: String, cache: Bool = true) -> [AgentMessageMarkdownBlock] {
+        #if DEBUG
+        blocksLookupCountForTesting &+= 1
+        #endif
         let key = cacheKey(for: text)
         // Perf CH-04: `cache: false` (live streaming rows) must only skip the
         // STORE — the read still hits, so a body that was parsed while finished
@@ -441,80 +447,110 @@ enum AgentMessageMarkdown {
     )
 
     static func applyingDetectedLinks(to source: AttributedString) -> AttributedString {
-        var attributed = source
-        let text = String(attributed.characters)
-        guard text.contains("/") || text.contains(".") else { return attributed }
-
-        func attributedRange(_ range: Range<String.Index>) -> Range<AttributedString.Index>? {
-            let startOffset = text.distance(from: text.startIndex, to: range.lowerBound)
-            let length = text.distance(from: range.lowerBound, to: range.upperBound)
-            guard let start = attributed.characters.index(attributed.startIndex, offsetBy: startOffset, limitedBy: attributed.endIndex),
-                  let end = attributed.characters.index(start, offsetBy: length, limitedBy: attributed.endIndex) else { return nil }
-            return start..<end
+        var hasSlashOrDot = false
+        for character in source.characters {
+            if character == "/" || character == "." {
+                hasSlashOrDot = true
+                break
+            }
         }
-        func hasExistingLink(_ range: Range<AttributedString.Index>) -> Bool {
-            attributed[range].runs.contains { $0.link != nil }
+        guard hasSlashOrDot else { return source }
+
+        // NSRange is native on NSAttributedString, so each match is O(1) instead of
+        // `String.distance` + `AttributedString.Index` offset from startIndex.
+        let ns = NSMutableAttributedString(attributedString: NSAttributedString(source))
+        let nsText = ns.string as NSString
+        let fullRange = NSRange(location: 0, length: nsText.length)
+        let sourceHasLinks = source.runs.contains { $0.link != nil }
+
+        func rangesOverlap(_ a: NSRange, _ b: NSRange) -> Bool {
+            a.location < b.location + b.length && b.location < a.location + a.length
         }
-        func markLink(_ range: Range<AttributedString.Index>, url: URL) {
-            attributed[range].link = url
-            // Scope-qualified: AppKit is imported too, and both scopes define
-            // `underlineStyle` with different value types.
-            attributed[range].swiftUI.underlineStyle = .single
-            attributed[range].foregroundColor = DS.Palette.accent
+        func hasExistingLink(_ range: NSRange) -> Bool {
+            guard sourceHasLinks else { return false }
+            guard range.length > 0, NSMaxRange(range) <= ns.length else { return true }
+            var found = false
+            ns.enumerateAttribute(.link, in: range, options: []) { value, _, stop in
+                if value != nil {
+                    found = true
+                    stop.pointee = true
+                }
+            }
+            return found
+        }
+        func markLink(_ range: NSRange, url: URL) {
+            ns.addAttribute(.link, value: url, range: range)
+            ns.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: range)
+            ns.addAttribute(.foregroundColor, value: DS.NS.accent, range: range)
+        }
+        func mappedTrimmed(_ range: NSRange) -> NSRange? {
+            let trimmed = trimmingTrailingPunctuation(nsText, range)
+            return trimmed.length > 0 ? trimmed : nil
         }
 
-        var claimed: [Range<String.Index>] = []
-        let fullRange = NSRange(text.startIndex..., in: text)
+        var claimed: [NSRange] = []
 
-        for match in urlRegex.matches(in: text, range: fullRange) {
-            guard let raw = Range(match.range, in: text) else { continue }
-            let range = trimmingTrailingPunctuation(text, raw)
-            guard !range.isEmpty, let ar = attributedRange(range), !hasExistingLink(ar) else { continue }
-            let token = String(text[range])
+        for match in urlRegex.matches(in: ns.string, range: fullRange) {
+            guard let range = mappedTrimmed(match.range), !hasExistingLink(range) else { continue }
+            let token = nsText.substring(with: range)
             guard let url = normalizedWebURL(token) else { continue }
             if url.isFileURL {
                 guard let fileLink = fileLinkURL(for: url.path) else { continue }
-                markLink(ar, url: fileLink)
+                markLink(range, url: fileLink)
             } else {
-                markLink(ar, url: url)
+                markLink(range, url: url)
             }
             claimed.append(range)
         }
 
-        for match in pathRegex.matches(in: text, range: fullRange) {
-            guard let raw = Range(match.range, in: text) else { continue }
-            let range = trimmingTrailingPunctuation(text, raw)
-            guard !range.isEmpty,
-                  !claimed.contains(where: { $0.overlaps(range) }),
-                  let ar = attributedRange(range), !hasExistingLink(ar) else { continue }
-            guard let fileLink = fileLinkURL(for: String(text[range])) else { continue }
-            markLink(ar, url: fileLink)
+        for match in pathRegex.matches(in: ns.string, range: fullRange) {
+            guard let range = mappedTrimmed(match.range),
+                  !claimed.contains(where: { rangesOverlap($0, range) }),
+                  !hasExistingLink(range) else { continue }
+            guard let fileLink = fileLinkURL(for: nsText.substring(with: range)) else { continue }
+            markLink(range, url: fileLink)
             claimed.append(range)
         }
 
-        // Bare filenames: restricted to inline-code runs. Collect ranges first —
-        // mutating link attributes while iterating `runs` would invalidate them.
-        let codeStringRanges: [Range<String.Index>] = attributed.runs
-            .filter { $0.inlinePresentationIntent?.contains(.code) == true }
-            .compactMap { run in
-                let startOffset = attributed.characters.distance(from: attributed.startIndex, to: run.range.lowerBound)
-                let length = attributed.characters.distance(from: run.range.lowerBound, to: run.range.upperBound)
-                guard let start = text.index(text.startIndex, offsetBy: startOffset, limitedBy: text.endIndex),
-                      let end = text.index(start, offsetBy: length, limitedBy: text.endIndex) else { return nil }
-                return start..<end
-            }
-        for codeRange in codeStringRanges {
-            let nsRange = NSRange(codeRange, in: text)
-            for match in bareFilenameRegex.matches(in: text, range: nsRange) {
-                guard let range = Range(match.range, in: text),
-                      !claimed.contains(where: { $0.overlaps(range) }),
-                      let ar = attributedRange(range), !hasExistingLink(ar) else { continue }
-                guard let fileLink = fileLinkURL(for: String(text[range])) else { continue }
-                markLink(ar, url: fileLink)
+        // Bare filenames: restricted to inline-code runs. Collect UTF-16 ranges
+        // from the source runs before mutation (few spans; not the 50-match path).
+        let codeNSRanges: [NSRange] = source.runs.compactMap { run in
+            guard run.inlinePresentationIntent?.contains(.code) == true else { return nil }
+            return NSRange(run.range, in: source)
+        }
+        for nsRange in codeNSRanges {
+            for match in bareFilenameRegex.matches(in: ns.string, range: nsRange) {
+                guard let range = mappedTrimmed(match.range),
+                      !claimed.contains(where: { rangesOverlap($0, range) }),
+                      !hasExistingLink(range) else { continue }
+                guard let fileLink = fileLinkURL(for: nsText.substring(with: range)) else { continue }
+                markLink(range, url: fileLink)
                 claimed.append(range)
             }
         }
-        return attributed
+
+        // NSAttributedString keeps AppKit keys (link, underline, NSColor).
+        // SwiftUI font/background/intent would otherwise drop on the way back.
+        var result = AttributedString(ns)
+        for run in source.runs {
+            let nsRange = NSRange(run.range, in: source)
+            guard nsRange.length > 0, let range = Range(nsRange, in: result) else { continue }
+            if let font = run.font {
+                result[range].font = font
+            }
+            if let backgroundColor = run.backgroundColor {
+                result[range].backgroundColor = backgroundColor
+            }
+            if let intent = run.inlinePresentationIntent {
+                result[range].inlinePresentationIntent = intent
+            }
+            let addedLink = run.link == nil && result[range].link != nil
+            if addedLink { continue }
+            if let foregroundColor = run.foregroundColor {
+                result[range].foregroundColor = foregroundColor
+            }
+        }
+        return result
     }
 
     /// "https://x", "file:///x" parse directly; "www.x" and "localhost:3000" get a
@@ -528,19 +564,19 @@ enum AgentMessageMarkdown {
 
     /// Sentence punctuation glued to a match ("see /a/b.swift.") is not part of the
     /// token. A trailing ")" is kept only when the token contains its "(".
-    private static func trimmingTrailingPunctuation(_ text: String, _ range: Range<String.Index>) -> Range<String.Index> {
-        var upper = range.upperBound
-        while upper > range.lowerBound {
-            let last = text[text.index(before: upper)]
+    private static func trimmingTrailingPunctuation(_ text: NSString, _ range: NSRange) -> NSRange {
+        var length = range.length
+        while length > 0 {
+            let last = text.substring(with: NSRange(location: range.location + length - 1, length: 1))
             if ".,;:!?\"'".contains(last) {
-                upper = text.index(before: upper)
-            } else if last == ")", !text[range.lowerBound..<upper].contains("(") {
-                upper = text.index(before: upper)
+                length -= 1
+            } else if last == ")", !(text.substring(with: NSRange(location: range.location, length: length)).contains("(")) {
+                length -= 1
             } else {
                 break
             }
         }
-        return range.lowerBound..<upper
+        return NSRange(location: range.location, length: length)
     }
 
     /// IMP-010: Copies `text` to the system general pasteboard.
@@ -599,7 +635,62 @@ enum AgentMessageMarkdown {
     }
 }
 
-public struct AgentMessageMarkdownView: View {
+/// Copy-button chrome for a fenced code block. Hover/copied @State is local so
+/// `AgentMessageMarkdownView` stays equatable on `text` and does not re-run
+/// `blocks(from:)` when the pointer enters or leaves Copy.
+struct CodeBlockCopyChrome: View {
+    let text: String
+    @State private var hovered = false
+    @State private var copied = false
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            AgentSelectablePlainText(
+                text: text.isEmpty ? " " : text,
+                fontSize: 11,
+                monospaced: true,
+                textColor: DS.NS.text
+            )
+            .padding(DS.Space.md)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(DS.Palette.surface)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+
+            if hovered {
+                Button(action: {
+                    AgentMessageMarkdown.copyCodeToPasteboard(text)
+                    copied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                        copied = false
+                    }
+                }) {
+                    Text(copied ? "Copied" : "Copy")
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .padding(.horizontal, DS.Space.sm)
+                        .padding(.vertical, DS.Space.xxs)
+                        .background(DS.Palette.surfaceRaised)
+                        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                }
+                .buttonStyle(.plain)
+                .help("Copy code to clipboard")
+                .padding(DS.Space.sm)
+                .transition(.opacity)
+            }
+        }
+        .onHover { inside in
+            withAnimation(.easeInOut(duration: 0.12)) {
+                hovered = inside
+            }
+        }
+    }
+}
+
+public struct AgentMessageMarkdownView: View, Equatable {
     let text: String
     var compact: Bool = false
     /// When false (live streaming rows), parse results are not inserted into NSCache
@@ -612,11 +703,9 @@ public struct AgentMessageMarkdownView: View {
         self.cacheResults = cacheResults
     }
 
-    /// IMP-010: tracks which code block (by enumeration offset) is hovered.
-    @State private var hoveredCode: Int? = nil
-    /// IMP-010: tracks which code block most recently had its copy action triggered,
-    /// so the button can show transient "Copied" feedback.
-    @State private var copiedCode: Int? = nil
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.text == rhs.text && lhs.compact == rhs.compact && lhs.cacheResults == rhs.cacheResults
+    }
 
     public var body: some View {
         let groups = AgentMessageMarkdown.selectionGroups(
@@ -624,17 +713,14 @@ public struct AgentMessageMarkdownView: View {
         )
         VStack(alignment: .leading, spacing: compact ? DS.Space.sm : DS.Space.md) {
             // Iterate the existing collection's indices instead of allocating an
-            // enumerated Array on every SwiftUI body pass. Streaming/hover state
-            // can invalidate this view frequently, and the groups already have
-            // stable positional identity for the code-copy state below.
+            // enumerated Array on every SwiftUI body pass. Positional ids stay
+            // because content-hash ids remount the live streaming group on every token.
             ForEach(groups.indices, id: \.self) { index in
                 let group = groups[index]
-                // Unary ForEach child (AvdLee list-patterns). Positional ids stay
-                // because hover/copy is index-keyed; content-hash ids remount the
-                // live streaming group on every token.
+                // Unary ForEach child (AvdLee list-patterns).
                 Group {
                     if group.count == 1, let block = group.first, isIsolatedBlock(block) {
-                        blockView(block, index: index)
+                        blockView(block)
                     } else {
                         // Perf CH-04: only the last group of a live row can still
                         // grow; earlier groups parse (and cache) like finished
@@ -687,7 +773,7 @@ public struct AgentMessageMarkdownView: View {
     }
 
     @ViewBuilder
-    private func blockView(_ block: AgentMessageMarkdownBlock, index: Int) -> some View {
+    private func blockView(_ block: AgentMessageMarkdownBlock) -> some View {
         switch block.kind {
         case .paragraph:
             linkedInline(block.text, lineSpacing: compact ? 3 : 5)
@@ -763,53 +849,7 @@ public struct AgentMessageMarkdownView: View {
             .padding(.leading, DS.Space.xs)
 
         case .code:
-            // IMP-010: wrap code block in ZStack so a copy button can be
-            // overlaid in the top-right corner without altering layout.
-            ZStack(alignment: .topTrailing) {
-                AgentSelectablePlainText(
-                    text: block.text.isEmpty ? " " : block.text,
-                    fontSize: 11,
-                    monospaced: true,
-                    textColor: DS.NS.text
-                )
-                    .padding(DS.Space.md)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(DS.Palette.surface)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                        .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-
-                // IMP-010: copy button — visible when this code block is hovered.
-                if hoveredCode == index {
-                    Button(action: {
-                        AgentMessageMarkdown.copyCodeToPasteboard(block.text)
-                        copiedCode = index
-                        // Reset feedback after 1.2 s to match MarkdownSurface JS pattern.
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                            if copiedCode == index { copiedCode = nil }
-                        }
-                    }) {
-                        Text(copiedCode == index ? "Copied" : "Copy")
-                            .font(DS.Font.caption2)
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .padding(.horizontal, DS.Space.sm)
-                            .padding(.vertical, DS.Space.xxs)
-                            .background(DS.Palette.surfaceRaised)
-                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                            .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-                    }
-                    .buttonStyle(.plain)
-                    .help("Copy code to clipboard")
-                    .padding(DS.Space.sm)
-                    .transition(.opacity)
-                }
-            }
-            .onHover { inside in
-                withAnimation(.easeInOut(duration: 0.12)) {
-                    hoveredCode = inside ? index : nil
-                }
-            }
+            CodeBlockCopyChrome(text: block.text)
         }
     }
 
