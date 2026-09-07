@@ -305,6 +305,39 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
         XCTAssertFalse(AgentChatLiveTurnChrome.shouldHideAssistantOutput(first, previousTurns: []))
     }
 
+    func test_laterTurnHidesCompactedWhitespaceDuplicate_becauseNormalizedFinalsAreTheSameAnswer() {
+        // WHY: exact-set hide uses AgentTranscriptOrder.normalizedFinalText, which
+        // strips whitespace. Two turns with the same compact final must still hide.
+        let first = AssistantTurnSnapshot(
+            turnId: "t-ws-1",
+            finalAssistantMessage: "hello world",
+            finished: true
+        )
+        let second = AssistantTurnSnapshot(
+            turnId: "t-ws-2",
+            finalAssistantMessage: "hello  world",
+            finished: true
+        )
+        XCTAssertTrue(AgentChatLiveTurnChrome.shouldHideAssistantOutput(second, previousTurns: [first]))
+    }
+
+    func test_laterTurnDoesNotHideSubstringExpansion_becauseHideIsExactNormalizedMembership() {
+        // WHY: the old O(turns² × contains) path treated a longer expansion as
+        // a duplicate. Exact membership keeps identical finals hidden and leaves
+        // expanded/distinct answers visible.
+        let first = AssistantTurnSnapshot(
+            turnId: "t-sub-1",
+            finalAssistantMessage: "same answer",
+            finished: true
+        )
+        let expanded = AssistantTurnSnapshot(
+            turnId: "t-sub-2",
+            finalAssistantMessage: "A same answer, expanded",
+            finished: true
+        )
+        XCTAssertFalse(AgentChatLiveTurnChrome.shouldHideAssistantOutput(expanded, previousTurns: [first]))
+    }
+
     func test_isRicherKeepsLiveThoughtAheadOfLaggingPersist_becauseFlushMustNotEraseThinking() {
         // WHY: Desk applies coordinator events immediately. A later SQLite
         // replay that has not flushed the reasoning delta must not wipe the row.

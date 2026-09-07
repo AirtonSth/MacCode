@@ -120,4 +120,69 @@ final class BotsDeskChatFlowTests: XCTestCase {
             "work after the ask paints below the waiting bubble, not above it"
         )
     }
+
+    func test_deskTimeline_hidesExactAndCompactedFinalsViaIncrementalSet() throws {
+        // WHY: Desk used to call the array overload once per turn, rebuilding
+        // the normalized-final set each time. The timeline must grow one set
+        // and still hide exact/compacted duplicates while leaving expansions.
+        let first = AssistantTurnSnapshot(
+            turnId: "t-desk-1",
+            items: [AssistantItem(id: "a", turnId: "t-desk-1", type: .tool, startedAtMs: 1_000)],
+            finalAssistantMessage: "hello world",
+            finished: true,
+            startedAtMs: 1_000
+        )
+        let compacted = AssistantTurnSnapshot(
+            turnId: "t-desk-2",
+            items: [AssistantItem(id: "b", turnId: "t-desk-2", type: .tool, startedAtMs: 2_000)],
+            finalAssistantMessage: "hello  world",
+            finished: true,
+            startedAtMs: 2_000
+        )
+        let expanded = AssistantTurnSnapshot(
+            turnId: "t-desk-3",
+            items: [AssistantItem(id: "c", turnId: "t-desk-3", type: .tool, startedAtMs: 3_000)],
+            finalAssistantMessage: "A hello world, expanded",
+            finished: true,
+            startedAtMs: 3_000
+        )
+        let items = BotsDeskFollowThrough.timeline(
+            messages: [],
+            workLog: [],
+            turns: [first, compacted, expanded],
+            hideWorkLog: true
+        )
+        let hidden = items.compactMap { item -> Bool? in
+            if case .liveTurn(_, let hide) = item { return hide }
+            return nil
+        }
+        XCTAssertEqual(
+            hidden,
+            [false, true, false],
+            "Desk must hide compacted duplicates and keep substring expansions, using the incremental set"
+        )
+
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/AppShell/BotsDeskFollowThrough.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "static func timeline("))
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "\n    static func splitLiveTail(")?.lowerBound ?? rest.endIndex
+        let timeline = String(rest[..<end])
+        XCTAssertTrue(
+            timeline.contains("insertNormalizedAssistantFinals"),
+            "Desk timeline must grow one normalized-final set instead of rebuilding per turn"
+        )
+        XCTAssertTrue(
+            timeline.contains("previousNormalizedFinals:"),
+            "Desk timeline must call the incremental-set hide overload"
+        )
+        XCTAssertFalse(
+            timeline.contains("previousTurns:"),
+            "Desk timeline must not call the array rebuild overload in the per-turn loop"
+        )
+    }
 }

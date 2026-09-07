@@ -6,7 +6,7 @@ import CoreModel
 final class AgentChatRowContextPerformanceTests: XCTestCase {
     func test_paintContextPreservesPeerHeadersAndDuplicateFinalDecisions() {
         let first = turn("first", final: "same answer")
-        let duplicate = turn("duplicate", final: "A same answer, expanded")
+        let duplicate = turn("duplicate", final: "same answer")
         let unrelated = turn("unrelated", final: "different")
         let entries: [AgentAppView.TranscriptEntry] = [
             .turn(first),
@@ -192,6 +192,131 @@ final class AgentChatRowContextPerformanceTests: XCTestCase {
             greenP95,
             legacyP95 * 0.75,
             "shared row derivation p95 must materially beat the legacy per-row rescan"
+        )
+    }
+
+    /// Residual #3: 320 finished turns × ~4 KiB finals. Nested `String.contains`
+    /// hide is O(turns² × character). Exact-set membership must stay equivalent
+    /// for identical finals and beat the nested scan after the hide-path fix.
+    func test_hidePath_320Turns4KiBFinals_microbench() {
+        let turnCount = 320
+        let finalBytes = 4096
+        let pad = String(repeating: "x", count: finalBytes - 24)
+        var entries: [AgentAppView.TranscriptEntry] = []
+        entries.reserveCapacity(turnCount)
+        var turns: [AssistantTurnSnapshot] = []
+        turns.reserveCapacity(turnCount)
+        for index in 0..<turnCount {
+            let final: String
+            if index == turnCount - 1 {
+                // Exact duplicate of turn 0 — both nested-contains and exact-set
+                // must hide this later final. Substring expansions are not this case.
+                final = "turn-0-final-" + pad
+            } else {
+                final = "turn-\(index)-final-" + pad
+            }
+            let snapshot = turn("turn-\(index)", final: final)
+            turns.append(snapshot)
+            entries.append(.turn(snapshot))
+        }
+        let rows = entries.map(AgentAppView.ChatFlowRow.entry)
+
+        func nestedContainsHide(
+            _ candidate: AssistantTurnSnapshot,
+            previousTurns: [AssistantTurnSnapshot]
+        ) -> Bool {
+            let bodies = AgentChatLiveTurnChrome.assistantBodies(in: candidate)
+            guard !bodies.isEmpty else { return false }
+            return bodies.contains { body in
+                previousTurns.contains {
+                    AgentChatLiveTurnChrome.assistantBodies(in: $0).contains {
+                        AgentChatLiveTurnChrome.assistantTextsMatch(body, $0)
+                    }
+                }
+            }
+        }
+
+        func nestedHideMap() -> [String: Bool] {
+            var hidden: [String: Bool] = [:]
+            var prior: [AssistantTurnSnapshot] = []
+            prior.reserveCapacity(turns.count)
+            for snapshot in turns {
+                hidden[snapshot.turnId] = nestedContainsHide(snapshot, previousTurns: prior)
+                prior.append(snapshot)
+            }
+            return hidden
+        }
+
+        func productionHideMap() -> [String: Bool] {
+            var hidden: [String: Bool] = [:]
+            var prior: [AssistantTurnSnapshot] = []
+            prior.reserveCapacity(turns.count)
+            for snapshot in turns {
+                hidden[snapshot.turnId] = AgentChatLiveTurnChrome.shouldHideAssistantOutput(
+                    snapshot,
+                    previousTurns: prior
+                )
+                prior.append(snapshot)
+            }
+            return hidden
+        }
+
+        for _ in 0..<2 {
+            _ = nestedHideMap()
+            _ = productionHideMap()
+            _ = AgentAppView.makeChatRowPaintContext(rows: rows, visibleEntries: entries, bots: [ceo])
+        }
+        var nestedSamples: [Double] = []
+        var hideSamples: [Double] = []
+        var contextSamples: [Double] = []
+        nestedSamples.reserveCapacity(5)
+        hideSamples.reserveCapacity(5)
+        contextSamples.reserveCapacity(5)
+        for _ in 0..<5 {
+            nestedSamples.append(measure { _ = nestedHideMap() })
+            hideSamples.append(measure { _ = productionHideMap() })
+            contextSamples.append(measure {
+                _ = AgentAppView.makeChatRowPaintContext(rows: rows, visibleEntries: entries, bots: [ceo])
+            })
+        }
+
+        let nestedMap = nestedHideMap()
+        let productionMap = productionHideMap()
+        let context = AgentAppView.makeChatRowPaintContext(rows: rows, visibleEntries: entries, bots: [ceo])
+        XCTAssertEqual(
+            productionMap,
+            nestedMap,
+            "exact-duplicate hide decisions must match the nested-contains scan for identical 4KiB finals"
+        )
+        XCTAssertEqual(context.hideAssistantOutputByTurnId, productionMap)
+        XCTAssertEqual(nestedMap["turn-0"], false)
+        XCTAssertEqual(nestedMap["turn-\(turnCount - 1)"], true, "the last turn repeats turn-0's final")
+        XCTAssertEqual(nestedMap["turn-1"], false)
+
+        let nestedMedian = median(nestedSamples)
+        let hideMedian = median(hideSamples)
+        let contextMedian = median(contextSamples)
+        print(
+            "HIDE_PATH_4KIB_BENCH nested_samples=\(format(nestedSamples)) nested_median_ms=\(format(nestedMedian)) "
+                + "shouldHide_samples=\(format(hideSamples)) shouldHide_median_ms=\(format(hideMedian)) "
+                + "paintContext_samples=\(format(contextSamples)) paintContext_median_ms=\(format(contextMedian))"
+        )
+        NSLog(
+            "[perf-proof] hide-4kib nested_ms=%@ shouldHide_ms=%@ paintContext_ms=%@ nested=%@ shouldHide=%@ paintContext=%@",
+            String(nestedMedian),
+            String(hideMedian),
+            String(contextMedian),
+            String(describing: nestedSamples),
+            String(describing: hideSamples),
+            String(describing: contextSamples)
+        )
+        XCTAssertLessThan(contextMedian, 60_000, "4KiB hide-path paint context must finish in a bounded sample")
+        let hideImprovement = (nestedMedian - hideMedian) / nestedMedian * 100.0
+        let contextImprovement = (nestedMedian - contextMedian) / nestedMedian * 100.0
+        XCTAssertGreaterThan(
+            max(hideImprovement, contextImprovement),
+            5.0,
+            "exact-set hide path must beat nested String.contains by ≥5% (hide=\(hideImprovement)% context=\(contextImprovement)% nested=\(nestedMedian)ms hide=\(hideMedian)ms context=\(contextMedian)ms)"
         )
     }
 
