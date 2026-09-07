@@ -133,8 +133,13 @@ final class CodexRunnerArgsTests: XCTestCase {
 
     func test_fastServiceTier_forwardedToCodexConfig() {
         let a = CodexRunner.buildArgs(req(serviceTier: .fast))
-        XCTAssertTrue(a.contains(#"model_service_tier="fast""#),
-                      "Fast mode must reach Codex as the service tier requested by t3code parity")
+        // WHY: openai/codex config key is `service_tier`. The old
+        // `model_service_tier` override was ignored (or hard-failed under
+        // --strict-config), so Fast on exec never applied.
+        XCTAssertTrue(a.contains(#"service_tier="fast""#),
+                      "Fast mode must reach Codex as the upstream service_tier config key")
+        XCTAssertFalse(a.contains("model_service_tier"),
+                       "Stale model_service_tier must not be emitted")
     }
 
     func test_supportedEfforts_omitMinimalRejectedByCodexCli() {

@@ -178,6 +178,14 @@ final class GrokRunnerArgsTests: XCTestCase {
                        "Grok 4.5 supports only low/medium/high")
     }
 
+    func test_glmFlashPreservesMaxReasoningEffort() throws {
+        let model = "glm-5.3-flash"
+        XCTAssertEqual(GrokRunner.supportedReasoningEfforts(for: model), [.low, .high, .max])
+        let args = GrokRunner.buildArgs(req(model: model, effort: .max))
+        let index = try XCTUnwrap(args.firstIndex(of: "--reasoning-effort"))
+        XCTAssertEqual(args[index + 1], "max")
+    }
+
     func test_composerModelOmitsReasoningEffortFlag() {
         let a = GrokRunner.buildArgs(req(model: "grok-composer-2.5-fast", effort: .high))
         XCTAssertNil(a.firstIndex(of: "--reasoning-effort"),

@@ -65,12 +65,12 @@ enum AgentMessageMarkdown {
     // unit test can prove repeated renders of identical content hit the cache.
     nonisolated(unsafe) static var blocksComputeCountForTesting = 0
     nonisolated(unsafe) static var inlineComputeCountForTesting = 0
+    /// Test-only: every `blocks(from:)` entry, including cache hits. Hover isolation
+    /// must not increment this after the first parent body evaluation.
+    nonisolated(unsafe) static var blocksLookupCountForTesting = 0
     /// Test-only: successful setObject admissions (not lookups).
     nonisolated(unsafe) static var blocksCacheStoreCountForTesting = 0
     nonisolated(unsafe) static var inlineCacheStoreCountForTesting = 0
-    /// Character-index advances while mapping regex matches onto AttributedString.
-    /// Distance-from-start is O(matches × len); a monotonic cursor is O(len).
-    nonisolated(unsafe) static var linkIndexAdvanceCountForTesting = 0
     #endif
 
     /// Whether a source string is eligible to occupy NSCache.
@@ -89,6 +89,9 @@ enum AgentMessageMarkdown {
     }
 
     static func blocks(from text: String, cache: Bool = true) -> [AgentMessageMarkdownBlock] {
+        #if DEBUG
+        blocksLookupCountForTesting &+= 1
+        #endif
         let key = cacheKey(for: text)
         // Perf CH-04: `cache: false` (live streaming rows) must only skip the
         // STORE — the read still hits, so a body that was parsed while finished
@@ -444,76 +447,110 @@ enum AgentMessageMarkdown {
     )
 
     static func applyingDetectedLinks(to source: AttributedString) -> AttributedString {
-        var attributed = source
-        let text = String(attributed.characters)
-        guard text.contains("/") || text.contains(".") else { return attributed }
-
-        func hasExistingLink(_ range: Range<AttributedString.Index>) -> Bool {
-            attributed[range].runs.contains { $0.link != nil }
+        var hasSlashOrDot = false
+        for character in source.characters {
+            if character == "/" || character == "." {
+                hasSlashOrDot = true
+                break
+            }
         }
-        func markLink(_ range: Range<AttributedString.Index>, url: URL) {
-            attributed[range].link = url
-            // Scope-qualified: AppKit is imported too, and both scopes define
-            // `underlineStyle` with different value types.
-            attributed[range].swiftUI.underlineStyle = .single
-            attributed[range].foregroundColor = DS.Palette.accent
+        guard hasSlashOrDot else { return source }
+
+        // NSRange is native on NSAttributedString, so each match is O(1) instead of
+        // `String.distance` + `AttributedString.Index` offset from startIndex.
+        let ns = NSMutableAttributedString(attributedString: NSAttributedString(source))
+        let nsText = ns.string as NSString
+        let fullRange = NSRange(location: 0, length: nsText.length)
+        let sourceHasLinks = source.runs.contains { $0.link != nil }
+
+        func rangesOverlap(_ a: NSRange, _ b: NSRange) -> Bool {
+            a.location < b.location + b.length && b.location < a.location + a.length
+        }
+        func hasExistingLink(_ range: NSRange) -> Bool {
+            guard sourceHasLinks else { return false }
+            guard range.length > 0, NSMaxRange(range) <= ns.length else { return true }
+            var found = false
+            ns.enumerateAttribute(.link, in: range, options: []) { value, _, stop in
+                if value != nil {
+                    found = true
+                    stop.pointee = true
+                }
+            }
+            return found
+        }
+        func markLink(_ range: NSRange, url: URL) {
+            ns.addAttribute(.link, value: url, range: range)
+            ns.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: range)
+            ns.addAttribute(.foregroundColor, value: DS.NS.accent, range: range)
+        }
+        func mappedTrimmed(_ range: NSRange) -> NSRange? {
+            let trimmed = trimmingTrailingPunctuation(nsText, range)
+            return trimmed.length > 0 ? trimmed : nil
         }
 
-        var claimed: [Range<String.Index>] = []
-        var planned: [(Range<String.Index>, URL)] = []
-        let fullRange = NSRange(text.startIndex..., in: text)
-        // Convert indices on the immutable source. Mutating link attributes
-        // invalidates a CharacterView held by the cursor.
-        var cursor = MonotonicCharacterCursor(text: text, attributed: attributed)
+        var claimed: [NSRange] = []
 
-        for match in urlRegex.matches(in: text, range: fullRange) {
-            guard let raw = Range(match.range, in: text) else { continue }
-            let range = trimmingTrailingPunctuation(text, raw)
-            guard !range.isEmpty else { continue }
-            let token = String(text[range])
+        for match in urlRegex.matches(in: ns.string, range: fullRange) {
+            guard let range = mappedTrimmed(match.range), !hasExistingLink(range) else { continue }
+            let token = nsText.substring(with: range)
             guard let url = normalizedWebURL(token) else { continue }
             if url.isFileURL {
                 guard let fileLink = fileLinkURL(for: url.path) else { continue }
-                planned.append((range, fileLink))
+                markLink(range, url: fileLink)
             } else {
-                planned.append((range, url))
+                markLink(range, url: url)
             }
             claimed.append(range)
         }
 
-        for match in pathRegex.matches(in: text, range: fullRange) {
-            guard let raw = Range(match.range, in: text) else { continue }
-            let range = trimmingTrailingPunctuation(text, raw)
-            guard !range.isEmpty,
-                  !claimed.contains(where: { $0.overlaps(range) }) else { continue }
-            guard let fileLink = fileLinkURL(for: String(text[range])) else { continue }
-            planned.append((range, fileLink))
+        for match in pathRegex.matches(in: ns.string, range: fullRange) {
+            guard let range = mappedTrimmed(match.range),
+                  !claimed.contains(where: { rangesOverlap($0, range) }),
+                  !hasExistingLink(range) else { continue }
+            guard let fileLink = fileLinkURL(for: nsText.substring(with: range)) else { continue }
+            markLink(range, url: fileLink)
             claimed.append(range)
         }
 
-        // Bare filenames: restricted to inline-code runs. Collect ranges first —
-        // mutating link attributes while iterating `runs` would invalidate them.
-        let codeStringRanges: [Range<String.Index>] = attributed.runs
-            .filter { $0.inlinePresentationIntent?.contains(.code) == true }
-            .compactMap { cursor.stringRange(for: $0.range) }
-        for codeRange in codeStringRanges {
-            let nsRange = NSRange(codeRange, in: text)
-            for match in bareFilenameRegex.matches(in: text, range: nsRange) {
-                guard let range = Range(match.range, in: text),
-                      !claimed.contains(where: { $0.overlaps(range) }) else { continue }
-                guard let fileLink = fileLinkURL(for: String(text[range])) else { continue }
-                planned.append((range, fileLink))
+        // Bare filenames: restricted to inline-code runs. Collect UTF-16 ranges
+        // from the source runs before mutation (few spans; not the 50-match path).
+        let codeNSRanges: [NSRange] = source.runs.compactMap { run in
+            guard run.inlinePresentationIntent?.contains(.code) == true else { return nil }
+            return NSRange(run.range, in: source)
+        }
+        for nsRange in codeNSRanges {
+            for match in bareFilenameRegex.matches(in: ns.string, range: nsRange) {
+                guard let range = mappedTrimmed(match.range),
+                      !claimed.contains(where: { rangesOverlap($0, range) }),
+                      !hasExistingLink(range) else { continue }
+                guard let fileLink = fileLinkURL(for: nsText.substring(with: range)) else { continue }
+                markLink(range, url: fileLink)
                 claimed.append(range)
             }
         }
 
-        planned.sort { $0.0.lowerBound < $1.0.lowerBound }
-        cursor = MonotonicCharacterCursor(text: text, attributed: attributed)
-        for (range, url) in planned {
-            guard let ar = cursor.attributedRange(for: range), !hasExistingLink(ar) else { continue }
-            markLink(ar, url: url)
+        // NSAttributedString keeps AppKit keys (link, underline, NSColor).
+        // SwiftUI font/background/intent would otherwise drop on the way back.
+        var result = AttributedString(ns)
+        for run in source.runs {
+            let nsRange = NSRange(run.range, in: source)
+            guard nsRange.length > 0, let range = Range(nsRange, in: result) else { continue }
+            if let font = run.font {
+                result[range].font = font
+            }
+            if let backgroundColor = run.backgroundColor {
+                result[range].backgroundColor = backgroundColor
+            }
+            if let intent = run.inlinePresentationIntent {
+                result[range].inlinePresentationIntent = intent
+            }
+            let addedLink = run.link == nil && result[range].link != nil
+            if addedLink { continue }
+            if let foregroundColor = run.foregroundColor {
+                result[range].foregroundColor = foregroundColor
+            }
         }
-        return attributed
+        return result
     }
 
     /// "https://x", "file:///x" parse directly; "www.x" and "localhost:3000" get a
@@ -527,19 +564,19 @@ enum AgentMessageMarkdown {
 
     /// Sentence punctuation glued to a match ("see /a/b.swift.") is not part of the
     /// token. A trailing ")" is kept only when the token contains its "(".
-    private static func trimmingTrailingPunctuation(_ text: String, _ range: Range<String.Index>) -> Range<String.Index> {
-        var upper = range.upperBound
-        while upper > range.lowerBound {
-            let last = text[text.index(before: upper)]
+    private static func trimmingTrailingPunctuation(_ text: NSString, _ range: NSRange) -> NSRange {
+        var length = range.length
+        while length > 0 {
+            let last = text.substring(with: NSRange(location: range.location + length - 1, length: 1))
             if ".,;:!?\"'".contains(last) {
-                upper = text.index(before: upper)
-            } else if last == ")", !text[range.lowerBound..<upper].contains("(") {
-                upper = text.index(before: upper)
+                length -= 1
+            } else if last == ")", !(text.substring(with: NSRange(location: range.location, length: length)).contains("(")) {
+                length -= 1
             } else {
                 break
             }
         }
-        return range.lowerBound..<upper
+        return NSRange(location: range.location, length: length)
     }
 
     /// IMP-010: Copies `text` to the system general pasteboard.
@@ -598,88 +635,15 @@ enum AgentMessageMarkdown {
     }
 }
 
-/// Walks `String` and `AttributedString` characters forward together.
-/// Total cost for a sorted sequence of ranges is O(len), not O(matches × len).
-private struct MonotonicCharacterCursor {
-    let text: String
-    let attributed: AttributedString
-    private var stringIndex: String.Index
-    private var attrIndex: AttributedString.Index
-
-    init(text: String, attributed: AttributedString) {
-        self.text = text
-        self.attributed = attributed
-        self.stringIndex = text.startIndex
-        self.attrIndex = attributed.startIndex
-    }
-
-    mutating func attributedRange(for range: Range<String.Index>) -> Range<AttributedString.Index>? {
-        guard let start = advanceString(to: range.lowerBound),
-              let end = advanceString(to: range.upperBound) else { return nil }
-        return start..<end
-    }
-
-    mutating func stringRange(for range: Range<AttributedString.Index>) -> Range<String.Index>? {
-        guard let start = advanceAttr(to: range.lowerBound),
-              let end = advanceAttr(to: range.upperBound) else { return nil }
-        return start..<end
-    }
-
-    private mutating func rewind() {
-        stringIndex = text.startIndex
-        attrIndex = attributed.startIndex
-    }
-
-    private mutating func noteAdvance() {
-        #if DEBUG
-        AgentMessageMarkdown.linkIndexAdvanceCountForTesting &+= 1
-        #endif
-    }
-
-    private mutating func advanceString(to target: String.Index) -> AttributedString.Index? {
-        if target < stringIndex { rewind() }
-        let characters = attributed.characters
-        while stringIndex < target {
-            guard stringIndex < text.endIndex, attrIndex < characters.endIndex else { return nil }
-            stringIndex = text.index(after: stringIndex)
-            attrIndex = characters.index(after: attrIndex)
-            noteAdvance()
-        }
-        return attrIndex
-    }
-
-    private mutating func advanceAttr(to target: AttributedString.Index) -> String.Index? {
-        if target < attrIndex { rewind() }
-        let characters = attributed.characters
-        while attrIndex < target {
-            guard stringIndex < text.endIndex, attrIndex < characters.endIndex else { return nil }
-            stringIndex = text.index(after: stringIndex)
-            attrIndex = characters.index(after: attrIndex)
-            noteAdvance()
-        }
-        return stringIndex
-    }
-}
-
-/// IMP-010 / CH-13: hover and copy chrome are per-block `@State`.
-/// Keeping them on `AgentMessageMarkdownView` rebuilt every sibling on hover.
-struct AgentMessageMarkdownCodeBlockView: View, Equatable {
+/// Copy-button chrome for a fenced code block. Hover/copied @State is local so
+/// `AgentMessageMarkdownView` stays equatable on `text` and does not re-run
+/// `blocks(from:)` when the pointer enters or leaves Copy.
+struct CodeBlockCopyChrome: View {
     let text: String
     @State private var hovered = false
     @State private var copied = false
 
-    #if DEBUG
-    nonisolated(unsafe) static var bodyCountForTesting = 0
-    #endif
-
-    static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.text == rhs.text
-    }
-
     var body: some View {
-        #if DEBUG
-        let _ = Self.bumpBodyCountForTesting()
-        #endif
         ZStack(alignment: .topTrailing) {
             AgentSelectablePlainText(
                 text: text.isEmpty ? " " : text,
@@ -724,24 +688,14 @@ struct AgentMessageMarkdownCodeBlockView: View, Equatable {
             }
         }
     }
-
-    #if DEBUG
-    private static func bumpBodyCountForTesting() {
-        bodyCountForTesting &+= 1
-    }
-    #endif
 }
 
-public struct AgentMessageMarkdownView: View {
+public struct AgentMessageMarkdownView: View, Equatable {
     let text: String
     var compact: Bool = false
     /// When false (live streaming rows), parse results are not inserted into NSCache
     /// so growing partial bodies cannot thrash occupancy (R4-B).
     var cacheResults: Bool = true
-
-    #if DEBUG
-    nonisolated(unsafe) static var bodyCountForTesting = 0
-    #endif
 
     public init(text: String, compact: Bool = false, cacheResults: Bool = true) {
         self.text = text
@@ -749,23 +703,21 @@ public struct AgentMessageMarkdownView: View {
         self.cacheResults = cacheResults
     }
 
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.text == rhs.text && lhs.compact == rhs.compact && lhs.cacheResults == rhs.cacheResults
+    }
+
     public var body: some View {
-        #if DEBUG
-        let _ = Self.bumpBodyCountForTesting()
-        #endif
         let groups = AgentMessageMarkdown.selectionGroups(
             from: AgentMessageMarkdown.blocks(from: text, cache: cacheResults)
         )
         VStack(alignment: .leading, spacing: compact ? DS.Space.sm : DS.Space.md) {
             // Iterate the existing collection's indices instead of allocating an
-            // enumerated Array on every SwiftUI body pass. Streaming/hover state
-            // can invalidate this view frequently, and the groups already have
-            // stable positional identity for the code-copy state below.
+            // enumerated Array on every SwiftUI body pass. Positional ids stay
+            // because content-hash ids remount the live streaming group on every token.
             ForEach(groups.indices, id: \.self) { index in
                 let group = groups[index]
-                // Unary ForEach child (AvdLee list-patterns). Positional ids stay
-                // because hover/copy is index-keyed; content-hash ids remount the
-                // live streaming group on every token.
+                // Unary ForEach child (AvdLee list-patterns).
                 Group {
                     if group.count == 1, let block = group.first, isIsolatedBlock(block) {
                         blockView(block)
@@ -897,8 +849,7 @@ public struct AgentMessageMarkdownView: View {
             .padding(.leading, DS.Space.xs)
 
         case .code:
-            AgentMessageMarkdownCodeBlockView(text: block.text)
-                .equatable()
+            CodeBlockCopyChrome(text: block.text)
         }
     }
 
@@ -910,12 +861,6 @@ public struct AgentMessageMarkdownView: View {
         default: return 13
         }
     }
-
-    #if DEBUG
-    private static func bumpBodyCountForTesting() {
-        bodyCountForTesting &+= 1
-    }
-    #endif
 }
 
 /// UX-MAC_AGENT-006: monospace diff preview for approval requests, colorizing

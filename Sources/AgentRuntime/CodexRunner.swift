@@ -155,7 +155,9 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             args += ["-c", "model_reasoning_effort=\"\(r)\""]
         }
         if request.serviceTier == .fast {
-            args += ["-c", "model_service_tier=\"fast\""]
+            // Upstream config key is `service_tier` (openai/codex config_toml).
+            // `model_service_tier` is not recognized and Fast on exec was a no-op.
+            args += ["-c", "service_tier=\"fast\""]
         }
         args += botCatalogMCPOverrides(environment: request.environment)
         args += computerUseMCPOverrides(environment: request.environment)
