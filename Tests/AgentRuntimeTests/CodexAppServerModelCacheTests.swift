@@ -107,14 +107,16 @@ final class CodexAppServerModelCacheTests: XCTestCase {
         let live = [
             AgentModelDescriptor(id: "live-model-1", label: "Live 1", provider: .codex,
                                  supportsReasoning: false, supportsServiceTier: false, supportsCustomModel: true),
-            AgentModelDescriptor(id: "live-model-2", label: "Live 2", provider: .codex,
+            AgentModelDescriptor(id: "gpt-6-astra", label: "Live Astra", provider: .codex,
                                  supportsReasoning: false, supportsServiceTier: false, supportsCustomModel: true)
         ]
         let adapter = makeAdapter(discoveredModels: { live })
 
         let result = await adapter.listModels()
-        XCTAssertEqual(result.map(\.id), ["live-model-1", "live-model-2"],
-                       "listModels must return live discovered models when discovery succeeds")
+        XCTAssertEqual(result.map(\.id), ["live-model-1", "gpt-6-astra"],
+                       "listModels must preserve live models without duplicating Astra")
+        XCTAssertEqual(result.last?.label, "Live Astra")
+        XCTAssertFalse(result.last?.supportsReasoning ?? true)
     }
 
     func test_listModels_returnsFallback_whenDiscoveryReturnsEmpty() async {
@@ -215,9 +217,9 @@ final class CodexAppServerModelCacheTests: XCTestCase {
                        "the fallback result must still carry the hardcoded baseline so the picker stays usable")
     }
 
-    func test_listModelsResult_isFallback_false_onLiveDiscoveryAndCacheHit() async {
-        // WHY: live data must never trigger the fallback warning — the cache
-        // stores only live data, so a cache hit is live too.
+    func test_listModelsResult_keepsAstraSelectableWhenLiveCatalogOmitsIt_andCachesResult() async {
+        // A successful catalog keeps Astra selectable even when omitted upstream;
+        // a cache hit must preserve that option without a fallback warning.
         let live = [
             AgentModelDescriptor(id: "live-model-1", label: "Live 1", provider: .codex,
                                  supportsReasoning: false, supportsServiceTier: false, supportsCustomModel: true)
@@ -230,6 +232,7 @@ final class CodexAppServerModelCacheTests: XCTestCase {
         let cached = await adapter.listModelsResult()
         XCTAssertFalse(cached.isFallback,
                        "a cache hit serves previously fetched live data and is never a fallback")
-        XCTAssertEqual(cached.models.map(\.id), ["live-model-1"])
+        XCTAssertEqual(first.models.map(\.id), ["live-model-1", "gpt-6-astra"])
+        XCTAssertEqual(cached.models.map(\.id), first.models.map(\.id))
     }
 }

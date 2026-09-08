@@ -46,8 +46,8 @@ RUNTIME_MATRIX: dict[str, dict[str, tuple[str, str, str]]] = {
         "LIGHT": ("fast_scan", "gpt-5.6-luna", "medium"),
         "STANDARD": ("routine_worker", "gpt-5.6-luna", "xhigh"),
         "DEEP": ("deep_worker", "gpt-5.6-luna", "max"),
-        "REVIEWER": ("reviewer", "gpt-5.6-sol", "medium"),
-        "GENIUS": ("genius_worker", "gpt-5.6-sol", "high"),
+        "REVIEWER": ("reviewer", "gpt-6-astra", "medium"),
+        "GENIUS": ("genius_worker", "gpt-5.6-luna", "max"),
     },
     "claude-code": {
         "LIGHT": ("fast_scan", "haiku", "high"),
@@ -227,6 +227,11 @@ def validate_runtime_binding(
     if host not in RUNTIME_MATRIX or capability not in CAPABILITIES:
         return
     expected_role, expected_model, expected_effort = RUNTIME_MATRIX[host][capability]
+    if host == "codex" and model != expected_model:
+        errors.append(
+            f"{label}.runtime must match host-runtime-matrix model for capability {capability}"
+        )
+        return
     normalized_role = normalize_role(role) if isinstance(role, str) else role
     genius_role, genius_model, genius_effort = RUNTIME_MATRIX[host]["GENIUS"]
     matches_capability = (

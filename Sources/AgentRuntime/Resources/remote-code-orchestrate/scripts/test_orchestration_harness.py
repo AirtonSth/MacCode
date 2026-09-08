@@ -549,6 +549,31 @@ def expect_failure(
 
 
 def main() -> int:
+    # Codex keeps every producer on Luna and accepts independent Astra review.
+    codex_report = valid_t2()
+    codex_report["task"]["active_host"] = "codex"
+    for entry in codex_report["dag"]:
+        review = entry["kind"] == "REVIEW"
+        entry["runtime"] = {
+            "host": "codex",
+            "role": "reviewer" if review else "routine_worker",
+            "model": "gpt-6-astra" if review else "gpt-5.6-luna",
+            "effort": "medium" if review else "xhigh",
+            "fallback_reason": None,
+        }
+    run_validator(codex_report, True)
+    codex_report["dag"][0]["runtime"].update(
+        role="genius_worker", model="gpt-5.6-luna", effort="max"
+    )
+    run_validator(codex_report, True)
+    wrong_worker = copy.deepcopy(codex_report)
+    wrong_worker["dag"][0]["runtime"].update(
+        model="gpt-6-astra", fallback_reason="Luna unavailable"
+    )
+    run_validator(wrong_worker, False, "must match host-runtime-matrix model")
+    codex_report["dag"][-1]["runtime"]["model"] = "gpt-5.6-sol"
+    run_validator(codex_report, False, "must match host-runtime-matrix")
+
     for report in (
         valid_t0(),
         valid_t0_code_absolute_certainty(),

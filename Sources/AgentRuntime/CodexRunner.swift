@@ -119,13 +119,16 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         self.binaryNameOverride = binaryNameOverride
     }
 
+    static let astraModel = AgentModelDescriptor(id: "gpt-6-astra", label: "GPT-6-Astra", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true)
+
     public func listModels() async -> [AgentModelDescriptor] {
-        // Real Codex CLI models (codex 0.130.0, ~/.codex/models_cache.json).
+        // Explicit Codex model options, including Astra for catalogs that omit it.
         // id "" = account default (always works regardless of plan). The
         // earlier ids (gpt-5/gpt-5-codex/o3) are dead on this CLI and made
         // `codex --model …` fail with no output.
         [
             AgentModelDescriptor(id: "", label: "Default (account)", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
+            Self.astraModel,
             AgentModelDescriptor(id: "gpt-5.6-sol", label: "GPT-5.6-Sol", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
             AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
             AgentModelDescriptor(id: "gpt-5.4", label: "GPT-5.4", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),

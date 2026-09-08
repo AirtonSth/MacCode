@@ -452,15 +452,15 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
     func test_staticModelParserAcceptsStringReasoningFallbackShape() {
         let models = CodexAppServerClient.modelDescriptors(fromModelListResponse: [
             "models": [[
-                "id": "gpt-5.7-mini",
-                "name": "GPT-5.7 Mini",
+                "id": "gpt-6-astra",
+                "name": "GPT-6-Astra",
                 "supportedReasoningEfforts": ["low", "medium"],
                 "additional_speed_tiers": ["fast"],
                 "maxTokens": "128000"
             ]]
         ])
 
-        XCTAssertEqual(models.first?.id, "gpt-5.7-mini")
+        XCTAssertEqual(models.first?.id, "gpt-6-astra")
         XCTAssertEqual(models.first?.supportedReasoningEfforts, [.low, .medium])
         XCTAssertEqual(models.first?.supportsServiceTier, true)
         XCTAssertEqual(models.first?.contextWindowTokens, 128_000)

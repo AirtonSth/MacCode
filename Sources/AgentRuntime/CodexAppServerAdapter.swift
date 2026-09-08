@@ -337,14 +337,19 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         )
 
         if !needsFetch, let cached {
-            // The cache stores only live discovery data, so a hit is never a fallback.
+            // The cache stores successful discovery plus the explicit Astra option.
             return ModelListResult(models: cached, isFallback: false)
         }
 
         // Attempt live discovery.
-        let discovered = await modelListDiscovery()
+        var discovered = await modelListDiscovery()
 
         if !discovered.isEmpty {
+            // Some Codex catalogs omit Astra. Keep it selectable as an explicit
+            // model, but prefer live metadata when the provider includes it.
+            if !discovered.contains(where: { $0.id == CodexRunner.astraModel.id }) {
+                discovered.append(CodexRunner.astraModel)
+            }
             lock.lock()
             cachedModels = discovered
             modelCacheLastFetchedAt = now

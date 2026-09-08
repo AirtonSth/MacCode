@@ -73,9 +73,9 @@ final class CodexRunnerArgsTests: XCTestCase {
     }
 
     func test_modelPassedWhenChosen_andEffortMapped() {
-        let a = CodexRunner.buildArgs(req(model: "gpt-5-codex", effort: .high))
+        let a = CodexRunner.buildArgs(req(model: "gpt-6-astra", effort: .high))
         let m = a.firstIndex(of: "--model")!
-        XCTAssertEqual(a[a.index(after: m)], "gpt-5-codex")
+        XCTAssertEqual(a[a.index(after: m)], "gpt-6-astra")
         XCTAssertTrue(a.contains("-c") && a.contains(#"model_reasoning_effort="high""#),
                       "reasoning effort must be forwarded as a config override")
     }
@@ -103,7 +103,7 @@ final class CodexRunnerArgsTests: XCTestCase {
         let models = await CodexRunner().listModels()
         let ids = Set(models.map(\.id))
         XCTAssertTrue(ids.contains(""), "account default must stay (always works)")
-        for real in ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
+        for real in ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
                      "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"] {
             XCTAssertTrue(ids.contains(real), "missing real codex model \(real)")
         }
@@ -113,7 +113,7 @@ final class CodexRunnerArgsTests: XCTestCase {
     }
 
     func test_listModels_exposeCodexOptionDescriptors() async {
-        let model = await CodexRunner().listModels().first { $0.id == "gpt-5.5" }
+        let model = await CodexRunner().listModels().first { $0.id == "gpt-6-astra" }
 
         XCTAssertEqual(model?.supportedReasoningEfforts, AgentReasoningEffort.supportedCases,
                        "Codex model metadata must tell clients exactly which reasoning efforts are legal")
