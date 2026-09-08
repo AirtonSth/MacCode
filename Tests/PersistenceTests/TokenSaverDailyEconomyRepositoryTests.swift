@@ -61,6 +61,50 @@ final class TokenSaverDailyEconomyRepositoryTests: XCTestCase {
         XCTAssertEqual(try repo.sumTotalCredible(fromDayStartMs: from, toDayStartMs: to), 6_000_000)
     }
 
+    func test_windowTotal_countsEachThreadsLifetimeCacheOnceAndPreservesToday() throws {
+        let db = try makeDB()
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let repo = TokenSaverDailyEconomyRepository(db: db, calendar: cal)
+        let savings = TokenSaverSavingsRepository(db: db, calendar: cal)
+        let first = try XCTUnwrap(DateComponents(calendar: cal, year: 2026, month: 9, day: 7, hour: 12).date)
+        let second = try XCTUnwrap(cal.date(byAdding: .day, value: 1, to: first))
+        // A conversation and unscoped wraps span both days; another conversation
+        // appears only on the second. Lifetime cache: 300 + 30 + 100 = 430.
+        for (day, thread, saved) in [
+            (first, "shared", 100), (first, "", 10),
+            (second, "shared", 200), (second, "", 20),
+            (second, "other", 40), (second, "other", 60)
+        ] {
+            try savings.record(provider: "codex", mode: "x", inputTokens: saved,
+                               outputTokens: 0, delivered: true, threadID: thread, at: day)
+        }
+        for (day, measured, cache) in [(first, 110, 330), (second, 320, 430)] {
+            try repo.upsert(TokenSaverDailyEconomyRecord(
+                dayStartMs: repo.dayStartMs(for: day), measuredTokens: measured,
+                dialectTokens: 10, graphifyTokens: 3, orchestrationTokens: 2,
+                totalCredible: measured + 15 + cache, windowUsageTokens: 0,
+                formulaVersion: TokenSaverDailyEconomyRepository.formulaVersion,
+                appliedOutputShare: 0.007, updatedAt: "t"
+            ))
+        }
+        let result = try repo.windowTotalCredible(
+            fromDayStartMs: repo.dayStartMs(for: first),
+            toDayStartMs: repo.dayStartMs(for: second),
+            toDayEndMsExclusive: repo.dayEndMsExclusive(for: second)
+        )
+        XCTAssertEqual(result.total, 890, "460 daily savings + 430 unique cache, not 1220")
+        XCTAssertEqual(result.economyDays, 2)
+        XCTAssertEqual(try repo.record(dayStartMs: repo.dayStartMs(for: first))?.totalCredible, 455)
+        XCTAssertEqual(try repo.record(dayStartMs: repo.dayStartMs(for: second))?.totalCredible, 765)
+        let today = try repo.windowTotalCredible(
+            fromDayStartMs: repo.dayStartMs(for: second),
+            toDayStartMs: repo.dayStartMs(for: second),
+            toDayEndMsExclusive: repo.dayEndMsExclusive(for: second)
+        )
+        XCTAssertEqual(today.total, 765)
+    }
+
     func test_windowTotal_usesMeasuredOnlyForDaysWithoutEconomyRow() throws {
         let db = try makeDB()
         var cal = Calendar(identifier: .gregorian)

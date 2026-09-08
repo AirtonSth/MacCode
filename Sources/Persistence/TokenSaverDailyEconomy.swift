@@ -1,7 +1,7 @@
 import Foundation
 
 /// One calendar-day row of the **credible** vs-bare-agent economy.
-/// Week totals are the **sum of these daily rows** (not a re-estimate on the week aggregate).
+/// Window totals sum daily legs and count permanent cache savings once per thread.
 public struct TokenSaverDailyEconomyRecord: Sendable, Equatable {
     public let dayStartMs: Int64
     public let measuredTokens: Int
@@ -59,7 +59,7 @@ public struct TokenSaverDailyEconomyRecord: Sendable, Equatable {
     }
 }
 
-/// Persists per-day credible totals so Week = Σ(day.total_credible).
+/// Persists per-day credible totals, including each day's permanent thread cache stack.
 /// Does **not** backfill historical days; only upserts days that are recomputed going forward.
 public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
     /// v10: extra-turn cache amort is uncapped; dialect/graphify are granted
@@ -188,13 +188,10 @@ public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
         }
     }
 
-    /// UI window total:
-    /// - days with **current-formula** economy rows → `total_credible`
-    /// - days with only stale formula (or no row) → measured pipes only
-    ///
-    /// WHY ignore non-current formula: pre-v6 permanent-amort rows can still sit
-    /// at hundreds of millions; summing them paints Week ~999M until recompute
-    /// rewrites every day. Fail closed to measured rather than fantasy.
+    /// Sum current-formula daily legs, with permanent cache amortization counted
+    /// once per thread across those days. Daily totals include lifetime cache
+    /// savings, so summing total_credible would repeat conversations across days.
+    /// Stale/missing economy days still contribute measured pipes only.
     public func windowTotalCredible(
         fromDayStartMs: Int64,
         toDayStartMs: Int64,
@@ -204,10 +201,31 @@ public final class TokenSaverDailyEconomyRepository: @unchecked Sendable {
         let currentFormula = Self.formulaVersion
         let currentEconomy = economy.filter { $0.formulaVersion == currentFormula }
         let economyDays = Set(currentEconomy.map(\.dayStartMs))
-        var total = currentEconomy.reduce(0) { $0 + $1.totalCredible }
+        var total = currentEconomy.reduce(0) {
+            $0 + $1.measuredTokens + $1.dialectTokens + $1.graphifyTokens + $1.orchestrationTokens
+        }
+        let savings = TokenSaverSavingsRepository(db: db, calendar: calendar)
+        var threads: [String: TokenSaverThreadCacheAmortizationInput] = [:]
+        for day in currentEconomy {
+            let date = Date(timeIntervalSince1970: Double(day.dayStartMs) / 1000)
+            let inputs = try savings.threadCacheAmortizationInputs(
+                dayStartMs: day.dayStartMs,
+                dayEndMsExclusive: dayEndMsExclusive(for: date)
+            )
+            for input in inputs {
+                threads[input.threadID] = input
+            }
+        }
+        for input in threads.values {
+            // Same uncapped permanent-savings × extra-runs formula as Today.
+            let (cache, overflow) = input.savedTokens.multipliedReportingOverflow(by: max(0, input.runs - 1))
+            let (sum, sumOverflow) = total.addingReportingOverflow(overflow ? Int.max : cache)
+            total = sumOverflow ? Int.max : sum
+        }
         let measuredByDay = try measuredPipesByDay(
             fromDayStartMs: fromDayStartMs,
-            toDayEndMsExclusive: toDayEndMsExclusive
+            toDayEndMsExclusive: toDayEndMsExclusive,
+            calendar: calendar
         )
         var measuredOnly = 0
         for (day, measured) in measuredByDay {
