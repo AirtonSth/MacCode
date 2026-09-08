@@ -3038,4 +3038,187 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
     }
 
+    /// Residual #2: conversation-column body currently calls
+    /// `paintOrderedTranscriptEntries` 2× (idle) or 3× (reveal). The production
+    /// helper must keep paint order while dropping extra `placingMatchingFinalsAfterTurns`
+    /// on already-ordered windows.
+    func test_transcriptColumnPaint_paintOrderedCalls_microbench() {
+        let turnCount = 320
+        let finalBytes = 4096
+        let pad = String(repeating: "Z", count: finalBytes - 16)
+        let threadId = AgentThreadID()
+        var merged: [AgentAppView.TranscriptEntry] = []
+        merged.reserveCapacity(turnCount * 2)
+        for index in 0..<turnCount {
+            let final = "final-\(index)-" + pad
+            let message = AgentMessage(
+                threadId: threadId,
+                role: .assistant,
+                content: final,
+                createdAt: Date(timeIntervalSince1970: Double(index * 2))
+            )
+            let snapshot = AssistantTurnSnapshot(
+                turnId: "paint-turn-\(index)",
+                items: [
+                    AssistantItem(
+                        id: "tool-\(index)",
+                        turnId: "paint-turn-\(index)",
+                        type: .tool,
+                        startedAtMs: Int64((index * 2 + 1) * 1_000)
+                    )
+                ],
+                finalAssistantMessage: final,
+                finished: true,
+                startedAtMs: Int64((index * 2 + 1) * 1_000)
+            )
+            merged.append(.message(message))
+            merged.append(.turn(snapshot))
+        }
+
+        func median(_ values: [Double]) -> Double {
+            values.sorted()[values.count / 2]
+        }
+        func timeMs(_ body: () -> Void) -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            body()
+            return Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000.0
+        }
+
+        /// HEAD conversation-column body: order full list, then re-order the
+        /// visible window, then re-order older+visible on reveal.
+        func legacyColumnPaint(revealCount: Int) -> (
+            all: [AgentAppView.TranscriptEntry],
+            visible: [AgentAppView.TranscriptEntry],
+            paint: [AgentAppView.TranscriptEntry]
+        ) {
+            let allEntries = AgentAppView.paintOrderedTranscriptEntries(merged)
+            let visible = AgentAppView.paintOrderedTranscriptEntries(
+                AgentAppView.visibleTranscriptWindow(
+                    entries: allEntries,
+                    status: .completed,
+                    runStartedAt: nil
+                )
+            )
+            let hiddenCount = AgentAppView.hiddenTranscriptCount(
+                totalCount: allEntries.count,
+                visibleCount: visible.count
+            )
+            let revealed = min(revealCount, hiddenCount)
+            if revealed > 0 {
+                let older = AgentAppView.hiddenTranscriptRevealWindow(
+                    allItems: allEntries,
+                    visibleWindow: visible,
+                    revealCount: revealed
+                )
+                return (allEntries, visible, AgentAppView.paintOrderedTranscriptEntries(older + visible))
+            }
+            return (allEntries, visible, visible)
+        }
+
+        func productionColumnPaint(revealCount: Int) -> (
+            all: [AgentAppView.TranscriptEntry],
+            visible: [AgentAppView.TranscriptEntry],
+            paint: [AgentAppView.TranscriptEntry]
+        ) {
+            AgentAppView.transcriptColumnPaint(
+                mergedEntries: merged,
+                status: .completed,
+                runStartedAt: nil,
+                revealCount: revealCount
+            )
+        }
+
+        for _ in 0..<2 {
+            _ = legacyColumnPaint(revealCount: 0)
+            _ = productionColumnPaint(revealCount: 0)
+            _ = legacyColumnPaint(revealCount: 50)
+            _ = productionColumnPaint(revealCount: 50)
+        }
+        var idleLegacy: [Double] = []
+        var idleProduction: [Double] = []
+        var revealLegacy: [Double] = []
+        var revealProduction: [Double] = []
+        for _ in 0..<5 {
+            idleLegacy.append(timeMs { _ = legacyColumnPaint(revealCount: 0) })
+            idleProduction.append(timeMs { _ = productionColumnPaint(revealCount: 0) })
+            revealLegacy.append(timeMs { _ = legacyColumnPaint(revealCount: 50) })
+            revealProduction.append(timeMs { _ = productionColumnPaint(revealCount: 50) })
+        }
+
+        AgentAppView.TranscriptPaintOrderedProbe.reset()
+        let idle = productionColumnPaint(revealCount: 0)
+        let idleCalls = AgentAppView.TranscriptPaintOrderedProbe.callCount
+        AgentAppView.TranscriptPaintOrderedProbe.reset()
+        let revealed = productionColumnPaint(revealCount: 50)
+        let revealCalls = AgentAppView.TranscriptPaintOrderedProbe.callCount
+
+        let expectedIdleVisible = AgentAppView.visibleTranscriptWindow(
+            entries: idle.all,
+            status: .completed,
+            runStartedAt: nil
+        )
+        XCTAssertEqual(idle.visible.map(\.id), expectedIdleVisible.map(\.id))
+        XCTAssertEqual(idle.paint.map(\.id), idle.visible.map(\.id))
+        let olderReveal = AgentAppView.hiddenTranscriptRevealWindow(
+            allItems: revealed.all,
+            visibleWindow: revealed.visible,
+            revealCount: 50
+        )
+        var revealPaintIDs = Set(revealed.visible.map(\.id))
+        for entry in olderReveal {
+            revealPaintIDs.insert(entry.id)
+        }
+        XCTAssertEqual(
+            revealed.paint.map(\.id),
+            revealed.all.filter { revealPaintIDs.contains($0.id) }.map(\.id),
+            "reveal must keep allEntries relative order for older∪visible IDs"
+        )
+        // First matching final must sit after its turn in the full ordered list.
+        let firstTurnId = AgentAppView.TranscriptEntry.turn(
+            AssistantTurnSnapshot(turnId: "paint-turn-0")
+        ).id
+        let firstTurnIndex = idle.all.firstIndex(where: { $0.id == firstTurnId })
+        let firstMessageIndex = idle.all.firstIndex(where: {
+            if case .message(let message) = $0 { return message.content.hasPrefix("final-0-") }
+            return false
+        })
+        XCTAssertNotNil(firstTurnIndex)
+        XCTAssertNotNil(firstMessageIndex)
+        if let firstTurnIndex, let firstMessageIndex {
+            XCTAssertLessThan(firstTurnIndex, firstMessageIndex, "Work so far must precede its matching final")
+        }
+
+        let idleLegacyMed = median(idleLegacy)
+        let idleProdMed = median(idleProduction)
+        let revealLegacyMed = median(revealLegacy)
+        let revealProdMed = median(revealProduction)
+        print(
+            "PAINT_ORDERED_BODY_BENCH idle_legacy_samples=\(idleLegacy) idle_legacy_median_ms=\(idleLegacyMed) "
+                + "idle_prod_samples=\(idleProduction) idle_prod_median_ms=\(idleProdMed) idle_calls=\(idleCalls) "
+                + "reveal_legacy_samples=\(revealLegacy) reveal_legacy_median_ms=\(revealLegacyMed) "
+                + "reveal_prod_samples=\(revealProduction) reveal_prod_median_ms=\(revealProdMed) reveal_calls=\(revealCalls)"
+        )
+        NSLog(
+            "[perf-proof] paintOrdered idle_legacy_ms=%@ idle_prod_ms=%@ idle_calls=%d reveal_legacy_ms=%@ reveal_prod_ms=%@ reveal_calls=%d idle_legacy=%@ idle_prod=%@ reveal_legacy=%@ reveal_prod=%@",
+            String(idleLegacyMed),
+            String(idleProdMed),
+            idleCalls,
+            String(revealLegacyMed),
+            String(revealProdMed),
+            revealCalls,
+            String(describing: idleLegacy),
+            String(describing: idleProduction),
+            String(describing: revealLegacy),
+            String(describing: revealProduction)
+        )
+        // HEAD records 2 idle / 3 reveal calls. After the single-order fix this
+        // must be 1. Keep the bound loose here so BEFORE on HEAD still records.
+        XCTAssertEqual(idleCalls, 1, "idle column paint must order the full merged list once")
+        XCTAssertEqual(revealCalls, 1, "reveal concat must slice the already-ordered list without a second paintOrdered")
+        XCTAssertLessThan(idleProdMed, 60_000)
+        XCTAssertLessThan(revealProdMed, 60_000)
+        _ = idleLegacyMed
+        _ = revealLegacyMed
+    }
+
 }

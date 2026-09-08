@@ -184,14 +184,51 @@ public enum AgentChatLiveTurnChrome {
     }
 
     /// Later turns that only repeat an earlier final must not paint that answer again.
+    ///
+    /// Hot path is exact membership in a set of compact/normalized prior finals
+    /// (`AgentTranscriptOrder.normalizedFinalText`). Substring matching stays on
+    /// `assistantTextsMatch` for compose/dedupe, where the lists are small.
+    ///
+    /// Compatibility overload: rebuilds and re-normalizes the full prior-final
+    /// set on every call. Do not use this in a per-turn loop. Agent App paint
+    /// context and Bots Desk timeline grow one `Set` with
+    /// `insertNormalizedAssistantFinals` and call
+    /// `shouldHideAssistantOutput(_:previousNormalizedFinals:)`.
     public static func shouldHideAssistantOutput(
         _ turn: AssistantTurnSnapshot,
         previousTurns: [AssistantTurnSnapshot]
     ) -> Bool {
-        let bodies = assistantBodies(in: turn)
-        guard !bodies.isEmpty else { return false }
-        return bodies.contains { body in
-            previousTurns.contains { assistantBodies(in: $0).contains { assistantTextsMatch(body, $0) } }
+        var previousNormalizedFinals = Set<String>()
+        previousNormalizedFinals.reserveCapacity(previousTurns.count)
+        for previous in previousTurns {
+            insertNormalizedAssistantFinals(from: previous, into: &previousNormalizedFinals)
+        }
+        return shouldHideAssistantOutput(turn, previousNormalizedFinals: previousNormalizedFinals)
+    }
+
+    public static func shouldHideAssistantOutput(
+        _ turn: AssistantTurnSnapshot,
+        previousNormalizedFinals: Set<String>
+    ) -> Bool {
+        guard !previousNormalizedFinals.isEmpty else { return false }
+        for body in assistantBodies(in: turn) {
+            let normalized = AgentTranscriptOrder.normalizedFinalText(body)
+            if !normalized.isEmpty, previousNormalizedFinals.contains(normalized) {
+                return true
+            }
+        }
+        return false
+    }
+
+    public static func insertNormalizedAssistantFinals(
+        from turn: AssistantTurnSnapshot,
+        into previousNormalizedFinals: inout Set<String>
+    ) {
+        for body in assistantBodies(in: turn) {
+            let normalized = AgentTranscriptOrder.normalizedFinalText(body)
+            if !normalized.isEmpty {
+                previousNormalizedFinals.insert(normalized)
+            }
         }
     }
 

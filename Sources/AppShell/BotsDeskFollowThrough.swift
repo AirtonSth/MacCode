@@ -169,18 +169,23 @@ enum BotsDeskFollowThrough {
                         && !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 }
         }
-        var previousTurns: [AssistantTurnSnapshot] = []
-        previousTurns.reserveCapacity(visibleTurns.count)
-        let liveItems: [BotDeskTimelineItem] = visibleTurns
-            .sorted { AgentChatLiveTurnChrome.turnSortDate($0) < AgentChatLiveTurnChrome.turnSortDate($1) }
-            .map { turn in
-                let hide = AgentChatLiveTurnChrome.shouldHideAssistantOutput(
-                    turn,
-                    previousTurns: previousTurns
-                )
-                previousTurns.append(turn)
-                return .liveTurn(turn, hideAssistantOutput: hide)
-            }
+        var previousNormalizedFinals = Set<String>()
+        previousNormalizedFinals.reserveCapacity(visibleTurns.count)
+        var liveItems: [BotDeskTimelineItem] = []
+        liveItems.reserveCapacity(visibleTurns.count)
+        for turn in visibleTurns.sorted(
+            by: { AgentChatLiveTurnChrome.turnSortDate($0) < AgentChatLiveTurnChrome.turnSortDate($1) }
+        ) {
+            let hide = AgentChatLiveTurnChrome.shouldHideAssistantOutput(
+                turn,
+                previousNormalizedFinals: previousNormalizedFinals
+            )
+            AgentChatLiveTurnChrome.insertNormalizedAssistantFinals(
+                from: turn,
+                into: &previousNormalizedFinals
+            )
+            liveItems.append(.liveTurn(turn, hideAssistantOutput: hide))
+        }
         return interleavingTurnSegments(composeConversationOrder(
             messages: visibleMessages,
             workLog: logs,

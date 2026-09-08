@@ -196,4 +196,107 @@ final class VisibleTranscriptWindowTests: XCTestCase {
         XCTAssertEqual(visible.map(\.id), entries.map(\.id),
                        "a 1-entry running thread renders in full, unchanged")
     }
+
+    /// WHY: running / no-user / time-cutoff uses `filter`, so visible need not be
+    /// a suffix after `placingMatchingFinalsAfterTurns` moves a durable final
+    /// below its Work so far turn. Reveal must keep that full-list order.
+    func test_transcriptColumnPaint_runningNoUserTimeCutoffReveal_keepsFinalAfterTurn() {
+        let answer = "matching durable final"
+        let old1 = assistantMessage(content: "old-1", seconds: 1)
+        let old2 = assistantMessage(content: "old-2", seconds: 2)
+        let old3 = assistantMessage(content: "old-3", seconds: 3)
+        let finalMessage = assistantMessage(content: answer, seconds: 5)
+        let turn = AssistantTurnSnapshot(
+            turnId: "live-turn",
+            items: [
+                AssistantItem(
+                    id: "tool-live",
+                    turnId: "live-turn",
+                    type: .tool,
+                    state: .completed,
+                    startedAtMs: 10_000
+                )
+            ],
+            finalAssistantMessage: answer,
+            finished: true,
+            startedAtMs: 10_000
+        )
+        let later = assistantMessage(content: "later-live", seconds: 12)
+        let merged: [AgentAppView.TranscriptEntry] = [
+            .message(old1),
+            .message(old2),
+            .message(old3),
+            .message(finalMessage),
+            .turn(turn),
+            .message(later)
+        ]
+        let runStartedAt = Date(timeIntervalSince1970: 10)
+
+        let column = AgentAppView.transcriptColumnPaint(
+            mergedEntries: merged,
+            status: .running,
+            runStartedAt: runStartedAt,
+            revealCount: 1
+        )
+
+        let turnID = AgentAppView.TranscriptEntry.turn(turn).id
+        let finalID = AgentAppView.TranscriptEntry.message(finalMessage).id
+        let allIDs = column.all.map(\.id)
+        let visibleIDs = column.visible.map(\.id)
+        XCTAssertGreaterThan(allIDs.count, 2)
+        XCTAssertFalse(
+            Array(allIDs.suffix(visibleIDs.count)) == visibleIDs,
+            "running/no-user cutoff visible must be a non-suffix after the final moves after its turn"
+        )
+        XCTAssertTrue(visibleIDs.contains(turnID))
+        XCTAssertFalse(visibleIDs.contains(finalID), "the older-time final stays outside the cutoff window")
+
+        let allTurnIndex = allIDs.firstIndex(of: turnID)
+        let allFinalIndex = allIDs.firstIndex(of: finalID)
+        XCTAssertNotNil(allTurnIndex)
+        XCTAssertNotNil(allFinalIndex)
+        if let allTurnIndex, let allFinalIndex {
+            XCTAssertLessThan(allTurnIndex, allFinalIndex, "full-list paint order is Work so far then matching final")
+        }
+
+        let older = AgentAppView.hiddenTranscriptRevealWindow(
+            allItems: column.all,
+            visibleWindow: column.visible,
+            revealCount: 1
+        )
+        XCTAssertEqual(older.map(\.id), [finalID], "one-row reveal must pull the hidden matching final")
+        let concatIDs = (older + column.visible).map(\.id)
+        if let concatTurn = concatIDs.firstIndex(of: turnID),
+           let concatFinal = concatIDs.firstIndex(of: finalID) {
+            XCTAssertGreaterThan(
+                concatTurn,
+                concatFinal,
+                "precondition: older+visible concat is the mis-order this paint path must not use"
+            )
+        } else {
+            XCTFail("concat window must contain both the turn and its matching final")
+        }
+
+        let paintIDs = column.paint.map(\.id)
+        let paintTurn = paintIDs.firstIndex(of: turnID)
+        let paintFinal = paintIDs.firstIndex(of: finalID)
+        XCTAssertNotNil(paintTurn)
+        XCTAssertNotNil(paintFinal)
+        if let paintTurn, let paintFinal {
+            XCTAssertLessThan(
+                paintTurn,
+                paintFinal,
+                "reveal must keep the matching final after its Work so far turn"
+            )
+        }
+    }
+
+    private func assistantMessage(content: String, seconds: TimeInterval) -> AgentMessage {
+        AgentMessage(
+            threadId: Self.threadID,
+            role: .assistant,
+            content: content,
+            createdAt: Date(timeIntervalSince1970: seconds)
+        )
+    }
 }
