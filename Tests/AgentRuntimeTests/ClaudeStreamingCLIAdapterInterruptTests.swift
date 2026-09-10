@@ -512,6 +512,49 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
             "cancelled work item must not be rescheduled"
         )
     }
+
+    /// CLAUDE-INT-002: a grace-kill body that already started must no-op after a
+    /// matching receipt cleared pending ownership (cancel is ineffective mid-run).
+    func test_shouldExecuteInterruptGraceKill_requiresPendingOwnership() {
+        XCTAssertTrue(
+            ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
+                sessionStillCurrent: true,
+                inFlight: true,
+                pendingRequestId: "pending-1",
+                scheduledRequestId: "pending-1",
+                installedWorkItemIsSelf: true
+            )
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
+                sessionStillCurrent: true,
+                inFlight: true,
+                pendingRequestId: nil,
+                scheduledRequestId: "pending-1",
+                installedWorkItemIsSelf: true
+            ),
+            "receipt-cleared pending must not hard-stop"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
+                sessionStillCurrent: true,
+                inFlight: true,
+                pendingRequestId: "pending-1",
+                scheduledRequestId: "pending-1",
+                installedWorkItemIsSelf: false
+            ),
+            "replaced/cancelled work item must not hard-stop"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
+                sessionStillCurrent: true,
+                inFlight: false,
+                pendingRequestId: "pending-1",
+                scheduledRequestId: "pending-1",
+                installedWorkItemIsSelf: true
+            )
+        )
+    }
 }
 
 private actor EventSink {

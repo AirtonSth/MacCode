@@ -324,13 +324,33 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             try stopSession(threadId: threadId)
             return
         }
+        // Box lets the work item re-check that *this* item is still installed
+        // after DispatchWorkItem.cancel() (cancel is a no-op once running).
+        final class InterruptKillBox: @unchecked Sendable {
+            var item: DispatchWorkItem?
+        }
+        let killBox = InterruptKillBox()
         let killWork = DispatchWorkItem { [weak self, weak session] in
             guard let self, let session else { return }
             self.lock.lock()
-            let stillRunning = self.sessions[threadId] === session && session.inFlightRunId != nil
+            // CLAUDE-INT-002: cancel() does not stop a body that already began.
+            // Ownership of the pending interrupt + installed work item must still
+            // match before we hard-stop; a matching receipt clears both first.
+            let stillOwnsInterrupt = Self.shouldExecuteInterruptGraceKill(
+                sessionStillCurrent: self.sessions[threadId] === session,
+                inFlight: session.inFlightRunId != nil,
+                pendingRequestId: session.pendingInterruptRequestId,
+                scheduledRequestId: requestId,
+                installedWorkItemIsSelf: session.interruptKillWorkItem === killBox.item
+            )
+            if stillOwnsInterrupt {
+                session.interruptKillWorkItem = nil
+                session.pendingInterruptRequestId = nil
+            }
             self.lock.unlock()
-            if stillRunning { try? self.stopSession(threadId: threadId) }
+            if stillOwnsInterrupt { try? self.stopSession(threadId: threadId) }
         }
+        killBox.item = killWork
         lock.lock()
         session.pendingInterruptRequestId = requestId
         session.interruptKillWorkItem?.cancel()
@@ -496,6 +516,22 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
               let pending = pendingRequestId, !pending.isEmpty,
               let receipt = receiptRequestId, receipt == pending else { return false }
         return true
+    }
+
+    /// Whether a grace-kill work item that has already begun should still call
+    /// `stopSession`. False when a matching interrupt receipt cleared ownership
+    /// (pending id / installed work item) before the body reached this check.
+    nonisolated static func shouldExecuteInterruptGraceKill(
+        sessionStillCurrent: Bool,
+        inFlight: Bool,
+        pendingRequestId: String?,
+        scheduledRequestId: String,
+        installedWorkItemIsSelf: Bool
+    ) -> Bool {
+        sessionStillCurrent
+            && inFlight
+            && pendingRequestId == scheduledRequestId
+            && installedWorkItemIsSelf
     }
 
     /// CLAUDE-INT-002: interrupt_receipt_v1 answers with control_response before
