@@ -1162,36 +1162,61 @@ public enum AgentFileEditDiffPresentation {
 
     public static func extractDiffText(from item: AssistantItem) -> String? {
         for blob in [item.output ?? "", item.body] {
-            let trimmed = blob.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            if looksLikeDiff(trimmed) { return trimmed }
+            guard !blob.isEmpty else { continue }
+            // r11: do not copy the whole blob via trimmingCharacters on the
+            // common non-diff Bash miss. Streaming tool output misses the
+            // growth-keyed cache every token; a 50 KB trim was the miss tax.
+            // Positive diff hits still trim so parseUnifiedDiff does not
+            // promote leading blank lines to context.
+            if looksLikeDiff(blob) {
+                let trimmed = blob.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+                continue
+            }
             // Perf CH-03: JSON payloads must start with { or [ — skip both
             // JSONSerialization attempts for plain text (the common Bash case).
-            if let first = trimmed.first, first == "{" || first == "[" {
-                if let fromJSON = diffFromJSONChanges(trimmed) { return fromJSON }
-                if let fromEdit = synthesizeDiffFromEditJSON(trimmed) { return fromEdit }
+            // Scan only leading whitespace instead of allocating a trimmed copy.
+            if let first = firstNonWhitespace(in: blob), first == "{" || first == "[" {
+                if let fromJSON = diffFromJSONChanges(blob) { return fromJSON }
+                if let fromEdit = synthesizeDiffFromEditJSON(blob) { return fromEdit }
             }
-            if let fromPatch = extractApplyPatchBlock(trimmed) { return fromPatch }
+            if let fromPatch = extractApplyPatchBlock(blob) { return fromPatch }
+        }
+        return nil
+    }
+
+    /// First non-whitespace Character, or nil when the string is empty/whitespace.
+    /// Stops at the first payload byte so a 50 KB Bash dump is not copied.
+    static func firstNonWhitespace(in text: String) -> Character? {
+        for ch in text where !ch.isWhitespace {
+            return ch
         }
         return nil
     }
 
     public static func looksLikeDiff(_ text: String) -> Bool {
-        // Perf CH-03: lazy line scanning — the old eager split allocated the
-        // entire (possibly 50 KB) output before looking at the first lines.
-        for line in text.lazy.split(separator: "\n", omittingEmptySubsequences: true).prefix(60) {
-            let s = String(line)
-            if s.hasPrefix("diff --git ") || s.hasPrefix("@@") || s.hasPrefix("--- ") || s.hasPrefix("+++ ") {
-                return true
-            }
-            if s.hasPrefix("*** Begin Patch") || s.hasPrefix("*** Update File:") || s.hasPrefix("*** Add File:") {
-                return true
-            }
-        }
-        // Heuristic: several +/- code lines without being a bullet list.
+        // Perf CH-03: do not eager-split the whole blob into `[String]`.
+        // r11: walk Substring slices (hasPrefix without String(line)) and stop
+        // after 80 non-empty lines — one pass instead of prefix(60)+prefix(80).
         var plus = 0, minus = 0
-        for lazyLine in text.lazy.split(separator: "\n", omittingEmptySubsequences: true).prefix(80) {
-            let line = String(lazyLine)
+        var scanned = 0
+        var start = text.startIndex
+        while start < text.endIndex, scanned < 80 {
+            let end = text[start...].firstIndex(of: "\n") ?? text.endIndex
+            let line = text[start..<end]
+            start = end == text.endIndex ? end : text.index(after: end)
+            if line.isEmpty { continue }
+            scanned += 1
+            if scanned <= 60 {
+                if line.hasPrefix("diff --git ") || line.hasPrefix("@@")
+                    || line.hasPrefix("--- ") || line.hasPrefix("+++ ") {
+                    return true
+                }
+                if line.hasPrefix("*** Begin Patch") || line.hasPrefix("*** Update File:")
+                    || line.hasPrefix("*** Add File:") {
+                    return true
+                }
+            }
             if line.hasPrefix("+") && !line.hasPrefix("++") { plus += 1 }
             if line.hasPrefix("-") && !line.hasPrefix("--") { minus += 1 }
         }
