@@ -9,6 +9,7 @@ public enum CodexAppServerError: Error, CustomStringConvertible {
     case processExited(stderrTail: String)
     case responseTypeMismatch
     case requestTimedOut(method: String, timeout: TimeInterval)
+    case modelListPaginationCycle
     /// Resume (and optional start-fresh fallback) exhausted its bounded budget.
     case threadResumeUnavailable(attempts: Int, elapsedBound: TimeInterval)
 
@@ -28,6 +29,8 @@ public enum CodexAppServerError: Error, CustomStringConvertible {
             // Intermediate timeouts may still be retried by the adapter; this string
             // is also what is stored when recovery cannot continue.
             return "Codex app-server RPC \(method) timed out after \(Self.formatTimeout(timeout)). The app-server did not answer in time (large threads can be slow, or Codex may be stuck). Retry the run; if it keeps failing, verify Codex is healthy or start a new thread."
+        case .modelListPaginationCycle:
+            return "Codex app-server model/list returned a repeated pagination cursor"
         case .threadResumeUnavailable(let attempts, let elapsedBound):
             return "Codex thread/resume did not succeed after \(attempts) attempt(s) within \(Self.formatTimeout(elapsedBound)). The app-server stayed unresponsive. Stop and retry, check that the `codex` binary is installed and responsive, or start a new Codex thread."
         }
@@ -132,16 +135,229 @@ public struct CodexAppServerThreadPage: Sendable, Equatable {
     }
 }
 
-public enum CodexAppServerModelDiscovery {
-    public static func listModels(binary: String, cwd: String, environment: [String: String] = [:]) async -> [AgentModelDescriptor] {
-        do {
-            let client = try CodexAppServerClient(binary: binary, arguments: ["app-server"], cwd: cwd, environment: environment)
-            _ = try await client.initialize()
-            defer { client.stop() }
-            return try await client.listModels()
-        } catch {
+/// Reads the model catalog owned by the selected Codex harness account.
+///
+/// The app-server `model/list` response is authoritative for IDs it returns.
+/// This cache only fills IDs the same account has marked visible and API
+/// supported, which covers installed CLIs that lag the current harness catalog
+/// without turning hidden, unavailable, or another account's models into
+/// selectable options.
+public enum CodexHarnessModelCatalog {
+    public static func models(environment: [String: String]) -> [AgentModelDescriptor] {
+        guard let url = cacheURL(environment: environment),
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
             return []
         }
+        return models(from: data)
+    }
+
+    public static func models(from data: Data) -> [AgentModelDescriptor] {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rawModels = object["models"] as? [[String: Any]] else {
+            return []
+        }
+        return rawModels.compactMap { raw -> AgentModelDescriptor? in
+            guard let rawID = string(raw, "slug") ?? string(raw, "id") ?? string(raw, "model"),
+                  let visibility = string(raw, "visibility"),
+                  visibility.caseInsensitiveCompare("list") == .orderedSame,
+                  (bool(raw, "supported_in_api") ?? bool(raw, "supportedInAPI")) == true else {
+                return nil
+            }
+            let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty else { return nil }
+            let efforts = reasoningEfforts(
+                raw["supported_reasoning_levels"]
+                    ?? raw["supportedReasoningLevels"]
+            )
+            let speedTiers = (raw["additional_speed_tiers"] as? [String])
+                ?? (raw["additionalSpeedTiers"] as? [String])
+                ?? []
+            let serviceTiers = (raw["service_tiers"] as? [[String: Any]])
+                ?? (raw["serviceTiers"] as? [[String: Any]])
+                ?? []
+            let label = (string(raw, "display_name") ?? string(raw, "displayName"))?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return AgentModelDescriptor(
+                id: id,
+                label: label?.isEmpty == false ? label! : displayName(for: id),
+                provider: .codex,
+                supportsReasoning: !efforts.isEmpty,
+                supportedReasoningEfforts: efforts,
+                supportsServiceTier: speedTiers.contains { $0.caseInsensitiveCompare("fast") == .orderedSame }
+                    || !serviceTiers.isEmpty,
+                supportsCustomModel: true,
+                contextWindowTokens: integer(
+                    raw["context_window"]
+                        ?? raw["contextWindow"]
+                        ?? raw["context_window_tokens"]
+                        ?? raw["contextWindowTokens"]
+                )
+            )
+        }
+    }
+
+    /// Deduplicates each source while giving live app-server metadata priority.
+    public static func merge(
+        live: [AgentModelDescriptor],
+        harness: [AgentModelDescriptor]
+    ) -> [AgentModelDescriptor] {
+        var merged: [AgentModelDescriptor] = []
+        var ids = Set<String>()
+        for model in live + harness {
+            let id = model.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty, ids.insert(id).inserted else { continue }
+            merged.append(model)
+        }
+        return merged
+    }
+
+    /// Resolves only the selected account's Codex home. No sibling/default
+    /// account directories are searched when an account-scoped home is given.
+    public static func cacheURL(environment: [String: String]) -> URL? {
+        let configuredHome = environment["CODEX_HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let home = environment["HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let root = configuredHome.flatMap { $0.isEmpty ? nil : $0 }
+            ?? home.flatMap { $0.isEmpty ? nil : "\($0)/.codex" }
+            ?? FileManager.default.homeDirectoryForCurrentUser.path + "/.codex"
+        guard root.hasPrefix("/") else { return nil }
+        return URL(fileURLWithPath: root, isDirectory: true)
+            .appendingPathComponent("models_cache.json", isDirectory: false)
+    }
+
+    private static func string(_ object: [String: Any], _ key: String) -> String? {
+        object[key] as? String
+    }
+
+    private static func bool(_ object: [String: Any], _ key: String) -> Bool? {
+        object[key] as? Bool
+    }
+
+    private static func integer(_ value: Any?) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? Double { return Int(value) }
+        if let value = value as? String { return Int(value) }
+        return nil
+    }
+
+    private static func reasoningEfforts(_ value: Any?) -> [AgentReasoningEffort] {
+        let values: [String] = {
+            if let objects = value as? [[String: Any]] {
+                return objects.compactMap {
+                    $0["effort"] as? String
+                        ?? $0["reasoningEffort"] as? String
+                        ?? $0["value"] as? String
+                }
+            }
+            return value as? [String] ?? []
+        }()
+        var efforts: [AgentReasoningEffort] = []
+        for value in values {
+            // The current CoreModel has no Codex `ultra` wire case. Preserve
+            // every representable provider value and do not invent a different
+            // effort with a misleading meaning for this picker.
+            guard value != "ultra",
+                  let effort = AgentReasoningEffort(rawValue: value),
+                  !efforts.contains(effort) else { continue }
+            efforts.append(effort)
+        }
+        return efforts
+    }
+
+    private static func displayName(for id: String) -> String {
+        id.split(separator: "-")
+            .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+            .joined(separator: " ")
+    }
+}
+
+public enum CodexAppServerModelDiscovery {
+    static func environmentForDiscovery(
+        environment: [String: String],
+        runAsUser: AgentRunAsUser?,
+        baseEnvironment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String: String] {
+        var discoveryEnvironment = CodexRunner.processEnvironment(
+            overrides: environment,
+            purpose: .supportProcess,
+            base: baseEnvironment
+        )
+        let explicitCodexHome = environment["CODEX_HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false
+        let passedHome = environment["HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let parentHome = baseEnvironment["HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let foreignRunAsUser = runAsUser.map { $0.uid != getuid() } ?? false
+        let accountHome: String? = {
+            if foreignRunAsUser { return runAsUser?.homePath }
+            return passedHome
+        }()
+        let homeChangedForAccount = foreignRunAsUser
+            || (passedHome != nil && passedHome != parentHome)
+        if foreignRunAsUser, let runAsUser {
+            discoveryEnvironment["HOME"] = runAsUser.homePath
+        }
+        if homeChangedForAccount,
+           !explicitCodexHome,
+           let accountHome,
+           !accountHome.isEmpty {
+            discoveryEnvironment["CODEX_HOME"] = "\(accountHome)/.codex"
+        }
+        return discoveryEnvironment
+    }
+
+    public static func listModels(
+        binary: String,
+        cwd: String,
+        environment: [String: String] = [:],
+        runAsUser: AgentRunAsUser? = nil
+    ) async -> [AgentModelDescriptor] {
+        await listModelsResult(
+            binary: binary,
+            cwd: cwd,
+            environment: environment,
+            runAsUser: runAsUser
+        ).models
+    }
+
+    public static func listModelsResult(
+        binary: String,
+        cwd: String,
+        environment: [String: String] = [:],
+        runAsUser: AgentRunAsUser? = nil
+    ) async -> ModelListResult {
+        let discoveryEnvironment = environmentForDiscovery(
+            environment: environment,
+            runAsUser: runAsUser
+        )
+        let harnessModels = CodexHarnessModelCatalog.models(environment: discoveryEnvironment)
+        do {
+            let client = try CodexAppServerClient(
+                binary: binary,
+                arguments: ["app-server"],
+                cwd: cwd,
+                environment: discoveryEnvironment,
+                runAsUser: runAsUser,
+                forkProtocolSupportOverride: .unsupported
+            )
+            defer { client.stop() }
+            _ = try await client.initialize()
+            let liveModels = try await client.listModels()
+            let merged = CodexHarnessModelCatalog.merge(live: liveModels, harness: harnessModels)
+            if !merged.isEmpty {
+                return ModelListResult(models: merged, isFallback: false)
+            }
+        } catch {
+            // A same-account harness cache remains selectable when the live
+            // app-server cannot advertise the catalog, but it is not live data.
+            if !harnessModels.isEmpty {
+                return ModelListResult(models: harnessModels, isFallback: true)
+            }
+        }
+        return ModelListResult(models: [], isFallback: true)
     }
 }
 
@@ -359,14 +575,19 @@ public final class CodexAppServerClient: @unchecked Sendable {
 
     public func listModels() async throws -> [AgentModelDescriptor] {
         var cursor: String?
+        var seenCursors = Set<String>()
         var models: [AgentModelDescriptor] = []
-        repeat {
+        while true {
+            if let cursor, !seenCursors.insert(cursor).inserted {
+                throw CodexAppServerError.modelListPaginationCycle
+            }
             var params: JSONObject = [:]
             if let cursor, !cursor.isEmpty { params["cursor"] = cursor }
             let response = try await requestJSONObject(method: "model/list", params: params)
             models.append(contentsOf: Self.modelDescriptors(fromModelListResponse: response))
-            cursor = response["nextCursor"] as? String
-        } while cursor?.isEmpty == false
+            cursor = response["nextCursor"] as? String ?? response["next_cursor"] as? String
+            guard cursor?.isEmpty == false else { break }
+        }
         return models
     }
 

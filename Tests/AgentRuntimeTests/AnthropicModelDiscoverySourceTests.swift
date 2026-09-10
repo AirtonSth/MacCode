@@ -100,7 +100,9 @@ final class AnthropicModelDiscoverySourceTests: XCTestCase {
     func test_listModelsResult_isFallback_true_whenNoCredential() async {
         // WHY: without a credential no request is made and the static aliases are the
         // only option; isFallback must be true so the picker can warn the user.
-        let result = await AnthropicModelDiscovery.listModelsResult(environment: [:])
+        let result = await AnthropicModelDiscovery.listModelsResult(
+            environment: ["HOME": "/tmp/rc-no-claude-credentials-\(UUID().uuidString)"]
+        )
 
         XCTAssertTrue(result.isFallback, "absent credential must set isFallback=true; got false")
         XCTAssertTrue(result.models.isEmpty, "models must be empty when no credential is present")
@@ -250,7 +252,7 @@ final class AnthropicModelDiscoverySourceTests: XCTestCase {
         // on this value must see the correct signal.
         let body = makeModelListBody(ids: ["claude-opus-4"])
         let session = stubbedSession()
-        let runner = ClaudeRunner()
+        let runner = ClaudeRunner(binaryNameOverride: "/definitely/missing/claude")
 
         let result = await URLProtocolStub.withHandler({ _ in (200, body) }) {
             await runner.listModelsResult(
@@ -267,8 +269,11 @@ final class AnthropicModelDiscoverySourceTests: XCTestCase {
         // WHY: when discovery returns no credential/error, ClaudeRunner must substitute
         // the static alias list AND set isFallback=true so the picker knows these are defaults.
         // Pass an explicit empty env so the test is not affected by CI/machine env vars.
-        let runner = ClaudeRunner()
-        let result = await runner.listModelsResult(environment: [:], session: stubbedSession())
+        let runner = ClaudeRunner(binaryNameOverride: "/definitely/missing/claude")
+        let result = await runner.listModelsResult(
+            environment: ["HOME": "/tmp/rc-no-claude-credentials-\(UUID().uuidString)"],
+            session: stubbedSession()
+        )
 
         XCTAssertTrue(result.isFallback, "ClaudeRunner must report isFallback=true when using static aliases; got false")
         let staticAliasIds = AnthropicModelDiscovery.latestAliasModels().map(\.id)

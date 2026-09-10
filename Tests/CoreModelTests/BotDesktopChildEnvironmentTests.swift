@@ -50,6 +50,62 @@ final class BotDesktopChildEnvironmentTests: XCTestCase {
         }
     }
 
+    func test_runtimeGetsOnlySelectedBotsSecretValues() throws {
+        let secretStore = InMemoryBotSecretStore()
+        let botID = BotID(UUID(uuidString: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")!)
+        let otherBotID = BotID(UUID(uuidString: "11111111-2222-3333-4444-555555555555")!)
+        try secretStore.save(botID: botID, name: "SERVICE_TOKEN", value: "fixture-runtime-value")
+        try secretStore.save(botID: otherBotID, name: "OTHER_TOKEN", value: "fixture-other-value")
+
+        let env = try BotSecretEnvironment.applying(
+            to: [
+                BotSecretEnvironment.botIDEnvironmentKey: botID.value.uuidString,
+                "PATH": "/usr/bin",
+            ],
+            store: secretStore
+        )
+        XCTAssertEqual(env["SERVICE_TOKEN"], "fixture-runtime-value")
+        XCTAssertNil(env["OTHER_TOKEN"])
+        XCTAssertEqual(env[BotSecretEnvironment.botIDEnvironmentKey], botID.value.uuidString)
+        XCTAssertEqual(env[BotSecretEnvironment.secretNamesEnvironmentKey], "SERVICE_TOKEN")
+    }
+
+    func test_inheritedBotSecretsAreRemovedBeforeApplyingNextBot() throws {
+        let secretStore = InMemoryBotSecretStore()
+        let firstBotID = BotID(UUID(uuidString: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")!)
+        let secondBotID = BotID(UUID(uuidString: "11111111-2222-3333-4444-555555555555")!)
+        try secretStore.save(botID: firstBotID, name: "FIRST_TOKEN", value: "first-value")
+        try secretStore.save(botID: secondBotID, name: "SECOND_TOKEN", value: "second-value")
+
+        let firstEnvironment = try BotSecretEnvironment.applying(
+            to: [
+                BotSecretEnvironment.botIDEnvironmentKey: firstBotID.value.uuidString,
+                "PATH": "/usr/bin",
+            ],
+            store: secretStore
+        )
+        let secondEnvironment = try BotSecretEnvironment.applying(
+            to: firstEnvironment.merging([
+                BotSecretEnvironment.botIDEnvironmentKey: secondBotID.value.uuidString,
+                BotSecretEnvironment.secretNamesEnvironmentKey:
+                    "RC_TOKEN_SAVER_THREAD_ID,FIRST_TOKEN",
+                "RC_TOKEN_SAVER_THREAD_ID": "keep-control-value",
+            ]) { _, current in current },
+            store: secretStore
+        )
+
+        XCTAssertNil(secondEnvironment["FIRST_TOKEN"])
+        XCTAssertEqual(secondEnvironment["SECOND_TOKEN"], "second-value")
+        XCTAssertEqual(secondEnvironment["RC_TOKEN_SAVER_THREAD_ID"], "keep-control-value")
+        XCTAssertEqual(secondEnvironment[BotSecretEnvironment.secretNamesEnvironmentKey], "SECOND_TOKEN")
+
+        try secretStore.delete(botID: secondBotID, name: "SECOND_TOKEN")
+        let emptyEnvironment = try BotSecretEnvironment.applying(to: secondEnvironment, store: secretStore)
+        XCTAssertNil(emptyEnvironment["FIRST_TOKEN"])
+        XCTAssertNil(emptyEnvironment["SECOND_TOKEN"])
+        XCTAssertEqual(emptyEnvironment[BotSecretEnvironment.secretNamesEnvironmentKey], "")
+    }
+
     private func run(_ url: URL) throws -> (status: Int32, err: String) {
         let process = Process()
         process.executableURL = url

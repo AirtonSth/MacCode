@@ -29,6 +29,9 @@ public enum BotSelfConfigCatalog: Sendable {
 
     public static let getSettings = "bot_get_settings"
     public static let setSettings = "bot_set_settings"
+    public static let listSecrets = "bot_list_secrets"
+    public static let saveSecret = "bot_save_secret"
+    public static let deleteSecret = "bot_delete_secret"
     public static let writeHomeFile = "bot_write_home_file"
     public static let putMemory = "bot_put_memory"
     public static let forgetMemory = "bot_forget_memory"
@@ -47,7 +50,7 @@ public enum BotSelfConfigCatalog: Sendable {
 
     public static var toolNames: [String] {
         [
-            getSettings, setSettings, writeHomeFile,
+            getSettings, setSettings, listSecrets, saveSecret, deleteSecret, writeHomeFile,
             removeSkill, saveRoutine, setRoutineEnabled,
             skillView, recall, askUser, listPeers, askPeer,
         ]
@@ -69,6 +72,12 @@ public enum BotSelfConfigCatalog: Sendable {
             return "Read this bot's live identity, soul, desktop, notifications, memory, skills, and routines."
         case setSettings:
             return "Publish this bot's own name, Role, Instructions, description, notifications, or avatar. Same path as Studio Save. \(providerRoutingHonesty) \(BotBrainCompiler.handleCreateOnlyHonesty) \(BotBrainCompiler.workspaceHostAssignedHonesty) \(BotBrainCompiler.approvalsHonesty) \(BotPermission.honestyLabel) \(BotDesktopKind.logicalExecutionSpaceHonestyLabel) \(BotBrainCompiler.testRunHonesty) \(BotBrainCompiler.memoryHonesty) \(BotBrainCompiler.forgetHonesty) \(BotBrainCompiler.correctHonesty) \(BotBrainCompiler.skillsHonesty) \(BotBrainCompiler.removeHonesty) \(BotBrainCompiler.routinesHonesty) \(BotBrainCompiler.instructionHonesty) \(BotBrainCompiler.whenHonesty) \(BotBrainCompiler.activeHonesty) \(BotBrainCompiler.websiteHonesty) \(BotBrainCompiler.userRequestHonesty)"
+        case listSecrets:
+            return "List this bot's saved secret names only. Bot runs may omit bot_id for their own Bot; Agent App runs must pass the id of a Bot created in this run or a consulted Bot (or omit it only when exactly one Bot was consulted). Secret values are never returned."
+        case saveSecret:
+            return "Save or update one secret in this bot's protected storage only when the user explicitly instructed it. Bot runs may omit bot_id for their own Bot; Agent App runs must pass the id of a Bot created in this run or a consulted Bot (or omit it only when exactly one Bot was consulted). Pass user_confirmed=true. The value is write-only and is never returned."
+        case deleteSecret:
+            return "Delete one secret from this bot's protected storage only when the user explicitly instructed it. Bot runs may omit bot_id for their own Bot; Agent App runs must pass the id of a Bot created in this run or a consulted Bot (or omit it only when exactly one Bot was consulted). Pass user_confirmed=true."
         case writeHomeFile:
             return "Write MEMORY.md, USER.md, SOUL.md, memory/YYYY-MM-DD.md, or skills/<slug>/SKILL.md in this bot's Files. Edit the file to remember, forget, correct, add a skill, or update Instructions."
         case removeSkill:
@@ -97,6 +106,10 @@ public enum BotSelfConfigCatalog: Sendable {
             "type": "string",
             "description": "Omit for a Bot's own settings. After bot_ask_peer, pass the returned Bot id to target that consulted Bot; Agent App runs may omit it when exactly one Bot was consulted.",
         ]]
+        let secretBotID: [String: Any] = ["bot_id": [
+            "type": "string",
+            "description": "Omit for a Bot's own secret tools. Agent App runs must pass the id of a Bot created in this run or a consulted Bot; omission is allowed only when exactly one Bot was consulted.",
+        ]]
         switch name {
         case getSettings:
             return ["type": "object", "properties": botID]
@@ -111,6 +124,42 @@ public enum BotSelfConfigCatalog: Sendable {
                     "notifications_enabled": ["type": "boolean", "description": "Notifications On/Off."],
                     "avatar_symbol": ["type": "string", "description": "Avatar. Same field as Studio Avatar."],
                 ]) { _, new in new },
+            ]
+        case listSecrets:
+            return ["type": "object", "properties": secretBotID]
+        case saveSecret:
+            return [
+                "type": "object",
+                "properties": secretBotID.merging([
+                    "name": [
+                        "type": "string",
+                        "description": "Environment-variable name for this bot's runtime.",
+                    ],
+                    "value": [
+                        "type": "string",
+                        "description": "Secret value. Never repeat or include it in a reply.",
+                    ],
+                    "user_confirmed": [
+                        "type": "boolean",
+                        "description": "Must be true only when the user explicitly instructed this save or update.",
+                    ],
+                ]) { _, new in new },
+                "required": ["name", "value", "user_confirmed"],
+            ]
+        case deleteSecret:
+            return [
+                "type": "object",
+                "properties": secretBotID.merging([
+                    "name": [
+                        "type": "string",
+                        "description": "Environment-variable name to delete.",
+                    ],
+                    "user_confirmed": [
+                        "type": "boolean",
+                        "description": "Must be true only when the user explicitly instructed this deletion.",
+                    ],
+                ]) { _, new in new },
+                "required": ["name", "user_confirmed"],
             ]
         case writeHomeFile:
             return [
@@ -350,6 +399,7 @@ public struct BotSelfConfigService: Sendable {
     public let callerThreadID: AgentThreadID?
     public let callerRunID: AgentRunID?
     public let store: BotStore
+    public let secretStore: any BotSecretStore
     public let appSupportDirectory: URL
 
     public init(
@@ -357,16 +407,22 @@ public struct BotSelfConfigService: Sendable {
         callerThreadID: AgentThreadID? = nil,
         callerRunID: AgentRunID? = nil,
         store: BotStore,
+        secretStore: any BotSecretStore = BotKeychainSecretStore(),
         appSupportDirectory: URL? = nil
     ) {
         self.callerBotID = callerBotID
         self.callerThreadID = callerThreadID
         self.callerRunID = callerRunID
         self.store = store
+        self.secretStore = secretStore
         self.appSupportDirectory = appSupportDirectory ?? Self.resolvedAppSupportDirectory(botID: callerBotID)
     }
 
-    public static func make(environment: [String: String], store: BotStore) throws -> BotSelfConfigService {
+    public static func make(
+        environment: [String: String],
+        store: BotStore,
+        secretStore: any BotSecretStore = BotKeychainSecretStore()
+    ) throws -> BotSelfConfigService {
         guard let caller = callerID(from: environment) else {
             throw BotSelfConfigError.callerMissing
         }
@@ -389,6 +445,7 @@ public struct BotSelfConfigService: Sendable {
             callerThreadID: threadUUID.map(AgentThreadID.init),
             callerRunID: runUUID.map(AgentRunID.init),
             store: store,
+            secretStore: secretStore,
             appSupportDirectory: directory
         )
     }
@@ -671,6 +728,16 @@ public struct BotSelfConfigService: Sendable {
                 throw BotSelfConfigError.invalid("question is required.")
             }
             return try askUser(question: question)
+        case BotSelfConfigCatalog.listSecrets,
+             BotSelfConfigCatalog.saveSecret,
+             BotSelfConfigCatalog.deleteSecret:
+            guard let bot = try store.get(id: callerBotID), bot.deletedAt == nil else {
+                throw BotSelfConfigError.notFound
+            }
+            return try BotSecretService(
+                callerBotID: bot.id,
+                store: secretStore
+            ).invoke(name: name, arguments: arguments)
         default:
             let snapshot = try call(name: name, arguments: arguments)
             return try Self.snapshotObject(snapshot)

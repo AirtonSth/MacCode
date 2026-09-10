@@ -1033,6 +1033,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let provider: String?
         let attemptID: String?
         let delegationCapabilitySHA256: String?
+        let botID: String?
+        let botSecretValues: [String: String]
 
         init(environment: [String: String]) {
             tokenSaverEnabled = environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
@@ -1048,12 +1050,26 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     ? AgentDelegationCapability.sha256Hex($0)
                     : nil
             }
+            botID = environment[BotSecretEnvironment.botIDEnvironmentKey]
+            botSecretValues = environment[BotSecretEnvironment.secretNamesEnvironmentKey]
+                .map { marker in
+                    marker
+                        .split(separator: ",", omittingEmptySubsequences: true)
+                        .map(String.init)
+                        .filter(BotKeychainSecretStore.isValidName)
+                        .reduce(into: [String: String]()) { values, name in
+                            if let value = environment[name] {
+                                values[name] = value
+                            }
+                        }
+                } ?? [:]
         }
 
         var carriesTokenSaverScope: Bool {
             tokenSaverEnabled || workspaceID != nil || projectID != nil
                 || threadID != nil || attemptID != nil
-                || delegationCapabilitySHA256 != nil
+                || delegationCapabilitySHA256 != nil || botID != nil
+                || !botSecretValues.isEmpty
         }
     }
 
@@ -1108,6 +1124,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private let checkpointRepo: AgentTurnCheckpointRepository?
     private let orchestrationRuntime: AgentOrchestrationRuntime?
     private let providerSnapshotSupplier: (@Sendable () async throws -> [AgentProviderSnapshot])?
+    private let botSecretStore: any BotSecretStore
     private var providers: [AgentProvider: AgentProviderAdapter]
     private var active: [AgentRunID: AgentRunHandle] = [:]
     private var activeThreads: [AgentThreadID: AgentRunID] = [:]
@@ -1468,7 +1485,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         orchestrationRuntime: AgentOrchestrationRuntime? = nil,
         providerSnapshotSupplier: (@Sendable () async throws -> [AgentProviderSnapshot])? = nil,
         providers: [AgentProvider: AgentProviderRunner],
-        terminalTransitionLedger: TerminalTransitionLedger? = nil
+        terminalTransitionLedger: TerminalTransitionLedger? = nil,
+        botSecretStore: any BotSecretStore = BotKeychainSecretStore()
     ) {
         self.runRepo = runRepo
         self.messageRepo = messageRepo
@@ -1477,6 +1495,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         self.checkpointRepo = checkpointRepo
         self.orchestrationRuntime = orchestrationRuntime
         self.providerSnapshotSupplier = providerSnapshotSupplier
+        self.botSecretStore = botSecretStore
         self.providers = providers.mapValues { OneShotProviderAdapter(runner: $0) }
         self.terminalTransitionLedger = terminalTransitionLedger
     }
@@ -1489,7 +1508,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         checkpointRepo: AgentTurnCheckpointRepository? = nil,
         orchestrationRuntime: AgentOrchestrationRuntime? = nil,
         providerSnapshotSupplier: (@Sendable () async throws -> [AgentProviderSnapshot])? = nil,
-        providerAdapters: [AgentProvider: AgentProviderAdapter]
+        providerAdapters: [AgentProvider: AgentProviderAdapter],
+        botSecretStore: any BotSecretStore = BotKeychainSecretStore()
     ) {
         self.init(
             runRepo: runRepo,
@@ -1499,7 +1519,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             checkpointRepo: checkpointRepo,
             orchestrationRuntime: orchestrationRuntime,
             providerSnapshotSupplier: providerSnapshotSupplier,
-            providers: [:]
+            providers: [:],
+            botSecretStore: botSecretStore
         )
         self.providers = providerAdapters
     }
@@ -2162,6 +2183,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 forKey: AgentDelegationCapabilityTransport.environmentKey
             )
         }
+        // Secret loading is part of run admission, not desktop-environment
+        // shaping. Reload it for every turn so resident provider processes see
+        // the exact current Bot values before scope comparison or provider start.
+        effectiveEnvironment = try BotSecretEnvironment.applying(
+            to: effectiveEnvironment,
+            store: botSecretStore
+        )
         let effectiveReasoningEffort = Self.normalizedProviderReasoningEffort(
             provider: request.provider,
             model: request.model,

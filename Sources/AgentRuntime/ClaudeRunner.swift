@@ -11,8 +11,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
-        let result = await AnthropicModelDiscovery.listModelsResult()
-        return result.isFallback ? Self.listModels(installedVersion: nil) : result.models
+        await listModelsResult().models
     }
 
     /// Like `listModels` but returns a `ModelListResult` so callers can
@@ -21,8 +20,19 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     /// callers use the defaults.
     public func listModelsResult(
         environment: [String: String] = [:],
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        cwd: String = FileManager.default.currentDirectoryPath,
+        runAsUser: AgentRunAsUser? = nil
     ) async -> ModelListResult {
+        let harnessModels = await ClaudeHarnessModelDiscovery.listModels(
+            binary: binaryNameOverride ?? "claude",
+            cwd: cwd,
+            environment: environment,
+            runAsUser: runAsUser
+        )
+        if !harnessModels.isEmpty {
+            return ModelListResult(models: harnessModels, isFallback: false)
+        }
         let result = await AnthropicModelDiscovery.listModelsResult(environment: environment, session: session)
         if result.isFallback {
             return ModelListResult(models: Self.listModels(installedVersion: nil), isFallback: true)

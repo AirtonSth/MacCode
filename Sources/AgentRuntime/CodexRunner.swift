@@ -540,8 +540,11 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             ? LoginShellEnvironment.current(parentEnvironment: gui)
             : nil
 
-        var base = gui
+        // Scrub each inherited source before overlaying them so one source's
+        // marker cannot hide marked secrets from the other source.
+        var base = BotSecretEnvironment.scrubbingInherited(from: gui)
         if let login {
+            let login = BotSecretEnvironment.scrubbingInherited(from: login)
             // delta-over-GUI: overlay login keys that differ/are new, except the
             // GUI-owned identity/sandbox keys; drop shell-local volatile keys.
             for (key, value) in login where !isGuiOwned(key) {

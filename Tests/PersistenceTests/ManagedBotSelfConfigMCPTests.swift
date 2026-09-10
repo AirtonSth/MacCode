@@ -34,6 +34,9 @@ final class ManagedBotSelfConfigMCPTests: XCTestCase {
             XCTAssertFalse(names.contains(RemoteCodeHostCatalog.genericHostCallTool))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.getSettings))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.setSettings))
+            XCTAssertTrue(names.contains(BotSelfConfigCatalog.listSecrets))
+            XCTAssertTrue(names.contains(BotSelfConfigCatalog.saveSecret))
+            XCTAssertTrue(names.contains(BotSelfConfigCatalog.deleteSecret))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.writeHomeFile))
             XCTAssertFalse(names.contains(BotSelfConfigCatalog.setSkill))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.saveRoutine))
@@ -127,5 +130,79 @@ final class ManagedBotSelfConfigMCPTests: XCTestCase {
         let text = try XCTUnwrap(content.first?["text"] as? String)
         XCTAssertTrue(text.contains("Piper Live"))
         XCTAssertEqual(try store.get(id: bot.id)?.name, "Piper Live")
+    }
+
+    func test_secretToolsUseInjectedProtectedStore_andReturnMetadataOnly() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let store = BotStore(db: db)
+        let bot = try store.create(
+            name: "Piper", title: "Scout", description: "", soul: "Be brief.", provider: .claude
+        )
+        let secretStore = InMemoryBotSecretStore()
+        let environment = [BotSelfConfigCatalog.callerEnvironmentKey: bot.id.value.uuidString]
+        let server = ManagedBotSelfConfigMCP(
+            environment: environment,
+            storeFactory: { _ in store },
+            secretStore: secretStore
+        )
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": [
+                "name": BotSelfConfigCatalog.saveSecret,
+                "arguments": [
+                    "name": "SERVICE_TOKEN",
+                    "value": "fixture-value-one",
+                    "user_confirmed": true,
+                ],
+            ],
+        ]
+        let line = try XCTUnwrap(String(
+            data: JSONSerialization.data(withJSONObject: payload),
+            encoding: .utf8
+        ))
+        let saved = try parse(server.handle(line))
+        let savedText = try XCTUnwrap(
+            ((saved["result"] as? [String: Any])?["content"] as? [[String: Any]])?.first?["text"] as? String
+        )
+        XCTAssertFalse(savedText.contains("fixture-value-one"))
+        XCTAssertTrue(savedText.contains("SERVICE_TOKEN"))
+
+        let listPayload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": [
+                "name": BotSelfConfigCatalog.listSecrets,
+                "arguments": [:],
+            ],
+        ]
+        let listLine = try XCTUnwrap(String(
+            data: JSONSerialization.data(withJSONObject: listPayload),
+            encoding: .utf8
+        ))
+        let listed = try parse(server.handle(listLine))
+        let listedText = try XCTUnwrap(
+            ((listed["result"] as? [String: Any])?["content"] as? [[String: Any]])?.first?["text"] as? String
+        )
+        XCTAssertEqual(listedText, #"{"secrets":["SERVICE_TOKEN"]}"#)
+
+        let deletePayload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": [
+                "name": BotSelfConfigCatalog.deleteSecret,
+                "arguments": ["name": "SERVICE_TOKEN", "user_confirmed": true],
+            ],
+        ]
+        let deleteLine = try XCTUnwrap(String(
+            data: JSONSerialization.data(withJSONObject: deletePayload),
+            encoding: .utf8
+        ))
+        _ = try parse(server.handle(deleteLine))
+        XCTAssertTrue(try secretStore.list(botID: bot.id).isEmpty)
     }
 }

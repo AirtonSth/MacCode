@@ -341,6 +341,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
     private let sshPasswordStore: SSHPasswordStoring
     private let sshCommandRunner: SSHCommandRunner
+    private let botSecretStore: any BotSecretStore
     private let agentAppReadGateway: AgentAppReadGateway
     // PERF: publishQueuedMessage + notificationList constructed ISO8601DateFormatter
     // per date field. Construction is expensive; share one MainActor-isolated formatter.
@@ -377,7 +378,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public private(set) var restoreFailedSurfaceIDs: [SurfaceID] = []
 
     public convenience init(context: AppContext) {
-        self.init(context: context, sshPasswordStore: KeychainSSHPasswordStore())
+        self.init(
+            context: context,
+            sshPasswordStore: KeychainSSHPasswordStore(),
+            secretStore: BotKeychainSecretStore()
+        )
     }
 
     init(
@@ -385,11 +390,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         sshPasswordStore: SSHPasswordStoring,
         sshCommandRunner: @escaping SSHCommandRunner = { executable, arguments, password in
             try AppCommandRouter.runCommandBlocking(executable: executable, arguments: arguments, password: password)
-        }
+        },
+        secretStore: any BotSecretStore = BotKeychainSecretStore()
     ) {
         self.context = context
         self.sshPasswordStore = sshPasswordStore
         self.sshCommandRunner = sshCommandRunner
+        self.botSecretStore = secretStore
         self.agentAppReadGateway = AgentAppReadGateway(db: context.db)
     }
 
@@ -2685,39 +2692,67 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         arguments: [String: JSONValue],
         delegationCapability: String? = nil
     ) throws -> JSONValue {
+        let isSecretTool = toolName == BotSelfConfigCatalog.listSecrets
+            || toolName == BotSelfConfigCatalog.saveSecret
+            || toolName == BotSelfConfigCatalog.deleteSecret
+        let isSecretMutation = toolName == BotSelfConfigCatalog.saveSecret
+            || toolName == BotSelfConfigCatalog.deleteSecret
         let ctx = try validatedBotPeerCaller(
             threadID: callerThread,
             runID: callerRun,
             delegationCapability: delegationCapability,
-            mutation: false,
+            mutation: isSecretMutation,
             method: "bot.peer.self_config"
         )
-        guard toolName == BotSelfConfigCatalog.getSettings
+        guard isSecretTool
+                || toolName == BotSelfConfigCatalog.getSettings
                 || toolName == BotSelfConfigCatalog.setSettings else {
             throw JSONRPCError(code: -32602, message: "Tool is not available through a delegated Bot grant.")
         }
         let requestedID = arguments["bot_id"]?.stringValue
             .flatMap(UUID.init)
             .map(BotID.init)
-        guard let delegatedID = ctx.botPeerHandoffAuthority.delegatedBotID(
-            forHostRunID: callerRun,
-            requestedBotID: requestedID
-        ) else {
-            throw JSONRPCError(
-                code: -32046,
-                message: "This active run has no matching completed Bot consultation grant."
+        let targetID: BotID
+        if isSecretTool {
+            guard let candidate = requestedID ?? ctx.botPeerHandoffAuthority.delegatedBotID(
+                forHostRunID: callerRun
+            ) else {
+                throw JSONRPCError(
+                    code: -32046,
+                    message: "This active run has no matching Bot grant."
+                )
+            }
+            targetID = try authorizedHostSkillBot(
+                botID: candidate,
+                callerRun: callerRun,
+                callerThread: callerThread
             )
+        } else {
+            guard let delegatedID = ctx.botPeerHandoffAuthority.delegatedBotID(
+                forHostRunID: callerRun,
+                requestedBotID: requestedID
+            ) else {
+                throw JSONRPCError(
+                    code: -32046,
+                    message: "This active run has no matching completed Bot consultation grant."
+                )
+            }
+            targetID = delegatedID
         }
         var foundationArguments = arguments.mapValues(Self.botPeerFoundationValue)
-        foundationArguments["bot_id"] = delegatedID.value.uuidString.lowercased()
+        foundationArguments["bot_id"] = targetID.value.uuidString.lowercased()
         let environment = [
             "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": ctx.appSupportDirectory.path,
-            BotSelfConfigCatalog.callerEnvironmentKey: delegatedID.value.uuidString.lowercased(),
+            BotSelfConfigCatalog.callerEnvironmentKey: targetID.value.uuidString.lowercased(),
         ]
-        let service = try BotSelfConfigService.make(environment: environment, store: ctx.botStore)
+        let service = try BotSelfConfigService.make(
+            environment: environment,
+            store: ctx.botStore,
+            secretStore: botSecretStore
+        )
         let result = try service.invoke(name: toolName, arguments: foundationArguments)
         if toolName == BotSelfConfigCatalog.setSettings {
-            _ = botsViewModel?.refreshPublishedIdentity(for: delegatedID)
+            _ = botsViewModel?.refreshPublishedIdentity(for: targetID)
         }
         return JSONValue.from(result)
     }
@@ -6207,17 +6242,47 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor] {
-        let binary = configuredProviderBinary(provider)
-        let runner: AgentProviderRunner
+        await listAgentModels(provider: provider, runAsUser: nil)
+    }
+
+    public func listAgentModels(
+        provider: AgentProvider,
+        runAsUser: AgentRunAsUser?
+    ) async -> [AgentModelDescriptor] {
+        let binary = configuredProviderBinary(provider) ?? provider.rawValue
+        let binaryPath = Self.resolveProviderBinaryPath(binary: binary, runAsUser: runAsUser)
+        let environment = Self.probeEnvironment(
+            base: providerEnvironment(provider: provider, instanceId: nil),
+            provider: provider,
+            runAsUser: runAsUser
+        )
+        let cwd = context?.state.workspaces.values.first?.cwd ?? NSHomeDirectory()
         switch provider {
         case .codex:
-            runner = CodexRunner(binaryNameOverride: binary)
+            let discovered = await CodexAppServerModelDiscovery.listModels(
+                binary: binaryPath.isEmpty ? binary : binaryPath,
+                cwd: cwd,
+                environment: environment,
+                runAsUser: runAsUser
+            )
+            return discovered.isEmpty
+                ? await CodexRunner(binaryNameOverride: binaryPath.isEmpty ? binary : binaryPath).listModels()
+                : discovered
         case .claude:
-            runner = ClaudeRunner(binaryNameOverride: binary)
+            return await ClaudeRunner(binaryNameOverride: binaryPath.isEmpty ? binary : binaryPath)
+                .listModelsResult(
+                    environment: environment,
+                    cwd: cwd,
+                    runAsUser: runAsUser
+                ).models
         case .grok:
-            return await GrokACPAdapter(binaryNameOverride: binary).listModels()
+            return await GrokACPAdapter(
+                binaryNameOverride: binaryPath.isEmpty ? binary : binaryPath,
+                discoveryCwd: cwd,
+                discoveryEnvironment: environment,
+                discoveryRunAsUser: runAsUser
+            ).listModels()
         }
-        return await runner.listModels()
     }
 
     func refreshAgentProviderAuthentication(_ provider: AgentProvider) async -> [AgentProviderSnapshot] {
@@ -6317,7 +6382,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     ? await GrokACPAdapter(
                         binaryNameOverride: binaryPath.isEmpty ? binary : binaryPath,
                         discoveryCwd: FileManager.default.currentDirectoryPath,
-                        discoveryEnvironment: env
+                        discoveryEnvironment: env,
+                        discoveryRunAsUser: runAsUser
                     ).discoveryResult()
                     : nil
                 let models: [AgentModelDescriptor]
@@ -6326,41 +6392,32 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     models = grokDiscovery.models
                     liveCatalogVerified = !grokDiscovery.isFallback && !grokDiscovery.models.isEmpty
                 } else if instance.provider == .claude {
-                    let discovery = await AnthropicModelDiscovery.listModelsResult(environment: env)
-                    if !discovery.isFallback && !discovery.models.isEmpty {
-                        models = discovery.models
-                        liveCatalogVerified = true
-                    } else {
-                        models = await listAgentModels(
-                            provider: instance.provider,
-                            installedVersion: capabilities.version,
-                            binaryPath: binaryPath,
-                            environment: env
+                    let discovery = await ClaudeRunner(binaryNameOverride: binaryPath.isEmpty ? binary : binaryPath)
+                        .listModelsResult(
+                            environment: env,
+                            cwd: context?.state.workspaces.values.first?.cwd ?? NSHomeDirectory(),
+                            runAsUser: runAsUser
                         )
-                        // Claude Code (claude.ai OAuth) has no ANTHROPIC_API_KEY;
-                        // Anthropic REST discovery falls back. Treat installed +
-                        // authenticated CLI with models as verified so Auto can
-                        // admit Claude instead of silently routing to Codex.
-                        liveCatalogVerified = !models.isEmpty
-                            && !binaryPath.isEmpty
-                            && capabilities.authenticated != false
-                    }
+                    models = discovery.models
+                    liveCatalogVerified = !discovery.isFallback && !discovery.models.isEmpty
                 } else if instance.provider == .codex, !binaryPath.isEmpty {
                     let cwd = context?.state.workspaces.values.first?.cwd ?? NSHomeDirectory()
-                    let discovered = await CodexAppServerModelDiscovery.listModels(
+                    let discovery = await CodexAppServerModelDiscovery.listModelsResult(
                         binary: binaryPath,
                         cwd: cwd,
-                        environment: env
+                        environment: env,
+                        runAsUser: runAsUser
                     )
-                    if !discovered.isEmpty {
-                        models = discovered
-                        liveCatalogVerified = true
+                    if !discovery.models.isEmpty {
+                        models = discovery.models
+                        liveCatalogVerified = !discovery.isFallback
                     } else {
                         models = await listAgentModels(
                             provider: instance.provider,
                             installedVersion: capabilities.version,
                             binaryPath: binaryPath,
-                            environment: env
+                            environment: env,
+                            runAsUser: runAsUser
                         )
                         liveCatalogVerified = false
                     }
@@ -6369,7 +6426,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         provider: instance.provider,
                         installedVersion: capabilities.version,
                         binaryPath: binaryPath,
-                        environment: env
+                        environment: env,
+                        runAsUser: runAsUser
                     )
                     liveCatalogVerified = false
                 }
@@ -6443,7 +6501,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 ? await GrokACPAdapter(
                     binaryNameOverride: binaryPath.isEmpty ? binary : binaryPath,
                     discoveryCwd: FileManager.default.currentDirectoryPath,
-                    discoveryEnvironment: env
+                    discoveryEnvironment: env,
+                    discoveryRunAsUser: runAsUser
                 ).discoveryResult()
                 : nil
             let models: [AgentModelDescriptor]
@@ -6452,38 +6511,32 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 models = grokDiscovery.models
                 liveCatalogVerified = !grokDiscovery.isFallback && !grokDiscovery.models.isEmpty
             } else if provider == .claude {
-                let discovery = await AnthropicModelDiscovery.listModelsResult(environment: env)
-                if !discovery.isFallback && !discovery.models.isEmpty {
-                    models = discovery.models
-                    liveCatalogVerified = true
-                } else {
-                    models = await listAgentModels(
-                        provider: provider,
-                        installedVersion: capabilities.version,
-                        binaryPath: binaryPath,
-                        environment: env
+                let discovery = await ClaudeRunner(binaryNameOverride: binaryPath.isEmpty ? binary : binaryPath)
+                    .listModelsResult(
+                        environment: env,
+                        cwd: context?.state.workspaces.values.first?.cwd ?? NSHomeDirectory(),
+                        runAsUser: runAsUser
                     )
-                    // Same Claude Code OAuth path as the instance-based loader.
-                    liveCatalogVerified = !models.isEmpty
-                        && !binaryPath.isEmpty
-                        && capabilities.authenticated != false
-                }
+                models = discovery.models
+                liveCatalogVerified = !discovery.isFallback && !discovery.models.isEmpty
             } else if provider == .codex, !binaryPath.isEmpty {
                 let cwd = context?.state.workspaces.values.first?.cwd ?? NSHomeDirectory()
-                let discovered = await CodexAppServerModelDiscovery.listModels(
+                let discovery = await CodexAppServerModelDiscovery.listModelsResult(
                     binary: binaryPath,
                     cwd: cwd,
-                    environment: env
+                    environment: env,
+                    runAsUser: runAsUser
                 )
-                if !discovered.isEmpty {
-                    models = discovered
-                    liveCatalogVerified = true
+                if !discovery.models.isEmpty {
+                    models = discovery.models
+                    liveCatalogVerified = !discovery.isFallback
                 } else {
                     models = await listAgentModels(
                         provider: provider,
                         installedVersion: capabilities.version,
                         binaryPath: binaryPath,
-                        environment: env
+                        environment: env,
+                        runAsUser: runAsUser
                     )
                     liveCatalogVerified = false
                 }
@@ -6492,7 +6545,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     provider: provider,
                     installedVersion: capabilities.version,
                     binaryPath: binaryPath,
-                    environment: env
+                    environment: env,
+                    runAsUser: runAsUser
                 )
                 liveCatalogVerified = false
             }
@@ -6586,21 +6640,31 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         provider: AgentProvider,
         installedVersion: String?,
         binaryPath: String,
-        environment: [String: String]
+        environment: [String: String],
+        runAsUser: AgentRunAsUser? = nil
     ) async -> [AgentModelDescriptor] {
         switch provider {
         case .codex:
             if !binaryPath.isEmpty {
                 let cwd = context?.state.workspaces.values.first?.cwd ?? NSHomeDirectory()
-                let appServerModels = await CodexAppServerModelDiscovery.listModels(binary: binaryPath, cwd: cwd, environment: environment)
+                let appServerModels = await CodexAppServerModelDiscovery.listModels(
+                    binary: binaryPath,
+                    cwd: cwd,
+                    environment: environment,
+                    runAsUser: runAsUser
+                )
                 if !appServerModels.isEmpty {
                     return appServerModels
                 }
             }
-            return await listAgentModels(provider: provider)
+            return await listAgentModels(provider: provider, runAsUser: runAsUser)
         case .claude:
-            let apiModels = await AnthropicModelDiscovery.listModels(environment: environment)
-            return apiModels.isEmpty ? ClaudeRunner.listModels(installedVersion: installedVersion) : apiModels
+            return await ClaudeRunner(binaryNameOverride: binaryPath.isEmpty ? nil : binaryPath)
+                .listModelsResult(
+                    environment: environment,
+                    cwd: context?.state.workspaces.values.first?.cwd ?? NSHomeDirectory(),
+                    runAsUser: runAsUser
+                ).models
         case .grok:
             return GrokRunner.listModels(installedVersion: installedVersion)
         }

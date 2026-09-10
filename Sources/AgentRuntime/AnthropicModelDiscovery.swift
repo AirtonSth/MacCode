@@ -27,9 +27,14 @@ public enum AnthropicDiscoveryRequestBuilder {
     /// Returns nil if neither credential is available or the URL is invalid.
     public static func build(
         environment: [String: String],
-        timeoutSeconds: TimeInterval = defaultTimeoutSeconds
+        timeoutSeconds: TimeInterval = defaultTimeoutSeconds,
+        afterID: String? = nil
     ) -> URLRequest? {
-        guard let url = URL(string: "https://api.anthropic.com/v1/models") else { return nil }
+        guard var components = URLComponents(string: "https://api.anthropic.com/v1/models") else { return nil }
+        if let afterID, !afterID.isEmpty {
+            components.queryItems = [URLQueryItem(name: "after_id", value: afterID)]
+        }
+        guard let url = components.url else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = timeoutSeconds
@@ -139,17 +144,33 @@ public enum AnthropicModelDiscovery {
             return ModelListResult(models: cached.models, isFallback: false)
         }
 
-        guard let request = AnthropicDiscoveryRequestBuilder.build(environment: env) else {
-            return ModelListResult(models: [], isFallback: true)
-        }
-
         do {
-            let (data, response) = try await session.data(for: request)
-            guard (response as? HTTPURLResponse)?.statusCode == 200,
-                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                return ModelListResult(models: [], isFallback: true)
+            var afterID: String?
+            var seenAfterIDs = Set<String>()
+            var models: [AgentModelDescriptor] = []
+            while true {
+                guard let request = AnthropicDiscoveryRequestBuilder.build(
+                    environment: env,
+                    afterID: afterID
+                ) else {
+                    return ModelListResult(models: [], isFallback: true)
+                }
+                let (data, response) = try await session.data(for: request)
+                guard (response as? HTTPURLResponse)?.statusCode == 200,
+                      let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    return ModelListResult(models: [], isFallback: true)
+                }
+                models.append(contentsOf: modelDescriptors(fromListResponse: object))
+                guard object["has_more"] as? Bool == true else { break }
+                guard let nextAfterID = object["last_id"] as? String,
+                      !nextAfterID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      seenAfterIDs.insert(nextAfterID).inserted else {
+                    // A malformed or cyclic cursor cannot prove that the
+                    // catalog is complete. Preserve the honest fallback state.
+                    return ModelListResult(models: [], isFallback: true)
+                }
+                afterID = nextAfterID
             }
-            let models = modelDescriptors(fromListResponse: object)
             await _cache.store(ModelDiscoveryCacheEntry(models: models, fetchedAt: Date()), for: cacheKey)
             return ModelListResult(models: models, isFallback: false)
         } catch {

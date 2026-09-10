@@ -779,6 +779,37 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(result.models.map(\.id), ["account-live-model"])
     }
 
+    func test_modelCatalogUnionsStartupAndSessionAndSessionMetadataWinsDuplicates() {
+        let startup = AgentModelDescriptor(
+            id: "shared-model",
+            label: "Startup label",
+            provider: .grok,
+            supportsReasoning: false
+        )
+        let session = AgentModelDescriptor(
+            id: "shared-model",
+            label: "Negotiated label",
+            provider: .grok,
+            supportsReasoning: true,
+            supportedReasoningEfforts: [.low, .high],
+            supportsServiceTier: true,
+            contextWindowTokens: 256_000
+        )
+        let sessionOnly = AgentModelDescriptor(
+            id: "session-only",
+            label: "Session only",
+            provider: .grok
+        )
+
+        let merged = GrokACPAdapter.mergeModelCatalogs([startup], [session, sessionOnly])
+
+        XCTAssertEqual(merged.map(\.id), ["shared-model", "session-only"])
+        XCTAssertEqual(merged.first?.label, "Negotiated label")
+        XCTAssertEqual(merged.first?.supportedReasoningEfforts, [.low, .high])
+        XCTAssertTrue(merged.first?.supportsServiceTier == true)
+        XCTAssertEqual(merged.first?.contextWindowTokens, 256_000)
+    }
+
     func test_discoveryWithoutModeAdvertisementExposesFullPermissionSet() async throws {
         // Live Grok 0.2.x / 1.0.0 session/new often omits modes.availableModes while still
         // accepting session/set_mode for default / acceptEdits / bypassPermissions / plan.

@@ -207,6 +207,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
 
     public let provider: AgentProvider = .grok
     private let binaryNameOverride: String?
+    private let discoveryRunAsUser: AgentRunAsUser?
     private let cancellationGracePeriod: TimeInterval
     /// Inactivity bound while a prompt is in flight. Re-armed on every emitted
     /// turn event (tools, stream deltas). When `session/prompt` never returns
@@ -250,6 +251,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         turnInactivityTimeout: TimeInterval = 900,
         discoveryCwd: String = FileManager.default.temporaryDirectory.path,
         discoveryEnvironment: [String: String] = [:],
+        discoveryRunAsUser: AgentRunAsUser? = nil,
         modelCacheTTL: TimeInterval = 300,
         maxReadableEvents: Int = AgentRunCoordinator.hotReplayEventCount,
         maxReadableBytes: Int64 = AgentRunCoordinator.hotReplayEventBytes
@@ -259,6 +261,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         self.turnInactivityTimeout = max(0.01, turnInactivityTimeout)
         self.discoveryCwd = discoveryCwd
         self.discoveryEnvironment = discoveryEnvironment
+        self.discoveryRunAsUser = discoveryRunAsUser
         self.modelCacheTTL = max(0, modelCacheTTL)
         self.maxReadableEvents = max(1, maxReadableEvents)
         self.maxReadableBytes = max(1, maxReadableBytes)
@@ -297,12 +300,13 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 binary: binaryNameOverride ?? "grok",
                 cwd: discoveryCwd,
                 environment: discoveryEnvironment,
+                runAsUser: discoveryRunAsUser,
                 tagProcess: Self.discoveryProcessOwnershipTaggingEnabled
             )
             defer { client.stop() }
             let initialized = try await client.initialize()
             let opened = try await client.newSession(cwd: discoveryCwd)
-            let discovered = initialized.models.isEmpty ? opened.models : initialized.models
+            let discovered = Self.mergeModelCatalogs(initialized.models, opened.models)
             let modeIDs = Set(opened.availableModes.map(\.id))
             // Live Grok 0.2.x / 1.0.0 often omits `modes.availableModes` from session/new
             // while still accepting session/set_mode for the CLI wire IDs
@@ -373,6 +377,27 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         }
         Self.storeDiscovery(result, for: cacheKey, fetchedAt: now, ttl: modelCacheTTL)
         return result
+    }
+
+    /// Initialization and session/new can advertise different portions of the
+    /// current account catalog. Keep the union and let the later session/new
+    /// response own duplicate IDs because it is the current negotiated session
+    /// metadata; do not infer authority from a metadata score.
+    nonisolated static func mergeModelCatalogs(_ catalogs: [AgentModelDescriptor]...) -> [AgentModelDescriptor] {
+        var merged: [AgentModelDescriptor] = []
+        var indexes: [String: Int] = [:]
+        for catalog in catalogs {
+            for model in catalog {
+                guard !model.id.isEmpty else { continue }
+                if let index = indexes[model.id] {
+                    merged[index] = model
+                } else {
+                    indexes[model.id] = merged.count
+                    merged.append(model)
+                }
+            }
+        }
+        return merged
     }
 
     /// Opaque identity for one binary/account configuration. File metadata makes

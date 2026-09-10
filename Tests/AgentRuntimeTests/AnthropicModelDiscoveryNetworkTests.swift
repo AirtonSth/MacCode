@@ -109,6 +109,33 @@ final class AnthropicModelDiscoveryNetworkTests: XCTestCase {
         XCTAssertTrue(ids.contains("claude-haiku-3"), "haiku id must be present; got \(ids)")
     }
 
+    func test_listModels_followsPaginationMetadata() async {
+        let firstPage = Data("""
+        {"data":[{"id":"claude-opus-4","display_name":"Opus"}],"has_more":true,"last_id":"cursor-1"}
+        """.utf8)
+        let secondPage = Data("""
+        {"data":[{"id":"claude-sonnet-4","display_name":"Sonnet"}],"has_more":false}
+        """.utf8)
+        var queries: [String?] = []
+
+        let result = await URLProtocolStub.withHandler({ request in
+            queries.append(request.url?.query)
+            return queries.count == 1 ? (200, firstPage) : (200, secondPage)
+        }) {
+            await AnthropicModelDiscovery.listModelsResult(
+                environment: ["ANTHROPIC_API_KEY": "sk-ant-pagination"],
+                session: self.stubbedSession()
+            )
+        }
+
+        XCTAssertFalse(result.isFallback)
+        XCTAssertEqual(result.models.map(\.id), ["claude-opus-4", "claude-sonnet-4"])
+        XCTAssertEqual(queries.count, 2)
+        XCTAssertNil(queries[0])
+        XCTAssertTrue(queries[1]?.contains("after_id=cursor-1") == true,
+                      "second request must carry the provider cursor; got \(queries)")
+    }
+
     func test_listModels_non200_returnsEmpty() async {
         // WHY: a 4xx/5xx response must not produce descriptors; returning partial garbage
         // would populate the UI with invalid model IDs.
@@ -151,7 +178,7 @@ final class AnthropicModelDiscoveryNetworkTests: XCTestCase {
             return (200, self.makeModelListBody(ids: ["claude-opus-4"]))
         }) {
             await AnthropicModelDiscovery.listModels(
-                environment: [:],
+                environment: ["HOME": "/tmp/rc-no-claude-credentials-\(UUID().uuidString)"],
                 session: session
             )
         }

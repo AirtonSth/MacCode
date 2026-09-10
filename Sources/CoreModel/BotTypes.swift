@@ -315,6 +315,9 @@ public enum BotStandingInstructions {
     public static let removeSkillTool = "bot_remove_skill"
     public static let saveRoutineTool = "bot_save_routine"
     public static let setRoutineEnabledTool = "bot_set_routine_enabled"
+    public static let listSecretsTool = "bot_list_secrets"
+    public static let saveSecretTool = "bot_save_secret"
+    public static let deleteSecretTool = "bot_delete_secret"
     /// Must stay identical to `BotBrowserCatalog.open` / `get` / `waitLogin`.
     public static let openBrowserTool = "bot_browser_open"
     public static let getBrowserTool = "bot_browser_get"
@@ -334,6 +337,9 @@ public enum BotStandingInstructions {
 
     public static let generatedMutateLine =
         "When asked to add, correct, or create a skill, write skills/<slug>/SKILL.md with \(writeMemoryFileTool). When asked to remove a skill, call \(removeSkillTool) to delete that file. When asked to create or change a routine, call \(saveRoutineTool). When asked to set a routine Active or Off, call \(setRoutineEnabledTool). When the user corrects a recurring workflow, update that SKILL.md. When they change standing behavior, update Instructions with \(changeJobTool) or write SOUL.md. Those writes apply on later turns. They cannot add tools."
+
+    public static let generatedSecretsLine =
+        "When explicitly instructed by the user to save a secret, call \(saveSecretTool) with the exact environment-variable name and value and user_confirmed=true. Secret values are write-only: never repeat them. Use \(listSecretsTool) for names only; use \(deleteSecretTool) only when explicitly instructed. Saved secrets are available only to this Bot's runtime."
 
     public static let generatedBrowserLine =
         "When asked to open a website, call \(openBrowserTool). When asked what is open in that browser, call \(getBrowserTool). When asked to wait for a login, call \(waitLoginTool). When asked to read or use that page, call \(snapshotBrowserTool) then \(actBrowserTool). That browser is this teammate's own Playwright-driven browser — not the user's, and never a RemoteCode in-app browser tab."
@@ -369,6 +375,7 @@ public enum BotStandingInstructions {
         var lines = [
             generatedCapabilityLine,
             generatedMutateLine,
+            generatedSecretsLine,
         ]
         if admission.allowsGuestComputer {
             lines.append(generatedGuestComputerLine)
