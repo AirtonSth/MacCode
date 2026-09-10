@@ -11,6 +11,9 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
     public static let serverName = "remotecode-computer-use"
     static let maximumWaitersPerTarget = 128
     private static let maximumTicketsPerTarget = maximumWaitersPerTarget + 1
+    /// Wait-poll while an earlier ticket still owns the target (CU-10MS).
+    /// 50 ms (was 10 ms) cuts directory scans ~80% without changing FIFO order.
+    static let waitPollIntervalNanoseconds: UInt64 = 50_000_000
 
     public enum Kind: String, Sendable, Equatable {
         case observation
@@ -453,7 +456,7 @@ public final class ComputerUseHostQueue: @unchecked Sendable {
             ).filter { $0.lastPathComponent.hasPrefix("ticket-") }
                 .contains { $0.lastPathComponent < ticket.url.lastPathComponent }) ?? false
             if !earlier { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
+            try await Task.sleep(nanoseconds: Self.waitPollIntervalNanoseconds)
         }
     }
 

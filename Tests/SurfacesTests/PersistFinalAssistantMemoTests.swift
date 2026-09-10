@@ -206,4 +206,64 @@ final class PersistFinalAssistantMemoTests: XCTestCase {
         XCTAssertTrue(msgs.contains(where: { $0.role == .assistant && $0.content == "Answer D" }),
                       "a new final answer after the ID memo is set must still be persisted — skipping reload must not silently discard the message")
     }
+
+    /// First-completion list+append must hop off MainActor like open-bundle.
+    /// WHY: AgentAppViewModel is @MainActor; a 100-row listRecent on finish
+    /// used to hitch the UI actor. The payload helper is the off-main seam.
+    func test_persistFinalAssistantPayloadOffMain_appendsAndDedupes() async throws {
+        let (vm, messageRepo) = try makeVM()
+        vm.createThread(title: "off-main persist")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+
+        let first = await AgentAppViewModel.persistFinalAssistantPayloadOffMain(
+            repository: messageRepo,
+            threadId: tid,
+            text: "Off-main answer",
+            shouldReload: true
+        )
+        guard case .appended(let firstId) = first else {
+            XCTFail("first off-main persist must append a row")
+            return
+        }
+        let second = await AgentAppViewModel.persistFinalAssistantPayloadOffMain(
+            repository: messageRepo,
+            threadId: tid,
+            text: "Off-main answer",
+            shouldReload: true
+        )
+        guard case .alreadyPresent = second else {
+            XCTFail("reload path must not append a duplicate final")
+            return
+        }
+        let msgs = try messageRepo.list(threadId: tid)
+        let matches = msgs.filter { $0.role == .assistant && $0.content == "Off-main answer" }
+        XCTAssertEqual(matches.count, 1)
+        XCTAssertEqual(matches.first?.id, firstId)
+    }
+
+    func test_persistFinalAssistant_sourceHopsListAndAppendOffMain() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        let persistRange = try XCTUnwrap(source.range(of: "func persistFinalAssistantIfMissing"))
+        let persistBody = String(source[persistRange.lowerBound...].prefix(1_600))
+        XCTAssertTrue(
+            persistBody.contains("persistFinalAssistantPayloadOffMain"),
+            "finish persist must hop list+append off MainActor"
+        )
+        XCTAssertFalse(
+            persistBody.contains("messageRepo.listRecent"),
+            "listRecent must not remain on the MainActor persist path"
+        )
+        let hopRange = try XCTUnwrap(source.range(of: "func persistFinalAssistantPayloadOffMain"))
+        let hopBody = String(source[hopRange.lowerBound...].prefix(1_200))
+        XCTAssertTrue(hopBody.contains("Task.detached"))
+        XCTAssertTrue(hopBody.contains("repository.listRecent"))
+        XCTAssertTrue(hopBody.contains("repository.append"))
+    }
 }
