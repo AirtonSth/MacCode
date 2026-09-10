@@ -189,6 +189,128 @@ final class RemoteCodeHostCatalogRouterTests: XCTestCase {
         XCTAssertEqual(thread.objectValue?["title"]?.stringValue, "Desk thread")
     }
 
+    func test_createdBotSecretToolsUseActiveFullAccessGrantAndNeverReturnValues() throws {
+        let harness = try Harness()
+        let created = try harness.router.createHostBot(
+            name: "Secret target",
+            title: "QA",
+            description: "",
+            handle: "secret-target",
+            soul: "",
+            callerRun: harness.runID
+        )
+        let botID = try XCTUnwrap(created.objectValue?["id"]?.stringValue)
+        let secretValue = "fixture-secret-value"
+
+        let saved = try harness.router.invokeDelegatedBotSelfConfig(
+            callerThread: harness.thread.id,
+            callerRun: harness.runID,
+            toolName: BotSelfConfigCatalog.saveSecret,
+            arguments: [
+                "bot_id": .string(botID),
+                "name": .string("SERVICE_TOKEN"),
+                "value": .string(secretValue),
+                "user_confirmed": .bool(true),
+            ],
+            delegationCapability: harness.fullAccessCapability
+        )
+        XCTAssertEqual(saved.objectValue?["saved"]?.boolValue, true)
+        XCTAssertNil(saved.objectValue?["value"])
+        XCTAssertEqual(try harness.secretStore.load(
+            botID: BotID(UUID(uuidString: botID)!),
+            name: "SERVICE_TOKEN"
+        ), secretValue)
+
+        let listed = try harness.router.invokeDelegatedBotSelfConfig(
+            callerThread: harness.thread.id,
+            callerRun: harness.runID,
+            toolName: BotSelfConfigCatalog.listSecrets,
+            arguments: ["bot_id": .string(botID)],
+            delegationCapability: harness.fullAccessCapability
+        )
+        XCTAssertEqual(listed.objectValue?["secrets"]?.arrayValue?.compactMap(\.stringValue), ["SERVICE_TOKEN"])
+        XCTAssertFalse(String(describing: listed).contains(secretValue))
+
+        let deleted = try harness.router.invokeDelegatedBotSelfConfig(
+            callerThread: harness.thread.id,
+            callerRun: harness.runID,
+            toolName: BotSelfConfigCatalog.deleteSecret,
+            arguments: [
+                "bot_id": .string(botID),
+                "name": .string("SERVICE_TOKEN"),
+                "user_confirmed": .bool(true),
+            ],
+            delegationCapability: harness.fullAccessCapability
+        )
+        XCTAssertEqual(deleted.objectValue?["deleted"]?.boolValue, true)
+        XCTAssertNil(deleted.objectValue?["value"])
+        XCTAssertNil(try harness.secretStore.load(
+            botID: BotID(UUID(uuidString: botID)!),
+            name: "SERVICE_TOKEN"
+        ))
+
+        XCTAssertThrowsError(try harness.router.invokeDelegatedBotSelfConfig(
+            callerThread: harness.supervisedThread.id,
+            callerRun: harness.supervisedRunID,
+            toolName: BotSelfConfigCatalog.saveSecret,
+            arguments: [
+                "bot_id": .string(botID),
+                "name": .string("SERVICE_TOKEN"),
+                "value": .string(secretValue),
+                "user_confirmed": .bool(true),
+            ],
+            delegationCapability: harness.supervisedCapability
+        )) { error in
+            XCTAssertEqual((error as? JSONRPCError)?.code, -32048)
+        }
+
+        let outsider = try harness.context.botStore.create(
+            name: "Unrelated",
+            title: "No grant",
+            description: "",
+            soul: "",
+            provider: .claude,
+            model: "opus"
+        )
+        XCTAssertThrowsError(try harness.router.invokeDelegatedBotSelfConfig(
+            callerThread: harness.thread.id,
+            callerRun: harness.runID,
+            toolName: BotSelfConfigCatalog.saveSecret,
+            arguments: [
+                "bot_id": .string(outsider.id.value.uuidString.lowercased()),
+                "name": .string("OTHER_TOKEN"),
+                "value": .string("must-not-store"),
+                "user_confirmed": .bool(true),
+            ],
+            delegationCapability: harness.fullAccessCapability
+        )) { error in
+            XCTAssertEqual((error as? JSONRPCError)?.code, -32046)
+            XCTAssertFalse(String(describing: error).contains("must-not-store"))
+        }
+        XCTAssertNil(try harness.secretStore.load(botID: outsider.id, name: "OTHER_TOKEN"))
+
+        XCTAssertThrowsError(try harness.router.invokeDelegatedBotSelfConfig(
+            callerThread: harness.thread.id,
+            callerRun: harness.runID,
+            toolName: BotSelfConfigCatalog.listSecrets,
+            arguments: ["bot_id": .string(botID)],
+            delegationCapability: nil
+        )) { error in
+            XCTAssertEqual((error as? JSONRPCError)?.code, -32047)
+        }
+
+        try harness.context.orchestrationRuntime.finalizeReceipt(runId: harness.runID, status: .completed)
+        XCTAssertThrowsError(try harness.router.invokeDelegatedBotSelfConfig(
+            callerThread: harness.thread.id,
+            callerRun: harness.runID,
+            toolName: BotSelfConfigCatalog.listSecrets,
+            arguments: ["bot_id": .string(botID)],
+            delegationCapability: harness.fullAccessCapability
+        )) { error in
+            XCTAssertEqual((error as? JSONRPCError)?.code, -32047)
+        }
+    }
+
     func test_skillAuthorityComesFromAuthenticatedThreadNotCallerBotParameter() async throws {
         // WHY: provider-controlled JSON may claim any caller_bot_id. The host
         // must derive self-Bot identity from the authenticated thread linkage.
@@ -285,6 +407,7 @@ final class RemoteCodeHostCatalogRouterTests: XCTestCase {
     private struct Harness {
         let context: AppContext
         let router: AppCommandRouter
+        let secretStore: InMemoryBotSecretStore
         let thread: AgentThread
         let runID: AgentRunID
         let fullAccessCapability: String
@@ -300,7 +423,12 @@ final class RemoteCodeHostCatalogRouterTests: XCTestCase {
                 channel: .debug,
                 appSupportOverride: root.appendingPathComponent("support", isDirectory: true).path
             )
-            router = AppCommandRouter(context: context)
+            secretStore = InMemoryBotSecretStore()
+            router = AppCommandRouter(
+                context: context,
+                sshPasswordStore: KeychainSSHPasswordStore(),
+                secretStore: secretStore
+            )
             context.router = router
             thread = AgentThread(title: "host-catalog", provider: .claude, model: "opus", permissionMode: .fullAccess)
             try context.threadRepo.upsert(thread)

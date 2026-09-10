@@ -7,15 +7,18 @@ public struct ManagedBotSelfConfigMCP: Sendable {
 
     private let environment: [String: String]
     private let storeFactory: @Sendable ([String: String]) throws -> BotStore
+    private let secretStore: any BotSecretStore
 
     public init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         storeFactory: @escaping @Sendable ([String: String]) throws -> BotStore = {
             try BotSelfConfigService.openStore(environment: $0)
-        }
+        },
+        secretStore: any BotSecretStore = BotKeychainSecretStore()
     ) {
         self.environment = environment
         self.storeFactory = storeFactory
+        self.secretStore = secretStore
     }
 
     public func handle(_ line: String) -> String? {
@@ -36,7 +39,7 @@ public struct ManagedBotSelfConfigMCP: Sendable {
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
-                "instructions": "Delegate to RemoteCode Bots with AI-authored prompts. Bot-owned runs can also read and change their own Studio settings; an Agent App run may change only a Bot consulted by that exact active run. Built-in RemoteCode workspace, thread, Bot, and owned-skill intents must use the named rc_* host tools and must not fall back to Computer Use, macos-harness, or Accessibility.",
+                "instructions": "Delegate to RemoteCode Bots with AI-authored prompts. Bot-owned runs can also read and change their own Studio settings and protected secrets; an Agent App run may target settings only at a Bot consulted by that exact active run, while secret tools may target a Bot created or consulted by that exact active run. Built-in RemoteCode workspace, thread, Bot, and owned-skill intents must use the named rc_* host tools and must not fall back to Computer Use, macos-harness, or Accessibility.",
             ])
         case "tools/list":
             return reply(id: id, result: ["tools": BotSelfConfigCatalog.toolCatalog() + RemoteCodeHostCatalog.toolCatalog()])
@@ -91,14 +94,15 @@ public struct ManagedBotSelfConfigMCP: Sendable {
                 let requestedID = (arguments["bot_id"] as? String)
                     .flatMap(UUID.init)
                     .map(BotID.init)
-                let usesDelegatedSettingsGrant = (name == BotSelfConfigCatalog.getSettings
-                    || name == BotSelfConfigCatalog.setSettings)
+                let usesDelegatedSelfConfigGrant = [
+                    BotSelfConfigCatalog.getSettings,
+                    BotSelfConfigCatalog.setSettings,
+                    BotSelfConfigCatalog.listSecrets,
+                    BotSelfConfigCatalog.saveSecret,
+                    BotSelfConfigCatalog.deleteSecret,
+                ].contains(name)
                     && (callerID == nil || requestedID.map { $0 != callerID } == true)
-                if usesDelegatedSettingsGrant {
-                    guard name == BotSelfConfigCatalog.getSettings
-                            || name == BotSelfConfigCatalog.setSettings else {
-                        throw BotSelfConfigError.callerMissing
-                    }
+                if usesDelegatedSelfConfigGrant {
                     let object = try BotPeerRPCClient(environment: environment).call(
                         method: "bot.peer.self_config",
                         arguments: ["tool_name": name, "arguments": arguments]
@@ -110,7 +114,11 @@ public struct ManagedBotSelfConfigMCP: Sendable {
                 }
                 guard callerID != nil else { throw BotSelfConfigError.callerMissing }
                 let store = try storeFactory(environment)
-                let service = try BotSelfConfigService.make(environment: environment, store: store)
+                let service = try BotSelfConfigService.make(
+                    environment: environment,
+                    store: store,
+                    secretStore: secretStore
+                )
                 let object = try service.invoke(name: name, arguments: arguments)
                 return reply(id: id, result: [
                     "content": [["type": "text", "text": encode(object) ?? "{}"]],

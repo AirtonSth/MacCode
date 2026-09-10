@@ -258,6 +258,11 @@ public struct BotStudioDraft: Equatable, Codable {
 @MainActor
 public final class BotsStudioDraftState: ObservableObject {
     @Published public var draft = BotStudioDraft()
+    /// Secret drafts are memory-only. They are never part of the persisted
+    /// Studio draft or any bot file.
+    @Published public var secretNameDraft = ""
+    @Published public var secretValueDraft = ""
+    @Published public var editingSecretName: String?
 }
 
 public enum BotStudioFilesLocation: String, Codable, Sendable, Equatable {
@@ -3304,12 +3309,16 @@ public final class BotsViewModel: ObservableObject {
         didSet { persistInspectorIfHydrated() }
     }
     @Published public var errorMessage: String?
+    @Published public private(set) var botSecrets: [BotSecretMetadata] = []
+    @Published public private(set) var isBotSecretsLoading = false
+    @Published public private(set) var botSecretsLoadFailed = false
     @Published public private(set) var providers: [AgentProviderSnapshot] = []
     @Published public private(set) var isControlPlaneActive = true
     @Published public private(set) var isMemoryActive = true
     @Published public private(set) var isAutonomyActive = false
     @Published public private(set) var lastSendStartedProviderRun = false
     @Published public var pendingDeleteID: BotID?
+    @Published public var pendingSecretDeleteName: String?
     @Published public var pendingUnsavedNewBotConfirm = false
     public var onLeaveBots: (() -> Void)?
     private var unpublishedNewBotIDs: Set<BotID> = []
@@ -3334,6 +3343,7 @@ public final class BotsViewModel: ObservableObject {
     private let context: AppContext
     private let router: AppCommandRouter?
     private let botStore: BotStore
+    private let botSecretStore: any BotSecretStore
     private let settingsStore: SettingsStore
     private let draftPersistenceAuthority: BotDraftPersistenceAuthority
     private var messagesByBot: [BotID: [BotDeskMessage]] = [:]
@@ -3382,6 +3392,8 @@ public final class BotsViewModel: ObservableObject {
     private var studioDraftsByBot: [BotID: BotStudioDraft] = [:]
     private var studioDraftHydrated = false
     private var isApplyingStudioDraft = false
+    private var botSecretsReloadGeneration: UInt64 = 0
+    private var botSecretsReloadTask: Task<Void, Never>?
     var draftPersistenceScheduleForTesting: ((UInt64, @escaping () -> Void) -> Void)? {
         get { draftPersistenceAuthority.scheduleForTesting }
         set { draftPersistenceAuthority.scheduleForTesting = newValue }
@@ -3401,11 +3413,13 @@ public final class BotsViewModel: ObservableObject {
     public init(
         context: AppContext,
         router: AppCommandRouter? = nil,
-        loadImmediately: Bool = true
+        loadImmediately: Bool = true,
+        secretStore: any BotSecretStore = BotKeychainSecretStore()
     ) {
         self.context = context
         self.router = router
         self.botStore = context.botStore
+        self.botSecretStore = secretStore
         self.settingsStore = SettingsStore(db: context.db)
         self.draftPersistenceAuthority = context.botDraftPersistenceAuthority
         context.botPeerHandoffAuthority.router = router ?? context.router
@@ -4376,6 +4390,7 @@ public final class BotsViewModel: ObservableObject {
         loadStudioDraft(fresh)
         studioTab = .profile
         screen = .studio
+        reloadBotSecrets(for: fresh)
         ensureBotHome(fresh, revision: selectedRevision)
         persistSelection()
         leaveDeskLiveWatch()
@@ -4438,6 +4453,7 @@ public final class BotsViewModel: ObservableObject {
         let fresh = refreshPublishedIdentity(for: bot.id) ?? bot
         loadStudioDraft(fresh)
         screen = .studio
+        reloadBotSecrets(for: fresh)
         persistSelection()
         leaveDeskLiveWatch()
         reloadStudioSupport(id: fresh.id)
@@ -4466,6 +4482,108 @@ public final class BotsViewModel: ObservableObject {
         isApplyingStudioDraft = false
         adoptSelectedBot(bot.id)
         studioFilesLocation = resolvedStudioFilesLocation(for: bot)
+        botSecretsReloadGeneration &+= 1
+        botSecretsReloadTask?.cancel()
+        botSecretsReloadTask = nil
+        botSecrets = []
+        isBotSecretsLoading = true
+        botSecretsLoadFailed = false
+        pendingSecretDeleteName = nil
+        cancelBotSecretEdit()
+    }
+
+    /// Metadata is loaded after Studio mounts. Only the latest selected Bot
+    /// may publish the result; values never enter the view model.
+    public func reloadBotSecrets(for bot: BotDefinition? = nil) {
+        botSecretsReloadGeneration &+= 1
+        let generation = botSecretsReloadGeneration
+        botSecretsReloadTask?.cancel()
+        botSecretsReloadTask = nil
+        botSecrets = []
+        guard let bot = bot ?? selectedBot else {
+            isBotSecretsLoading = false
+            botSecretsLoadFailed = false
+            return
+        }
+        isBotSecretsLoading = true
+        botSecretsLoadFailed = false
+        let botID = bot.id
+        let secretStore = botSecretStore
+        botSecretsReloadTask = Task { @MainActor [weak self] in
+            do {
+                let metadata = try await Task.detached {
+                    try secretStore.list(botID: botID)
+                }.value
+                guard !Task.isCancelled,
+                      let self,
+                      self.botSecretsReloadGeneration == generation,
+                      self.selectedBotID == botID,
+                      self.screen == .studio else { return }
+                self.botSecretsReloadTask = nil
+                self.isBotSecretsLoading = false
+                self.botSecretsLoadFailed = false
+                self.botSecrets = metadata
+            } catch {
+                guard !Task.isCancelled,
+                      let self,
+                      self.botSecretsReloadGeneration == generation,
+                      self.selectedBotID == botID,
+                      self.screen == .studio else { return }
+                self.botSecretsReloadTask = nil
+                self.isBotSecretsLoading = false
+                self.botSecretsLoadFailed = true
+                self.errorMessage = "Protected secret storage is unavailable."
+            }
+        }
+    }
+
+    public func editBotSecret(_ name: String) {
+        studioState.secretNameDraft = name
+        studioState.secretValueDraft = ""
+        studioState.editingSecretName = name
+    }
+
+    public func cancelBotSecretEdit() {
+        studioState.secretNameDraft = ""
+        studioState.secretValueDraft = ""
+        studioState.editingSecretName = nil
+    }
+
+    public func saveBotSecret() {
+        guard let bot = selectedBot else { return }
+        do {
+            let name = try BotKeychainSecretStore.normalizedName(studioState.secretNameDraft)
+            if let editing = studioState.editingSecretName, editing != name {
+                throw BotSecretStoreError.invalidName
+            }
+            try botSecretStore.save(
+                botID: bot.id,
+                name: name,
+                value: studioState.secretValueDraft
+            )
+            cancelBotSecretEdit()
+            reloadBotSecrets(for: bot)
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    public func requestDeleteBotSecret(_ name: String) {
+        pendingSecretDeleteName = name
+    }
+
+    public func removeBotSecret(_ name: String) {
+        guard let bot = selectedBot else { return }
+        do {
+            try botSecretStore.delete(botID: bot.id, name: name)
+            if studioState.editingSecretName == name {
+                cancelBotSecretEdit()
+            }
+            pendingSecretDeleteName = nil
+            reloadBotSecrets(for: bot)
+        } catch {
+            errorMessage = String(describing: error)
+        }
     }
 
     public func openFleet() {
@@ -5259,6 +5377,7 @@ public final class BotsViewModel: ObservableObject {
 
     public func delete(id: BotID, navigate: Bool = true) {
         do {
+            try botSecretStore.deleteAll(botID: id)
             try botStore.delete(id: id)
             if let service = computerGuestService {
                 Task.detached { [service] in
@@ -10679,6 +10798,26 @@ public struct BotsRootView: View {
         } message: {
             Text(vm.errorMessage ?? "")
         }
+        .confirmationDialog(
+            "Remove secret?",
+            isPresented: Binding(
+                get: { vm.pendingSecretDeleteName != nil },
+                set: { if !$0 { vm.pendingSecretDeleteName = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Remove secret", role: .destructive) {
+                if let name = vm.pendingSecretDeleteName {
+                    vm.removeBotSecret(name)
+                }
+            }
+            .accessibilityIdentifier("bots.studio.secrets.remove.confirm")
+            Button("Cancel", role: .cancel) {
+                vm.pendingSecretDeleteName = nil
+            }
+        } message: {
+            Text("This deletes the protected value from this Bot's storage.")
+        }
         .modifier(BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail))
         .modifier(BotsUnsavedNewBotConfirmation(vm: vm))
         .onAppear { vm.scheduleFreshnessPass() }
@@ -10765,6 +10904,7 @@ public struct BotsRootView: View {
                     studioPage {
                         VStack(alignment: .leading, spacing: DS.Space.xl) {
                             studioSecurity
+                            studioSecrets
                             studioDesktop
                         }
                     }
@@ -11126,7 +11266,7 @@ public struct BotsRootView: View {
         VStack(alignment: .leading, spacing: DS.Space.xl) {
             studioSectionHeader(
                 BotsChrome.Label.security,
-                caption: "Readable only. No grants run from this tab."
+                caption: "Manage secrets and review runtime access."
             )
             VStack(alignment: .leading, spacing: 0) {
                 securityRow(symbol: "hand.raised", title: "Approvals", detail: "Allow once / Deny stay off until P1b.")
@@ -11142,6 +11282,118 @@ public struct BotsRootView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityIdentifier("bots.studio.security")
+    }
+
+    private var studioSecrets: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xl) {
+            studioSectionHeader(
+                "Secrets",
+                caption: "Stored in protected macOS storage for this Bot. Values are write-only here and are only exposed to this Bot's runtime."
+            )
+            if vm.isBotSecretsLoading {
+                ProgressView()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier("bots.studio.secrets.loading")
+            } else if vm.botSecretsLoadFailed {
+                Text("Protected secret storage is unavailable.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("bots.studio.secrets.error")
+            } else if vm.botSecrets.isEmpty {
+                studioEmptyState(
+                    icon: "key",
+                    title: "No secrets saved",
+                    subtitle: "Add an environment-variable name and value for this Bot."
+                )
+            } else {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(vm.botSecrets) { secret in
+                        HStack(spacing: DS.Space.lg) {
+                            Image(systemName: "key.fill")
+                                .foregroundColor(DS.Palette.textSecondary)
+                                .accessibilityHidden(true)
+                            Text(secret.name)
+                                .font(DS.Font.body)
+                                .foregroundColor(DS.Palette.text)
+                            Spacer(minLength: 0)
+                            Button("Update") {
+                                vm.editBotSecret(secret.name)
+                            }
+                            .buttonStyle(DSSecondaryButtonStyle())
+                            .accessibilityIdentifier("bots.studio.secrets.update.\(secret.name)")
+                            Button("Remove", role: .destructive) {
+                                vm.requestDeleteBotSecret(secret.name)
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundColor(DS.Palette.danger)
+                            .accessibilityIdentifier("bots.studio.secrets.remove.\(secret.name)")
+                        }
+                        .frame(minHeight: BotsChrome.hitTarget)
+                        if secret.id != vm.botSecrets.last?.id {
+                            studioRule
+                        }
+                    }
+                }
+            }
+            VStack(alignment: .leading, spacing: DS.Space.lg) {
+                labeledField("Name", caption: "Environment-variable name used only by this Bot's runtime.") {
+                    studioField(
+                        placeholder: "SERVICE_TOKEN",
+                        text: Binding(
+                            get: { vm.studioState.secretNameDraft },
+                            set: { vm.studioState.secretNameDraft = $0 }
+                        )
+                    )
+                    .disabled(vm.studioState.editingSecretName != nil)
+                    .accessibilityIdentifier("bots.studio.secrets.name")
+                }
+                labeledField(
+                    "Value",
+                    caption: vm.studioState.editingSecretName == nil
+                        ? "The value is cleared after save."
+                        : "Enter the replacement value."
+                ) {
+                    SecureField(
+                        "Enter secret value",
+                        text: Binding(
+                            get: { vm.studioState.secretValueDraft },
+                            set: { vm.studioState.secretValueDraft = $0 }
+                        )
+                    )
+                    .textFieldStyle(.plain)
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.text)
+                    .padding(.horizontal, DS.Space.lg)
+                    .padding(.vertical, DS.Space.md)
+                    .frame(minHeight: 34)
+                    .background(DS.Palette.surface)
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+                    )
+                    .accessibilityIdentifier("bots.studio.secrets.value")
+                }
+                HStack(spacing: DS.Space.md) {
+                    if vm.studioState.editingSecretName != nil {
+                        Button("Cancel") {
+                            vm.cancelBotSecretEdit()
+                        }
+                        .buttonStyle(DSSecondaryButtonStyle())
+                        .accessibilityIdentifier("bots.studio.secrets.cancel")
+                    }
+                    Button(vm.studioState.editingSecretName == nil ? "Save secret" : "Update secret") {
+                        vm.saveBotSecret()
+                    }
+                    .buttonStyle(BotsPrimaryButtonStyle())
+                    .disabled(!vm.isControlPlaneActive)
+                    .accessibilityIdentifier("bots.studio.secrets.save")
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("bots.studio.secrets")
     }
 
     private func securityRow(symbol: String, title: String, detail: String) -> some View {

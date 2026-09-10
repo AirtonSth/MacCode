@@ -199,7 +199,19 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
-        await ClaudeRunner(binaryNameOverride: binaryNameOverride).listModels()
+        await listModelsResult().models
+    }
+
+    public func listModelsResult(
+        environment: [String: String] = [:],
+        cwd: String = FileManager.default.currentDirectoryPath,
+        runAsUser: AgentRunAsUser? = nil
+    ) async -> ModelListResult {
+        await ClaudeRunner(binaryNameOverride: binaryNameOverride).listModelsResult(
+            environment: environment,
+            cwd: cwd,
+            runAsUser: runAsUser
+        )
     }
 
     public func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {

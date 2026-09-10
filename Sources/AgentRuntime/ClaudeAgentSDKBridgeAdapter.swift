@@ -203,7 +203,19 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
-        await ClaudeRunner().listModels()
+        await listModelsResult().models
+    }
+
+    public func listModelsResult(
+        environment: [String: String] = [:],
+        cwd: String = FileManager.default.currentDirectoryPath,
+        runAsUser: AgentRunAsUser? = nil
+    ) async -> ModelListResult {
+        await ClaudeRunner(binaryNameOverride: binaryNameOverride).listModelsResult(
+            environment: environment,
+            cwd: cwd,
+            runAsUser: runAsUser
+        )
     }
 
     public var forkSafety: AgentProviderForkSafety {

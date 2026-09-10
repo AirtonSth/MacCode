@@ -85,13 +85,16 @@ final class AnthropicModelDiscoveryCacheTests: XCTestCase {
 
     func test_requestBuilder_returnsNil_whenNoCredentials() {
         // WHY: without credentials the request would always 401; returning nil lets the caller skip the fetch
-        let req = AnthropicDiscoveryRequestBuilder.build(environment: [:])
+        let req = AnthropicDiscoveryRequestBuilder.build(environment: ["HOME": "/tmp/rc-no-claude-credentials-\(UUID().uuidString)"])
         XCTAssertNil(req)
     }
 
     func test_requestBuilder_returnsNil_whenApiKeyIsEmpty() {
         // WHY: an empty key after trimming must be treated the same as absent
-        let req = AnthropicDiscoveryRequestBuilder.build(environment: ["ANTHROPIC_API_KEY": "   "])
+        let req = AnthropicDiscoveryRequestBuilder.build(environment: [
+            "HOME": "/tmp/rc-no-claude-credentials-\(UUID().uuidString)",
+            "ANTHROPIC_API_KEY": "   "
+        ])
         XCTAssertNil(req)
     }
 

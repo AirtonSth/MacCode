@@ -217,7 +217,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     private var modelCacheLastFetchedAt: Date? = nil
     private let modelCacheTTL: TimeInterval
     // Injectable for tests; production default calls CodexAppServerModelDiscovery.
-    private let modelListDiscovery: @Sendable () async -> [AgentModelDescriptor]
+    private let modelListDiscovery: @Sendable () async -> ModelListResult
 
     public init(binaryNameOverride: String? = nil,
                 clientFactory: ClientFactory? = nil,
@@ -237,12 +237,14 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         self.pendingFinishInactivityTimeout = max(0.01, pendingFinishInactivityTimeout)
         self.modelCacheTTL = modelCacheTTL
         if let modelListDiscovery {
-            self.modelListDiscovery = modelListDiscovery
+            self.modelListDiscovery = {
+                ModelListResult(models: await modelListDiscovery(), isFallback: false)
+            }
         } else {
             let nameOverride = binaryNameOverride
             self.modelListDiscovery = {
                 let binary = nameOverride ?? "codex"
-                return await CodexAppServerModelDiscovery.listModels(
+                return await CodexAppServerModelDiscovery.listModelsResult(
                     binary: binary,
                     cwd: FileManager.default.currentDirectoryPath
                 )
@@ -303,9 +305,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
 
     /// Like `listModels()` but carries the fallback signal (mirrors
     /// `ClaudeRunner.listModelsResult`): `isFallback == true` means live
-    /// app-server discovery produced nothing and the hardcoded CodexRunner
-    /// list was substituted, so callers can surface "model list failed"
-    /// instead of presenting the static list as live data.
+    /// app-server discovery did not produce a current catalog, so callers can
+    /// surface "model list failed" instead of presenting fallback data as live.
     public func listModelsResult() async -> ModelListResult {
         return await resolvedModelsResult(forceRefresh: false)
     }
@@ -337,24 +338,22 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         )
 
         if !needsFetch, let cached {
-            // The cache stores successful discovery plus the explicit Astra option.
+            // The cache stores successful current harness-backed discovery.
             return ModelListResult(models: cached, isFallback: false)
         }
 
         // Attempt live discovery.
-        var discovered = await modelListDiscovery()
+        let discovery = await modelListDiscovery()
+        let discovered = discovery.models
 
         if !discovered.isEmpty {
-            // Some Codex catalogs omit Astra. Keep it selectable as an explicit
-            // model, but prefer live metadata when the provider includes it.
-            if !discovered.contains(where: { $0.id == CodexRunner.astraModel.id }) {
-                discovered.append(CodexRunner.astraModel)
+            if !discovery.isFallback {
+                lock.lock()
+                cachedModels = discovered
+                modelCacheLastFetchedAt = now
+                lock.unlock()
             }
-            lock.lock()
-            cachedModels = discovered
-            modelCacheLastFetchedAt = now
-            lock.unlock()
-            return ModelListResult(models: discovered, isFallback: false)
+            return discovery
         }
 
         // Fallback: return the hardcoded list from CodexRunner (always non-empty),

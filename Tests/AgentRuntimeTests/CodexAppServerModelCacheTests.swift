@@ -24,7 +24,7 @@ private final class Counter: @unchecked Sendable {
     }
 }
 
-final class CodexAppServerModelCacheTests: XCTestCase {
+final class CodexAppServerModelCacheTests: ProviderProcessTestCase {
 
     // -------------------------------------------------------------------------
     // MARK: - ModelListTTLDecision (pure, no async)
@@ -217,9 +217,9 @@ final class CodexAppServerModelCacheTests: XCTestCase {
                        "the fallback result must still carry the hardcoded baseline so the picker stays usable")
     }
 
-    func test_listModelsResult_keepsAstraSelectableWhenLiveCatalogOmitsIt_andCachesResult() async {
-        // A successful catalog keeps Astra selectable even when omitted upstream;
-        // a cache hit must preserve that option without a fallback warning.
+    func test_listModelsResult_keepsLiveCatalogWithoutInventingAstra_andCachesResult() async {
+        // An injected live catalog is already the source under test. The adapter
+        // must not invent a special model that the source did not return.
         let live = [
             AgentModelDescriptor(id: "live-model-1", label: "Live 1", provider: .codex,
                                  supportsReasoning: false, supportsServiceTier: false, supportsCustomModel: true)
@@ -232,7 +232,171 @@ final class CodexAppServerModelCacheTests: XCTestCase {
         let cached = await adapter.listModelsResult()
         XCTAssertFalse(cached.isFallback,
                        "a cache hit serves previously fetched live data and is never a fallback")
-        XCTAssertEqual(first.models.map(\.id), ["live-model-1", "gpt-6-astra"])
+        XCTAssertEqual(first.models.map(\.id), ["live-model-1"])
         XCTAssertEqual(cached.models.map(\.id), first.models.map(\.id))
+    }
+
+    func test_modelDiscoveryAddsAstraFromSameAccountHarnessCacheWhenModelListOmitsIt() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-harness-models-\(UUID().uuidString)", isDirectory: true)
+        let home = root.appendingPathComponent("codex-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let cache: [String: Any] = [
+            "models": [
+                [
+                    "slug": "gpt-6-astra",
+                    "display_name": "GPT-6-Astra",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "supported_reasoning_levels": [
+                        ["effort": "low"], ["effort": "medium"], ["effort": "high"],
+                        ["effort": "xhigh"], ["effort": "max"], ["effort": "ultra"]
+                    ],
+                    "additional_speed_tiers": ["fast"],
+                    "service_tiers": [["id": "priority"]],
+                    "context_window": 272_000
+                ],
+                ["slug": "gpt-hidden", "display_name": "Hidden", "visibility": "hide", "supported_in_api": true],
+                ["slug": "gpt-disabled", "display_name": "Disabled", "visibility": "list", "supported_in_api": false]
+            ]
+        ]
+        let cacheData = try JSONSerialization.data(withJSONObject: cache)
+        try cacheData.write(to: home.appendingPathComponent("models_cache.json"))
+
+        let binary = root.appendingPathComponent("codex")
+        try """
+        #!/usr/bin/python3
+        import json, sys
+        for line in sys.stdin:
+            request = json.loads(line)
+            method = request.get("method")
+            if method == "initialize":
+                print(json.dumps({"id": request["id"], "result": {"userAgent": "fake-codex"}}), flush=True)
+            elif method == "model/list":
+                print(json.dumps({"id": request["id"], "result": {"data": [{
+                    "model": "gpt-5.6-luna",
+                    "displayName": "Live Luna",
+                    "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+                    "modelContextWindow": 999
+                }]}}), flush=True)
+        """.write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+
+        let result = await CodexAppServerModelDiscovery.listModelsResult(
+            binary: binary.path,
+            cwd: root.path,
+            environment: ["CODEX_HOME": home.path]
+        )
+
+        XCTAssertFalse(result.isFallback,
+                       "a live model/list response plus the selected account cache is current harness discovery")
+        XCTAssertEqual(result.models.first?.label, "Live Luna",
+                       "live model/list metadata must win for duplicate IDs")
+        let astra = try XCTUnwrap(result.models.first { $0.id == "gpt-6-astra" })
+        XCTAssertEqual(astra.supportedReasoningEfforts, [.low, .medium, .high, .xhigh, .max])
+        XCTAssertTrue(astra.supportsServiceTier)
+        XCTAssertEqual(astra.contextWindowTokens, 272_000)
+        XCTAssertFalse(result.models.contains { $0.id == "gpt-hidden" })
+        XCTAssertFalse(result.models.contains { $0.id == "gpt-disabled" })
+    }
+
+    func test_modelDiscoveryRetainsSameAccountCacheAsFallbackWhenLiveDiscoveryFails() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-harness-fallback-\(UUID().uuidString)", isDirectory: true)
+        let home = root.appendingPathComponent("codex-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let cacheData = try JSONSerialization.data(withJSONObject: [
+            "models": [[
+                "slug": "cached-luna",
+                "display_name": "Cached Luna",
+                "visibility": "list",
+                "supported_in_api": true
+            ]]
+        ])
+        try cacheData.write(to: home.appendingPathComponent("models_cache.json"))
+
+        let binary = root.appendingPathComponent("codex")
+        try """
+        #!/usr/bin/python3
+        import json, sys
+        for line in sys.stdin:
+            request = json.loads(line)
+            if request.get("method") == "initialize":
+                print(json.dumps({"id": request["id"], "error": {"code": -32000, "message": "offline"}}), flush=True)
+        """.write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+
+        let result = await CodexAppServerModelDiscovery.listModelsResult(
+            binary: binary.path,
+            cwd: root.path,
+            environment: ["CODEX_HOME": home.path]
+        )
+
+        XCTAssertTrue(result.isFallback,
+                      "same-account cache after failed live discovery must remain fallback data")
+        XCTAssertEqual(result.models.map(\.id), ["cached-luna"])
+    }
+
+    func test_harnessCatalogUsesConfiguredAccountHomeWithoutLeakingAnotherCache() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codex-harness-account-scope-\(UUID().uuidString)", isDirectory: true)
+        let homeA = root.appendingPathComponent("account-a", isDirectory: true)
+        let homeB = root.appendingPathComponent("account-b", isDirectory: true)
+        try FileManager.default.createDirectory(at: homeA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: homeB, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        func writeCache(_ id: String, to home: URL) throws {
+            let data = try JSONSerialization.data(withJSONObject: [
+                "models": [[
+                    "slug": id,
+                    "display_name": id,
+                    "visibility": "list",
+                    "supported_in_api": true
+                ]]
+            ])
+            try data.write(to: home.appendingPathComponent("models_cache.json"))
+        }
+        try writeCache("account-a-model", to: homeA)
+        try writeCache("account-b-model", to: homeB)
+
+        let accountA = CodexHarnessModelCatalog.models(environment: ["CODEX_HOME": homeA.path])
+        let accountB = CodexHarnessModelCatalog.models(environment: ["CODEX_HOME": homeB.path])
+        XCTAssertEqual(accountA.map(\.id), ["account-a-model"])
+        XCTAssertEqual(accountB.map(\.id), ["account-b-model"])
+        XCTAssertFalse(accountA.contains { $0.id == "account-b-model" })
+        XCTAssertFalse(accountB.contains { $0.id == "account-a-model" })
+    }
+
+    func test_discoveryEnvironmentDoesNotInheritParentCodexHomeWhenHomeChanges() {
+        let parentHome = "/tmp/codex-parent-home"
+        let accountHome = "/tmp/codex-selected-account"
+        let base = ["HOME": parentHome, "CODEX_HOME": "\(parentHome)/.codex"]
+
+        let selected = CodexAppServerModelDiscovery.environmentForDiscovery(
+            environment: ["HOME": accountHome],
+            runAsUser: nil,
+            baseEnvironment: base
+        )
+        XCTAssertEqual(selected["HOME"], accountHome)
+        XCTAssertEqual(selected["CODEX_HOME"], "\(accountHome)/.codex")
+
+        let sameAccount = CodexAppServerModelDiscovery.environmentForDiscovery(
+            environment: ["HOME": parentHome],
+            runAsUser: nil,
+            baseEnvironment: base
+        )
+        XCTAssertEqual(sameAccount["CODEX_HOME"], "\(parentHome)/.codex")
+
+        let explicit = CodexAppServerModelDiscovery.environmentForDiscovery(
+            environment: ["HOME": accountHome, "CODEX_HOME": "/tmp/explicit-codex-home"],
+            runAsUser: nil,
+            baseEnvironment: base
+        )
+        XCTAssertEqual(explicit["CODEX_HOME"], "/tmp/explicit-codex-home")
     }
 }

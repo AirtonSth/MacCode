@@ -29,6 +29,9 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(BotStandingInstructions.removeSkillTool, BotSelfConfigCatalog.removeSkill)
         XCTAssertEqual(BotStandingInstructions.saveRoutineTool, BotSelfConfigCatalog.saveRoutine)
         XCTAssertEqual(BotStandingInstructions.setRoutineEnabledTool, BotSelfConfigCatalog.setRoutineEnabled)
+        XCTAssertEqual(BotStandingInstructions.listSecretsTool, BotSelfConfigCatalog.listSecrets)
+        XCTAssertEqual(BotStandingInstructions.saveSecretTool, BotSelfConfigCatalog.saveSecret)
+        XCTAssertEqual(BotStandingInstructions.deleteSecretTool, BotSelfConfigCatalog.deleteSecret)
         let tools = BotStandingInstructions.admittedToolsText
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.writeHomeFile))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setSettings))
@@ -39,6 +42,9 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.removeSkill))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.saveRoutine))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setRoutineEnabled))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.listSecrets))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.saveSecret))
+        XCTAssertTrue(tools.contains(BotSelfConfigCatalog.deleteSecret))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.skillView))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.recall))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.askUser))
@@ -71,6 +77,9 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(Set(BotSelfConfigCatalog.toolNames), [
             BotSelfConfigCatalog.getSettings,
             BotSelfConfigCatalog.setSettings,
+            BotSelfConfigCatalog.listSecrets,
+            BotSelfConfigCatalog.saveSecret,
+            BotSelfConfigCatalog.deleteSecret,
             BotSelfConfigCatalog.writeHomeFile,
             BotSelfConfigCatalog.removeSkill,
             BotSelfConfigCatalog.saveRoutine,

@@ -1185,18 +1185,70 @@ public final class GrokACPClient: @unchecked Sendable {
     static func modelDescriptors(from state: JSONObject?) -> [AgentModelDescriptor] {
         let rawModels = state?["availableModels"] as? [JSONObject] ?? []
         return rawModels.compactMap { raw -> AgentModelDescriptor? in
-            guard let id = raw["modelId"] as? String, !id.isEmpty else { return nil }
+            guard let rawID = raw["modelId"] as? String else { return nil }
+            let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty else { return nil }
             let metadata = raw["_meta"] as? JSONObject ?? [:]
-            let efforts = metadata["reasoningEfforts"] as? [JSONObject] ?? []
-            let supported = efforts.compactMap { ($0["value"] as? String).flatMap(AgentReasoningEffort.init(rawValue:)) }
+            let supported = reasoningEfforts(
+                from: metadata["reasoningEfforts"]
+                    ?? metadata["supportedReasoningEfforts"]
+                    ?? raw["reasoningEfforts"]
+                    ?? raw["supportedReasoningEfforts"]
+            )
+            let speedTiers = (metadata["additionalSpeedTiers"] as? [String])
+                ?? (metadata["additional_speed_tiers"] as? [String])
+                ?? (raw["additionalSpeedTiers"] as? [String])
+                ?? (raw["additional_speed_tiers"] as? [String])
+                ?? []
+            let contextWindow = integer(
+                metadata["modelContextWindow"]
+                    ?? metadata["contextWindowTokens"]
+                    ?? metadata["contextWindow"]
+                    ?? raw["modelContextWindow"]
+                    ?? raw["contextWindowTokens"]
+                    ?? raw["contextWindow"]
+                    ?? raw["maxTokens"]
+            )
             return AgentModelDescriptor(
                 id: id,
-                label: raw["name"] as? String ?? id,
+                label: (raw["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                    ? (raw["name"] as? String ?? id)
+                    : id,
                 provider: .grok,
-                supportsReasoning: metadata["supportsReasoningEffort"] as? Bool ?? !supported.isEmpty,
+                supportsReasoning: metadata["supportsReasoningEffort"] as? Bool
+                    ?? raw["supportsReasoningEffort"] as? Bool
+                    ?? !supported.isEmpty,
                 supportedReasoningEfforts: supported,
-                supportsCustomModel: false
+                supportsServiceTier: metadata["supportsServiceTier"] as? Bool
+                    ?? raw["supportsServiceTier"] as? Bool
+                    ?? speedTiers.contains("fast"),
+                supportsCustomModel: metadata["supportsCustomModel"] as? Bool
+                    ?? raw["supportsCustomModel"] as? Bool
+                    ?? true,
+                contextWindowTokens: contextWindow
             )
         }
+    }
+
+    private static func reasoningEfforts(from value: Any?) -> [AgentReasoningEffort] {
+        if let strings = value as? [String] {
+            return strings.compactMap(AgentReasoningEffort.init(rawValue:))
+        }
+        if let objects = value as? [JSONObject] {
+            return objects.compactMap {
+                ($0["reasoningEffort"] as? String
+                    ?? $0["id"] as? String
+                    ?? $0["value"] as? String)
+                    .flatMap(AgentReasoningEffort.init(rawValue:))
+            }
+        }
+        return []
+    }
+
+    private static func integer(_ value: Any?) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? Double { return Int(value) }
+        if let value = value as? String { return Int(value) }
+        return nil
     }
 }

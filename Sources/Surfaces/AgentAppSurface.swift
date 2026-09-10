@@ -4958,7 +4958,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 m = try await modelListLoader(provider)
                 isFallback = false
             } else if provider == .claude {
-                let result = await ClaudeRunner().listModelsResult()
+                let launchConfig = providerLaunchConfig?(provider, providerInstanceId)
+                let result = await ClaudeRunner(binaryNameOverride: launchConfig?.binary)
+                    .listModelsResult(
+                        environment: launchConfig?.environment ?? [:],
+                        cwd: cwd,
+                        runAsUser: runAsUser
+                    )
                 m = result.models
                 isFallback = result.isFallback
             } else if provider == .grok {
@@ -4966,16 +4972,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 let result = await GrokACPAdapter(
                     binaryNameOverride: launchConfig?.binary,
                     discoveryCwd: cwd,
-                    discoveryEnvironment: launchConfig?.environment ?? [:]
+                    discoveryEnvironment: launchConfig?.environment ?? [:],
+                    discoveryRunAsUser: runAsUser
                 ).listModelsResult()
                 m = result.models
                 isFallback = result.isFallback
             } else {
-                // F33: this is CodexRunner's baked-in list, not live discovery
-                // (live codex models arrive via the provider-snapshot path), so
-                // flag it as a fallback instead of presenting it as live.
-                m = await CodexRunner().listModels()
-                isFallback = true
+                let launchConfig = providerLaunchConfig?(provider, providerInstanceId)
+                let result = await CodexAppServerModelDiscovery.listModelsResult(
+                    binary: launchConfig?.binary ?? "codex",
+                    cwd: cwd,
+                    environment: launchConfig?.environment ?? [:],
+                    runAsUser: runAsUser
+                )
+                m = result.models
+                isFallback = result.isFallback
             }
             await MainActor.run {
                 self.availableModels = m
@@ -5025,7 +5036,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 loadedSnapshots,
                 cwd: cwdSnapshot,
                 launchConfig: launchConfig,
-                forceRefresh: forceCatalogRefresh
+                forceRefresh: forceCatalogRefresh,
+                runAsUser: runAsUser
             )
             self.providerSnapshotStatusMessage = nil
             self.applyProviderSnapshots(snapshots)
@@ -5141,7 +5153,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// a refresh within the TTL just serves the cached list back.
     public func refreshModelList() async {
         if provider == .claude {
-            _ = await AnthropicModelDiscovery.refresh()
+            let launchConfig = providerLaunchConfig?(provider, providerInstanceId)
+            _ = await AnthropicModelDiscovery.refresh(environment: launchConfig?.environment ?? [:])
         }
         await loadProviderSnapshots(forceCatalogRefresh: true)
         await loadModels()
@@ -5204,6 +5217,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         cwd: String,
         launchConfig: ((AgentProvider, String?) -> (binary: String?, environment: [String: String]))?,
         forceRefresh: Bool,
+        runAsUser: AgentRunAsUser? = nil,
         now: Date = Date()
     ) async -> [AgentProviderSnapshot] {
         var resolved: [AgentProviderSnapshot] = []
@@ -5240,14 +5254,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     switch snapshot.provider {
                     case .claude:
                         let result = await ClaudeRunner(binaryNameOverride: binary)
-                            .listModelsResult(environment: environment)
+                            .listModelsResult(
+                                environment: environment,
+                                cwd: cwd,
+                                runAsUser: runAsUser
+                            )
                         liveModels = result.isFallback ? [] : result.models
                     case .codex:
-                        liveModels = await CodexAppServerModelDiscovery.listModels(
+                        let result = await CodexAppServerModelDiscovery.listModelsResult(
                             binary: binary,
                             cwd: cwd,
-                            environment: environment
+                            environment: environment,
+                            runAsUser: runAsUser
                         )
+                        liveModels = result.isFallback ? [] : result.models
                     case .grok:
                         liveModels = []
                     }
@@ -5295,8 +5315,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             environment: [String: String],
             instanceId: String
         ) -> String {
-            let envFingerprint = environment.keys.sorted().joined(separator: ",")
-            return "\(provider.rawValue)|\(instanceId)|\(binary)|\(cwd)|\(envFingerprint)"
+            let environmentKeys = environment.keys.sorted().joined(separator: ",")
+            let accountSelectors = ["HOME", "CODEX_HOME", "GROK_HOME", "REMOTE_CODE_INSTANCE"]
+                .map { "\($0)=\(environment[$0] ?? "")" }
+                .joined(separator: "\u{1f}")
+            return "\(provider.rawValue)|\(instanceId)|\(binary)|\(cwd)|\(environmentKeys)|\(accountSelectors)"
         }
 
         func models(for key: String, ttl: TimeInterval, now: Date) -> [AgentModelDescriptor]? {
@@ -17486,7 +17509,7 @@ public struct AgentAppView: View {
                 // F33: no provider gate — codex's baked-in list must surface
                 // the same fallback notice + refresh affordance as claude.
                 if vm.displayedModelListIsFallback {
-                    Text("Using built-in defaults - live list unavailable")
+                    Text("Live model list unavailable. Refresh to check available models.")
                         .font(DS.Font.caption)
                         .foregroundColor(DS.Palette.textSecondary)
                     compactMenuRow("Refresh model list", selected: false) {

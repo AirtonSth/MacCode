@@ -820,6 +820,106 @@ final class TokenSaverCompressionTests: XCTestCase {
         }
     }
 
+    func test_reusedProviderSessionsRefreshWhenBotSecretsChangeButReuseWhenUnchanged() async throws {
+        for provider in [AgentProvider.claude, .codex, .grok] {
+            let tmp = NSTemporaryDirectory() + "rc2-bot-secret-scope-" + provider.rawValue + "-" + UUID().uuidString
+            let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+            let threadRepo = AgentThreadRepository(db: db)
+            let messageRepo = AgentMessageRepository(db: db)
+            let runRepo = AgentRunRepository(db: db)
+            let thread = AgentThread(title: "bot secrets", provider: provider, model: "test")
+            try threadRepo.upsert(thread)
+            let adapter = ScopeRefreshingAdapter(provider: provider)
+            let botID = BotID(UUID(uuidString: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")!)
+            let secretStore = InMemoryBotSecretStore()
+            let coordinator = AgentRunCoordinator(
+                runRepo: runRepo,
+                messageRepo: messageRepo,
+                threadRepo: threadRepo,
+                providerAdapters: [provider: adapter],
+                botSecretStore: secretStore
+            )
+            let scope = BotSecretScopeTestState(botID: botID)
+            coordinator.runEnvironmentProvider = { selectedProvider, selectedThread, _ in
+                scope.environment(provider: selectedProvider, threadId: selectedThread)
+            }
+
+            func runTurn(_ prompt: String, providerThreadId: String? = nil) async throws {
+                let runID = AgentRunID()
+                _ = try await coordinator.startRun(.init(
+                    runId: runID,
+                    threadId: thread.id,
+                    provider: provider,
+                    model: "test",
+                    cwd: tmp,
+                    prompt: prompt,
+                    providerThreadId: providerThreadId
+                ))
+                try await waitForRun(runID, in: runRepo)
+            }
+
+            try secretStore.save(botID: botID, name: "SERVICE_TOKEN", value: "one")
+            try await runTurn("first")
+            let providerThreadID = try XCTUnwrap(try threadRepo.get(id: thread.id)?.providerThreadId)
+
+            try await runTurn("unchanged", providerThreadId: providerThreadID)
+            XCTAssertEqual(adapter.stopSessionCalls, 0, "\(provider.rawValue) must reuse an unchanged secret scope")
+
+            try secretStore.save(botID: botID, name: "SERVICE_TOKEN", value: "two")
+            try await runTurn("updated", providerThreadId: providerThreadID)
+            XCTAssertEqual(adapter.stopSessionCalls, 1, "\(provider.rawValue) must refresh after a secret update")
+
+            try await runTurn("updated again", providerThreadId: providerThreadID)
+            XCTAssertEqual(adapter.stopSessionCalls, 1, "\(provider.rawValue) must reuse an unchanged updated secret")
+
+            try secretStore.delete(botID: botID, name: "SERVICE_TOKEN")
+            try await runTurn("removed", providerThreadId: providerThreadID)
+            XCTAssertEqual(adapter.stopSessionCalls, 2, "\(provider.rawValue) must refresh after a secret removal")
+
+            try await runTurn("still removed", providerThreadId: providerThreadID)
+            XCTAssertEqual(adapter.stopSessionCalls, 2, "\(provider.rawValue) must reuse an unchanged empty secret scope")
+        }
+    }
+
+    func test_startRunFailsClosedOnProtectedSecretStorageFailureBeforeProviderAdmission() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-bot-secret-failure-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "secret failure", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = PromptCapturingRunner(provider: .codex)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: runner],
+            botSecretStore: FailingBotSecretStore()
+        )
+        let admission = CallLog()
+        coordinator.providerAdmissionCheck = { _, _ in admission.add("admission") }
+
+        do {
+            _ = try await coordinator.startRun(.init(
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "must not start",
+                environment: [
+                    BotSecretEnvironment.botIDEnvironmentKey:
+                        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                ]
+            ))
+            XCTFail("secret storage failure must reject run admission")
+        } catch {
+            XCTAssertEqual(String(describing: error), "Protected secret storage is unavailable.")
+        }
+        XCTAssertTrue(admission.steps.isEmpty)
+        XCTAssertNil(runner.capturedPrompt)
+    }
+
     func test_startRun_refusesStaleTokenSaverScopeWhenLiveSessionLacksDurableProviderThreadId() async throws {
         // WHY: provider process env is immutable after launch. A live adapter
         // session with no durable providerThreadId has no safe resume handle, so
@@ -2436,3 +2536,35 @@ final class TokenSaverCompressionTests: XCTestCase {
         throw XCTSkip("durable RCW1 response metadata did not persist")
     }
 }
+
+private final class BotSecretScopeTestState: @unchecked Sendable {
+    private let lock = NSLock()
+    private let botID: BotID
+
+    init(botID: BotID) {
+        self.botID = botID
+    }
+
+    func environment(provider: AgentProvider, threadId: AgentThreadID) -> [String: String] {
+        lock.withLock {
+            var environment = [
+                "REMOTE_CODE_AGENT_PROVIDER": provider.rawValue,
+                BotSecretEnvironment.botIDEnvironmentKey: botID.value.uuidString,
+            ]
+            environment["RC_TOKEN_SAVER_THREAD_ID"] = threadId.value.uuidString
+            return environment
+        }
+    }
+}
+
+private final class FailingBotSecretStore: BotSecretStore, @unchecked Sendable {
+    private func fail() throws -> Never { throw SyntheticProtectedStorageFailure() }
+
+    func list(botID: BotID) throws -> [BotSecretMetadata] { try fail() }
+    func save(botID: BotID, name: String, value: String) throws { try fail() }
+    func load(botID: BotID, name: String) throws -> String? { try fail() }
+    func delete(botID: BotID, name: String) throws { try fail() }
+    func deleteAll(botID: BotID) throws { try fail() }
+}
+
+private struct SyntheticProtectedStorageFailure: Error {}

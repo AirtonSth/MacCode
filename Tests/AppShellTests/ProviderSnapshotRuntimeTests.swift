@@ -330,9 +330,12 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let home = dir.appendingPathComponent("codex-home", isDirectory: true)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        try Data("""
+        {"models":[{"slug":"gpt-6-astra","display_name":"GPT-6-Astra","visibility":"list","supported_in_api":true,"supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"},{"effort":"max"}],"additional_speed_tiers":["fast"],"context_window":272000}]}
+        """.utf8).write(to: home.appendingPathComponent("models_cache.json"))
         let fakeCodex = dir.appendingPathComponent("fake-codex")
         try """
-        #!/usr/bin/env python3
+        #!/usr/bin/python3
         import json, os, sys
         if len(sys.argv) > 1 and sys.argv[1] == "--version":
             print("codex-test 9.9.9")
@@ -399,7 +402,61 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertEqual(model.supportedReasoningEfforts, [.low, .medium, .high])
         XCTAssertEqual(model.supportsServiceTier, true)
         XCTAssertEqual(model.contextWindowTokens, 512_000)
+        let astra = try XCTUnwrap(codex.models.first { $0.id == "gpt-6-astra" })
+        XCTAssertEqual(astra.supportedReasoningEfforts, [.low, .medium, .high, .xhigh, .max])
+        XCTAssertEqual(astra.contextWindowTokens, 272_000)
         XCTAssertEqual(codex.environmentKeys, ["CODEX_HOME"])
+    }
+
+    func test_providerSnapshotsKeepSelectedAccountCacheWhenCodexAppServerInitializationFails() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let home = dir.appendingPathComponent("codex-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try Data("""
+        {"models":[{"slug":"gpt-6-astra","display_name":"GPT-6-Astra","visibility":"list","supported_in_api":true}]}
+        """.utf8).write(to: home.appendingPathComponent("models_cache.json"))
+
+        let fakeCodex = dir.appendingPathComponent("fake-codex")
+        try """
+        #!/usr/bin/python3
+        import sys
+        if len(sys.argv) > 1 and sys.argv[1] == "--version":
+            print("codex-test 9.9.9")
+            raise SystemExit(0)
+        if len(sys.argv) > 2 and sys.argv[1:3] == ["login", "status"]:
+            print("Logged in using ChatGPT")
+            raise SystemExit(0)
+        if len(sys.argv) > 1 and sys.argv[1] == "app-server":
+            raise SystemExit(1)
+        raise SystemExit(1)
+        """.write(to: fakeCodex, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCodex.path)
+
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        try ctx.settingsRepo.set("agent.provider.instances", """
+        [
+          {
+            "id": "codex-selected-account",
+            "provider": "codex",
+            "displayName": "Codex Selected Account",
+            "binaryPath": "\(fakeCodex.path)",
+            "homePath": "\(home.path)",
+            "enabled": true
+          }
+        ]
+        """)
+
+        let snapshots = await router.listAgentProviderSnapshots()
+        let codex = try XCTUnwrap(snapshots.first { $0.id == "codex-selected-account" })
+
+        XCTAssertTrue(codex.models.contains { $0.id == "gpt-6-astra" },
+                      "a valid selected-account models_cache entry must remain selectable when live initialization fails")
+        XCTAssertEqual(codex.modelDiscoverySource, .builtInFallback,
+                       "same-account harness cache is selectable but must not be labeled live")
+        XCTAssertNotEqual(codex.modelDiscoverySource, .live)
     }
 
     func test_providerSnapshotsCacheRuntimeProbesPerBinaryAndHome() async throws {
