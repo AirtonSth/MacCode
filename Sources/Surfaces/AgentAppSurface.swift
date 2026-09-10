@@ -7164,9 +7164,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// IMP-MAC_AGENT-013: serialize a full thread (read from the durable store,
     /// not the paged in-memory window) to shareable markdown.
     ///
-    /// SQLite `listRecent` and per-body concat hop off MainActor (same pattern as
-    /// `loadMessagePagePayloadOffMain`). Each body is capped at
-    /// `fullLoadBodyBudgetBytes`; durable `maxMessagesPerThread` is unchanged.
+    /// SQLite `listRecent` and body concat hop off MainActor (same pattern as
+    /// `loadMessagePagePayloadOffMain`). Bodies stay complete; durable
+    /// `maxMessagesPerThread` is unchanged.
     public func exportThreadMarkdown(
         _ id: AgentThreadID,
         includeTimeline: Bool = false
@@ -7199,8 +7199,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return (fileName, contents)
     }
 
-    /// Newest retained window + capped bodies. Runs off MainActor so export
-    /// does not concatenate 100 uncapped SQLite rows on the UI actor.
+    /// Newest retained window, complete bodies. Runs off MainActor so export
+    /// does not concatenate SQLite rows on the UI actor.
     nonisolated static func exportThreadMessageMarkdownOffMain(
         repository: AgentMessageRepository,
         threadId: AgentThreadID,
@@ -7222,25 +7222,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 }
                 lines.append(heading)
                 lines.append("")
-                lines.append(cappedExportBody(message.content))
+                lines.append(message.content)
                 lines.append("")
             }
             return lines.joined(separator: "\n")
         }.value
-    }
-
-    /// Per-body export cap. Matches `cappedVisibleText` grapheme-window-after-utf8-budget.
-    nonisolated static func cappedExportBody(_ content: String) -> String {
-        let limit = fullLoadBodyBudgetBytes
-        guard limit > 0 else { return "" }
-        guard content.utf8.count > limit else { return content }
-        guard let end = content.index(content.startIndex, offsetBy: limit, limitedBy: content.endIndex),
-              end < content.endIndex else {
-            return content
-        }
-        let head = content[..<end]
-        let dropped = max(1, content.utf8.count - head.utf8.count)
-        return "\(head)\n... \(AgentTimelineItemPresentation.truncationSizeLabel(dropped)) more truncated in export ..."
     }
 
     private static let exportThreadFilenameSeparators = CharacterSet(charactersIn: "/\\:?%*|\"<>")

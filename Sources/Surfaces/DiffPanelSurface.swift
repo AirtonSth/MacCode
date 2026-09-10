@@ -676,7 +676,9 @@ public final class DiffPanelViewModel: ObservableObject {
                         at: URL(fileURLWithPath: fullPath),
                         maxBytes: GitDiff.untrackedDiffPreviewByteCap
                     ) ?? Data()
-                    let content = String(data: data, encoding: .utf8) ?? ""
+                    // Prefix may split a UTF-8 scalar; lossy decode keeps the
+                    // valid head instead of rendering the whole file empty.
+                    let content = String(decoding: data, as: UTF8.self)
                     d = gc.synthesizeUntrackedDiff(content: content, path: p)
                 } else {
                     d = gc.diff(in: cwd, path: p, ignoreWhitespace: ws)

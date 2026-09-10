@@ -697,6 +697,15 @@ final class GitDiffTests: XCTestCase {
         XCTAssertEqual(prefix, payload)
     }
 
+    func test_readFilePrefix_missingFile_returnsNil() {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-git-prefix-missing-\(UUID().uuidString).bin")
+        XCTAssertNil(
+            GitDiff.readFilePrefix(at: url, maxBytes: 64),
+            "open/read failure must return nil, not empty Data"
+        )
+    }
+
     func test_untrackedDiffPreviewByteCap_matchesFilePreview512KiB() {
         XCTAssertEqual(
             GitDiff.untrackedDiffPreviewByteCap, 512 * 1024,

@@ -132,6 +132,10 @@ final class UntrackedDiffSynthesisTests: XCTestCase {
             chunk.contains("GitDiff.untrackedDiffPreviewByteCap"),
             "untracked reload must cap at FilePreviewSurface.maxTextPreviewBytes (512 KiB)"
         )
+        XCTAssertTrue(
+            chunk.contains("String(decoding: data, as: UTF8.self)"),
+            "prefix decode must keep a valid UTF-8 head instead of nil on a mid-scalar cut"
+        )
         XCTAssertEqual(GitDiff.untrackedDiffPreviewByteCap, 512 * 1024)
     }
 }

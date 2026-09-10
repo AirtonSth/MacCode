@@ -778,25 +778,21 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
                      "exportThreadMarkdown must return nil for an unknown thread id instead of crashing or returning garbage")
     }
 
-    func test_exportThreadMarkdown_capsEachBodyAtFullLoadBudget() async throws {
-        // WHY: export used to concatenate every retained body uncapped on
-        // MainActor. Per-body cap matches the hot-UI budget so a fat 100-row
-        // thread cannot materialize unbounded strings in the save-panel path.
+    func test_exportThreadMarkdown_preservesFullBodyOffMain() async throws {
+        // WHY: export hops listRecent+concat off MainActor, but the durable
+        // retained bodies must stay complete (review: no 128 KiB export loss).
         let (vm, _) = try makeVM()
         vm.createThread(title: "Fat export")
         let tid = try XCTUnwrap(vm.selectedThreadId)
-        let budget = AgentAppViewModel.fullLoadBodyBudgetBytes
-        let huge = String(repeating: "x", count: budget + 2_048)
+        let huge = String(repeating: "x", count: AgentAppViewModel.fullLoadBodyBudgetBytes + 2_048)
         try vm.messageRepo.append(AgentMessage(threadId: tid, role: .assistant, content: huge))
 
         let exported = await vm.exportThreadMarkdown(tid)
         let result = try XCTUnwrap(exported)
-        XCTAssertTrue(result.contents.contains("truncated in export"),
-                      "export must cap bodies over fullLoadBodyBudgetBytes")
-        XCTAssertLessThan(result.contents.utf8.count, huge.utf8.count,
-                          "capped export must be smaller than the uncapped body")
-        XCTAssertFalse(result.contents.contains(huge),
-                       "the full uncapped body must not appear in the export")
+        XCTAssertTrue(result.contents.contains(huge),
+                      "export must keep the full retained body after the off-main hop")
+        XCTAssertFalse(result.contents.contains("truncated in export"),
+                       "export must not inject a display-budget truncation marker")
     }
 
     // MARK: - userMessageBubbleWidthCap
