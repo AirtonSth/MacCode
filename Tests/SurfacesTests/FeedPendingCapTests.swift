@@ -1,4 +1,5 @@
 import XCTest
+import Foundation
 @testable import Surfaces
 
 /// Tests for `FeedPanelViewModel.trimmed(_:cap:)`.
@@ -68,5 +69,79 @@ final class FeedPendingCapTests: XCTestCase {
         let ids = result.map(\.id)
         XCTAssertEqual(ids, ids.sorted(),
                        "Surviving items must remain in original (append) order after trim.")
+    }
+
+    /// WHY: live `items` used `removeFirst` (O(n) shift, worse under @Published
+    /// CoW aliasing) while `pending` already used `trimmed` → `Array(suffix)`.
+    func test_trimmed_matchesArraySuffix() {
+        let items = makeItems(count: 400)
+        let cap = 200
+        let viaHelper = FeedPanelViewModel.trimmed(items, cap: cap)
+        let viaSuffix = Array(items.suffix(cap))
+        XCTAssertEqual(viaHelper.map(\.id), viaSuffix.map(\.id),
+                       "trimmed must be Array(suffix) so live and pending share one drop-oldest contract")
+        var viaRemoveFirst = items
+        viaRemoveFirst.removeFirst(viaRemoveFirst.count - cap)
+        XCTAssertEqual(viaHelper.map(\.id), viaRemoveFirst.map(\.id),
+                       "suffix trim must keep the same newest-cap items as removeFirst")
+    }
+
+    /// Microbench: aliased Array (the @Published shape) — suffix copies k
+    /// newest items; removeFirst unique-copies n then shifts.
+    func test_microbench_suffixTrimVsRemoveFirstWhenAliased() {
+        let count = 8_000
+        let cap = 200
+        let warmup = 2
+        let samples = 5
+
+        func median(_ values: [Double]) -> Double {
+            let s = values.sorted()
+            return s[s.count / 2]
+        }
+
+        func timeRemoveFirst() -> Double {
+            var items = makeItems(count: count)
+            let alias = items
+            _ = alias.count
+            let start = DispatchTime.now().uptimeNanoseconds
+            items.removeFirst(items.count - cap)
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(items.count, cap)
+            XCTAssertEqual(alias.count, count)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        func timeSuffix() -> Double {
+            var items = makeItems(count: count)
+            let alias = items
+            _ = alias.count
+            let start = DispatchTime.now().uptimeNanoseconds
+            items = FeedPanelViewModel.trimmed(items, cap: cap)
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(items.count, cap)
+            XCTAssertEqual(alias.count, count)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup { _ = timeRemoveFirst(); _ = timeSuffix() }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samples {
+            before.append(timeRemoveFirst())
+            after.append(timeSuffix())
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = beforeMed > 0 ? (beforeMed - afterMed) / beforeMed * 100.0 : 0
+        NSLog(
+            "[perf-proof] feedTrim removeFirst_ms=%@ suffix_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+            String(beforeMed), String(afterMed), improvement,
+            String(describing: before), String(describing: after)
+        )
+        XCTAssertLessThan(
+            afterMed,
+            beforeMed,
+            "Array(suffix) trim must beat aliased removeFirst (got suffix=\(afterMed)ms removeFirst=\(beforeMed)ms)"
+        )
     }
 }

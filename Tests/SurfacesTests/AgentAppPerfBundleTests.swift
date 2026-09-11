@@ -3221,4 +3221,37 @@ final class AgentAppPerfBundleTests: XCTestCase {
         _ = revealLegacyMed
     }
 
+    /// Live tool rows re-enter body on every token. `toolCommandPreview` must
+    /// reuse `toolInputObject` so 20 tools × 200 prefixes parse 20 times, not 4000.
+    func test_toolCommandPreview_computeCountStaysAtUniqueToolsAcrossDeltas() {
+        let toolCount = 20
+        let deltas = 200
+        let pad = String(repeating: "p", count: 32)
+        let items: [AssistantItem] = (0..<toolCount).map { index in
+            AssistantItem(
+                id: "perf-tool-\(index)",
+                turnId: "perf-turn",
+                type: .tool,
+                state: .completed,
+                summary: "Bash",
+                body: #"{"command":"ls \#(index) \#(pad)"}"#,
+                startedAtMs: Int64(index),
+                finishedAtMs: Int64(index + 1)
+            )
+        }
+        let before = AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting
+        for _ in 0..<deltas {
+            for item in items {
+                _ = AgentTimelineItemPresentation.toolCommandPreview(for: item)
+            }
+        }
+        let parses = AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting - before
+        NSLog(
+            "[perf-proof] toolInputObjectComputeCount tools=%d deltas=%d before_floor=%d after=%d",
+            toolCount, deltas, toolCount * deltas, parses
+        )
+        XCTAssertEqual(parses, toolCount)
+        XCTAssertLessThan(parses, toolCount * deltas)
+    }
+
 }

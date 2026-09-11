@@ -1099,10 +1099,12 @@ public enum AgentFileEditDiffPresentation {
     /// JSONSerialization passes over the whole blob + full-text splits) on every
     /// body pass — even for Bash tools whose 50 KB output is not a diff. Cached
     /// per item growth signature (byte counts invalidate on growth).
+    static let diffModelCacheCountLimit = 256
+    static let diffModelCacheCostLimit = 2 * 1_024 * 1_024
     private static let diffModelCache: NSCache<NSString, DiffModelBox> = {
         let cache = NSCache<NSString, DiffModelBox>()
-        cache.countLimit = 512
-        cache.totalCostLimit = 4 * 1_024 * 1_024
+        cache.countLimit = diffModelCacheCountLimit
+        cache.totalCostLimit = diffModelCacheCostLimit
         return cache
     }()
     #if DEBUG

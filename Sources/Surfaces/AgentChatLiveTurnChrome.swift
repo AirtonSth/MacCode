@@ -18,6 +18,41 @@ public enum AgentChatLiveTurnChrome {
         segment.isFirst
     }
 
+    /// Render-relevant identity for live rows. Byte counts alone freeze
+    /// `itemProgress` % and equal-length text replacement.
+    static func liveRowItemInputsMatch(_ lhs: AssistantItem, _ rhs: AssistantItem) -> Bool {
+        lhs.id == rhs.id
+            && lhs.state == rhs.state
+            && lhs.type == rhs.type
+            && lhs.progress == rhs.progress
+            && lhs.resourcePath == rhs.resourcePath
+            && lhs.distillApplied == rhs.distillApplied
+            && liveTextFingerprint(lhs.summary) == liveTextFingerprint(rhs.summary)
+            && liveTextFingerprint(lhs.body) == liveTextFingerprint(rhs.body)
+            && liveTextFingerprint(lhs.output) == liveTextFingerprint(rhs.output)
+    }
+
+    /// Count + head/mid/tail so equal-length replacement still invalidates
+    /// without walking multi-MiB tool output on every SwiftUI equality tick.
+    static func liveTextFingerprint(_ text: String?) -> UInt64 {
+        guard let text, !text.isEmpty else { return 0 }
+        let utf8 = text.utf8
+        let count = utf8.count
+        func mix<S: Sequence>(_ bytes: S) -> UInt64 where S.Element == UInt8 {
+            var h: UInt64 = 2_166_136_261
+            for b in bytes {
+                h ^= UInt64(b)
+                h = h &* 16_777_619
+            }
+            return h
+        }
+        let head = mix(utf8.prefix(64))
+        let tail = mix(utf8.suffix(64))
+        let midDrop = count > 64 ? max(0, (count / 2) - 32) : 0
+        let mid = mix(utf8.dropFirst(midDrop).prefix(64))
+        return UInt64(count) ^ (head &* 0x9E37_79B9_7F4A_7C15) ^ mid ^ (tail &* 0xC2B2_AE3D_27D4_EB4F)
+    }
+
     public static func timelineByReplaying(_ events: [AssistantEvent]) -> AssistantTimelineState {
         var next = AssistantTimelineState()
         for event in events {
@@ -424,13 +459,18 @@ public enum AgentChatWorkBlock: Identifiable, Equatable, Sendable {
 
 // MARK: - Reasoning
 
-public struct AgentChatReasoningRow: View {
+public struct AgentChatReasoningRow: View, Equatable {
     public let item: AssistantItem
     @Binding public var expandedIDs: Set<String>
 
     public init(item: AssistantItem, expandedIDs: Binding<Set<String>>) {
         self.item = item
         self._expandedIDs = expandedIDs
+    }
+
+    public static func == (lhs: AgentChatReasoningRow, rhs: AgentChatReasoningRow) -> Bool {
+        AgentChatLiveTurnChrome.liveRowItemInputsMatch(lhs.item, rhs.item)
+            && lhs.expandedIDs.contains(lhs.item.id) == rhs.expandedIDs.contains(rhs.item.id)
     }
 
     public var body: some View {
@@ -473,13 +513,18 @@ public struct AgentChatReasoningRow: View {
 
 // MARK: - Tool rows
 
-public struct AgentChatLiveToolRow: View {
+public struct AgentChatLiveToolRow: View, Equatable {
     public let item: AssistantItem
     @Binding public var expandedIDs: Set<String>
 
     public init(item: AssistantItem, expandedIDs: Binding<Set<String>>) {
         self.item = item
         self._expandedIDs = expandedIDs
+    }
+
+    public static func == (lhs: AgentChatLiveToolRow, rhs: AgentChatLiveToolRow) -> Bool {
+        AgentChatLiveTurnChrome.liveRowItemInputsMatch(lhs.item, rhs.item)
+            && lhs.expandedIDs.contains(lhs.item.id) == rhs.expandedIDs.contains(rhs.item.id)
     }
 
     public var body: some View {
@@ -705,6 +750,7 @@ public struct AgentChatToolGroupRow: View {
                 VStack(alignment: .leading, spacing: DS.Space.lg) {
                     ForEach(items) { item in
                         AgentChatLiveToolRow(item: item, expandedIDs: $expandedToolIDs)
+                            .equatable()
                     }
                 }
                 .padding(.leading, DS.Space.md)
@@ -814,6 +860,7 @@ public struct AgentChatWorkBlockView: View {
                 expandedReasoning: $expandedReasoning,
                 expandedTools: $expandedTools
             )
+            .equatable()
         case .toolGroup(let id, let items):
             AgentChatToolGroupRow(
                 id: id,
@@ -825,15 +872,22 @@ public struct AgentChatWorkBlockView: View {
     }
 }
 
-public struct AgentChatLiveItemRow: View {
+public struct AgentChatLiveItemRow: View, Equatable {
     public let item: AssistantItem
     @Binding public var expandedReasoning: Set<String>
     @Binding public var expandedTools: Set<String>
+
+    public static func == (lhs: AgentChatLiveItemRow, rhs: AgentChatLiveItemRow) -> Bool {
+        AgentChatLiveTurnChrome.liveRowItemInputsMatch(lhs.item, rhs.item)
+            && lhs.expandedReasoning.contains(lhs.item.id) == rhs.expandedReasoning.contains(rhs.item.id)
+            && lhs.expandedTools.contains(lhs.item.id) == rhs.expandedTools.contains(rhs.item.id)
+    }
 
     public var body: some View {
         switch item.type {
         case .reasoning:
             AgentChatReasoningRow(item: item, expandedIDs: $expandedReasoning)
+                .equatable()
                 .accessibilityIdentifier("bots.desk.thought.\(item.id)")
         case .assistantMessage:
             if !item.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -856,6 +910,7 @@ public struct AgentChatLiveItemRow: View {
         case .tool, .commandExecution, .fileChange, .mcpToolCall, .dynamicToolCall,
                 .collabToolCall, .webSearch, .review, .contextCompaction, .error, .imageView:
             AgentChatLiveToolRow(item: item, expandedIDs: $expandedTools)
+                .equatable()
         }
     }
 }
@@ -903,8 +958,11 @@ public struct AgentChatLiveTurnView: View, Equatable {
             && lhs.turn.finished == rhs.turn.finished
             && lhs.turn.items.count == rhs.turn.items.count
             && lhs.turn.finalAssistantMessage == rhs.turn.finalAssistantMessage
-            && lhs.turn.items.last?.body.utf8.count == rhs.turn.items.last?.body.utf8.count
-            && lhs.turn.items.last?.output?.utf8.count == rhs.turn.items.last?.output?.utf8.count
+            && lhs.turn.items.last?.progress == rhs.turn.items.last?.progress
+            && lhs.turn.items.last.map { AgentChatLiveTurnChrome.liveTextFingerprint($0.body) }
+                == rhs.turn.items.last.map { AgentChatLiveTurnChrome.liveTextFingerprint($0.body) }
+            && lhs.turn.items.last.map { AgentChatLiveTurnChrome.liveTextFingerprint($0.output) }
+                == rhs.turn.items.last.map { AgentChatLiveTurnChrome.liveTextFingerprint($0.output) }
             && (lhs.renderFinal == nil) == (rhs.renderFinal == nil)
             && (lhs.afterWork == nil) == (rhs.afterWork == nil)
     }
@@ -973,6 +1031,7 @@ public struct AgentChatLiveTurnView: View, Equatable {
                         expandedReasoning: $expandedReasoning,
                         expandedTools: $expandedTools
                     )
+                    .equatable()
                 }
                 if AgentChatLiveTurnChrome.shouldRenderFinalMessage(turn, composition: composition),
                    let final = turn.finalAssistantMessage {

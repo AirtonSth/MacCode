@@ -93,4 +93,33 @@ final class GraphifyUsageDetectorTests: XCTestCase {
             "Must not delete successful tool results that merely mention errors in content"
         )
     }
+
+    func test_failureScan_catchesSignatureAfter8KiBStoredPrefix() {
+        // WHY: stored output is prefix-capped at 8 KiB; looksLikeFailure on
+        // that prefix misses a shell failure that arrives later in the stream.
+        let prefix = String(repeating: "a", count: GraphifyUsageDetector.maxHaystackUTF8Bytes)
+        let signature = "graphify: command not found"
+        let capped = GraphifyUsageDetector.cappedHaystack(prefix + signature)
+        XCTAssertFalse(
+            GraphifyUsageDetector.looksLikeFailure(output: capped),
+            "8 KiB stored prefix of 'a' must not be treated as the failure itself"
+        )
+
+        var state = GraphifyUsageDetector.FailureScanState()
+        GraphifyUsageDetector.ingestFailureScan(&state, chunk: prefix)
+        XCTAssertFalse(state.sawFailure, "benign prefix must not trip failure")
+        GraphifyUsageDetector.ingestFailureScan(&state, chunk: signature)
+        XCTAssertTrue(
+            state.sawFailure,
+            "streaming scan must catch a failure signature after the 8 KiB stored prefix"
+        )
+    }
+
+    func test_failureScan_catchesNeedleSplitAcrossChunks() {
+        var state = GraphifyUsageDetector.FailureScanState()
+        GraphifyUsageDetector.ingestFailureScan(&state, chunk: "graphify: command not fou")
+        XCTAssertFalse(state.sawFailure)
+        GraphifyUsageDetector.ingestFailureScan(&state, chunk: "nd\n")
+        XCTAssertTrue(state.sawFailure, "overlap tail must catch a split 'command not found'")
+    }
 }

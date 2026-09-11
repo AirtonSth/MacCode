@@ -36,16 +36,16 @@ enum AgentMessageMarkdown {
     private final class BlocksBox { let blocks: [AgentMessageMarkdownBlock]; init(_ b: [AgentMessageMarkdownBlock]) { blocks = b } }
     private final class AttributedBox { let value: AttributedString; init(_ v: AttributedString) { value = v } }
 
-    /// Soft byte budget for cached markdown parse results (blocks + inline share
-    /// independent budgets). AA-08: a few MB so finished 60 KiB replies stay
-    /// cached across conversation switches. Streaming partials still skip store
+    /// Soft byte budget for cached markdown parse results (blocks + inline +
+    /// prose share independent budgets). Finished 60 KiB replies still cache
+    /// (~34 large replies per 2 MiB). Streaming partials still skip store
     /// via `cache: false`.
-    static let blocksCacheCostLimit = 4 * 1_024 * 1_024
-    static let inlineCacheCostLimit = 4 * 1_024 * 1_024
+    static let blocksCacheCostLimit = 2 * 1_024 * 1_024
+    static let inlineCacheCostLimit = 2 * 1_024 * 1_024
     /// Peak block-parse results retained process-wide (NSCache countLimit).
-    static let blocksCacheCountLimit = 512
+    static let blocksCacheCountLimit = 256
     /// Peak inline AttributedString results retained process-wide.
-    static let inlineCacheCountLimit = 512
+    static let inlineCacheCountLimit = 256
 
     private static let blocksCache: NSCache<NSString, BlocksBox> = {
         let cache = NSCache<NSString, BlocksBox>()

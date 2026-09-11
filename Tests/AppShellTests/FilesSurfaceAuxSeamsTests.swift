@@ -1,3 +1,5 @@
+import AppKit
+import ImageIO
 import XCTest
 @testable import AppShell
 
@@ -42,6 +44,63 @@ final class FilesSurfaceAuxSeamsTests: XCTestCase {
             "size above the threshold should show the guard before loading")
         XCTAssertFalse(shouldGateLargeMedia(size: LargeMediaGuardThreshold + 1, loadAnyway: true),
             "Load Anyway must bypass the guard for the current file")
+    }
+
+    func test_filesImageThumbnail_capsDecodedPixelsAt2048() throws {
+        // WHY: Files preview used 4096² (~64 MiB RGBA) with immediate ImageIO
+        // cache. Agent App opens Files in a split; cap must match File Preview.
+        XCTAssertEqual(FilesImageThumbnailMaxPixelSize, 2048)
+        let url = try Self.writeSolidPNG(width: 3000, height: 2200)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let decoded = try XCTUnwrap(decodeFilesImageThumbnail(url: url))
+        guard let cg = decoded.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            XCTFail("Files thumbnail must vend a CGImage")
+            return
+        }
+        XCTAssertLessThanOrEqual(cg.width, 2048)
+        XCTAssertLessThanOrEqual(cg.height, 2048)
+        XCTAssertLessThanOrEqual(cg.bytesPerRow * cg.height, 2048 * 2048 * 4)
+        NSLog(
+            "[perf-proof] filesSurface thumb source=3000x2200 decoded=%dx%d bytes=%d before_budget=%d after_budget=%d",
+            cg.width, cg.height, cg.bytesPerRow * cg.height,
+            4096 * 4096 * 4, 2048 * 2048 * 4
+        )
+    }
+
+    private static func writeSolidPNG(width: Int, height: Int) throws -> URL {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw NSError(domain: "FilesSurfaceAuxSeamsTests", code: 1)
+        }
+        context.setFillColor(red: 0.1, green: 0.6, blue: 0.3, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        guard let image = context.makeImage() else {
+            throw NSError(domain: "FilesSurfaceAuxSeamsTests", code: 2)
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-files-thumb-\(UUID().uuidString).png")
+        guard let destination = CGImageDestinationCreateWithURL(
+            url as CFURL,
+            "public.png" as CFString,
+            1,
+            nil
+        ) else {
+            throw NSError(domain: "FilesSurfaceAuxSeamsTests", code: 3)
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw NSError(domain: "FilesSurfaceAuxSeamsTests", code: 4)
+        }
+        return url
     }
 
     func test_binaryMetadataRows_includePathMimeAndByteSize() {

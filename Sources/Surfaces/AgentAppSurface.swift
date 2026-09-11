@@ -10579,6 +10579,10 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
     /// The parser stores a tool_use's input there as JSON (e.g. {"command":"…"} for Bash,
     /// {"file_path":"…"} for Read/Edit). The transcript previously showed only "Ran Bash"
     /// with no command — this surfaces the actual command so the run is legible.
+    ///
+    /// PERF: live tool rows used to `JSONSerialization` this body on every paint
+    /// (~30 Hz × N tools). Route through `toolInputObject` so identical JSON
+    /// parses once and subsequent paints are cache hits.
     static func toolCommandPreview(for item: AssistantItem) -> String? {
         switch item.type {
         case .tool, .mcpToolCall, .dynamicToolCall, .collabToolCall, .commandExecution:
@@ -18776,7 +18780,11 @@ enum ScrollPinPolicy {
 
 // PERF-MAC_AGENT-004: 1s cadence for the first minute, 5s after, so the
 // "Working for Xs" row stops forcing a re-render every second on long runs.
-private struct ElapsedTickSchedule: TimelineSchedule {
+// Perf CH-12: honour `mode == .lowFrequency` (SwiftUI passes it while the
+// view is occluded / its window is minimized) by pinning the 5s cadence, so
+// hidden live tool clocks are not a steady 1s wake-up source. Mirrors
+// `AgentChatElapsedTickSchedule`.
+struct ElapsedTickSchedule: TimelineSchedule {
     let start: Date
 
     func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
@@ -18784,7 +18792,7 @@ private struct ElapsedTickSchedule: TimelineSchedule {
         return AnyIterator {
             let current = next
             let elapsed = current.timeIntervalSince(start)
-            let step: TimeInterval = elapsed < 60 ? 1 : 5
+            let step: TimeInterval = (elapsed < 60 && mode != .lowFrequency) ? 1 : 5
             next = current.addingTimeInterval(step)
             return current
         }
