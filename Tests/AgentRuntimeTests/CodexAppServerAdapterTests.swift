@@ -1636,7 +1636,8 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             "threadId": "codex-thread-1",
             "requestId": settleRpcId
         ])
-        let settled = try XCTUnwrap(try await settleTask.value as? [String: Any])
+        let settledRaw = try await settleTask.value
+        let settled = try XCTUnwrap(settledRaw as? [String: Any])
         XCTAssertEqual(settled["decision"] as? String, "abort",
                        "ReviewDecision settle must send abort, not cancel")
 
