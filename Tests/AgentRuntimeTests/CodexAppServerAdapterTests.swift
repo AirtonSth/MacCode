@@ -1598,15 +1598,9 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         let aborted = try await decision(method: "execCommandApproval", response: .cancel, itemId: "exec-cancel")
         XCTAssertEqual(aborted["decision"] as? String, "abort")
 
-        let approvedSession = try await decision(
-            method: "applyPatchApproval",
-            response: .approveForSession,
-            itemId: "patch-session"
-        )
-        XCTAssertEqual(approvedSession["decision"] as? String, "approved_for_session")
-
         // WHY: stopSession / serverRequest/resolved must use the same dialect.
         // Hard-coding {"decision":"cancel"} is illegal for ReviewDecision methods.
+        // Run before approveForSession so fullAccess auto-approve does not swallow the card.
         nextRpcId += 1
         let settleRpcId = "rpc-\(nextRpcId)"
         let settleTask = Task {
@@ -1640,6 +1634,13 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         let settled = try XCTUnwrap(settledRaw as? [String: Any])
         XCTAssertEqual(settled["decision"] as? String, "abort",
                        "ReviewDecision settle must send abort, not cancel")
+
+        let approvedSession = try await decision(
+            method: "applyPatchApproval",
+            response: .approveForSession,
+            itemId: "patch-session"
+        )
+        XCTAssertEqual(approvedSession["decision"] as? String, "approved_for_session")
 
         // After Approve Session, fullAccess auto-approve must also use ReviewDecision.
         let autoPatch = try await client.serverRequestHandler?("rpc-5", "applyPatchApproval", [
