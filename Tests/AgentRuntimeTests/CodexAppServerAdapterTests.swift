@@ -28,18 +28,18 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                        "a Codex release without threadSource cannot reconcile a lost fork response and must fail closed")
     }
 
-    func test_currentServerRequestInventoryMatchesGeneratedCodexSchema_0_153_2() throws {
+    func test_currentServerRequestInventoryMatchesGeneratedCodexSchema_0_154_0() throws {
         // WHY: a hand-copied expectation can drift in lockstep with the switch.
         // Read the checked-in projection generated from ServerRequest.json so a
         // schema upgrade introduces a failing ownership decision by default.
-        // 0.153.2 still includes currentTime/read; inventory must own that callback.
+        // 0.154.0 still includes currentTime/read; inventory must own that callback.
         let fixture = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
-            .appendingPathComponent("Fixtures/CodexAppServer/ServerRequestMethods-0.153.2.json")
+            .appendingPathComponent("Fixtures/CodexAppServer/ServerRequestMethods-0.154.0.json")
         let data = try Data(contentsOf: fixture)
         let schema = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(schema["generatedBy"] as? String,
-                       "codex-cli 0.153.2 app-server generate-json-schema --experimental")
+                       "codex-cli 0.154.0 app-server generate-json-schema --experimental")
         let variants = try XCTUnwrap(schema["oneOf"] as? [[String: Any]])
         let schemaMethods = Set(variants.compactMap { variant -> String? in
             let properties = variant["properties"] as? [String: Any]
@@ -109,7 +109,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
 
         let version = try runCodex(codex, arguments: ["--version"])
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        XCTAssertEqual(version, "codex-cli 0.153.2",
+        XCTAssertEqual(version, "codex-cli 0.154.0",
                        "the checked-in projection must be regenerated deliberately when the release Codex version changes")
         _ = try runCodex(codex, arguments: [
             "app-server", "generate-json-schema", "--experimental", "--out", output.path

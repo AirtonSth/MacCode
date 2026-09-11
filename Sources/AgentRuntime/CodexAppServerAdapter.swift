@@ -176,7 +176,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case mcpElicitation(requestedSchema: [String: Any]?)
     }
 
-    /// Server-to-client methods in the Codex 0.153.2 app-server schema. Keep the
+    /// Server-to-client methods in the Codex 0.154.0 app-server schema. Keep the
     /// inventory explicit so a protocol upgrade cannot silently fall through as
     /// an unknown callback with no ownership decision.
     static let currentServerRequestMethods: Set<String> = [
