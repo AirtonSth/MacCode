@@ -2095,7 +2095,11 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             onEvent?(.event(.requestResolved(requestId: requestId, state: .cancelled)))
             switch pending.responseKind {
             case .legacyDecision:
-                pending.continuation.resume(returning: ["decision": "cancel"])
+                // Use the same dialect as interactive cancel: ReviewDecision
+                // methods need `"abort"`, accept-dialect needs `"cancel"`.
+                pending.continuation.resume(returning: [
+                    "decision": Self.codexDecision(.cancel, pending: pending)
+                ])
             case .permissions:
                 pending.continuation.resume(returning: [
                     "permissions": [String: Any](),
@@ -2128,7 +2132,11 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         emit([.requestResolved(requestId: requestId, state: .cancelled)], threadId: threadId)
         switch pending.responseKind {
         case .legacyDecision:
-            pending.continuation.resume(returning: ["decision": "cancel"])
+            // Use the same dialect as interactive cancel: ReviewDecision
+            // methods need `"abort"`, accept-dialect needs `"cancel"`.
+            pending.continuation.resume(returning: [
+                "decision": Self.codexDecision(.cancel, pending: pending)
+            ])
         case .permissions:
             pending.continuation.resume(returning: [
                 "permissions": [String: Any](),

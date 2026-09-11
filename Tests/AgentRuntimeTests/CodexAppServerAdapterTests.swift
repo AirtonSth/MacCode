@@ -1605,6 +1605,41 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )
         XCTAssertEqual(approvedSession["decision"] as? String, "approved_for_session")
 
+        // WHY: stopSession / serverRequest/resolved must use the same dialect.
+        // Hard-coding {"decision":"cancel"} is illegal for ReviewDecision methods.
+        nextRpcId += 1
+        let settleRpcId = "rpc-\(nextRpcId)"
+        let settleTask = Task {
+            try await client.serverRequestHandler?(settleRpcId, "applyPatchApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "patch-settle-abort",
+                "command": "apply_patch"
+            ])
+        }
+        let settleRequest: AssistantPendingRequest = try await {
+            let deadline = Date().addingTimeInterval(3)
+            while Date() < deadline {
+                let events = await sink.snapshot()
+                if let request = events.compactMap({
+                    if case .requestOpened(let request) = $0 { return request }
+                    return nil
+                }).first(where: { !seenRequestIds.contains($0.id) }) {
+                    return request
+                }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            throw CodexAdapterTestWaitError.timedOut("settle approval patch-settle-abort")
+        }()
+        seenRequestIds.insert(settleRequest.id)
+        client.notificationHandler?("serverRequest/resolved", [
+            "threadId": "codex-thread-1",
+            "requestId": settleRpcId
+        ])
+        let settled = try XCTUnwrap(try await settleTask.value as? [String: Any])
+        XCTAssertEqual(settled["decision"] as? String, "abort",
+                       "ReviewDecision settle must send abort, not cancel")
+
         // After Approve Session, fullAccess auto-approve must also use ReviewDecision.
         let autoPatch = try await client.serverRequestHandler?("rpc-5", "applyPatchApproval", [
             "threadId": "codex-thread-1",
