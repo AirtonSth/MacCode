@@ -1806,7 +1806,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
     func test_commandExecutionApproveDoesNotInventAmendmentWhenAvailableDecisionsExplicitlyEmpty() async throws {
         // WHY: Upstream treats Some([]) as an authoritative empty allow-list.
         // Collapsing that with an absent field would fall back to proposals and
-        // emit an amendment Codex did not offer.
+        // invent either an amendment or string accept Codex did not offer.
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
             client.notificationHandler = notificationHandler
@@ -1834,7 +1834,8 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approve)
         let raw = try await responseTask.value
         let response = try XCTUnwrap(raw as? [String: Any])
-        XCTAssertEqual(response["decision"] as? String, "accept")
+        XCTAssertEqual(response["decision"] as? String, "decline",
+                       "empty availableDecisions must not invent accept or an amendment")
         XCTAssertNil(response["decision"] as? [String: Any])
     }
 

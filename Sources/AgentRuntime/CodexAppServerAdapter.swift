@@ -2746,13 +2746,35 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             if let amendment = offeredCommandExecutionApproveDecision(pending) {
                 return amendment
             }
+            // When Codex sent availableDecisions, that allow-list is authoritative:
+            // only emit string accept if it was offered. An empty list must not
+            // invent accept after amendment lookup returned nil.
+            if let available = pending.availableDecisions {
+                if allowListContainsStringDecision(available, "accept") {
+                    return "accept"
+                }
+                return "decline"
+            }
             return "accept"
         case .approveForSession:
+            if let available = pending.availableDecisions {
+                if allowListContainsStringDecision(available, "acceptForSession") {
+                    return "acceptForSession"
+                }
+                return "decline"
+            }
             return "acceptForSession"
         case .decline:
             return "decline"
         case .cancel:
             return "cancel"
+        }
+    }
+
+    private static func allowListContainsStringDecision(_ available: [Any], _ name: String) -> Bool {
+        available.contains { raw in
+            if let string = raw as? String { return string == name }
+            return false
         }
     }
 
