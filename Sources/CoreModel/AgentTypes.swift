@@ -32,6 +32,9 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
     case high
     case xhigh
     case max
+    /// Codex app-server / model-catalog wire value (codex-cli 0.154+). Distinct
+    /// from Claude-only `ultracode`.
+    case ultra
     case ultracode
 
     public static var supportedCases: [AgentReasoningEffort] {
@@ -39,8 +42,9 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
     }
 
     /// `supportedCases` is the conservative provider-neutral fallback. Live
-    /// Codex catalogs may expose `max` for specific models; callers with that
-    /// observable model contract should preserve it rather than using this list.
+    /// Codex catalogs may expose `max` and `ultra` for specific models; callers
+    /// with that observable model contract should preserve them rather than
+    /// using this list.
     /// `ultracode` remains Claude-only and is not Codex's distinct `ultra` value.
     /// Claude Code 2.1.203+ accepts it as a native effort selector meaning
     /// "xhigh effort + standing dynamic workflow orchestration"; RemoteCode also
@@ -59,6 +63,7 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
         case .high: return "High"
         case .xhigh: return "Extra High"
         case .max: return "Max"
+        case .ultra: return "Ultra"
         case .ultracode: return "Ultracode"
         }
     }
@@ -71,6 +76,7 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
         case .high: return "Deeper reasoning for harder tasks"
         case .xhigh: return "Very deep reasoning for hard problems"
         case .max: return "Deepest reasoning the model supports — slowest, most tokens"
+        case .ultra: return "Codex ultra reasoning — beyond max for supported models"
         case .ultracode: return "Extra High effort + autonomous workflow orchestration"
         }
     }
@@ -108,7 +114,7 @@ public enum GrokReasoningPolicy {
             return supported.contains(.low) ? .low : (supported.first ?? deepest)
         case .low, .medium, .high, .xhigh:
             return supported.contains(effort) ? effort : deepest
-        case .max, .ultracode:
+        case .max, .ultra, .ultracode:
             return deepest
         }
     }

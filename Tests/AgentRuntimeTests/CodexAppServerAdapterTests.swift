@@ -4112,6 +4112,83 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )
     }
 
+    func test_codex154TurnNotificationsEmitAssistantEvents() async throws {
+        // WHY: codex-cli 0.154.0 emits autoApprovalReview/strictReviewRequired,
+        // turn/moderationMetadata, and model/safetyBuffering/updated. The adapter
+        // previously hit `default: break` and dropped them (CODEX-APP-011).
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "codex 0.154 notifications"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("autoApprovalReview/strictReviewRequired", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "startedAtMs": 1
+        ])
+        client.notificationHandler?("turn/moderationMetadata", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "metadata": ["policy": "standard"]
+        ])
+        client.notificationHandler?("model/safetyBuffering/updated", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "model": "gpt-5.5",
+            "showBufferingUi": true,
+            "reasons": ["latency"]
+        ])
+
+        let events = try await waitForEvents(in: sink) { events in
+            let summaries = events.compactMap { event -> String? in
+                if case .itemStarted(let item) = event { return item.summary }
+                return nil
+            }
+            return summaries.contains("Strict auto-approval review required")
+                && summaries.contains("Turn moderation metadata")
+                && summaries.contains("Model safety buffering")
+        }
+        XCTAssertTrue(
+            events.contains {
+                if case .itemStarted(let item) = $0 {
+                    return item.summary == "Strict auto-approval review required" && item.type == .review
+                }
+                return false
+            }
+        )
+        XCTAssertTrue(
+            events.contains {
+                if case .itemStarted(let item) = $0 {
+                    return item.summary == "Turn moderation metadata"
+                        && (item.output?.contains("standard") == true)
+                }
+                return false
+            }
+        )
+        XCTAssertTrue(
+            events.contains {
+                if case .itemStarted(let item) = $0 {
+                    return item.summary == "Model safety buffering"
+                        && (item.output?.contains("gpt-5.5") == true)
+                }
+                return false
+            }
+        )
+    }
+
     func test_autoApprovalReviewUsesReviewIdAndTerminalStatuses() async throws {
         // WHY: ItemGuardianApprovalReviewCompletedNotification carries reviewId +
         // GuardianApprovalReviewStatus (approved/denied/timedOut/aborted). Missing
