@@ -254,11 +254,10 @@ public enum CodexHarnessModelCatalog {
         }()
         var efforts: [AgentReasoningEffort] = []
         for value in values {
-            // The current CoreModel has no Codex `ultra` wire case. Preserve
-            // every representable provider value and do not invent a different
-            // effort with a misleading meaning for this picker.
-            guard value != "ultra",
-                  let effort = AgentReasoningEffort(rawValue: value),
+            // Preserve every representable Codex catalog effort, including
+            // `ultra` (codex-cli 0.154+). Do not invent a different effort with
+            // a misleading meaning for this picker.
+            guard let effort = AgentReasoningEffort(rawValue: value),
                   !efforts.contains(effort) else { continue }
             efforts.append(effort)
         }
