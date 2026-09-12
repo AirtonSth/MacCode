@@ -390,10 +390,18 @@ struct GrokACPSessionOpenResult {
     let sessionId: String
     let models: [AgentModelDescriptor]
     let currentModelId: String?
+    /// Live current effort: `configOptions.reasoning_effort.currentValue` when
+    /// present, else model `_meta.reasoningEffort` (may differ from option default).
+    let currentReasoningEffortRaw: String?
     let availableModes: [GrokACPSessionMode]
     let currentModeId: String?
     /// Typed ACP `configOptions` from session/new|load (model + reasoning_effort).
     let configOptions: [[String: Any]]
+
+    /// True when session/new|load advertised a selectable `reasoning_effort` option.
+    var advertisesReasoningEffortConfig: Bool {
+        !advertisedReasoningEffortIds.isEmpty
+    }
 
     var planModeId: String? {
         availableModes.first {
@@ -783,8 +791,6 @@ public final class GrokACPClient: @unchecked Sendable {
     /// `reasoningEffort` is the ACP `_meta.reasoningEffort` wire value (grok-build
     /// `REASONING_EFFORT_META_KEY`). Omit when the host has nothing to bind.
     /// Values are mapped via `wireReasoningEffort` before the wire call.
-    /// Effort-only rebinds use the same method: live grok 1.0.13 rejects
-    /// `session/set_config_option` (`-32602 Invalid params` / `-32601`).
     func setModel(
         sessionId: String,
         modelId: String,
@@ -798,22 +804,41 @@ public final class GrokACPClient: @unchecked Sendable {
         _ = try await requestJSONObject(method: "session/set_model", params: params, timeout: 15)
     }
 
+    /// Flat-string `session/set_config_option` (live grok 1.0.25+). Nested
+    /// `{value:{value}}` and `optionId` shapes still return `-32602`.
+    func setConfigOption(
+        sessionId: String,
+        configId: String,
+        value: String
+    ) async throws {
+        _ = try await requestJSONObject(
+            method: "session/set_config_option",
+            params: [
+                "sessionId": sessionId,
+                "configId": configId,
+                "value": value,
+            ],
+            timeout: 15
+        )
+    }
+
     /// Pure routing for model/effort binds before a prompt.
-    /// Live grok 1.0.13 `session/set_config_option` is not a working bind
-    /// path (`-32602` on `{value:{value:}}`, `-32601` on the ACP string
-    /// value). Effort-only therefore uses `session/set_model` +
-    /// `_meta.reasoningEffort`, which the same agent accepts without a
-    /// model-id change.
+    /// Prefer flat `session/set_config_option` for effort-only binds when the
+    /// open result advertised `reasoning_effort` (live grok 1.0.25). Fall back
+    /// to `session/set_model` + `_meta.reasoningEffort` for older agents /
+    /// missing configOptions (1.0.13 rejected set_config_option).
     enum ModelEffortBind: Equatable {
         case none
         case setModel(modelId: String, reasoningEffort: AgentReasoningEffort?)
+        case setConfigOption(configId: String, value: String, effort: AgentReasoningEffort)
     }
 
     static func modelEffortBind(
         requestModel: String,
         sessionModel: String,
         requestEffort: AgentReasoningEffort?,
-        sessionEffort: AgentReasoningEffort?
+        sessionEffort: AgentReasoningEffort?,
+        prefersConfigOptionEffort: Bool = false
     ) -> ModelEffortBind {
         let model = requestModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let targetModel = model.isEmpty ? sessionModel : model
@@ -826,7 +851,14 @@ public final class GrokACPClient: @unchecked Sendable {
             return .setModel(modelId: targetModel, reasoningEffort: targetEffort)
         }
         if needsEffortBind, let targetEffort,
-           wireReasoningEffort(targetEffort, modelId: targetModel) != nil {
+           let wire = wireReasoningEffort(targetEffort, modelId: targetModel) {
+            if prefersConfigOptionEffort {
+                return .setConfigOption(
+                    configId: "reasoning_effort",
+                    value: wire,
+                    effort: targetEffort
+                )
+            }
             return .setModel(modelId: targetModel, reasoningEffort: targetEffort)
         }
         return .none
@@ -1172,10 +1204,16 @@ public final class GrokACPClient: @unchecked Sendable {
             return GrokACPSessionMode(id: id, name: name, description: raw["description"] as? String)
         }
         let configOptions = (result["configOptions"] as? [JSONObject]) ?? []
+        let currentModelId = state?["currentModelId"] as? String
         return GrokACPSessionOpenResult(
             sessionId: sessionId,
             models: models,
-            currentModelId: state?["currentModelId"] as? String,
+            currentModelId: currentModelId,
+            currentReasoningEffortRaw: currentReasoningEffortRaw(
+                from: state,
+                currentModelId: currentModelId,
+                configOptions: configOptions
+            ),
             availableModes: availableModes,
             currentModeId: modeState?["currentModeId"] as? String,
             configOptions: configOptions
@@ -1189,12 +1227,25 @@ public final class GrokACPClient: @unchecked Sendable {
             let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !id.isEmpty else { return nil }
             let metadata = raw["_meta"] as? JSONObject ?? [:]
-            let supported = reasoningEfforts(
-                from: metadata["reasoningEfforts"]
-                    ?? metadata["supportedReasoningEfforts"]
-                    ?? raw["reasoningEfforts"]
-                    ?? raw["supportedReasoningEfforts"]
-            )
+            let effortEntries = (metadata["reasoningEfforts"] as? [JSONObject])
+                ?? (metadata["supportedReasoningEfforts"] as? [JSONObject])
+                ?? (raw["reasoningEfforts"] as? [JSONObject])
+                ?? (raw["supportedReasoningEfforts"] as? [JSONObject])
+                ?? []
+            let supported: [AgentReasoningEffort]
+            if effortEntries.isEmpty {
+                supported = reasoningEfforts(
+                    from: metadata["reasoningEfforts"]
+                        ?? metadata["supportedReasoningEfforts"]
+                        ?? raw["reasoningEfforts"]
+                        ?? raw["supportedReasoningEfforts"]
+                )
+            } else {
+                supported = parseReasoningEffortCatalog(
+                    entries: effortEntries,
+                    currentRaw: metadata["reasoningEffort"] as? String
+                ).ordered
+            }
             let speedTiers = (metadata["additionalSpeedTiers"] as? [String])
                 ?? (metadata["additional_speed_tiers"] as? [String])
                 ?? (raw["additionalSpeedTiers"] as? [String])
@@ -1230,14 +1281,85 @@ public final class GrokACPClient: @unchecked Sendable {
         }
     }
 
+    /// Stable effort order with preferred default first so `.first` consumers
+    /// (schedulers, drafts) match the agent-advertised default rather than
+    /// the raw ACP array order (live grok-4.6 lists `xhigh` first).
+    static func parseReasoningEffortCatalog(
+        entries: [JSONObject],
+        currentRaw: String?
+    ) -> (ordered: [AgentReasoningEffort], preferred: AgentReasoningEffort?) {
+        var seen: [AgentReasoningEffort] = []
+        var flaggedDefault: AgentReasoningEffort?
+        for entry in entries {
+            // Prefer `id` over `value` so glm aliases (id=medium,value=high)
+            // keep distinct catalog identities.
+            let raw = ((entry["id"] as? String)
+                ?? (entry["reasoningEffort"] as? String)
+                ?? (entry["value"] as? String))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard let effort = AgentReasoningEffort(rawValue: raw) else { continue }
+            if !seen.contains(effort) { seen.append(effort) }
+            if flaggedDefault == nil, (entry["default"] as? Bool) == true {
+                flaggedDefault = effort
+            }
+        }
+        let current = currentRaw.flatMap { AgentReasoningEffort(rawValue: $0) }
+        let preferred = flaggedDefault
+            ?? (current.flatMap { seen.contains($0) ? $0 : nil })
+            ?? (seen.contains(.high) ? .high : seen.first)
+        guard let preferred else { return ([], nil) }
+        let rest = seen.filter { $0 != preferred }
+        return ([preferred] + rest, preferred)
+    }
+
+    /// Live current effort from typed configOptions, else model `_meta`.
+    static func currentReasoningEffortRaw(
+        from state: JSONObject?,
+        currentModelId: String?,
+        configOptions: [JSONObject] = []
+    ) -> String? {
+        if let option = configOptions.first(where: {
+            (($0["id"] as? String) ?? ($0["configId"] as? String)) == "reasoning_effort"
+        }) {
+            let current = (option["currentValue"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !current.isEmpty { return current }
+        }
+        let rawModels = state?["availableModels"] as? [JSONObject] ?? []
+        let trimmed = currentModelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let match = rawModels.first { ($0["modelId"] as? String) == trimmed } ?? rawModels.first
+        let metadata = match?["_meta"] as? JSONObject ?? [:]
+        let raw = (metadata["reasoningEffort"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return raw.isEmpty ? nil : raw
+    }
+
+    /// Seed open-state effort from live current when advertised; else preferred default (`.first`).
+    static func seededReasoningEffort(
+        models: [AgentModelDescriptor],
+        currentModelId: String?,
+        currentEffortRaw: String? = nil
+    ) -> AgentReasoningEffort? {
+        let trimmed = currentModelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let match = models.first { $0.id == trimmed } ?? models.first
+        let supported = match?.supportedReasoningEfforts ?? []
+        if let raw = currentEffortRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty,
+           let current = AgentReasoningEffort(rawValue: raw),
+           supported.contains(current) {
+            return current
+        }
+        return supported.first
+    }
+
     private static func reasoningEfforts(from value: Any?) -> [AgentReasoningEffort] {
         if let strings = value as? [String] {
             return strings.compactMap(AgentReasoningEffort.init(rawValue:))
         }
         if let objects = value as? [JSONObject] {
             return objects.compactMap {
-                ($0["reasoningEffort"] as? String
-                    ?? $0["id"] as? String
+                ($0["id"] as? String
+                    ?? $0["reasoningEffort"] as? String
                     ?? $0["value"] as? String)
                     .flatMap(AgentReasoningEffort.init(rawValue:))
             }
