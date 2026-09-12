@@ -171,7 +171,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case mcpElicitation(requestedSchema: [String: Any]?)
     }
 
-    /// Server-to-client methods in the Codex 0.152.1 app-server schema. Keep the
+    /// Server-to-client methods in the Codex 0.154.0 app-server schema. Keep the
     /// inventory explicit so a protocol upgrade cannot silently fall through as
     /// an unknown callback with no ownership decision.
     static let currentServerRequestMethods: Set<String> = [
@@ -1788,6 +1788,52 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 state: .completed,
                 summary: "Model rerouted",
                 output: "Model rerouted: \(reason)",
+                startedAtMs: now,
+                finishedAtMs: now
+            )))
+        case "model/safetyBuffering/updated", "model.safetyBuffering.updated":
+            let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
+            let itemId = "model-safety-buffering-\(turnId.isEmpty ? UUID().uuidString : turnId)"
+            let model = string(payload, "model") ?? string(payload, "fasterModel") ?? "unknown"
+            let showUI = payload["showBufferingUi"] as? Bool ?? payload["showBufferingUI"] as? Bool
+            let reasons = Self.joinedStrings(payload["reasons"]) ?? Self.joinedStrings(payload["useCases"]) ?? ""
+            var output = "Model safety buffering: \(model)"
+            if let showUI { output += showUI ? " (show UI)" : " (hide UI)" }
+            if !reasons.isEmpty { output += " — \(reasons)" }
+            events.append(.itemStarted(item: AssistantItem(
+                id: itemId,
+                turnId: turnId,
+                type: .tool,
+                state: .completed,
+                summary: "Model safety buffering",
+                output: output,
+                startedAtMs: now,
+                finishedAtMs: now
+            )))
+        case "autoApprovalReview/strictReviewRequired", "autoApprovalReview.strictReviewRequired":
+            let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
+            let itemId = "strict-review-\(turnId.isEmpty ? UUID().uuidString : turnId)"
+            events.append(.itemStarted(item: AssistantItem(
+                id: itemId,
+                turnId: turnId,
+                type: .review,
+                state: .streaming,
+                summary: "Strict auto-approval review required",
+                output: Self.jsonString(payload),
+                startedAtMs: now,
+                finishedAtMs: nil
+            )))
+        case "turn/moderationMetadata", "turn.moderationMetadata":
+            let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
+            let itemId = "turn-moderation-\(turnId.isEmpty ? UUID().uuidString : turnId)"
+            let metadata = payload["metadata"] ?? payload
+            events.append(.itemStarted(item: AssistantItem(
+                id: itemId,
+                turnId: turnId,
+                type: .tool,
+                state: .completed,
+                summary: "Turn moderation metadata",
+                output: Self.jsonString(metadata),
                 startedAtMs: now,
                 finishedAtMs: now
             )))
