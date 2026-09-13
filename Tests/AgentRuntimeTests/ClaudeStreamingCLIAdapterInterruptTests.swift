@@ -516,10 +516,12 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
     /// CLAUDE-INT-002: a grace-kill body that already started must no-op after a
     /// matching receipt cleared pending ownership (cancel is ineffective mid-run).
     func test_shouldExecuteInterruptGraceKill_requiresPendingOwnership() {
+        let runId = AgentRunID()
         XCTAssertTrue(
             ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
                 sessionStillCurrent: true,
-                inFlight: true,
+                inFlightRunId: runId,
+                ownedRunId: runId,
                 pendingRequestId: "pending-1",
                 scheduledRequestId: "pending-1",
                 installedWorkItemIsSelf: true
@@ -528,7 +530,8 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         XCTAssertFalse(
             ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
                 sessionStillCurrent: true,
-                inFlight: true,
+                inFlightRunId: runId,
+                ownedRunId: runId,
                 pendingRequestId: nil,
                 scheduledRequestId: "pending-1",
                 installedWorkItemIsSelf: true
@@ -538,7 +541,8 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         XCTAssertFalse(
             ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
                 sessionStillCurrent: true,
-                inFlight: true,
+                inFlightRunId: runId,
+                ownedRunId: runId,
                 pendingRequestId: "pending-1",
                 scheduledRequestId: "pending-1",
                 installedWorkItemIsSelf: false
@@ -548,11 +552,42 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         XCTAssertFalse(
             ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
                 sessionStillCurrent: true,
-                inFlight: false,
+                inFlightRunId: nil,
+                ownedRunId: runId,
                 pendingRequestId: "pending-1",
                 scheduledRequestId: "pending-1",
                 installedWorkItemIsSelf: true
             )
+        )
+    }
+
+    /// Interrupt scheduled for run A; aborted_streaming/emitTerminal clears
+    /// in-flight; a later sendTurn sets run B. The grace-kill body must not
+    /// treat "in-flight again" as ownership of the interrupted run.
+    func test_shouldExecuteInterruptGraceKill_refusesAfterNewTurnReplacesInFlightRun() {
+        let interruptedRun = AgentRunID()
+        let nextRun = AgentRunID()
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
+                sessionStillCurrent: true,
+                inFlightRunId: nextRun,
+                ownedRunId: interruptedRun,
+                pendingRequestId: "pending-1",
+                scheduledRequestId: "pending-1",
+                installedWorkItemIsSelf: true
+            ),
+            "grace-kill of the interrupted run must not stopSession after a new inFlightRunId"
+        )
+        XCTAssertTrue(
+            ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
+                sessionStillCurrent: true,
+                inFlightRunId: interruptedRun,
+                ownedRunId: interruptedRun,
+                pendingRequestId: "pending-1",
+                scheduledRequestId: "pending-1",
+                installedWorkItemIsSelf: true
+            ),
+            "same-run in-flight ownership must still allow the grace kill"
         )
     }
 }

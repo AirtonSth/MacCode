@@ -309,6 +309,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             session?.cancellationRequested = true
         }
         let cancelQueued = session?.cliCapabilities.contains("interrupt_cancel_queued_v1") ?? false
+        let ownedRunId = session?.inFlightRunId
         lock.unlock()
         guard let session else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
         // Attempt graceful interrupt via stream-json control message first.
@@ -338,7 +339,8 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             // match before we hard-stop; a matching receipt clears both first.
             let stillOwnsInterrupt = Self.shouldExecuteInterruptGraceKill(
                 sessionStillCurrent: self.sessions[threadId] === session,
-                inFlight: session.inFlightRunId != nil,
+                inFlightRunId: session.inFlightRunId,
+                ownedRunId: ownedRunId,
                 pendingRequestId: session.pendingInterruptRequestId,
                 scheduledRequestId: requestId,
                 installedWorkItemIsSelf: session.interruptKillWorkItem === killBox.item
@@ -520,16 +522,20 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
 
     /// Whether a grace-kill work item that has already begun should still call
     /// `stopSession`. False when a matching interrupt receipt cleared ownership
-    /// (pending id / installed work item) before the body reached this check.
+    /// (pending id / installed work item) before the body reached this check,
+    /// or when the in-flight run is no longer the interrupted one (emitTerminal
+    /// released it and a later sendTurn started a new turn on the warm session).
     nonisolated static func shouldExecuteInterruptGraceKill(
         sessionStillCurrent: Bool,
-        inFlight: Bool,
+        inFlightRunId: AgentRunID?,
+        ownedRunId: AgentRunID?,
         pendingRequestId: String?,
         scheduledRequestId: String,
         installedWorkItemIsSelf: Bool
     ) -> Bool {
         sessionStillCurrent
-            && inFlight
+            && inFlightRunId != nil
+            && inFlightRunId == ownedRunId
             && pendingRequestId == scheduledRequestId
             && installedWorkItemIsSelf
     }
@@ -1257,6 +1263,11 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.pendingPermissionMeta.removeAll()
         session.pendingBackgroundTaskIds.removeAll()
         session.sawDetachedShellSpawn = false
+        // The interrupted run completed without a control_response receipt.
+        // Drop the grace-kill so a later sendTurn cannot inherit this timer.
+        session.interruptKillWorkItem?.cancel()
+        session.interruptKillWorkItem = nil
+        session.pendingInterruptRequestId = nil
         lock.unlock()
     }
 
