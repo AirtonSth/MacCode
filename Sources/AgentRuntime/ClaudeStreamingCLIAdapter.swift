@@ -337,20 +337,34 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             // CLAUDE-INT-002: cancel() does not stop a body that already began.
             // Ownership of the pending interrupt + installed work item must still
             // match before we hard-stop; a matching receipt clears both first.
+            let mappedSessionIsExact = self.sessions[threadId] === session
             let stillOwnsInterrupt = Self.shouldExecuteInterruptGraceKill(
-                sessionStillCurrent: self.sessions[threadId] === session,
+                sessionStillCurrent: mappedSessionIsExact,
                 inFlightRunId: session.inFlightRunId,
                 ownedRunId: ownedRunId,
                 pendingRequestId: session.pendingInterruptRequestId,
                 scheduledRequestId: requestId,
                 installedWorkItemIsSelf: session.interruptKillWorkItem === killBox.item
             )
+            var sessionToTerminate: Session? = nil
             if stillOwnsInterrupt {
                 session.interruptKillWorkItem = nil
                 session.pendingInterruptRequestId = nil
             }
+            // Remove the exact Session under this lock. stopSession(threadId:)
+            // after unlock re-resolves by id and can terminate a later sendTurn.
+            if Self.shouldRemoveSessionOnInterruptGraceKill(
+                stillOwnsInterrupt: stillOwnsInterrupt,
+                mappedSessionIsExact: mappedSessionIsExact
+            ) {
+                session.cancellationRequested = true
+                self.sessions.removeValue(forKey: threadId)
+                sessionToTerminate = session
+            }
             self.lock.unlock()
-            if stillOwnsInterrupt { try? self.stopSession(threadId: threadId) }
+            if let sessionToTerminate {
+                self.terminate(session: sessionToTerminate, status: .cancelled)
+            }
         }
         killBox.item = killWork
         lock.lock()
@@ -520,8 +534,8 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         return true
     }
 
-    /// Whether a grace-kill work item that has already begun should still call
-    /// `stopSession`. False when a matching interrupt receipt cleared ownership
+    /// Whether a grace-kill work item that has already begun still owns the
+    /// interrupted run. False when a matching interrupt receipt cleared ownership
     /// (pending id / installed work item) before the body reached this check,
     /// or when the in-flight run is no longer the interrupted one (emitTerminal
     /// released it and a later sendTurn started a new turn on the warm session).
@@ -538,6 +552,17 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             && inFlightRunId == ownedRunId
             && pendingRequestId == scheduledRequestId
             && installedWorkItemIsSelf
+    }
+
+    /// Remove `sessions[threadId]` only for the exact Session that still owns
+    /// the interrupt, under the same lock as the ownership check. Re-resolving
+    /// by threadId after unlock (`stopSession`) would terminate a later sendTurn
+    /// that replaced the map entry between check and remove.
+    nonisolated static func shouldRemoveSessionOnInterruptGraceKill(
+        stillOwnsInterrupt: Bool,
+        mappedSessionIsExact: Bool
+    ) -> Bool {
+        stillOwnsInterrupt && mappedSessionIsExact
     }
 
     /// CLAUDE-INT-002: interrupt_receipt_v1 answers with control_response before
