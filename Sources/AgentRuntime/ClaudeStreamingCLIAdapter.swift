@@ -90,6 +90,12 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         var pendingPermissionMeta: [String: PendingPermissionMeta] = [:]
         var environment: [String: String] = [:]
         var cancellationRequested = false
+        /// Advertised CLI `system/init` capabilities (interrupt_receipt_v1, …).
+        var cliCapabilities = Set<String>()
+        /// request_id of the in-flight host interrupt control_request, if any.
+        var pendingInterruptRequestId: String?
+        /// Grace-period process stop; cancelled when an interrupt receipt arrives.
+        var interruptKillWorkItem: DispatchWorkItem?
         /// Prompt of the in-flight turn — needed to re-drive once after an
         /// ambient task-notification-only CLI exit (see CLAUDE-AMBIENT-TASK-RESULT).
         var lastInFlightPrompt: String?
@@ -302,13 +308,54 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             interruptedThreadIds.insert(threadId)
             session?.cancellationRequested = true
         }
+        let cancelQueued = session?.cliCapabilities.contains("interrupt_cancel_queued_v1") ?? false
         lock.unlock()
         guard let session else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
         // Attempt graceful interrupt via stream-json control message first.
         // This lets the Claude CLI finish writing and close cleanly, preserving
         // the warm session for potential resumption. Fall back to process kill
         // only if the stdin write fails (pipe closed, process already dead, etc.).
-        let line = Self.controlInterruptLine()
+        // Publish pendingInterruptRequestId AND the grace-kill work item before the
+        // stdin write becomes visible so a fast control_response can cancel the
+        // same work item (CLAUDE-INT-002 race).
+        let line = Self.controlInterruptLine(cancelQueued: cancelQueued)
+        guard let requestId = Self.controlRequestId(fromInterruptLine: line), !requestId.isEmpty else {
+            // Malformed interrupt payload — fall back to hard stop.
+            try stopSession(threadId: threadId)
+            return
+        }
+        // Box lets the work item re-check that *this* item is still installed
+        // after DispatchWorkItem.cancel() (cancel is a no-op once running).
+        final class InterruptKillBox: @unchecked Sendable {
+            var item: DispatchWorkItem?
+        }
+        let killBox = InterruptKillBox()
+        let killWork = DispatchWorkItem { [weak self, weak session] in
+            guard let self, let session else { return }
+            self.lock.lock()
+            // CLAUDE-INT-002: cancel() does not stop a body that already began.
+            // Ownership of the pending interrupt + installed work item must still
+            // match before we hard-stop; a matching receipt clears both first.
+            let stillOwnsInterrupt = Self.shouldExecuteInterruptGraceKill(
+                sessionStillCurrent: self.sessions[threadId] === session,
+                inFlight: session.inFlightRunId != nil,
+                pendingRequestId: session.pendingInterruptRequestId,
+                scheduledRequestId: requestId,
+                installedWorkItemIsSelf: session.interruptKillWorkItem === killBox.item
+            )
+            if stillOwnsInterrupt {
+                session.interruptKillWorkItem = nil
+                session.pendingInterruptRequestId = nil
+            }
+            self.lock.unlock()
+            if stillOwnsInterrupt { try? self.stopSession(threadId: threadId) }
+        }
+        killBox.item = killWork
+        lock.lock()
+        session.pendingInterruptRequestId = requestId
+        session.interruptKillWorkItem?.cancel()
+        session.interruptKillWorkItem = killWork
+        lock.unlock()
         let didSend = session.writeQueue.sync {
             (try? GuardedStdinWrite.write(line,
                                           to: session.stdinPipe.fileHandleForWriting,
@@ -316,15 +363,32 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                                           notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) })) != nil
         }
         if !didSend {
+            lock.lock()
+            if session.pendingInterruptRequestId == requestId {
+                session.pendingInterruptRequestId = nil
+            }
+            if session.interruptKillWorkItem === killWork {
+                session.interruptKillWorkItem?.cancel()
+                session.interruptKillWorkItem = nil
+            }
+            lock.unlock()
             try stopSession(threadId: threadId)
             return
         }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + interruptGracePeriod) { [weak self, weak session] in
-            guard let self, let session else { return }
-            self.lock.lock()
-            let stillRunning = self.sessions[threadId] === session && session.inFlightRunId != nil
-            self.lock.unlock()
-            if stillRunning { try? self.stopSession(threadId: threadId) }
+        // Schedule only while this interrupt is still pending. A receipt that
+        // arrived during the write already cleared pending + cancelled killWork.
+        lock.lock()
+        let stillPending = Self.shouldScheduleInterruptGraceKill(
+            pendingRequestId: session.pendingInterruptRequestId,
+            scheduledRequestId: requestId,
+            killWorkStillInstalled: session.interruptKillWorkItem === killWork
+        )
+        lock.unlock()
+        if stillPending {
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + interruptGracePeriod,
+                execute: killWork
+            )
         }
     }
 
@@ -352,8 +416,13 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         }
         // CLAUDE-CLI-015: SDKUserMessage requires parent_tool_use_id (null for
         // top-level host turns). Bridge always sets it; CLI stdin must match.
+        // CLAUDE-ORIGIN-001: unattributed user lines miss human-only CLI gates
+        // (ultracode, queued_turn_count). Host-typed stdin is origin.kind=human
+        // and carries a uuid so reply binding and cancel_queued receipts work.
         return [
             "type": "user",
+            "uuid": UUID().uuidString,
+            "origin": ["kind": "human"],
             "message": [
                 "role": "user",
                 "content": content
@@ -390,17 +459,100 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
 
     /// Builds the newline-terminated stream-json control interrupt payload.
     /// Pure builder — no I/O, no actor isolation. Extracted for unit testing.
-    nonisolated static func controlInterruptLine() -> Data {
+    /// When `cancelQueued` is true (`interrupt_cancel_queued_v1`), include
+    /// `cancel_queued: true` so queued turns are cancelled with the interrupt.
+    nonisolated static func controlInterruptLine(cancelQueued: Bool = false) -> Data {
         // Claude CLI stream-json / Agent SDK control channel:
         // {"type":"control_request","request_id":"<uuid>","request":{"subtype":"interrupt"}}
+        var request: [String: Any] = ["subtype": "interrupt"]
+        if cancelQueued {
+            request["cancel_queued"] = true
+        }
         let payload: [String: Any] = [
             "type": "control_request",
             "request_id": UUID().uuidString,
-            "request": ["subtype": "interrupt"]
+            "request": request
         ]
         var data = (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
         data.append(0x0A) // newline delimiter
         return data
+    }
+
+    /// request_id from a control interrupt line produced by `controlInterruptLine`.
+    nonisolated static func controlRequestId(fromInterruptLine data: Data) -> String? {
+        let stripped = data.last == 0x0A ? data.dropLast() : Data.SubSequence(data)
+        guard let object = try? JSONSerialization.jsonObject(with: Data(stripped)) as? [String: Any],
+              let requestId = object["request_id"] as? String,
+              !requestId.isEmpty else { return nil }
+        return requestId
+    }
+
+    /// Capabilities advertised on `system/init`. Nil when the object is not init.
+    nonisolated static func initCapabilities(from object: [String: Any]?) -> Set<String>? {
+        guard let object,
+              (object["type"] as? String) == "system",
+              (object["subtype"] as? String) == "init" else { return nil }
+        let raw = object["capabilities"] as? [Any] ?? []
+        return Set(raw.compactMap { $0 as? String }.filter { !$0.isEmpty })
+    }
+
+    /// Cancel the grace kill only for a successful receipt matching the pending interrupt.
+    /// After a successful interrupt stdin write, schedule the grace kill only if
+    /// this request is still pending and still owns the pre-installed work item.
+    nonisolated static func shouldScheduleInterruptGraceKill(
+        pendingRequestId: String?,
+        scheduledRequestId: String,
+        killWorkStillInstalled: Bool
+    ) -> Bool {
+        pendingRequestId == scheduledRequestId && killWorkStillInstalled
+    }
+
+        nonisolated static func shouldCancelInterruptGraceKill(
+        pendingRequestId: String?,
+        receiptRequestId: String?,
+        receiptSuccess: Bool
+    ) -> Bool {
+        guard receiptSuccess,
+              let pending = pendingRequestId, !pending.isEmpty,
+              let receipt = receiptRequestId, receipt == pending else { return false }
+        return true
+    }
+
+    /// Whether a grace-kill work item that has already begun should still call
+    /// `stopSession`. False when a matching interrupt receipt cleared ownership
+    /// (pending id / installed work item) before the body reached this check.
+    nonisolated static func shouldExecuteInterruptGraceKill(
+        sessionStillCurrent: Bool,
+        inFlight: Bool,
+        pendingRequestId: String?,
+        scheduledRequestId: String,
+        installedWorkItemIsSelf: Bool
+    ) -> Bool {
+        sessionStillCurrent
+            && inFlight
+            && pendingRequestId == scheduledRequestId
+            && installedWorkItemIsSelf
+    }
+
+    /// CLAUDE-INT-002: interrupt_receipt_v1 answers with control_response before
+    /// the aborted result. Drop the grace process-stop when the receipt matches.
+    private func applyInterruptReceipt(
+        _ receipt: ClaudeControlResponseReceipt,
+        session: Session
+    ) {
+        lock.lock()
+        let pending = session.pendingInterruptRequestId
+        let shouldCancel = Self.shouldCancelInterruptGraceKill(
+            pendingRequestId: pending,
+            receiptRequestId: receipt.requestId,
+            receiptSuccess: receipt.success
+        )
+        if shouldCancel {
+            session.interruptKillWorkItem?.cancel()
+            session.interruptKillWorkItem = nil
+            session.pendingInterruptRequestId = nil
+        }
+        lock.unlock()
     }
 
     public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
@@ -505,7 +657,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             }
         } else {
             // tool_use path: interrupt the turn (legacy corpus behavior).
-            let line = Self.controlInterruptLine()
+            lock.lock()
+            let cancelQueued = session.cliCapabilities.contains("interrupt_cancel_queued_v1")
+            lock.unlock()
+            let line = Self.controlInterruptLine(cancelQueued: cancelQueued)
             try session.writeQueue.sync {
                 try GuardedStdinWrite.write(
                     line,
@@ -812,6 +967,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         var armedPostIdleFlush = false
         var isBackgroundLifecycle = false
         if let rawObject {
+            if let caps = Self.initCapabilities(from: rawObject) {
+                lock.lock()
+                session.cliCapabilities = caps
+                lock.unlock()
+            }
+            if let receipt = ClaudeParser.controlResponseReceipt(from: rawObject) {
+                applyInterruptReceipt(receipt, session: session)
+            }
             // CLAUDE-BG-LIFECYCLE: keep the pending-background-work view current
             // BEFORE the parser's turn events are processed below, so a `result`
             // in this same batch is judged against the up-to-date set.
@@ -869,7 +1032,9 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             emit(.event(event), session: session)
             if case .error(_, let recoverable) = event, !recoverable {
                 lock.lock()
-                session.sawError = true
+                if !session.cancellationRequested {
+                    session.sawError = true
+                }
                 lock.unlock()
             }
             if case .threadStarted(_, let providerThreadId) = event {
@@ -929,9 +1094,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             if case .proposedPlan = event {
                 lock.lock()
                 let isPlanSession = session.interactionMode == .plan
+                let cancelQueued = session.cliCapabilities.contains("interrupt_cancel_queued_v1")
                 lock.unlock()
                 if isPlanSession {
-                    let line = Self.controlInterruptLine()
+                    let line = Self.controlInterruptLine(cancelQueued: cancelQueued)
                     _ = session.writeQueue.sync {
                         try? GuardedStdinWrite.write(
                             line,
