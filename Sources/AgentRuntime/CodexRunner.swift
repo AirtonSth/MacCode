@@ -401,7 +401,10 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             // Under the lock: an in-flight readabilityHandler callback may
             // still be reading/parsing concurrently.
             stdoutReadLock.lock()
-            let tail = BoundedPipeDrain.readRemaining(from: stdoutPipe.fileHandleForReading)
+            let tail = BoundedPipeDrain.readRemaining(
+                from: stdoutPipe.fileHandleForReading,
+                maxBytes: BoundedPipeDrain.defaultStdoutMaxBytes
+            )
             for line in outBuf.take(tail) + outBuf.flush() {
                 emitLine(line)
             }

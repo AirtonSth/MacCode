@@ -785,7 +785,10 @@ public final class CodexAppServerClient: @unchecked Sendable {
     private func drainedStderrTail() -> String {
         let handle = stderrPipe.fileHandleForReading
         handle.readabilityHandler = nil
-        let remaining = BoundedPipeDrain.readRemaining(from: handle)
+        let remaining = BoundedPipeDrain.readRemaining(
+            from: handle,
+            maxBytes: BoundedPipeDrain.defaultStderrMaxBytes
+        )
         return parseQueue.sync {
             if !remaining.isEmpty {
                 stderrBuffer.append(remaining)

@@ -576,6 +576,244 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         XCTAssertFalse(result.content.contains { $0.type == "image" })
     }
 
+    func testZoomRejectsCompressedCaptureWithExcessiveDimensionsWithoutInflate() async throws {
+        // WHY: zoom must honor the same pixel cap as screenshot and must not
+        // inflate a too-large PNG just to reject the region.
+        let probe = Probe()
+        probe.captureData = try makePNGBase64(
+            width: ComputerUseNativeHostBackend.maximumCapturePixelDimension + 1,
+            height: 1,
+            rgba: Array(repeating: 255, count: (ComputerUseNativeHostBackend.maximumCapturePixelDimension + 1) * 4)
+        )
+        let backend = makeBackend(probe: probe)
+        ComputerUseNativeHostBackend.resetPNGPixelInflateMetrics()
+
+        let result = await backend.invoke(
+            name: "zoom",
+            arguments: [
+                "target_pid": 17,
+                "target_window_id": 29,
+                "region": [0, 0, 1, 1],
+            ]
+        )
+
+        XCTAssertTrue(result.isError)
+        XCTAssertTrue(result.content.first?.text?.contains("capture_too_large") == true)
+        XCTAssertFalse(result.content.contains { $0.type == "image" })
+        XCTAssertEqual(ComputerUseNativeHostBackend.pngPixelInflateCount, 0)
+    }
+
+    func testScreenshotReadsImageSizeWithoutPNGPixelInflate() async throws {
+        // WHY: screenshot only needs width/height for the pixel token. Inflating
+        // the full PNG just to read IHDR re-allocates the captured frame.
+        let probe = Probe()
+        probe.captureData = try makePNGBase64(width: 32, height: 24)
+        let backend = makeBackend(probe: probe)
+        ComputerUseNativeHostBackend.resetPNGPixelInflateMetrics()
+
+        let result = await backend.invoke(
+            name: "screenshot",
+            arguments: ["target_pid": 17, "target_window_id": 29]
+        )
+
+        XCTAssertFalse(result.isError)
+        XCTAssertEqual(result.content.last?.type, "image")
+        XCTAssertEqual(
+            ComputerUseNativeHostBackend.pngPixelInflateCount,
+            0,
+            "screenshot must measure PNG IHDR without expanding pixels"
+        )
+        XCTAssertEqual(ComputerUseNativeHostBackend.lastPNGInflatePixelCount, 0)
+    }
+
+    func testZoomInflatesEncodedPNGOnceNotTwice() async throws {
+        // WHY: imageSize used to NSBitmapImageRep-decode the full PNG, then
+        // crop decoded it again. Zoom must inflate the encoded frame once.
+        let probe = Probe()
+        probe.captureData = try makePNGBase64(width: 32, height: 24)
+        let backend = makeBackend(probe: probe)
+        ComputerUseNativeHostBackend.resetPNGPixelInflateMetrics()
+
+        let zoom = await backend.invoke(
+            name: "zoom",
+            arguments: [
+                "target_pid": 17,
+                "target_window_id": 29,
+                "region": [4, 6, 8, 4],
+            ]
+        )
+
+        XCTAssertFalse(zoom.isError)
+        XCTAssertEqual(
+            ComputerUseNativeHostBackend.pngPixelInflateCount,
+            1,
+            "encoded zoom must inflate the full PNG once, then crop the live CGImage"
+        )
+        XCTAssertEqual(
+            ComputerUseNativeHostBackend.lastPNGInflatePixelCount,
+            32 * 24,
+            "the single inflate must be the captured frame, not a second full-frame decode"
+        )
+        let croppedData = try XCTUnwrap(zoom.content.last?.data).flatMap { Data(base64Encoded: $0) }
+        let cropped = try XCTUnwrap(croppedData.flatMap(NSBitmapImageRep.init(data:)))
+        XCTAssertEqual(cropped.pixelsWide, 8)
+        XCTAssertEqual(cropped.pixelsHigh, 4)
+        XCTAssertLessThanOrEqual(
+            croppedData?.count ?? Int.max,
+            ComputerUseNativeHostBackend.maximumCaptureEncodedBytes
+        )
+        XCTAssertLessThan(
+            cropped.pixelsWide * cropped.pixelsHigh,
+            32 * 24,
+            "retained crop pixels must be the region, not the full captured frame"
+        )
+    }
+
+    func testNativeZoomCropsCGImageBeforePNGWithoutInflate() throws {
+        // WHY: production capture already holds a CGImage. Encoding the full
+        // frame to PNG just so zoom can decode it again doubles peak pixels.
+        let image = try XCTUnwrap(makeCGImage(width: 64, height: 48))
+        ComputerUseNativeHostBackend.resetPNGPixelInflateMetrics()
+
+        let full = try XCTUnwrap(
+            ComputerUseNativeHostBackend.encodePreparedCapture(image: image, region: nil).successCapture()
+        )
+        let cropped = try XCTUnwrap(
+            ComputerUseNativeHostBackend.encodePreparedCapture(
+                image: image,
+                region: CGRect(x: 8, y: 12, width: 16, height: 10)
+            ).successCapture()
+        )
+
+        XCTAssertEqual(ComputerUseNativeHostBackend.pngPixelInflateCount, 0)
+        XCTAssertEqual(full.sourcePixelSize, [64, 48])
+        XCTAssertEqual(cropped.sourcePixelSize, [64, 48])
+        let fullPNG = try XCTUnwrap(Data(base64Encoded: full.data))
+        let croppedPNG = try XCTUnwrap(Data(base64Encoded: cropped.data))
+        XCTAssertLessThan(croppedPNG.count, fullPNG.count)
+        XCTAssertLessThanOrEqual(croppedPNG.count, ComputerUseNativeHostBackend.maximumCaptureEncodedBytes)
+        let croppedRep = try XCTUnwrap(NSBitmapImageRep(data: croppedPNG))
+        XCTAssertEqual(croppedRep.pixelsWide, 16)
+        XCTAssertEqual(croppedRep.pixelsHigh, 10)
+        XCTAssertEqual(
+            croppedRep.pixelsWide * croppedRep.pixelsHigh * 4,
+            16 * 10 * 4,
+            "peak retained crop bytes are the region pixels, not 64×48"
+        )
+    }
+
+    func testNativeZoomRejectsOutOfBoundsRegionWithoutEncoding() throws {
+        let image = try XCTUnwrap(makeCGImage(width: 8, height: 8))
+        ComputerUseNativeHostBackend.resetPNGPixelInflateMetrics()
+
+        switch ComputerUseNativeHostBackend.encodePreparedCapture(
+            image: image,
+            region: CGRect(x: 6, y: 0, width: 4, height: 1)
+        ) {
+        case .unavailable(let reason):
+            XCTAssertEqual(reason, "invalid_region")
+        case .success, .quartzFallback:
+            XCTFail("out-of-bounds zoom must fail closed before PNG encode")
+        }
+        XCTAssertEqual(ComputerUseNativeHostBackend.pngPixelInflateCount, 0)
+    }
+
+    func testEncodePreparedCaptureKeepsPixelAndByteBudgets() throws {
+        let oversize = try XCTUnwrap(makeCGImage(
+            width: ComputerUseNativeHostBackend.maximumCapturePixelDimension + 1,
+            height: 1
+        ))
+        switch ComputerUseNativeHostBackend.encodePreparedCapture(image: oversize, region: nil) {
+        case .unavailable(let reason):
+            XCTAssertEqual(reason, "capture_too_large")
+        case .success, .quartzFallback:
+            XCTFail("pixel-dimension cap must reject before PNG encode")
+        }
+
+        let image = try XCTUnwrap(makeCGImage(width: 4, height: 3))
+        let encoded = try XCTUnwrap(
+            ComputerUseNativeHostBackend.encodePreparedCapture(image: image, region: nil).successCapture()
+        )
+        let png = try XCTUnwrap(Data(base64Encoded: encoded.data))
+        XCTAssertLessThanOrEqual(png.count, ComputerUseNativeHostBackend.maximumCaptureEncodedBytes)
+        XCTAssertLessThanOrEqual(
+            encoded.data.utf8.count,
+            ComputerUseNativeHostBackend.maximumCaptureBase64Characters
+        )
+    }
+
+    func testZoomSkipsPNGInflateWhenNativeAlreadyCropped() async throws {
+        // WHY: once NativePlatform cropped the live CGImage, invoke must not
+        // base64-decode that PNG back into a full-frame bitmap.
+        let image = try XCTUnwrap(makeCGImage(width: 12, height: 8))
+        let cropped = try XCTUnwrap(
+            ComputerUseNativeHostBackend.encodePreparedCapture(
+                image: image,
+                region: CGRect(x: 2, y: 1, width: 4, height: 2)
+            ).successCapture()
+        )
+        let probe = Probe()
+        probe.captureData = cropped.data
+        probe.captureSourcePixelSize = cropped.sourcePixelSize
+        let backend = makeBackend(probe: probe)
+        ComputerUseNativeHostBackend.resetPNGPixelInflateMetrics()
+
+        let zoom = await backend.invoke(
+            name: "zoom",
+            arguments: [
+                "target_pid": 17,
+                "target_window_id": 29,
+                "region": [2, 1, 4, 2],
+            ]
+        )
+
+        XCTAssertFalse(zoom.isError)
+        XCTAssertEqual(ComputerUseNativeHostBackend.pngPixelInflateCount, 0)
+        XCTAssertEqual(zoom.content.last?.data, cropped.data)
+        let croppedData = try XCTUnwrap(zoom.content.last?.data).flatMap { Data(base64Encoded: $0) }
+        let rep = try XCTUnwrap(croppedData.flatMap(NSBitmapImageRep.init(data:)))
+        XCTAssertEqual(rep.pixelsWide, 4)
+        XCTAssertEqual(rep.pixelsHigh, 2)
+        let envelope = try XCTUnwrap(pixelTokenEnvelope(from: zoom))
+        XCTAssertEqual(intArray(envelope["fullImageSize"]), [12, 8])
+        XCTAssertEqual(intArray(envelope["region"]), [2, 1, 4, 2])
+    }
+
+    func testZoomCropBeforeEncodeDropsRetainedEncodedBytesVersusFullFrame() throws {
+        // WHY: the old zoom path PNG+base64 encoded the full CGImage, then
+        // inflated it to crop. Peak retained encoded bytes were the full-frame
+        // payload. Crop-before-encode must retain only the region PNG/base64
+        // while pixelScope still names the source frame.
+        let image = try XCTUnwrap(makeCGImage(width: 80, height: 80))
+        let region = CGRect(x: 0, y: 0, width: 40, height: 40)
+        ComputerUseNativeHostBackend.resetPNGPixelInflateMetrics()
+
+        let full = try XCTUnwrap(
+            ComputerUseNativeHostBackend.encodePreparedCapture(image: image, region: nil).successCapture()
+        )
+        let cropped = try XCTUnwrap(
+            ComputerUseNativeHostBackend.encodePreparedCapture(image: image, region: region).successCapture()
+        )
+
+        XCTAssertEqual(ComputerUseNativeHostBackend.pngPixelInflateCount, 0)
+        XCTAssertEqual(cropped.sourcePixelSize, [80, 80])
+        let fullPNG = try XCTUnwrap(Data(base64Encoded: full.data))
+        let croppedPNG = try XCTUnwrap(Data(base64Encoded: cropped.data))
+        let fullEncoded = full.data.utf8.count
+        let croppedEncoded = cropped.data.utf8.count
+        let encodedDrop = 1.0 - (Double(croppedEncoded) / Double(fullEncoded))
+        XCTAssertLessThan(croppedPNG.count, fullPNG.count)
+        XCTAssertLessThan(croppedEncoded, fullEncoded)
+        XCTAssertGreaterThan(
+            encodedDrop,
+            0.30,
+            "25% region must drop retained encoded capture bytes (was \(encodedDrop); full=\(fullEncoded) crop=\(croppedEncoded))"
+        )
+        XCTAssertEqual(Double(40 * 40) / Double(80 * 80), 0.25)
+        let croppedRep = try XCTUnwrap(NSBitmapImageRep(data: croppedPNG))
+        XCTAssertEqual(croppedRep.pixelsWide * croppedRep.pixelsHigh, 40 * 40)
+    }
+
     func testMissingPermissionExecutesNoMutation() async throws {
         let probe = Probe()
         probe.accessibilityPermission = false
@@ -1026,6 +1264,53 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         return nil
     }
 
+    private func intArray(_ value: Any?) -> [Int]? {
+        guard let values = value as? [Any] else { return nil }
+        let ints = values.compactMap { ($0 as? NSNumber)?.intValue }
+        return ints.count == values.count ? ints : nil
+    }
+
+    private func pixelTokenEnvelope(from result: ComputerUseToolResult) -> [String: Any]? {
+        guard let token = stateToken(from: result),
+              token.hasPrefix("native-pixel-v1:") else {
+            return nil
+        }
+        let encoded = String(token.dropFirst("native-pixel-v1:".count))
+        guard let data = Data(base64Encoded: encoded),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return object
+    }
+
+    private func makeCGImage(width: Int, height: Int, rgba: [UInt8]? = nil) -> CGImage? {
+        let pixels: [UInt8]
+        if let rgba {
+            pixels = rgba
+        } else {
+            var generated = [UInt8](repeating: 0, count: width * height * 4)
+            for index in 0..<(width * height) {
+                generated[index * 4] = UInt8(index & 0xff)
+                generated[index * 4 + 1] = UInt8((index * 3) & 0xff)
+                generated[index * 4 + 2] = UInt8((index * 7) & 0xff)
+                generated[index * 4 + 3] = 255
+            }
+            pixels = generated
+        }
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        return pixels.withUnsafeBytes { bytes in
+            CGContext(
+                data: UnsafeMutableRawPointer(mutating: bytes.baseAddress),
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )?.makeImage()
+        }
+    }
+
     private func makePNGBase64(width: Int, height: Int, red: UInt8 = 0) throws -> String {
         var pixels = [UInt8](repeating: 0, count: width * height * 4)
         for index in 0..<(width * height) {
@@ -1086,10 +1371,15 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
                 if let failure = probe.captureFailure {
                     return .unavailable(failure)
                 }
+                let capture = ComputerUseNativeCapture(
+                    data: probe.captureData,
+                    mimeType: "image/png",
+                    sourcePixelSize: probe.captureSourcePixelSize
+                )
                 if probe.captureFallback {
-                    return .quartzFallback(.init(data: probe.captureData, mimeType: "image/png"))
+                    return .quartzFallback(capture)
                 }
-                return .success(.init(data: probe.captureData, mimeType: "image/png"))
+                return .success(capture)
             },
             uiTree: { _ in
                 probe.uiTreeCalls += 1
@@ -1114,6 +1404,17 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
             },
             activate: { _ in probe.activations += 1 }
         ))
+    }
+}
+
+private extension ComputerUseNativeCaptureResult {
+    func successCapture() -> ComputerUseNativeCapture? {
+        switch self {
+        case .success(let capture), .quartzFallback(let capture):
+            return capture
+        case .unavailable:
+            return nil
+        }
     }
 }
 
@@ -1142,6 +1443,7 @@ private final class Probe: @unchecked Sendable {
     var uiTree: String? = "{\"role\":\"AXWindow\",\"title\":\"RemoteCode\"}"
     var uiTreeCalls = 0
     var captureData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1s="
+    var captureSourcePixelSize: [Int]?
     var captureFailure: String?
     var captureFallback = false
 

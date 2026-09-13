@@ -9,11 +9,16 @@ import Darwin
 /// pipe data is still drained (discarded) so a verbose child cannot block.
 enum BoundedPipeDrain {
     static let defaultTimeout: TimeInterval = 0.25
+    /// Retention cap for provider stdout teardown. Remaining pipe bytes are
+    /// still drained (discarded) so a verbose child cannot block.
+    static let defaultStdoutMaxBytes = 2 * 1_024 * 1_024
+    /// Retention cap for provider stderr teardown.
+    static let defaultStderrMaxBytes = 1 * 1_024 * 1_024
 
     static func readRemaining(
         from handle: FileHandle,
         timeout: TimeInterval = defaultTimeout,
-        maxBytes: Int = Int.max
+        maxBytes: Int = defaultStdoutMaxBytes
     ) -> Data {
         let fd = handle.fileDescriptor
         defer { try? handle.close() }

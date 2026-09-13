@@ -540,7 +540,10 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             // Under the lock: an in-flight readabilityHandler callback may
             // still be reading/parsing concurrently.
             stdoutReadLock.lock()
-            let tail = BoundedPipeDrain.readRemaining(from: stdoutPipe.fileHandleForReading)
+            let tail = BoundedPipeDrain.readRemaining(
+                from: stdoutPipe.fileHandleForReading,
+                maxBytes: BoundedPipeDrain.defaultStdoutMaxBytes
+            )
             for line in outBuf.take(tail) + outBuf.flush() {
                 emitLine(line)
             }
@@ -549,7 +552,10 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             // (auth error, crash banner) writes the only explanation to
             // stderr, and the async handler can lose the race with the
             // teardown above, leaving the bytes undelivered in the pipe.
-            let stderrTail = BoundedPipeDrain.readRemaining(from: stderrPipe.fileHandleForReading)
+            let stderrTail = BoundedPipeDrain.readRemaining(
+                from: stderrPipe.fileHandleForReading,
+                maxBytes: BoundedPipeDrain.defaultStderrMaxBytes
+            )
             if !stderrTail.isEmpty,
                let visible = Self.displayableStderr(String(data: stderrTail, encoding: .utf8) ?? "") {
                 onEvent(.event(.providerRuntime(ProviderStderrClassifier.runtimeEvent(
