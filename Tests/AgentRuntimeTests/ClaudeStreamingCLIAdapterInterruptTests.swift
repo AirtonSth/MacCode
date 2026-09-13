@@ -590,6 +590,39 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
             "same-run in-flight ownership must still allow the grace kill"
         )
     }
+
+    /// Post-check / pre-stop: ownership may still be true while a later sendTurn
+    /// has already replaced the map entry. Removal must require exact identity
+    /// so a threadId re-lookup cannot terminate run B.
+    func test_shouldRemoveSessionOnInterruptGraceKill_requiresExactMappedSession() {
+        XCTAssertTrue(
+            ClaudeStreamingCLIAdapter.shouldRemoveSessionOnInterruptGraceKill(
+                stillOwnsInterrupt: true,
+                mappedSessionIsExact: true
+            ),
+            "owned interrupt on the exact Session must remove that map entry under the lock"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldRemoveSessionOnInterruptGraceKill(
+                stillOwnsInterrupt: true,
+                mappedSessionIsExact: false
+            ),
+            "post-check replacement at threadId must not be removed or terminated"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldRemoveSessionOnInterruptGraceKill(
+                stillOwnsInterrupt: false,
+                mappedSessionIsExact: true
+            ),
+            "lost interrupt ownership must not remove the still-current Session"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldRemoveSessionOnInterruptGraceKill(
+                stillOwnsInterrupt: false,
+                mappedSessionIsExact: false
+            )
+        )
+    }
 }
 
 private actor EventSink {
