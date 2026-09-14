@@ -227,7 +227,11 @@ public final class AgentTranscriptState: ObservableObject {
             }
             if leftIndex == lhs.items.count && rightIndex == rhs.items.count { break }
             if leftIndex == lhs.items.count || rightIndex == rhs.items.count { return false }
+            // AA-26: the streaming body is compared against its own prefix on
+            // every delta; `utf8.count` mismatch is O(1) and the common case, so
+            // check it before the O(n) string equality.
             if lhs.items[leftIndex].id != rhs.items[rightIndex].id
+                || lhs.items[leftIndex].body.utf8.count != rhs.items[rightIndex].body.utf8.count
                 || lhs.items[leftIndex].body != rhs.items[rightIndex].body {
                 return false
             }
@@ -605,6 +609,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Provider item IDs are not globally unique, so UI rows must never read raw
     /// transport from the legacy item-id-only map when an ID repeats in a thread.
     private var tokenSaverTranslationsByTimelineItemKey: [String: AssistantSR1Translation] = [:]
+    /// AA-24: structural key of the timeline the item-translation index was built for.
+    private var tokenSaverTranslationsIndexedStructureKey = ""
     /// Final-message optimization callbacks can arrive before the matching
     /// timeline translation. Keep those live badges separate so an unrelated
     /// progress-item translation cannot clear them during the next stream batch.
@@ -9740,12 +9746,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 requests[id] = request
             }
         }
-        let visibleUserMessageIds = Set(
-            messages.lazy.filter { $0.role == .user }.map(\.id)
-        )
-        for (id, request) in requests
-            where visibleUserMessageIds.contains(id) && RCWireProtocol.isWire(request) {
-            persistedUserRCW1RequestsByMessageId[id] = request
+        if !requests.isEmpty {
+            let visibleUserMessageIds = Set(
+                messages.lazy.filter { $0.role == .user }.map(\.id)
+            )
+            for (id, request) in requests
+                where visibleUserMessageIds.contains(id) && RCWireProtocol.isWire(request) {
+                persistedUserRCW1RequestsByMessageId[id] = request
+            }
         }
         ids.formUnion(persistedUserRCW1RequestsByMessageId.keys)
         requests.merge(persistedUserRCW1RequestsByMessageId) { _, durable in durable }
@@ -9777,13 +9785,36 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if requests != tokenSaverWireRequestTextsByMessageId {
             tokenSaverWireRequestTextsByMessageId = requests
         }
-        if itemTranslations != tokenSaverTranslationsByItemId {
+        let translationsChanged = itemTranslations != tokenSaverTranslationsByItemId
+        if translationsChanged {
             tokenSaverTranslationsByItemId = itemTranslations
         }
-        tokenSaverTranslationsByTimelineItemKey = Self.safelyIndexedTokenSaverItemTranslations(
-            itemTranslations,
-            turns: sourceTimeline.turns
-        )
+        // AA-24: this ran two full `for turn { for item }` passes over the whole
+        // thread on every stream quantum (~100 Hz). The index only changes when
+        // the translations change or the timeline's item set changes (items are
+        // append-only per turn; a merged duplicate keeps its id).
+        let structure = Self.timelineItemStructureKey(sourceTimeline.turns)
+        if translationsChanged
+            || structure != tokenSaverTranslationsIndexedStructureKey
+            || (itemTranslations.isEmpty) != tokenSaverTranslationsByTimelineItemKey.isEmpty {
+            tokenSaverTranslationsIndexedStructureKey = structure
+            tokenSaverTranslationsByTimelineItemKey = itemTranslations.isEmpty
+                ? [:]
+                : Self.safelyIndexedTokenSaverItemTranslations(
+                    itemTranslations,
+                    turns: sourceTimeline.turns
+                )
+        }
+    }
+
+    /// Cheap structural fingerprint of the timeline's item set: turn count,
+    /// total item count and the newest turn/item ids. Items are append-only
+    /// within a turn, so any addition changes the total or the tail id.
+    nonisolated static func timelineItemStructureKey(_ turns: [AssistantTurnSnapshot]) -> String {
+        var total = 0
+        for turn in turns { total += turn.items.count }
+        let last = turns.last
+        return "\(turns.count)|\(total)|\(last?.turnId ?? "-")|\(last?.items.last?.id ?? "-")"
     }
 
     private func mergePersistedUserRCW1Requests(
@@ -12167,12 +12198,36 @@ public struct AgentAppView: View {
         }
     }
 
+    // AA-20: normalize the (possibly live, possibly > cache limit) LHS ONCE per
+    // candidate list instead of once per candidate — the per-candidate variant
+    // re-walked a growing streamed body for every persisted assistant message.
     private static func assistantText(_ text: String, matchesAny candidates: [String]) -> Bool {
-        candidates.contains { assistantText(text, matches: $0) }
+        guard !candidates.isEmpty else { return false }
+        let normalizedLHS = normalizedAssistantText(text)
+        guard !normalizedLHS.isEmpty else { return false }
+        var compactLHS: String?
+        return candidates.contains { rhs in
+            let normalizedRHS = normalizedAssistantText(rhs)
+            guard !normalizedRHS.isEmpty else { return false }
+            if normalizedLHS == normalizedRHS || normalizedLHS.contains(normalizedRHS) { return true }
+            if compactLHS == nil { compactLHS = compactAssistantText(text) }
+            let compactRHS = compactAssistantText(rhs)
+            return compactLHS! == compactRHS || compactLHS!.contains(compactRHS)
+        }
     }
 
     private static func assistantText(_ text: String, equalsAny candidates: [String]) -> Bool {
-        candidates.contains { assistantText(text, equals: $0) }
+        guard !candidates.isEmpty else { return false }
+        let normalizedLHS = normalizedAssistantText(text)
+        guard !normalizedLHS.isEmpty else { return false }
+        var compactLHS: String?
+        return candidates.contains { rhs in
+            let normalizedRHS = normalizedAssistantText(rhs)
+            guard !normalizedRHS.isEmpty else { return false }
+            if normalizedLHS == normalizedRHS { return true }
+            if compactLHS == nil { compactLHS = compactAssistantText(text) }
+            return compactLHS! == compactAssistantText(rhs)
+        }
     }
 
     private static func renderableAssistantItemBodies(in turn: AssistantTurnSnapshot, persistedAssistantTexts: [String] = []) -> [String] {
@@ -12873,13 +12928,14 @@ public struct AgentAppView: View {
         mergedEntries: [TranscriptEntry],
         status: AgentRunStatus,
         runStartedAt: Date?,
-        revealCount: Int
+        revealCount: Int,
+        alreadyPaintOrdered: Bool = false
     ) -> (
         all: [TranscriptEntry],
         visible: [TranscriptEntry],
         paint: [TranscriptEntry]
     ) {
-        let allEntries = paintOrderedTranscriptEntries(mergedEntries)
+        let allEntries = alreadyPaintOrdered ? mergedEntries : paintOrderedTranscriptEntries(mergedEntries)
         let visible = visibleTranscriptWindow(
             entries: allEntries,
             status: status,
@@ -13025,6 +13081,12 @@ public struct AgentAppView: View {
     private final class TranscriptCache {
         var signature: String?
         var entries: [TranscriptEntry] = []
+        /// AA-21: paint-order permutation (indices into `entries`) keyed by
+        /// structure + completion. `paintOrderedTranscriptEntries` runs the
+        /// final-after-turn repair, which normalizes every assistant text in the
+        /// thread with an O(n²) substring fallback — it must not run per frame.
+        var paintKey: String?
+        var paintOrder: [Int] = []
     }
     private let transcriptCache = TranscriptCache()
 
@@ -13112,20 +13174,40 @@ public struct AgentAppView: View {
         return false
     }
 
-    private var visibleTranscriptEntries: [TranscriptEntry] {
-        Self.visibleTranscriptWindow(
-            entries: transcriptEntries,
-            status: vm.status,
-            runStartedAt: vm.runStartedAt
-        )
+    /// AA-21: `paintOrderedTranscriptEntries` memoized on (structure signature,
+    /// finished-turn count, message count). Token deltas change none of those,
+    /// so the order repair — the only O(messages × turns × text) pass left in
+    /// the body — runs on structural change only. The permutation is applied
+    /// to the freshly rematerialized entries, so bodies never go stale.
+    private func paintOrderedTranscriptEntriesCached(_ merged: [TranscriptEntry]) -> [TranscriptEntry] {
+        var finishedTurns = 0
+        for turn in vm.timeline.turns where turn.finished { finishedTurns += 1 }
+        let key = "\(transcriptCache.signature ?? "-")|\(finishedTurns)|\(vm.messages.count)|\(merged.count)"
+        if transcriptCache.paintKey == key,
+           transcriptCache.paintOrder.count == merged.count,
+           transcriptCache.paintOrder.allSatisfy({ $0 < merged.count }) {
+            return transcriptCache.paintOrder.map { merged[$0] }
+        }
+        let ordered = Self.paintOrderedTranscriptEntries(merged)
+        var indexById = [String: Int](minimumCapacity: merged.count)
+        for (index, entry) in merged.enumerated() { indexById[entry.id] = index }
+        let order = ordered.compactMap { indexById[$0.id] }
+        if order.count == merged.count, Set(order).count == merged.count {
+            transcriptCache.paintKey = key
+            transcriptCache.paintOrder = order
+        } else {
+            transcriptCache.paintKey = nil
+            transcriptCache.paintOrder = []
+        }
+        return ordered
     }
 
-    private var activeBotPeerReviewName: String? {
+    private func activeBotPeerReviewName(in visibleEntries: [TranscriptEntry]) -> String? {
         guard vm.selectedThreadRunIsStartingOrRunning,
               let runStartedAt = vm.runStartedAt else { return nil }
         var newestUserMessageAt: Date?
         var newestPeerReply: (createdAt: Date, name: String)?
-        for entry in visibleTranscriptEntries {
+        for entry in visibleEntries {
             guard case .message(let message) = entry else { continue }
             if message.role == .user {
                 newestUserMessageAt = message.createdAt
@@ -13441,103 +13523,11 @@ public struct AgentAppView: View {
     /// so their inputs are cached against a signature that also folds in the external
     /// dependencies (persisted assistant texts + proposed plans). Running/unfinished
     /// turns are computed fresh every pass.
-    private func turnRenderInputs(for turn: AssistantTurnSnapshot) -> TurnRenderInputs {
-        let running = vm.selectedThreadRunIsStartingOrRunning
-        let expandWork = isCompletedWorkExpanded(for: turn)
-        let followUpAnchorMs = Self.followUpWorkAnchorMs(
-            status: vm.status,
-            newestUserMessageAt: vm.messages.last(where: { $0.role == .user })?.createdAt
-        )
-        let prevItems: [AssistantItem]?
-        let prevBlocks: [TurnRenderBlock]?
-        if expandWork,
-           !turn.finished,
-           expandedLiveWorkCache.turnId == turn.turnId,
-           !expandedLiveWorkCache.items.isEmpty {
-            prevItems = expandedLiveWorkCache.items
-            prevBlocks = expandedLiveWorkCache.blocks
-        } else {
-            prevItems = nil
-            prevBlocks = nil
-        }
-        guard turn.finished else {
-            let value = computeTurnRenderInputsCounted(
-                turn: turn,
-                running: running,
-                expandCompletedWork: expandWork,
-                followUpWorkAnchorMs: followUpAnchorMs,
-                previousExpandedWorkItems: prevItems,
-                previousExpandedWorkBlocks: prevBlocks
-            )
-            if expandWork, !value.expandedWorkSourceItems.isEmpty {
-                expandedLiveWorkCache.turnId = turn.turnId
-                expandedLiveWorkCache.items = value.expandedWorkSourceItems
-                expandedLiveWorkCache.blocks = value.completedWorkBlocks
-            } else if expandedLiveWorkCache.turnId == turn.turnId {
-                expandedLiveWorkCache.clear()
-            }
-            return value
-        }
-        if expandedLiveWorkCache.turnId == turn.turnId {
-            expandedLiveWorkCache.clear()
-        }
-        let plansKey = "\(vm.timeline.proposedPlans.count)|\(vm.timeline.proposedPlans.last?.id ?? "-")"
-        let signature = Self.finishedTurnRenderSignature(
-            turn: turn,
-            assistantTextsKey: assistantTextsKey,
-            plansKey: plansKey,
-            expandCompletedWork: expandWork
-        ) + "|a\(followUpAnchorMs.map(String.init) ?? "-")"
-        if let cached = turnRenderCache.entries[turn.turnId], cached.signature == signature {
-            return cached.value
-        }
-        let value = computeTurnRenderInputsCounted(
-            turn: turn,
-            running: running,
-            expandCompletedWork: expandWork,
-            followUpWorkAnchorMs: followUpAnchorMs
-        )
-        // Bound the cache: a hard cap keeps it from growing with total finished turns
-        // over a very long session (entries rebuild on demand if cleared).
-        if turnRenderCache.entries.count > 1_024 { turnRenderCache.entries.removeAll(keepingCapacity: true) }
-        turnRenderCache.entries[turn.turnId] = (signature, value)
-        return value
-    }
-
-    /// Signature for a FINISHED turn's render data. A finished turn's items are
-    /// immutable, so (turnId, items.count) is a stable content key; the persisted
-    /// assistant texts and proposed plans are external dependencies that change the
-    /// answer-vs-worklog split and the plan rows, so they fold into the key too.
-    /// `expandCompletedWork` is included so collapsed (count-only) and expanded
-    /// (full blocks) inputs do not share a stale cache entry.
     nonisolated static func finishedTurnRenderSignature(turn: AssistantTurnSnapshot,
                                                         assistantTextsKey: String,
                                                         plansKey: String,
                                                         expandCompletedWork: Bool = false) -> String {
         "\(turn.turnId)|i\(turn.items.count)|\(assistantTextsKey)|pl\(plansKey)|w\(expandCompletedWork ? 1 : 0)"
-    }
-
-    private func computeTurnRenderInputsCounted(
-        turn: AssistantTurnSnapshot,
-        running: Bool,
-        expandCompletedWork: Bool,
-        followUpWorkAnchorMs: Int64?,
-        previousExpandedWorkItems: [AssistantItem]? = nil,
-        previousExpandedWorkBlocks: [TurnRenderBlock]? = nil
-    ) -> TurnRenderInputs {
-        #if DEBUG
-        Self.turnRenderComputeCountForTesting &+= 1
-        #endif
-        return Self.computeTurnRenderInputs(
-            turn: turn,
-            persistedAssistantTexts: persistedAssistantTexts,
-            proposedPlans: vm.timeline.proposedPlans,
-            running: running,
-            expandCompletedWork: expandCompletedWork,
-            followUpWorkAnchorMs: followUpWorkAnchorMs,
-            previousExpandedWorkItems: previousExpandedWorkItems,
-            previousExpandedWorkBlocks: previousExpandedWorkBlocks
-        )
     }
 
     /// The message-only key that backs `persistedAssistantTexts`'s memo; reused as the
@@ -13602,10 +13592,22 @@ public struct AgentAppView: View {
     }
 
     private func visibleHiddenPersistedIDs(_ ids: Set<AgentMessageID>) -> Set<AgentMessageID> {
-        Set(ids.filter { id in
-            Self.keepsTokenSaverPersistedHidden(
-                requiresDurableRow: vm.tokenSaverRequiresDurableMessageRow(for: id),
-                messageText: vm.messages.first(where: { $0.id == id })?.content ?? "",
+        // AA-22: this runs once per assistant row per body pass, even on a
+        // cache hit. The message lookup was an eager `messages.first(where:)`
+        // per hidden id although `keepsTokenSaverPersistedHidden` returns early
+        // for every id that does not need its durable row (the common case).
+        // Resolve the text only when needed, through one index built on demand.
+        var contentById: [AgentMessageID: String]?
+        return Set(ids.filter { id in
+            guard vm.tokenSaverRequiresDurableMessageRow(for: id) else { return true }
+            if contentById == nil {
+                var index = [AgentMessageID: String](minimumCapacity: vm.messages.count)
+                for message in vm.messages { index[message.id] = message.content }
+                contentById = index
+            }
+            return Self.keepsTokenSaverPersistedHidden(
+                requiresDurableRow: true,
+                messageText: contentById?[id] ?? "",
                 turns: vm.timeline.turns
             )
         })
@@ -14190,11 +14192,21 @@ public struct AgentAppView: View {
             scrollToBottomIdentifier: "agent.timeline.scrollToBottom",
             accessibilityIdentifier: "agent.timeline"
         ) { timelineColumnWidth in
+                        // AA-25: materialize the merged entries ONCE per body; the
+                        // property rebuilt two whole-thread dictionaries each read
+                        // and used to be read three times per pass.
+                        let mergedEntries = transcriptEntries
+                        let visibleEntries = Self.visibleTranscriptWindow(
+                            entries: mergedEntries,
+                            status: vm.status,
+                            runStartedAt: vm.runStartedAt
+                        )
                         let columnPaint = Self.transcriptColumnPaint(
-                            mergedEntries: transcriptEntries,
+                            mergedEntries: paintOrderedTranscriptEntriesCached(mergedEntries),
                             status: vm.status,
                             runStartedAt: vm.runStartedAt,
-                            revealCount: vm.transcriptHistoryRevealCount
+                            revealCount: vm.transcriptHistoryRevealCount,
+                            alreadyPaintOrdered: true
                         )
                         let allEntries = columnPaint.all
                         let entries = columnPaint.visible
@@ -14207,10 +14219,13 @@ public struct AgentAppView: View {
                             hiddenCount
                         )
                         let paintSequence = columnPaint.paint
-                        let latestLiveId = paintSequence.reversed().compactMap { entry -> String? in
-                            if case .turn(let turn) = entry, !turn.finished { return turn.turnId }
+                        let latestLiveId: String? = paintSequence.last(where: { entry in
+                            if case .turn(let turn) = entry { return !turn.finished }
+                            return false
+                        }).flatMap { entry -> String? in
+                            if case .turn(let turn) = entry { return turn.turnId }
                             return nil
-                        }.first
+                        }
                         let split = Self.splitTrailingLiveTurns(
                             paintSequence,
                             latestLiveTurnId: latestLiveId
@@ -14226,7 +14241,7 @@ public struct AgentAppView: View {
                         let mentionBots = vm.mentionableBotsProvider()
                         let rowPaintContext = Self.makeChatRowPaintContext(
                             rows: allRows,
-                            visibleEntries: visibleTranscriptEntries,
+                            visibleEntries: visibleEntries,
                             bots: mentionBots
                         )
                         VStack(alignment: .leading, spacing: 32) {
@@ -14314,7 +14329,7 @@ public struct AgentAppView: View {
                                 AgentChatWorkingStatusStrip(
                                     startedAt: vm.runStartedAt ?? Date(),
                                     isStopping: vm.isStopping,
-                                    context: activeBotPeerReviewName.map {
+                                    context: activeBotPeerReviewName(in: visibleEntries).map {
                                         AgentChatWorkingContext.reviewing(peerName: $0)
                                     },
                                     hold: vm.backgroundHoldSummary,
@@ -15939,8 +15954,19 @@ public struct AgentAppView: View {
         _ turn: AssistantTurnSnapshot,
         hideAssistantOutput: Bool
     ) -> some View {
-        let inputs = turnRenderInputs(for: turn)
+        // AA-20: the painted row (`AgentChatLiveTurnView`) composes itself from
+        // `turn`; the only thing this view contributed from `turnRenderInputs`
+        // was `turnPlans`. Computing the full render model here ran, for the
+        // LIVE turn on every body pass, `renderableItems` → assistant-text dedupe
+        // against every persisted message (O(items × messages × body length),
+        // uncached above 16 KiB). Same plan filter `turnSegmentView` uses.
         let durableFinalMessageId = vm.tokenSaverMessageId(forRCW1TurnId: turn.turnId)
+        let turnPlans: [AssistantProposedPlan] = vm.suppressesProposedPlanReview
+            ? []
+            : vm.timeline.proposedPlans.filter {
+                $0.turnId == turn.turnId
+                    && !$0.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
         AgentChatLiveTurnView(
             turn: turn,
             live: !turn.finished,
@@ -15951,7 +15977,7 @@ public struct AgentAppView: View {
             afterWork: vm.suppressesProposedPlanReview
                 ? nil
                 : AnyView(
-                    ForEach(inputs.turnPlans) { plan in
+                    ForEach(turnPlans) { plan in
                         proposedPlanRow(plan)
                     }
                 )
