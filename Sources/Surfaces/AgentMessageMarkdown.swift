@@ -91,10 +91,14 @@ enum AgentMessageMarkdown {
     }
 
     static func cacheKey(for text: String) -> NSString {
-        var hasher = Hasher()
-        hasher.combine(text.utf8.count)
-        hasher.combine(text)
-        return "\(text.utf8.count):\(hasher.finalize())" as NSString
+        cacheKey(for: text, fingerprint: sourceFingerprint(for: text))
+    }
+
+    /// AA-32: the cache key IS the source fingerprint prefixed by the byte
+    /// count. Callers that already computed `sourceFingerprint(for:)` for the
+    /// text-view identity pass it here instead of hashing the text again.
+    static func cacheKey(for text: String, fingerprint: Int) -> NSString {
+        "\(text.utf8.count):\(fingerprint)" as NSString
     }
 
     static func blocks(from text: String, cache: Bool = true) -> [AgentMessageMarkdownBlock] {
@@ -379,8 +383,8 @@ enum AgentMessageMarkdown {
         return blocks.isEmpty ? [AgentMessageMarkdownBlock(kind: .paragraph, text: text)] : blocks
     }
 
-    static func attributedInline(_ text: String, cache: Bool = true) -> AttributedString {
-        let key = cacheKey(for: text)
+    static func attributedInline(_ text: String, cache: Bool = true, fingerprint: Int? = nil) -> AttributedString {
+        let key = fingerprint.map { cacheKey(for: text, fingerprint: $0) } ?? cacheKey(for: text)
         // Perf CH-04: `cache: false` skips only the store; the read still hits.
         if let cached = inlineCache.object(forKey: key) { return cached.value }
         let result = computeAttributedInline(text)

@@ -61,16 +61,17 @@ struct AgentLinkedInlineText: View {
     var cacheResults: Bool = true
 
     var body: some View {
+        // AA-28/AA-32: ONE UTF-8 hash of the source text per body pass serves
+        // both the inline cache key and the text view's content identity (which
+        // lets it skip the grapheme count + AttributedString deep-equality).
+        let fingerprint = AgentMessageMarkdown.sourceFingerprint(for: text)
         AgentLinkedAttributedText(
-            attributed: AgentMessageMarkdown.attributedInline(text, cache: cacheResults),
+            attributed: AgentMessageMarkdown.attributedInline(text, cache: cacheResults, fingerprint: fingerprint),
             font: Self.nsFont(size: fontSize, weight: fontWeight, monospaced: monospaced),
             textColor: textColor,
             lineFragmentPadding: lineFragmentPadding,
             lineSpacing: lineSpacing,
-            // AA-28: identity of the SOURCE text (one UTF-8 hash) so the text
-            // view can skip the per-pass grapheme count + AttributedString
-            // deep-equality on unchanged rows.
-            sourceFingerprint: AgentMessageMarkdown.sourceFingerprint(for: text)
+            sourceFingerprint: fingerprint
         )
     }
 

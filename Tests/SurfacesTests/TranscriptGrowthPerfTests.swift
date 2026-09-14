@@ -122,6 +122,32 @@ final class TranscriptGrowthPerfTests: XCTestCase {
         XCTAssertFalse(source.contains("timelineItemIndex"), "no per-open/replay index rebuilds without a reader")
     }
 
+    // MARK: AA-32
+
+    func test_inlineCacheKeyIsTheSourceFingerprintSoRowsHashOnce() {
+        // WHY: AgentLinkedInlineText hashed its text twice per body pass — once
+        // for the inline NSCache key, once for the text view's fingerprint. The
+        // two derivations must stay identical so one hash can serve both, and
+        // a precomputed fingerprint must hit the same cache entry.
+        let text = "Deploy finished; see `Package.swift` for the pinned version."
+        let fingerprint = AgentMessageMarkdown.sourceFingerprint(for: text)
+        XCTAssertEqual(
+            AgentMessageMarkdown.cacheKey(for: text),
+            AgentMessageMarkdown.cacheKey(for: text, fingerprint: fingerprint)
+        )
+        let plain = AgentMessageMarkdown.attributedInline(text)
+        let computeAfterPlain = AgentMessageMarkdown.inlineComputeCountForTesting
+        let viaFingerprint = AgentMessageMarkdown.attributedInline(text, fingerprint: fingerprint)
+        XCTAssertEqual(plain, viaFingerprint)
+        XCTAssertEqual(
+            AgentMessageMarkdown.inlineComputeCountForTesting,
+            computeAfterPlain,
+            "the precomputed fingerprint must address the same cache entry (no re-parse)"
+        )
+        let source = try? String(contentsOf: sourceURL("Sources/Surfaces/AgentLinkedInlineText.swift"), encoding: .utf8)
+        XCTAssertEqual(source?.components(separatedBy: "sourceFingerprint(for: text)").count, 2, "the row computes its fingerprint exactly once")
+    }
+
     // MARK: AA-20 source pin
 
     func test_turnViewDoesNotComputeTheFullTurnRenderModel() throws {
