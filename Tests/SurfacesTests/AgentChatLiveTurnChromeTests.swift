@@ -3,6 +3,37 @@ import CoreModel
 @testable import Surfaces
 
 final class AgentChatLiveTurnChromeTests: XCTestCase {
+    func test_normalizedAssistantFinalsMemoizeFinishedTurnsOnly() {
+        // WHY: the row paint context normalizes every visible turn's assistant
+        // text on every body pass (per-scalar walk). Finished turns are
+        // immutable in practice and must be served from the memo; live turns
+        // must always reflect the current body.
+        func turn(_ id: String, body: String, final: String?, finished: Bool) -> AssistantTurnSnapshot {
+            var t = AssistantTurnSnapshot(turnId: id, startedAtMs: 1)
+            t.items = [AssistantItem(id: "\(id)-a", turnId: id, type: .assistantMessage, body: body, startedAtMs: 1)]
+            t.finalAssistantMessage = final
+            t.finished = finished
+            return t
+        }
+        let finished = turn("memo-\(UUID().uuidString)", body: "Same  answer", final: "Same answer", finished: true)
+        let before = AgentChatLiveTurnChrome.normalizedFinalsComputeCountForTesting
+        let first = AgentChatLiveTurnChrome.normalizedAssistantFinals(for: finished)
+        XCTAssertEqual(first, [AgentTranscriptOrder.normalizedFinalText("Same  answer"), AgentTranscriptOrder.normalizedFinalText("Same answer")])
+        XCTAssertEqual(AgentChatLiveTurnChrome.normalizedFinalsComputeCountForTesting, before + 1)
+        _ = AgentChatLiveTurnChrome.normalizedAssistantFinals(for: finished)
+        XCTAssertEqual(AgentChatLiveTurnChrome.normalizedFinalsComputeCountForTesting, before + 1, "a finished turn is served from the memo")
+
+        var changedFinal = finished
+        changedFinal.finalAssistantMessage = "Same answer, revised"
+        _ = AgentChatLiveTurnChrome.normalizedAssistantFinals(for: changedFinal)
+        XCTAssertEqual(AgentChatLiveTurnChrome.normalizedFinalsComputeCountForTesting, before + 2, "a different final length re-keys the memo")
+
+        let live = turn("live-\(UUID().uuidString)", body: "streaming", final: nil, finished: false)
+        _ = AgentChatLiveTurnChrome.normalizedAssistantFinals(for: live)
+        _ = AgentChatLiveTurnChrome.normalizedAssistantFinals(for: live)
+        XCTAssertEqual(AgentChatLiveTurnChrome.normalizedFinalsComputeCountForTesting, before + 4, "live turns are never memoized")
+    }
+
 
     func test_streamingReasoningUsesThinkingLabel_becauseTheUserMustSeeLiveThought() {
         // WHY: a live turn that is still reasoning is not "Working…". Agent App

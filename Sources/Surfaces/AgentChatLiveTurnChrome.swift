@@ -211,11 +211,9 @@ public enum AgentChatLiveTurnChrome {
         previousNormalizedFinals: Set<String>
     ) -> Bool {
         guard !previousNormalizedFinals.isEmpty else { return false }
-        for body in assistantBodies(in: turn) {
-            let normalized = AgentTranscriptOrder.normalizedFinalText(body)
-            if !normalized.isEmpty, previousNormalizedFinals.contains(normalized) {
-                return true
-            }
+        for normalized in normalizedAssistantFinals(for: turn)
+        where previousNormalizedFinals.contains(normalized) {
+            return true
         }
         return false
     }
@@ -224,12 +222,41 @@ public enum AgentChatLiveTurnChrome {
         from turn: AssistantTurnSnapshot,
         into previousNormalizedFinals: inout Set<String>
     ) {
+        for normalized in normalizedAssistantFinals(for: turn) {
+            previousNormalizedFinals.insert(normalized)
+        }
+    }
+
+    /// Non-empty normalized (whitespace-stripped, 32 KiB-capped) assistant
+    /// bodies + final of a turn. The row paint context recomputes these for
+    /// every visible turn on every body pass — a per-scalar walk over all
+    /// visible assistant text per frame. Finished turns are immutable in
+    /// practice, so their result is memoized by (turnId, items.count, final
+    /// length); live turns are always recomputed.
+    private static let normalizedFinalsMemo: NSCache<NSString, NSArray> = {
+        let cache = NSCache<NSString, NSArray>()
+        cache.countLimit = 512
+        return cache
+    }()
+    public private(set) nonisolated(unsafe) static var normalizedFinalsComputeCountForTesting = 0
+
+    public static func normalizedAssistantFinals(for turn: AssistantTurnSnapshot) -> [String] {
+        let key: NSString? = turn.finished
+            ? "\(turn.turnId)|\(turn.items.count)|\(turn.finalAssistantMessage?.utf8.count ?? -1)" as NSString
+            : nil
+        if let key, let cached = normalizedFinalsMemo.object(forKey: key) as? [String] {
+            return cached
+        }
+        normalizedFinalsComputeCountForTesting &+= 1
+        var result: [String] = []
         for body in assistantBodies(in: turn) {
             let normalized = AgentTranscriptOrder.normalizedFinalText(body)
-            if !normalized.isEmpty {
-                previousNormalizedFinals.insert(normalized)
-            }
+            if !normalized.isEmpty { result.append(normalized) }
         }
+        if let key {
+            normalizedFinalsMemo.setObject(result as NSArray, forKey: key)
+        }
+        return result
     }
 
     public static func paintsLiveTurnChrome(_ timeline: AssistantTimelineState) -> Bool {
