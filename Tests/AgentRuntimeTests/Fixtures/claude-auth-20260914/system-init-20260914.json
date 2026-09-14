@@ -1,0 +1,38 @@
+{
+  "type": "system",
+  "subtype": "init",
+  "claude_code_version": "2.1.270",
+  "session_id": "4d139d35-6f36-4382-91af-070d46344e05",
+  "uuid": "cbadbce6-9761-4b77-bd96-6a1ccc198cec",
+  "apiKeySource": "none",
+  "capabilities": [
+    "interrupt_receipt_v1",
+    "interrupt_cancel_queued_v1",
+    "msg_lifecycle_v1"
+  ],
+  "mcp_servers": [
+    {
+      "name": "plugin:stripe:stripe",
+      "status": "pending"
+    },
+    {
+      "name": "computer-use-mcp",
+      "status": "pending"
+    },
+    {
+      "name": "linear",
+      "status": "pending"
+    },
+    {
+      "name": "railway",
+      "status": "connected"
+    },
+    {
+      "name": "slack",
+      "status": "pending"
+    }
+  ],
+  "permissionMode": "default",
+  "model": "claude-haiku-4-5-20251001",
+  "fast_mode_state": "off"
+}

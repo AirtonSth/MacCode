@@ -1202,7 +1202,7 @@ final class ClaudeParserCLITests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-            .appendingPathComponent("plan-claude-provider-bugs-20260914/fixtures/\(name)")
+            .appendingPathComponent("Tests/AgentRuntimeTests/Fixtures/claude-auth-20260914/\(name)")
         let text = try String(contentsOf: url, encoding: .utf8)
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
