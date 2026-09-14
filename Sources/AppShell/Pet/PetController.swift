@@ -51,6 +51,19 @@ public final class PetController {
     /// overlays `lastUpdatePreview` + retained `startedAt`; it must not repeat
     /// N full `threadRepo.get` + bot list/link queries on MainActor.
     private var activeThreadChromeByID: [AgentThreadID: CachedActiveThreadChrome] = [:]
+    /// PL-03: which active threads belong to a bot. Resolved once per thread
+    /// (a thread's bot link cannot change mid-run) from the BotStore in-memory
+    /// cache or one off-main SQLite lookup; `applyActiveThreadIDs` used to call
+    /// `botStore.conversationsLinked` + `bots(ids:)` synchronously on the main
+    /// thread for every `agent.item.started/completed` of every run.
+    private enum LinkedBotResolution {
+        case unlinked
+        case linked(botID: BotID, name: String?)
+    }
+    private var linkedBotByActiveThread: [AgentThreadID: LinkedBotResolution] = [:]
+    private var linkedBotResolveGeneration = 0
+    private var linkedBotResolveTask: Task<Void, Never>?
+    var linkedBotDurableLookupCountForTesting = 0
     /// Durable `threadRepo.get` calls from `applyActiveThreadIDs`.
     private(set) var activeThreadDurableLookupCountForTesting = 0
     /// Latest-wins generation for off-main chrome fetches. A stale Task must
@@ -1175,31 +1188,24 @@ public final class PetController {
                 lastUpdatePreview: self.lastUpdatePreviewByThread[threadID]
             )
         }
-        let linked = (try? context.botStore.conversationsLinked(to: Set(threadIDs))) ?? [:]
-        let destNames: [BotID: String]
-        if linked.isEmpty {
-            destNames = [:]
-        } else {
-            let botIDs = Set(linked.values.map(\.botID))
-            destNames = ((try? context.botStore.bots(ids: botIDs)) ?? [:]).mapValues(\.name)
-        }
+        let linkedBots = resolveLinkedBots(for: threadIDs)
         let remapped = items.map { item -> PetActiveThreadItem in
-            guard let botID = linked[item.threadID]?.botID else {
+            guard let link = linkedBots[item.threadID] else {
                 return item
             }
             let chrome = CachedActiveThreadChrome(
                 workspaceID: nil,
                 workspaceName: "Bots",
                 providerName: nil,
-                threadTitle: destNames[botID],
-                route: .botsDesk(botID: botID)
+                threadTitle: link.name,
+                route: .botsDesk(botID: link.botID)
             )
             self.activeThreadChromeByID[item.threadID] = chrome
             return PetActiveThreadItem(
                 threadID: item.threadID,
                 workspaceID: nil,
                 workspaceName: "Bots",
-                threadTitle: destNames[botID],
+                threadTitle: link.name,
                 startedAt: startedAtByThread[item.threadID],
                 lastUpdatePreview: item.lastUpdatePreview,
                 route: chrome.route
@@ -1212,6 +1218,70 @@ public final class PetController {
             reconcilePetActiveRuns([])
         }
         publishLiveActivitySurface()
+    }
+
+    /// Cache-only resolution of active thread → bot. Unknown threads are
+    /// resolved off-main once; the result re-applies the active list.
+    private func resolveLinkedBots(
+        for threadIDs: [AgentThreadID]
+    ) -> [AgentThreadID: (botID: BotID, name: String?)] {
+        let activeSet = Set(threadIDs)
+        linkedBotByActiveThread = linkedBotByActiveThread.filter { activeSet.contains($0.key) }
+        var resolved: [AgentThreadID: (botID: BotID, name: String?)] = [:]
+        var unresolved: [AgentThreadID] = []
+        for threadID in threadIDs {
+            switch linkedBotByActiveThread[threadID] {
+            case .linked(let botID, let name)?:
+                resolved[threadID] = (botID, name)
+            case .unlinked?:
+                continue
+            case nil:
+                // Lock-free BotStore cache: paints the Bots route immediately;
+                // the name still comes from the off-main lookup.
+                if let botID = context.botStore.cachedBotID(linkedTo: threadID) {
+                    resolved[threadID] = (botID, nil)
+                }
+                unresolved.append(threadID)
+            }
+        }
+        if !unresolved.isEmpty {
+            fetchLinkedBotsOffMain(threadIDs: threadIDs, unresolved: unresolved)
+        }
+        return resolved
+    }
+
+    private func fetchLinkedBotsOffMain(threadIDs: [AgentThreadID], unresolved: [AgentThreadID]) {
+        guard linkedBotResolveTask == nil else { return }
+        linkedBotResolveGeneration += 1
+        let generation = linkedBotResolveGeneration
+        let botStore = context.botStore
+        linkedBotResolveTask = Task.detached(priority: .utility) { [weak self] in
+            let linked = (try? botStore.conversationsLinked(to: Set(unresolved))) ?? [:]
+            let botIDs = Set(linked.values.map(\.botID))
+            let names: [BotID: String] = botIDs.isEmpty
+                ? [:]
+                : ((try? botStore.bots(ids: botIDs)) ?? [:]).mapValues(\.name)
+            await MainActor.run {
+                guard let self else { return }
+                self.linkedBotResolveTask = nil
+                guard generation == self.linkedBotResolveGeneration else { return }
+                self.linkedBotDurableLookupCountForTesting += 1
+                for threadID in unresolved {
+                    if let conversation = linked[threadID] {
+                        self.linkedBotByActiveThread[threadID] = .linked(
+                            botID: conversation.botID,
+                            name: names[conversation.botID]
+                        )
+                    } else {
+                        self.linkedBotByActiveThread[threadID] = .unlinked
+                    }
+                }
+                guard !linked.isEmpty else { return }
+                let current = Set(self.model.activeThreads.map(\.threadID))
+                guard current == Set(threadIDs) else { return }
+                self.applyActiveThreadIDs(threadIDs)
+            }
+        }
     }
 
     private func cacheMissingActiveThreadChrome(ids: [AgentThreadID]) {
