@@ -181,6 +181,15 @@ public enum TokenSaverWidgetDigest {
 
     public private(set) nonisolated(unsafe) static var suppressedDuplicatePublishCountForTesting = 0
 
+    /// Tests that count digest publishes must start from a clean last body:
+    /// the dedupe is process-global and an earlier test may have published an
+    /// identical digest.
+    public static func resetLastBodyForTesting() {
+        lock.lock()
+        lastBody = nil
+        lock.unlock()
+    }
+
     private static func cacheAndPublish(_ body: [String: JSONValue]) {
         lock.lock()
         let previous = lastBody

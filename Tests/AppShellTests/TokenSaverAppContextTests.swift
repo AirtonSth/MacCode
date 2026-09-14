@@ -1247,6 +1247,9 @@ final class TokenSaverAppContextTests: XCTestCase {
             tokenSaverAccountUsageRefresher: refresher
         )
         savePrivateSession(in: context)
+        // EV-25: the digest dedupe is process-global; an identical body from an
+        // earlier test must not suppress this test's single publish.
+        TokenSaverWidgetDigest.resetLastBodyForTesting()
         let digestEvents = LockedEventCount()
         let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
             if event.kind == TokenSaverWidgetDigest.eventKind.rawValue {
@@ -1262,6 +1265,11 @@ final class TokenSaverAppContextTests: XCTestCase {
         }
 
         XCTAssertTrue(didFinish)
+        // EV-25 publishes from a detached task; wait for the first publish, then
+        // give a duplicate a chance to show up before asserting exactly one.
+        let published = await waitUntil { digestEvents.value >= 1 }
+        XCTAssertTrue(published, "the final disk digest must be published")
+        try? await Task.sleep(nanoseconds: 150_000_000)
         XCTAssertEqual(digestEvents.value, 1,
                        "Grok-first/full-second must publish the final disk digest exactly once")
     }
