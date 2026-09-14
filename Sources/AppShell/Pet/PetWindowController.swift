@@ -959,13 +959,6 @@ public final class PetWindowController: NSObject {
         dockPlacementCacheByDisplayID.removeAll()
     }
 
-    private func revalidateDockPlacementCache() {
-        invalidateDockPlacementCache()
-        for screen in NSScreen.screens {
-            _ = petPlacementContext(for: screen)
-        }
-    }
-
     private func installDockPlacementCacheObservers() {
         guard dockPlacementObservationTokens.isEmpty else { return }
         observeDockPlacement(
@@ -976,16 +969,13 @@ public final class PetWindowController: NSObject {
             DistributedNotificationCenter.default(),
             name: Notification.Name("com.apple.dock.prefchanged")
         )
+        // PL-04: the 30 s revalidation loop hit-tested the Dock against the
+        // WindowServer for every screen on the main thread (~130 ms per tick in
+        // the 2026-09-14 sample) even though the notifications above already
+        // invalidate the cache and `petPlacementContext(for:)` recomputes lazily
+        // on the next use. Invalidation-only; no periodic work.
         dockPlacementRevalidateTask?.cancel()
-        dockPlacementRevalidateTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 30_000_000_000)
-                guard !Task.isCancelled else { return }
-                await MainActor.run {
-                    self?.revalidateDockPlacementCache()
-                }
-            }
-        }
+        dockPlacementRevalidateTask = nil
     }
 
     private func observeDockPlacement(_ center: NotificationCenter, name: Notification.Name) {
