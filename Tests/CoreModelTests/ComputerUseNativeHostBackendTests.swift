@@ -4,6 +4,63 @@ import ScreenCaptureKit
 @testable import CoreModel
 
 final class ComputerUseNativeHostBackendTests: XCTestCase {
+    func test_doctorNamesTheLaunchingAppAndRemediationWhenPermissionsAreMissing() async throws {
+        // WHY: the helper's own permission checks resolve against the TCC
+        // "responsible" app that launched the provider. A bare `false` sent the
+        // owner hunting in the wrong place (2026-09-14: RemoteCode toggled on in
+        // System Settings, helper still false — stale/duplicate entry).
+        func backend(accessibility: Bool, screenCapture: Bool) -> ComputerUseNativeHostBackend {
+            ComputerUseNativeHostBackend(hooks: .init(
+                listWindows: { _ in [ComputerUseNativeWindow(
+                    target: .init(pid: 17, windowID: 29),
+                    title: "RemoteCode",
+                    bundleIdentifier: "com.example.RemoteCode",
+                    isOnScreen: true,
+                    isMinimized: false,
+                    bounds: .zero
+                )] },
+                userActivity: { _ in .none },
+                activityMonitorAvailable: { true },
+                accessibilityPermission: { accessibility },
+                axTargetAvailable: { _ in accessibility },
+                screenCapturePermission: { screenCapture },
+                capture: { _ in .unavailable("test") },
+                uiTree: { _ in nil },
+                hostLauncherPath: { "/Applications/RemoteCode.app/Contents/MacOS/RemoteCode" }
+            ))
+        }
+        let missing = await backend(accessibility: false, screenCapture: false).invoke(
+            name: "doctor",
+            arguments: ["target_pid": 17, "target_window_id": 29]
+        )
+        let text = try XCTUnwrap(missing.content.first?.text)
+        // JSONSerialization escapes "/" as "\/"; compare on unescaped content.
+        let unescaped = text.replacingOccurrences(of: "\\/", with: "/")
+        XCTAssertTrue(unescaped.contains("\"launched_by\":\"/Applications/RemoteCode.app/Contents/MacOS/RemoteCode\""), unescaped)
+        XCTAssertTrue(unescaped.contains("\"remediation\":"), unescaped)
+        XCTAssertTrue(unescaped.contains("Screen Recording and Accessibility for /Applications/RemoteCode.app"), unescaped)
+        XCTAssertTrue(unescaped.contains("remove the entry and add the app again"), unescaped)
+
+        let granted = await backend(accessibility: true, screenCapture: true).invoke(
+            name: "doctor",
+            arguments: ["target_pid": 17, "target_window_id": 29]
+        )
+        let grantedText = try XCTUnwrap(granted.content.first?.text)
+        XCTAssertFalse(grantedText.contains("remediation"), "no remediation noise when both permissions hold")
+        XCTAssertNil(ComputerUseNativeHostBackend.permissionRemediation(accessibility: true, screenCapture: true, launchedBy: nil))
+        XCTAssertEqual(
+            ComputerUseNativeHostBackend.permissionRemediation(accessibility: true, screenCapture: false, launchedBy: nil)?.hasPrefix("Missing Screen Recording for the app that launched this run."),
+            true
+        )
+    }
+
+    func test_hostLauncherWalkResolvesParentChainWithoutTouchingTCC() {
+        // The test process always has a parent; the walk must terminate and
+        // return either an .app executable or the top-most ancestor path.
+        XCTAssertGreaterThan(ComputerUseNativeHostBackend.NativePlatform.parentPID(of: getpid()), 0)
+        _ = ComputerUseNativeHostBackend.NativePlatform.hostLauncherExecutablePath()
+    }
+
     func test_observationResolvesExactTargetWithoutActivation() async throws {
         let probe = Probe()
         let backend = makeBackend(probe: probe)

@@ -247,6 +247,11 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         public var typeText: @Sendable (ComputerUseNativeHostTarget, String) -> Bool
         public var pixelAction: @Sendable (ComputerUseNativeHostTarget, String, [Double]) -> Bool
         public var activate: @Sendable (ComputerUseNativeHostTarget) -> Void
+        /// Executable of the app that launched this MCP (TCC attributes Screen
+        /// Recording / Accessibility to that responsible app, not to this helper).
+        public var hostLauncherPath: @Sendable () -> String? = {
+            NativePlatform.hostLauncherExecutablePath()
+        }
 
         public init(
             listWindows: @escaping @Sendable (String?) -> [ComputerUseNativeWindow] = {
@@ -285,8 +290,12 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             pixelAction: @escaping @Sendable (ComputerUseNativeHostTarget, String, [Double]) -> Bool = {
                 NativePlatform.pixelAction(target: $0, name: $1, coordinate: $2)
             },
-            activate: @escaping @Sendable (ComputerUseNativeHostTarget) -> Void = { _ in }
+            activate: @escaping @Sendable (ComputerUseNativeHostTarget) -> Void = { _ in },
+            hostLauncherPath: @escaping @Sendable () -> String? = {
+                NativePlatform.hostLauncherExecutablePath()
+            }
         ) {
+            self.hostLauncherPath = hostLauncherPath
             self.listWindows = listWindows
             self.userActivity = userActivity
             self.activityMonitorAvailable = activityMonitorAvailable
@@ -787,8 +796,30 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         )
     }
 
+    /// Why a permission is false is invisible from inside the helper: the
+    /// grant lives on the app that launched the provider (TCC "responsible
+    /// process"). Name that app and the exact remediation so an agent or the
+    /// owner can act without guessing.
+    static func permissionRemediation(
+        accessibility: Bool,
+        screenCapture: Bool,
+        launchedBy: String?
+    ) -> String? {
+        guard !accessibility || !screenCapture else { return nil }
+        var missing: [String] = []
+        if !screenCapture { missing.append("Screen Recording") }
+        if !accessibility { missing.append("Accessibility") }
+        let app = launchedBy.map { path -> String in
+            if let range = path.range(of: ".app/") {
+                return String(path[..<range.lowerBound]) + ".app"
+            }
+            return path
+        } ?? "the app that launched this run"
+        return "Missing \(missing.joined(separator: " and ")) for \(app). macOS grants these to the launching app, not to this helper: in System Settings › Privacy & Security enable it for that app; if it is already listed, remove the entry and add the app again (the entry may belong to an older build), then start a new run."
+    }
+
     private func encodeObservation(_ observation: ComputerUseNativeHostObservation) -> String {
-        let object: [String: Any] = [
+        var object: [String: Any] = [
             "target_pid": Int(observation.target.pid),
             "target_window_id": Int(observation.target.windowID),
             "state_token": observation.stateToken,
@@ -802,6 +833,15 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             "is_minimized": observation.isMinimized,
             "is_on_screen": observation.isOnScreen,
         ]
+        if !observation.accessibilityPermission || !observation.screenCapturePermission {
+            let launchedBy = hooks.hostLauncherPath()
+            object["launched_by"] = launchedBy as Any
+            object["remediation"] = Self.permissionRemediation(
+                accessibility: observation.accessibilityPermission,
+                screenCapture: observation.screenCapturePermission,
+                launchedBy: launchedBy
+            ) as Any
+        }
         return encode(object)
     }
 
@@ -1206,6 +1246,39 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
 
         public static func screenCapturePermission() -> Bool {
             CGPreflightScreenCaptureAccess()
+        }
+
+        /// First ancestor executable that lives inside an `.app` bundle (the
+        /// TCC-responsible app for this helper), else the top-most non-launchd
+        /// ancestor. Walks the ppid chain via sysctl; never touches TCC.
+        public static func hostLauncherExecutablePath(startingAt pid: pid_t = getpid()) -> String? {
+            var current = parentPID(of: pid)
+            var fallback: String?
+            var hops = 0
+            while current > 1, hops < 32 {
+                hops += 1
+                if let path = executablePath(of: current) {
+                    if path.contains(".app/Contents/MacOS/") { return path }
+                    fallback = path
+                }
+                current = parentPID(of: current)
+            }
+            return fallback
+        }
+
+        static func parentPID(of pid: pid_t) -> pid_t {
+            var info = kinfo_proc()
+            var size = MemoryLayout<kinfo_proc>.stride
+            var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+            guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0, size > 0 else { return 0 }
+            return info.kp_eproc.e_ppid
+        }
+
+        static func executablePath(of pid: pid_t) -> String? {
+            var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+            let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+            guard length > 0 else { return nil }
+            return String(cString: buffer)
         }
 
         private static let activityMonitor = ComputerUseNativeActivityMonitor()
