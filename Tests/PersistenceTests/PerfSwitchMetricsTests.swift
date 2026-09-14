@@ -12,6 +12,24 @@ final class PerfSwitchMetricsTests: XCTestCase {
         super.tearDown()
     }
 
+    func test_recordedIntervalsAndMainWaitsStayBounded() {
+        // WHY (EV-20): the interval and main-wait arrays are test seams, but in
+        // release they grew for the whole process lifetime on every main-thread
+        // SQLite call. A bounded ring keeps the exact count while dropping old
+        // samples.
+        let capacity = PerfSwitchMetrics.recordedIntervalCapacity
+        for _ in 0..<(capacity + 100) {
+            PerfSwitchMetrics.recordQueueOccupied(nanoseconds: 10, onMainThread: true)
+        }
+        XCTAssertEqual(PerfSwitchMetrics.recordedIntervalsForTesting().count, capacity)
+        XCTAssertEqual(PerfSwitchMetrics.mainThreadSyncNanosecondsForTesting().count, capacity)
+        XCTAssertEqual(
+            PerfSwitchMetrics.mainThreadSyncCountForTesting(),
+            capacity + 100,
+            "the count stays exact even when the sample ring drops old entries"
+        )
+    }
+
     func test_tabSwitchInterval_recordsInstallAndCommitted() {
         // WHY: PF-00 (a) must produce a measurable tab-switch interval so later
         // PF-10/11 claims have a comparable instrument, not a log line.

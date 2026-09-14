@@ -17,6 +17,10 @@ public enum PerfSwitchMetrics {
     public static let sqliteMainSyncName: StaticString = "sqlite_main_sync"
 
     public static let slowMainSyncNanoseconds: UInt64 = 2_000_000
+    /// EV-20: the interval/wait arrays are test seams, but they were appended for
+    /// the whole process lifetime in release. Keep a bounded ring so a long
+    /// session with N runs does not grow them without limit.
+    static let recordedIntervalCapacity = 512
 
     public struct Interval: Equatable, Sendable {
         public var name: String
@@ -168,20 +172,29 @@ public enum PerfSwitchMetrics {
         record(Interval(name: "sqlite_main_sync", nanoseconds: nanoseconds, onMainThread: true))
         state.withLock {
             $0.mainThreadSyncCount += 1
+            if $0.mainThreadSyncNanoseconds.count >= recordedIntervalCapacity {
+                $0.mainThreadSyncNanoseconds.removeFirst()
+            }
             $0.mainThreadSyncNanoseconds.append(nanoseconds)
         }
         guard nanoseconds > slowMainSyncNanoseconds else { return }
+#if DEBUG
+        // EV-20: `Thread.callStackSymbols` symbolicates on the MAIN thread, right
+        // after a main-thread SQLite wait already exceeded 2 ms — i.e. exactly
+        // under lock contention. In release that was a positive feedback loop
+        // (more contention → more main-thread symbolication). Debug only.
         let stack = Thread.callStackSymbols.prefix(16).joined(separator: "\n")
         state.withLock {
             $0.slowMainSyncLogCount += 1
             $0.lastSlowMainSyncStack = stack
         }
-#if DEBUG
         NSLog(
             "SQLiteDB main-thread wait %.2fms\n%@",
             Double(nanoseconds) / 1_000_000.0,
             stack
         )
+#else
+        state.withLock { $0.slowMainSyncLogCount += 1 }
 #endif
     }
 
@@ -212,6 +225,11 @@ public enum PerfSwitchMetrics {
     }
 
     private static func record(_ interval: Interval) {
-        state.withLock { $0.recorded.append(interval) }
+        state.withLock {
+            if $0.recorded.count >= recordedIntervalCapacity {
+                $0.recorded.removeFirst()
+            }
+            $0.recorded.append(interval)
+        }
     }
 }
