@@ -318,6 +318,18 @@ public enum AgentChatLiveTurnChrome {
         return Date.distantPast
     }
 
+    /// AA-23: a turn with hundreds of steps mounted every block as an eager row
+    /// and, while live, re-diffed all of them on every paint tick. Paint the
+    /// newest `AgentWorkDisclosureLayout.expandedPaintWindow` blocks; older ones
+    /// stay one tap away behind "Show earlier steps" (same policy the transcript
+    /// already uses for older entries). Nothing is dropped — only deferred.
+    public static func visibleWorkBlocks(
+        _ blocks: [AgentChatWorkBlock],
+        revealCount: Int
+    ) -> (hiddenCount: Int, rows: [AgentChatWorkBlock]) {
+        AgentWorkDisclosureLayout.paintSlice(all: blocks, revealCount: revealCount)
+    }
+
     public static func workBlocks(from items: [AssistantItem], groupThreshold: Int = 2) -> [AgentChatWorkBlock] {
         var blocks: [AgentChatWorkBlock] = []
         var run: [AssistantItem] = []
@@ -864,6 +876,8 @@ public struct AgentChatLiveTurnView: View, Equatable {
     @State private var expandedReasoning: Set<String> = []
     @State private var expandedTools: Set<String> = []
     @State private var expandedToolGroups: Set<String> = []
+    /// AA-23: how many of the older (folded) work blocks the user has revealed.
+    @State private var earlierWorkReveal = 0
 
     public init(
         turn: AssistantTurnSnapshot,
@@ -898,6 +912,7 @@ public struct AgentChatLiveTurnView: View, Equatable {
     public var body: some View {
         let composition = AgentChatLiveTurnChrome.compose(turn)
         let blocks = AgentChatLiveTurnChrome.workBlocks(from: composition.activity)
+        let slice = AgentChatLiveTurnChrome.visibleWorkBlocks(blocks, revealCount: earlierWorkReveal)
         VStack(alignment: .leading, spacing: DS.Space.xl) {
             if !composition.activity.isEmpty {
                 VStack(alignment: .leading, spacing: DS.Space.lg) {
@@ -921,7 +936,22 @@ public struct AgentChatLiveTurnView: View, Equatable {
                             live ? "agent.liveWork.\(turn.turnId)" : "agent.completedWork.\(turn.turnId)"
                         )
                     }
-                    ForEach(blocks) { block in
+                    if slice.hiddenCount > 0 {
+                        Button {
+                            let hiddenBase = max(0, blocks.count - AgentWorkDisclosureLayout.expandedPaintWindow)
+                            earlierWorkReveal = AgentWorkDisclosureLayout.advancedRevealCount(
+                                current: earlierWorkReveal,
+                                hiddenBase: hiddenBase
+                            )
+                        } label: {
+                            Text("Show earlier steps (\(slice.hiddenCount) hidden)")
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.accent)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("agent.work.revealEarlier.\(turn.turnId)")
+                    }
+                    ForEach(slice.rows) { block in
                         AgentChatWorkBlockView(
                             block: block,
                             expandedReasoning: $expandedReasoning,

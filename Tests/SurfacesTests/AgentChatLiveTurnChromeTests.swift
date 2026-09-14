@@ -3,6 +3,41 @@ import CoreModel
 @testable import Surfaces
 
 final class AgentChatLiveTurnChromeTests: XCTestCase {
+    func test_liveTurnPaintsANewestWindowOfWorkBlocksWithEarlierStepsBehindAReveal() throws {
+        // WHY (AA-23): a turn with hundreds of tool groups mounted every block as
+        // an eager row and, while live, re-diffed all of them on every paint
+        // tick. The newest window paints; older blocks stay one tap away.
+        let blocks: [AgentChatWorkBlock] = (0..<60).map { index in
+            .item(AssistantItem(id: "step-\(index)", turnId: "t", type: .reasoning, body: "step \(index)", startedAtMs: Int64(index)))
+        }
+        let folded = AgentChatLiveTurnChrome.visibleWorkBlocks(blocks, revealCount: 0)
+        XCTAssertEqual(folded.rows.count, AgentWorkDisclosureLayout.expandedPaintWindow)
+        XCTAssertEqual(folded.hiddenCount, 60 - AgentWorkDisclosureLayout.expandedPaintWindow)
+        XCTAssertEqual(folded.rows.last?.id, blocks.last?.id, "the newest block is always painted")
+        XCTAssertEqual(folded.rows.first?.id, blocks[12].id, "the oldest painted block follows the window")
+
+        let hiddenBase = blocks.count - AgentWorkDisclosureLayout.expandedPaintWindow
+        let revealed = AgentWorkDisclosureLayout.advancedRevealCount(current: 0, hiddenBase: hiddenBase)
+        let opened = AgentChatLiveTurnChrome.visibleWorkBlocks(blocks, revealCount: revealed)
+        XCTAssertEqual(opened.hiddenCount, 0, "one reveal page exposes the remaining 12 older steps")
+        XCTAssertEqual(opened.rows.count, 60)
+
+        let short = AgentChatLiveTurnChrome.visibleWorkBlocks(Array(blocks.prefix(10)), revealCount: 0)
+        XCTAssertEqual(short.hiddenCount, 0, "turns under the window are unchanged")
+        XCTAssertEqual(short.rows.count, 10)
+
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent("Sources/Surfaces/AgentChatLiveTurnChrome.swift"),
+            encoding: .utf8
+        )
+        let bodyStart = try XCTUnwrap(source.range(of: "let slice = AgentChatLiveTurnChrome.visibleWorkBlocks(blocks, revealCount: earlierWorkReveal)"))
+        let body = String(source[bodyStart.upperBound...].prefix(2_500))
+        XCTAssertTrue(body.contains("ForEach(slice.rows)"), "the turn view must paint the window, not every block")
+        XCTAssertTrue(body.contains("Show earlier steps ("), "older blocks stay reachable")
+    }
+
     func test_normalizedAssistantFinalsMemoizeFinishedTurnsOnly() {
         // WHY: the row paint context normalizes every visible turn's assistant
         // text on every body pass (per-scalar walk). Finished turns are
