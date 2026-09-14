@@ -123,6 +123,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         var sawDetachedShellSpawn: Bool
         /// Fresh destination created by recoverSession fallback; first sendTurn may seed.
         var pendingFreshFallbackSeed: Bool
+        /// The app-server thread carries an active `/goal`. A goal loop ends each
+        /// iteration with `thread/status idle` → `turn/completed` → `status active`
+        /// → `turn/started`, all within the same second. That per-iteration
+        /// `turn/completed` is NOT the end of the run: the finish is withheld until
+        /// `thread/goal/cleared`, a non-active goal status, or an authoritative
+        /// thread/read that shows no newer turn.
+        var goalActive: Bool
         /// Fresh-fallback dest is not a durable resume identity until seeded startTurn is accepted.
         var awaitingSeedPublish: Bool
     }
@@ -1475,6 +1482,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             }
         case "turn/started":
             if let turnId = string(payload, "turnId") ?? (payload["turn"] as? [String: Any]).flatMap({ string($0, "id") }) {
+                dropPendingFinishForContinuingGoal(threadId: threadId, newTurnId: turnId)
                 setActiveTurn(threadId: threadId, turnId: turnId)
                 events.append(.turnStarted(turnId: turnId))
             }
@@ -1680,6 +1688,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 events.append(.activePlanUpdated(plan))
             }
         case "thread/goal/updated", "thread.goal.updated":
+            setGoalActive(threadId: threadId, Self.isActiveGoalStatus(from: payload))
             let turnId = goalTurnId(threadId: threadId)
             let itemId = "goal-\(string(payload, "threadId") ?? providerThreadId(threadId: threadId) ?? threadId.value.uuidString)-\(turnId.isEmpty ? String(now) : turnId)"
             let detail = Self.goalDetail(from: payload)
@@ -1698,6 +1707,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 finishedAtMs: now
             )))
         case "thread/goal/cleared", "thread.goal.cleared":
+            setGoalActive(threadId: threadId, false)
             let turnId = goalTurnId(threadId: threadId)
             let itemId = "goal-cleared-\(string(payload, "threadId") ?? providerThreadId(threadId: threadId) ?? threadId.value.uuidString)-\(turnId.isEmpty ? String(now) : turnId)"
             events.append(.itemStarted(item: AssistantItem(
@@ -1710,6 +1720,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 startedAtMs: now,
                 finishedAtMs: now
             )))
+            // The goal loop is over; a finish withheld at the last iteration's
+            // turn/completed is released now instead of waiting for reconcile.
+            if let pending = takePendingFinish(threadId: threadId) {
+                finished = .finished(pending.status, finalMessage: pending.finalMessage, providerThreadId: publishedDestination(pending.providerThreadId, threadId: threadId))
+                markFinished(threadId: threadId, status: pending.status, turnId: pending.turnId)
+            }
         case "turn/diff/updated", "turn.diff.updated":
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
             let itemId = "turn-diff-\(turnId.isEmpty ? UUID().uuidString : turnId)"
@@ -1951,7 +1967,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 // turn end still stamps; during deferral the UI may show awaiting
                 // while Codex is still active (same class as non-deferred; bounded
                 // nudge self-corrects on the next unmarked completion).
+                // A goal iteration reports idle right BEFORE turn/completed, so the
+                // active-status deferral alone lets the per-iteration turn end close
+                // the run while Codex immediately starts the next turn (proven live
+                // 2026-09-14: run marked completed, goal kept streaming for 10+ min).
                 let deferring = shouldDeferFinishUntilIdle(threadId: threadId)
+                    || hasActiveGoal(threadId: threadId)
                 if sawDetachedShellSpawn(threadId: threadId) {
                     if let marked = BackgroundAwaitContinuation.prefixingAwaitingMarker(final.isEmpty ? nil : final) {
                         final = marked
@@ -2249,6 +2270,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             turnReconcileGeneration: 0,
             sawDetachedShellSpawn: false,
             pendingFreshFallbackSeed: false,
+            goalActive: false,
             awaitingSeedPublish: awaitingSeedPublish
         )
         lock.unlock()
@@ -2293,7 +2315,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     private func updateThreadStatus(threadId: AgentThreadID, statusType: String) -> PendingFinish? {
         lock.lock()
         sessions[threadId]?.threadStatusType = statusType
-        let pending = Self.isIdleThreadStatus(statusType) ? sessions[threadId]?.pendingFinish : nil
+        let pending = Self.isIdleThreadStatus(statusType) && sessions[threadId]?.goalActive != true
+            ? sessions[threadId]?.pendingFinish
+            : nil
         if pending != nil {
             sessions[threadId]?.pendingFinish = nil
             sessions[threadId]?.pendingFinishWatchdog?.cancel()
@@ -2306,6 +2330,49 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     private func shouldDeferFinishUntilIdle(threadId: AgentThreadID) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return Self.isActiveThreadStatus(sessions[threadId]?.threadStatusType)
+    }
+
+    /// Pops a withheld finish (and its watchdog) so the caller can release it
+    /// through the ordered `finished` path of the notification handler.
+    private func takePendingFinish(threadId: AgentThreadID) -> PendingFinish? {
+        lock.lock(); defer { lock.unlock() }
+        guard let pending = sessions[threadId]?.pendingFinish else { return nil }
+        sessions[threadId]?.pendingFinish = nil
+        sessions[threadId]?.pendingFinishWatchdog?.cancel()
+        sessions[threadId]?.pendingFinishWatchdog = nil
+        return pending
+    }
+
+    private func hasActiveGoal(threadId: AgentThreadID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return sessions[threadId]?.goalActive == true
+    }
+
+    private func setGoalActive(threadId: AgentThreadID, _ active: Bool) {
+        lock.lock()
+        sessions[threadId]?.goalActive = active
+        lock.unlock()
+    }
+
+    /// A goal loop started its next iteration (`turn/started` with a new id, or
+    /// thread/read shows a newer turn): the finish withheld at the previous
+    /// iteration's `turn/completed` is stale. Drop it and invalidate the
+    /// reconcile loop so neither can close the still-running goal run.
+    /// Returns true when a pending finish was dropped.
+    @discardableResult
+    private func dropPendingFinishForContinuingGoal(threadId: AgentThreadID, newTurnId: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard var session = sessions[threadId],
+              session.goalActive,
+              let pending = session.pendingFinish,
+              pending.turnId != newTurnId
+        else { return false }
+        session.pendingFinish = nil
+        session.pendingFinishWatchdog?.cancel()
+        session.pendingFinishWatchdog = nil
+        session.turnReconcileGeneration &+= 1
+        sessions[threadId] = session
+        return true
     }
 
     /// Hold `.finished` until the thread reports idle, or until true quiet
@@ -2531,6 +2598,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         else {
             return false
         }
+        if let newerTurnId = Self.turnIds(fromThreadReadResponse: response).last,
+           newerTurnId != turnId,
+           dropPendingFinishForContinuingGoal(threadId: threadId, newTurnId: newerTurnId) {
+            // Active goal already moved to a newer turn: the completed turn we
+            // were reconciling is a finished iteration, not the end of the run.
+            return true
+        }
 
         // Prefer the withheld pending payload (preserves [[RC_AWAITING]] stamps).
         // When we deferred after turn/completed, turnCompleted was already
@@ -2602,6 +2676,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         sessions[threadId]?.status = status
         sessions[threadId]?.activeTurnId = nil
         sessions[threadId]?.threadStatusType = nil
+        sessions[threadId]?.goalActive = false
         sessions[threadId]?.pendingFinish = nil
         sessions[threadId]?.pendingFinishWatchdog?.cancel()
         sessions[threadId]?.pendingFinishWatchdog = nil
@@ -3733,6 +3808,18 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             contextTokens: contextTokens,
             semantics: .cumulative
         )
+    }
+
+    /// `thread/goal/updated` carries the full goal state; `goal.status` is
+    /// "active" while the loop runs. A missing status still means a goal exists.
+    private static func isActiveGoalStatus(from payload: [String: Any]) -> Bool {
+        let goal = payload["goal"] as? [String: Any] ?? payload
+        guard let status = string(goal, "status")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .nilIfEmpty
+        else { return true }
+        return status == "active" || status == "running" || status == "inprogress" || status == "in_progress"
     }
 
     private static func goalDetail(from payload: [String: Any]) -> String {

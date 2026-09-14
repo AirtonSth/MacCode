@@ -481,6 +481,144 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTFail("idle Codex thread status must release the deferred completed turn")
     }
 
+    func test_activeGoalKeepsRunOpenAcrossIterationTurnBoundaryUntilGoalCleared() async throws {
+        // WHY: a Codex `/goal` loop ends EVERY iteration with the same wire
+        // sequence a normal turn end has (status idle, turn/completed) and then
+        // starts the next turn in the same second. Live 2026-09-14: the run was
+        // marked completed at the first boundary (sidebar/composer idle) while
+        // Codex kept working 10+ more minutes under the dead run. The run must
+        // stay open across iterations and finish only once the goal is cleared.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "/goal bring PRs to merge-ready"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        func status(_ type: String) {
+            client.notificationHandler?("thread/status/changed", [
+                "threadId": "codex-thread-1",
+                "status": ["type": type]
+            ])
+        }
+        client.notificationHandler?("thread/goal/updated", [
+            "threadId": "codex-thread-1",
+            "goal": ["objective": "bring PRs to merge-ready", "status": "active"]
+        ])
+        status("active")
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "goal-turn-1", "status": "inProgress"]
+        ])
+        // Iteration boundary exactly as the app-server emits it.
+        status("idle")
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "goal-turn-1", "status": "completed"],
+            "finalMessage": "iteration 1 done"
+        ])
+        status("active")
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "goal-turn-2", "status": "inProgress"]
+        ])
+        // Authoritative thread/read: iteration 1 finished AND a newer turn exists.
+        // The reconcile probe must read that as "goal moved on", not "run over".
+        client.readResponse = ["thread": [
+            "id": "codex-thread-1",
+            "status": "active",
+            "turns": [
+                ["id": "goal-turn-1", "status": "completed"],
+                ["id": "goal-turn-2", "status": "inProgress"]
+            ]
+        ]]
+
+        try await Task.sleep(nanoseconds: 2_600_000_000) // past the 2s reconcile probe
+        let premature = await sink.finish
+        XCTAssertNil(premature, "a goal iteration's turn/completed must not finish the run while the goal is active")
+        let midEvents = await sink.snapshot()
+        XCTAssertTrue(midEvents.contains {
+            if case .turnCompleted(let turnId, let final) = $0 { return turnId == "goal-turn-1" && final == "iteration 1 done" }
+            return false
+        }, "the finished iteration must still complete its own turn in the transcript")
+        XCTAssertTrue(midEvents.contains {
+            if case .turnStarted(let turnId) = $0 { return turnId == "goal-turn-2" }
+            return false
+        }, "the next goal iteration must start inside the same run")
+
+        // Goal ends: last iteration completes, then the app-server clears the goal.
+        status("idle")
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "goal-turn-2", "status": "completed"],
+            "finalMessage": "goal achieved"
+        ])
+        client.notificationHandler?("thread/goal/cleared", ["threadId": "codex-thread-1"])
+        let finish = try await waitForFinish(in: sink, timeout: 3)
+        XCTAssertEqual(finish.0, .completed)
+        XCTAssertEqual(finish.1, "goal achieved", "the run's final must be the LAST iteration's answer")
+    }
+
+    func test_activeGoalFinishesFromAuthoritativeThreadReadWhenNoNewerTurnAppears() async throws {
+        // WHY: `thread/goal/cleared` has never been observed on the wire, so a
+        // goal-deferred finish must not depend on it. When the goal stops without
+        // a new turn, the existing thread/read reconcile must release the finish.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "/goal finish audit"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        client.notificationHandler?("thread/goal/updated", [
+            "threadId": "codex-thread-1",
+            "goal": ["objective": "finish audit", "status": "active"]
+        ])
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "goal-turn-1", "status": "inProgress"]
+        ])
+        client.readResponse = ["thread": [
+            "id": "codex-thread-1",
+            "status": "idle",
+            "turns": [["id": "goal-turn-1", "status": "completed"]]
+        ]]
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "idle"]
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "goal-turn-1", "status": "completed"],
+            "finalMessage": "audit finished"
+        ])
+
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let premature = await sink.finish
+        XCTAssertNil(premature, "an active goal must withhold the finish at turn/completed")
+
+        let finish = try await waitForFinish(in: sink, timeout: 5)
+        XCTAssertEqual(finish.0, .completed)
+        XCTAssertEqual(finish.1, "audit finished")
+        XCTAssertFalse(client.readCalls.isEmpty, "release must come from the authoritative thread/read reconcile")
+    }
+
     func test_pendingFinishInactivityFlushesWhenThreadNeverGoesIdle() async throws {
         // WHY: removing absolute max left wedged pendingFinish with no exit if
         // idle never arrives. Quiet inactivity must flush the withheld finish
