@@ -98,7 +98,10 @@ public final class AgentTranscriptPaintTick: ObservableObject {
 public final class AgentTranscriptState: ObservableObject {
     @Published public var messages: [AgentMessage] = [] {
         didSet {
-            if oldValue != messages { contentGeneration &+= 1 }
+            if oldValue != messages {
+                contentGeneration &+= 1
+                messagesGeneration &+= 1
+            }
             waitingBotPeerActivity = Self.hasWaitingBotPeerActivity(
                 in: messages,
                 threadId: selectedThreadIdForPeerFlag
@@ -136,6 +139,10 @@ public final class AgentTranscriptState: ObservableObject {
     /// (assistant bodies / finals / work presence). Tool-body-only stream
     /// assigns still publish `timeline` for paint, but must not rehash hide-set.
     public private(set) var contentGeneration: UInt64 = 0
+    /// AA-31: bumped only when `messages` actually changed, so per-message
+    /// content digests can be reused across the (far more frequent) timeline
+    /// content generations.
+    public private(set) var messagesGeneration: UInt64 = 0
 
     /// Hide-set depends on persisted assistant text, live assistant item
     /// bodies, finals, and whether a turn has any work item. Growing a tool
@@ -1949,18 +1956,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    /// PERF: O(1) id -> (turn,item) index over `timeline.turns`, rebuilt once after a
-    /// thread's replay. Lets post-replay item-location lookups avoid the O(turns x items)
-    /// scan that AssistantTimelineState.mutateItem performs. Behavior-preserving: it is a
-    /// derived view of `timeline.turns`, never a source of timeline content.
-    private(set) var timelineItemIndex = TimelineItemIndex(turns: [])
-
-    /// O(1) location of a timeline item by id, equivalent to a linear scan of
-    /// `timeline.turns`. Returns nil when the id is not present.
-    func timelineItemLocation(_ id: String) -> TimelineItemIndex.Location? {
-        timelineItemIndex.location(of: id)
-    }
-
     /// Wire Token Saver thread-savings footer. Host calls after init with the
     /// shared ledger + eligibility (enabled && subscribed) + graphify gate.
     /// Safe to call once per surface.
@@ -2332,10 +2327,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         normalizeInteractionModeForSelectedProvider()
         if let cachedTimeline = paintedTimelineByThread[id] {
             timeline = cachedTimeline
-            timelineItemIndex = TimelineItemIndex(turns: cachedTimeline.turns)
         } else {
             timeline = AssistantTimelineState()
-            timelineItemIndex = TimelineItemIndex(turns: [])
         }
         loadAllMessages(id)
         focusTick &+= 1
@@ -2663,9 +2656,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             timeline.apply(event)
         }
         refreshTokenSaverOptimizationStateFromTimeline(preservingExisting: true)
-        // PERF: rebuild the O(1) item index once over the fully-replayed timeline so
-        // subsequent item-location lookups skip the O(turns x items) linear scan.
-        timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
         applyCheckpointSummaries(bundle.checkpointSummaries)
         suppressPersistedFinalDuplicatedByTimeline()
         resetTimelineUpdateTick()
@@ -2775,7 +2765,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.rehydratePendingCallbacks(threadId: id)
                 self.lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: replayEvents)
                 self.refreshTokenSaverOptimizationStateFromTimeline(preservingExisting: true)
-                self.timelineItemIndex = TimelineItemIndex(turns: self.timeline.turns)
             } catch {
                 guard self.selectedThreadId == id,
                       self.selectThreadOpenGeneration == openGeneration else { return }
@@ -5911,7 +5900,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             timeline.enforceAggregateHotTextBudget()
             rehydrateDurableActiveState(threadId: id)
-            timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
             scheduleTimelineUpdateTick()
         }
         if let durable = try? coordinator.durableActiveRunChrome(threadId: id) {
@@ -6759,7 +6747,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         messageHistoryIsPartial = false
         cancelOlderMessageLoad()
         timeline = AssistantTimelineState()
-        timelineItemIndex = TimelineItemIndex(turns: [])
         resetTimelineUpdateTick()
         _ = streamEventBatch.drain()
         streamUIBackpressured = false
@@ -9334,7 +9321,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         rehydrateDurableActiveState(threadId: threadId)
         lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: events)
         refreshTokenSaverOptimizationStateFromTimeline()
-        timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
         scheduleTimelineUpdateTick()
     }
 
@@ -12371,24 +12357,33 @@ public struct AgentAppView: View {
         messages: [AgentMessage],
         timelineTurns: [AssistantTurnSnapshot]
     ) -> String {
+        var key = hiddenPersistedMessagesKeyPart(messages: messages)
+        key += "|t\(timelineTurns.count)"
+        for turn in timelineTurns {
+            key += hiddenPersistedTurnKeyPart(turn)
+        }
+        return key
+    }
+
+    nonisolated static func hiddenPersistedMessagesKeyPart(messages: [AgentMessage]) -> String {
         var key = "m\(messages.count)"
         for message in messages {
             if message.role != .assistant { continue }
             key += "|a\(message.id.value.uuidString):\(hiddenPersistedTextDigest(message.content))"
         }
-        key += "|t\(timelineTurns.count)"
-        for turn in timelineTurns {
-            var bodyHasher = Hasher()
-            var itemIds = ""
-            for item in turn.items where item.type == .assistantMessage {
-                bodyHasher.combine(item.body)
-                if !itemIds.isEmpty { itemIds += "," }
-                itemIds += item.id
-            }
-            let finalDigest = hiddenPersistedTextDigest(turn.finalAssistantMessage ?? "")
-            key += "|\(turn.turnId):f\(finalDigest):b\(bodyHasher.finalize()):i\(itemIds):fin\(turn.finished ? 1 : 0)"
-        }
         return key
+    }
+
+    nonisolated static func hiddenPersistedTurnKeyPart(_ turn: AssistantTurnSnapshot) -> String {
+        var bodyHasher = Hasher()
+        var itemIds = ""
+        for item in turn.items where item.type == .assistantMessage {
+            bodyHasher.combine(item.body)
+            if !itemIds.isEmpty { itemIds += "," }
+            itemIds += item.id
+        }
+        let finalDigest = hiddenPersistedTextDigest(turn.finalAssistantMessage ?? "")
+        return "|\(turn.turnId):f\(finalDigest):b\(bodyHasher.finalize()):i\(itemIds):fin\(turn.finished ? 1 : 0)"
     }
 
     /// Within-process content fingerprint for memo keys. Combines full text so
@@ -13543,6 +13538,53 @@ public struct AgentAppView: View {
     }
     private let hiddenPersistedAssistantMessageCache = HiddenPersistedAssistantMessageCache()
 
+    /// AA-31: `hiddenPersistedAssistantContentKey` hashed EVERY persisted
+    /// assistant message and every turn's assistant bodies on each content
+    /// generation — i.e. on every assistant-text delta, O(total transcript
+    /// text). Messages only change when `messagesGeneration` moves; finished
+    /// turns are immutable in practice (items.count + final length re-key
+    /// them). Only the live turn is re-hashed per delta.
+    private final class HiddenPersistedContentKeyCache {
+        var messagesGeneration: UInt64?
+        var messagesPart = ""
+        var turnParts: [String: (itemsCount: Int, finalCount: Int, part: String)] = [:]
+        var turnPartComputeCount = 0
+    }
+    private let hiddenPersistedContentKeyCache = HiddenPersistedContentKeyCache()
+
+    private func cachedHiddenPersistedAssistantContentKey() -> String {
+        let cache = hiddenPersistedContentKeyCache
+        let messagesGeneration = vm.transcriptState.messagesGeneration
+        if cache.messagesGeneration != messagesGeneration {
+            cache.messagesPart = Self.hiddenPersistedMessagesKeyPart(messages: vm.messages)
+            cache.messagesGeneration = messagesGeneration
+        }
+        let turns = vm.timeline.turns
+        var key = cache.messagesPart
+        key += "|t\(turns.count)"
+        for turn in turns {
+            let finalCount = turn.finalAssistantMessage?.utf8.count ?? -1
+            if turn.finished,
+               let cached = cache.turnParts[turn.turnId],
+               cached.itemsCount == turn.items.count,
+               cached.finalCount == finalCount {
+                key += cached.part
+                continue
+            }
+            let part = Self.hiddenPersistedTurnKeyPart(turn)
+            cache.turnPartComputeCount += 1
+            if turn.finished {
+                cache.turnParts[turn.turnId] = (turn.items.count, finalCount, part)
+            }
+            key += part
+        }
+        if cache.turnParts.count > turns.count + 64 {
+            let live = Set(turns.map(\.turnId))
+            cache.turnParts = cache.turnParts.filter { live.contains($0.key) }
+        }
+        return key
+    }
+
     private var persistedAssistantTexts: [String] {
         let key = "\(vm.messages.count)|\(vm.messages.last?.id.value.uuidString ?? "-")"
         if assistantTextsCache.key == key { return assistantTextsCache.texts }
@@ -13562,10 +13604,7 @@ public struct AgentAppView: View {
         if hiddenPersistedAssistantMessageCache.generation == generation {
             return visibleHiddenPersistedIDs(hiddenPersistedAssistantMessageCache.ids)
         }
-        let key = Self.hiddenPersistedAssistantContentKey(
-            messages: vm.messages,
-            timelineTurns: vm.timeline.turns
-        )
+        let key = cachedHiddenPersistedAssistantContentKey()
         if hiddenPersistedAssistantMessageCache.key == key {
             hiddenPersistedAssistantMessageCache.generation = generation
             return visibleHiddenPersistedIDs(hiddenPersistedAssistantMessageCache.ids)
@@ -14412,6 +14451,10 @@ public struct AgentAppView: View {
         let liveTurnIds = Set(vm.timeline.turns.map(\.turnId))
         if !expandedCompletedWorkTurns.isEmpty { expandedCompletedWorkTurns.formIntersection(liveTurnIds) }
         if !userCollapsedLiveWorkTurns.isEmpty { userCollapsedLiveWorkTurns.formIntersection(liveTurnIds) }
+        // AA-31: the only per-turn map that was never pruned.
+        if !workDisclosureRevealByTurn.isEmpty {
+            workDisclosureRevealByTurn = workDisclosureRevealByTurn.filter { liveTurnIds.contains($0.key) }
+        }
     }
 
     // UX-MAC_AGENT-BG-AWAIT / incomplete-turn: when a thread ends incomplete

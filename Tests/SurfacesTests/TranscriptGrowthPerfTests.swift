@@ -69,6 +69,59 @@ final class TranscriptGrowthPerfTests: XCTestCase {
         )
     }
 
+    // MARK: AA-31 / AA-29
+
+    func test_hiddenPersistedContentKeyPartsComposeToTheFullKey() {
+        // WHY: the view now caches the per-message part (by messagesGeneration)
+        // and per-finished-turn parts instead of re-hashing every assistant text
+        // on each delta. The composition must stay byte-identical to the
+        // single-pass key so the existing hide-set memo semantics hold.
+        let messages = [
+            AgentMessage(threadId: AgentThreadID(), role: .user, content: "question"),
+            AgentMessage(threadId: AgentThreadID(), role: .assistant, content: "answer one"),
+            AgentMessage(threadId: AgentThreadID(), role: .assistant, content: "answer two")
+        ]
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "t1"))
+        s.apply(.itemStarted(item: AssistantItem(id: "a", turnId: "t1", type: .assistantMessage, body: "answer one", startedAtMs: 1)))
+        s.apply(.turnCompleted(turnId: "t1", finalMessage: "answer one"))
+        s.apply(.turnStarted(turnId: "t2"))
+        s.apply(.itemStarted(item: AssistantItem(id: "b", turnId: "t2", type: .assistantMessage, body: "partial", startedAtMs: 2)))
+        var composed = AgentAppView.hiddenPersistedMessagesKeyPart(messages: messages)
+        composed += "|t\(s.turns.count)"
+        for turn in s.turns { composed += AgentAppView.hiddenPersistedTurnKeyPart(turn) }
+        XCTAssertEqual(
+            composed,
+            AgentAppView.hiddenPersistedAssistantContentKey(messages: messages, timelineTurns: s.turns)
+        )
+        // A finished turn's part is stable; the live turn's part follows its body.
+        let before = AgentAppView.hiddenPersistedTurnKeyPart(s.turns[1])
+        s.apply(.itemDelta(itemId: "b", bodyAppend: " more", outputAppend: nil, summary: nil))
+        XCTAssertNotEqual(AgentAppView.hiddenPersistedTurnKeyPart(s.turns[1]), before)
+    }
+
+    @MainActor
+    func test_messagesGenerationMovesOnlyWhenMessagesChange() {
+        let state = AgentTranscriptState()
+        let start = state.messagesGeneration
+        let message = AgentMessage(threadId: AgentThreadID(), role: .assistant, content: "hello")
+        state.messages = [message]
+        XCTAssertEqual(state.messagesGeneration, start + 1)
+        state.messages = [message]
+        XCTAssertEqual(state.messagesGeneration, start + 1, "re-assigning equal messages is not a change")
+        var timeline = AssistantTimelineState()
+        timeline.apply(.turnStarted(turnId: "t"))
+        state.timeline = timeline
+        XCTAssertEqual(state.messagesGeneration, start + 1, "timeline changes must not invalidate the message digests")
+    }
+
+    func test_viewModelNoLongerBuildsTheUnreadTimelineItemIndex() throws {
+        // WHY (AA-29): TimelineItemIndex was built O(total items) on every thread
+        // open, replay and refused-event path and never read in production.
+        let source = try String(contentsOf: sourceURL("Sources/Surfaces/AgentAppSurface.swift"), encoding: .utf8)
+        XCTAssertFalse(source.contains("timelineItemIndex"), "no per-open/replay index rebuilds without a reader")
+    }
+
     // MARK: AA-20 source pin
 
     func test_turnViewDoesNotComputeTheFullTurnRenderModel() throws {
