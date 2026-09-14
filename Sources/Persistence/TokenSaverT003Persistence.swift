@@ -2596,7 +2596,21 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
     private let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }
 
+    /// EV-23: process-wide write revision. Admission decisions memoized per run
+    /// include it in their key, so a lane promotion/opt-out written by anyone
+    /// (app or test) invalidates every cached decision exactly.
+    private static let revisionLock = NSLock()
+    nonisolated(unsafe) private static var revisionValue: UInt64 = 0
+    public static var revision: UInt64 {
+        revisionLock.lock(); defer { revisionLock.unlock() }
+        return revisionValue
+    }
+    private static func bumpRevision() {
+        revisionLock.lock(); revisionValue &+= 1; revisionLock.unlock()
+    }
+
     public func upsert(_ record: TokenSaverLaneStateRecord, now: Date = Date()) throws {
+        Self.bumpRevision()
         try db.performSync { database in
             let statement = try database.prepare("""
                 INSERT INTO token_saver_lane_state
@@ -2718,6 +2732,7 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
     }
 
     public func ensureDefaults(projectID: String) throws {
+        Self.bumpRevision()
         try db.performSync { database in
             try database.transaction {
                 try self.insertDefaults(database: database, projectID: projectID)
@@ -2774,6 +2789,7 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
     }
 
     public func setOptOut(projectID: String, optedOut: Bool, now: Date = Date()) throws {
+        Self.bumpRevision()
         try db.performSync { database in
             try database.transaction {
                 try self.insertDefaults(database: database, projectID: projectID, now: now)
@@ -2799,6 +2815,7 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
     }
 
     public func setRetentionDays(projectID: String, days: Int, now: Date = Date()) throws {
+        Self.bumpRevision()
         try db.performSync { database in
             try database.transaction {
                 try self.insertDefaults(database: database, projectID: projectID, now: now)
@@ -2815,6 +2832,7 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
     }
 
     public func forceVerbatim(projectID: String, now: Date = Date()) throws {
+        Self.bumpRevision()
         try db.performSync { database in
             try database.transaction {
                 try self.insertDefaults(database: database, projectID: projectID, now: now)

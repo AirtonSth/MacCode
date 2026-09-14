@@ -531,7 +531,21 @@ public final class AgentThreadRepository {
         try db.withLiveAgentThreadBindings(body)
     }
 
+    /// EV-23: bumped on writes that can change a thread's identity (project,
+    /// workspace, run-as-user) — insert/replace, delete, and the explicit
+    /// identity update. Per-run admission memos key on it.
+    private static let identityRevisionLock = NSLock()
+    nonisolated(unsafe) private static var identityRevisionValue: UInt64 = 0
+    public static var identityRevision: UInt64 {
+        identityRevisionLock.lock(); defer { identityRevisionLock.unlock() }
+        return identityRevisionValue
+    }
+    static func bumpIdentityRevision() {
+        identityRevisionLock.lock(); identityRevisionValue &+= 1; identityRevisionLock.unlock()
+    }
+
     public func upsert(_ t: AgentThread) throws {
+        Self.bumpIdentityRevision()
         let st = try db.prepare("""
             INSERT INTO agent_threads(id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json)
             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1565,6 +1579,7 @@ public final class AgentThreadRepository {
     }
 
     public func delete(id: AgentThreadID) throws {
+        Self.bumpIdentityRevision()
         let st = try db.prepare("DELETE FROM agent_threads WHERE id = ?;")
         try st.bind(1, id.value.uuidString)
         _ = try st.step()
@@ -2180,6 +2195,7 @@ public final class AgentThreadRepository {
         interactionMode: AgentInteractionMode,
         at date: Date = Date()
     ) throws -> Bool {
+        Self.bumpIdentityRevision()
         setPickerConfigCountForTesting += 1
         let st = try db.prepare("""
             UPDATE agent_threads
@@ -6010,11 +6026,14 @@ public final class AgentRunRepository: @unchecked Sendable {
         createdAt: String? = nil
     ) throws {
         let boundedPayload = try boundedProviderPayload(event.payloadJSON)
-        let known = try knownProviderEventIds(db: db, threadId: threadId)
+        // EV-24: do not keep a reference to the cached Set alive across the
+        // insert below — `rememberProviderEventId` mutates the dictionary's Set
+        // and a live copy forced a full copy-on-write of every id on EVERY event.
+        let isKnown = try knownProviderEventIds(db: db, threadId: threadId).contains(event.id)
         // First write of a freshly minted event_id cannot collide. Retry and
         // relaunch still SELECT so matching bytes stay idempotent and a
         // different identity still fails loud.
-        if known.contains(event.id) {
+        if isKnown {
             try probeExistingProviderEventIdentity(
                 db: db,
                 threadId: threadId,
@@ -6070,12 +6089,27 @@ public final class AgentRunRepository: @unchecked Sendable {
         return ids
     }
 
+    /// EV-24: retention keeps ~100 provider rows per thread but the id cache
+    /// kept every id ever inserted for the run. Above this bound the entry is
+    /// dropped and re-seeded from the (retained) rows on the next lookup.
+    static let knownProviderEventIdsPerThreadLimit = 2_000
+
     private func rememberProviderEventId(threadId: AgentThreadID, eventId: String) {
         let key = threadId.value.uuidString
         committedProviderEventLock.lock()
         defer { committedProviderEventLock.unlock() }
-        guard knownProviderEventIdsByThread[key] != nil else { return }
+        guard let count = knownProviderEventIdsByThread[key]?.count else { return }
+        if count >= Self.knownProviderEventIdsPerThreadLimit {
+            knownProviderEventIdsByThread[key] = nil
+            return
+        }
         knownProviderEventIdsByThread[key]?.insert(eventId)
+    }
+
+    func knownProviderEventIdCountForTesting(threadId: AgentThreadID) -> Int? {
+        committedProviderEventLock.lock()
+        defer { committedProviderEventLock.unlock() }
+        return knownProviderEventIdsByThread[threadId.value.uuidString]?.count
     }
 
     private func probeExistingProviderEventIdentity(
