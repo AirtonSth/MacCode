@@ -751,7 +751,38 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     private var exactRunWaiters: [AgentRunID: [CheckedContinuation<AgentRun?, Never>]] = [:]
     private var observedTerminalRuns: [AgentRunID: AgentRun] = [:]
     private var agentAppDispatchWaiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
-    private var lastPeerProgressByRunID: [AgentRunID: Date] = [:]
+    /// EV-21: stamped from the coordinator's stream thread for EVERY event of
+    /// EVERY run (~90/s with 3 runs). It used to be MainActor state written via
+    /// `Task { @MainActor }`, i.e. one main-queue hop per token. A lock-guarded
+    /// box lets the stream thread write in place; only `latestPeerProgress`
+    /// reads it, on the main actor.
+    private final class PeerProgressStamps: @unchecked Sendable {
+        private let lock = NSLock()
+        private var dates: [AgentRunID: Date] = [:]
+
+        func stamp(_ run: AgentRunID) {
+            lock.lock(); defer { lock.unlock() }
+            dates[run] = Date()
+        }
+
+        func date(for run: AgentRunID) -> Date? {
+            lock.lock(); defer { lock.unlock() }
+            return dates[run]
+        }
+
+        func remove(_ run: AgentRunID) {
+            lock.lock(); defer { lock.unlock() }
+            dates.removeValue(forKey: run)
+        }
+
+        var countForTesting: Int {
+            lock.lock(); defer { lock.unlock() }
+            return dates.count
+        }
+    }
+
+    private nonisolated let peerProgress = PeerProgressStamps()
+    var peerProgressStampCountForTesting: Int { peerProgress.countForTesting }
     private var deletionFences: [UUID: DeletionFence] = [:]
     private var deletionResolutionWaiters: [UUID: [CheckedContinuation<Bool, Never>]] = [:]
     private var retiredActivityIDs: Set<UUID> = []
@@ -2482,7 +2513,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             case .peerPrepared, .peerRunning:
                 dates.append(handoff.createdAt)
                 if let peerRunID = handoff.peerRunID,
-                   let stamped = lastPeerProgressByRunID[peerRunID] {
+                   let stamped = peerProgress.date(for: peerRunID) {
                     dates.append(stamped)
                 }
                 if let threadID = handoff.peerThreadID,
@@ -2502,9 +2533,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         run: AgentRunID,
         threadId: AgentThreadID
     ) {
-        Task { @MainActor [weak self] in
-            self?.lastPeerProgressByRunID[run] = Date()
-        }
+        // EV-21: no MainActor hop per stream event; write in place.
+        peerProgress.stamp(run)
     }
 
     nonisolated func runCoordinator(
@@ -2515,6 +2545,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         finalMessage: String?,
         providerThreadId: String?
     ) {
+        peerProgress.remove(runId)
         Task { @MainActor [weak self] in
             self?.stopOrphanedPeerRuns(hostRunID: runId, status: status)
             self?.resolveExactRunWaiters(
@@ -4122,30 +4153,38 @@ public final class BotsViewModel: ObservableObject {
         let ownerBotID = selectedBotID
         let ownerConversationID = selectedConversation?.id
         let threadId = selectedConversation?.linkedAgentThreadID
-        let assistantChars = deskMessages
-            .filter { $0.role == .assistant }
-            .reduce(0) { $0 + $1.text.utf8.count }
-        let turnCount = max(
-            deskLiveTimeline.turns.count,
-            deskMessages.filter { $0.role == .user }.count
-        )
+        // PL-02: snapshot on the MainActor, reduce + read off-main. `Task { }`
+        // inside a @MainActor class inherits the actor, so the previous "off-main"
+        // body ran three SettingsStore loads + the O(messages) reduce on main on
+        // every `.rc2TokenSaverUsageChanged` (≥ every 2 s with active runs).
+        let messageSnapshot = deskMessages
+        let liveTurnCount = deskLiveTimeline.turns.count
         let usage = deskLiveTimeline.tokenUsage
-        let observation = TokenSaverThreadFooterReload.Observation(
-            assistantChars: assistantChars,
-            turnCount: turnCount,
-            cacheReadInputTokens: usage?.cacheReadInputTokens ?? 0,
-            providerRawTokens: usage.map { max(0, $0.inputTokens) + max(0, $0.outputTokens) } ?? 0,
-            providerBilledTokenUnits: usage.map(\.billedTotalTokenUnits).flatMap { $0 > 0 ? $0 : nil },
-            autoRoutingActive: deskRouting.routingMode == .auto
-        )
+        let autoRoutingActive = deskRouting.routingMode == .auto
         let db = context.db
         let settingsRepo = context.settingsRepo
         let savingsRepo = context.tokenSaverSavingsRepo
         let graphifyRepo = context.graphifyUsageRepo
-        tokenSaverFooterReloadTask = Task { [weak self] in
-            let eligible = SettingsStore(db: db).load().tokenSaverEnabled
+        tokenSaverFooterReloadTask = Task.detached(priority: .utility) { [weak self] in
+            let assistantChars = messageSnapshot
+                .filter { $0.role == .assistant }
+                .reduce(0) { $0 + $1.text.utf8.count }
+            let turnCount = max(
+                liveTurnCount,
+                messageSnapshot.filter { $0.role == .user }.count
+            )
+            let observation = TokenSaverThreadFooterReload.Observation(
+                assistantChars: assistantChars,
+                turnCount: turnCount,
+                cacheReadInputTokens: usage?.cacheReadInputTokens ?? 0,
+                providerRawTokens: usage.map { max(0, $0.inputTokens) + max(0, $0.outputTokens) } ?? 0,
+                providerBilledTokenUnits: usage.map(\.billedTotalTokenUnits).flatMap { $0 > 0 ? $0 : nil },
+                autoRoutingActive: autoRoutingActive
+            )
+            let settings = SettingsStore(db: db).load()
+            let eligible = settings.tokenSaverEnabled
                 && PrivateAccountSessionStore(repo: settingsRepo).load()?.user.subscribed == true
-            let graphifyActive = SettingsStore(db: db).load().isGraphifyRuntimeActive
+            let graphifyActive = settings.isGraphifyRuntimeActive
             let total = await TokenSaverThreadFooterReload.loadDeliveredTotal(
                 eligible: eligible,
                 threadId: threadId,

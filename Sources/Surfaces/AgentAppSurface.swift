@@ -2031,9 +2031,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let providerRaw = usage.map { max(0, $0.inputTokens) + max(0, $0.outputTokens) } ?? 0
         let providerBilled = usage.map { $0.billedTotalTokenUnits } ?? 0
         let autoRouting = routingMode == .auto
-        tokenSaverFooterReloadTask = Task { [weak self] in
-            // Eligibility/settings reads off-main so a savings burst does not
-            // stack cold SettingsStore performSync on the MainActor.
+        // PL-02: `Task { }` here inherits the MainActor, so the "off-main" reads
+        // below ran on main. Detach so eligibility/settings/ledger reads and the
+        // O(messages) reduce never touch the main thread.
+        tokenSaverFooterReloadTask = Task.detached(priority: .utility) { [weak self] in
             let assistantChars = messageSnapshot
                 .filter { $0.role == .assistant }
                 .reduce(0) { $0 + $1.content.utf8.count }
