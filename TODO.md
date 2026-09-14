@@ -95,7 +95,7 @@ Auditoria de código de 2026-09-14 (leitura de `AgentAppSurface.swift`, `Assista
   Fazer: `@autoclosure`/lookup após o guard; índice `[AgentMessageID: AgentMessage]`; guardar o conjunto filtrado junto de `hiddenPersistedAssistantMessageCache`.
 
 - [x] **AA-23 · P1 · por delta — `AgentChatLiveTurnView` recompõe e reagrupa "Ran N commands" do zero no turno vivo, sem cap de items.**
-  **FEITO `ef5e7fef`** — só a parte do memo de `toolGroupSummary` (chave por hash antes do scan; verbos só em miss). Cap de items no turno vivo NÃO feito (mudaria o render do Bots também; decisão do dono).
+  **FEITO `ef5e7fef`** — só a parte do memo de `toolGroupSummary` (chave por hash antes do scan; verbos só em miss). Cap de items no turno vivo FEITO em `afe8c14b`: `AgentChatLiveTurnView` pinta os 48 blocos mais novos (`AgentWorkDisclosureLayout.expandedPaintWindow`) e dobra os anteriores atrás de "Show earlier steps (N hidden)" — mesma política de revelação que o transcript já usa; vale para Agent App e Bots. Teste `test_liveTurnPaintsANewestWindowOfWorkBlocksWithEarlierStepsBehindAReveal`.
   `AgentChatLiveTurnChrome.swift:866`: `compose(turn)` + `workBlocks` por delta; `==` (`:852`) compara `finalAssistantMessage` inteiro; caps `liveTurnRenderableItemLimit = 48` / `visibleLiveTurnItems` (`:12403`, `:12525`) só existem no caminho morto de AA-20 — turno com 300 tool calls monta 300 linhas. `toolGroupSummary` (`:319`) monta a chave memo com `ids.joined` (~11 KB) **antes** do lookup.
   Fazer: aplicar `visibleLiveTurnItems`/`liveRenderableCopy` a `composition.activity` quando `live`; chave do memo por `(count, first.id, last.id, last.state)` antes do scan; `==` comparar `utf8.count` do final antes do texto.
 
@@ -152,7 +152,8 @@ Auditoria de código de 2026-09-14 (`BotsWindow.swift`, `BotsDeskFollowThrough.s
   `BotsWindow.swift:3999-4007` → `BotsDeskFollowThrough.swift:147-186`, lido no body em `:11979`. `messageDuplicatesTurn` (`AgentChatLiveTurnChrome.swift:178-184`) itera todos os turnos, `assistantBodies` + `trimming`, `assistantTextsMatch` (`:164`) com `a.contains(b) || b.contains(a)`; `compose(turn)` roda ~4× por turno por passada (`:163-171`, `deskPaintsLiveTurnChrome` 2× em `:4004-4005`); `sorted(by: turnSortDate)` recalcula `items.min` dentro do comparador (`:176`, `AgentChatLiveTurnChrome.swift:281`); `composeConversationOrder:262` reordena tudo; `BotDeskTimelineItem.createdAt:2580` idem.
   Fazer: `deskTimeline` como stored, recomputado só quando `deskMessages`/`deskWorkLog`/estrutura de turnos mudar; `sortDate` pré-computado por turno; `compose` 1× por turno em dicionário por `turnId`; dedupe por `Set` normalizado (o `shouldHideAssistantOutput:209` já faz O(1)).
 
-- [ ] **BT-23 · P1 · 2 s — o watch do turno vivo replays até 4.096 eventos do SQLite no main a cada 2 s depois que um turno longo estoura o budget observado.**
+- [x] **BT-23 · P1 · 2 s — o watch do turno vivo replays até 4.096 eventos do SQLite no main a cada 2 s depois que um turno longo estoura o budget observado.**
+  **FEITO `59d57716`** — fetch + `timelineByReplaying` em `Task.detached` a partir do watch, adoção no main com guarda de geração (`deskLiveReplayGeneration`); caminho síncrono mantido para seleção/restores/terminal. Teste `test_deskLiveTurnWatchFetchesTheHotWindowOffMainAndAdoptsItOnMain`.
   `BotsWindow.swift:8795-8826` → `applyDeskLiveReplay:8649` → `:8713-8715` `coordinator.latestStreamEvents` (`AgentRunCoordinator.swift:5307`, até 4.096 eventos / 32 MiB, decode síncrono no MainActor) + `timelineByReplaying`. O caminho incremental (`:8669-8711`) é desligado quando `liveObservedEventOverflowThreads` contém o thread (`:8780`) — que é exatamente o turno grande; fica no replay cheio até `clearDeskObservedEvents`.
   Fazer: fetch+replay em `Task.detached` com generation; overflow recuperável (re-seed do cursor pelo próximo sufixo atestado).
 
@@ -241,10 +242,8 @@ Auditoria de código de 2026-09-14 (`AgentRunCoordinator.swift`, `AppContext.swi
 ## Adiados nesta rodada (com motivo)
 
 - **PL-05 / EV-25(b)** — tirar `token_saver.digest` e `agent.account.usage.refresh` da tabela `events`: depende de confirmar no app iOS que `events.recent` não é usado para eles (decisão do dono). O dedupe do digest (EV-25) já derruba a maior parte do volume.
-- **BT-23** — replay de até 4.096 eventos no main a cada 2 s: o watch só roda quando não há push nos últimos 1 s (`lastDeskStreamPushAt`), então não dispara durante streaming ativo; o caminho de cursor/observed events é delicado e precisa de teste de corrida próprio antes de ir off-main.
 - **BT-20 (parte estrutural)** — `BotsTranscriptState` separado do `BotsViewModel`: refator grande; a versão lite já reduz a 1 publish por lote.
 - **BT-26 / BT-29 / AA-29 / AA-30 / AA-31** — memória e limpezas P2 sem evidência de custo por frame; fazer junto com uma amostra de memória em sessão longa.
-- **AA-23 (cap de items do turno vivo)** — muda o que o Bots renderiza para turnos com centenas de tool calls; precisa decisão de UX.
 - **EV-26** — `publishAsync` no EventBus: após EV-25 o publish do digest a partir do main ficou raro; sem evidência restante.
 - **AA-32 (parte 2)** — chave do cache de markdown por identidade estável (id da mensagem + `messagesGeneration`; id do item + `utf8.count`) em vez de hash do texto: só vale medir com histórico revelado durante scroll.
 - **EV-27 / EV-28** — SUM de payload por thread e retenção de `token_saver_attempt_events`: mudam schema/retention; precisam de bump em `Schema` + teste de migração.
