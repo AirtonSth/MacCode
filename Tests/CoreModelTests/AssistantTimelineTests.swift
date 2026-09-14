@@ -2,6 +2,36 @@ import XCTest
 @testable import CoreModel
 
 final class AssistantTimelineTests: XCTestCase {
+    func test_appendPathTurnLookupsDoNotScaleWithTurnCount() {
+        // WHY (AA-27): turnStarted / itemStarted / turnCompleted located the turn
+        // with an oldest-first `firstIndex`, so every event in a 500-turn thread
+        // (and every event of the replay when that thread is reopened) walked
+        // ~500 turn ids. The target is the newest turn; newest-first is O(1).
+        var s = AssistantTimelineState()
+        let priorTurns = 500
+        for turn in 0..<priorTurns {
+            let turnId = "turn-\(turn)"
+            s.apply(.turnStarted(turnId: turnId))
+            s.apply(.itemStarted(item: AssistantItem(id: "item-\(turn)", turnId: turnId, type: .tool, startedAtMs: Int64(turn))))
+            s.apply(.turnCompleted(turnId: turnId, finalMessage: nil))
+        }
+        AssistantTimelineState.turnLookupComparisonsForTesting = 0
+        let events = 300
+        let live = "turn-live"
+        s.apply(.turnStarted(turnId: live))
+        for i in 0..<events {
+            s.apply(.itemStarted(item: AssistantItem(id: "live-\(i)", turnId: live, type: .tool, startedAtMs: Int64(i))))
+        }
+        s.apply(.turnCompleted(turnId: live, finalMessage: "done"))
+        let comparisons = AssistantTimelineState.turnLookupComparisonsForTesting
+        // ensureTurn + itemStarted lookup per event ≈ 2 comparisons; oldest-first cost ≈ events × priorTurns.
+        XCTAssertLessThanOrEqual(comparisons, (events + 2) * 4,
+                                 "turn lookup on the append path must not scale with the number of prior turns")
+        XCTAssertEqual(s.turns.count, priorTurns + 1)
+        XCTAssertEqual(s.turns.last?.items.count, events, "every item must still land on the live turn")
+        XCTAssertEqual(s.turns.last?.finalAssistantMessage, "done")
+    }
+
     func test_legacyAssistantItemWithoutDistillMetadataStillDecodes() throws {
         // WHY: adding host-owned presentation truth must not strand persisted
         // transcripts written before the metadata field existed.

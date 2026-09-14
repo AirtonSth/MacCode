@@ -1477,14 +1477,14 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             ensureTurn(tid, startedAtMs: nowMs)
         case .itemStarted(let item):
             ensureTurn(item.turnId)
-            if let idx = turns.firstIndex(where: { $0.turnId == item.turnId }) {
+            if let idx = turnIndex(item.turnId) {
                 let deltaKey = Self.pendingItemDeltaKey(itemId: item.id)
                 let pending = pendingItemDeltas.removeValue(forKey: deltaKey)
                 if pending != nil { pendingItemDeltaOrder.removeAll { $0 == deltaKey } }
                 let metadataKey = Self.pendingHostMetadataKey(turnId: item.turnId, itemId: item.id)
                 let pendingMetadata = pendingItemDeltas.removeValue(forKey: metadataKey)
                 if pendingMetadata != nil { pendingItemDeltaOrder.removeAll { $0 == metadataKey } }
-                if let itemIndex = turns[idx].items.firstIndex(where: { $0.id == item.id }) {
+                if let itemIndex = itemIndex(item.id, inTurn: idx) {
                     let existing = turns[idx].items[itemIndex]
                     if existing.distillApplied == true {
                         // Host attestation binds to the exact terminal bytes. A
@@ -1592,7 +1592,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                 recordActivity(for: item, state: item.state)
             }
         case .turnCompleted(let tid, let final):
-            if let idx = turns.firstIndex(where: { $0.turnId == tid }) {
+            if let idx = turnIndex(tid) {
                 turns[idx].finalAssistantMessage = final.map { Self.cappedText($0, limit: Self.liveTextLimit) }
                 turns[idx].finished = true
             }
@@ -1726,8 +1726,33 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         }
     }
 
+    /// AA-27: turn/item lookups on the append path used oldest-first
+    /// `firstIndex`, i.e. O(turns) per turnStarted/itemStarted/turnCompleted and
+    /// O(items) per itemStarted (O(items²) per turn, paid again on every thread
+    /// open replay). The target is essentially always the newest turn/item and
+    /// ids are unique, so newest-first resolves the same index.
+    private func turnIndex(_ tid: String) -> Int? {
+        for index in turns.indices.reversed() {
+            #if DEBUG
+            Self.turnLookupComparisonsForTesting &+= 1
+            #endif
+            if turns[index].turnId == tid { return index }
+        }
+        return nil
+    }
+
+    private func itemIndex(_ iid: String, inTurn turnIndex: Int) -> Int? {
+        for index in turns[turnIndex].items.indices.reversed() {
+            #if DEBUG
+            Self.itemLookupComparisonsForTesting &+= 1
+            #endif
+            if turns[turnIndex].items[index].id == iid { return index }
+        }
+        return nil
+    }
+
     private mutating func ensureTurn(_ tid: String, startedAtMs: Int64? = nil) {
-        if let idx = turns.firstIndex(where: { $0.turnId == tid }) {
+        if let idx = turnIndex(tid) {
             // Keep the earliest start time if turnStarted arrives after itemStarted.
             if turns[idx].startedAtMs == nil, let startedAtMs {
                 turns[idx].startedAtMs = startedAtMs
@@ -2003,6 +2028,8 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     /// release builds carry no shared-mutable write on the streaming path (apply()
     /// runs on both the UI main actor and the runner's background thread).
     nonisolated(unsafe) static var itemLookupComparisonsForTesting = 0
+    /// AA-27 seam: comparisons spent locating a turn by id on the append path.
+    nonisolated(unsafe) static var turnLookupComparisonsForTesting = 0
 
     /// Test-only observability for the `cappedText` grapheme walk (F11). A perf unit
     /// test resets this and asserts that under-limit text takes the O(1) byte fast
