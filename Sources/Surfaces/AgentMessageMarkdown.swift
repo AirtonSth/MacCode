@@ -81,6 +81,15 @@ enum AgentMessageMarkdown {
 
     /// CH-08: key by utf8 count + 64-bit hash so SwiftUI body does not rehash
     /// the full NSString on every pass.
+    /// AA-28: one UTF-8 hash of the source text, handed down to the NSTextView
+    /// wrapper as the row's content identity (see `AgentLinkedAttributedText`).
+    static func sourceFingerprint(for text: String) -> Int {
+        var hasher = Hasher()
+        hasher.combine(text.utf8.count)
+        hasher.combine(text)
+        return hasher.finalize()
+    }
+
     static func cacheKey(for text: String) -> NSString {
         var hasher = Hasher()
         hasher.combine(text.utf8.count)

@@ -66,7 +66,11 @@ struct AgentLinkedInlineText: View {
             font: Self.nsFont(size: fontSize, weight: fontWeight, monospaced: monospaced),
             textColor: textColor,
             lineFragmentPadding: lineFragmentPadding,
-            lineSpacing: lineSpacing
+            lineSpacing: lineSpacing,
+            // AA-28: identity of the SOURCE text (one UTF-8 hash) so the text
+            // view can skip the per-pass grapheme count + AttributedString
+            // deep-equality on unchanged rows.
+            sourceFingerprint: AgentMessageMarkdown.sourceFingerprint(for: text)
         )
     }
 
@@ -124,6 +128,10 @@ struct AgentLinkedAttributedText: View {
     let lineFragmentPadding: CGFloat
     let lineSpacing: CGFloat
     var maximumNumberOfLines: Int? = nil
+    /// Optional content identity of `attributed`'s source (AA-28). When set,
+    /// equal fingerprints mean equal content and the representable skips the
+    /// O(text) `AttributedString` comparison on every layout pass.
+    var sourceFingerprint: Int? = nil
 
     @Environment(\.openURL) private var openURL
 
@@ -135,6 +143,7 @@ struct AgentLinkedAttributedText: View {
             lineFragmentPadding: lineFragmentPadding,
             lineSpacing: lineSpacing,
             maximumNumberOfLines: maximumNumberOfLines,
+            sourceFingerprint: sourceFingerprint,
             openURL: openURL
         )
     }
@@ -155,6 +164,9 @@ struct AgentLinkedInlineTextAppliedState {
     let maximumNumberOfLines: Int?
     let lineFragmentPadding: CGFloat
     let sourceFingerprint: Int
+    /// True when `sourceFingerprint` hashes the source CONTENT (AA-28), not
+    /// just its length; only then may equal fingerprints skip the deep compare.
+    let contentFingerprinted: Bool
 
     init(
         attributed: AttributedString,
@@ -163,7 +175,8 @@ struct AgentLinkedInlineTextAppliedState {
         lineSpacing: CGFloat,
         maximumNumberOfLines: Int?,
         lineFragmentPadding: CGFloat,
-        sourceFingerprint: Int = 0
+        sourceFingerprint: Int = 0,
+        contentFingerprinted: Bool = false
     ) {
         self.attributed = attributed
         self.font = font
@@ -172,6 +185,7 @@ struct AgentLinkedInlineTextAppliedState {
         self.maximumNumberOfLines = maximumNumberOfLines
         self.lineFragmentPadding = lineFragmentPadding
         self.sourceFingerprint = sourceFingerprint
+        self.contentFingerprinted = contentFingerprinted
     }
 }
 
@@ -202,8 +216,12 @@ struct AgentLinkedInlineTextUpdatePlan: Equatable {
                 lineFragmentPaddingDirty: true
             )
         }
+        // AA-28: with content fingerprints on both sides, equal fingerprints ARE
+        // equal content; the O(text) AttributedString compare only remains for
+        // callers that did not provide one (length-only fingerprint).
         let attributedChanged = previous.sourceFingerprint != next.sourceFingerprint
-            || previous.attributed != next.attributed
+            || (!(previous.contentFingerprinted && next.contentFingerprinted)
+                && previous.attributed != next.attributed)
         let fontChanged = !previous.font.isEqual(next.font)
         let textColorChanged = !previous.textColor.isEqual(next.textColor)
         let lineSpacingChanged = previous.lineSpacing != next.lineSpacing
@@ -227,6 +245,7 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
     let lineFragmentPadding: CGFloat
     let lineSpacing: CGFloat
     var maximumNumberOfLines: Int? = nil
+    var sourceFingerprint: Int? = nil
     let openURL: OpenURLAction
 
     func makeCoordinator() -> Coordinator {
@@ -305,7 +324,11 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
     private func apply(to tv: IntrinsicHeightTextView, context: Context) {
         tv.clipsToBounds = true
         var hasher = Hasher()
-        hasher.combine(attributed.characters.count)
+        if let sourceFingerprint {
+            hasher.combine(sourceFingerprint)
+        } else {
+            hasher.combine(attributed.characters.count)
+        }
         hasher.combine(font.pointSize)
         hasher.combine(lineSpacing)
         hasher.combine(maximumNumberOfLines)
@@ -317,7 +340,8 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
             lineSpacing: lineSpacing,
             maximumNumberOfLines: maximumNumberOfLines,
             lineFragmentPadding: lineFragmentPadding,
-            sourceFingerprint: hasher.finalize()
+            sourceFingerprint: hasher.finalize(),
+            contentFingerprinted: sourceFingerprint != nil
         )
         let plan = AgentLinkedInlineTextUpdatePlan.make(
             previous: context.coordinator.applied,
