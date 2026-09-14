@@ -5193,8 +5193,9 @@ public final class AppContext {
         pendingUsageByRun[snapshot.runId] = pending
 
         if succeeded {
-            recomputeTokenSaverDailyEconomyToday()
-            scheduleTokenSaverUsageChangedNotification()
+            // PL-01: recompute off-main (coalesced); the usage-changed
+            // notification is posted only after the day row is upserted.
+            scheduleTokenSaverDailyEconomyRecompute(notifyUsageChanged: true)
         }
 
         let target = Self.effectiveUsage(pending)
@@ -5391,8 +5392,7 @@ public final class AppContext {
                 governance: governance.jsonString(),
                 threadID: threadId.value.uuidString
             )
-            recomputeTokenSaverDailyEconomyToday()
-            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+            scheduleTokenSaverDailyEconomyRecompute(notifyUsageChanged: true)
         } catch {
             NSLog("RemoteCode Token Saver sidecar savings persist failed: \(error)")
         }
@@ -5404,15 +5404,64 @@ public final class AppContext {
     }
 
     /// Persist today's credible total so Week = Σ(daily.total_credible).
+    /// Synchronous (main-thread) variant kept for boot/tests; production
+    /// triggers go through `scheduleTokenSaverDailyEconomyRecompute`.
     public func recomputeTokenSaverDailyEconomyToday(now: Date = Date()) {
+        tokenSaverDailyEconomySharedSnapshotLoadsForTesting += 1
         let snapshot = loadTokenSaverDailyEconomySharedSnapshot()
         recomputeTokenSaverDailyEconomy(for: now, now: now, snapshot: snapshot)
+    }
+
+    private var tokenSaverDailyEconomyRecomputeTask: Task<Void, Never>?
+    private var tokenSaverDailyEconomyRecomputeDirty = false
+    private var tokenSaverDailyEconomyRecomputeNotifyPending = false
+    private static let tokenSaverDailyEconomyRecomputeDebounce: TimeInterval = 1.0
+    var tokenSaverDailyEconomyRecomputeDebounceForTesting: TimeInterval?
+    var tokenSaverDailyEconomyOffMainRecomputeCountForTesting = 0
+
+    /// PL-01 / EV-22: every trigger (usage flush per run every 0.75 s, Graphify
+    /// item settle/fail, sidecar savings) ran the 7-read + upsert recompute
+    /// synchronously on the main thread, waiting on the SQLite lock behind N
+    /// writers — ~16% of the main thread in the 2026-09-14 live sample.
+    /// Coalesce all triggers into one debounced recompute that runs off-main;
+    /// only the usage-changed notification hops back, and only after the day
+    /// row is upserted so footers read the new value.
+    func scheduleTokenSaverDailyEconomyRecompute(notifyUsageChanged: Bool = false) {
+        tokenSaverDailyEconomyRecomputeDirty = true
+        tokenSaverDailyEconomyRecomputeNotifyPending =
+            tokenSaverDailyEconomyRecomputeNotifyPending || notifyUsageChanged
+        guard tokenSaverDailyEconomyRecomputeTask == nil else { return }
+        let delay = tokenSaverDailyEconomyRecomputeDebounceForTesting
+            ?? Self.tokenSaverDailyEconomyRecomputeDebounce
+        tokenSaverDailyEconomyRecomputeTask = Task { [weak self] in
+            while true {
+                guard let self, self.tokenSaverDailyEconomyRecomputeDirty else { break }
+                self.tokenSaverDailyEconomyRecomputeDirty = false
+                if delay > 0 {
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                }
+                self.tokenSaverDailyEconomySharedSnapshotLoadsForTesting += 1
+                let now = Date()
+                await Task.detached(priority: .utility) { [self] in
+                    let snapshot = self.loadTokenSaverDailyEconomySharedSnapshot()
+                    self.recomputeTokenSaverDailyEconomy(for: now, now: now, snapshot: snapshot)
+                }.value
+                self.tokenSaverDailyEconomyOffMainRecomputeCountForTesting += 1
+                let notify = self.tokenSaverDailyEconomyRecomputeNotifyPending
+                self.tokenSaverDailyEconomyRecomputeNotifyPending = false
+                if notify {
+                    self.scheduleTokenSaverUsageChangedNotification()
+                }
+            }
+            self?.tokenSaverDailyEconomyRecomputeTask = nil
+        }
     }
 
     /// Recompute the last `dayCount` calendar days (inclusive of today) so Week
     /// totals heal after formula changes (e.g. v5 permanent-amort → v6 day-scoped).
     /// Older formula rows would otherwise keep painting ~999M until each day ages out.
     public func recomputeTokenSaverDailyEconomyWindow(dayCount: Int = 7, now: Date = Date()) {
+        tokenSaverDailyEconomySharedSnapshotLoadsForTesting += 1
         let snapshot = loadTokenSaverDailyEconomySharedSnapshot()
         let cal = Calendar.current
         let todayStart = cal.startOfDay(for: now)
@@ -5426,16 +5475,16 @@ public final class AppContext {
     /// Settings + usage.json are identical for every day in a window. A new
     /// `SettingsStore` has an empty cache, so the previous per-day path did
     /// 7 SQLite loads + 7 usage.json decode passes on the MainActor.
-    private func loadTokenSaverDailyEconomySharedSnapshot() -> TokenSaverDailyEconomySharedSnapshot {
-        tokenSaverDailyEconomySharedSnapshotLoadsForTesting += 1
-        return TokenSaverDailyEconomySharedSnapshot(
+    nonisolated private func loadTokenSaverDailyEconomySharedSnapshot() -> TokenSaverDailyEconomySharedSnapshot {
+        TokenSaverDailyEconomySharedSnapshot(
             settings: SettingsStore(db: db).load(),
             usage: TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load()
         )
     }
 
     /// Persist one calendar day's credible total (day-scoped amort + caps).
-    private func recomputeTokenSaverDailyEconomy(
+    /// Touches only repositories (thread-safe `performSync`) — callable off-main.
+    nonisolated private func recomputeTokenSaverDailyEconomy(
         for day: Date,
         now: Date,
         snapshot: TokenSaverDailyEconomySharedSnapshot
@@ -5722,7 +5771,7 @@ public final class AppContext {
         backgroundWriterQueue.async { [weak self] in
             try? self?.graphifyUsageRepo.deleteItem(runId: runKey, itemId: itemId)
             DispatchQueue.main.async { [weak self] in
-                self?.recomputeTokenSaverDailyEconomyToday()
+                self?.scheduleTokenSaverDailyEconomyRecompute()
             }
         }
     }
@@ -5863,7 +5912,7 @@ public final class AppContext {
             backgroundWriterQueue.async { [weak self] in
                 try? self?.graphifyUsageRepo.deleteItem(runId: runKey, itemId: itemId)
                 DispatchQueue.main.async { [weak self] in
-                    self?.recomputeTokenSaverDailyEconomyToday()
+                    self?.scheduleTokenSaverDailyEconomyRecompute()
                 }
             }
             return
@@ -5879,7 +5928,7 @@ public final class AppContext {
                 answerTokens: answerTokens
             )
             DispatchQueue.main.async { [weak self] in
-                self?.recomputeTokenSaverDailyEconomyToday()
+                self?.scheduleTokenSaverDailyEconomyRecompute()
             }
         }
         graphifyItemBuffersLock.lock()
