@@ -319,26 +319,31 @@ public enum AgentChatLiveTurnChrome {
     public static func toolGroupSummary(_ items: [AssistantItem]) -> String {
         // Single pass feeds the memo key plus the noun/verb classification
         // below; counts, key, and verdicts identical to the reduce/map scans.
+        // AA-23: the memo key used to be built AFTER a pass that ran
+        // `AgentTimelineItemPresentation.make` per item and joined every id into
+        // a string (~11 KB for a 300-command group) — per frame, before the memo
+        // was even consulted. Hash the identity first; classify only on a miss.
         var streamingCount = 0
         var failedCount = 0
-        var ids: [String] = []
-        ids.reserveCapacity(items.count)
+        var identity = Hasher()
         var types = Set<AssistantItemType>()
-        var verbs = Set<String>()
         for item in items {
             if item.state == .streaming { streamingCount += 1 }
             if item.state == .failed { failedCount += 1 }
-            ids.append(item.id)
+            identity.combine(item.id)
             types.insert(item.type)
-            verbs.insert(AgentTimelineItemPresentation.make(for: item).verb)
         }
-        let key = "\(items.count)|\(streamingCount)|\(failedCount)|" + ids.joined(separator: ",")
+        let key = "\(items.count)|\(streamingCount)|\(failedCount)|\(identity.finalize())"
         toolGroupSummaryLock.lock()
         if let cached = toolGroupSummaryMemo[key] {
             toolGroupSummaryLock.unlock()
             return cached
         }
         toolGroupSummaryLock.unlock()
+        var verbs = Set<String>()
+        for item in items {
+            verbs.insert(AgentTimelineItemPresentation.make(for: item).verb)
+        }
         let noun: String = {
             let plural = items.count != 1
             switch types {
