@@ -637,6 +637,105 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(finish.1, "audit finished")
     }
 
+    func test_activeGoalSurvivesUsageLimitedStatusBetweenIterations() async throws {
+        // WHY: verified against openai/codex (codex-rs/state/src/model/thread_goal.rs
+        // `ThreadGoalStatus::is_terminal`, codex-rs/ext/goal/src/runtime.rs
+        // `stop_active_goal_for_turn`): hitting Codex's own usage/rate limit
+        // mid-goal reports `thread/goal/updated` with status "usageLimited" —
+        // NOT "active", but also NOT terminal (only "budgetLimited"/"complete"
+        // are); the goal runtime auto-resumes it back to "active"
+        // (`continue_if_idle`) once the limit clears. The old status allow-list
+        // here ("active"/"running"/"inProgress"/"in_progress" — the real
+        // protocol never sends the last three) treated "usageLimited" as
+        // goal-over, clearing goalActive and reopening the exact premature-
+        // finish bug goalActive exists to prevent — live 2026-09-14 showed a
+        // "Ran Codex rate limit" event immediately before the thread got stuck
+        // needing a manual Continue.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "/goal bring PRs to merge-ready"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        client.notificationHandler?("thread/goal/updated", [
+            "threadId": "codex-thread-1",
+            "goal": ["objective": "bring PRs to merge-ready", "status": "active"]
+        ])
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "goal-turn-1", "status": "inProgress"]
+        ])
+        // Codex hits its own rate limit mid-goal: recoverable, not terminal.
+        client.notificationHandler?("thread/goal/updated", [
+            "threadId": "codex-thread-1",
+            "goal": ["objective": "bring PRs to merge-ready", "status": "usageLimited"]
+        ])
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "idle"]
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "goal-turn-1", "status": "completed"],
+            "finalMessage": "hit a rate limit, will resume"
+        ])
+        client.readResponse = ["thread": [
+            "id": "codex-thread-1",
+            "status": "idle",
+            "turns": [["id": "goal-turn-1", "status": "completed"]]
+        ]]
+
+        // Past the ~2s reconcile probe: still no newer turn (limit hasn't
+        // cleared yet), but a usageLimited goal is not over — must not finish.
+        try await Task.sleep(nanoseconds: 2_600_000_000)
+        let premature = await sink.finish
+        XCTAssertNil(premature, "a usageLimited goal status must not read as goal-over and finish the run")
+
+        // The rate limit clears: goal goes active again and starts the next turn.
+        client.notificationHandler?("thread/goal/updated", [
+            "threadId": "codex-thread-1",
+            "goal": ["objective": "bring PRs to merge-ready", "status": "active"]
+        ])
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "goal-turn-2", "status": "inProgress"]
+        ])
+        client.readResponse = ["thread": [
+            "id": "codex-thread-1",
+            "status": "active",
+            "turns": [
+                ["id": "goal-turn-1", "status": "completed"],
+                ["id": "goal-turn-2", "status": "inProgress"]
+            ]
+        ]]
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let stillOpen = await sink.finish
+        XCTAssertNil(stillOpen, "the goal resuming after its rate limit clears must still be the same open run")
+
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "idle"]
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "goal-turn-2", "status": "completed"],
+            "finalMessage": "goal achieved"
+        ])
+        client.notificationHandler?("thread/goal/cleared", ["threadId": "codex-thread-1"])
+        let finish = try await waitForFinish(in: sink, timeout: 3)
+        XCTAssertEqual(finish.0, .completed)
+        XCTAssertEqual(finish.1, "goal achieved")
+    }
+
     func test_pendingFinishInactivityFlushesWhenThreadNeverGoesIdle() async throws {
         // WHY: removing absolute max left wedged pendingFinish with no exit if
         // idle never arrives. Quiet inactivity must flush the withheld finish

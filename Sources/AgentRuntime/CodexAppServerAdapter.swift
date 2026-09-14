@@ -1688,7 +1688,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 events.append(.activePlanUpdated(plan))
             }
         case "thread/goal/updated", "thread.goal.updated":
-            setGoalActive(threadId: threadId, Self.isActiveGoalStatus(from: payload))
+            setGoalActive(threadId: threadId, Self.isNonTerminalGoalStatus(from: payload))
             let turnId = goalTurnId(threadId: threadId)
             let itemId = "goal-\(string(payload, "threadId") ?? providerThreadId(threadId: threadId) ?? threadId.value.uuidString)-\(turnId.isEmpty ? String(now) : turnId)"
             let detail = Self.goalDetail(from: payload)
@@ -3822,16 +3822,30 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         )
     }
 
-    /// `thread/goal/updated` carries the full goal state; `goal.status` is
-    /// "active" while the loop runs. A missing status still means a goal exists.
-    private static func isActiveGoalStatus(from payload: [String: Any]) -> Bool {
+    /// `thread/goal/updated` carries the full goal state. Real wire values
+    /// (openai/codex `v2::ThreadGoalStatus`, camelCase JSON): `active`, `paused`,
+    /// `blocked`, `usageLimited`, `budgetLimited`, `complete` — verified against
+    /// codex-rs/app-server-protocol/schema/typescript/v2/ThreadGoalStatus.ts and
+    /// codex-rs/state/src/model/thread_goal.rs's `ThreadGoalStatus::is_terminal`
+    /// (only `BudgetLimited` / `Complete` are terminal there). `paused`,
+    /// `blocked`, and `usageLimited` are the goal runtime's own recoverable
+    /// pauses (turn error, empty response, hitting a usage/rate limit —
+    /// `stop_active_goal_for_turn` in codex-rs/ext/goal/src/runtime.rs) that it
+    /// auto-resumes back to `active` (`continue_if_idle`) once cleared, so a
+    /// goal in one of those states is NOT over. A missing status still means a
+    /// goal exists. Name/allow-list previously guessed "running"/"inProgress"/
+    /// "in_progress", none of which the real protocol ever sends, while
+    /// treating the genuinely-recoverable `paused`/`blocked`/`usageLimited`
+    /// wire values as "goal over" — undoing goalActive's whole point the
+    /// moment a goal hit a rate limit mid-loop (live 2026-09-14).
+    private static func isNonTerminalGoalStatus(from payload: [String: Any]) -> Bool {
         let goal = payload["goal"] as? [String: Any] ?? payload
         guard let status = string(goal, "status")?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
             .nilIfEmpty
         else { return true }
-        return status == "active" || status == "running" || status == "inprogress" || status == "in_progress"
+        return status != "complete" && status != "budgetlimited" && status != "budget_limited"
     }
 
     private static func goalDetail(from payload: [String: Any]) -> String {
