@@ -10538,8 +10538,10 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         }
         let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return nil }
-        if let data = body.data(using: .utf8),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        // S-02: every tool row asked for this 1-2× per body pass (label, L2
+        // summary, expanded command) and each call re-parsed the input JSON.
+        // `toolInputObject` already memoizes the parse per body string.
+        if let obj = toolInputObject(for: item) {
             // Most-informative field per tool family, in priority order.
             for key in ["command", "cmd", "script", "query", "pattern", "skill", "file_path", "path", "url", "prompt", "name"] {
                 if let value = (obj[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {

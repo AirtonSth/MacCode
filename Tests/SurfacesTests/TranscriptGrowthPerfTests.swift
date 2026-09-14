@@ -148,6 +148,30 @@ final class TranscriptGrowthPerfTests: XCTestCase {
         XCTAssertEqual(source?.components(separatedBy: "sourceFingerprint(for: text)").count, 2, "the row computes its fingerprint exactly once")
     }
 
+    // MARK: S-02
+
+    func test_toolCommandPreviewReusesTheMemoizedToolInputParse() {
+        // WHY: a visible tool row derives label, L2 summary and the expanded
+        // command from the same input JSON on every body pass; each derivation
+        // re-parsed it. One parse per body string, shared with rawShellCommand.
+        let body = "{\"command\":\"swift test --filter TranscriptGrowthPerf\",\"timeout\":120000}"
+        let item = AssistantItem(id: "tool-\(UUID().uuidString)", turnId: "t", type: .tool, body: body, startedAtMs: 1)
+        let before = AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting
+        let preview = AgentTimelineItemPresentation.toolCommandPreview(for: item)
+        XCTAssertEqual(preview, "swift test --filter TranscriptGrowthPerf")
+        let parsesAfterFirst = AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting
+        XCTAssertLessThanOrEqual(parsesAfterFirst - before, 1, "the first preview may parse once")
+        _ = AgentTimelineItemPresentation.toolCommandPreview(for: item)
+        _ = AgentTimelineItemPresentation.toolCommandSummary(for: item)
+        _ = AgentTimelineItemPresentation.rawShellCommand(for: item)
+        _ = AgentTimelineItemPresentation.toolDisplayLabel(for: item)
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting,
+            parsesAfterFirst,
+            "label, summary, preview and raw command must share the single memoized parse"
+        )
+    }
+
     // MARK: AA-20 source pin
 
     func test_turnViewDoesNotComputeTheFullTurnRenderModel() throws {
