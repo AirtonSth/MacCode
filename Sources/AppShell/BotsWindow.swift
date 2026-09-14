@@ -3225,6 +3225,9 @@ public final class BotsViewModel: ObservableObject {
     public private(set) var applyIncomingDeskEventCountForTesting = 0
     /// Test seam: fallback live-turn poll bodies that hit coordinator/run SQLite.
     public private(set) var deskLiveTurnWatchApplyCountForTesting = 0
+    /// BT-23: full hot-window replays the watch fetched + decoded off the main actor.
+    public private(set) var deskLiveReplayOffMainFetchCountForTesting = 0
+    private var deskLiveReplayGeneration = 0
     private var lastDeskStreamPushAt: Date?
     /// Cross-thread mirror of the selected desk `linkedAgentThreadID` so
     /// nonisolated stream delivery can drop other threads without a MainActor hop.
@@ -5667,6 +5670,17 @@ public final class BotsViewModel: ObservableObject {
             return .reviewing(peerName: peer.name)
         }
         return .agent(name: bot.name)
+    }
+
+    /// Test seam (BT-23): one non-terminal watch tick for the selected desk
+    /// thread, without the 2 s cadence or the push-quiet gate.
+    func deskLiveTurnWatchTickForTesting() {
+        guard let botID = selectedBotID,
+              let threadID = selectedConversation?.linkedAgentThreadID else { return }
+        deskLiveTurnWatchApplyCountForTesting += 1
+        if applyDeskLiveReplay(botID: botID, threadID: threadID, fetchOffMain: true) {
+            refreshPublishedIdentity(for: botID)
+        }
     }
 
     public func refreshDeskLiveTurn() {
@@ -8837,7 +8851,8 @@ public final class BotsViewModel: ObservableObject {
     private func applyDeskLiveReplay(
         botID: BotID,
         threadID: AgentThreadID,
-        reconcileObservedAtTerminal: Bool = false
+        reconcileObservedAtTerminal: Bool = false,
+        fetchOffMain: Bool = false
     ) -> Bool {
         let cursor = context.coordinator.streamEventCursor(threadId: threadID)
         let hasUnconfirmedObservedEvents = liveObservedEventsByThread[threadID]?.isEmpty == false
@@ -8898,8 +8913,56 @@ public final class BotsViewModel: ObservableObject {
             }
         }
         deskLiveReplayFetchCountForTesting += 1
+        if fetchOffMain {
+            // BT-23: the 2 s watch fell back to this full replay (up to 4,096
+            // events / 32 MiB decoded) on the MainActor for the rest of a long
+            // turn once the observed-event window overflowed. Fetch + replay
+            // detached; adopt on main only if nothing newer superseded it.
+            deskLiveReplayOffMainFetchCountForTesting += 1
+            deskLiveReplayGeneration += 1
+            let generation = deskLiveReplayGeneration
+            let coordinator = context.coordinator
+            Task.detached(priority: .userInitiated) { [weak self] in
+                let events = coordinator.latestStreamEvents(threadId: threadID)
+                let state = AgentChatLiveTurnChrome.timelineByReplaying(events)
+                await MainActor.run {
+                    guard let self, generation == self.deskLiveReplayGeneration else { return }
+                    let adopted = self.adoptReplayedDeskTimeline(
+                        state,
+                        cursor: cursor,
+                        botID: botID,
+                        threadID: threadID,
+                        requiresTerminalReconciliation: requiresTerminalReconciliation,
+                        hasUnconfirmedObservedEvents: hasUnconfirmedObservedEvents
+                    )
+                    if adopted { self.refreshPublishedIdentity(for: botID) }
+                }
+            }
+            return false
+        }
         let events = context.coordinator.latestStreamEvents(threadId: threadID)
         let state = AgentChatLiveTurnChrome.timelineByReplaying(events)
+        return adoptReplayedDeskTimeline(
+            state,
+            cursor: cursor,
+            botID: botID,
+            threadID: threadID,
+            requiresTerminalReconciliation: requiresTerminalReconciliation,
+            hasUnconfirmedObservedEvents: hasUnconfirmedObservedEvents
+        )
+    }
+
+    /// Tail of a full replay: keep the richer in-memory timeline when SQLite
+    /// still lags, otherwise adopt the replayed state. Shared by the
+    /// synchronous path and the detached watch fetch (BT-23).
+    private func adoptReplayedDeskTimeline(
+        _ state: AssistantTimelineState,
+        cursor: AgentRunRepository.StreamEventCursor,
+        botID: BotID,
+        threadID: AgentThreadID,
+        requiresTerminalReconciliation: Bool,
+        hasUnconfirmedObservedEvents: Bool
+    ) -> Bool {
         // Compare against THIS thread. A per-bot cache kept a richer
         // hop's Worked rows after the user opened another conversation.
         let current = liveTimelineByThread[threadID] ?? AssistantTimelineState()
@@ -9021,7 +9084,9 @@ public final class BotsViewModel: ObservableObject {
                     continue
                 }
                 self.deskLiveTurnWatchApplyCountForTesting += 1
-                if self.applyDeskLiveReplay(botID: botID, threadID: threadID) {
+                // BT-23: a full replay from here runs detached and refreshes the
+                // identity itself once adopted; the incremental path stays sync.
+                if self.applyDeskLiveReplay(botID: botID, threadID: threadID, fetchOffMain: true) {
                     self.refreshPublishedIdentity(for: botID)
                 }
                 let run = self.linkedRun(for: threadID, botID: botID)

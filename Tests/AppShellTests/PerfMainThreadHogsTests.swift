@@ -179,6 +179,57 @@ final class PerfMainThreadHogsTests: XCTestCase {
         XCTAssertTrue(source.contains("com.apple.dock.prefchanged"))
     }
 
+    // MARK: BT-23
+
+    func test_deskLiveTurnWatchFetchesTheHotWindowOffMainAndAdoptsItOnMain() async throws {
+        // WHY: once a long turn overflowed the observed-event window, every 2 s
+        // watch tick decoded up to 4,096 stream events on the MainActor for the
+        // rest of the run. The fetch + replay must run detached; the result is
+        // adopted on main and the desk still ends up showing the durable turn.
+        let h = try makeDeskHarness()
+        let run = AgentRun(threadId: h.thread.id, provider: .claude, model: "opus", status: .running, startedAt: Date())
+        try h.context.runRepo.upsert(run)
+        let events: [AssistantEvent] = [
+            .turnStarted(turnId: "t-durable"),
+            .itemStarted(item: AssistantItem(id: "r-durable", turnId: "t-durable", type: .reasoning, state: .streaming, body: "seed", startedAtMs: 10))
+        ]
+        for (index, event) in events.enumerated() {
+            let json = try XCTUnwrap(String(data: try JSONEncoder().encode(event), encoding: .utf8))
+            try h.context.runRepo.appendStreamEvent(runId: run.id, seq: index + 1, kind: event.debugDescription, payloadJSON: json)
+        }
+        h.vm.openDesk(h.bot)
+        h.vm.selectDeskThread(h.conversation.id)
+        XCTAssertEqual(h.vm.selectedConversation?.linkedAgentThreadID, h.thread.id)
+        // Force the overflow latch so the watch cannot take the incremental path.
+        h.vm.deskLiveObservedEventByteLimitForTesting = 1
+        h.vm.applyDeskLiveEventForTesting(.itemDelta(itemId: "r-durable", bodyAppend: " overflow", outputAppend: nil, summary: nil), threadId: h.thread.id)
+        // The watch only replays when the durable cursor moved: persist one more
+        // event the desk has not seen yet.
+        let late = AssistantEvent.itemStarted(item: AssistantItem(id: "r-late", turnId: "t-durable", type: .tool, startedAtMs: 20))
+        let lateJSON = try XCTUnwrap(String(data: try JSONEncoder().encode(late), encoding: .utf8))
+        try h.context.runRepo.appendStreamEvent(runId: run.id, seq: events.count + 1, kind: late.debugDescription, payloadJSON: lateJSON)
+
+        let fetchesBefore = h.vm.deskLiveReplayFetchCountForTesting
+        let offMainBefore = h.vm.deskLiveReplayOffMainFetchCountForTesting
+        h.vm.deskLiveTurnWatchTickForTesting()
+        XCTAssertEqual(h.vm.deskLiveReplayOffMainFetchCountForTesting, offMainBefore + 1, "the watch must take the detached fetch path")
+        XCTAssertEqual(h.vm.deskLiveReplayFetchCountForTesting, fetchesBefore + 1)
+        XCTAssertFalse(
+            h.vm.deskLiveTimeline.turns.contains(where: { $0.items.contains(where: { $0.id == "r-late" }) }),
+            "the tick itself must not decode the hot window on the main actor"
+        )
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if h.vm.deskLiveTimeline.turns.contains(where: { $0.items.contains(where: { $0.id == "r-late" }) }) { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(
+            h.vm.deskLiveTimeline.turns.contains(where: { $0.items.contains(where: { $0.id == "r-late" }) }),
+            "the replayed durable event must be adopted on the main actor"
+        )
+    }
+
     // MARK: BT-26
 
     func test_liveTimelineLRUEvictsOldestButNeverThePinnedThread() {
