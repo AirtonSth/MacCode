@@ -2212,6 +2212,12 @@ public final class AppContext {
                     // This is a per-run admission signal. Provider-global MCP
                     // config must never make Docker/VM/remote runs host-capable.
                     environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] = "1"
+                    // The helper this run spawns inherits THIS app's TCC grants.
+                    // Ask from the app (once per launch) so the current code
+                    // identity is registered and the owner sees the system prompt.
+                    if !Self.isRunningUnitTests {
+                        ComputerUsePermissionBroker.requestOnceIfMissing()
+                    }
                 }
             }
         }
@@ -2452,6 +2458,7 @@ public final class AppContext {
         func disableRuntime() -> String? {
             cancelTokenSaverLocalAsyncWork()
             tokenSaverRuntimeAdmitted = false
+            invalidateTokenSaverRuntimeActiveCache()
             if persistPreference {
                 settingsStore.update { $0.tokenSaverEnabled = false }
             }
@@ -2513,6 +2520,7 @@ public final class AppContext {
             settingsStore.update { $0.tokenSaverEnabled = true }
         }
         tokenSaverRuntimeAdmitted = true
+        invalidateTokenSaverRuntimeActiveCache()
         tokenSaverDistillServiceController.startIfEligible(
             session: session,
             settings: enabledSettings,
@@ -2551,7 +2559,30 @@ public final class AppContext {
     /// Unit tests without a sandboxed integration root retain their historical
     /// direct-settings seam; production and lifecycle tests always use the real gate.
     func isTokenSaverRuntimeActive(settings: AppSettings? = nil) -> Bool {
-        let stored = settings ?? SettingsStore(db: db).load()
+        // EV-23: the no-argument form (per `.tokenUsage` event, 4-5×) loaded a
+        // fresh SettingsStore + the account session — 2 SQLite reads + 2 JSON
+        // decodes each. Cache on (settings revision, admitted flag); account
+        // changes invalidate through `reconcileTokenSaverLifecycleAfterAccountChange`.
+        if settings == nil {
+            let revision = SettingsStore.revision
+            let admitted = tokenSaverRuntimeAdmitted
+            tokenSaverObservationCacheLock.lock()
+            if let cached = tokenSaverRuntimeActiveCache,
+               cached.revision == revision, cached.admitted == admitted {
+                tokenSaverObservationCacheLock.unlock()
+                return cached.active
+            }
+            tokenSaverObservationCacheLock.unlock()
+            let active = computeTokenSaverRuntimeActive(settings: SettingsStore(db: db).load())
+            tokenSaverObservationCacheLock.lock()
+            tokenSaverRuntimeActiveCache = (revision, admitted, active)
+            tokenSaverObservationCacheLock.unlock()
+            return active
+        }
+        return computeTokenSaverRuntimeActive(settings: settings!)
+    }
+
+    private func computeTokenSaverRuntimeActive(settings stored: AppSettings) -> Bool {
         guard stored.tokenSaverEnabled else { return false }
         if Self.isRunningUnitTests, agentSkillsHomeOverrideForTesting == nil {
             return true
@@ -2578,6 +2609,7 @@ public final class AppContext {
         let identity = currentTokenSaverAccountIdentity()
         guard identity != lastTokenSaverAccountIdentity else { return }
         lastTokenSaverAccountIdentity = identity
+        invalidateTokenSaverRuntimeActiveCache()
         tokenSaverEntitlementReconcileTask?.cancel()
 
         let storedSettings = SettingsStore(db: db).load()
@@ -3369,16 +3401,25 @@ public final class AppContext {
     /// Disk-backed Token Saver glanceable publish for remote iOS clients.
     @MainActor
     public func publishTokenSaverWidgetDigestFromDisk(isRefreshing: Bool = false) {
-        let enabled = SettingsStore(db: db).load().tokenSaverEnabled
-        let subscribed = PrivateAccountSessionStore(repo: settingsRepo).load()?.user.subscribed == true
-        TokenSaverWidgetDigest.publishFromDisk(
-            appSupportDirectory: appSupportDirectory,
-            economyRepo: tokenSaverDailyEconomyRepo,
-            tokenSaverEnabled: enabled,
-            subscribed: subscribed,
-            isRefreshing: isRefreshing,
-            updatedAt: Date()
-        )
+        // EV-25: settings + account session + usage.json + two economy rows were
+        // read on the MainActor per account-usage cycle. All inputs are
+        // thread-safe repositories; publish from a detached task.
+        let db = db
+        let settingsRepo = settingsRepo
+        let appSupportDirectory = appSupportDirectory
+        let economyRepo = tokenSaverDailyEconomyRepo
+        Task.detached(priority: .utility) {
+            let enabled = SettingsStore(db: db).load().tokenSaverEnabled
+            let subscribed = PrivateAccountSessionStore(repo: settingsRepo).load()?.user.subscribed == true
+            TokenSaverWidgetDigest.publishFromDisk(
+                appSupportDirectory: appSupportDirectory,
+                economyRepo: economyRepo,
+                tokenSaverEnabled: enabled,
+                subscribed: subscribed,
+                isRefreshing: isRefreshing,
+                updatedAt: Date()
+            )
+        }
     }
 
     nonisolated static func accountUsagePayload(
@@ -3545,11 +3586,58 @@ public final class AppContext {
         return .init(allowed: true, reason: lane.state)
     }
 
+    /// EV-23: `.tokenUsage` events call this 3-4× each (12-25 SQLite reads per
+    /// event on the provider parse thread, holding the single connection's
+    /// lock). Thread identity, project and lane state cannot change for the
+    /// life of a run — memoize per (run, lane, settings revision) and drop the
+    /// entry when the run finishes.
+    private let tokenSaverObservationCacheLock = NSLock()
+    private var tokenSaverObservationByRunLane: [String: TokenSaverAdmissionDecision] = [:]
+    private var tokenSaverRuntimeActiveCache: (revision: UInt64, admitted: Bool, active: Bool)?
+    var tokenSaverObservationCacheMissesForTesting = 0
+
+    nonisolated private func tokenSaverObservationCacheKey(runId: AgentRunID, lane: String) -> String {
+        // Any settings, lane-state or thread-identity write invalidates (exact,
+        // not time-based): a lane promoted mid-run is admitted on the next event.
+        "\(runId.value.uuidString)|\(lane)|\(SettingsStore.revision)|\(TokenSaverLaneStateRepository.revision)|\(AgentThreadRepository.identityRevision)"
+    }
+
     private func tokenSaverProjectObservation(runId: AgentRunID, lane: String) -> TokenSaverAdmissionDecision {
+        let key = tokenSaverObservationCacheKey(runId: runId, lane: lane)
+        tokenSaverObservationCacheLock.lock()
+        if let cached = tokenSaverObservationByRunLane[key] {
+            tokenSaverObservationCacheLock.unlock()
+            return cached
+        }
+        tokenSaverObservationCacheLock.unlock()
         guard let threadId = try? runRepo.threadId(of: runId) else {
             return .init(allowed: false, reason: "missing_run_scope")
         }
-        return tokenSaverProjectObservation(threadId: threadId, lane: lane)
+        let decision = tokenSaverProjectObservation(threadId: threadId, lane: lane)
+        tokenSaverObservationCacheLock.lock()
+        tokenSaverObservationCacheMissesForTesting += 1
+        if tokenSaverObservationByRunLane.count > 512 {
+            tokenSaverObservationByRunLane.removeAll(keepingCapacity: true)
+        }
+        tokenSaverObservationByRunLane[key] = decision
+        tokenSaverObservationCacheLock.unlock()
+        return decision
+    }
+
+    private func forgetTokenSaverObservation(runId: AgentRunID) {
+        let prefix = runId.value.uuidString + "|"
+        tokenSaverObservationCacheLock.lock()
+        for key in tokenSaverObservationByRunLane.keys where key.hasPrefix(prefix) {
+            tokenSaverObservationByRunLane.removeValue(forKey: key)
+        }
+        tokenSaverObservationCacheLock.unlock()
+    }
+
+    private func invalidateTokenSaverRuntimeActiveCache() {
+        tokenSaverObservationCacheLock.lock()
+        tokenSaverRuntimeActiveCache = nil
+        tokenSaverObservationByRunLane.removeAll(keepingCapacity: true)
+        tokenSaverObservationCacheLock.unlock()
     }
 
     private func tokenSaverProjectAdmission(
@@ -5159,6 +5247,7 @@ public final class AppContext {
     }
 
     private func finishPendingTokenSaverUsage(runId: AgentRunID) {
+        forgetTokenSaverObservation(runId: runId)
         if var pending = pendingUsageByRun[runId] {
             pending.finished = true
             pendingUsageByRun[runId] = pending

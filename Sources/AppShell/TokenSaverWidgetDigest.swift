@@ -123,7 +123,9 @@ public enum TokenSaverWidgetDigest {
     /// Load current Token Saver glanceable state from disk and publish.
     /// Independent of SidebarViewModel so remote clients get data even when
     /// the sidebar has not been shown this session.
-    @MainActor
+    /// Off-main safe: reads usage.json + two economy rows, publishes through
+    /// the thread-safe EventBus. (EV-25: used to be `@MainActor` and ran the
+    /// file read + SQLite on main on every account-usage cycle.)
     public static func publishFromDisk(
         appSupportDirectory: URL,
         economyRepo: TokenSaverDailyEconomyRepository,
@@ -177,11 +179,38 @@ public enum TokenSaverWidgetDigest {
         return lastBody
     }
 
+    public private(set) nonisolated(unsafe) static var suppressedDuplicatePublishCountForTesting = 0
+
     private static func cacheAndPublish(_ body: [String: JSONValue]) {
         lock.lock()
+        let previous = lastBody
         lastBody = body
         lock.unlock()
+        // EV-25: every account-usage cycle republished a structurally identical
+        // digest (only `updated_at_ms` moved) — 155 persisted events + fan-out
+        // per 10 min. Skip when nothing the client renders changed.
+        if let previous, digestsEquivalent(previous, body) {
+            lock.lock()
+            suppressedDuplicatePublishCountForTesting += 1
+            lock.unlock()
+            return
+        }
         EventBus.shared.publish(kind: eventKind, payload: .object(body))
+    }
+
+    static func digestsEquivalent(_ lhs: [String: JSONValue], _ rhs: [String: JSONValue]) -> Bool {
+        func stripped(_ body: [String: JSONValue]) -> [String: JSONValue] {
+            var out = body
+            out["updated_at_ms"] = nil
+            for scope in ["today", "week"] {
+                if case .object(var nested)? = out[scope] {
+                    nested["updated_at_ms"] = nil
+                    out[scope] = .object(nested)
+                }
+            }
+            return out
+        }
+        return stripped(lhs) == stripped(rhs)
     }
 
     private static func provider(

@@ -4,6 +4,41 @@ import AgentRuntime
 import CoreModel
 
 final class TokenSaverWidgetDigestTests: XCTestCase {
+    func testIdenticalDigestsAreNotRepublished() {
+        // WHY (EV-25): every account-usage cycle republished a structurally
+        // identical digest (only updated_at_ms moved) — 155 persisted events and
+        // fan-outs per 10 min. Only a rendered field change may publish.
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2Digest-\(UUID().uuidString)", isDirectory: true)
+        let snapshot = TokenSaverUsageStore(appSupportDirectory: dir).load()
+        func publish(saved: Int, at seconds: TimeInterval) {
+            TokenSaverWidgetDigest.publish(
+                enabled: true,
+                subscribed: true,
+                todaySavedTokens: saved,
+                weekSavedTokens: saved,
+                snapshot: snapshot,
+                isRefreshing: false,
+                updatedAt: Date(timeIntervalSince1970: seconds)
+            )
+        }
+        publish(saved: 1_000, at: 1)
+        let suppressedBefore = TokenSaverWidgetDigest.suppressedDuplicatePublishCountForTesting
+        publish(saved: 1_000, at: 2)
+        XCTAssertEqual(
+            TokenSaverWidgetDigest.suppressedDuplicatePublishCountForTesting,
+            suppressedBefore + 1,
+            "same content with a newer timestamp must be suppressed"
+        )
+        publish(saved: 2_000, at: 3)
+        XCTAssertEqual(
+            TokenSaverWidgetDigest.suppressedDuplicatePublishCountForTesting,
+            suppressedBefore + 1,
+            "a changed savings figure must publish"
+        )
+        XCTAssertEqual(TokenSaverWidgetDigest.lastCachedBody()?["estimated_save_tokens"], .number(2_000))
+    }
+
     func testPayloadMatchesGlanceableCardContract() {
         let body = TokenSaverWidgetDigest.payload(
             enabled: true,
