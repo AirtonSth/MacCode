@@ -179,6 +179,131 @@ final class PerfMainThreadHogsTests: XCTestCase {
         XCTAssertTrue(source.contains("com.apple.dock.prefchanged"))
     }
 
+    // MARK: BT-21 / BT-25 source pins
+
+    func test_botsDeskLiveTurnRowsAreEquatableAndRailTakesOneLiveSnapshot() throws {
+        // WHY (BT-21): without `.equatable()` every finished turn re-ran
+        // compose + workBlocks on every Bots body pass (Agent App already gates
+        // it). WHY (BT-25): the rail took the coordinator's global lock and
+        // allocated a Set per row per pass; one snapshot per pass instead.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        var searchStart = source.startIndex
+        var liveTurnSites = 0
+        while let range = source.range(of: "AgentChatLiveTurnView(", range: searchStart..<source.endIndex) {
+            liveTurnSites += 1
+            let tail = String(source[range.upperBound...].prefix(900))
+            XCTAssertTrue(tail.contains(".equatable()"), "every Bots AgentChatLiveTurnView must be gated by .equatable()")
+            searchStart = range.upperBound
+        }
+        XCTAssertEqual(liveTurnSites, 2)
+        let rail = try XCTUnwrap(source.range(of: "private var deskThreadRail: some View {"))
+        let railSlice = String(source[rail.upperBound...].prefix(2_500))
+        XCTAssertTrue(railSlice.contains("let liveThreadIDs = vm.liveDeskThreadIDsSnapshot()"))
+        XCTAssertTrue(railSlice.contains("deskThreadRow(conversation, liveThreadIDs: liveThreadIDs)"))
+        XCTAssertFalse(railSlice.contains("vm.isDeskConversationRunning(conversation)"), "rows must not re-snapshot the coordinator")
+    }
+
+    // MARK: BT-20 / BT-22 / BT-24 (Bots desk)
+
+    private func makeDeskHarness() throws -> (context: AppContext, vm: BotsViewModel, bot: BotDefinition, thread: AgentThread, conversation: BotConversation) {
+        let directory = NSTemporaryDirectory() + "RC2BotsPerf-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        let conversation = BotConversation(botID: bot.id, title: "Standup", linkedAgentThreadID: thread.id)
+        try context.botStore.upsertConversation(conversation)
+        return (context, vm, bot, thread, conversation)
+    }
+
+    func test_deskStreamEventsCoalesceIntoOneMainHopAndOnePublishPerBatch() async throws {
+        // WHY (BT-20): each token scheduled its own MainActor Task and its own
+        // @Published write on the monolithic BotsViewModel, invalidating the
+        // whole Bots tree per token. A burst delivered before the main actor
+        // runs must land as ONE hop and still apply every event in order.
+        let h = try makeDeskHarness()
+        h.vm.openDesk(h.bot)
+        h.vm.selectDeskThread(h.conversation.id)
+        XCTAssertEqual(h.vm.selectedConversation?.linkedAgentThreadID, h.thread.id)
+        h.vm.resetDeskStreamMainHopCountForTesting()
+        let runID = AgentRunID()
+        h.vm.runCoordinator(h.context.coordinator, didReceive: .turnStarted(turnId: "t1"), run: runID, threadId: h.thread.id)
+        for i in 0..<200 {
+            h.vm.runCoordinator(
+                h.context.coordinator,
+                didReceive: .itemStarted(item: AssistantItem(id: "item-\(i)", turnId: "t1", type: .tool, startedAtMs: Int64(i))),
+                run: runID,
+                threadId: h.thread.id
+            )
+        }
+        XCTAssertEqual(h.vm.deskStreamMainHopCountForTesting, 1, "a burst delivered before the main actor drains must open exactly one hop")
+        for _ in 0..<200 {
+            if h.vm.applyIncomingDeskEventCountForTesting == 201 { break }
+            await Task.yield()
+        }
+        XCTAssertEqual(h.vm.applyIncomingDeskEventCountForTesting, 201, "every event of the batch must still be applied")
+        XCTAssertEqual(h.vm.deskLiveTimeline.turns.first?.turnId, "t1")
+        XCTAssertEqual(h.vm.deskLiveTimeline.turns.first?.items.count, 200, "order and completeness must survive coalescing")
+        XCTAssertEqual(h.vm.deskLiveTimeline.turns.first?.items.last?.id, "item-199")
+    }
+
+    func test_deskTimelineIsMemoizedAcrossBodyPassesAndRematerializesLiveBodies() async throws {
+        // WHY (BT-22): the transcript model was rebuilt on every body pass with
+        // an O(messages × turns × items × bytes) duplicate scan. Reads without a
+        // structural change must reuse the model; streamed text must still be
+        // the live snapshot; a new item must rebuild.
+        let h = try makeDeskHarness()
+        h.vm.openDesk(h.bot)
+        h.vm.selectDeskThread(h.conversation.id)
+        let runID = AgentRunID()
+        func deliver(_ event: AssistantEvent) async {
+            h.vm.runCoordinator(h.context.coordinator, didReceive: event, run: runID, threadId: h.thread.id)
+            for _ in 0..<50 { await Task.yield() }
+        }
+        await deliver(.turnStarted(turnId: "t1"))
+        await deliver(.itemStarted(item: AssistantItem(id: "a", turnId: "t1", type: .assistantMessage, startedAtMs: 1)))
+        await deliver(.itemDelta(itemId: "a", bodyAppend: "Hello", outputAppend: nil, summary: nil))
+        let baseline = h.vm.deskTimelineComputeCountForTesting
+        _ = h.vm.deskTimeline
+        _ = h.vm.deskTimeline
+        _ = h.vm.deskTimeline
+        XCTAssertEqual(h.vm.deskTimelineComputeCountForTesting, baseline + 1, "repeated body reads must reuse the model")
+
+        await deliver(.itemDelta(itemId: "a", bodyAppend: " world", outputAppend: nil, summary: nil))
+        let afterDelta = h.vm.deskTimeline
+        XCTAssertEqual(h.vm.deskTimelineComputeCountForTesting, baseline + 1, "a body delta is not a structural change")
+        let liveTurn = afterDelta.compactMap { item -> AssistantTurnSnapshot? in
+            if case .liveTurn(let turn, _) = item { return turn }
+            return nil
+        }.first
+        XCTAssertEqual(liveTurn?.items.first?.body, "Hello world", "the memoized model must carry the LIVE turn snapshot, not the one captured at compute time")
+
+        await deliver(.itemStarted(item: AssistantItem(id: "b", turnId: "t1", type: .tool, startedAtMs: 2)))
+        _ = h.vm.deskTimeline
+        XCTAssertEqual(h.vm.deskTimelineComputeCountForTesting, baseline + 2, "a new item must rebuild the model")
+    }
+
+    func test_duplicateTerminalNotificationsApplyFollowThroughOnce() async throws {
+        // WHY (BT-24): didChangeStatus(terminal) and didFinish both delivered the
+        // same run end; each pass re-ran message decode + work log + replay +
+        // SQLite writes. The same (thread, run) terminal must settle once.
+        let h = try makeDeskHarness()
+        let runID = AgentRunID()
+        h.vm.runCoordinator(h.context.coordinator, didChangeStatus: .completed, runId: runID, threadId: h.thread.id)
+        h.vm.runCoordinator(h.context.coordinator, didFinish: runID, threadId: h.thread.id, status: .completed, finalMessage: "done", providerThreadId: nil)
+        for _ in 0..<200 {
+            if h.vm.followThroughApplyCountForTesting >= 1 { break }
+            await Task.yield()
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(h.vm.followThroughApplyCountForTesting, 1, "the same terminal run must settle once")
+        let settled = try h.context.botStore.conversationLinked(to: h.thread.id)
+        XCTAssertNotNil(settled, "the conversation row must still be updated by the single follow-through")
+    }
+
     private func sourceURL(_ relative: String) -> URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
