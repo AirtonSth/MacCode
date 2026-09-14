@@ -230,10 +230,12 @@ Auditoria de código de 2026-09-14 (`AgentRunCoordinator.swift`, `AppContext.swi
 - [x] **S-01 · P1 · por frame — `makeChatRowPaintContext` (Agent App) e `BotsDeskFollowThrough.timeline` (Bots) normalizavam todos os corpos assistente de todos os turnos visíveis a cada body pass (laço por scalar até 32 KiB por texto).**
   **FEITO `7ee72473`** — `AgentChatLiveTurnChrome.normalizedAssistantFinals(for:)` memoiza turnos finalizados por (turnId, items.count, tamanho do final) em `NSCache` de 512; turnos vivos sempre recalculados. Teste `test_normalizedAssistantFinalsMemoizeFinishedTurnsOnly`.
 
-- [ ] **EV-25(c) · P1 · db — uma transação SQLite por evento publicado (`EventLogRepository.append`: BEGIN IMMEDIATE / INSERT / prune / COMMIT) e, no teto de 5.000 linhas, `DELETE FROM command_receipt_events WHERE NOT EXISTS (…)` por linha.**
+- [x] **EV-25(c) · P1 · db — uma transação SQLite por evento publicado (`EventLogRepository.append`: BEGIN IMMEDIATE / INSERT / prune / COMMIT) e, no teto de 5.000 linhas, `DELETE FROM command_receipt_events WHERE NOT EXISTS (…)` por linha.**
+  **FEITO `8e92d997`** — `PendingEventLogRows` + 1 flush por vez na `backgroundWriterQueue` → `EventLogRepository.appendBatch` (1 transação, prune 1× por lote). Testes `test_appendBatch_insertsInOrderAndEnforcesTheCapAcrossTheBatchBoundary`, `test_wireBackgroundPersister_coalescesBurstsIntoBatchesWithoutLosingRows` (40 eventos com a fila segurada → todas no disco após o fence, < 40 flushes). Correção de isolamento do teste do digest em `5e9bcd60`.
   `AppContext.wireBackgroundPersister` (`AppContext.swift:6053`), `EventLog.swift:79-92`. Fazer: buffer com lock + flush enfileirado na `backgroundWriterQueue` assim que o buffer deixa de estar vazio (latência igual quando ocioso; coalesce só sob tempestade) → `appendBatch` em uma transação; o `DELETE` de órfãos passa a rodar 1× por lote. Verificar: 40 eventos publicados com a fila segurada → todas as linhas no disco após o `persistenceCommitFence` e `eventLogFlushCountForTesting < 40`.
 
-- [ ] **AA-32 · P2 · por frame — `AgentMessageMarkdown.cacheKey(for:)` faz `hasher.combine(text)` (O(texto)) a cada lookup de bloco/inline por linha montada por passada, mesmo em hit de cache; `AgentLinkedInlineText.body` paga o mesmo hash de novo para o `sourceFingerprint` (AA-28).**
+- [x] **AA-32 · P2 · por frame — `AgentMessageMarkdown.cacheKey(for:)` faz `hasher.combine(text)` (O(texto)) a cada lookup de bloco/inline por linha montada por passada, mesmo em hit de cache; `AgentLinkedInlineText.body` paga o mesmo hash de novo para o `sourceFingerprint` (AA-28).**
+  **FEITO `0db95b6f`** — hash único por linha: `sourceFingerprint` alimenta `attributedInline(fingerprint:)` e o representable (`cacheKey(for:fingerprint:)` provado idêntico a `cacheKey(for:)`). A chave por identidade do dono (mensagem/item) ficou de fora — precisa de medição durante scroll.
   `AgentMessageMarkdown.swift:82-88`, `AgentLinkedInlineText.swift` body. Fazer: calcular o hash 1× por body e reutilizar como chave do cache e como fingerprint (passar `sourceFingerprint` para `attributedInline`/`blocks` como chave pré-computada); ou chavear por identidade estável do dono (id da mensagem + `messagesGeneration`, id do item + `utf8.count` para corpos vivos). Não medido: precisa de amostra durante scroll com histórico revelado.
 
 ## Adiados nesta rodada (com motivo)
@@ -244,6 +246,7 @@ Auditoria de código de 2026-09-14 (`AgentRunCoordinator.swift`, `AppContext.swi
 - **BT-26 / BT-29 / AA-29 / AA-30 / AA-31** — memória e limpezas P2 sem evidência de custo por frame; fazer junto com uma amostra de memória em sessão longa.
 - **AA-23 (cap de items do turno vivo)** — muda o que o Bots renderiza para turnos com centenas de tool calls; precisa decisão de UX.
 - **EV-26** — `publishAsync` no EventBus: após EV-25 o publish do digest a partir do main ficou raro; sem evidência restante.
+- **AA-32 (parte 2)** — chave do cache de markdown por identidade estável (id da mensagem + `messagesGeneration`; id do item + `utf8.count`) em vez de hash do texto: só vale medir com histórico revelado durante scroll.
 - **EV-27 / EV-28** — SUM de payload por thread e retenção de `token_saver_attempt_events`: mudam schema/retention; precisam de bump em `Schema` + teste de migração.
 - **EV-30** — `assistantChars` incremental: PL-02 já tirou o reduce do main; o custo restante é O(mensagens ≤ 80) off-main.
 
