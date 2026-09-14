@@ -72,19 +72,44 @@ public final class EventLogRepository {
         public let createdAt: String
     }
 
+    public struct PendingRow: Sendable, Equatable {
+        public let seq: Int64
+        public let kind: String
+        public let payloadJSON: String
+
+        public init(seq: Int64, kind: String, payloadJSON: String) {
+            self.seq = seq
+            self.kind = kind
+            self.payloadJSON = payloadJSON
+        }
+    }
+
     public func append(seq: Int64, kind: String, payloadJSON: String) throws {
+        try appendBatch([PendingRow(seq: seq, kind: kind, payloadJSON: payloadJSON)])
+    }
+
+    /// EV-25(c): one BEGIN IMMEDIATE / n INSERTs / prune / COMMIT for a batch.
+    /// Under a stream storm the writer queue used to commit one transaction per
+    /// event (~1,100 per 10 min live) and, at the 5,000-row cap, re-ran the
+    /// orphaned-receipt DELETE per row. Rows are inserted in the given order.
+    public func appendBatch(_ rows: [PendingRow]) throws {
+        guard !rows.isEmpty else { return }
         try db.performSync { db in
             try db.transaction {
                 let st = try db.prepare("""
                     INSERT INTO events(seq, kind, request_id, origin_client_id, payload_json, created_at)
                     VALUES(?, ?, NULL, NULL, ?, ?);
                 """)
-                try st.bind(1, seq)
-                try st.bind(2, kind)
-                try st.bind(3, payloadJSON)
-                try st.bind(4, iso.string(from: Date()))
-                _ = try st.step()
-                db.noteEventRowsInserted(1)
+                let createdAt = iso.string(from: Date())
+                for row in rows {
+                    st.reset()
+                    try st.bind(1, row.seq)
+                    try st.bind(2, row.kind)
+                    try st.bind(3, row.payloadJSON)
+                    try st.bind(4, createdAt)
+                    _ = try st.step()
+                }
+                db.noteEventRowsInserted(Int64(rows.count))
                 try EventRetentionPolicy.prune(db: db, cap: EventLogRepository.cap)
             }
         }

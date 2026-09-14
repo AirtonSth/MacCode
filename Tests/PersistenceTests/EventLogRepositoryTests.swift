@@ -22,6 +22,29 @@ final class EventLogRepositoryTests: XCTestCase {
         return db
     }
 
+    // MARK: - EV-25(c): batched append
+
+    /// WHY: the writer queue coalesces a storm of published events into one
+    /// transaction. Order, cap enforcement and newest-row retention must be
+    /// identical to appending one row at a time.
+    func test_appendBatch_insertsInOrderAndEnforcesTheCapAcrossTheBatchBoundary() throws {
+        let db = try makeDB()
+        let repo = EventLogRepository(db: db)
+        let first = (0..<4_990).map { EventLogRepository.PendingRow(seq: Int64($0), kind: "test", payloadJSON: "{}") }
+        try repo.appendBatch(first)
+        let crossing = (4_990..<5_020).map { EventLogRepository.PendingRow(seq: Int64($0), kind: "test", payloadJSON: "{\"i\":\($0)}") }
+        try repo.appendBatch(crossing)
+
+        let all = try repo.read(since: -1, limit: 6_000)
+        XCTAssertEqual(all.count, 5_000, "a batch that crosses the cap must prune exactly the excess")
+        XCTAssertEqual(all.first?.seq, 20, "the oldest rows go, in batch order")
+        XCTAssertEqual(all.last?.seq, 5_019)
+        XCTAssertEqual(all.last?.payloadJSON, "{\"i\":5019}")
+        XCTAssertEqual(all.map(\.seq), all.map(\.seq).sorted(), "batch insertion preserves sequence order")
+        try repo.appendBatch([])
+        XCTAssertEqual(try repo.read(since: -1, limit: 6_000).count, 5_000, "an empty batch is a no-op")
+    }
+
     // MARK: - T009: events bound — cap at 5000 rows
 
     /// WHY: append() must enforce the documented hard cap after every write. If the

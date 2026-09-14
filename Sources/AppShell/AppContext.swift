@@ -6050,17 +6050,69 @@ public final class AppContext {
     /// Wire an EventBus persister to encode and append on the serial writer
     /// queue. Serial submission preserves event sequence while keeping payload
     /// encoding and SQLite transactions off the producer/delivery path.
+    /// EV-25(c): events published while the writer queue is busy pile up here
+    /// and land in ONE transaction when the scheduled flush runs. The flush is
+    /// enqueued as soon as the buffer becomes non-empty, so an idle writer
+    /// persists with the same latency as before and only storms coalesce.
+    final class PendingEventLogRows: @unchecked Sendable {
+        private let lock = NSLock()
+        private var rows: [EventBus.Event] = []
+
+        /// Returns true when this event opened a new batch (caller schedules the flush).
+        func append(_ event: EventBus.Event) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            rows.append(event)
+            return rows.count == 1
+        }
+
+        func drain() -> [EventBus.Event] {
+            lock.lock(); defer { lock.unlock() }
+            let drained = rows
+            rows.removeAll(keepingCapacity: true)
+            return drained
+        }
+    }
+
+    private let pendingEventLogRows = PendingEventLogRows()
+    private let eventLogFlushLock = NSLock()
+    nonisolated(unsafe) private var eventLogFlushCountValue = 0
+    nonisolated(unsafe) private var eventLogPersistedRowCountValue = 0
+    /// Test seams: flushes vs rows persisted through them.
+    nonisolated var eventLogFlushCountForTesting: Int {
+        eventLogFlushLock.lock(); defer { eventLogFlushLock.unlock() }
+        return eventLogFlushCountValue
+    }
+    nonisolated var eventLogPersistedRowCountForTesting: Int {
+        eventLogFlushLock.lock(); defer { eventLogFlushLock.unlock() }
+        return eventLogPersistedRowCountValue
+    }
+
     public func wireBackgroundPersister(eventBus: EventBus = .shared) {
         let log = eventLog
         let queue = backgroundWriterQueue
+        let pending = pendingEventLogRows
+        let flushLock = eventLogFlushLock
         eventBus.persistenceCommitFence = {
             queue.sync {}
         }
-        eventBus.persister = { ev in
+        eventBus.persister = { [weak self] ev in
             guard AppDelegate.shouldPersistEvent(ev) else { return }
+            guard pending.append(ev) else { return }
             queue.async {
-                let json = EventBus.encodePayloadForPersistence(ev.payload)
-                _ = try? log.append(seq: ev.seq, kind: ev.kind, payloadJSON: json)
+                let batch = pending.drain()
+                guard !batch.isEmpty else { return }
+                let rows = batch.map { event in
+                    EventLogRepository.PendingRow(
+                        seq: event.seq,
+                        kind: event.kind,
+                        payloadJSON: EventBus.encodePayloadForPersistence(event.payload)
+                    )
+                }
+                _ = try? log.appendBatch(rows)
+                flushLock.lock()
+                self?.eventLogFlushCountValue += 1
+                self?.eventLogPersistedRowCountValue += rows.count
+                flushLock.unlock()
             }
         }
     }

@@ -153,6 +153,41 @@ final class BackgroundWriterQueueTests: XCTestCase {
     /// Why: the EventBus.publish path is called from the main thread (coordinator
     /// callbacks are main-actor). If the persister blocks on main the UI stalls
     /// during high-frequency agent events.
+    /// WHY (EV-25c): one BEGIN/INSERT/prune/COMMIT per published event was the
+    /// dominant SQLite writer with 3 runs streaming. Events published while the
+    /// writer is busy must coalesce into one flush, and every row must still be
+    /// on disk once the commit fence returns.
+    @MainActor
+    func test_wireBackgroundPersister_coalescesBurstsIntoBatchesWithoutLosingRows() throws {
+        let dir = NSTemporaryDirectory() + "RC2WriterQueueBatch-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        ctx.wireBackgroundPersister()
+        defer {
+            EventBus.shared.persister = nil
+            EventBus.shared.persistenceCommitFence = nil
+        }
+        let since = EventBus.shared.currentSeq
+        // Hold the writer so the burst has to pile up behind it.
+        let gate = DispatchSemaphore(value: 0)
+        ctx.backgroundWriterQueue.async { gate.wait() }
+        let burst = 40
+        for i in 0..<burst {
+            EventBus.shared.publishRawForTesting(kind: "test.batch.persist", payload: .string("row-\(i)"))
+        }
+        gate.signal()
+        EventBus.shared.persistenceCommitFence?()
+
+        let rows = try ctx.eventLog.read(since: since, limit: 1_000).filter { $0.kind == "test.batch.persist" }
+        XCTAssertEqual(rows.count, burst, "every published row must be durable once the fence returns")
+        XCTAssertEqual(rows.map(\.seq), rows.map(\.seq).sorted())
+        XCTAssertEqual(ctx.eventLogPersistedRowCountForTesting, burst)
+        XCTAssertLessThan(
+            ctx.eventLogFlushCountForTesting,
+            burst,
+            "a burst behind a busy writer must land in fewer transactions than events"
+        )
+    }
+
     @MainActor
     func test_wireBackgroundPersister_dispatchIsOffMain() throws {
         let dir = NSTemporaryDirectory() + "RC2WriterQueueTest-" + UUID().uuidString
