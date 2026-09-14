@@ -42,22 +42,26 @@ Escala real do transcript: `agent_messages` é pequeno (maior thread: 10 msgs / 
 
 ## F1 — Parar de acordar o main thread por evento (P0)
 
-- [ ] **PL-01 · P0 · idle-com-runs — recálculo da economia diária do Token Saver roda no main thread a cada flush de uso.**
+- [x] **PL-01 · P0 · idle-com-runs — recálculo da economia diária do Token Saver roda no main thread a cada flush de uso.**
+  **FEITO `30f1ff5d`** — `scheduleTokenSaverDailyEconomyRecompute` coalesce (1 s) + `Task.detached`; notificação só após o upsert; gatilhos Graphify/sidecar migrados. Teste `test_tokenSaverDailyEconomyRecompute_coalescesTriggersAndPostsUsageChangedAfterUpsert` (10 gatilhos → 1 recompute). Medição antes→depois ao vivo pendente (precisa build release rodando).
   `Sources/AppShell/AppContext.swift:5155` faz `DispatchQueue.main.async { completeTokenSaverUsageWrite }` após gravar `usage.json` na `backgroundWriterQueue`; `:5197` chama `recomputeTokenSaverDailyEconomyToday()` que em `:5430-5530` faz `SettingsStore.load()` + decode de `usage.json` + `measuredPipes`, `signalCount`, `answerTokensSum`, `medianExplorationTokens`, `prune`, `threadCacheAmortizationInputs` e `upsert` — 8 idas ao `SQLiteDB` no main, cada uma esperando os escritores dos runs. Frequência: debounce de 0,75 s **por run** (`:610`), então com 3 runs é ~1–4×/s. 955 + 45 amostras = ~16% do main thread parado.
   Fazer: mover `recomputeTokenSaverDailyEconomy` para a mesma `backgroundWriterQueue`, logo depois do `record(...)` (já está fora do main, já tem o snapshot); no main só atualizar `pendingUsageByRun` e agendar a notificação. `recomputeTokenSaverDailyEconomyWindow` (chamado no boot) idem, em `Task.detached`. Manter a ordem: o upsert do dia precisa terminar antes de `.rc2TokenSaverUsageChanged` ser postado, senão o rodapé lê o valor antigo.
   Verificar: teste em `AppContextTokenSaver…Tests` com `beforeTokenSaverUsageWriteForTesting` + contador `PerfSwitchMetrics.mainThreadSyncCountForTesting()` = 0 durante o flush; reamostrar 8 s: 0 amostras de `recomputeTokenSaverDailyEconomy` no main.
 
-- [ ] **PL-02 · P0 · stream — rodapé do Token Saver (Bots e Agent App) lê SQLite no main achando que está off-main.**
+- [x] **PL-02 · P0 · stream — rodapé do Token Saver (Bots e Agent App) lê SQLite no main achando que está off-main.**
+  **FEITO `b17d0ea6`** — `Task.detached` nos dois VMs; reduce do Bots movido para dentro da task. Pin `test_tokenSaverFooterReloadsAreDetachedFromTheMainActor`.
   `Sources/AppShell/BotsWindow.swift:4120-4190`: `reloadTokenSaverThreadSavings` faz o `reduce` de `deskMessages` (O(n) em mensagens) **no main** antes do `Task`, e o `Task { }` (herda MainActor) faz `SettingsStore(db:).load()` 2×, `PrivateAccountSessionStore.load()`, `loadDeliveredTotal` e `currentDayGraphifySignalCount` — 4–5 `performSync` no main por disparo. Disparos: `.rc2TokenSaverUsageChanged` (≥ a cada 2 s com runs ativos, `AppContext.swift:606`), `selectDeskThread`, `performThreadFreshness`, `reloadSelectedBot`, `restoreDeskMessages`. `Sources/Surfaces/AgentAppSurface.swift:2014-2070` tem o mesmo padrão (comentário "off-main" falso); os closures vêm de `AppCommandRouter.swift:3646 wireTokenSaverThreadFooter`. 107 amostras (Bots) na janela de 8 s.
   Fazer: trocar por `Task.detached` capturando `db`/repos (thread-safe, regra 5) e valores `Sendable`; mover o `reduce` do Bots para dentro da task com snapshot de `deskMessages`; cachear `SettingsStore` (uma instância por VM, ou ler `tokenSaverEnabled`/`isGraphifyRuntimeActive` do `AppContext` que já observa settings) para não carregar 3× a mesma linha.
   Verificar: teste fonte/comportamental: publicar `.rc2TokenSaverUsageChanged` 20× → `PerfSwitchMetrics.mainThreadSyncCountForTesting()` não cresce; rodapé continua atualizando (valor igual ao de antes).
 
-- [ ] **PL-03 · P0 · stream — o Pet consulta `bot_conversations` no main a cada `agent.item.started/completed` de qualquer run.**
+- [x] **PL-03 · P0 · stream — o Pet consulta `bot_conversations` no main a cada `agent.item.started/completed` de qualquer run.**
+  **FEITO `ed85970e`** — `linkedBotByActiveThread` (cache do BotStore primeiro, 1 lookup off-main por thread desconhecida, generation guard). Teste `test_petResolvesLinkedBotOnceOffMainAndReusesItAcrossActiveRunRefreshes` (20 reaplicações → 1 lookup).
   `Sources/AppShell/Pet/PetController.swift` `shouldResyncActiveRuns` devolve true para `agentItemStarted/Completed` (1,4/s por run) → `refreshActiveThreadsFromCoordinator` → `applyActiveThreadIDs` → `context.botStore.conversationsLinked(to:)` e `bots(ids:)` (`Sources/Persistence/BotStore.swift:672`, `db.performSync` no main). 372 amostras (~6%). PF-03 tirou o `listChrome` do main mas esta segunda consulta ficou.
   Fazer: só consultar quando o **conjunto** de threads ativas mudar (cache `linkedBotByThread` invalidado por `agentRunStarted/Finished`, não por item); e fazer a consulta em `Task.detached` com `activeThreadChromeGeneration`, como `fetchActiveThreadChromeOffMain` já faz. Item events só reaplicam os ids com o cache.
   Verificar: `PetControllerTests`: 50 `agent.item.completed` para o mesmo conjunto de threads → `botStore.conversationsLinked` chamado 0× (contador no fake); `agent.run.started` de thread nova → 1× off-main.
 
-- [ ] **PL-04 · P1 · idle — o Pet revalida a posição do Dock a cada 30 s com hit-test no WindowServer para todas as telas.**
+- [x] **PL-04 · P1 · idle — o Pet revalida a posição do Dock a cada 30 s com hit-test no WindowServer para todas as telas.**
+  **FEITO `1614385c`** — laço removido; invalidação só por notificação. Pin `test_petDockPlacementCacheHasNoPeriodicRevalidationLoop`.
   `Sources/AppShell/Pet/PetWindowController.swift:962-990`: `dockPlacementRevalidateTask` loop de 30 s → `revalidateDockPlacementCache` → `petPlacementContext(for:)` por `NSScreen` → `PetDockFrameProvider.frame(for:)`. Um tick = 130 amostras (≈130 ms de main thread travado) na janela de 8 s. PF-02 cacheou a chamada por pose, mas o laço periódico ficou.
   Fazer: remover o laço; manter só a invalidação por `didChangeScreenParametersNotification` / `com.apple.dock.prefchanged` (já observadas) e recomputar preguiçosamente no próximo uso. Se precisar de fallback, 1× ao trazer o Pet para frente.
   Verificar: teste: após `install…Observers`, nenhum `frame(for:)` é chamado sem notificação em 60 s simulados (relógio injetável); notificação → 1 chamada.
@@ -156,15 +160,18 @@ Auditoria de código de 2026-09-14 (`BotsWindow.swift`, `BotsDeskFollowThrough.s
 
 Auditoria de código de 2026-09-14 (`AgentRunCoordinator.swift`, `AppContext.swift`, `EventBus.swift`, `EventLog.swift`, `Repositories.swift`, `PerfSwitchMetrics.swift`). Saudáveis: persistência de stream events em batch por thread (250 ms / count / bytes, uma transação), `storage_usage_counters` (1 página suja por transação), `EventLogRepository.append` off-main na `backgroundWriterQueue`, sem VACUUM/checkpoint no main, `agent_turn_snapshots` **não tem escritor** (tabela morta), Graphify por delta com curto-circuito, `persistProviderNativeSubagentLifecycle` gated.
 
-- [ ] **EV-20 · P0 · main — `PerfSwitchMetrics` grava toda espera de SQLite no main em dois arrays sem limite e, acima de 2 ms, simboliza a stack (`Thread.callStackSymbols`) no main — em release.**
+- [x] **EV-20 · P0 · main — `PerfSwitchMetrics` grava toda espera de SQLite no main em dois arrays sem limite e, acima de 2 ms, simboliza a stack (`Thread.callStackSymbols`) no main — em release.**
+  **FEITO `842ec837`** — ring de 512 + captura de stack só em DEBUG. Teste `test_recordedIntervalsAndMainWaitsStayBounded`.
   `SQLite.swift:453-458` → `PerfSwitchMetrics.swift:147-180`, `:214-216`; `slowMainSyncNanoseconds = 2 ms`; só o `NSLog` está em `#if DEBUG`. Realimentação positiva: quanto mais contenção, mais tempo o main gasta simbolizando. Nenhum leitor em produção (só `*ForTesting`).
   Fazer: `isCapturing` false em release (ou `#if DEBUG` no corpo); arrays em ring de 512; remover `callStackSymbols` em release.
 
-- [ ] **EV-21 · P0 · por evento — `BotPeerHandoffAuthority` hopa para o MainActor em todo `AssistantEvent` de todo run, sem filtro.**
+- [x] **EV-21 · P0 · por evento — `BotPeerHandoffAuthority` hopa para o MainActor em todo `AssistantEvent` de todo run, sem filtro.**
+  **FEITO `b17d0ea6`** — `PeerProgressStamps` com lock, escrito na thread do stream; poda em `didFinish`. Teste `test_peerHandoffAuthorityStampsStreamProgressWithoutMainActorHop`.
   `BotsWindow.swift:2499-2508` (registrado em `:792`): `Task { @MainActor { lastPeerProgressByRunID[run] = Date() } }` por delta (~90 tasks/s com 3 runs); lido só em `:2485`; nunca poda runs terminados.
   Fazer: dicionário com `NSLock` escrito na thread chamadora, ou early-return se `run` não é peer rastreado; podar em `didFinish`.
 
-- [ ] **EV-22 · P0 · main — `recomputeTokenSaverDailyEconomyToday` também dispara do caminho Graphify, por item de tool finalizado.** (complementa PL-01)
+- [x] **EV-22 · P0 · main — `recomputeTokenSaverDailyEconomyToday` também dispara do caminho Graphify, por item de tool finalizado.** (complementa PL-01)
+  **FEITO `30f1ff5d`** junto com PL-01 (os 3 gatilhos Graphify usam o mesmo agendador coalescido).
   `AppContext.swift:5865`, `:5881` (`processGraphifyBuffer` → `DispatchQueue.main.async { recomputeTokenSaverDailyEconomyToday() }` por `markSucceeded`/falha), `:5725` (`failGraphifyUsageItem`). `loadTokenSaverDailyEconomySharedSnapshot` (`:5432-5433`) instancia `SettingsStore` novo (cache por instância → miss garantido, `SettingsStore.swift:317,343`) e lê+decodifica `usage.json` no main.
   Fazer: junto com PL-01 — debounce ~2 s, `Task.detached` com generation, um `SettingsStore` compartilhado no `AppContext` invalidado por `SettingsStore.revision` (padrão em `:5536-5552`).
 
@@ -189,7 +196,8 @@ Auditoria de código de 2026-09-14 (`AgentRunCoordinator.swift`, `AppContext.swi
 
 - [ ] **EV-28 · P2 · db — `token_saver_attempt_events` cresce sem retenção; 3 `performSync` separados por `.tokenUsage`.** `TokenSaverT003Persistence.swift:1693-1720`, `Schema.swift:767-775`. Uma `db.transaction`; poda por idade no `runCCRRetention` de 24 h (`AppDelegate.swift:997-1017`).
 
-- [ ] **EV-29 · P2 · main — Pet: `noteLiveActivityProgress` (`PetController.swift:576-612`) aceita `agent.item.delta` e cai em `applyActiveThreadIDs` → `conversationsLinked` (`:1178`) quando algum chrome não está cacheado.** (complementa PL-03) Usar `botStore.cachedBotID(linkedTo:)` (`BotStore.swift:92`, sem lock de DB) e só cair no SQLite off-main para misses.
+- [x] **EV-29 · P2 · main — Pet: `noteLiveActivityProgress` (`PetController.swift:576-612`) aceita `agent.item.delta` e cai em `applyActiveThreadIDs` → `conversationsLinked` (`:1178`) quando algum chrome não está cacheado.** (complementa PL-03)
+  **FEITO `ed85970e`** junto com PL-03 (`cachedBotID(linkedTo:)` primeiro; SQLite só off-main para misses). Usar `botStore.cachedBotID(linkedTo:)` (`BotStore.swift:92`, sem lock de DB) e só cair no SQLite off-main para misses.
 
 - [ ] **EV-30 · P2 — `.rc2TokenSaverUsageChanged` a cada 2 s faz cada surface aberta reduzir todos os corpos assistente + 2 leituras SQLite (`AgentAppSurface.swift:2012+`).** (complementa PL-02) `assistantChars` incremental; pular quando `surfaceVisibility != .visible`.
 
