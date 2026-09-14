@@ -125,11 +125,13 @@ Auditoria de código de 2026-09-14 (leitura de `AgentAppSurface.swift`, `Assista
   `AgentLinkedInlineText.swift:305`, `:205`; `apply(to:)` chamado em `updateNSView:300` e `sizeThatFits:296`; `AgentMessageMarkdown.cacheKey:82` faz `hasher.combine(text)` por bloco mesmo em hit. Vale para Agent App e Bots (mesma view).
   Fazer: fingerprint pelo conteúdo (reaproveitar a chave do markdown) e remover o fallback `||`.
 
-- [ ] **AA-29 · P2 — `TimelineItemIndex` é construído (`:2328`, `:2661`, `:2771`, `:5907`, `:9330`) e nunca lido em produção (`timelineItemLocation:1954` só em testes).** Remover as construções ou ligar em `mutateItem`.
+- [x] **AA-29 · P2 — `TimelineItemIndex` é construído (`:2328`, `:2661`, `:2771`, `:5907`, `:9330`) e nunca lido em produção (`timelineItemLocation:1954` só em testes).** Remover as construções ou ligar em `mutateItem`.
+  **FEITO `09bf5cdc`** — propriedade, 7 construções e acessor removidos (sem leitor em produção); struct + testes mantidos. Pin `test_viewModelNoLongerBuildsTheUnreadTimelineItemIndex`.
 
 - [ ] **AA-30 · P2 · scheduled — `tickScheduledLivePoll:5882` zera a timeline e replays todos os eventos a cada 2 s.** Replays só além de `scheduledLiveStreamCount`.
 
-- [ ] **AA-31 · P2 · memória — `sr1TranslationsByItemId` guarda 2 entradas por item (`AssistantEvents.swift:1751,1755`), só poda no teto de 5.000 turnos; `hiddenPersistedAssistantContentKey:12314` monta String O(mensagens+turnos+items) a cada delta; `workDisclosureRevealByTurn` fora de `pruneExpandedItemIds:14380`.** Trocar a String por fold de `Hasher`; incluir no prune.
+- [x] **AA-31 · P2 · memória — `sr1TranslationsByItemId` guarda 2 entradas por item (`AssistantEvents.swift:1751,1755`), só poda no teto de 5.000 turnos; `hiddenPersistedAssistantContentKey:12314` monta String O(mensagens+turnos+items) a cada delta; `workDisclosureRevealByTurn` fora de `pruneExpandedItemIds:14380`.** Trocar a String por fold de `Hasher`; incluir no prune.
+  **FEITO `09bf5cdc`** — chave do hide-set cacheada por mensagem (`AgentTranscriptState.messagesGeneration`, só bump em mudança real) e por turno finalizado (items.count + tamanho do final); só o turno vivo é re-hasheado por delta; `workDisclosureRevealByTurn` entrou no prune. `sr1TranslationsByItemId` (2 entradas/item) ficou como está (memória, sem custo por frame). Testes `test_hiddenPersistedContentKeyPartsComposeToTheFullKey`, `test_messagesGenerationMovesOnlyWhenMessagesChange`.
 
 ## F3 — Custo que cresce com o tamanho do chat (Bots)
 
@@ -164,7 +166,8 @@ Auditoria de código de 2026-09-14 (`BotsWindow.swift`, `BotsDeskFollowThrough.s
   `:12369` `vm.isDeskConversationRunning(conversation)` → `:4836` → `liveDeskThreadIDs():4839` → `coordinator.activeThreadIdsSnapshot()` (`NSLock` global, aloca `Set`), por linha visível + `filteredDeskConversations:4820` + `deskThreadActiveCount:4823`, dentro do body que roda por token (BT-20). Contenção direta main ↔ thread de stream.
   Fazer: calcular o `Set` 1× por passada/tick e passar para as linhas.
 
-- [ ] **BT-26 · P2 · memória — caches por thread nunca podados na sessão.** `BotsWindow.swift:3362-3371`: `liveTimelineByThread` (até 32 MiB **por thread**, `AssistantEvents.swift:1038`), `liveStreamCountByThread`, `liveStreamCursorByThread`, `settledTerminalRunIDByThread`, `messagesByConversation`; janelas destacadas multiplicam. LRU de 3-5 threads; o replay do SQLite já reidrata.
+- [x] **BT-26 · P2 · memória — caches por thread nunca podados na sessão.** `BotsWindow.swift:3362-3371`: `liveTimelineByThread` (até 32 MiB **por thread**, `AssistantEvents.swift:1038`), `liveStreamCountByThread`, `liveStreamCursorByThread`, `settledTerminalRunIDByThread`, `messagesByConversation`; janelas destacadas multiplicam. LRU de 3-5 threads; o replay do SQLite já reidrata.
+  **FEITO `f9a331dc`** — LRU de 6 timelines com o thread selecionado fixado (`lruEvictions`), cursores/contagens evictados junto; `messagesByConversation` (≤80 msgs cada) ficou como está. Teste `test_liveTimelineLRUEvictsOldestButNeverThePinnedThread`.
 
 - [x] **BT-27 · P2 · por turno — `tokenSaverMessage(forTurnId:)` (`:4280`) filtra `deskMessages` por turno por passada (`:12069`, `:12077`).** Índice `[String: BotDeskMessage]` ao atribuir `deskMessages`.
   **FEITO `58db877d`** — índice `tokenSaverMessagesByTurnId` no `didSet` de `deskMessages`.
@@ -221,6 +224,17 @@ Auditoria de código de 2026-09-14 (`AgentRunCoordinator.swift`, `AppContext.swi
   **FEITO `ed85970e`** junto com PL-03 (`cachedBotID(linkedTo:)` primeiro; SQLite só off-main para misses). Usar `botStore.cachedBotID(linkedTo:)` (`BotStore.swift:92`, sem lock de DB) e só cair no SQLite off-main para misses.
 
 - [ ] **EV-30 · P2 — `.rc2TokenSaverUsageChanged` a cada 2 s faz cada surface aberta reduzir todos os corpos assistente + 2 leituras SQLite (`AgentAppSurface.swift:2012+`).** (complementa PL-02) `assistantChars` incremental; pular quando `surfaceVisibility != .visible`.
+
+## F5 — Achados da 2ª varredura (2026-09-14, tarde)
+
+- [x] **S-01 · P1 · por frame — `makeChatRowPaintContext` (Agent App) e `BotsDeskFollowThrough.timeline` (Bots) normalizavam todos os corpos assistente de todos os turnos visíveis a cada body pass (laço por scalar até 32 KiB por texto).**
+  **FEITO `7ee72473`** — `AgentChatLiveTurnChrome.normalizedAssistantFinals(for:)` memoiza turnos finalizados por (turnId, items.count, tamanho do final) em `NSCache` de 512; turnos vivos sempre recalculados. Teste `test_normalizedAssistantFinalsMemoizeFinishedTurnsOnly`.
+
+- [ ] **EV-25(c) · P1 · db — uma transação SQLite por evento publicado (`EventLogRepository.append`: BEGIN IMMEDIATE / INSERT / prune / COMMIT) e, no teto de 5.000 linhas, `DELETE FROM command_receipt_events WHERE NOT EXISTS (…)` por linha.**
+  `AppContext.wireBackgroundPersister` (`AppContext.swift:6053`), `EventLog.swift:79-92`. Fazer: buffer com lock + flush enfileirado na `backgroundWriterQueue` assim que o buffer deixa de estar vazio (latência igual quando ocioso; coalesce só sob tempestade) → `appendBatch` em uma transação; o `DELETE` de órfãos passa a rodar 1× por lote. Verificar: 40 eventos publicados com a fila segurada → todas as linhas no disco após o `persistenceCommitFence` e `eventLogFlushCountForTesting < 40`.
+
+- [ ] **AA-32 · P2 · por frame — `AgentMessageMarkdown.cacheKey(for:)` faz `hasher.combine(text)` (O(texto)) a cada lookup de bloco/inline por linha montada por passada, mesmo em hit de cache; `AgentLinkedInlineText.body` paga o mesmo hash de novo para o `sourceFingerprint` (AA-28).**
+  `AgentMessageMarkdown.swift:82-88`, `AgentLinkedInlineText.swift` body. Fazer: calcular o hash 1× por body e reutilizar como chave do cache e como fingerprint (passar `sourceFingerprint` para `attributedInline`/`blocks` como chave pré-computada); ou chavear por identidade estável do dono (id da mensagem + `messagesGeneration`, id do item + `utf8.count` para corpos vivos). Não medido: precisa de amostra durante scroll com histórico revelado.
 
 ## Adiados nesta rodada (com motivo)
 
