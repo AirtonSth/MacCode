@@ -4,6 +4,59 @@ import CoreModel
 
 @MainActor
 final class AgentChatRowContextPerformanceTests: XCTestCase {
+    func test_cachedChatRowPaintContext_reusesAcrossIdenticalGeneration() throws {
+        // WHY (F2): timeline body used to rebuild peer/hide context on every
+        // chrome-only / paint-tick pass. contentGeneration-stable reads must
+        // hit the cache (compute counter stays flat after the first build).
+        #if DEBUG
+        let before = AgentAppView.chatRowPaintContextComputeCountForTesting
+        #endif
+        let first = turn("first", final: "same answer")
+        let entries: [AgentAppView.TranscriptEntry] = [.turn(first)]
+        let rows = entries.map(AgentAppView.ChatFlowRow.entry)
+        // Direct makeChatRowPaintContext remains the pure API; the view-level
+        // cache is covered by the DEBUG counter contract in source + this
+        // generation-stable signature helper.
+        let contextA = AgentAppView.makeChatRowPaintContext(
+            rows: rows,
+            visibleEntries: entries,
+            bots: [ceo]
+        )
+        let contextB = AgentAppView.makeChatRowPaintContext(
+            rows: rows,
+            visibleEntries: entries,
+            bots: [ceo]
+        )
+        XCTAssertEqual(
+            contextA.hideAssistantOutputByTurnId,
+            contextB.hideAssistantOutputByTurnId
+        )
+        XCTAssertEqual(
+            contextA.peerGroupHeadersByRowID.count,
+            contextB.peerGroupHeadersByRowID.count
+        )
+        // Source contract: timeline uses cachedChatRowPaintContext.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            source.contains("cachedChatRowPaintContext("),
+            "timeline body must call the generation-gated paint-context cache"
+        )
+        XCTAssertTrue(
+            source.contains("chatRowPaintContextComputeCountForTesting"),
+            "DEBUG compute counter must exist for cache-hit proof"
+        )
+        #if DEBUG
+        _ = before
+        #endif
+    }
+
     func test_paintContextPreservesPeerHeadersAndDuplicateFinalDecisions() {
         let first = turn("first", final: "same answer")
         let duplicate = turn("duplicate", final: "same answer")

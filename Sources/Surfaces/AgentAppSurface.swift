@@ -2118,11 +2118,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var selectThreadHydrationTask: Task<Void, Never>?
     private var paintedTimelineByThread: [AgentThreadID: AssistantTimelineState] = [:]
     private var paintedTimelineOrder: [AgentThreadID] = []
-    private static let paintedTimelineLimit = 3
+    /// F3: keep at most 2 painted timelines (was 3). Each entry can pin up to
+    /// `aggregateHotTextByteLimit` of hot transcript; dropping one slot cuts
+    /// peak switch-cache RAM by ~33% while still covering selected + one back.
+    private static let paintedTimelineLimit = 2
     var paintedTimelineCountForTesting: Int { paintedTimelineByThread.count }
 
-    /// AA-07: keep at most 3 painted timelines, plus the selected thread and any
-    /// thread that still has a live run on this surface.
+    /// AA-07 / F3: keep at most `paintedTimelineLimit` painted timelines, plus
+    /// the selected thread and any thread that still has a live run on this surface.
     private func rememberPaintedTimeline(_ id: AgentThreadID, _ timeline: AssistantTimelineState) {
         paintedTimelineByThread[id] = timeline
         paintedTimelineOrder.removeAll { $0 == id }
@@ -5561,16 +5564,51 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public var mentionableBotsProvider: () -> [BotDefinition] = { [] }
 
+    #if DEBUG
+    /// Test-only: bots-provider invocations from `composerSuggestions`.
+    nonisolated(unsafe) static var composerMentionableBotsProviderCallCountForTesting: UInt64 = 0
+    /// Test-only: Claude slash-catalog loads from `composerSuggestions`.
+    nonisolated(unsafe) static var composerClaudeSlashEntriesCallCountForTesting: UInt64 = 0
+    #endif
+
     public var composerSuggestions: [AgentComposerSuggestion] {
+        // F1: ordinary typing has no @ / $ token. Gathering bots + Claude slash
+        // catalogs before `suggestions` can short-circuit wasted work on every
+        // composer body (and every keystroke that republishes suggestions).
+        let token = AgentComposerSuggestions.activeToken(
+            in: prompt,
+            cursorOffset: composerCursorOffset
+        )
+        guard let trigger = token.first, trigger == "@" || trigger == "/" || trigger == "$" else {
+            return []
+        }
         let isClaude = selectedProviderSnapshot?.provider == .claude
+        let mentionableBots: [BotDefinition]
+        if trigger == "@" {
+            #if DEBUG
+            Self.composerMentionableBotsProviderCallCountForTesting &+= 1
+            #endif
+            mentionableBots = mentionableBotsProvider()
+        } else {
+            mentionableBots = []
+        }
+        let extraSkillNames: [String]
+        if isClaude && (trigger == "/" || trigger == "$") {
+            #if DEBUG
+            Self.composerClaudeSlashEntriesCallCountForTesting &+= 1
+            #endif
+            extraSkillNames = claudeProjectSlashEntries()
+        } else {
+            extraSkillNames = []
+        }
         return AgentComposerSuggestions.suggestions(
             for: prompt,
             cursorOffset: composerCursorOffset,
             snapshot: selectedProviderSnapshot,
             localSlashCommands: Self.localSlashCommands,
             extraCommands: isClaude ? ClaudeSlashCommandDiscovery.builtInClaudeCommands : [],
-            extraSkillNames: isClaude ? claudeProjectSlashEntries() : [],
-            mentionableBots: mentionableBotsProvider()
+            extraSkillNames: extraSkillNames,
+            mentionableBots: mentionableBots
         )
     }
 
@@ -10334,7 +10372,9 @@ public enum AgentComposerSuggestions {
         return updated
     }
 
-    private static func activeToken(in text: String, cursorOffset: Int? = nil) -> String {
+    /// Shared with `AgentAppViewModel.composerSuggestions` so the VM can gate
+    /// expensive bot/slash catalog loads before calling `suggestions`.
+    static func activeToken(in text: String, cursorOffset: Int? = nil) -> String {
         guard let range = activeTokenRange(in: text, cursorOffset: cursorOffset) else { return "" }
         return String(text[range])
     }
@@ -13373,6 +13413,52 @@ public struct AgentAppView: View {
     }
     private let assistantTextsCache = AssistantTextsCache()
 
+    /// F2: memoize `makeChatRowPaintContext` across chrome-only / paint-tick
+    /// body passes when `contentGeneration` and the compact row/bots signature
+    /// are unchanged. Peer-header + hide-set walks are O(visible rows).
+    private final class ChatRowPaintContextCache {
+        var generation: UInt64 = 0
+        var signature: String = ""
+        var context: ChatRowPaintContext?
+    }
+    private let chatRowPaintContextCache = ChatRowPaintContextCache()
+    #if DEBUG
+    /// Test-only: uncached `makeChatRowPaintContext` invocations.
+    static nonisolated(unsafe) var chatRowPaintContextComputeCountForTesting: UInt64 = 0
+    #endif
+
+    private func cachedChatRowPaintContext(
+        rows: [ChatFlowRow],
+        visibleEntries: [TranscriptEntry],
+        bots: [BotDefinition]
+    ) -> ChatRowPaintContext {
+        let generation = vm.transcriptState.contentGeneration
+        // Cheap identity: row ids + bot handles. Generation already tracks
+        // message/timeline content mutation.
+        var signature = "\(generation)|\(rows.count)|\(visibleEntries.count)|\(bots.count)"
+        if let first = rows.first?.id { signature += "|\(first)" }
+        if let last = rows.last?.id { signature += "|\(last)" }
+        if let firstBot = bots.first?.handle { signature += "|\(firstBot)" }
+        if let lastBot = bots.last?.handle { signature += "|\(lastBot)" }
+        if chatRowPaintContextCache.generation == generation,
+           chatRowPaintContextCache.signature == signature,
+           let cached = chatRowPaintContextCache.context {
+            return cached
+        }
+        #if DEBUG
+        Self.chatRowPaintContextComputeCountForTesting &+= 1
+        #endif
+        let context = Self.makeChatRowPaintContext(
+            rows: rows,
+            visibleEntries: visibleEntries,
+            bots: bots
+        )
+        chatRowPaintContextCache.generation = generation
+        chatRowPaintContextCache.signature = signature
+        chatRowPaintContextCache.context = context
+        return context
+    }
+
     // F2: per-turn render data, memoized for FINISHED turns (immutable content) so a
     // long completed thread no longer re-derives renderableItems / final-id splitting /
     // block grouping / plan filtering for every visible turn on every body pass. Keyed
@@ -14223,7 +14309,9 @@ public struct AgentAppView: View {
                         let liveRows = Self.chatFlowRows(split.liveTail)
                         let allRows = historyRows + liveRows
                         let mentionBots = vm.mentionableBotsProvider()
-                        let rowPaintContext = Self.makeChatRowPaintContext(
+                        // F2: reuse paint context across chrome-only / paint-tick
+                        // passes when contentGeneration is unchanged.
+                        let rowPaintContext = cachedChatRowPaintContext(
                             rows: allRows,
                             visibleEntries: visibleTranscriptEntries,
                             bots: mentionBots
