@@ -567,15 +567,28 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(finish.1, "goal achieved", "the run's final must be the LAST iteration's answer")
     }
 
-    func test_activeGoalFinishesFromAuthoritativeThreadReadWhenNoNewerTurnAppears() async throws {
+    func test_activeGoalSurvivesReconcilePollWhenNoNewerTurnAppearsYetAndFlushesFromInactivity() async throws {
         // WHY: `thread/goal/cleared` has never been observed on the wire, so a
-        // goal-deferred finish must not depend on it. When the goal stops without
-        // a new turn, the existing thread/read reconcile must release the finish.
+        // goal-deferred finish must not depend on it. But the ~2s/15s thread/read
+        // reconcile probe only inspects the ONE completed iteration turn — it
+        // can't tell "goal is actually over" apart from "goal is between
+        // iterations, waiting minutes on something slow like CI" — and a real
+        // /goal thread stalled exactly like this live 2026-09-14: every
+        // iteration's turn/completed raced the reconcile probe and lost, the run
+        // kept closing out from under the still-active goal, and the generic
+        // background-await auto-continue budget (5) burned out trying to recover
+        // it. The reconcile probe must not treat "no newer turn yet" as terminal
+        // while the goal is still active; only the inactivity watchdog (this
+        // codebase's existing documented bound for a goal that never
+        // clears/advances) may release it.
         let client = MockCodexAppServerClient(autoComplete: false)
-        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
-            client.notificationHandler = notificationHandler
-            return client
-        }
+        let adapter = CodexAppServerAdapter(
+            clientFactory: { _, notificationHandler, _ in
+                client.notificationHandler = notificationHandler
+                return client
+            },
+            pendingFinishInactivityTimeout: 4.0
+        )
         let sink = EventSink()
         _ = try await adapter.sendTurn(AgentRunRequest(
             threadId: AgentThreadID(),
@@ -609,14 +622,19 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             "finalMessage": "audit finished"
         ])
 
-        try await Task.sleep(nanoseconds: 300_000_000)
+        // Past the ~2s reconcile probe (thread/read already shows goal-turn-1
+        // completed with no newer turn) but before the 4s inactivity watchdog.
+        try await Task.sleep(nanoseconds: 2_600_000_000)
         let premature = await sink.finish
-        XCTAssertNil(premature, "an active goal must withhold the finish at turn/completed")
+        XCTAssertNil(
+            premature,
+            "the reconcile probe alone must not finish an active goal just because no newer turn has started yet"
+        )
+        XCTAssertFalse(client.readCalls.isEmpty, "the reconcile probe must still poll thread/read while deferring")
 
-        let finish = try await waitForFinish(in: sink, timeout: 5)
+        let finish = try await waitForFinish(in: sink, timeout: 3)
         XCTAssertEqual(finish.0, .completed)
         XCTAssertEqual(finish.1, "audit finished")
-        XCTAssertFalse(client.readCalls.isEmpty, "release must come from the authoritative thread/read reconcile")
     }
 
     func test_pendingFinishInactivityFlushesWhenThreadNeverGoesIdle() async throws {

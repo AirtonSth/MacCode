@@ -2605,6 +2605,18 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             // were reconciling is a finished iteration, not the end of the run.
             return true
         }
+        // turnIsAuthoritativelyTerminal only inspects the one completed iteration
+        // turn, so a still-active goal between iterations (e.g. waiting minutes
+        // on CI) reads as terminal here every time the next turn/started has not
+        // landed yet within this poll's ~2-17s window — this loop re-polls every
+        // 15s, so it would close the run out from under a slow-but-active goal
+        // long before the inactivity watchdog ever gets a chance to. Keep polling
+        // instead; `thread/goal/cleared` (or a goal/updated non-active status)
+        // releases the withheld finish directly, and the watchdog remains the
+        // backstop for a goal that never clears.
+        if hasActiveGoal(threadId: threadId) {
+            return false
+        }
 
         // Prefer the withheld pending payload (preserves [[RC_AWAITING]] stamps).
         // When we deferred after turn/completed, turnCompleted was already
