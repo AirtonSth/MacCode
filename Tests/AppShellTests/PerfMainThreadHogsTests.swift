@@ -179,6 +179,19 @@ final class PerfMainThreadHogsTests: XCTestCase {
         XCTAssertTrue(source.contains("com.apple.dock.prefchanged"))
     }
 
+    // MARK: BT-26
+
+    func test_liveTimelineLRUEvictsOldestButNeverThePinnedThread() {
+        // WHY: liveTimelineByThread kept one up-to-32 MiB timeline for every
+        // thread the VM ever touched. Bound it; the selected thread stays.
+        let ids = (0..<8).map { _ in AgentThreadID() }
+        let pinned = ids[0]
+        let evictions = BotsViewModel.lruEvictions(recency: ids, limit: BotsViewModel.liveTimelineCacheLimit, pinned: pinned)
+        XCTAssertEqual(BotsViewModel.liveTimelineCacheLimit, 6)
+        XCTAssertEqual(evictions, [ids[1], ids[2]], "oldest non-pinned entries go first, down to the limit")
+        XCTAssertTrue(BotsViewModel.lruEvictions(recency: Array(ids.prefix(6)), limit: 6, pinned: nil).isEmpty)
+    }
+
     // MARK: BT-21 / BT-25 source pins
 
     func test_botsDeskLiveTurnRowsAreEquatableAndRailTakesOneLiveSnapshot() throws {

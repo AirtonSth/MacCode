@@ -3408,6 +3408,46 @@ public final class BotsViewModel: ObservableObject {
     private var lastLinkedRunIDByBot: [BotID: AgentRunID] = [:]
     private var lastStartedConversationByBot: [BotID: BotConversation] = [:]
     private var liveTimelineByThread: [AgentThreadID: AssistantTimelineState] = [:]
+    /// BT-26: recency for `liveTimelineByThread`. Each state is bounded at
+    /// 32 MiB of hot text but the map itself grew for every thread the VM ever
+    /// touched (detached windows multiply it). Keep a small LRU; the selected
+    /// thread is pinned and the SQLite replay path rehydrates evicted ones.
+    private var liveTimelineRecency: [AgentThreadID] = []
+    static let liveTimelineCacheLimit = 6
+    var liveTimelineCacheCountForTesting: Int { liveTimelineByThread.count }
+
+    private func storeLiveTimeline(_ state: AssistantTimelineState, for threadID: AgentThreadID) {
+        liveTimelineByThread[threadID] = state
+        liveTimelineRecency.removeAll { $0 == threadID }
+        liveTimelineRecency.append(threadID)
+        for evicted in Self.lruEvictions(
+            recency: liveTimelineRecency,
+            limit: Self.liveTimelineCacheLimit,
+            pinned: selectedConversation?.linkedAgentThreadID
+        ) {
+            liveTimelineByThread.removeValue(forKey: evicted)
+            liveStreamCountByThread.removeValue(forKey: evicted)
+            liveStreamCursorByThread.removeValue(forKey: evicted)
+            liveTimelineRecency.removeAll { $0 == evicted }
+        }
+    }
+
+    /// Oldest-first ids to evict so at most `limit` remain, never the pinned id.
+    nonisolated static func lruEvictions(
+        recency: [AgentThreadID],
+        limit: Int,
+        pinned: AgentThreadID?
+    ) -> [AgentThreadID] {
+        guard recency.count > limit else { return [] }
+        var evictions: [AgentThreadID] = []
+        var remaining = recency.count
+        for candidate in recency where remaining > limit {
+            if candidate == pinned { continue }
+            evictions.append(candidate)
+            remaining -= 1
+        }
+        return evictions
+    }
     private var liveStreamCountByThread: [AgentThreadID: Int] = [:]
     private var liveStreamCursorByThread: [AgentThreadID: AgentRunRepository.StreamEventCursor] = [:]
     private var liveObservedEventsByThread: [AgentThreadID: [AssistantEvent]] = [:]
@@ -8880,7 +8920,7 @@ public final class BotsViewModel: ObservableObject {
             }
             return true
         }
-        liveTimelineByThread[threadID] = state
+        storeLiveTimeline(state, for: threadID)
         liveStreamCountByThread[threadID] = cursor.count
         clearDeskObservedEvents(threadID: threadID)
         if selectedBotID == botID {
@@ -8931,7 +8971,7 @@ public final class BotsViewModel: ObservableObject {
         lastDeskStreamPushAt = Date()
         next.enforceAggregateHotTextBudget()
         deskLiveTimeline = next
-        liveTimelineByThread[selectedThreadId] = next
+        storeLiveTimeline(next, for: selectedThreadId)
         if let terminalReplay, let botID = selectedBotID {
             _ = applyDeskLiveReplay(
                 botID: botID,
