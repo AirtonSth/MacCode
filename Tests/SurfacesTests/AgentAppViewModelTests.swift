@@ -9424,12 +9424,13 @@ final class AgentAppViewModelTests: XCTestCase {
 
     @MainActor
     func test_paintedTimelineLimit_retentionEstimate_3to2() {
-        // WHY: document the F3 memory capacity cut for before/after reporting.
+        // WHY: document the F3 inactive-cache capacity cut. Selected/live
+        // timelines can still remain above this inactive bound.
         let prior = 3
-        let limit = 2
+        let limit = AgentAppViewModel.paintedTimelineLimit
         let reduction = Double(prior - limit) / Double(prior)
-        XCTAssertEqual(reduction, 1.0 / 3.0, accuracy: 0.001)
         XCTAssertEqual(limit, 2)
+        XCTAssertEqual(reduction, 1.0 / 3.0, accuracy: 0.001)
     }
 
     @MainActor

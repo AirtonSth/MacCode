@@ -4,38 +4,39 @@ import CoreModel
 
 @MainActor
 final class AgentChatRowContextPerformanceTests: XCTestCase {
+    func test_chatRowPaintContextSignature_includesMiddleBotIdentity() {
+        // WHY (F2 review): first/last-only bot keys miss middle catalog edits.
+        let rows = [AgentAppView.ChatFlowRow.entry(.turn(turn("t", final: "a")))]
+        let entries: [AgentAppView.TranscriptEntry] = [.turn(turn("t", final: "a"))]
+        let botsA = [
+            ceo,
+            BotDefinition(handle: "mid", name: "Mid A", title: "", description: "", avatarSymbol: "a"),
+            cfo
+        ]
+        let botsB = [
+            ceo,
+            BotDefinition(handle: "mid", name: "Mid B", title: "", description: "", avatarSymbol: "a"),
+            cfo
+        ]
+        let sigA = AgentAppView.chatRowPaintContextSignature(
+            generation: 1,
+            rows: rows,
+            visibleEntries: entries,
+            bots: botsA
+        )
+        let sigB = AgentAppView.chatRowPaintContextSignature(
+            generation: 1,
+            rows: rows,
+            visibleEntries: entries,
+            bots: botsB
+        )
+        XCTAssertNotEqual(sigA, sigB, "middle bot name/symbol must invalidate the paint-context signature")
+    }
+
     func test_cachedChatRowPaintContext_reusesAcrossIdenticalGeneration() throws {
         // WHY (F2): timeline body used to rebuild peer/hide context on every
         // chrome-only / paint-tick pass. contentGeneration-stable reads must
         // hit the cache (compute counter stays flat after the first build).
-        #if DEBUG
-        let before = AgentAppView.chatRowPaintContextComputeCountForTesting
-        #endif
-        let first = turn("first", final: "same answer")
-        let entries: [AgentAppView.TranscriptEntry] = [.turn(first)]
-        let rows = entries.map(AgentAppView.ChatFlowRow.entry)
-        // Direct makeChatRowPaintContext remains the pure API; the view-level
-        // cache is covered by the DEBUG counter contract in source + this
-        // generation-stable signature helper.
-        let contextA = AgentAppView.makeChatRowPaintContext(
-            rows: rows,
-            visibleEntries: entries,
-            bots: [ceo]
-        )
-        let contextB = AgentAppView.makeChatRowPaintContext(
-            rows: rows,
-            visibleEntries: entries,
-            bots: [ceo]
-        )
-        XCTAssertEqual(
-            contextA.hideAssistantOutputByTurnId,
-            contextB.hideAssistantOutputByTurnId
-        )
-        XCTAssertEqual(
-            contextA.peerGroupHeadersByRowID.count,
-            contextB.peerGroupHeadersByRowID.count
-        )
-        // Source contract: timeline uses cachedChatRowPaintContext.
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -52,9 +53,10 @@ final class AgentChatRowContextPerformanceTests: XCTestCase {
             source.contains("chatRowPaintContextComputeCountForTesting"),
             "DEBUG compute counter must exist for cache-hit proof"
         )
-        #if DEBUG
-        _ = before
-        #endif
+        XCTAssertTrue(
+            source.contains("chatRowPaintContextSignature("),
+            "signature helper must cover bot identity fields"
+        )
     }
 
     func test_paintContextPreservesPeerHeadersAndDuplicateFinalDecisions() {

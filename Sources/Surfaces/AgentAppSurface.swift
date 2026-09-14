@@ -2119,9 +2119,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var paintedTimelineByThread: [AgentThreadID: AssistantTimelineState] = [:]
     private var paintedTimelineOrder: [AgentThreadID] = []
     /// F3: keep at most 2 painted timelines (was 3). Each entry can pin up to
-    /// `aggregateHotTextByteLimit` of hot transcript; dropping one slot cuts
-    /// peak switch-cache RAM by ~33% while still covering selected + one back.
-    private static let paintedTimelineLimit = 2
+    /// `aggregateHotTextByteLimit` of hot transcript; dropping one inactive slot
+    /// cuts nominal inactive-cache capacity by ~33% (selected/live may still
+    /// remain above the inactive bound).
+    static let paintedTimelineLimit = 2
     var paintedTimelineCountForTesting: Int { paintedTimelineByThread.count }
 
     /// AA-07 / F3: keep at most `paintedTimelineLimit` painted timelines, plus
@@ -13427,19 +13428,37 @@ public struct AgentAppView: View {
     static nonisolated(unsafe) var chatRowPaintContextComputeCountForTesting: UInt64 = 0
     #endif
 
+    /// Signature for F2 paint-context reuse. Includes every bot identity field
+    /// consumed by peer-header derivation (handle/name/symbol), not just ends.
+    nonisolated static func chatRowPaintContextSignature(
+        generation: UInt64,
+        rows: [ChatFlowRow],
+        visibleEntries: [TranscriptEntry],
+        bots: [BotDefinition]
+    ) -> String {
+        var signature = "\(generation)|\(rows.count)|\(visibleEntries.count)|\(bots.count)"
+        if let first = rows.first?.id { signature += "|r0:\(first)" }
+        if let last = rows.last?.id { signature += "|rN:\(last)" }
+        if let first = visibleEntries.first?.id { signature += "|v0:\(first)" }
+        if let last = visibleEntries.last?.id { signature += "|vN:\(last)" }
+        for bot in bots {
+            signature += "|b:\(bot.handle)|\(bot.name)|\(bot.avatarSymbol)"
+        }
+        return signature
+    }
+
     private func cachedChatRowPaintContext(
         rows: [ChatFlowRow],
         visibleEntries: [TranscriptEntry],
         bots: [BotDefinition]
     ) -> ChatRowPaintContext {
         let generation = vm.transcriptState.contentGeneration
-        // Cheap identity: row ids + bot handles. Generation already tracks
-        // message/timeline content mutation.
-        var signature = "\(generation)|\(rows.count)|\(visibleEntries.count)|\(bots.count)"
-        if let first = rows.first?.id { signature += "|\(first)" }
-        if let last = rows.last?.id { signature += "|\(last)" }
-        if let firstBot = bots.first?.handle { signature += "|\(firstBot)" }
-        if let lastBot = bots.last?.handle { signature += "|\(lastBot)" }
+        let signature = Self.chatRowPaintContextSignature(
+            generation: generation,
+            rows: rows,
+            visibleEntries: visibleEntries,
+            bots: bots
+        )
         if chatRowPaintContextCache.generation == generation,
            chatRowPaintContextCache.signature == signature,
            let cached = chatRowPaintContextCache.context {
@@ -13458,6 +13477,17 @@ public struct AgentAppView: View {
         chatRowPaintContextCache.context = context
         return context
     }
+
+    #if DEBUG
+    /// Test seam for F2 cache hit/miss counters.
+    func cachedChatRowPaintContextForTesting(
+        rows: [ChatFlowRow],
+        visibleEntries: [TranscriptEntry],
+        bots: [BotDefinition]
+    ) -> ChatRowPaintContext {
+        cachedChatRowPaintContext(rows: rows, visibleEntries: visibleEntries, bots: bots)
+    }
+    #endif
 
     // F2: per-turn render data, memoized for FINISHED turns (immutable content) so a
     // long completed thread no longer re-derives renderableItems / final-id splitting /
