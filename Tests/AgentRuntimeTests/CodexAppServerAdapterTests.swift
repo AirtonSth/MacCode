@@ -447,12 +447,12 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertNil(prematureFinish,
                      "turn/completed must not finish the local run while Codex still reports the thread active")
 
-        do {
-            _ = try await adapter.sendTurn(request) { _ in }
-            XCTFail("a second Codex turn must be rejected while the previous app-server thread is still active")
-        } catch {
-            // expected: active Codex status keeps the turn in flight.
+        _ = try await adapter.sendTurn(request) { event in
+            Task { await sink.record(event) }
         }
+        XCTAssertEqual(client.steeredTurns.count, 1,
+                       "an in-flight Codex follow-up must use turn/steer instead of throwing unsupported")
+        XCTAssertEqual(client.steeredTurns.first?.expectedTurnId, "turn-app-server-1")
 
         client.notificationHandler?("thread/status/changed", [
             "threadId": "codex-thread-1",
@@ -943,30 +943,28 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
     }
 
-    func test_sendTurn_rejectsConcurrentInFlightTurn() async throws {
-        // RUN-LIFECYCLE-STREAM-003: a second concurrent turn on a thread with a
-        // live turn must be rejected, not silently replace the session.
+    func test_sendTurn_steersConcurrentInFlightTurn() async throws {
+        // In-flight Codex follow-up uses turn/steer instead of throwing unsupported.
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
             return client
         }
         let threadId = AgentThreadID()
-        func makeRequest() -> AgentRunRequest {
+        func makeRequest(_ prompt: String) -> AgentRunRequest {
             AgentRunRequest(threadId: threadId, provider: .codex, model: "gpt-5.5",
-                            cwd: "/tmp/remotecode-app-server-adapter", prompt: "wait")
+                            cwd: "/tmp/remotecode-app-server-adapter", prompt: prompt)
         }
         let noop: @Sendable (AgentRunEvent) -> Void = { _ in }
 
-        // First turn starts and stays in flight (autoComplete: false).
-        _ = try await adapter.sendTurn(makeRequest(), onEvent: noop)
+        _ = try await adapter.sendTurn(makeRequest("wait"), onEvent: noop)
+        _ = try await adapter.sendTurn(makeRequest("also check tests"), onEvent: noop)
 
-        do {
-            _ = try await adapter.sendTurn(makeRequest(), onEvent: noop)
-            XCTFail("a second concurrent turn on an in-flight thread must be rejected")
-        } catch {
-            // expected — the adapter throws rather than replacing the live session.
-        }
+        XCTAssertEqual(client.startedTurns.count, 1, "the live turn must not be replaced with a second turn/start")
+        XCTAssertEqual(client.steeredTurns.count, 1)
+        XCTAssertEqual(client.steeredTurns.first?.expectedTurnId, "turn-app-server-1")
+        XCTAssertEqual(client.steeredTurns.first?.request.prompt, "also check tests")
+        XCTAssertEqual(client.openedRequests.count, 1, "steer must reuse the open thread")
     }
 
     func test_adapterFailsRunWhenAppServerProcessExitsBeforeTurnCompleted() async throws {
@@ -1343,7 +1341,8 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertEqual(client.rolledBackTurns.first?.providerThreadId, "codex-thread-1")
-        XCTAssertEqual(client.rolledBackTurns.first?.numTurns, 2)
+        XCTAssertEqual(client.rolledBackTurns.first?.beforeTurnId, "turn-beta")
+        XCTAssertFalse(client.readCalls.isEmpty, "thread/revert must rehydrate via thread/turns/list")
     }
 
     func test_adapterRecoversAppServerSessionFromProviderThreadIdForReadAndRollback() async throws {
@@ -1395,7 +1394,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertEqual(client.rolledBackTurns.first?.providerThreadId, "codex-thread-recovered")
-        XCTAssertEqual(client.rolledBackTurns.first?.numTurns, 1)
+        XCTAssertEqual(client.rolledBackTurns.first?.beforeTurnId, "turn-beta")
 
         _ = try await adapter.sendTurn(AgentRunRequest(
             threadId: threadId,
@@ -1777,26 +1776,37 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         let rawResponse = try await responseTask.value
         let response = try XCTUnwrap(rawResponse as? [String: Any])
         XCTAssertEqual(response["decision"] as? String, "acceptForSession")
-        let update = try XCTUnwrap(client.updatedThreadSettings.first,
-                                   "Approve Session must update the live Codex thread settings so later approvals in the same turn are auto-approved")
-        XCTAssertEqual(update.providerThreadId, "codex-thread-1")
-        XCTAssertEqual(update.permissionMode, .fullAccess)
-        let autoResponse = try await client.serverRequestHandler?("rpc-3", "item/commandExecution/requestApproval", [
-            "threadId": "codex-thread-1",
-            "turnId": "turn-app-server-1",
-            "itemId": "cmd-2",
-            "command": "npm install"
-        ])
-        let autoDecision = try XCTUnwrap(autoResponse as? [String: Any])
-        XCTAssertEqual(autoDecision["decision"] as? String, "acceptForSession",
-                       "After Approve Session, later approval requests in the same loaded session must be auto-approved instead of surfacing another pending card")
+        XCTAssertTrue(client.updatedThreadSettings.isEmpty,
+                       "acceptForSession is per-kind provider memory; do not promote the thread to fullAccess")
+
+        let secondTask = Task {
+            try await client.serverRequestHandler?("rpc-3", "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-2",
+                "command": "npm install"
+            ])
+        }
+        let secondDeadline = Date().addingTimeInterval(3)
+        var secondRequest: AssistantPendingRequest?
+        while Date() < secondDeadline {
+            let opened = (await sink.snapshot()).compactMap {
+                if case .requestOpened(let request) = $0 { return request }
+                return nil
+            }
+            if let next = opened.first(where: { $0.id != request.id }) {
+                secondRequest = next
+                break
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let second = try XCTUnwrap(secondRequest, "a later command approval must still surface a card")
+        try await adapter.respondToRequest(threadId: threadId, requestId: second.id, response: .approve)
+        let laterRaw = try await secondTask.value
+        let laterDecision = try XCTUnwrap(laterRaw as? [String: Any])
+        XCTAssertEqual(laterDecision["decision"] as? String, "accept")
         let events = await sink.snapshot()
         XCTAssertTrue(events.contains { if case .requestResolved(let id, let state) = $0 { return id == request.id && state == .approved } else { return false } })
-        let openedRequests = events.compactMap {
-            if case .requestOpened(let request) = $0 { return request }
-            return nil
-        }
-        XCTAssertEqual(openedRequests.map(\.id), [request.id])
     }
 
     func test_applyPatchApprovalUsesReviewDecisionDialect() async throws {
@@ -1888,26 +1898,15 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             itemId: "patch-session"
         )
         XCTAssertEqual(approvedSession["decision"] as? String, "approved_for_session")
+        XCTAssertTrue(client.updatedThreadSettings.isEmpty,
+                       "approveForSession must not promote the thread to fullAccess")
 
-        // After Approve Session, fullAccess auto-approve must also use ReviewDecision.
-        let autoPatch = try await client.serverRequestHandler?("rpc-5", "applyPatchApproval", [
-            "threadId": "codex-thread-1",
-            "turnId": "turn-app-server-1",
-            "itemId": "patch-auto",
-            "command": "apply_patch"
-        ])
-        let autoPatchDecision = try XCTUnwrap(autoPatch as? [String: Any])
-        XCTAssertEqual(autoPatchDecision["decision"] as? String, "approved_for_session",
-                       "fullAccess auto-approve for applyPatch must use approved_for_session, not acceptForSession")
-
-        let autoExec = try await client.serverRequestHandler?("rpc-6", "execCommandApproval", [
-            "threadId": "codex-thread-1",
-            "turnId": "turn-app-server-1",
-            "itemId": "exec-auto",
-            "command": "ls"
-        ])
-        let autoExecDecision = try XCTUnwrap(autoExec as? [String: Any])
-        XCTAssertEqual(autoExecDecision["decision"] as? String, "approved_for_session")
+        let laterPatch = try await decision(
+            method: "applyPatchApproval",
+            response: .approve,
+            itemId: "patch-after-session"
+        )
+        XCTAssertEqual(laterPatch["decision"] as? String, "approved")
     }
 
     func test_commandExecutionApprovalStillUsesAcceptDialect() async throws {
@@ -1965,14 +1964,12 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
         let request = try await waitForApproval(in: sink)
 
-        do {
-            try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approveForSession)
-            XCTFail("settings promotion failure must be surfaced")
-        } catch { }
-        do {
-            _ = try await responseTask.value
-            XCTFail("the provider continuation must settle with an error when session settings promotion fails")
-        } catch { }
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approveForSession)
+        let raw = try await responseTask.value
+        let response = try XCTUnwrap(raw as? [String: Any])
+        XCTAssertEqual(response["decision"] as? String, "acceptForSession")
+        XCTAssertTrue(client.updatedThreadSettings.isEmpty,
+                       "settings errors must not matter because approveForSession does not update thread settings")
     }
 
     func test_currentPermissionsRequestIsExplicitlyBridged() async throws {
@@ -4450,7 +4447,13 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                 "state": "compacted",
                 "summary": "Snapshot compacted",
                 "tokenUsage": [
-                    "last": ["inputTokens": 10, "outputTokens": 2, "totalTokens": 12],
+                    "last": [
+                        "inputTokens": 10,
+                        "outputTokens": 2,
+                        "totalTokens": 12,
+                        "cachedInputTokens": 8,
+                        "cacheWriteInputTokens": 1
+                    ],
                     "modelContextWindow": 100
                 ],
                 "turns": []
@@ -4471,8 +4474,103 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )) { _ in }
 
         let events = try await adapter.readThread(threadId: threadId)
-        XCTAssertTrue(events.contains { if case .tokenUsage(let usage) = $0 { return usage.totalTokens == 12 && usage.contextWindow == 100 } else { return false } })
+        XCTAssertTrue(events.contains { if case .tokenUsage(let usage) = $0 { return usage.totalTokens == 12 && usage.contextWindow == 100 && usage.cacheReadInputTokens == 8 && usage.cacheCreationInputTokens == 1 && usage.uncachedInputTokens == 2 } else { return false } })
         XCTAssertTrue(events.contains { if case .contextCompaction(let summary) = $0 { return summary == "Snapshot compacted" } else { return false } })
+    }
+
+    func test_mcpStartupStatusUsesNameAndSurfacesError() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "mcp"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        client.notificationHandler?("mcpServer/startupStatus/updated", [
+            "name": "filesystem",
+            "status": "failed",
+            "error": "No such file or directory"
+        ])
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let events = await sink.snapshot()
+        XCTAssertTrue(events.contains {
+            if case .itemStarted(let item) = $0 {
+                return item.id == "filesystem"
+                    && item.state == .failed
+                    && item.output == "No such file or directory"
+            }
+            return false
+        })
+    }
+
+    func test_systemErrorFailsTurnAndBlocksFork_notLoadedIsNotIdle() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false, supportsForkReconciliation: true)
+        let adapter = CodexAppServerAdapter(
+            clientFactory: { _, notificationHandler, _ in
+                client.notificationHandler = notificationHandler
+                return client
+            },
+            forkProtocolSupportOverride: client.forkProtocolSupport
+        )
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "status"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "active"]
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "finalMessage": "maybe done"
+        ])
+        try await Task.sleep(nanoseconds: 30_000_000)
+        let stillActive = await sink.finish
+        XCTAssertNil(stillActive, "active status still defers finish")
+
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "notLoaded"]
+        ])
+        try await Task.sleep(nanoseconds: 30_000_000)
+        let stillNotLoaded = await sink.finish
+        XCTAssertNil(stillNotLoaded, "notLoaded is not idle and must not release a withheld finish")
+
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "systemError"]
+        ])
+        let finish = try await waitForFinish(in: sink, timeout: 3)
+        XCTAssertEqual(finish.0, .failed)
+
+        do {
+            _ = try await adapter.forkThread(AgentProviderForkRequest(
+                sourceThreadId: threadId,
+                childThreadId: AgentThreadID(),
+                idempotencyKey: "remotecode-thread-fork:system-error",
+                workingDirectory: "/tmp/remotecode-app-server-adapter"
+            ))
+            XCTFail("systemError threads must be unforkable")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("systemError"))
+        }
     }
 
     /// Shell-detached foreground command_execution (e.g. `cmd > f 2>&1 &` + `PID=$!`)
@@ -5029,7 +5127,12 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     }
     struct RolledBackTurn {
         let providerThreadId: String
-        let numTurns: Int
+        let beforeTurnId: String
+    }
+    struct SteeredTurn {
+        let providerThreadId: String
+        let expectedTurnId: String
+        let request: AgentRunRequest
     }
     struct ReadCall {
         let providerThreadId: String
@@ -5060,6 +5163,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     private var _providerChildren: [CodexAppServerThreadSummary] = []
     private var _deletedThreadIds: [String] = []
     private var _rolledBackTurns: [RolledBackTurn] = []
+    private var _steeredTurns: [SteeredTurn] = []
     private var _readCalls: [ReadCall] = []
     private var _updatedThreadSettings: [UpdatedThreadSettings] = []
 
@@ -5106,6 +5210,11 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     var rolledBackTurns: [RolledBackTurn] {
         lock.lock(); defer { lock.unlock() }
         return _rolledBackTurns
+    }
+
+    var steeredTurns: [SteeredTurn] {
+        lock.lock(); defer { lock.unlock() }
+        return _steeredTurns
     }
 
     var forkedThreadIds: [String] {
@@ -5179,6 +5288,13 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
         }
         let providerThreadId = request.providerThreadId?.isEmpty == false ? request.providerThreadId! : "codex-thread-1"
         return CodexAppServerThreadOpenResult(providerThreadId: providerThreadId, response: ["id": providerThreadId])
+    }
+
+    func steerTurn(providerThreadId: String, expectedTurnId: String, for request: AgentRunRequest) async throws -> CodexAppServerClient.JSONObject {
+        lock.lock()
+        _steeredTurns.append(SteeredTurn(providerThreadId: providerThreadId, expectedTurnId: expectedTurnId, request: request))
+        lock.unlock()
+        return ["turn": ["id": expectedTurnId]]
     }
 
     func startTurn(providerThreadId: String, for request: AgentRunRequest) async throws -> CodexAppServerClient.JSONObject {
@@ -5260,8 +5376,8 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
         }
     }
 
-    func rollbackThread(providerThreadId: String, numTurns: Int) async throws -> CodexAppServerClient.JSONObject {
-        recordRolledBack(RolledBackTurn(providerThreadId: providerThreadId, numTurns: numTurns))
+    func rollbackThread(providerThreadId: String, beforeTurnId: String) async throws -> CodexAppServerClient.JSONObject {
+        recordRolledBack(RolledBackTurn(providerThreadId: providerThreadId, beforeTurnId: beforeTurnId))
         return ["thread": ["id": providerThreadId, "turns": []]]
     }
 

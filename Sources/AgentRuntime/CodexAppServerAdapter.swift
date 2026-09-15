@@ -8,13 +8,14 @@ public protocol CodexAppServerControlling: AnyObject, Sendable {
     func initialize(clientName: String, clientTitle: String, clientVersion: String) async throws -> CodexAppServerInitializeResult
     func openThread(for request: AgentRunRequest) async throws -> CodexAppServerThreadOpenResult
     func startTurn(providerThreadId: String, for request: AgentRunRequest) async throws -> CodexAppServerClient.JSONObject
+    func steerTurn(providerThreadId: String, expectedTurnId: String, for request: AgentRunRequest) async throws -> CodexAppServerClient.JSONObject
     func interruptTurn(providerThreadId: String, turnId: String) async throws
     func readThread(providerThreadId: String, includeTurns: Bool) async throws -> CodexAppServerClient.JSONObject
     func forkThread(providerThreadId: String, lastTurnId: String?) async throws -> String
     func forkThread(providerThreadId: String, lastTurnId: String?, threadSource: String) async throws -> CodexAppServerThreadSummary
     func listThreads(cursor: String?, archived: Bool) async throws -> CodexAppServerThreadPage
     func deleteThread(providerThreadId: String) async throws
-    func rollbackThread(providerThreadId: String, numTurns: Int) async throws -> CodexAppServerClient.JSONObject
+    func rollbackThread(providerThreadId: String, beforeTurnId: String) async throws -> CodexAppServerClient.JSONObject
     func updateThreadSettings(providerThreadId: String, permissionMode: AgentPermissionMode) async throws
     func stop()
     func stopImmediatelyForAppTermination()
@@ -22,6 +23,10 @@ public protocol CodexAppServerControlling: AnyObject, Sendable {
 
 public extension CodexAppServerControlling {
     var forkProtocolSupport: CodexForkProtocolSupport { .unsupported }
+
+    func steerTurn(providerThreadId: String, expectedTurnId: String, for request: AgentRunRequest) async throws -> CodexAppServerClient.JSONObject {
+        throw AgentProviderAdapterError.unsupported("turn/steer")
+    }
 
     func forkThread(providerThreadId: String, lastTurnId: String?, threadSource: String) async throws -> CodexAppServerThreadSummary {
         throw AgentProviderAdapterError.unsupported("Codex keyed fork RPC")
@@ -412,6 +417,23 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
         lock.unlock()
         if hasInFlightTurn {
+            if let session,
+               let expectedTurnId = session.activeTurnId,
+               !expectedTurnId.isEmpty {
+                lock.lock()
+                sessions[request.threadId]?.runId = request.runId
+                sessions[request.threadId]?.onEvent = onEvent
+                lock.unlock()
+                onEvent(.status(.running))
+                _ = try await session.client.steerTurn(
+                    providerThreadId: session.providerThreadId,
+                    expectedTurnId: expectedTurnId,
+                    for: request
+                )
+                return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in
+                    self?.cancel(threadId: request.threadId, runId: request.runId)
+                }
+            }
             throw AgentProviderAdapterError.unsupported("Codex session already has an in-flight turn")
         }
 
@@ -533,19 +555,6 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case .legacyDecision:
             let decision = Self.codexDecision(response, kind: pending.kind)
             payload["decision"] = decision
-            if response == .approveForSession {
-                do {
-                    try await promoteSessionPermission(threadId: threadId, to: .fullAccess)
-                    setSessionPermissionMode(threadId: threadId, permissionMode: .fullAccess)
-                } catch {
-                    pending.continuation.resume(throwing: error)
-                    emit([
-                        runtimeEvent(method: "item/requestApproval/decisionFailed", payload: payload),
-                        .requestResolved(requestId: requestId, state: .declined)
-                    ], threadId: threadId)
-                    throw error
-                }
-            }
             providerResponse = ["decision": decision]
         case .permissions(let requested):
             providerResponse = Self.permissionsApprovalResponse(requested: requested, response: response)
@@ -713,6 +722,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
            !expectedSourceId.isEmpty,
            expectedSourceId != snapshot.providerThreadId {
             throw AgentProviderAdapterError.unsupported("Codex app-server recovered the wrong parent thread for fork")
+        }
+        if Self.isFailedUnforkableThreadStatus(snapshot.threadStatusType) {
+            throw AgentProviderAdapterError.unsupported("Codex app-server cannot fork a thread in systemError")
         }
         guard snapshot.activeTurnId == nil,
               snapshot.pendingFinish == nil,
@@ -900,11 +912,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         guard let targetIndex else {
             throw AgentProviderAdapterError.unsupported("Codex app-server rollback target is not in completed turn history: \(toTurnId)")
         }
-        let numTurns = snapshot.completedTurnIds.distance(from: targetIndex, to: snapshot.completedTurnIds.endIndex) - 1
-        guard numTurns > 0 else { return }
+        let dropIndex = snapshot.completedTurnIds.index(after: targetIndex)
+        guard dropIndex < snapshot.completedTurnIds.endIndex else { return }
+        let beforeTurnId = snapshot.completedTurnIds[dropIndex]
         let client = snapshot.client
         let providerThreadId = snapshot.providerThreadId
-        _ = try await client.rollbackThread(providerThreadId: providerThreadId, numTurns: numTurns)
+        _ = try await client.rollbackThread(providerThreadId: providerThreadId, beforeTurnId: beforeTurnId)
+        _ = try await readThread(threadId: threadId)
     }
 
     public func stopAll() {
@@ -1323,13 +1337,6 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 ))
             ], threadId: threadId)
         }
-    }
-
-    private func promoteSessionPermission(threadId: AgentThreadID, to mode: AgentPermissionMode) async throws {
-        guard let snapshot = sessionSnapshot(threadId: threadId) else {
-            throw AgentProviderAdapterError.sessionNotFound(threadId)
-        }
-        try await snapshot.client.updateThreadSettings(providerThreadId: snapshot.providerThreadId, permissionMode: mode)
     }
 
     private func awaitUserInput(
@@ -1793,9 +1800,14 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             }
         case "mcpServer/oauthLogin/completed", "mcpServer.startupStatus.updated", "mcpServer/startupStatus/updated":
             let turnId = activeTurnId(threadId: threadId) ?? ""
-            let itemId = string(payload, "serverName") ?? string(payload, "server_name") ?? string(payload, "serverId") ?? "mcp-server-\(UUID().uuidString)"
+            let itemId = string(payload, "name")
+                ?? string(payload, "serverName")
+                ?? string(payload, "server_name")
+                ?? string(payload, "serverId")
+                ?? "mcp-server-\(UUID().uuidString)"
             let status = string(payload, "status") ?? string(payload, "state") ?? "completed"
-            events.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .mcpToolCall, state: status == "failed" ? .failed : .completed, summary: "MCP server status", output: Self.jsonString(payload), startedAtMs: now, finishedAtMs: now)))
+            let output = string(payload, "error") ?? Self.jsonString(payload)
+            events.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .mcpToolCall, state: status == "failed" ? .failed : .completed, summary: "MCP server status", output: output, startedAtMs: now, finishedAtMs: now)))
         case "model/rerouted", "model.rerouted":
             let turnId = activeTurnId(threadId: threadId) ?? ""
             let itemId = "model-rerouted-\(turnId.isEmpty ? UUID().uuidString : turnId)"
@@ -2325,6 +2337,22 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     private func updateThreadStatus(threadId: AgentThreadID, statusType: String) -> PendingFinish? {
         lock.lock()
         sessions[threadId]?.threadStatusType = statusType
+        if Self.isFailedUnforkableThreadStatus(statusType) {
+            let existing = sessions[threadId]?.pendingFinish
+            sessions[threadId]?.pendingFinish = nil
+            sessions[threadId]?.pendingFinishWatchdog?.cancel()
+            sessions[threadId]?.pendingFinishWatchdog = nil
+            let turnId = existing?.turnId ?? sessions[threadId]?.activeTurnId
+            let providerThreadId = existing?.providerThreadId ?? sessions[threadId]?.providerThreadId
+            lock.unlock()
+            return PendingFinish(
+                status: .failed,
+                finalMessage: existing?.finalMessage,
+                providerThreadId: providerThreadId,
+                turnId: turnId,
+                deferredAt: existing?.deferredAt ?? Date()
+            )
+        }
         let pending = Self.isIdleThreadStatus(statusType) && sessions[threadId]?.goalActive != true
             ? sessions[threadId]?.pendingFinish
             : nil
@@ -2697,7 +2725,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         lock.lock()
         sessions[threadId]?.status = status
         sessions[threadId]?.activeTurnId = nil
-        sessions[threadId]?.threadStatusType = nil
+        if !Self.isFailedUnforkableThreadStatus(sessions[threadId]?.threadStatusType) {
+            sessions[threadId]?.threadStatusType = nil
+        }
         sessions[threadId]?.goalActive = false
         sessions[threadId]?.pendingFinish = nil
         sessions[threadId]?.pendingFinishWatchdog?.cancel()
@@ -3804,6 +3834,20 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let output = int(source["outputTokens"]) ?? int(source["output_tokens"]) ?? 0
         let totalTokens = int(source["totalTokens"]) ?? int(source["total_tokens"]) ?? int(container["usedTokens"]) ?? (input + output)
         guard totalTokens > 0 || input > 0 || output > 0 else { return nil }
+        let cached = int(source["cachedInputTokens"])
+            ?? int(source["cached_input_tokens"])
+            ?? int(total?["cachedInputTokens"])
+            ?? int(total?["cached_input_tokens"])
+            ?? int(container["cachedInputTokens"])
+            ?? int(container["cached_input_tokens"])
+            ?? 0
+        let cacheWrite = int(source["cacheWriteInputTokens"])
+            ?? int(source["cache_write_input_tokens"])
+            ?? int(total?["cacheWriteInputTokens"])
+            ?? int(total?["cache_write_input_tokens"])
+            ?? int(container["cacheWriteInputTokens"])
+            ?? int(container["cache_write_input_tokens"])
+            ?? 0
         let contextWindow = int(container["modelContextWindow"]) ?? int(container["contextWindow"]) ?? int(container["maxTokens"])
         let reportedCostMicros = costMicros(from: source) ?? costMicros(from: container)
         // Context occupancy is always the per-turn `last` bucket when present.
@@ -3826,6 +3870,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             totalTokens: totalTokens,
             contextWindow: contextWindow,
             compactsAutomatically: true,
+            uncachedInputTokens: max(0, input - cached),
+            cacheCreationInputTokens: cacheWrite,
+            cacheReadInputTokens: cached,
             reportedCostMicros: reportedCostMicros,
             contextTokens: contextTokens,
             semantics: .cumulative
@@ -3915,11 +3962,15 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
 
     private static func isActiveThreadStatus(_ statusType: String?) -> Bool {
         guard let statusType else { return false }
-        return statusType == "active" || statusType == "running" || statusType == "busy"
+        return statusType == "active"
     }
 
     private static func isIdleThreadStatus(_ statusType: String) -> Bool {
-        statusType == "idle" || statusType == "completed" || statusType == "complete"
+        statusType == "idle"
+    }
+
+    private static func isFailedUnforkableThreadStatus(_ statusType: String?) -> Bool {
+        statusType == "systemerror"
     }
 
     private static func hookDetail(from payload: [String: Any]) -> String? {

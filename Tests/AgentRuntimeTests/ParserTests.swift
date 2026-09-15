@@ -263,6 +263,46 @@ final class CodexParserTests: XCTestCase {
         XCTAssertEqual(item?.body, "Unsupported Codex realtime event: realtime.audio.delta",
                        "unsupported realtime/audio Codex events must be visible instead of silently vanishing")
     }
+
+    func test_reasoningFileChangeAndWebSearchLandInOutputNotBody() {
+        // WHY: Agent App Thought/edit/search cards read item.output; exec JSONL
+        // used to park these types in body so the UI showed a placeholder.
+        let p = CodexParser()
+        var state = AssistantTimelineState()
+        for l in [
+            #"{"type":"thread.started","thread_id":"t-output"}"#,
+            #"{"type":"turn.started"}"#,
+            #"{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"**Scanning docs**"}}"#,
+            #"{"type":"item.completed","item":{"id":"item_1","type":"file_change","text":"updated App.swift"}}"#,
+            #"{"type":"item.completed","item":{"id":"item_2","type":"web_search","text":"RemoteCode"}}"#,
+            #"{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Done."}}"#,
+            #"{"type":"turn.completed"}"#
+        ] { for ev in p.parseLine(l) { state.apply(ev) } }
+
+        let reasoning = state.turns[0].items.first { $0.id == "item_0" }
+        XCTAssertEqual(reasoning?.type, .reasoning)
+        XCTAssertEqual(reasoning?.output, "**Scanning docs**")
+        XCTAssertEqual(reasoning?.body ?? "", "")
+        let file = state.turns[0].items.first { $0.id == "item_1" }
+        XCTAssertEqual(file?.type, .fileChange)
+        XCTAssertEqual(file?.output, "updated App.swift")
+        let search = state.turns[0].items.first { $0.id == "item_2" }
+        XCTAssertEqual(search?.type, .webSearch)
+        XCTAssertEqual(search?.output, "RemoteCode")
+        XCTAssertEqual(state.turns[0].finalAssistantMessage, "Done.",
+                       "assistant text stays on body/assembled; reasoning must not steal the reply")
+    }
+
+    func test_todoListItemsUseTextAndCompleted() {
+        // WHY: official exec todo_list is items[].{text,completed}, not plan/steps.
+        let p = CodexParser()
+        var state = AssistantTimelineState()
+        state.apply(.turnStarted(turnId: "turn-1"))
+        let events = p.parseLine(#"{"type":"item.updated","item":{"id":"item_2","type":"todo_list","items":[{"text":"Scan protocol","completed":false},{"text":"Patch wire","completed":true}]}}"#)
+        for event in events { state.apply(event) }
+        XCTAssertEqual(state.activePlan?.steps.map(\.title), ["Scan protocol", "Patch wire"])
+        XCTAssertEqual(state.activePlan?.steps.map(\.status), [.pending, .completed])
+    }
 }
 
 final class ClaudeParserTests: XCTestCase {

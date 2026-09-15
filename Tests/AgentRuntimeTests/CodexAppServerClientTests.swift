@@ -181,7 +181,8 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             ("turn/interrupt", { try await $0.interruptTurn(providerThreadId: "provider-thread", turnId: "turn") }),
             ("thread/read", { _ = try await $0.readThread(providerThreadId: "provider-thread") }),
             ("thread/fork", { _ = try await $0.forkThread(providerThreadId: "provider-thread") }),
-            ("thread/rollback", { _ = try await $0.rollbackThread(providerThreadId: "provider-thread", numTurns: 1) }),
+            ("thread/revert", { _ = try await $0.rollbackThread(providerThreadId: "provider-thread", beforeTurnId: "turn-1") }),
+            ("turn/steer", { _ = try await $0.steerTurn(providerThreadId: "provider-thread", expectedTurnId: "turn-1", for: startRequest) }),
             ("thread/settings/update", { try await $0.updateThreadSettings(providerThreadId: "provider-thread", permissionMode: .fullAccess) })
         ]
 
@@ -323,6 +324,36 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(params["serviceTier"] as? String, "fast")
         XCTAssertEqual(params["approvalPolicy"] as? String, "never")
         XCTAssertEqual(params["sandbox"] as? String, "danger-full-access")
+    }
+
+    func test_openThreadResumeSendsOnlyThreadId() async throws {
+        let script = try makeFakeAppServerPeer()
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+        defer { client.stop() }
+
+        _ = try await client.initialize()
+        let opened = try await client.openThread(for: AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "gpt-5.3-codex",
+            cwd: "/tmp/remotecode-app-server-test",
+            prompt: "continue",
+            providerThreadId: "live-thread",
+            permissionMode: .fullAccess,
+            serviceTier: .fast
+        ))
+
+        XCTAssertEqual(opened.providerThreadId, "live-thread")
+        XCTAssertEqual(opened.response["lastMethod"] as? String, "thread/resume")
+        XCTAssertFalse(opened.resumeFellBackToStart)
+        let params = try XCTUnwrap(opened.response["lastParams"] as? [String: Any])
+        XCTAssertEqual(Set(params.keys), ["threadId"],
+                       "thread/resume must send only threadId; start params stay on thread/start fallback")
+        XCTAssertEqual(params["threadId"] as? String, "live-thread")
     }
 
     func test_timedOutThreadResumeRequiresFreshClientRecovery() {
@@ -596,7 +627,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
 
         _ = try await client.initialize()
         let read = try await client.readThread(providerThreadId: "thread-app-server-1")
-        let rolledBack = try await client.rollbackThread(providerThreadId: "thread-app-server-1", numTurns: 2)
+        let rolledBack = try await client.rollbackThread(providerThreadId: "thread-app-server-1", beforeTurnId: "turn-2")
         try await client.interruptTurn(providerThreadId: "thread-app-server-1", turnId: "turn-app-server-1")
 
         XCTAssertEqual(read["lastMethod"] as? String, "thread/read")
@@ -605,8 +636,40 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(turns.compactMap { $0["id"] as? String }, ["turn-1", "turn-2"])
         let finalItems = try XCTUnwrap(turns.last?["items"] as? [[String: Any]])
         XCTAssertEqual(finalItems.last?["text"] as? String, "Final reply on the second page.")
-        XCTAssertEqual(rolledBack["lastMethod"] as? String, "thread/rollback")
-        XCTAssertEqual((rolledBack["lastParams"] as? [String: Any])?["numTurns"] as? Int, 2)
+        XCTAssertEqual(rolledBack["lastMethod"] as? String, "thread/revert")
+        XCTAssertEqual((rolledBack["lastParams"] as? [String: Any])?["threadId"] as? String, "thread-app-server-1")
+        XCTAssertEqual((rolledBack["lastParams"] as? [String: Any])?["beforeTurnId"] as? String, "turn-2")
+        XCTAssertNil((rolledBack["lastParams"] as? [String: Any])?["numTurns"])
+    }
+
+    func test_steerTurnSendsExpectedTurnIdAndInputOnly() async throws {
+        let script = try makeFakeAppServerPeer()
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+        defer { client.stop() }
+
+        _ = try await client.initialize()
+        let response = try await client.steerTurn(
+            providerThreadId: "thread-app-server-1",
+            expectedTurnId: "turn-live",
+            for: AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-test",
+                prompt: "also check tests"
+            )
+        )
+        XCTAssertEqual(response["lastMethod"] as? String, "turn/steer")
+        let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
+        XCTAssertEqual(Set(params.keys), ["threadId", "expectedTurnId", "input"])
+        XCTAssertEqual(params["threadId"] as? String, "thread-app-server-1")
+        XCTAssertEqual(params["expectedTurnId"] as? String, "turn-live")
+        let input = try XCTUnwrap(params["input"] as? [[String: Any]])
+        XCTAssertEqual(input.first?["text"] as? String, "also check tests")
     }
 
     func test_updateThreadSettingsSendsFullAccessRuntimePolicy() async throws {
@@ -1089,11 +1152,27 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                     }
                 }), flush=True)
             elif method == "thread/resume":
+                params = msg.get("params", {})
+                thread_id = params.get("threadId", "")
+                if thread_id == "stale-thread":
+                    print(json.dumps({
+                        "id": msg["id"],
+                        "error": {
+                            "code": -32603,
+                            "message": "thread not found"
+                        }
+                    }), flush=True)
+                    continue
                 print(json.dumps({
                     "id": msg["id"],
-                    "error": {
-                        "code": -32603,
-                        "message": "thread not found"
+                    "result": {
+                        "lastMethod": method,
+                        "lastParams": params,
+                        "thread": {
+                            "id": thread_id,
+                            "turns": [],
+                            "status": {"state": "idle", "activeFlags": []}
+                        }
                     }
                 }), flush=True)
             elif method == "thread/fork":
@@ -1184,6 +1263,17 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                         }
                     }
                 }), flush=True)
+            elif method == "turn/steer":
+                print(json.dumps({
+                    "id": msg["id"],
+                    "result": {
+                        "lastMethod": method,
+                        "lastParams": msg.get("params", {}),
+                        "turn": {
+                            "id": msg.get("params", {}).get("expectedTurnId", "turn-steered-1")
+                        }
+                    }
+                }), flush=True)
             elif method == "thread/read":
                 print(json.dumps({
                     "id": msg["id"],
@@ -1209,7 +1299,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                     ] if last_page else []}],
                     "nextCursor": None if last_page else "page-2"
                 }}), flush=True)
-            elif method == "thread/rollback":
+            elif method == "thread/revert":
                 print(json.dumps({
                     "id": msg["id"],
                     "result": {
