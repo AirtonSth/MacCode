@@ -559,10 +559,11 @@ final class IntrinsicHeightTextView: NSTextView {
     private final class IdealSizeBox { let value: CGSize; init(_ v: CGSize) { value = v } }
     /// Perf CH-02: user-bubble hug measurement allocates NSTextStorage +
     /// NSLayoutManager and ensureLayouts the WHOLE prompt; it used to run on
-    /// every bubble body pass. Cached per (font, padding, text).
+    /// every bubble body pass. Cached per (font, padding, source fingerprint)
+    /// so long prompts are not duplicated as NSCache keys.
     private static let idealSizeCache: NSCache<NSString, IdealSizeBox> = {
         let cache = NSCache<NSString, IdealSizeBox>()
-        cache.countLimit = 256
+        cache.countLimit = 128
         cache.totalCostLimit = 1_024 * 1_024
         return cache
     }()
@@ -575,7 +576,8 @@ final class IntrinsicHeightTextView: NSTextView {
         font: NSFont,
         lineFragmentPadding: CGFloat = 0
     ) -> CGSize {
-        let key = "\(font.fontName)|\(font.pointSize)|\(lineFragmentPadding)|\(string)" as NSString
+        let fingerprint = AgentMessageMarkdown.sourceFingerprint(for: string)
+        let key = "\(font.fontName)|\(font.pointSize)|\(lineFragmentPadding)|\(fingerprint)" as NSString
         if let cached = idealSizeCache.object(forKey: key) { return cached.value }
         let attributed = NSAttributedString(string: string, attributes: [.font: font])
         let storage = NSTextStorage(attributedString: attributed)

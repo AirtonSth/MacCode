@@ -3489,20 +3489,29 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let fallback = renderableItemCount(persisted) > 0 ? persisted : providerSnapshot
 
         for (turnOrdinal, persistedTurn) in persistedOccurrences.turns.enumerated() {
-            for (itemIndex, persistedItem) in persistedTurn.items.enumerated()
-            where persistedItem.distillApplied == true {
-                let itemOrdinal = persistedTurn.items[..<itemIndex].reduce(into: 0) { count, item in
-                    if item.id == persistedItem.id, item.type == persistedItem.type {
-                        count += 1
-                    }
+            var occurrenceCountByIdentity: [String: Int] = [:]
+            occurrenceCountByIdentity.reserveCapacity(persistedTurn.items.count)
+            // Pre-index snapshot occurrences once per turn so attested pairing
+            // stays O(items) instead of filtering the whole turn per item.
+            var snapshotItemsByIdentity: [String: [ReplayItemOccurrence]] = [:]
+            if snapshotOccurrences.turns.indices.contains(turnOrdinal) {
+                let snapshotOccurrenceTurn = snapshotOccurrences.turns[turnOrdinal]
+                snapshotItemsByIdentity.reserveCapacity(snapshotOccurrenceTurn.items.count)
+                for item in snapshotOccurrenceTurn.items {
+                    let identity = "\(item.id)\u{1f}\(item.type.rawValue)"
+                    snapshotItemsByIdentity[identity, default: []].append(item)
                 }
+            }
+            for persistedItem in persistedTurn.items {
+                let identity = "\(persistedItem.id)\u{1f}\(persistedItem.type.rawValue)"
+                let itemOrdinal = occurrenceCountByIdentity[identity, default: 0]
+                occurrenceCountByIdentity[identity, default: 0] = itemOrdinal + 1
+                guard persistedItem.distillApplied == true else { continue }
                 guard snapshotOccurrences.turns.indices.contains(turnOrdinal) else {
                     return fallback
                 }
                 let snapshotOccurrenceTurn = snapshotOccurrences.turns[turnOrdinal]
-                let occurrenceMatches = snapshotOccurrenceTurn.items.filter {
-                    $0.id == persistedItem.id && $0.type == persistedItem.type
-                }
+                let occurrenceMatches = snapshotItemsByIdentity[identity] ?? []
                 guard occurrenceMatches.indices.contains(itemOrdinal),
                       replayOccurrenceMatches(
                           persistedItem,

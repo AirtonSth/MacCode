@@ -1,0 +1,30 @@
+{
+  "head": "28029d43",
+  "date": "2026-09-15",
+  "surfaces": {
+    "event_bus_default_recent_limit": 128,
+    "event_bus_default_recent_byte_limit": 2097152,
+    "painted_timeline_limit": 3,
+    "message_history_page_limit": 25,
+    "idle_transcript_window_count": 20,
+    "ideal_size_cache_count_limit": 256,
+    "ideal_size_cache_total_cost_limit": 1048576,
+    "markdown_blocks_cache_count_limit": 512,
+    "markdown_blocks_cache_cost_limit": 4194304,
+    "markdown_inline_cache_count_limit": 512,
+    "markdown_inline_cache_cost_limit": 4194304,
+    "assistant_live_text_limit": 200000,
+    "aggregate_hot_text_byte_limit": 33554432,
+    "prompt_history_limit": 200
+  },
+  "lookup_model": {
+    "active_item_delta_comparisons_per_event": "O(1) newest-first (already fixed)",
+    "non_active_item_delta_comparisons_per_event": "O(distance_from_end) nested scan",
+    "timeline_item_index_in_viewmodel": "absent by AA-29 (unused rebuild removed)",
+    "incremental_index_inside_AssistantTimelineState": false
+  },
+  "estimated_pain": {
+    "history_replay_main_actor": "O(events * avg_scan) at ~5k event prune cap",
+    "ideal_size_key_bytes": "up to 256 * avg_prompt_utf16"
+  }
+}
