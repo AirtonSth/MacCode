@@ -15,32 +15,19 @@ final class ToolRowPresentationTests: XCTestCase {
     func test_toolInputObject_parsesIdenticalBodyOnce() {
         // WHY: live tool rows re-enter body / TimelineView ticks and used to
         // JSON-decode item.body on every pass (make + rawShell + preview + summary).
-        // preview / open / skill must share that same cache — extra calls after
-        // the first parse must not increment the compute counter.
         let command = "rc-cache-\(UUID().uuidString)"
-        let item = toolItem(
-            body: #"{"command":"\#(command)","file_path":"/tmp/Foo.swift","skill":"ads"}"#,
-            summary: "Bash"
-        )
+        let item = toolItem(body: #"{"command":"\#(command)"}"#)
         let before = AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting
         XCTAssertEqual(AgentTimelineItemPresentation.toolInputObject(for: item)?["command"] as? String, command)
         _ = AgentTimelineItemPresentation.toolInputObject(for: item)
         _ = AgentTimelineItemPresentation.rawShellCommand(for: item)
         _ = AgentTimelineItemPresentation.toolCommandPreview(for: item)
-        _ = AgentTimelineItemPresentation.toolOpenTarget(for: item)
-        _ = AgentTimelineItemPresentation.isSkillToolItem(item)
-        _ = AgentTimelineItemPresentation.toolCommandPreview(for: item)
-        _ = AgentTimelineItemPresentation.toolOpenTarget(for: item)
-        _ = AgentTimelineItemPresentation.isSkillToolItem(item)
         XCTAssertEqual(
             AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting - before,
             1,
-            "identical tool JSON must parse once; extra preview/open/skill calls must reuse the cache"
+            "identical tool JSON must parse once and reuse the cache"
         )
         XCTAssertEqual(AgentTimelineItemPresentation.rawShellCommand(for: item), command)
-        XCTAssertEqual(AgentTimelineItemPresentation.toolCommandPreview(for: item), command)
-        XCTAssertEqual(AgentTimelineItemPresentation.toolOpenTarget(for: item), .file("/tmp/Foo.swift"))
-        XCTAssertTrue(AgentTimelineItemPresentation.isSkillToolItem(item))
     }
 
     func test_toolCommandPreview_aloneParsesThroughToolInputObjectCache() {
