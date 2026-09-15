@@ -188,6 +188,11 @@ struct RemoteCodeDistillServiceMain {
         // leading `cli` arg. Native Swift, fail-open — replaces the old Python CLI (N1).
         let rawArgs = CommandLine.arguments
         let programName = (rawArgs.first as NSString?)?.lastPathComponent ?? ""
+        if rawArgs.dropFirst().first == ChromeProfileConnection.hostArgument {
+            do { try ChromeProfileConnection.runHost(origin: rawArgs.dropFirst(2).first ?? "") }
+            catch { FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8)) }
+            return
+        }
         if programName == "distill" {
             if rawArgs.dropFirst().first == "subagent" {
                 await runSubagentTelemetry(arguments: Array(rawArgs.dropFirst(2)))
@@ -801,6 +806,7 @@ struct RemoteCodeDistillServiceMain {
                 FileHandle.standardOutput.write(Data((response + "\n").utf8))
             }
         }
+        await server.closeBrowser()
     }
 
     /// Bot-owned Studio settings. Bound to RC_REMOTE_CODE_BOT_ID on the calling run.

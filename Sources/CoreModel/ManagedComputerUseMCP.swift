@@ -124,18 +124,21 @@ public struct ManagedComputerUseMCP: Sendable {
     ]
 
     public static var advertisedToolNames: [String] {
-        observationTools + mutationTools
+        observationTools + mutationTools + ChromeProfileComputerUseBackend.tools
     }
 
     private let queue: ComputerUseHostQueue
     private let backend: any ComputerUseToolBackend
+    private let browserBackend: any ComputerUseToolBackend
 
     public init(
         queue: ComputerUseHostQueue = .shared,
-        backend: any ComputerUseToolBackend = ComputerUseNativeHostBackend()
+        backend: any ComputerUseToolBackend = ComputerUseNativeHostBackend(),
+        browserBackend: any ComputerUseToolBackend = ChromeProfileComputerUseBackend()
     ) {
         self.queue = queue
         self.backend = backend
+        self.browserBackend = browserBackend
     }
 
     public func handle(_ line: String) async -> String? {
@@ -156,7 +159,7 @@ public struct ManagedComputerUseMCP: Sendable {
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
-                "instructions": "RemoteCode computer-use. HID is host-queued so bots never share the pointer.",
+                "instructions": "RemoteCode computer-use. Prefer browser_* for Chrome: these tools use your current profile in owned background tabs through the RemoteCode extension. Selecting an owned tab gives control to the user; automation must release it with browser_close. Native app actions require exact window identity and fresh state, yield to human activity, and never activate windows or move the physical pointer.",
             ])
         case "tools/list":
             return reply(id: id, result: ["tools": Self.toolCatalog()])
@@ -166,6 +169,11 @@ public struct ManagedComputerUseMCP: Sendable {
             let arguments = params?["arguments"] as? [String: Any] ?? [:]
             guard Self.advertisedToolNames.contains(name) else {
                 return errorReply(id: id, code: -32602, message: "unknown tool: \(name)")
+            }
+            // Chrome's own background tabs do not use host HID or its lease.
+            if ChromeProfileComputerUseBackend.tools.contains(name) {
+                let result = await browserBackend.invoke(name: name, arguments: arguments)
+                return reply(id: id, result: ["content": result.jsonContent(), "isError": result.isError])
             }
             let kind: ComputerUseHostQueue.Kind = Self.mutationTools.contains(name) ? .mutation : .observation
             let targetPID = Self.targetPID(from: arguments)
@@ -187,6 +195,10 @@ public struct ManagedComputerUseMCP: Sendable {
         }
     }
 
+    public func closeBrowser() async {
+        _ = await browserBackend.invoke(name: "browser_close", arguments: [:])
+    }
+
     public static func toolCatalog() -> [[String: Any]] {
         advertisedToolNames.map { name in
             [
@@ -199,6 +211,16 @@ public struct ManagedComputerUseMCP: Sendable {
 
     private static func description(for name: String) -> String {
         switch name {
+        case "browser_open":
+            return "Open an HTTP(S) URL in your session's inactive, muted tab in the user's current Chrome profile, using existing logins. Requires the RemoteCode Chrome extension. Returns immediately; call browser_snapshot next."
+        case "browser_snapshot":
+            return "Read text and element refs from your Chrome tab without activating it. Refs are replaced by each snapshot and after navigation."
+        case "browser_act":
+            return "Click, fill, append text, or scroll in your background Chrome tab using a fresh element ref. Yields if the user selects the tab. Never controls the OS pointer or clipboard."
+        case "browser_close":
+            return "Close only your owned background Chrome tab. If the user selected it, release ownership and leave it open."
+        case "browser_status":
+            return "Check whether the Chrome extension is connected, without opening a tab."
         case screenshotTool:
             return "Capture the exact target window; returned image coordinates are pixels with a top-left origin."
         case "zoom":
@@ -233,6 +255,20 @@ public struct ManagedComputerUseMCP: Sendable {
     }
 
     private static func inputSchema(for name: String) -> [String: Any] {
+        if ChromeProfileComputerUseBackend.tools.contains(name) {
+            switch name {
+            case "browser_open":
+                return ["type": "object", "properties": ["url": ["type": "string"]], "required": ["url"]]
+            case "browser_act":
+                return ["type": "object", "properties": [
+                    "action": ["type": "string", "enum": ["click", "fill", "type", "scroll"]],
+                    "ref": ["type": "string"], "text": ["type": "string"],
+                    "delta_x": ["type": "number"], "delta_y": ["type": "number"],
+                ], "required": ["action"]]
+            default:
+                return ["type": "object", "properties": [String: Any]()]
+            }
+        }
         let targeting: [String: Any] = [
             "target_app": ["type": "string"],
             "target_pid": ["type": "integer"],

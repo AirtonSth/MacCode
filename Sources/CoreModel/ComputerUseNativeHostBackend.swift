@@ -510,7 +510,9 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                 + "cursor_position: \(Self.cursorPosition())")
         case "left_click", "right_click", "mouse_move", "scroll", "type", "key", "click_element", "open_application":
             let kind: TokenKind = ["type", "click_element"].contains(name) ? .semantic : .pixel
-            let observation = await makeObservation(window: window, kind: kind)
+            // Preflight only needs metadata. Read the expensive pixels/AX tree
+            // once, after the human-activity check, in mutate's final validation.
+            let observation = await makeObservation(window: window, kind: .geometry)
             return await mutate(
                 name: name,
                 target: target,
@@ -1349,13 +1351,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             }
 
             private func run(ready: DispatchGroup) {
-                let keyboard = CGEventMask(1 << CGEventType.keyDown.rawValue)
-                    | CGEventMask(1 << CGEventType.keyUp.rawValue)
-                let mouse = CGEventMask(1 << CGEventType.mouseMoved.rawValue)
-                    | CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
-                    | CGEventMask(1 << CGEventType.rightMouseDown.rawValue)
-                    | CGEventMask(1 << CGEventType.scrollWheel.rawValue)
-                let mask = keyboard | mouse
+                let mask = NativePlatform.activityEventMask
                 let context = Unmanaged.passUnretained(self).toOpaque()
                 guard let eventTap = CGEvent.tapCreate(
                     tap: .cgSessionEventTap,
@@ -1417,7 +1413,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                     == ComputerUseNativeActivityMonitor.syntheticEventUserData
                 guard !synthetic else { return }
                 let timestamp = DispatchTime.now().uptimeNanoseconds
-                if type == .keyDown || type == .keyUp {
+                if type == .keyDown || type == .keyUp || type == .flagsChanged {
                     guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return }
                     monitor.record(.init(
                         kind: .keyboard,
@@ -1436,6 +1432,15 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         }
 
         private static let activityTap = ActivityTap(monitor: activityMonitor)
+
+        // A held drag keeps the user in control even after the initial mouse
+        // down has aged out of the quiet window.
+        static let activityEventMask: CGEventMask = [
+            CGEventType.keyDown, .keyUp, .flagsChanged, .mouseMoved,
+            .leftMouseDown, .leftMouseUp, .leftMouseDragged,
+            .rightMouseDown, .rightMouseUp, .rightMouseDragged,
+            .otherMouseDown, .otherMouseUp, .otherMouseDragged, .scrollWheel,
+        ].reduce(0) { $0 | CGEventMask(1 << $1.rawValue) }
 
         public static func userActivity(target: ComputerUseNativeHostTarget) -> ComputerUseNativeUserActivity {
             _ = activityTap.start()

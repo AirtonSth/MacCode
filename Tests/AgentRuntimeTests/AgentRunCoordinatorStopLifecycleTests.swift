@@ -130,6 +130,70 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
                        "sanity: the stop must still land the thread in .cancelled")
     }
 
+    func test_terminalFinalSupersedesEarlierTurnFinalWithoutLeavingRunActive() async throws {
+        final class RevisedFinalRunner: AgentProviderRunner, @unchecked Sendable {
+            let provider: AgentProvider = .claude
+
+            func listModels() async -> [AgentModelDescriptor] { [] }
+
+            func startRun(
+                _ request: AgentRunRequest,
+                onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+            ) async throws -> AgentRunHandle {
+                let providerThreadId = request.providerThreadId ?? UUID().uuidString
+                Task.detached {
+                    onEvent(.status(.running))
+                    onEvent(.event(.threadStarted(
+                        threadId: providerThreadId,
+                        providerThreadId: providerThreadId
+                    )))
+                    onEvent(.event(.turnStarted(turnId: "turn-1")))
+                    onEvent(.event(.turnCompleted(
+                        turnId: "turn-1",
+                        finalMessage: "Waiting for the remaining checks."
+                    )))
+                    onEvent(.finished(
+                        .completed,
+                        finalMessage: "All checks passed.",
+                        providerThreadId: providerThreadId
+                    ))
+                }
+                return AgentRunHandle(runId: request.runId, process: nil) {}
+            }
+        }
+
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("revised-terminal-final")
+        let thread = AgentThread(title: "revised final", provider: .claude, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.claude: RevisedFinalRunner()]
+        )
+        let recorder = LifecycleRecorder()
+        coordinator.addObserver(recorder)
+
+        let runId = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .claude,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "run checks"
+        ))
+        await waitUntil { recorder.finished.contains { $0.0 == runId } }
+
+        XCTAssertNil(coordinator.activeRunId(threadId: thread.id),
+                     "a revised terminal final must not strand the run where Stop can only retry persistence")
+        XCTAssertEqual(try runRepo.get(id: runId)?.status, .completed)
+        XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .completed)
+        let assistantMessages = try messageRepo.list(threadId: thread.id).filter { $0.role == .assistant }
+        XCTAssertEqual(assistantMessages.map(\.content), ["All checks passed."],
+                       "the terminal final is authoritative for the run's single assistant row")
+        XCTAssertEqual(recorder.finished.filter { $0.0 == runId }.count, 1)
+    }
+
     // MARK: - F19: stop/reap on a finished thread
 
     /// Adapter spy: records recoverSession/stopSession calls; recoverSession

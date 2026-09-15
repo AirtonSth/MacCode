@@ -600,7 +600,11 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         try await client.interruptTurn(providerThreadId: "thread-app-server-1", turnId: "turn-app-server-1")
 
         XCTAssertEqual(read["lastMethod"] as? String, "thread/read")
-        XCTAssertEqual((read["lastParams"] as? [String: Any])?["includeTurns"] as? Bool, true)
+        XCTAssertEqual((read["lastParams"] as? [String: Any])?["includeTurns"] as? Bool, false)
+        let turns = try XCTUnwrap((read["thread"] as? [String: Any])?["turns"] as? [[String: Any]])
+        XCTAssertEqual(turns.compactMap { $0["id"] as? String }, ["turn-1", "turn-2"])
+        let finalItems = try XCTUnwrap(turns.last?["items"] as? [[String: Any]])
+        XCTAssertEqual(finalItems.last?["text"] as? String, "Final reply on the second page.")
         XCTAssertEqual(rolledBack["lastMethod"] as? String, "thread/rollback")
         XCTAssertEqual((rolledBack["lastParams"] as? [String: Any])?["numTurns"] as? Int, 2)
     }
@@ -1017,8 +1021,9 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             .appendingPathComponent("remotecode-codex-app-server-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let script = dir.appendingPathComponent("fake-codex-app-server.py")
+        // Protocol peers must bypass user PATH wrappers that buffer stdout.
         let source = """
-        #!/usr/bin/env python3
+        #!/usr/bin/python3
         import json
         import sys
 
@@ -1192,6 +1197,18 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                         }
                     }
                 }), flush=True)
+            elif method == "thread/turns/list":
+                params = msg.get("params", {})
+                if params.get("sortDirection") != "asc" or params.get("itemsView") != "full":
+                    print(json.dumps({"id": msg["id"], "error": {"code": -32602, "message": "Expected chronological full turn pages"}}), flush=True)
+                    continue
+                last_page = params.get("cursor") == "page-2"
+                print(json.dumps({"id": msg["id"], "result": {
+                    "data": [{"id": "turn-2" if last_page else "turn-1", "status": "completed", "items": [
+                        {"type": "agentMessage", "id": "final-2", "text": "Final reply on the second page."}
+                    ] if last_page else []}],
+                    "nextCursor": None if last_page else "page-2"
+                }}), flush=True)
             elif method == "thread/rollback":
                 print(json.dumps({
                     "id": msg["id"],
@@ -1283,7 +1300,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let script = dir.appendingPathComponent("crashing-codex-app-server.py")
         let source = """
-        #!/usr/bin/env python3
+        #!/usr/bin/python3
         import sys
 
         sys.stdin.readline()
@@ -1301,7 +1318,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let script = dir.appendingPathComponent("initializing-then-exiting-codex-app-server.py")
         let source = #"""
-        #!/usr/bin/env python3
+        #!/usr/bin/python3
         import json, sys
 
         request = json.loads(sys.stdin.readline())
@@ -1320,7 +1337,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let script = dir.appendingPathComponent("silent-codex-app-server.py")
         let source = """
-        #!/usr/bin/env python3
+        #!/usr/bin/python3
         import os, pathlib, sys
 
         pathlib.Path(__file__ + '.pid').write_text(str(os.getpid()))
@@ -1339,7 +1356,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let script = dir.appendingPathComponent("late-response-codex-app-server.py")
         let source = """
-        #!/usr/bin/env python3
+        #!/usr/bin/python3
         import json, os, pathlib, sys, time
 
         pathlib.Path(__file__ + '.pid').write_text(str(os.getpid()))

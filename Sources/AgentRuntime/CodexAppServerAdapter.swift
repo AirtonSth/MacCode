@@ -72,6 +72,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     ) throws -> CodexAppServerControlling
 
     private struct Session {
+        var runId: AgentRunID
         var client: CodexAppServerControlling
         var providerThreadId: String
         var activeTurnId: String?
@@ -399,6 +400,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             || Self.isActiveThreadStatus(session?.threadStatusType)
         let reusableSession: (client: CodexAppServerControlling, providerThreadId: String)?
         if var existing = session, !hasInFlightTurn {
+            existing.runId = request.runId
             existing.status = .running
             existing.onEvent = onEvent
             existing.interactionMode = request.interactionMode
@@ -427,6 +429,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             resumeFellBackToStart = opened.resumeFellBackToStart
             recordSession(
                 threadId: request.threadId,
+                runId: request.runId,
                 client: client,
                 providerThreadId: providerThreadId,
                 interactionMode: request.interactionMode,
@@ -495,7 +498,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
 
         return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in
-            self?.cancel(threadId: request.threadId)
+            self?.cancel(threadId: request.threadId, runId: request.runId)
         }
     }
 
@@ -627,8 +630,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         guard let session = removeSession(threadId: threadId) else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
-        settlePendingCallbacks(session: session)
-        session.client.stop()
+        stop(session)
     }
 
     public func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {
@@ -644,6 +646,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 : Self.recoveryActiveTurnId(from: request.extraArgs)
             recordSession(
                 threadId: request.threadId,
+                runId: request.runId,
                 client: opened.client,
                 providerThreadId: opened.result.providerThreadId,
                 interactionMode: request.interactionMode,
@@ -2186,19 +2189,24 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         return nil
     }
 
-    private func cancel(threadId: AgentThreadID) {
-        guard let session = removeSession(threadId: threadId) else { return }
-        let turnId = session.activeTurnId
+    private func cancel(threadId: AgentThreadID, runId: AgentRunID) {
+        let session: Session? = {
+            lock.lock(); defer { lock.unlock() }
+            guard sessions[threadId]?.runId == runId else { return nil }
+            return sessions.removeValue(forKey: threadId)
+        }()
+        guard let session else { return }
+        stop(session)
+    }
+
+    private func stop(_ session: Session) {
+        // The coordinator already gives interruptTurn a graceful window.
+        // Hard cancellation must close the exact client without awaiting another
+        // RPC after removing it from sessions (force stop could no longer find it).
+        session.pendingFinishWatchdog?.cancel()
         settlePendingCallbacks(session: session)
-        if let turnId {
-            Task {
-                try? await session.client.interruptTurn(providerThreadId: session.providerThreadId, turnId: turnId)
-                session.client.stop()
-                session.onEvent?(.status(.cancelled))
-                session.onEvent?(.finished(.cancelled, finalMessage: nil, providerThreadId: publishedDestination(session)))
-            }
-        } else {
-            session.client.stop()
+        session.client.stop()
+        if session.status == .running || session.activeTurnId != nil || session.pendingFinish != nil {
             session.onEvent?(.status(.cancelled))
             session.onEvent?(.finished(.cancelled, finalMessage: nil, providerThreadId: publishedDestination(session)))
         }
@@ -2238,6 +2246,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
 
     private func recordSession(
         threadId: AgentThreadID,
+        runId: AgentRunID,
         client: CodexAppServerControlling,
         providerThreadId: String,
         interactionMode: AgentInteractionMode,
@@ -2248,6 +2257,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     ) {
         lock.lock()
         sessions[threadId] = Session(
+            runId: runId,
             client: client,
             providerThreadId: providerThreadId,
             activeTurnId: nil,

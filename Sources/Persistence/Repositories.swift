@@ -5545,11 +5545,18 @@ public final class AgentRunRepository: @unchecked Sendable {
                     try existing.bind(1, assistantMessage.id.value.uuidString)
                     if try existing.step() {
                         guard existing.columnText(0) == assistantMessage.threadId.value.uuidString,
-                              existing.columnText(1) == assistantMessage.role.rawValue,
-                              existing.columnText(2) == assistantMessage.content else {
+                              existing.columnText(1) == assistantMessage.role.rawValue else {
                             throw SQLiteError.execute(
                                 "Conflicting terminal assistant identity \(assistantMessage.id.value.uuidString)."
                             )
+                        }
+                        if existing.columnText(2) != assistantMessage.content {
+                            let update = try database.prepare(
+                                "UPDATE agent_messages SET content = ? WHERE id = ?;"
+                            )
+                            try update.bind(1, assistantMessage.content)
+                            try update.bind(2, assistantMessage.id.value.uuidString)
+                            _ = try update.step()
                         }
                         assistantMessageId = assistantMessage.id
                     } else {

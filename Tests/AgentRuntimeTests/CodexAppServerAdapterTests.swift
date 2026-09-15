@@ -838,8 +838,9 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTFail("quiet after process progress must flush pendingFinish")
     }
 
-    func test_adapterInterruptUsesActiveAppServerTurn() async throws {
-        let client = MockCodexAppServerClient(autoComplete: false, interruptDelayNanoseconds: 200_000_000)
+    func test_softInterruptTargetsActiveTurnAndHardCancelDoesNotWaitForRPC() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false, interruptDelayNanoseconds: 10_000_000_000)
+        defer { client.stop() }
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
             return client
@@ -865,25 +866,53 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             Task { await sink.record(event) }
         }
 
-        handle.cancel()
-
-        try await Task.sleep(nanoseconds: 50_000_000)
-        let prematureStatus = await sink.status()
-        XCTAssertNil(prematureStatus,
-                     "Stop must not publish a terminal cancelled state before the native turn/interrupt RPC settles")
-
+        try adapter.interruptTurn(threadId: threadId)
         let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline {
-            if !client.interruptedTurns.isEmpty, await sink.status() == .cancelled { break }
+        while client.interruptedTurns.isEmpty, Date() < deadline {
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertEqual(client.interruptedTurns.first?.providerThreadId, "codex-thread-1")
         XCTAssertEqual(client.interruptedTurns.first?.turnId, "turn-app-server-1")
+        XCTAssertFalse(client.didStop, "the graceful interrupt leaves time for the provider to acknowledge")
+
+        handle.cancel()
+
+        XCTAssertTrue(client.didStop, "hard cancel must close the process even while turn/interrupt is hung")
+        XCTAssertFalse(adapter.hasSession(threadId: threadId))
+        let finishDeadline = Date().addingTimeInterval(1)
+        while await sink.status() == nil, Date() < finishDeadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
         let finishedStatus = await sink.status()
         XCTAssertEqual(finishedStatus, .cancelled,
                        "Codex app-server cancellation must finish the local run so macOS and iOS do not stay running forever")
-        XCTAssertTrue(client.didStop,
-                      "Codex app-server cancellation must stop the provider process tree after interrupting the active turn")
+        XCTAssertEqual(client.interruptedTurns.count, 1, "hard cancel must not wait on a second interrupt RPC")
+    }
+
+    func test_oldCancelHandleCannotStopANewerRunInTheSameSession() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        let first = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "fake-model",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "first"
+        )) { event in Task { await sink.record(event) } }
+        client.notificationHandler?("turn/completed", ["threadId": "codex-thread-1", "turnId": "turn-app-server-1"])
+        _ = try await waitForFinish(in: sink, timeout: 1)
+        let second = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "fake-model",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "second"
+        )) { _ in }
+        defer { second.cancel() }
+
+        first.cancel()
+
+        XCTAssertTrue(adapter.hasSession(threadId: threadId), "a delayed stop from the previous run cannot remove the new session")
+        XCTAssertFalse(client.didStop)
     }
 
     func test_startTurnFailureStopsAndRemovesRecordedSession() async throws {
@@ -2534,6 +2563,10 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         let userInput = try await waitForUserInput(in: sink)
 
         try adapter.stopSession(threadId: threadId)
+
+        let finish = try await waitForFinish(in: sink, timeout: 1)
+        XCTAssertEqual(finish.0, .cancelled, "force stop must acknowledge the active run after closing the client")
+        XCTAssertTrue(client.didStop)
 
         let rawApprovalResponse = try await approvalTask.value
         let approvalResponse = try XCTUnwrap(rawApprovalResponse as? [String: Any])
@@ -5169,10 +5202,10 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     }
 
     func interruptTurn(providerThreadId: String, turnId: String) async throws {
+        recordInterrupted(InterruptedTurn(providerThreadId: providerThreadId, turnId: turnId))
         if interruptDelayNanoseconds > 0 {
             try await Task.sleep(nanoseconds: interruptDelayNanoseconds)
         }
-        recordInterrupted(InterruptedTurn(providerThreadId: providerThreadId, turnId: turnId))
     }
 
     func readThread(providerThreadId: String, includeTurns: Bool) async throws -> CodexAppServerClient.JSONObject {

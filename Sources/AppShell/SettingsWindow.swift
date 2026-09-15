@@ -1620,6 +1620,7 @@ public struct SettingsView: View {
                         .background(routeAnchor(.general))
                         .accessibilityIdentifier("settings.section.general")
                     hostFileAccessSection
+                    ChromeExtensionSettingsSection()
                     diffDefaultsSection
                     terminalSection
                     sidebarSection

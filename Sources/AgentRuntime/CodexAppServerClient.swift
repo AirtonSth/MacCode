@@ -634,13 +634,42 @@ public final class CodexAppServerClient: @unchecked Sendable {
     }
 
     public func readThread(providerThreadId: String, includeTurns: Bool = true) async throws -> JSONObject {
-        try await requestJSONObject(
+        var response = try await requestJSONObject(
             method: "thread/read",
             params: [
                 "threadId": providerThreadId,
-                "includeTurns": includeTurns
+                "includeTurns": false
             ]
         )
+        guard includeTurns else { return response }
+        guard var thread = response["thread"] as? JSONObject else {
+            throw CodexAppServerError.responseTypeMismatch
+        }
+        // Paginated Codex threads reject thread/read(includeTurns: true).
+        // Keep the adapter's chronological turn shape using the supported pages.
+        var turns: [JSONObject] = []
+        var cursor: String?
+        var seenCursors = Set<String>()
+        repeat {
+            try Task.checkCancellation()
+            var params: JSONObject = [
+                "threadId": providerThreadId, "limit": 50,
+                "sortDirection": "asc", "itemsView": "full"
+            ]
+            if let cursor { params["cursor"] = cursor }
+            let page = try await requestJSONObject(method: "thread/turns/list", params: params)
+            guard let data = page["data"] as? [JSONObject] else {
+                throw CodexAppServerError.responseTypeMismatch
+            }
+            turns.append(contentsOf: data)
+            cursor = page["nextCursor"] as? String
+            if let cursor, !seenCursors.insert(cursor).inserted {
+                throw CodexAppServerError.rpcError(code: nil, message: "thread/turns/list returned a repeated pagination cursor")
+            }
+        } while cursor != nil
+        thread["turns"] = turns
+        response["thread"] = thread
+        return response
     }
 
     public func forkThread(providerThreadId: String, lastTurnId: String? = nil) async throws -> String {

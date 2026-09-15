@@ -474,6 +474,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         probe.activity = .human
         let backend = makeBackend(probe: probe)
         let token = try await stateToken(from: backend, name: "doctor")
+        probe.uiTreeCalls = 0
 
         let result = await backend.invoke(
             name: "click_element",
@@ -485,6 +486,16 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         XCTAssertTrue(result.isError)
         XCTAssertTrue(result.content.first?.text?.contains("human_activity") == true)
         XCTAssertEqual(probe.semanticMutations, 0, "physical user activity has priority over semantic automation")
+        XCTAssertEqual(probe.uiTreeCalls, 0, "busy targets must yield without traversing their UI")
+        XCTAssertEqual(probe.captureCalls, 0)
+    }
+
+    func testActivityTapObservesOngoingDragsAndModifierKeys() {
+        let mask = ComputerUseNativeHostBackend.NativePlatform.activityEventMask
+        for type in [CGEventType.leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .flagsChanged] {
+            XCTAssertNotEqual(mask & CGEventMask(1 << type.rawValue), 0,
+                              "ongoing human interaction must keep automation paused")
+        }
     }
 
     func testUnavailableActivityMonitorFailsClosedBeforeMutation() async throws {
@@ -1037,6 +1048,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         let probe = Probe()
         let backend = makeBackend(probe: probe)
         let token = try await stateToken(from: backend)
+        probe.uiTreeCalls = 0
 
         let result = await backend.invoke(
             name: "click_element",
@@ -1048,6 +1060,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         XCTAssertFalse(result.isError)
         XCTAssertEqual(probe.semanticMutations, 1)
         XCTAssertEqual(probe.activations, 0)
+        XCTAssertEqual(probe.uiTreeCalls, 1, "one fresh traversal validates the action without a duplicate preflight")
     }
 
     private func stateToken(from backend: ComputerUseNativeHostBackend, name: String = "doctor") async throws -> String {
