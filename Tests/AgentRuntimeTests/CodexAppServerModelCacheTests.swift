@@ -295,7 +295,7 @@ final class CodexAppServerModelCacheTests: ProviderProcessTestCase {
         XCTAssertEqual(result.models.first?.label, "Live Luna",
                        "live model/list metadata must win for duplicate IDs")
         let astra = try XCTUnwrap(result.models.first { $0.id == "gpt-6-astra" })
-        XCTAssertEqual(astra.supportedReasoningEfforts, [.low, .medium, .high, .xhigh, .max])
+        XCTAssertEqual(astra.supportedReasoningEfforts, [.low, .medium, .high, .xhigh, .max, .ultra])
         XCTAssertTrue(astra.supportsServiceTier)
         XCTAssertEqual(astra.contextWindowTokens, 272_000)
         XCTAssertFalse(result.models.contains { $0.id == "gpt-hidden" })

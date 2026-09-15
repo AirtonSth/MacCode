@@ -526,6 +526,26 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                       "Plan mode must travel as app-server collaborationMode, not only as prompt text")
     }
 
+    func test_turnStartParams_preservesUltraReasoningEffort() throws {
+        // WHY: codex-cli 0.154+ catalogs advertise `ultra`. Dropping or remapping
+        // it prevented Agent App from sending the wire value the model supports.
+        let params = CodexAppServerClient.turnStartParams(
+            providerThreadId: "thread-ultra",
+            for: AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .codex,
+                model: "gpt-6-astra",
+                cwd: "/tmp",
+                prompt: "hello",
+                reasoningEffort: .ultra
+            )
+        )
+        XCTAssertEqual(params["effort"] as? String, "ultra")
+        let collaboration = try XCTUnwrap(params["collaborationMode"] as? [String: Any])
+        let settings = try XCTUnwrap(collaboration["settings"] as? [String: Any])
+        XCTAssertEqual(settings["reasoning_effort"] as? String, "ultra")
+    }
+
     func test_turnStartParams_emptyModelUsesBuiltInDefaultInCollaborationMode() throws {
         // WHY: top-level model is omitted for account-default, but upstream
         // Settings.model is required inside collaborationMode. A stale gpt-5.5

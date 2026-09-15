@@ -80,7 +80,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         switch requested {
         case .xhigh, .ultracode:
             return supported.contains(.high) ? .high : supported.last
-        case .max:
+        case .max, .ultra:
             return supported.last
         case .minimal, .low, .medium, .high:
             return supported.contains(.medium) ? .medium : supported.last
@@ -101,7 +101,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         case .minimal, .low: return ["--effort", "low"]
         case .high: return ["--effort", "high"]
         case .xhigh: return ["--effort", "xhigh"]
-        case .max: return ["--effort", "max"]
+        case .max, .ultra: return ["--effort", "max"]
         case .ultracode: return ["--effort", "ultracode"]
         case .medium: return ["--effort", "medium"]
         }
@@ -149,7 +149,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             case .medium: return "medium"
             case .high: return "high"
             case .xhigh, .ultracode: return "xhigh"
-            case .max: return "max"
+            case .max, .ultra: return "max"
             case .none: return ""
             }
         }()
