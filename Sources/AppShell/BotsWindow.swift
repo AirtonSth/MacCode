@@ -4981,8 +4981,9 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
-    public func createDeskThread() {
-        guard let bot = selectedBot else { return }
+    @discardableResult
+    public func createDeskThread() -> Bool {
+        guard let bot = selectedBot else { return false }
         if !isDeskThreadRailVisible {
             isDeskThreadRailVisible = true
         }
@@ -4991,13 +4992,14 @@ public final class BotsViewModel: ObservableObject {
             try botStore.upsertConversation(conversation)
         } catch {
             errorMessage = String(describing: error)
-            return
+            return false
         }
         conversations.removeAll { $0.id == conversation.id }
         conversations.insert(conversation, at: 0)
         deskRoutingByConversation[conversation.id] = deskRouting
         persistDeskRouting()
         selectDeskThread(conversation.id)
+        return true
     }
 
     public var filteredDeskConversations: [BotConversation] {
@@ -6733,21 +6735,30 @@ public final class BotsViewModel: ObservableObject {
             return
         }
         let botID = routine?.definition.botID ?? fleetItem?.botID
+        guard let botID, let bot = bots.first(where: { $0.id == botID }) else {
+            errorMessage = "Task bot is unavailable."
+            return
+        }
+        let spec = routine?.definition.scheduleSpec
+            ?? fleetItem.flatMap {
+                BotScheduleSpec.decodeJSON($0.scheduleSpecJSON)
+                    ?? BotScheduleSpec.parseDisplayNote($0.scheduleNote)
+            }
         do {
             // Dest first. Test run used to listRoutines after the store
             // stamped last_test_run_requested_at. Patch it locally so
             // dest does not reread every schedule.
             try botStore.requestRoutineTestRun(id: id)
             adoptTestRunRequested(id: id)
-            if let botID, let bot = bots.first(where: { $0.id == botID }) {
-                if let spec = routine?.definition.scheduleSpec {
-                    deskRouting.provider = spec.provider
-                    deskRouting.providerInstanceID = spec.providerInstanceID
-                    deskRouting.model = spec.model
-                    deskRouting.routingMode = spec.routingMode
-                    deskRouting.reasoningEffort = spec.reasoningEffort
-                }
-                openDesk(bot)
+            openDesk(bot)
+            // Each task execution owns a fresh conversation and provider session.
+            guard createDeskThread() else { return }
+            if let spec {
+                deskRouting.provider = spec.provider
+                deskRouting.providerInstanceID = spec.providerInstanceID
+                deskRouting.model = spec.model
+                deskRouting.routingMode = spec.routingMode
+                deskRouting.reasoningEffort = spec.reasoningEffort
             }
             _ = send(instruction)
         } catch {
