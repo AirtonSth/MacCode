@@ -847,8 +847,15 @@ public final class GrokACPClient: @unchecked Sendable {
     ) -> ModelEffortBind {
         let model = requestModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let targetModel = model.isEmpty ? sessionModel : model
+        // session/new|load ads are not refreshed after setModel; keep only
+        // efforts the target model still supports so grok-4.6 xhigh cannot
+        // skip the grok-4.5 clamp. Empty ads still fall through to
+        // GrokRunner.normalizedReasoningEffort (muse-spark empty _meta).
+        let supported = GrokReasoningPolicy.supportedEfforts(for: targetModel)
         let targetEffort = requestEffort.flatMap { requested -> AgentReasoningEffort? in
-            if advertisedEfforts.contains(requested) { return requested }
+            if advertisedEfforts.contains(requested), supported.contains(requested) {
+                return requested
+            }
             return GrokRunner.normalizedReasoningEffort(requested, model: targetModel)
         }
         let needsModelBind = !model.isEmpty && model != sessionModel
