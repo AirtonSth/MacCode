@@ -1,6 +1,14 @@
 import Foundation
 import CoreModel
 
+/// Inbound CLI `control_response` for a host `control_request` (interrupt receipt).
+struct ClaudeControlResponseReceipt: Equatable, Sendable {
+    let requestId: String
+    let success: Bool
+    let cancelled: [String]
+    let stillQueued: [String]
+}
+
 /// Parser for Anthropic Claude CLI streaming output.
 /// Maps stream events into the same normalized AssistantEvent model.
 /// Supported events:
@@ -50,6 +58,11 @@ public final class ClaudeParser {
     // below cannot catch them: it records emitted bodies only at
     // content_block_stop, which has not arrived yet).
     private var streamedMessageIds: Set<String> = []
+    /// CLAUDE-AUTH-002: AUTH-001 completes the turn on the synthetic assistant
+    /// envelope. Live 2.1.270 still emits a follow-on `result` (`api_error`).
+    /// Remember that so the result path does not hard-error or `ensureTurn` a
+    /// second empty turn.
+    private var completedTurnAsAuthFailure = false
 
     public func parseLine(_ line: String) -> [AssistantEvent] {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -243,6 +256,27 @@ public final class ClaudeParser {
             // `claude --print --output-format stream-json` emits whole
             // messages, NOT Anthropic-API deltas: {type:"assistant",
             // message:{content:[{type:"text",text:…}|{type:"tool_use",…}]}}.
+            // CLAUDE-AUTH-001: unauthenticated CLI 2.1.x emits a synthetic
+            // assistant envelope (`error: authentication_failed`) instead of
+            // `auth_status`. Treat it as recoverable failure, not assistant text.
+            // Complete the turn here so `inFlightRunId` can clear even if no
+            // `result` follows. CLAUDE-AUTH-002: 2.1.270 always emits a follow-on
+            // result (`terminal_reason=api_error`); that path must not hard-error
+            // or open a second turn.
+            if type == "assistant", Self.isAuthenticationFailedAssistantEnvelope(obj) {
+                ensureTurn(&out)
+                out.append(contentsOf: authenticationFailedAssistantEvents(from: obj, now: now))
+                if let tid = currentTurnId {
+                    out.append(.turnCompleted(turnId: tid, finalMessage: nil))
+                    currentTurnId = nil
+                    resetAssistantBodyDedupState()
+                    indexToAssistantBody = [:]
+                    exitPlanToolIds.removeAll()
+                    completedTurnAsAuthFailure = true
+                }
+                break
+            }
+            completedTurnAsAuthFailure = false
             ensureTurn(&out)
             let msg = obj["message"] as? [String: Any] ?? [:]
             // `--replay-user-messages` echoes the host's own prompt back as a
@@ -337,6 +371,7 @@ public final class ClaudeParser {
             if let usage = tokenUsage(from: obj) {
                 out.append(.tokenUsage(usage))
             }
+            out.append(contentsOf: permissionDenialResultEvents(from: obj, now: now))
             // CLAUDE-AMBIENT-TASK-RESULT: on resume the CLI dumps orphaned
             // background-task notifications and may emit a success result with
             // origin.kind == "task-notification", num_turns == 0, and an empty
@@ -351,7 +386,44 @@ public final class ClaudeParser {
                ) {
                 break
             }
-            if isError {
+            // CLAUDE-AUTH-002: after AUTH-001, live 2.1.270 still emits
+            // `subtype=success is_error=true terminal_reason=api_error`.
+            // Do not append recoverable:false or ensureTurn a second empty turn.
+            let alreadyCompletedAsAuthFailure = completedTurnAsAuthFailure
+            completedTurnAsAuthFailure = false
+            let isAuthFailedResult = alreadyCompletedAsAuthFailure
+                || Self.isAuthenticationFailedResult(obj)
+            if isAuthFailedResult {
+                if !alreadyCompletedAsAuthFailure {
+                    let msg = resultText.flatMap { $0.isEmpty ? nil : $0 }
+                        ?? "Claude authentication failed"
+                    out.append(.error(message: msg, recoverable: true))
+                    out.append(contentsOf: completedRuntimeItem(
+                        id: stringValue(obj["uuid"]) ?? "claude-auth-failed-result-\(now)",
+                        type: .error,
+                        summary: "Claude auth",
+                        body: msg,
+                        now: now
+                    ))
+                }
+                if alreadyCompletedAsAuthFailure, currentTurnId == nil {
+                    break
+                }
+                if currentTurnId == nil {
+                    ensureTurn(&out)
+                }
+                let final = (resultText?.isEmpty == false ? resultText : nil)
+                    ?? (assembledAssistantBody.isEmpty ? nil : assembledAssistantBody)
+                if let tid = currentTurnId {
+                    out.append(.turnCompleted(turnId: tid, finalMessage: final))
+                    currentTurnId = nil
+                    resetAssistantBodyDedupState()
+                    indexToAssistantBody = [:]
+                    exitPlanToolIds.removeAll()
+                }
+                break
+            }
+            if isError, !Self.isHostInterruptResult(obj) {
                 let msg = resultText
                     ?? (obj["error"] as? [String: Any])?["message"] as? String
                     ?? "claude run failed"
@@ -476,6 +548,11 @@ public final class ClaudeParser {
                     }
                 }
             }
+        case "control_response":
+            // Inbound receipts (interrupt_receipt_v1, permission answers echoed
+            // on stdout). Adapter matches pending interrupt request_id. Do not
+            // emit a hard error or a new AssistantEvent case.
+            break
         case "control_cancel_request":
             // CLAUDE-CLI-008: CLI cancelled an in-flight control request — drop both
             // approval and user-input pending UI for that request_id.
@@ -565,6 +642,11 @@ public final class ClaudeParser {
             // Claude Code headless stream-json emits system/api_retry before a
             // retriable API call. Surface it so long retries do not look hung.
             return apiRetryEvents(from: obj, now: now)
+        case "permission_denied":
+            // CLAUDE-PERM-DENIED-001: denials the CLI decides without calling
+            // the host (deny rule / mode / classifier). Interactive asks still
+            // arrive as control_request can_use_tool.
+            return permissionDeniedEvents(from: obj, now: now)
         default:
             if let usage = tokenUsage(from: obj) {
                 return [.tokenUsage(usage)]
@@ -686,6 +768,25 @@ public final class ClaudeParser {
             body: message,
             now: now
         )
+    }
+
+    private func authenticationFailedAssistantEvents(from obj: [String: Any], now: Int64) -> [AssistantEvent] {
+        let msg = obj["message"] as? [String: Any] ?? [:]
+        let content = msg["content"] as? [[String: Any]] ?? []
+        let bodyText = content.compactMap { block -> String? in
+            guard (block["type"] as? String) == "text" else { return nil }
+            let text = block["text"] as? String ?? ""
+            return text.isEmpty ? nil : text
+        }.joined(separator: "\n")
+        let message = bodyText.isEmpty
+            ? (stringValue(obj["error"]) ?? "Claude authentication failed")
+            : bodyText
+        let id = stringValue(obj["uuid"])
+            ?? stringValue(msg["id"])
+            ?? "claude-auth-failed-\(now)"
+        return [
+            .error(message: message, recoverable: true)
+        ] + completedRuntimeItem(id: id, type: .error, summary: "Claude auth", body: message, now: now)
     }
 
     private func rateLimitEvents(from obj: [String: Any], now: Int64) -> [AssistantEvent] {
@@ -1037,6 +1138,71 @@ public final class ClaudeParser {
         return kind == "task-notification"
     }
 
+    /// Host-driven interrupt completion. CLI 2.1.x returns `is_error: true` with
+    /// `terminal_reason: aborted_streaming` after a control interrupt; that is a
+    /// cancelled turn, not a hard provider failure.
+    static func isHostInterruptResult(_ obj: [String: Any]) -> Bool {
+        (obj["terminal_reason"] as? String) == "aborted_streaming"
+    }
+
+    /// Unauthenticated stream-json paints a synthetic assistant with
+    /// `error: authentication_failed` / `is_api_error_message` instead of `auth_status`.
+    static func isAuthenticationFailedAssistantEnvelope(_ obj: [String: Any]) -> Bool {
+        guard (obj["type"] as? String) == "assistant" else { return false }
+        // Require the authentication discriminator. Bare is_api_error_message is
+        // also used for rate limits / invalid_request / server errors and must
+        // not complete the turn as "Claude auth".
+        if let error = obj["error"] as? String, error == "authentication_failed" { return true }
+        return false
+    }
+
+    /// CLI 2.1.270 logged-out `result`: `subtype=success`, `is_error=true`,
+    /// `terminal_reason=api_error`, body like "Not logged in · Please run /login".
+    /// Other `api_error` failures (rate limit, billing, 5xx) must stay loud.
+    static func isAuthenticationFailedResult(_ obj: [String: Any]) -> Bool {
+        guard (obj["terminal_reason"] as? String) == "api_error" else { return false }
+        let isError = (obj["is_error"] as? Bool)
+            ?? ((obj["subtype"] as? String).map { $0 != "success" } ?? false)
+        guard isError else { return false }
+        let text = ((obj["result"] as? String) ?? "").lowercased()
+        return text.contains("not logged in") || text.contains("please run /login")
+    }
+
+    /// Parse an inbound stdout `control_response` (interrupt receipt).
+    static func controlResponseReceipt(from obj: [String: Any]) -> ClaudeControlResponseReceipt? {
+        guard (obj["type"] as? String) == "control_response" else { return nil }
+        let envelope = obj["response"] as? [String: Any] ?? [:]
+        let requestId = textValue(envelope["request_id"])
+            ?? textValue(obj["request_id"])
+            ?? textValue(obj["requestId"])
+        guard let requestId, !requestId.isEmpty else { return nil }
+        let subtype = textValue(envelope["subtype"]) ?? ""
+        let inner = envelope["response"] as? [String: Any] ?? [:]
+        let cancelled = stringArray(inner["cancelled"])
+        let stillQueued = stringArray(inner["still_queued"])
+        return ClaudeControlResponseReceipt(
+            requestId: requestId,
+            success: subtype == "success",
+            cancelled: cancelled,
+            stillQueued: stillQueued
+        )
+    }
+
+    private static func textValue(_ value: Any?) -> String? {
+        switch value {
+        case let string as String:
+            return string
+        case let number as NSNumber:
+            return number.stringValue
+        default:
+            return nil
+        }
+    }
+
+    private static func stringArray(_ value: Any?) -> [String] {
+        (value as? [Any])?.compactMap { textValue($0) } ?? []
+    }
+
     private func planMarkdown(from payload: Any?) -> String? {
         if let object = payload as? [String: Any] {
             return stringValue(object["plan"])
@@ -1188,6 +1354,90 @@ public final class ClaudeParser {
                 payloadJSON: jsonString(row) ?? "{}",
                 receivedAtMs: now
             )))
+        }
+        // CLAUDE-INIT-MCP-001: runtime connect failures live on
+        // `mcp_servers[].status=failed`. `mcp_server_errors` is only
+        // config-validation skips.
+        if let servers = obj["mcp_servers"] as? [[String: Any]] {
+            for server in servers {
+                guard stringValue(server["status"]) == "failed" else { continue }
+                out.append(.providerRuntime(ProviderRuntimeEvent(
+                    provider: .claude,
+                    source: "claude.stream-json.init",
+                    method: "claude.init.mcp_server_error",
+                    payloadJSON: jsonString(server) ?? "{}",
+                    receivedAtMs: now
+                )))
+            }
+        }
+        return out
+    }
+
+    /// CLAUDE-PERM-DENIED-001: `system/permission_denied` is best-effort; the
+    /// host still needs a denial card when the CLI refuses without `can_use_tool`.
+    private func permissionDeniedEvents(from obj: [String: Any], now: Int64) -> [AssistantEvent] {
+        let tool = stringValue(obj["tool_name"])
+            ?? stringValue(obj["toolName"])
+            ?? stringValue(obj["name"])
+        let id = stringValue(obj["tool_use_id"])
+            ?? stringValue(obj["uuid"])
+            ?? stringValue(obj["request_id"])
+            ?? "claude-permission-denied-\(now)"
+        let summary = tool.map { "Permission denied: \($0)" } ?? "Permission denied"
+        var out: [AssistantEvent] = [
+            .providerRuntime(ProviderRuntimeEvent(
+                provider: .claude,
+                source: "claude.stream-json",
+                method: "claude.permission_denied",
+                payloadJSON: jsonString(obj) ?? "{}",
+                receivedAtMs: now
+            ))
+        ]
+        out.append(contentsOf: completedRuntimeItem(
+            id: id,
+            type: .error,
+            summary: summary,
+            body: stringValue(obj["reason"]) ?? stringValue(obj["message"]) ?? jsonString(obj),
+            now: now
+        ))
+        return out
+    }
+
+    /// Authoritative permission-denial record on `result.permission_denials`
+    /// (complete for path-scoped Read/Edit/Write as of CLI 2.1.269). Empty
+    /// arrays are silent.
+    private func permissionDenialResultEvents(from obj: [String: Any], now: Int64) -> [AssistantEvent] {
+        let rows: [[String: Any]]
+        if let dicts = obj["permission_denials"] as? [[String: Any]] {
+            rows = dicts
+        } else if let strings = obj["permission_denials"] as? [String] {
+            rows = strings.map { ["message": $0] }
+        } else {
+            return []
+        }
+        var out: [AssistantEvent] = []
+        for (index, row) in rows.enumerated() {
+            let tool = stringValue(row["tool_name"])
+                ?? stringValue(row["toolName"])
+                ?? stringValue(row["name"])
+            let id = stringValue(row["tool_use_id"])
+                ?? stringValue(row["uuid"])
+                ?? "claude-permission-denial-\(index)-\(now)"
+            let summary = tool.map { "Permission denied: \($0)" } ?? "Permission denied"
+            out.append(.providerRuntime(ProviderRuntimeEvent(
+                provider: .claude,
+                source: "claude.stream-json.result",
+                method: "claude.result.permission_denial",
+                payloadJSON: jsonString(row) ?? "{}",
+                receivedAtMs: now
+            )))
+            out.append(contentsOf: completedRuntimeItem(
+                id: id,
+                type: .error,
+                summary: summary,
+                body: stringValue(row["reason"]) ?? stringValue(row["message"]) ?? jsonString(row),
+                now: now
+            ))
         }
         return out
     }

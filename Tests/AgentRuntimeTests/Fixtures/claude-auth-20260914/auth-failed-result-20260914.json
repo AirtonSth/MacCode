@@ -1,0 +1,14 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": true,
+  "result": "Not logged in \u00b7 Please run /login",
+  "terminal_reason": "api_error",
+  "num_turns": 1,
+  "session_id": "4d139d35-6f36-4382-91af-070d46344e05",
+  "uuid": "caa736d5-77ad-44d4-a0fc-b938f3484297",
+  "permission_denials": [],
+  "origin": null,
+  "error": null,
+  "stop_reason": "stop_sequence"
+}
