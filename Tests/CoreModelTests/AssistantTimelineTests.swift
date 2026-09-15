@@ -830,6 +830,125 @@ final class AssistantTimelineTests: XCTestCase {
                        "an accumulated earlier item must not be mutated by the active item's deltas")
     }
 
+    // History replay / progress / deltas targeting OLDER items used to newest-first
+    // scan from the live end, so an item near the start of a 3k-item turn cost ~N
+    // comparisons per event (~O(N·M) on the main actor at the prune cap). The
+    // incremental id→location map inside AssistantTimelineState must keep that
+    // path at the same O(1) bound as the active-item test, without rebuilding a
+    // view-model TimelineItemIndex (AA-29).
+    func test_streamingDeltasToNonActiveItemStayBoundedRegardlessOfAccumulatedItems() {
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "run"))
+
+        let priorItems = 3_000
+        for i in 0..<priorItems {
+            let id = "item-\(i)"
+            s.apply(.itemStarted(item: AssistantItem(id: id, turnId: "run", type: .tool, startedAtMs: Int64(i))))
+            s.apply(.itemCompleted(itemId: id, finalState: .completed))
+        }
+
+        let targetId = "item-0"
+        AssistantTimelineState.itemLookupComparisonsForTesting = 0
+        let deltas = 2_000
+        for i in 0..<deltas {
+            s.apply(.itemDelta(itemId: targetId, bodyAppend: "tok\(i) ", outputAppend: nil, summary: nil))
+        }
+        let comparisons = AssistantTimelineState.itemLookupComparisonsForTesting
+
+        XCTAssertLessThanOrEqual(comparisons, deltas * 3,
+                                 "non-active item lookup must not scale with accumulated timeline size (was ~distance-from-end comparisons per event)")
+
+        XCTAssertEqual(s.turns.count, 1)
+        XCTAssertEqual(s.turns[0].items.count, priorItems)
+        XCTAssertEqual(s.turns[0].items.first?.id, targetId)
+        XCTAssertTrue(s.turns[0].items.first?.body.hasPrefix("tok0 ") == true)
+        XCTAssertTrue(s.turns[0].items.first?.body.hasSuffix("tok\(deltas - 1) ") == true)
+        XCTAssertEqual(s.turns[0].items.last?.body, "",
+                       "a later item must not be mutated by an earlier item's deltas")
+    }
+
+    func test_decodedTimelineNonActiveDeltasStayBounded() throws {
+        // WHY: the location map is excluded from Codable. Reopen/decode must
+        // rebuild it; otherwise history replay falls back to the O(N) scan.
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "run"))
+        let priorItems = 400
+        for i in 0..<priorItems {
+            s.apply(.itemStarted(item: AssistantItem(id: "item-\(i)", turnId: "run", type: .tool, startedAtMs: Int64(i))))
+        }
+        let data = try JSONEncoder().encode(s)
+        let json = String(decoding: data, as: UTF8.self)
+        XCTAssertFalse(json.contains("itemLocations"),
+                       "the derived location map must not be persisted")
+        XCTAssertFalse(json.contains("turnLocations"),
+                       "the derived turn index must not be persisted")
+        let decoded = try JSONDecoder().decode(AssistantTimelineState.self, from: data)
+        XCTAssertEqual(decoded, s,
+                       "semantic equality ignores derived maps; decode rebuild keeps lookups O(1)")
+        XCTAssertEqual(decoded.turns.count, s.turns.count)
+        XCTAssertEqual(decoded.turns[0].items.count, priorItems)
+
+        var replayed = decoded
+        AssistantTimelineState.itemLookupComparisonsForTesting = 0
+        let deltas = 200
+        for i in 0..<deltas {
+            replayed.apply(.itemDelta(itemId: "item-0", bodyAppend: "x\(i)", outputAppend: nil, summary: nil))
+        }
+        XCTAssertLessThanOrEqual(
+            AssistantTimelineState.itemLookupComparisonsForTesting,
+            deltas * 3,
+            "decode must rebuild the item location map so reopen does not re-scan the timeline"
+        )
+        XCTAssertTrue(replayed.turns[0].items.first?.body.hasPrefix("x0") == true)
+        XCTAssertEqual(replayed.turns[0].items.last?.body, "")
+    }
+
+    func test_equalityIgnoresDerivedLocationMaps() throws {
+        // WHY: synthesized Equatable would treat an empty map and a rebuilt map
+        // as unequal even when public/persisted timeline state matches.
+        var live = AssistantTimelineState()
+        live.apply(.turnStarted(turnId: "t"))
+        live.apply(.itemStarted(item: AssistantItem(id: "same", turnId: "t", type: .tool, startedAtMs: 1)))
+        let decoded = try JSONDecoder().decode(
+            AssistantTimelineState.self,
+            from: try JSONEncoder().encode(live)
+        )
+        XCTAssertEqual(live, decoded)
+        var emptyMaps = decoded
+        // Force a semantic-equal twin via decode of the same bytes again.
+        let again = try JSONDecoder().decode(
+            AssistantTimelineState.self,
+            from: try JSONEncoder().encode(emptyMaps)
+        )
+        XCTAssertEqual(decoded, again)
+    }
+
+    func test_turnScopedLookupDoesNotPoisonNewestOccurrenceMap() {
+        // WHY: a reused provider item id's late turn-scoped host-metadata on an
+        // older turn must not redirect subsequent unscoped deltas away from the
+        // newest occurrence (newest-first contract).
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "old"))
+        s.apply(.itemStarted(item: AssistantItem(id: "reused", turnId: "old", type: .tool, startedAtMs: 1)))
+        s.apply(.turnStarted(turnId: "new"))
+        s.apply(.itemStarted(item: AssistantItem(id: "reused", turnId: "new", type: .tool, startedAtMs: 2)))
+
+        // Turn-scoped mutate of the older occurrence (host-metadata style).
+        s.apply(.itemHostMetadata(turnId: "old", itemId: "reused", distillApplied: true, attestation: nil))
+        s.apply(.itemDelta(itemId: "reused", bodyAppend: "NEW", outputAppend: nil, summary: nil))
+
+        XCTAssertEqual(
+            s.turns.last?.items.last(where: { $0.id == "reused" })?.body,
+            "NEW",
+            "unscoped delta must still target the newest occurrence after turn-scoped metadata"
+        )
+        XCTAssertEqual(
+            s.turns.first?.items.first(where: { $0.id == "reused" })?.body,
+            "",
+            "older occurrence must not absorb the unscoped delta"
+        )
+    }
+
     // Lookup correctness: the active-item fast path must still resolve a delta to its
     // OWN item even when newer items have started after it (e.g. trailing tool output
     // arriving after the next item began). Guards the newest-first lookup change.

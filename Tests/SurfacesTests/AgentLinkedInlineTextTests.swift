@@ -652,4 +652,45 @@ final class AgentLinkedInlineTextTests: XCTestCase {
         XCTAssertEqual(IntrinsicHeightTextView.idealSizeComputeCountForTesting, 3)
         XCTAssertGreaterThan(longer.width, first.width)
     }
+
+    func test_idealSize_cacheKeyUsesFingerprintNotFullPrompt() throws {
+        // WHY: keys used to embed the whole UTF-16 prompt (`…|\(string)`), so a
+        // 256-entry NSCache retained every long user bubble twice. Fingerprint
+        // keys plus countLimit 128 cut retained key bytes without changing hug
+        // measurement for identical (text, font).
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/Surfaces/AgentLinkedInlineText.swift"),
+            encoding: .utf8
+        )
+        XCTAssertFalse(
+            source.contains("|\\(string)"),
+            "idealSize cache key must not retain the full prompt string"
+        )
+        XCTAssertTrue(
+            source.contains("sourceFingerprint(for: string)"),
+            "idealSize must key the hug cache by source fingerprint"
+        )
+        XCTAssertTrue(
+            source.contains("countLimit = 128"),
+            "idealSize cache must keep at most 128 measured prompts"
+        )
+
+        let font = NSFont.systemFont(ofSize: 13)
+        let prompt = String(repeating: "paste a very long user prompt ", count: 80)
+        IntrinsicHeightTextView.idealSizeComputeCountForTesting = 0
+        let first = IntrinsicHeightTextView.idealSize(string: prompt, font: font)
+        let second = IntrinsicHeightTextView.idealSize(string: prompt, font: font)
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(
+            IntrinsicHeightTextView.idealSizeComputeCountForTesting, 1,
+            "fingerprint keys must still hit for the same long prompt"
+        )
+        let other = IntrinsicHeightTextView.idealSize(string: prompt + "!", font: font)
+        XCTAssertEqual(IntrinsicHeightTextView.idealSizeComputeCountForTesting, 2)
+        XCTAssertNotEqual(other, first, "a different prompt must measure independently")
+    }
 }

@@ -122,6 +122,23 @@ final class TranscriptGrowthPerfTests: XCTestCase {
         XCTAssertFalse(source.contains("timelineItemIndex"), "no per-open/replay index rebuilds without a reader")
     }
 
+    func test_hostMetadataOrdinalPairingIsSinglePassNotPrefixReduce() throws {
+        // WHY (P1): attested replay counted (id,type) ordinals with a prefix
+        // reduce per item — O(items²) equality checks per turn. Cold open of a
+        // large attested turn must stay a single pass of occurrence counts.
+        let source = try String(contentsOf: sourceURL("Sources/Surfaces/AgentAppSurface.swift"), encoding: .utf8)
+        let marker = try XCTUnwrap(source.range(of: "snapshotPreservingPersistedHostMetadata"))
+        let slice = String(source[marker.lowerBound...].prefix(3_500))
+        XCTAssertFalse(
+            slice.contains("reduce(into: 0)"),
+            "host-metadata ordinal pairing must not walk each item's prefix"
+        )
+        XCTAssertTrue(
+            slice.contains("occurrenceCountByIdentity"),
+            "ordinal pairing must count (id,type) occurrences in one pass"
+        )
+    }
+
     // MARK: AA-32
 
     func test_inlineCacheKeyIsTheSourceFingerprintSoRowsHashOnce() {
