@@ -250,7 +250,7 @@ public final class CodexParser {
             if terminal {
                 out.append(.itemCompleted(itemId: iid, finalState: finalState))
             }
-        default: // reasoning / plan / file_change / …
+        default: // reasoning / plan / file_change / web_search
             if tt == .plan, let plan = activePlan(from: item, now: now) {
                 out.append(.activePlanUpdated(plan))
             }
@@ -258,7 +258,8 @@ public final class CodexParser {
                 id: iid, turnId: turnId, type: tt,
                 state: terminal ? finalState : .streaming,
                 summary: item["command"] as? String ?? item["name"] as? String,
-                body: text, progress: Self.progressValue(item), startedAtMs: now,
+                body: "", output: text,
+                progress: Self.progressValue(item), startedAtMs: now,
                 finishedAtMs: terminal ? now : nil
             )))
             if terminal {
@@ -275,6 +276,10 @@ public final class CodexParser {
         }
         if let text = item["text"] as? String, !text.isEmpty { return text }
         if let output = item["output"] as? String, !output.isEmpty { return output }
+        // Official openai/codex WebSearchItem is {id, type:"web_search", query};
+        // message is an optional extra field on some item kinds.
+        if let query = item["query"] as? String, !query.isEmpty { return query }
+        if let message = item["message"] as? String, !message.isEmpty { return message }
         if let command = item["command"] as? String, !command.isEmpty { return command }
         if let changes = item["changes"] {
             if let data = try? JSONSerialization.data(withJSONObject: changes),
@@ -351,7 +356,8 @@ public final class CodexParser {
     }
 
     private func activePlan(from obj: [String: Any], now: Int64) -> AssistantActivePlan? {
-        let rawSteps = obj["plan"] as? [[String: Any]]
+        let rawSteps = obj["items"] as? [[String: Any]]
+            ?? obj["plan"] as? [[String: Any]]
             ?? obj["steps"] as? [[String: Any]]
             ?? (obj["update"] as? [String: Any])?["plan"] as? [[String: Any]]
         guard let rawSteps, !rawSteps.isEmpty else { return nil }
@@ -363,9 +369,14 @@ public final class CodexParser {
                 ?? ""
             let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return nil }
-            let statusRaw = raw["status"] as? String ?? "pending"
-            let status = AssistantPlanStepStatus(rawValue: statusRaw)
-                ?? (statusRaw == "inProgress" ? .inProgress : .pending)
+            let status: AssistantPlanStepStatus
+            if let completed = raw["completed"] as? Bool {
+                status = completed ? .completed : .pending
+            } else {
+                let statusRaw = raw["status"] as? String ?? "pending"
+                status = AssistantPlanStepStatus(rawValue: statusRaw)
+                    ?? (statusRaw == "inProgress" ? .inProgress : .pending)
+            }
             let id = raw["id"] as? String ?? "\(index)-\(trimmed)"
             return AssistantPlanStep(id: id, title: trimmed, status: status)
         }

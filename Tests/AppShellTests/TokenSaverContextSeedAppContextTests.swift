@@ -292,7 +292,7 @@ private final class AppContextSeedMockClient: CodexAppServerControlling, @unchec
         ["thread": ["id": providerThreadId, "turns": []]]
     }
     func forkThread(providerThreadId: String, lastTurnId: String?) async throws -> String { "child" }
-    func rollbackThread(providerThreadId: String, numTurns: Int) async throws -> CodexAppServerClient.JSONObject {
+    func rollbackThread(providerThreadId: String, beforeTurnId: String) async throws -> CodexAppServerClient.JSONObject {
         ["thread": ["id": providerThreadId]]
     }
     func updateThreadSettings(providerThreadId: String, permissionMode: AgentPermissionMode) async throws {}

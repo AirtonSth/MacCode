@@ -173,7 +173,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             case .supervised:
                 args += ["-c", #"approval_policy="untrusted""#, "--sandbox", "read-only"]
             case .autoAcceptEdits:
-                args += ["-c", #"approval_policy="never""#, "--sandbox", "workspace-write"]
+                args += ["-c", #"approval_policy="on-request""#, "--sandbox", "workspace-write"]
             case .fullAccess:
                 args += ["-c", #"approval_policy="never""#, "--sandbox", "danger-full-access"]
             }

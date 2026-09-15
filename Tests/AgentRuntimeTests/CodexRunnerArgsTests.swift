@@ -89,10 +89,19 @@ final class CodexRunnerArgsTests: XCTestCase {
     func test_approvalPolicyByPermission() {
         XCTAssertTrue(CodexRunner.buildArgs(req(mode: .supervised)).contains(#"approval_policy="untrusted""#),
                       "supervised mode must keep Codex in approval-required mode instead of auto-running untrusted commands")
-        XCTAssertTrue(CodexRunner.buildArgs(req(mode: .autoAcceptEdits)).contains(#"approval_policy="never""#),
-                      "auto-accept-edits mode must let Codex run workspace-write commands without approval deadlocks")
+        XCTAssertTrue(CodexRunner.buildArgs(req(mode: .autoAcceptEdits)).contains(#"approval_policy="on-request""#),
+                      "auto-accept-edits must match the app-server mapping: on-request plus workspace-write")
         XCTAssertTrue(CodexRunner.buildArgs(req(mode: .fullAccess)).contains(#"approval_policy="never""#),
                       "full-access mode must not prompt for approvals after the user selects danger-full-access")
+        let appServer = CodexAppServerClient.turnStartParams(
+            providerThreadId: "thread-parity",
+            for: req(mode: .autoAcceptEdits)
+        )
+        XCTAssertEqual(appServer["approvalPolicy"] as? String, "on-request")
+        XCTAssertTrue(
+            CodexRunner.buildArgs(req(mode: .autoAcceptEdits)).contains(#"approval_policy="on-request""#),
+            "exec and app-server must emit the same auto-accept-edits policy"
+        )
     }
 
     /// Regression: the picker once listed gpt-5 / gpt-5-codex / o3, which

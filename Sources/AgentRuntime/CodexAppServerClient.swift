@@ -596,8 +596,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
         var resumeFellBack = false
         if let providerThreadId = request.providerThreadId, !providerThreadId.isEmpty {
             do {
-                var resumeParams = params
-                resumeParams["threadId"] = providerThreadId
+                let resumeParams: JSONObject = ["threadId": providerThreadId]
                 response = try await requestJSONObject(method: "thread/resume", params: resumeParams)
             } catch {
                 guard Self.isRecoverableThreadResumeError(error) else { throw error }
@@ -618,6 +617,18 @@ public final class CodexAppServerClient: @unchecked Sendable {
         try await self.request(
             method: "turn/start",
             params: Self.turnStartParams(providerThreadId: providerThreadId, for: request),
+            acceptancePermit: request.acceptancePermit
+        )
+    }
+
+    public func steerTurn(providerThreadId: String, expectedTurnId: String, for request: AgentRunRequest) async throws -> JSONObject {
+        try await self.request(
+            method: "turn/steer",
+            params: Self.turnSteerParams(
+                providerThreadId: providerThreadId,
+                expectedTurnId: expectedTurnId,
+                for: request
+            ),
             acceptancePermit: request.acceptancePermit
         )
     }
@@ -726,12 +737,12 @@ public final class CodexAppServerClient: @unchecked Sendable {
         )
     }
 
-    public func rollbackThread(providerThreadId: String, numTurns: Int) async throws -> JSONObject {
+    public func rollbackThread(providerThreadId: String, beforeTurnId: String) async throws -> JSONObject {
         try await requestJSONObject(
-            method: "thread/rollback",
+            method: "thread/revert",
             params: [
                 "threadId": providerThreadId,
-                "numTurns": numTurns
+                "beforeTurnId": beforeTurnId
             ]
         )
     }
@@ -1034,6 +1045,19 @@ public final class CodexAppServerClient: @unchecked Sendable {
         if request.serviceTier == .fast { params["serviceTier"] = "fast" }
         params["effort"] = appServerReasoningEffort(for: request.reasoningEffort).rawValue
         return params
+    }
+
+    public static func turnSteerParams(
+        providerThreadId: String,
+        expectedTurnId: String,
+        for request: AgentRunRequest
+    ) -> JSONObject {
+        let start = turnStartParams(providerThreadId: providerThreadId, for: request)
+        return [
+            "threadId": providerThreadId,
+            "expectedTurnId": expectedTurnId,
+            "input": start["input"] ?? []
+        ]
     }
 
     public static func isRecoverableThreadResumeError(_ error: Error) -> Bool {
