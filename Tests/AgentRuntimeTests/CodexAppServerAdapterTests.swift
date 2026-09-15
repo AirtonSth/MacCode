@@ -967,6 +967,68 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(client.openedRequests.count, 1, "steer must reuse the open thread")
     }
 
+    func test_sendTurn_steerFailureKeepsOriginalRunBinding() async throws {
+        // WHY: rebinding runId/onEvent before turn/steer returns abandons the
+        // live run on ActiveTurnNotSteerable — original handle cannot cancel,
+        // and later notifications hit the failed follow-up callback.
+        let client = MockCodexAppServerClient(
+            autoComplete: false,
+            steerTurnError: NSError(domain: "CodexSteer", code: 1)
+        )
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        func makeRequest(_ prompt: String) -> AgentRunRequest {
+            AgentRunRequest(threadId: threadId, provider: .codex, model: "gpt-5.5",
+                            cwd: "/tmp/remotecode-app-server-adapter", prompt: prompt)
+        }
+        let originalSink = EventSink()
+        let followUpSink = EventSink()
+        let handle = try await adapter.sendTurn(makeRequest("wait")) { event in
+            Task { await originalSink.record(event) }
+        }
+
+        do {
+            _ = try await adapter.sendTurn(makeRequest("also check tests")) { event in
+                Task { await followUpSink.record(event) }
+            }
+            XCTFail("steer failure must propagate")
+            return
+        } catch {
+            XCTAssertEqual(client.steeredTurns.count, 1)
+            XCTAssertEqual(client.steeredTurns.first?.expectedTurnId, "turn-app-server-1")
+        }
+
+        client.notificationHandler?("item/agentMessage/delta", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "itemId": "item-1",
+            "delta": "still live"
+        ])
+        _ = try await waitForEvents(in: originalSink, matching: { events in
+            events.contains { event in
+                if case .itemDelta(_, let body, _, _) = event { return body == "still live" }
+                return false
+            }
+        })
+
+        handle.cancel()
+
+        XCTAssertFalse(adapter.hasSession(threadId: threadId),
+                       "the original handle must still cancel after a failed steer")
+        XCTAssertTrue(client.didStop,
+                      "failed steer must not retarget cancel away from the live session")
+        let finished = try await waitForFinish(in: originalSink, timeout: 1)
+        XCTAssertEqual(finished.0, .cancelled)
+        XCTAssertNil(await followUpSink.finish,
+                     "live finish must not land on the abandoned follow-up callback")
+        let followUpEvents = await followUpSink.snapshot()
+        XCTAssertTrue(followUpEvents.isEmpty,
+                      "failed steer must not rebind onEvent onto the follow-up callback")
+    }
+
     func test_adapterFailsRunWhenAppServerProcessExitsBeforeTurnCompleted() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
@@ -5151,6 +5213,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     let autoComplete: Bool
     let interruptDelayNanoseconds: UInt64
     let startTurnError: Error?
+    let steerTurnError: Error?
     let openThreadBehavior: MockOpenThreadBehavior
     let updateSettingsError: Error?
     private let lock = NSLock()
@@ -5171,6 +5234,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
         autoComplete: Bool = true,
         interruptDelayNanoseconds: UInt64 = 0,
         startTurnError: Error? = nil,
+        steerTurnError: Error? = nil,
         openThreadError: Error? = nil,
         openThreadBehavior: MockOpenThreadBehavior? = nil,
         updateSettingsError: Error? = nil,
@@ -5179,6 +5243,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
         self.autoComplete = autoComplete
         self.interruptDelayNanoseconds = interruptDelayNanoseconds
         self.startTurnError = startTurnError
+        self.steerTurnError = steerTurnError
         if let openThreadBehavior {
             self.openThreadBehavior = openThreadBehavior
         } else if let openThreadError {
@@ -5294,6 +5359,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
         lock.lock()
         _steeredTurns.append(SteeredTurn(providerThreadId: providerThreadId, expectedTurnId: expectedTurnId, request: request))
         lock.unlock()
+        if let steerTurnError { throw steerTurnError }
         return ["turn": ["id": expectedTurnId]]
     }
 

@@ -420,16 +420,19 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             if let session,
                let expectedTurnId = session.activeTurnId,
                !expectedTurnId.isEmpty {
-                lock.lock()
-                sessions[request.threadId]?.runId = request.runId
-                sessions[request.threadId]?.onEvent = onEvent
-                lock.unlock()
-                onEvent(.status(.running))
+                // Steer first. Rebinding runId/onEvent before turn/steer returns
+                // leaves the original handle unable to cancel, and live events
+                // hit the abandoned follow-up callback on steer failure.
                 _ = try await session.client.steerTurn(
                     providerThreadId: session.providerThreadId,
                     expectedTurnId: expectedTurnId,
                     for: request
                 )
+                lock.lock()
+                sessions[request.threadId]?.runId = request.runId
+                sessions[request.threadId]?.onEvent = onEvent
+                lock.unlock()
+                onEvent(.status(.running))
                 return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in
                     self?.cancel(threadId: request.threadId, runId: request.runId)
                 }
