@@ -9396,9 +9396,9 @@ final class AgentAppViewModelTests: XCTestCase {
 
     @MainActor
     func test_paintedTimelineByThread_evictsLRUAndDeletedThreads() throws {
-        // WHY (AA-07): paintedTimelineByThread grew for every thread visited
-        // in the session. Cap at 3 plus the selected/live run, and drop
-        // deleted ids.
+        // WHY (AA-07 / F3): paintedTimelineByThread grew for every thread
+        // visited in the session. Cap at 2 plus the selected/live run, and
+        // drop deleted ids. 3→2 cuts peak switch-cache capacity by ~33%.
         let (vm, repo) = try makeVM()
         var ids: [AgentThreadID] = []
         for index in 0..<5 {
@@ -9414,12 +9414,23 @@ final class AgentAppViewModelTests: XCTestCase {
         }
         XCTAssertLessThanOrEqual(
             vm.paintedTimelineCountForTesting,
-            3,
+            2,
             "visiting 5 threads must not keep every painted timeline"
         )
 
         vm.selectThread(ids[0])
-        XCTAssertLessThanOrEqual(vm.paintedTimelineCountForTesting, 3)
+        XCTAssertLessThanOrEqual(vm.paintedTimelineCountForTesting, 2)
+    }
+
+    @MainActor
+    func test_paintedTimelineLimit_retentionEstimate_3to2() {
+        // WHY: document the F3 inactive-cache capacity cut. Selected/live
+        // timelines can still remain above this inactive bound.
+        let prior = 3
+        let limit = AgentAppViewModel.paintedTimelineLimit
+        let reduction = Double(prior - limit) / Double(prior)
+        XCTAssertEqual(limit, 2)
+        XCTAssertEqual(reduction, 1.0 / 3.0, accuracy: 0.001)
     }
 
     @MainActor

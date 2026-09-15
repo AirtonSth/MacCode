@@ -4,6 +4,61 @@ import CoreModel
 
 @MainActor
 final class AgentChatRowContextPerformanceTests: XCTestCase {
+    func test_chatRowPaintContextSignature_includesMiddleBotIdentity() {
+        // WHY (F2 review): first/last-only bot keys miss middle catalog edits.
+        let rows = [AgentAppView.ChatFlowRow.entry(.turn(turn("t", final: "a")))]
+        let entries: [AgentAppView.TranscriptEntry] = [.turn(turn("t", final: "a"))]
+        let botsA = [
+            ceo,
+            BotDefinition(handle: "mid", name: "Mid A", title: "", description: "", avatarSymbol: "a"),
+            cfo
+        ]
+        let botsB = [
+            ceo,
+            BotDefinition(handle: "mid", name: "Mid B", title: "", description: "", avatarSymbol: "a"),
+            cfo
+        ]
+        let sigA = AgentAppView.chatRowPaintContextSignature(
+            generation: 1,
+            rows: rows,
+            visibleEntries: entries,
+            bots: botsA
+        )
+        let sigB = AgentAppView.chatRowPaintContextSignature(
+            generation: 1,
+            rows: rows,
+            visibleEntries: entries,
+            bots: botsB
+        )
+        XCTAssertNotEqual(sigA, sigB, "middle bot name/symbol must invalidate the paint-context signature")
+    }
+
+    func test_cachedChatRowPaintContext_reusesAcrossIdenticalGeneration() throws {
+        // WHY (F2): timeline body used to rebuild peer/hide context on every
+        // chrome-only / paint-tick pass. contentGeneration-stable reads must
+        // hit the cache (compute counter stays flat after the first build).
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            source.contains("cachedChatRowPaintContext("),
+            "timeline body must call the generation-gated paint-context cache"
+        )
+        XCTAssertTrue(
+            source.contains("chatRowPaintContextComputeCountForTesting"),
+            "DEBUG compute counter must exist for cache-hit proof"
+        )
+        XCTAssertTrue(
+            source.contains("chatRowPaintContextSignature("),
+            "signature helper must cover bot identity fields"
+        )
+    }
+
     func test_paintContextPreservesPeerHeadersAndDuplicateFinalDecisions() {
         let first = turn("first", final: "same answer")
         let duplicate = turn("duplicate", final: "same answer")
