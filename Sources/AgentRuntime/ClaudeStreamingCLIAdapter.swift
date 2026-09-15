@@ -1513,7 +1513,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         // still be reading/parsing — the lock keeps LineBuffer and ClaudeParser
         // access and fd read order serialized so no final line is split or raced.
         session.stdoutReadLock.lock()
-        let tail = BoundedPipeDrain.readRemaining(from: session.stdoutPipe.fileHandleForReading)
+        let tail = BoundedPipeDrain.readRemaining(
+            from: session.stdoutPipe.fileHandleForReading,
+            maxBytes: BoundedPipeDrain.defaultStdoutMaxBytes
+        )
         for line in session.lineBuffer.take(tail) + session.lineBuffer.flush() {
             handleLine(line, session: session)
         }

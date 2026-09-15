@@ -223,12 +223,18 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
             stdoutReadLock.lock()
-            let tail = BoundedPipeDrain.readRemaining(from: stdoutPipe.fileHandleForReading)
+            let tail = BoundedPipeDrain.readRemaining(
+                from: stdoutPipe.fileHandleForReading,
+                maxBytes: BoundedPipeDrain.defaultStdoutMaxBytes
+            )
             for line in outBuf.take(tail) + outBuf.flush() {
                 emitLine(line)
             }
             stdoutReadLock.unlock()
-            let stderrTail = BoundedPipeDrain.readRemaining(from: stderrPipe.fileHandleForReading)
+            let stderrTail = BoundedPipeDrain.readRemaining(
+                from: stderrPipe.fileHandleForReading,
+                maxBytes: BoundedPipeDrain.defaultStderrMaxBytes
+            )
             if !stderrTail.isEmpty,
                let visible = Self.displayableStderr(String(data: stderrTail, encoding: .utf8) ?? "") {
                 onEvent(.event(.providerRuntime(ProviderStderrClassifier.runtimeEvent(

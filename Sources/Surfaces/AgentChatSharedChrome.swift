@@ -379,6 +379,9 @@ actor AgentAttachmentThumbnailLoader {
     static let defaultMaxPixel = 64
     static let defaultMaxConcurrentDecodes = 2
     static let defaultMaxWaitingDecodes = 8
+    /// AppKit SVG rasterization (`NSImage(contentsOf:)`) is skipped above this
+    /// on-disk size. ImageIO remains the unbounded-safe path for raster files.
+    static let maxAppKitSVGFallbackBytes: Int64 = 2 * 1_024 * 1_024
     private static let transcriptSaturationRetryNanoseconds: [UInt64] = [
         25_000_000,
         50_000_000,
@@ -560,8 +563,11 @@ actor AgentAttachmentThumbnailLoader {
 
         // AppKit accepts a few formats (notably SVG) that ImageIO cannot thumbnail.
         // Rasterize those once on this detached decoder task so the old visible result
-        // is preserved without retaining an unbounded source image.
-        guard let sourceImage = NSImage(contentsOf: url),
+        // is preserved without retaining an unbounded source image. Skip the
+        // NSImage(contentsOf:) path above 2 MiB — SVG XML can expand far beyond
+        // the on-disk size once AppKit parses it.
+        guard allowsAppKitImageFallback(path: path),
+              let sourceImage = NSImage(contentsOf: url),
               sourceImage.size.width.isFinite,
               sourceImage.size.height.isFinite,
               sourceImage.size.width > 0,
@@ -592,6 +598,18 @@ actor AgentAttachmentThumbnailLoader {
         NSGraphicsContext.restoreGraphicsState()
         guard let cgImage = context.makeImage() else { return nil }
         return decodedThumbnail(from: cgImage)
+    }
+
+    nonisolated static func allowsAppKitImageFallback(
+        fileSizeBytes: Int64
+    ) -> Bool {
+        fileSizeBytes > 0 && fileSizeBytes <= maxAppKitSVGFallbackBytes
+    }
+
+    nonisolated static func allowsAppKitImageFallback(path: String) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = attributes[.size] as? NSNumber else { return false }
+        return allowsAppKitImageFallback(fileSizeBytes: size.int64Value)
     }
 
     nonisolated private static func decodedThumbnail(

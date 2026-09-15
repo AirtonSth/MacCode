@@ -1571,7 +1571,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     // yielding "install failed: " with no explanation.
     static func npmInstallFailureText(buffered: LockedDataBuffer, outputPipe: Pipe) -> String {
         var data = buffered.value
-        data.append(BoundedPipeDrain.readRemaining(from: outputPipe.fileHandleForReading))
+        data.append(BoundedPipeDrain.readRemaining(
+            from: outputPipe.fileHandleForReading,
+            maxBytes: BoundedPipeDrain.defaultStdoutMaxBytes
+        ))
         return String(data: data, encoding: .utf8) ?? ""
     }
 
@@ -1894,7 +1897,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         // still be reading/parsing — the lock keeps LineBuffer access and fd
         // read order serialized so no final line is split or reordered.
         session.stdoutReadLock.lock()
-        let tail = BoundedPipeDrain.readRemaining(from: session.stdoutPipe.fileHandleForReading)
+        let tail = BoundedPipeDrain.readRemaining(
+            from: session.stdoutPipe.fileHandleForReading,
+            maxBytes: BoundedPipeDrain.defaultStdoutMaxBytes
+        )
         for line in session.lineBuffer.take(tail) + session.lineBuffer.flush() {
             handleLine(line, session: session)
         }
@@ -1903,7 +1909,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         // (missing module, ESM syntax error, auth failure) writes the only
         // explanation to stderr, and the async handler can lose the race with
         // the teardown above, leaving the bytes undelivered in the pipe.
-        let stderrTail = BoundedPipeDrain.readRemaining(from: session.stderrPipe.fileHandleForReading)
+        let stderrTail = BoundedPipeDrain.readRemaining(
+            from: session.stderrPipe.fileHandleForReading,
+            maxBytes: BoundedPipeDrain.defaultStderrMaxBytes
+        )
         if !stderrTail.isEmpty {
             handleStderr(stderrTail, session: session)
         }
