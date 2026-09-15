@@ -274,7 +274,7 @@ final class CodexParserTests: XCTestCase {
             #"{"type":"turn.started"}"#,
             #"{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"**Scanning docs**"}}"#,
             #"{"type":"item.completed","item":{"id":"item_1","type":"file_change","text":"updated App.swift"}}"#,
-            #"{"type":"item.completed","item":{"id":"item_2","type":"web_search","text":"RemoteCode"}}"#,
+            #"{"type":"item.completed","item":{"id":"item_2","type":"web_search","query":"RemoteCode"}}"#,
             #"{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Done."}}"#,
             #"{"type":"turn.completed"}"#
         ] { for ev in p.parseLine(l) { state.apply(ev) } }

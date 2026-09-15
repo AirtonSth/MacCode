@@ -276,6 +276,10 @@ public final class CodexParser {
         }
         if let text = item["text"] as? String, !text.isEmpty { return text }
         if let output = item["output"] as? String, !output.isEmpty { return output }
+        // Official openai/codex WebSearchItem is {id, type:"web_search", query};
+        // message is an optional extra field on some item kinds.
+        if let query = item["query"] as? String, !query.isEmpty { return query }
+        if let message = item["message"] as? String, !message.isEmpty { return message }
         if let command = item["command"] as? String, !command.isEmpty { return command }
         if let changes = item["changes"] {
             if let data = try? JSONSerialization.data(withJSONObject: changes),
