@@ -30,6 +30,24 @@ final class ToolRowPresentationTests: XCTestCase {
         XCTAssertEqual(AgentTimelineItemPresentation.rawShellCommand(for: item), command)
     }
 
+    func test_toolCommandPreview_aloneParsesThroughToolInputObjectCache() {
+        // WHY: preview used to JSONSerialization item.body on every call and
+        // never incremented the toolInputObject compute seam. Routing through
+        // the cache must make N preview paints cost 1 parse.
+        let command = "rc-preview-cache-\(UUID().uuidString)"
+        let item = toolItem(body: #"{"command":"\#(command)"}"#)
+        let before = AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting
+        XCTAssertEqual(AgentTimelineItemPresentation.toolCommandPreview(for: item), command)
+        for _ in 0..<32 {
+            _ = AgentTimelineItemPresentation.toolCommandPreview(for: item)
+        }
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting - before,
+            1,
+            "preview-only paints must reuse toolInputObject, not re-parse JSON"
+        )
+    }
+
     func test_extractsBashCommandFromJSONBody() {
         let item = toolItem(body: #"{"command":"swift build && swift test","description":"build"}"#)
         XCTAssertEqual(AgentTimelineItemPresentation.toolCommandPreview(for: item), "swift build && swift test",

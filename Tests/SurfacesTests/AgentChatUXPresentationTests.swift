@@ -749,6 +749,11 @@ final class AgentChatUXPresentationTests: XCTestCase {
         XCTAssertEqual(AgentFileEditDiffPresentation.diffModelComputeCountForTesting, 3)
     }
 
+    func test_diffModelCacheLimits_areHalvedFrom4MiBAnd512() {
+        XCTAssertEqual(AgentFileEditDiffPresentation.diffModelCacheCountLimit, 256)
+        XCTAssertEqual(AgentFileEditDiffPresentation.diffModelCacheCostLimit, 2 * 1_024 * 1_024)
+    }
+
     /// WHY (perf CH-03): plain-text tool output must never reach
     /// JSONSerialization — only payloads starting with { or [ can be JSON.
     func test_extractDiffText_skipsJSONAttemptsForPlainText() {

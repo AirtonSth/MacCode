@@ -622,6 +622,22 @@ func shouldGateLargeMedia(size: Int, loadAnyway: Bool, threshold: Int = LargeMed
 
 let LargeMediaGuardThreshold = 64 * 1024 * 1024
 
+/// Longest decoded edge for Files image preview. Matches File Preview so a
+/// 12 MP screenshot does not pin 4096² RGBA (~64 MiB) in the process.
+let FilesImageThumbnailMaxPixelSize = 2048
+
+func decodeFilesImageThumbnail(url: URL) -> NSImage? {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+    let options: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceThumbnailMaxPixelSize: FilesImageThumbnailMaxPixelSize
+    ]
+    guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+    return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+}
+
 struct BinaryMetadataRow: Equatable {
     let label: String
     let value: String
@@ -2683,15 +2699,7 @@ private struct ImagePreview: View {
 
     private static func decodeDownsampled(url: URL) async -> NSImage? {
         await Task.detached(priority: .userInitiated) {
-            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-            let options: [CFString: Any] = [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceShouldCacheImmediately: true,
-                kCGImageSourceThumbnailMaxPixelSize: 4096
-            ]
-            guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
-            return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+            decodeFilesImageThumbnail(url: url)
         }.value
     }
 }

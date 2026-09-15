@@ -748,6 +748,10 @@ public final class AppContext {
         var summary: String?
         var body: String = ""
         var output: String = ""
+        /// Full result-stream UTF-8 count for `answerTokens`. Stored `output`
+        /// is prefix-capped to the detect window; this count is not, so Token
+        /// Saver Graphify credit does not shrink when the string is capped.
+        var outputUTF8Count: Int = 0
         var provider: String
         var createdAtMs: Int64
         var recordedInvocation: Bool = false
@@ -756,6 +760,24 @@ public final class AppContext {
         /// (or the window filled without the substring). Later itemDelta must
         /// not re-parse/split a growing body on the ACP parse queue.
         var scannedNegative: Bool = false
+        /// Failure signatures after the 8 KiB stored prefix still set this.
+        var failureScan = GraphifyUsageDetector.FailureScanState()
+
+        /// Same window as command-body detect (`GraphifyUsageDetector.maxHaystackUTF8Bytes`).
+        static let maxOutputUTF8Bytes = GraphifyUsageDetector.maxHaystackUTF8Bytes
+
+        mutating func replaceResultOutput(_ full: String) {
+            outputUTF8Count = full.utf8.count
+            GraphifyUsageDetector.ingestFailureScan(&failureScan, chunk: full)
+            output = GraphifyUsageDetector.cappedHaystack(full)
+        }
+
+        mutating func appendResultOutput(_ chunk: String) {
+            guard !chunk.isEmpty else { return }
+            outputUTF8Count += chunk.utf8.count
+            GraphifyUsageDetector.ingestFailureScan(&failureScan, chunk: chunk)
+            output = GraphifyUsageDetector.appendCapped(output, chunk)
+        }
 
         /// After the pending row exists, later command-text chunks are unused
         /// until finalize (detect already ran; answer tokens come from output).
@@ -793,6 +815,33 @@ public final class AppContext {
         graphifyItemBuffersLock.lock()
         defer { graphifyItemBuffersLock.unlock() }
         return graphifyItemBuffers[key]?.body.utf8.count ?? 0
+    }
+
+    /// Result-phase stored-string cap (same detect window as body).
+    static let graphifyOutputMaxUTF8Bytes = GraphifyItemBuffer.maxOutputUTF8Bytes
+
+    /// Test seam: prefix-capped stored result output bytes.
+    func graphifyBufferStoredOutputUTF8CountForTesting(runId: AgentRunID, itemId: String) -> Int {
+        let key = "\(runId.value.uuidString)|\(itemId)"
+        graphifyItemBuffersLock.lock()
+        defer { graphifyItemBuffersLock.unlock() }
+        return graphifyItemBuffers[key]?.output.utf8.count ?? 0
+    }
+
+    /// Test seam: full result-stream UTF-8 count used for answerTokens.
+    func graphifyBufferOutputUTF8CountForTesting(runId: AgentRunID, itemId: String) -> Int {
+        let key = "\(runId.value.uuidString)|\(itemId)"
+        graphifyItemBuffersLock.lock()
+        defer { graphifyItemBuffersLock.unlock() }
+        return graphifyItemBuffers[key]?.outputUTF8Count ?? 0
+    }
+
+    /// Test seam: streaming failure scan saw a signature after the stored prefix.
+    func graphifyBufferSawFailureForTesting(runId: AgentRunID, itemId: String) -> Bool {
+        let key = "\(runId.value.uuidString)|\(itemId)"
+        graphifyItemBuffersLock.lock()
+        defer { graphifyItemBuffersLock.unlock() }
+        return graphifyItemBuffers[key]?.failureScan.sawFailure ?? false
     }
 
     public init(
@@ -5738,7 +5787,7 @@ public final class AppContext {
         if !item.body.isEmpty {
             buf.body = GraphifyUsageDetector.cappedHaystack(item.body)
         }
-        if let o = item.output, !o.isEmpty { buf.output = o }
+        if let o = item.output, !o.isEmpty { buf.replaceResultOutput(o) }
         graphifyItemBuffers[bufferKey] = buf
         graphifyItemBuffersLock.unlock()
 
@@ -5789,7 +5838,7 @@ public final class AppContext {
                     existing.body = GraphifyUsageDetector.appendCapped(existing.body, o)
                 }
             }
-            if let o = outputAppend, resultPhase { existing.output += o }
+            if let o = outputAppend, resultPhase { existing.appendResultOutput(o) }
             graphifyItemBuffers[bufferKey] = existing
             graphifyItemBuffersLock.unlock()
             if bodyClosed, !finalize { return }
@@ -5823,7 +5872,7 @@ public final class AppContext {
             // with partial input JSON as "answer" tokens.
             let resultPhase = (summary == "result") || (buf.summary == "result")
             if resultPhase {
-                buf.output += o
+                buf.appendResultOutput(o)
             } else {
                 buf.body = GraphifyUsageDetector.appendCapped(buf.body, o)
             }
@@ -5879,6 +5928,7 @@ public final class AppContext {
         let summary = buf.summary
         let body = buf.body
         let output = buf.output
+        let outputUTF8Count = buf.outputUTF8Count
         let provider = buf.provider
         let createdAtMs = buf.createdAtMs
         let alreadyInvocation = buf.recordedInvocation
@@ -5979,6 +6029,8 @@ public final class AppContext {
             || (finalBuf?.recordedExploration == true)
             || !invocations.isEmpty
         let finalOutput = finalBuf?.output ?? output
+        let finalOutputUTF8Count = finalBuf?.outputUTF8Count ?? outputUTF8Count
+        let streamedFailure = finalBuf?.failureScan.sawFailure ?? false
         graphifyItemBuffersLock.unlock()
 
         guard hadInterest else {
@@ -5994,7 +6046,7 @@ public final class AppContext {
             return
         }
 
-        if GraphifyUsageDetector.looksLikeFailure(output: finalOutput) {
+        if streamedFailure || GraphifyUsageDetector.looksLikeFailure(output: finalOutput) {
             graphifyItemBuffersLock.lock()
             graphifyItemBuffers.removeValue(forKey: bufferKey)
             graphifyItemBuffersLock.unlock()
@@ -6007,7 +6059,7 @@ public final class AppContext {
             return
         }
 
-        let answerTokens = GraphifyUsageDetector.tokensFromUTF8Count(finalOutput.utf8.count)
+        let answerTokens = GraphifyUsageDetector.tokensFromUTF8Count(finalOutputUTF8Count)
         // Enqueue after pending inserts (serial queue) so markSucceeded finds rows.
         backgroundWriterQueue.async { [weak self] in
             guard let self else { return }

@@ -641,16 +641,61 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
 /// outputs lost their terminal `agent_message`/`turn.completed` and the
 /// run hung "running" forever. Only complete lines are emitted; the
 /// trailing partial is held until the next read (or `flush()` at EOF).
+///
+/// The unterminated partial is capped: a single tool-result JSON line (or a
+/// hung provider that never sends `\n`) must not pin RAM = line size. Bytes
+/// past the cap are drained until the next newline so a later
+/// `turn.completed` frame is still parsed. Overflow is fail-open: the truncated
+/// line is replaced with a small valid NDJSON `error` record (recoverable,
+/// `[[rc:line-overflow]]`) so `emitLine` still JSON-decodes and surfaces it.
+/// The 2 MiB prefix is not re-emitted. No SQLite write on the pipe thread.
 final class LineBuffer {
+    /// Peak retained unterminated line. 2 MiB sits in the 1–4 MiB band:
+    /// legitimate NDJSON still fits; an 8 MiB blob drops 75%.
+    static let maxPartialBytes = 2 * 1024 * 1024
+    static let truncationMarker = "[RemoteCode] NDJSON line truncated[[rc:line-overflow]]"
+    /// Identification snippet inside the overflow JSON — not the 2 MiB prefix.
+    static let overflowPrefixBytes = 128
+
     private var buffer = Data()
     /// Bytes in the trailing partial line that were already checked for a
     /// newline. Pipe deliveries commonly split one long record into many small
     /// chunks; resuming from this offset avoids rescanning the whole partial on
     /// every delivery.
     private var scannedByteCount = 0
+    /// Current partial exceeded `maxPartialBytes`; further bytes are discarded
+    /// until the next newline so later frames still parse.
+    private var droppingUntilNewline = false
+    private var truncatedPartial = false
+
+    var retainedByteCountForTesting: Int { buffer.count }
+    var truncatedPartialForTesting: Bool { truncatedPartial || droppingUntilNewline }
 
     /// Append a chunk, return any now-complete lines (trimmed, non-empty).
     func take(_ data: Data) -> [String] {
+        guard !data.isEmpty else { return [] }
+        if !droppingUntilNewline,
+           buffer.count + data.count <= Self.maxPartialBytes {
+            return takeFast(data)
+        }
+        return takeCapped(data)
+    }
+
+    /// Emit any final, unterminated line (last record before EOF).
+    func flush() -> [String] {
+        droppingUntilNewline = false
+        guard !buffer.isEmpty || truncatedPartial else { return [] }
+        let rest = buffer
+        let wasTruncated = truncatedPartial
+        buffer.removeAll()
+        scannedByteCount = 0
+        truncatedPartial = false
+        return Self.decode(rest, truncated: wasTruncated).map { [$0] } ?? []
+    }
+
+    /// Unchanged under-cap path: one prefix removal, resume scan from
+    /// `scannedByteCount`. Must stay faster than per-line `removeSubrange`.
+    private func takeFast(_ data: Data) -> [String] {
         buffer.append(data)
         var lines: [String] = []
         var lineStart = buffer.startIndex
@@ -668,31 +713,89 @@ final class LineBuffer {
         if lineStart != buffer.startIndex {
             buffer.removeSubrange(buffer.startIndex..<lineStart)
         }
-        // The retained suffix has no newline; only bytes appended by the next
-        // delivery need to be searched. Complete-line prefixes are removed once
-        // per take instead of once per line.
         scannedByteCount = buffer.count
         return lines
     }
 
-    /// Emit any final, unterminated line (last record before EOF).
-    func flush() -> [String] {
-        guard !buffer.isEmpty else { return [] }
-        let rest = buffer
-        buffer.removeAll()
-        scannedByteCount = 0
-        return Self.decode(rest).map { [$0] } ?? []
+    private func takeCapped(_ data: Data) -> [String] {
+        var lines: [String] = []
+        var offset = data.startIndex
+        while offset < data.endIndex {
+            if droppingUntilNewline {
+                if let nl = data[offset...].firstIndex(of: 0x0A) {
+                    if let s = emitBuffer() { lines.append(s) }
+                    offset = data.index(after: nl)
+                    continue
+                }
+                return lines
+            }
+            if let nl = data[offset...].firstIndex(of: 0x0A) {
+                appendCapped(data[offset..<nl])
+                if let s = emitBuffer() { lines.append(s) }
+                offset = data.index(after: nl)
+            } else {
+                appendCapped(data[offset...])
+                break
+            }
+        }
+        scannedByteCount = buffer.count
+        return lines
     }
 
-    private static func decode(_ data: Data) -> String? {
+    private func appendCapped(_ piece: Data.SubSequence) {
+        if droppingUntilNewline { return }
+        let room = Self.maxPartialBytes - buffer.count
+        if piece.count <= room {
+            buffer.append(contentsOf: piece)
+            return
+        }
+        if room > 0 {
+            buffer.append(contentsOf: piece.prefix(room))
+        }
+        truncatedPartial = true
+        droppingUntilNewline = true
+    }
+
+    private func emitBuffer() -> String? {
+        let s = Self.decode(buffer, truncated: truncatedPartial)
+        buffer.removeAll(keepingCapacity: true)
+        scannedByteCount = 0
+        truncatedPartial = false
+        droppingUntilNewline = false
+        return s
+    }
+
+    private static func decode(_ data: Data, truncated: Bool = false) -> String? {
         var d = data
         if d.last == 0x0D { d.removeLast() }   // strip a CRLF's CR
+        if truncated {
+            return overflowRecordJSON(retained: d)
+        }
         // Lines are now complete, so no UTF-8 sequence is split; decode
         // is lossless. (Lossy `String(decoding:)` never returns nil — far
         // safer than the old guard that dropped the whole chunk.)
         let s = String(decoding: d, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return s.isEmpty ? nil : s
+    }
+
+    /// Valid NDJSON so `interpretStreamJSONLine` cannot drop the overflow.
+    /// CodexParser `error` + ProviderRuntimeEvent both surface it.
+    static func overflowRecordJSON(retained: Data) -> String {
+        let prefix = String(decoding: retained.prefix(overflowPrefixBytes), as: UTF8.self)
+        let payload: [String: Any] = [
+            "type": "error",
+            "message": truncationMarker,
+            "recoverable": true,
+            "truncated": true,
+            "retained_bytes": retained.count,
+            "prefix": prefix,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+           let json = String(data: data, encoding: .utf8) {
+            return json
+        }
+        return #"{"message":"\#(truncationMarker)","recoverable":true,"type":"error"}"#
     }
 }
 

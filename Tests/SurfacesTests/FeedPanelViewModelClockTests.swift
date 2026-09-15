@@ -193,6 +193,43 @@ final class FeedPanelViewModelClockTests: XCTestCase {
                        "flushed events must remain in the original append order — reversed display is the view's job")
     }
 
+    /// WHY: live `items` trim must match `trimmed` (newest-200) once count
+    /// crosses trimAt=256. removeFirst shift was equivalent only when unique;
+    /// suffix is the shared contract.
+    func test_liveItemsTrim_keepsNewestCapAfterCrossingSlack() {
+        let vm = FeedPanelViewModel()
+        let trimAt = 256
+        let cap = 200
+        for i in 0..<(trimAt + 1) {
+            vm.receive(seq: Int64(i), kind: "workspace.created", title: "e\(i)", ts: Double(i))
+        }
+        XCTAssertEqual(vm.items.count, cap,
+                       "crossing trimAt must drop back to cap via Array(suffix), not an unbounded live list")
+        XCTAssertEqual(vm.items.first?.id, Int64((trimAt + 1) - cap),
+                       "oldest live rows must leave; newest cap rows stay")
+        XCTAssertEqual(vm.items.last?.id, Int64(trimAt),
+                       "the event that crossed trimAt must remain as newest")
+    }
+
+    func test_flushPendingTrim_matchesLiveSuffixCap() {
+        let vm = FeedPanelViewModel()
+        for i in 0..<100 {
+            vm.receive(seq: Int64(i), kind: "workspace.created", title: "live\(i)", ts: Double(i))
+        }
+        vm.paused = true
+        for i in 100..<400 {
+            vm.receive(seq: Int64(i), kind: "workspace.created", title: "pend\(i)", ts: Double(i))
+        }
+        XCTAssertEqual(vm.pendingCount, 200,
+                       "paused pending already caps at 200 via trimmed")
+        vm.paused = false
+        XCTAssertEqual(vm.items.count, 200,
+                       "flush of 100 live + 200 pending (300) must suffix-trim to cap")
+        XCTAssertEqual(vm.items.first?.id, 200,
+                       "flush trim must keep the newest 200 (pending ids 200...399)")
+        XCTAssertEqual(vm.items.last?.id, 399)
+    }
+
     // MARK: - T060: json() roundtrip
 
     func test_json_roundtripPreservesAllFields() throws {

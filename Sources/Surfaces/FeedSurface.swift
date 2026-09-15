@@ -106,7 +106,7 @@ public final class FeedPanelViewModel: ObservableObject {
 
     private func append(_ item: Item) {
         items.append(item)
-        if items.count > Self.trimAt { items.removeFirst(items.count - Self.cap) }
+        if items.count > Self.trimAt { items = Self.trimmed(items, cap: Self.cap) }
         recomputeFiltered()
     }
 
@@ -114,7 +114,7 @@ public final class FeedPanelViewModel: ObservableObject {
         guard !pending.isEmpty else { return }
         items.append(contentsOf: pending)
         pending.removeAll()
-        if items.count > Self.trimAt { items.removeFirst(items.count - Self.cap) }
+        if items.count > Self.trimAt { items = Self.trimmed(items, cap: Self.cap) }
         recomputeFiltered()
     }
 

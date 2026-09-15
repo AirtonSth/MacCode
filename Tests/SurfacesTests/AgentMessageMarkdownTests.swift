@@ -161,18 +161,18 @@ final class AgentMessageMarkdownTests: XCTestCase {
         )
     }
 
-    func test_inlineCacheCountLimitIs512() {
-        XCTAssertEqual(AgentMessageMarkdown.inlineCacheCountLimit, 512)
-        XCTAssertEqual(AgentMessageMarkdown.blocksCacheCountLimit, 512)
+    func test_inlineCacheCountLimitIs256() {
+        XCTAssertEqual(AgentMessageMarkdown.inlineCacheCountLimit, 256)
+        XCTAssertEqual(AgentMessageMarkdown.blocksCacheCountLimit, 256)
         XCTAssertEqual(
             AgentMessageMarkdown.inlineCacheCountLimit,
             AgentMessageMarkdown.blocksCacheCountLimit
         )
     }
 
-    func test_markdownCacheCostLimits_are4MiB() {
-        XCTAssertEqual(AgentMessageMarkdown.blocksCacheCostLimit, 4 * 1_024 * 1_024)
-        XCTAssertEqual(AgentMessageMarkdown.inlineCacheCostLimit, 4 * 1_024 * 1_024)
+    func test_markdownCacheCostLimits_are2MiB() {
+        XCTAssertEqual(AgentMessageMarkdown.blocksCacheCostLimit, 2 * 1_024 * 1_024)
+        XCTAssertEqual(AgentMessageMarkdown.inlineCacheCostLimit, 2 * 1_024 * 1_024)
     }
 
     func test_finishedLargeReply_secondParseHitsCache() {
@@ -202,20 +202,20 @@ final class AgentMessageMarkdownTests: XCTestCase {
         XCTAssertEqual(String(first.characters), String(second.characters))
     }
 
-    func test_retentionEstimate_markdownCost_raisedForFinishedReplies() {
+    func test_retentionEstimate_markdownCost_halvedForSteadyState() {
         let blocks = AgentMessageMarkdown.blocksCacheCostLimit
         let inline = AgentMessageMarkdown.inlineCacheCostLimit
-        XCTAssertGreaterThanOrEqual(blocks, 4 * 1_024 * 1_024)
-        XCTAssertGreaterThanOrEqual(inline, 4 * 1_024 * 1_024)
-        XCTAssertEqual(blocks + inline, 8 * 1_024 * 1_024)
+        XCTAssertEqual(blocks, 2 * 1_024 * 1_024)
+        XCTAssertEqual(inline, 2 * 1_024 * 1_024)
+        XCTAssertEqual(blocks + inline, 4 * 1_024 * 1_024)
     }
 
-    func test_inlineMarkdownCountLimit_is512() {
-        XCTAssertEqual(AgentMessageMarkdown.inlineCacheCountLimit, 512)
+    func test_inlineMarkdownCountLimit_is256() {
+        XCTAssertEqual(AgentMessageMarkdown.inlineCacheCountLimit, 256)
     }
 
-    func test_blocksMarkdownCountLimit_is512() {
-        XCTAssertEqual(AgentMessageMarkdown.blocksCacheCountLimit, 512)
+    func test_blocksMarkdownCountLimit_is256() {
+        XCTAssertEqual(AgentMessageMarkdown.blocksCacheCountLimit, 256)
     }
 
     /// cache:true still memoizes identical finished content (regression pin for F3).
