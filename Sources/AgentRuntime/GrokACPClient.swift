@@ -974,31 +974,109 @@ public final class GrokACPClient: @unchecked Sendable {
                         "Grok ACP \(capabilities.agentVersion ?? "v1") does not support image prompts"
                     )
                 }
-                let data = try Data(contentsOf: URL(fileURLWithPath: attachment.path), options: .mappedIfSafe)
+                let payload: AgentAttachmentWireImage.Payload
+                do {
+                    payload = try AgentAttachmentWireImage.encode(
+                        path: attachment.path,
+                        mimeType: attachment.mimeType ?? "application/octet-stream"
+                    )
+                } catch let error as AgentAttachmentWireImage.EncodeError {
+                    throw GrokACPError.unsupported(error.description)
+                }
                 blocks.append([
                     "type": "image",
-                    "data": data.base64EncodedString(),
-                    "mimeType": attachment.mimeType ?? "application/octet-stream"
+                    "data": payload.data.base64EncodedString(),
+                    "mimeType": payload.mediaType
                 ])
             case .file:
                 guard capabilities.embeddedContext else {
                     throw GrokACPError.unsupported("Grok ACP does not negotiate embedded file context")
                 }
-                let data = try Data(contentsOf: URL(fileURLWithPath: attachment.path), options: .mappedIfSafe)
-                guard let text = String(data: data, encoding: .utf8) else {
-                    throw GrokACPError.unsupported("Grok ACP embedded context requires UTF-8 text: \(attachment.displayName)")
+                let prefix: EmbeddedFilePrefix
+                do {
+                    prefix = try embeddedUTF8FilePrefix(
+                        path: attachment.path,
+                        displayName: attachment.displayName
+                    )
+                } catch let error as EmbeddedFilePrefixError {
+                    throw GrokACPError.unsupported(error.description)
                 }
                 blocks.append([
                     "type": "resource",
                     "resource": [
                         "uri": URL(fileURLWithPath: attachment.path).absoluteString,
                         "mimeType": attachment.mimeType ?? "text/plain",
-                        "text": text
+                        "text": prefix.wireText
                     ]
                 ])
             }
         }
         return blocks
+    }
+
+    static let embeddedFilePrefixBytes = 512 * 1_024
+
+    struct EmbeddedFilePrefix: Equatable {
+        let text: String
+        let originalByteCount: Int
+        let truncated: Bool
+        let path: String
+
+        var wireText: String {
+            guard truncated else { return text }
+            return text
+                + "\n\n[truncated: showing first \(GrokACPClient.embeddedFilePrefixBytes) of \(originalByteCount) bytes; full file remains at \(path)]"
+        }
+    }
+
+    enum EmbeddedFilePrefixError: Error, CustomStringConvertible, Equatable {
+        case notUTF8(String)
+
+        var description: String {
+            switch self {
+            case .notUTF8(let displayName):
+                return "Grok ACP embedded context requires UTF-8 text: \(displayName)"
+            }
+        }
+    }
+
+    static func embeddedUTF8FilePrefix(
+        path: String,
+        displayName: String,
+        maxPrefixBytes: Int = embeddedFilePrefixBytes
+    ) throws -> EmbeddedFilePrefix {
+        let url = URL(fileURLWithPath: path)
+        let originalByteCount: Int
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+           let size = attributes[.size] as? NSNumber {
+            originalByteCount = size.intValue
+        } else {
+            originalByteCount = 0
+        }
+        let maxPrefixBytes = max(1, maxPrefixBytes)
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let prefix = try handle.read(upToCount: maxPrefixBytes) ?? Data()
+        guard let text = Self.utf8StringAllowingPartialTail(prefix) else {
+            throw EmbeddedFilePrefixError.notUTF8(displayName)
+        }
+        return EmbeddedFilePrefix(
+            text: text,
+            originalByteCount: max(originalByteCount, prefix.count),
+            truncated: originalByteCount > maxPrefixBytes,
+            path: path
+        )
+    }
+
+    private static func utf8StringAllowingPartialTail(_ data: Data) -> String? {
+        if let text = String(data: data, encoding: .utf8) { return text }
+        var trimmed = data
+        for _ in 0..<3 {
+            guard !trimmed.isEmpty else { break }
+            trimmed.removeLast()
+            if let text = String(data: trimmed, encoding: .utf8) { return text }
+        }
+        return nil
     }
 
     private func requestJSONObject(

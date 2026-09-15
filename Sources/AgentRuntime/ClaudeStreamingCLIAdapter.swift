@@ -1,5 +1,7 @@
+import CoreGraphics
 import Foundation
 import CoreModel
+import ImageIO
 import os
 
 private let claudeStreamLog = Logger(subsystem: "io.remotecode.agent", category: "claude.stream")
@@ -447,7 +449,11 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         ]
     }
 
-    nonisolated static func attachmentContentBlock(_ attachment: AgentAttachment) throws -> [String: Any] {
+    nonisolated static func attachmentContentBlock(
+        _ attachment: AgentAttachment,
+        maxPixel: Int = AgentAttachmentWireImage.maxPixel,
+        maxEncodedBytes: Int = AgentAttachmentWireImage.maxEncodedBytes
+    ) throws -> [String: Any] {
         let mimeType = attachment.mimeType ?? ""
         let isImage = attachment.kind == .image || mimeType.hasPrefix("image/")
         if isImage {
@@ -457,13 +463,23 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                     "Unsupported Claude image attachment type: \(mimeType.isEmpty ? "unknown" : mimeType)"
                 )
             }
-            let data = try Data(contentsOf: URL(fileURLWithPath: attachment.path))
+            let payload: AgentAttachmentWireImage.Payload
+            do {
+                payload = try AgentAttachmentWireImage.encode(
+                    path: attachment.path,
+                    mimeType: mimeType,
+                    maxPixel: maxPixel,
+                    maxEncodedBytes: maxEncodedBytes
+                )
+            } catch let error as AgentAttachmentWireImage.EncodeError {
+                throw AgentProviderAdapterError.unsupported(error.description)
+            }
             return [
                 "type": "image",
                 "source": [
                     "type": "base64",
-                    "media_type": mimeType,
-                    "data": data.base64EncodedString()
+                    "media_type": payload.mediaType,
+                    "data": payload.data.base64EncodedString()
                 ]
             ]
         }
@@ -2316,6 +2332,162 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         }
     }
 
+}
+
+/// Caps provider-visible image attachment bytes. Original files stay on disk.
+/// ImageIO thumbnail matches `AgentAttachmentThumbnailLoader` (max-pixel,
+/// no source cache, transform-aware) at a 2048px provider-vision budget.
+enum AgentAttachmentWireImage {
+    static let maxPixel = 2048
+    static let maxEncodedBytes = 5 * 1_024 * 1_024
+    static let jpegQualities: [Double] = [0.85, 0.70, 0.55, 0.40, 0.25]
+
+    struct Payload: Equatable {
+        let data: Data
+        let mediaType: String
+        let originalByteCount: Int
+        let downsampled: Bool
+    }
+
+    enum EncodeError: Error, CustomStringConvertible, Equatable {
+        case unreadable(String)
+        case exceedsCap(originalBytes: Int, encodedBytes: Int, capBytes: Int, maxPixel: Int)
+
+        var description: String {
+            switch self {
+            case .unreadable(let path):
+                return "Unable to decode image attachment for the provider wire (original kept on disk): \(path)"
+            case .exceedsCap(let originalBytes, let encodedBytes, let capBytes, let maxPixel):
+                return "Image attachment exceeds the \(capBytes) byte wire cap after \(maxPixel)px downsample (\(encodedBytes) encoded bytes from \(originalBytes) original). Original file kept on disk."
+            }
+        }
+    }
+
+    static func encode(
+        path: String,
+        mimeType: String,
+        maxPixel: Int = maxPixel,
+        maxEncodedBytes: Int = maxEncodedBytes
+    ) throws -> Payload {
+        let url = URL(fileURLWithPath: path)
+        guard let originalByteCount = fileSizeBytes(at: path), originalByteCount > 0 else {
+            throw EncodeError.unreadable(path)
+        }
+        let maxPixel = max(1, maxPixel)
+        let maxEncodedBytes = max(1, maxEncodedBytes)
+        let source = CGImageSourceCreateWithURL(
+            url as CFURL,
+            [kCGImageSourceShouldCache: false] as CFDictionary
+        )
+        let dimensions = source.flatMap(Self.dimensions(of:))
+        let withinByteCap = originalByteCount <= maxEncodedBytes
+        let withinPixelCap = dimensions.map { max($0.width, $0.height) <= maxPixel } ?? true
+        if withinByteCap && withinPixelCap {
+            let data = try readBounded(url: url, maxEncodedBytes: maxEncodedBytes, originalByteCount: originalByteCount)
+            return Payload(
+                data: data,
+                mediaType: mimeType,
+                originalByteCount: originalByteCount,
+                downsampled: false
+            )
+        }
+
+        guard let source,
+              let cgImage = thumbnail(from: source, maxPixel: maxPixel) else {
+            throw EncodeError.unreadable(path)
+        }
+
+        var lastEncodedCount = 0
+        for quality in jpegQualities {
+            guard let encoded = encodeJPEG(cgImage, quality: quality) else { continue }
+            lastEncodedCount = encoded.count
+            if encoded.count <= maxEncodedBytes {
+                return Payload(
+                    data: encoded,
+                    mediaType: "image/jpeg",
+                    originalByteCount: originalByteCount,
+                    downsampled: true
+                )
+            }
+        }
+        throw EncodeError.exceedsCap(
+            originalBytes: originalByteCount,
+            encodedBytes: lastEncodedCount,
+            capBytes: maxEncodedBytes,
+            maxPixel: maxPixel
+        )
+    }
+
+    private static func fileSizeBytes(at path: String) -> Int? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = attributes[.size] as? NSNumber else { return nil }
+        let value = size.intValue
+        return value > 0 ? value : nil
+    }
+
+    private static func readBounded(url: URL, maxEncodedBytes: Int, originalByteCount: Int) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: maxEncodedBytes + 1) ?? Data()
+        guard data.count <= maxEncodedBytes else {
+            throw EncodeError.exceedsCap(
+                originalBytes: originalByteCount,
+                encodedBytes: data.count,
+                capBytes: maxEncodedBytes,
+                maxPixel: maxPixel
+            )
+        }
+        return data
+    }
+
+    private static func dimensions(
+        of source: CGImageSource
+    ) -> (width: Int, height: Int)? {
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(
+            source,
+            0,
+            [kCGImageSourceShouldCache: false] as CFDictionary
+        ) as? [CFString: Any],
+        let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+        let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+        width > 0,
+        height > 0 else {
+            return nil
+        }
+        return (width, height)
+    }
+
+    private static func thumbnail(from source: CGImageSource, maxPixel: Int) -> CGImage? {
+        CGImageSourceCreateThumbnailAtIndex(
+            source,
+            0,
+            [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+                kCGImageSourceShouldCacheImmediately: true,
+            ] as CFDictionary
+        )
+    }
+
+    private static func encodeJPEG(_ image: CGImage, quality: Double) -> Data? {
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            output,
+            "public.jpeg" as CFString,
+            1,
+            nil
+        ) else {
+            return nil
+        }
+        CGImageDestinationAddImage(
+            destination,
+            image,
+            [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary
+        )
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return output as Data
+    }
 }
 
 private extension AgentRunRequest {
