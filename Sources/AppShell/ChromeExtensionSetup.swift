@@ -16,8 +16,8 @@ final class ChromeExtensionSetup: ObservableObject {
         var message: String {
             switch self {
             case .disconnected: return "Connect Chrome to use your existing logins in background tabs."
-            case .preparing: return "Preparing the Chrome extension…"
-            case .awaitingChrome: return "Local setup is ready. Finish loading the extension in Chrome."
+            case .preparing: return "Installing the Chrome extension…"
+            case .awaitingChrome: return "Checking the Chrome connection…"
             case .connected: return "Chrome is connected. Your background tabs can use your existing logins."
             case .failed(let message): return message
             }
@@ -51,15 +51,14 @@ final class ChromeExtensionSetup: ObservableObject {
             }.value
         },
         openSetup: @escaping @MainActor (URL) async throws -> Void = { folder in
-            guard let chrome = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.google.Chrome") else {
-                throw NSError(domain: "RemoteCode.ChromeSetup", code: 2,
-                              userInfo: [NSLocalizedDescriptionKey: "Install Google Chrome, then try setup again."])
+            try await ComputerUseHostQueue.shared.withExclusive(kind: .mutation) {
+                let result = await ChromeProfileComputerUseBackend(prepare: { folder })
+                    .invoke(name: "browser_setup", arguments: [:])
+                if result.isError {
+                    throw NSError(domain: "RemoteCode.ChromeSetup", code: 2,
+                                  userInfo: [NSLocalizedDescriptionKey: result.content.first?.text ?? "Chrome setup failed."])
+                }
             }
-            NSWorkspace.shared.activateFileViewerSelecting([folder])
-            _ = try await NSWorkspace.shared.open(
-                [URL(string: "chrome://extensions")!], withApplicationAt: chrome,
-                configuration: NSWorkspace.OpenConfiguration()
-            )
         }
     ) {
         self.prepare = prepare
@@ -106,6 +105,15 @@ final class ChromeExtensionSetup: ObservableObject {
             state = extensionDirectory == nil ? .disconnected : .awaitingChrome
         }
     }
+
+    func waitForConnection() async {
+        while state == .awaitingChrome && !Task.isCancelled {
+            await refresh()
+            guard state == .awaitingChrome else { return }
+            do { try await Task.sleep(for: .seconds(2)) }
+            catch { return }
+        }
+    }
 }
 
 struct ChromeExtensionSettingsSection: View {
@@ -119,7 +127,7 @@ struct ChromeExtensionSettingsSection: View {
                 .foregroundColor(DS.Palette.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
-                Button(setup.extensionDirectory == nil ? "Set Up Chrome Extension" : "Open Chrome Setup") {
+                Button("Set Up Chrome Extension") {
                     Task { await setup.install() }
                 }
                 .buttonStyle(.bordered)
@@ -137,17 +145,34 @@ struct ChromeExtensionSettingsSection: View {
                 .foregroundColor(setup.state == .connected ? DS.Palette.success : DS.Palette.textSecondary)
                 .textSelection(.enabled)
                 .accessibilityIdentifier("settings.computerUse.chrome.status")
-            if setup.extensionDirectory != nil && setup.state != .connected {
-                Text("One-time Chrome setup: enable Developer mode, choose Load unpacked, and select the extension folder shown in Finder. Return here to check the connection.")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("settings.computerUse.chrome.instructions")
+            if let folder = setup.extensionDirectory, case .failed = setup.state {
+                VStack(alignment: .leading, spacing: DS.Space.sm) {
+                    ForEach(Array(ChromeProfileConnection.installationSteps(for: folder).enumerated()), id: \.offset) { index, step in
+                        Text("\(index + 1). \(step)")
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Button("Copy Folder Path") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(folder.path, forType: .string)
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("settings.computerUse.chrome.copyPath")
+                }
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+                .textSelection(.enabled)
+                .accessibilityIdentifier("settings.computerUse.chrome.instructions")
             }
+            Text("Setup briefly controls Chrome to install the extension. You can also ask an agent to do this for you.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
         }
         .dsPanel(padding: DS.Space.lg)
         .accessibilityIdentifier("settings.section.computerUse")
         .task { await setup.refresh() }
+        .task(id: setup.state == .awaitingChrome) {
+            await setup.waitForConnection()
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await setup.refresh() }
         }

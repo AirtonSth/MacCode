@@ -1796,7 +1796,7 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             return Unmanaged<AXValue>.fromOpaque(pointer).takeUnretainedValue()
         }
 
-        private static func exactAXWindow(target: ComputerUseNativeHostTarget) -> AXUIElement? {
+        static func exactAXWindow(target: ComputerUseNativeHostTarget) -> AXUIElement? {
             let quartzWindows = listWindows(bundleID: nil)
             guard let targetQuartzWindow = quartzWindows.first(where: { $0.target == target }) else {
                 return nil

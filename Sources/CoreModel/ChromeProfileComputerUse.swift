@@ -7,6 +7,7 @@ public enum ChromeProfileConnection {
     public static let hostName = "io.remotecode.computer_use"
     public static let extensionID = "ejnjfchbceelacijgldkmckpmjfpdgip"
     public static let hostArgument = "chrome-native-host"
+    public static let setupURL = URL(string: "chrome://extensions/")!
     static let maximumFrameBytes = 1_048_576
 
     public static var directory: URL {
@@ -19,6 +20,15 @@ public enum ChromeProfileConnection {
     }
 
     public static var socketPath: String { directory.appendingPathComponent("bridge.sock").path }
+
+    public static func installationSteps(for folder: URL) -> [String] {
+        [
+            "Open chrome://extensions/ in the Chrome profile you want RemoteCode to use.",
+            "Turn on Developer mode, then click Load unpacked.",
+            "In the folder picker, press Command-Shift-G, paste \(folder.path), press Return, then click Select.",
+            "Keep this folder in place. Chrome loads the extension directly from it.",
+        ]
+    }
 
     struct Failure: Error, LocalizedError {
         let message: String
@@ -114,7 +124,7 @@ public enum ChromeProfileConnection {
             }
         }
         guard connected == 0 else {
-            throw Failure(message: "Chrome extension is not connected. In RemoteCode, open Settings > Computer Use > Set Up Chrome Extension. If already installed, click its toolbar button in the Chrome profile you want to use.")
+            throw Failure(message: "Chrome extension is not connected. Call browser_setup to install or repair it automatically.")
         }
         let deadline = Date().addingTimeInterval(20)
         var request = object
@@ -172,10 +182,11 @@ public enum ChromeProfileConnection {
             catch { continue }
             let deadline = Date().addingTimeInterval(15)
             try writeFrame(request, fd: STDOUT_FILENO, until: deadline)
-            let response = try readFrame(fd: STDIN_FILENO, until: deadline)
+            var response = try readFrame(fd: STDIN_FILENO, until: deadline)
             guard response["id"] as? String == request["id"] as? String else {
                 throw Failure(message: "Unexpected Chrome response. Reconnect the extension.")
             }
+            response["chrome_pid"] = getppid()
             // A caller can disappear after an action. Do not replay it.
             try? writeFrame(response, fd: client, until: deadline)
         }
@@ -190,7 +201,8 @@ public enum ChromeProfileConnection {
         let destination = directory.appendingPathComponent("extension")
         // Match the shipped Contents/Resources layout. Bundle.module embeds a
         // developer build path and can fatalError in the installed app.
-        let executableDirectory = URL(fileURLWithPath: executable).resolvingSymlinksInPath().deletingLastPathComponent()
+        let executableURL = URL(fileURLWithPath: executable).resolvingSymlinksInPath()
+        let executableDirectory = executableURL.deletingLastPathComponent()
         let bundles = [
             executableDirectory.deletingLastPathComponent().appendingPathComponent("Resources/RemoteCode_CoreModel.bundle"),
             executableDirectory.appendingPathComponent("RemoteCode_CoreModel.bundle"),
@@ -203,7 +215,7 @@ public enum ChromeProfileConnection {
             try Data(contentsOf: source.appendingPathComponent(name)).write(to: destination.appendingPathComponent(name), options: .atomic)
         }
         let host = directory.appendingPathComponent("native-host")
-        let quoted = "'" + executable.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let quoted = "'" + executableURL.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
         try Data("#!/bin/sh\nexec \(quoted) \(hostArgument) \"$@\"\n".utf8).write(to: host, options: .atomic)
         try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: host.path)
         let registration = homeDirectory.appendingPathComponent("Library/Application Support/Google/Chrome/NativeMessagingHosts")
@@ -218,21 +230,49 @@ public enum ChromeProfileConnection {
 }
 
 public final class ChromeProfileComputerUseBackend: ComputerUseToolBackend, @unchecked Sendable {
-    public static let tools = ["browser_open", "browser_snapshot", "browser_act", "browser_close", "browser_status"]
+    public static let tools = ["browser_setup", "browser_open", "browser_snapshot", "browser_act", "browser_close", "browser_status"]
     private let sessionID = UUID().uuidString
+    private let prepare: @Sendable () throws -> URL
+    private let installInChrome: @Sendable (URL, Int32?) async throws -> Void
     private let send: @Sendable ([String: Any]) throws -> [String: Any]
     private let queue = DispatchQueue(label: "io.remotecode.chrome-profile")
 
-    public init(send: @escaping @Sendable ([String: Any]) throws -> [String: Any] = { try ChromeProfileConnection.request($0) }) {
+    public init(
+        prepare: @escaping @Sendable () throws -> URL = {
+            try ChromeProfileConnection.install(executable: CommandLine.arguments[0])
+        },
+        installInChrome: @escaping @Sendable (URL, Int32?) async throws -> Void = {
+            try await ChromeExtensionInstallAutomation.install(folder: $0, targetPID: $1)
+        },
+        send: @escaping @Sendable ([String: Any]) throws -> [String: Any] = { try ChromeProfileConnection.request($0) }
+    ) {
+        self.prepare = prepare
+        self.installInChrome = installInChrome
         self.send = send
     }
 
     public func invoke(name: String, arguments: [String: Any]) async -> ComputerUseToolResult {
-        await withCheckedContinuation { continuation in
+        if name == "browser_setup" { return await setup(arguments: arguments) }
+        return await withCheckedContinuation { continuation in
             queue.async { [self] in
                 do {
                     guard Self.tools.contains(name) else { throw ChromeProfileConnection.Failure(message: "Unknown browser tool.") }
-                    let response = try send(["operation": name, "session": sessionID, "arguments": arguments])
+                    let response: [String: Any]
+                    if name == "browser_status" {
+                        let status: [String: Any]
+                        do { status = try send(["operation": "browser_status", "session": sessionID, "arguments": [:]]) }
+                        catch { status = ["ok": false, "error": error.localizedDescription] }
+                        if status["ok"] as? Bool == true, status["connected"] as? Bool == true {
+                            response = status
+                        } else {
+                            response = [
+                                "ok": true, "connected": false, "next_tool": "browser_setup",
+                                "message": status["error"] as? String ?? "Load or enable the RemoteCode extension in Chrome.",
+                            ]
+                        }
+                    } else {
+                        response = try send(["operation": name, "session": sessionID, "arguments": arguments])
+                    }
                     let data = try JSONSerialization.data(withJSONObject: response, options: [.sortedKeys])
                     continuation.resume(returning: ComputerUseToolResult(
                         text: String(decoding: data, as: UTF8.self), isError: response["ok"] as? Bool != true
@@ -242,5 +282,42 @@ public final class ChromeProfileComputerUseBackend: ComputerUseToolBackend, @unc
                 }
             }
         }
+    }
+
+    private func setup(arguments: [String: Any]) async -> ComputerUseToolResult {
+        do {
+            let targetPID = ComputerUseNativeHostBackend.exactInt32(arguments["target_pid"])
+            if arguments["target_pid"] != nil && (targetPID == nil || targetPID! <= 0) {
+                throw ChromeProfileConnection.Failure(message: "target_pid must identify a running Google Chrome process.")
+            }
+            let current = await invoke(name: "browser_status", arguments: [:])
+            if try isConnected(current, targetPID: targetPID) { return current }
+            let folder = try await Task.detached { [prepare] in try prepare() }.value
+            try Task.checkCancellation()
+            try await installInChrome(folder, targetPID)
+            var status = current
+            for _ in 0..<20 {
+                try Task.checkCancellation()
+                status = await invoke(name: "browser_status", arguments: [:])
+                if try isConnected(status, targetPID: targetPID) { return status }
+                try await Task.sleep(for: .milliseconds(250))
+            }
+            return ComputerUseToolResult(
+                text: "Chrome loaded the extension, but the native connection could not be verified. Installation is not complete. Inspect the RemoteCode extension's error in Chrome before retrying browser_setup.\n\(status.content.first?.text ?? "")",
+                isError: true
+            )
+        } catch {
+            return ComputerUseToolResult(text: error.localizedDescription, isError: true)
+        }
+    }
+
+    private func isConnected(_ result: ComputerUseToolResult, targetPID: Int32?) throws -> Bool {
+        let data = Data((result.content.first?.text ?? "{}").utf8)
+        let status = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard !result.isError && status?["ok"] as? Bool == true && status?["connected"] as? Bool == true else { return false }
+        if let targetPID, ComputerUseNativeHostBackend.exactInt32(status?["chrome_pid"]) != targetPID {
+            throw ChromeProfileConnection.Failure(message: "Another Chrome process is connected, or its identity cannot be verified. Disconnect that profile's RemoteCode extension before setting up the requested Chrome process.")
+        }
+        return true
     }
 }

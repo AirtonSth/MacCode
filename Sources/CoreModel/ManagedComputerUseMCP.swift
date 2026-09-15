@@ -159,7 +159,7 @@ public struct ManagedComputerUseMCP: Sendable {
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
-                "instructions": "RemoteCode computer-use. Prefer browser_* for Chrome: these tools use your current profile in owned background tabs through the RemoteCode extension. Selecting an owned tab gives control to the user; automation must release it with browser_close. Native app actions require exact window identity and fresh state, yield to human activity, and never activate windows or move the physical pointer.",
+                "instructions": "RemoteCode computer-use. Prefer browser_* for Chrome: these tools use your current profile in owned background tabs through the RemoteCode extension. If browser_status says disconnected, call browser_setup with no arguments: it prepares the extension, opens Chrome, loads it through Chrome's UI, and verifies the connection. This one-time setup briefly controls Chrome's foreground window and stops for human activity; do not send the user manual installation steps unless setup reports a permission or browser-policy blocker. Selecting an owned tab gives control to the user; automation must release it with browser_close. Other native app actions require exact window identity and fresh state, yield to human activity, and never activate windows or move the physical pointer.",
             ])
         case "tools/list":
             return reply(id: id, result: ["tools": Self.toolCatalog()])
@@ -170,16 +170,18 @@ public struct ManagedComputerUseMCP: Sendable {
             guard Self.advertisedToolNames.contains(name) else {
                 return errorReply(id: id, code: -32602, message: "unknown tool: \(name)")
             }
-            // Chrome's own background tabs do not use host HID or its lease.
-            if ChromeProfileComputerUseBackend.tools.contains(name) {
+            // Installation owns the global lease for its entire UI sequence.
+            // Other Chrome tools only operate in background tabs.
+            if ChromeProfileComputerUseBackend.tools.contains(name), name != "browser_setup" {
                 let result = await browserBackend.invoke(name: name, arguments: arguments)
                 return reply(id: id, result: ["content": result.jsonContent(), "isError": result.isError])
             }
-            let kind: ComputerUseHostQueue.Kind = Self.mutationTools.contains(name) ? .mutation : .observation
-            let targetPID = Self.targetPID(from: arguments)
+            let kind: ComputerUseHostQueue.Kind = Self.mutationTools.contains(name) || name == "browser_setup" ? .mutation : .observation
+            let targetPID = name == "browser_setup" ? nil : Self.targetPID(from: arguments)
             do {
                 let result = try await queue.withExclusive(kind: kind, targetPID: targetPID) {
-                    await backend.invoke(name: name, arguments: arguments)
+                    if name == "browser_setup" { return await browserBackend.invoke(name: name, arguments: arguments) }
+                    return await backend.invoke(name: name, arguments: arguments)
                 }
                 return reply(id: id, result: [
                     "content": result.jsonContent(),
@@ -211,6 +213,8 @@ public struct ManagedComputerUseMCP: Sendable {
 
     private static func description(for name: String) -> String {
         switch name {
+        case "browser_setup":
+            return "Install the RemoteCode extension in one call, including Chrome's Developer mode, Load unpacked, folder selection, and a verified native connection. No arguments needed. Requires macOS Accessibility permission and briefly controls Chrome in the foreground under an exclusive lease; stops for human activity. Optional target_pid selects a specific Chrome process. Already-connected Chrome is left untouched."
         case "browser_open":
             return "Open an HTTP(S) URL in your session's inactive, muted tab in the user's current Chrome profile, using existing logins. Requires the RemoteCode Chrome extension. Returns immediately; call browser_snapshot next."
         case "browser_snapshot":
@@ -220,7 +224,7 @@ public struct ManagedComputerUseMCP: Sendable {
         case "browser_close":
             return "Close only your owned background Chrome tab. If the user selected it, release ownership and leave it open."
         case "browser_status":
-            return "Check whether the Chrome extension is connected, without opening a tab."
+            return "Check whether the Chrome extension is connected, without opening a tab. If connected=false, call browser_setup."
         case screenshotTool:
             return "Capture the exact target window; returned image coordinates are pixels with a top-left origin."
         case "zoom":
@@ -257,6 +261,8 @@ public struct ManagedComputerUseMCP: Sendable {
     private static func inputSchema(for name: String) -> [String: Any] {
         if ChromeProfileComputerUseBackend.tools.contains(name) {
             switch name {
+            case "browser_setup":
+                return ["type": "object", "properties": ["target_pid": ["type": "integer", "description": "Optional exact Google Chrome PID. Omit to use the usual Chrome application."]]]
             case "browser_open":
                 return ["type": "object", "properties": ["url": ["type": "string"]], "required": ["url"]]
             case "browser_act":

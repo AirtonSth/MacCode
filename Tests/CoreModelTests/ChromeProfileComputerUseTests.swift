@@ -3,7 +3,7 @@ import XCTest
 @testable import CoreModel
 
 final class ChromeProfileComputerUseTests: XCTestCase {
-    func testInstallerUsesPackagedResourcesAndOnlyRegistersItsOwnExtension() throws {
+    func testAgentCanInstallAndRepairPackagedExtensionInOneToolCall() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("rc-chrome-install-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }
         let contents = root.appendingPathComponent("RemoteCode.app/Contents")
@@ -16,7 +16,29 @@ final class ChromeProfileComputerUseTests: XCTestCase {
         }
         let home = root.appendingPathComponent("test-user")
         let executable = contents.appendingPathComponent("MacOS/RemoteCodeDistillService").path
-        let installed = try ChromeProfileConnection.install(executable: executable, homeDirectory: home)
+        let connection = SetupConnection()
+        let backend = ChromeProfileComputerUseBackend(prepare: {
+            try ChromeProfileConnection.install(executable: executable, homeDirectory: home)
+        }, installInChrome: { folder, _ in
+            XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent("manifest.json").path))
+            connection.connect()
+        }, send: { _ in connection.status() })
+        let server = ManagedComputerUseMCP(browserBackend: backend)
+        let request = #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"browser_setup","arguments":{}}}"#
+        let setupReply = await server.handle(request)
+        let reply = try XCTUnwrap(setupReply)
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(reply.utf8)) as? [String: Any])
+        let result = try XCTUnwrap(envelope["result"] as? [String: Any])
+        XCTAssertEqual(result["isError"] as? Bool, false)
+        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+        let setup = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(XCTUnwrap(content.first?["text"] as? String).utf8)) as? [String: Any])
+        XCTAssertEqual(setup["connected"] as? Bool, true)
+        let installed = home.appendingPathComponent("Library/Application Support/RemoteCode/ChromeComputerUse/extension")
+        try Data("stale resource".utf8).write(to: installed.appendingPathComponent("background.js"))
+        connection.disconnect()
+        _ = await server.handle(request)
+        XCTAssertEqual(try Data(contentsOf: installed.appendingPathComponent("background.js")),
+                       try Data(contentsOf: source.appendingPathComponent("background.js")))
         let manifest = try JSONSerialization.jsonObject(with: Data(contentsOf: installed.appendingPathComponent("manifest.json"))) as! [String: Any]
         XCTAssertEqual(manifest["name"] as? String, "RemoteCode Computer Use")
         let native = home.appendingPathComponent("Library/Application Support/Google/Chrome/NativeMessagingHosts/\(ChromeProfileConnection.hostName).json")
@@ -25,6 +47,37 @@ final class ChromeProfileComputerUseTests: XCTestCase {
         let wrapper = try String(contentsOfFile: XCTUnwrap(registration["path"] as? String))
         XCTAssertTrue(wrapper.contains(executable))
         XCTAssertTrue(wrapper.contains(ChromeProfileConnection.hostArgument))
+    }
+
+    func testSetupLeavesAConnectedProfileUntouchedAndReportsPreparationFailures() async throws {
+        let connected = ChromeProfileComputerUseBackend(prepare: {
+            XCTFail("A connected profile must not be reinstalled.")
+            return URL(fileURLWithPath: "/unused")
+        }, send: { _ in ["ok": true, "connected": true] })
+        let ready = await connected.invoke(name: "browser_setup", arguments: [:])
+        XCTAssertFalse(ready.isError)
+        XCTAssertTrue(ready.content.first?.text?.contains(#""connected":true"#) == true)
+
+        let broken = ChromeProfileComputerUseBackend(prepare: {
+            throw ChromeProfileConnection.Failure(message: "Packaged resources are missing.")
+        }, send: { _ in throw ChromeProfileConnection.Failure(message: "Disconnected") })
+        let status = await broken.invoke(name: "browser_status", arguments: [:])
+        XCTAssertFalse(status.isError)
+        XCTAssertTrue(status.content.first?.text?.contains(#""next_tool":"browser_setup""#) == true)
+        let failed = await broken.invoke(name: "browser_setup", arguments: [:])
+        XCTAssertTrue(failed.isError)
+        XCTAssertEqual(failed.content.first?.text, "Packaged resources are missing.")
+    }
+
+    func testSetupDoesNotReportSuccessWhenChromeUIFails() async {
+        let backend = ChromeProfileComputerUseBackend(prepare: {
+            URL(fileURLWithPath: "/test/extension")
+        }, installInChrome: { _, _ in
+            throw ChromeProfileConnection.Failure(message: "Accessibility permission required.")
+        }, send: { _ in ["ok": true, "connected": false] })
+        let result = await backend.invoke(name: "browser_setup", arguments: [:])
+        XCTAssertTrue(result.isError)
+        XCTAssertEqual(result.content.first?.text, "Accessibility permission required.")
     }
 
     func testBrowserToolsReachProfileBackendWithIndependentSessionIdentity() async throws {
@@ -60,6 +113,17 @@ final class ChromeProfileComputerUseTests: XCTestCase {
         _ = withUnsafeBytes(of: &oversized) { Darwin.write(fds[0], $0.baseAddress, 4) }
         XCTAssertThrowsError(try ChromeProfileConnection.readFrame(fd: fds[1], until: deadline))
         XCTAssertThrowsError(try ChromeProfileConnection.runHost(origin: "chrome-extension://unrelated/"))
+    }
+}
+
+private final class SetupConnection: @unchecked Sendable {
+    private let lock = NSLock()
+    private var connected = false
+    func connect() { lock.lock(); defer { lock.unlock() }; connected = true }
+    func disconnect() { lock.lock(); defer { lock.unlock() }; connected = false }
+    func status() -> [String: Any] {
+        lock.lock(); defer { lock.unlock() }
+        return ["ok": true, "connected": connected]
     }
 }
 

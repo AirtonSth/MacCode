@@ -23,7 +23,7 @@ final class ChromeExtensionSetupTests: XCTestCase {
         XCTAssertEqual(opened, [folder])
         XCTAssertEqual(setup.extensionDirectory, folder)
         XCTAssertEqual(setup.state, .awaitingChrome)
-        await setup.refresh()
+        await setup.waitForConnection()
         XCTAssertEqual(setup.state, .connected)
         XCTAssertFalse(setup.checking)
     }
