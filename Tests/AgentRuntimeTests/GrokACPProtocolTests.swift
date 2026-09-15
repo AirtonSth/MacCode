@@ -264,6 +264,25 @@ final class GrokACPProtocolTests: XCTestCase {
             .setModel(modelId: model, reasoningEffort: .max)
         )
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.max, modelId: model), "max")
+        XCTAssertEqual(
+            GrokACPClient.modelEffortBind(
+                requestModel: model, sessionModel: model,
+                requestEffort: .medium, sessionEffort: .max,
+                prefersConfigOptionEffort: true
+            ),
+            .setConfigOption(configId: "reasoning_effort", value: "medium", effort: .medium)
+        )
+        XCTAssertEqual(
+            GrokACPClient.modelEffortBind(
+                requestModel: "muse-spark-1.3-contributor",
+                sessionModel: "muse-spark-1.3-contributor",
+                requestEffort: .xhigh,
+                sessionEffort: .low,
+                prefersConfigOptionEffort: true,
+                advertisedEfforts: [.low, .medium, .high, .xhigh]
+            ),
+            .setConfigOption(configId: "reasoning_effort", value: "xhigh", effort: .xhigh)
+        )
     }
 
     func test_regularACPLaunchEmptyModelOmitsModelFlagAndMatchesEffortSemantics() throws {
@@ -1575,6 +1594,56 @@ final class GrokACPProtocolTests: XCTestCase {
             prefersConfigOptionEffort: true
         )
         XCTAssertEqual(noop, .none)
+    }
+
+    /// WHY: advertisedEfforts is a let from session/new|load and is not
+    /// refreshed after setModel. Opening grok-4.6 advertises xhigh; binding
+    /// grok-4.5 must still clamp instead of returning the stale ad unchanged.
+    func test_modelEffortBindIntersectsStaleAdsWithTargetModelSupportedEfforts() {
+        let grok45FromGrok46Ads = GrokACPClient.modelEffortBind(
+            requestModel: "grok-4.5",
+            sessionModel: "grok-4.6",
+            requestEffort: .xhigh,
+            sessionEffort: .high,
+            advertisedEfforts: [.low, .medium, .high, .xhigh]
+        )
+        guard case let .setModel(modelId, effort) = grok45FromGrok46Ads else {
+            return XCTFail("grok-4.6→4.5 xhigh must bind via set_model, got \(grok45FromGrok46Ads)")
+        }
+        XCTAssertEqual(modelId, "grok-4.5")
+        XCTAssertEqual(effort, .high)
+
+        let effortOnlyAfterModelSwitch = GrokACPClient.modelEffortBind(
+            requestModel: "grok-4.5",
+            sessionModel: "grok-4.5",
+            requestEffort: .xhigh,
+            sessionEffort: .high,
+            prefersConfigOptionEffort: true,
+            advertisedEfforts: [.low, .medium, .high, .xhigh]
+        )
+        guard case let .setConfigOption(_, value, clamped) = effortOnlyAfterModelSwitch else {
+            return XCTFail("stale grok-4.6 ads on grok-4.5 must still clamp, got \(effortOnlyAfterModelSwitch)")
+        }
+        XCTAssertEqual(value, "high")
+        XCTAssertEqual(clamped, .high)
+
+        let museEmptyMeta = GrokACPClient.modelEffortBind(
+            requestModel: "muse-spark-1.3-contributor",
+            sessionModel: "muse-spark-1.3-contributor",
+            requestEffort: .xhigh,
+            sessionEffort: .low,
+            prefersConfigOptionEffort: true,
+            advertisedEfforts: []
+        )
+        guard case let .setConfigOption(_, museValue, museEffort) = museEmptyMeta else {
+            return XCTFail("muse-spark empty _meta must keep museSparkEfforts xhigh, got \(museEmptyMeta)")
+        }
+        XCTAssertEqual(museValue, "xhigh")
+        XCTAssertEqual(museEffort, .xhigh)
+        XCTAssertEqual(
+            GrokReasoningPolicy.supportedEfforts(for: "muse-spark-1.3-contributor"),
+            GrokReasoningPolicy.museSparkEfforts
+        )
     }
 
     /// WHY: session/new|load advertise typed configOptions; ignoring them leaves

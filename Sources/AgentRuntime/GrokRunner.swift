@@ -39,10 +39,34 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
                 supportsCustomModel: true
             ),
             AgentModelDescriptor(
-                id: "grok-composer-2.5-fast",
-                label: "Grok Composer 2.5 Fast",
+                id: "glm-5.3",
+                label: "GLM 5.3",
+                provider: .grok,
+                supportsReasoning: true,
+                supportedReasoningEfforts: GrokReasoningPolicy.glm53Efforts,
+                supportsCustomModel: true
+            ),
+            AgentModelDescriptor(
+                id: "glm-5.3-flash",
+                label: "GLM 5.3 Flash",
+                provider: .grok,
+                supportsReasoning: true,
+                supportedReasoningEfforts: GrokReasoningPolicy.glm53Efforts,
+                supportsCustomModel: true
+            ),
+            AgentModelDescriptor(
+                id: "qwen38-omlx",
+                label: "Qwen3.8-27B MTPLX 128k",
                 provider: .grok,
                 supportsReasoning: false,
+                supportsCustomModel: true
+            ),
+            AgentModelDescriptor(
+                id: "muse-spark-1.3-contributor",
+                label: "Muse Spark 1.3 Contributor",
+                provider: .grok,
+                supportsReasoning: true,
+                supportedReasoningEfforts: GrokReasoningPolicy.museSparkEfforts,
                 supportsCustomModel: true
             ),
             // Current account default tracks Grok 4.6.
