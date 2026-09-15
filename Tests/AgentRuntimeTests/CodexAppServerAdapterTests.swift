@@ -4164,10 +4164,16 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(
             events.contains {
                 if case .itemStarted(let item) = $0 {
-                    return item.summary == "Strict auto-approval review required" && item.type == .review
+                    return item.summary == "Strict auto-approval review required"
+                        && item.type == .review
+                        && item.id == "strict-review-turn-app-server-1"
+                        && item.state == .completed
+                        && item.state != .streaming
+                        && item.finishedAtMs != nil
                 }
                 return false
-            }
+            },
+            "strictReviewRequired must be a terminal .review item; completed reviewId never matches this chip"
         )
         XCTAssertTrue(
             events.contains {

@@ -1827,17 +1827,19 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 finishedAtMs: now
             )))
         case "autoApprovalReview/strictReviewRequired", "autoApprovalReview.strictReviewRequired":
+            // Terminal: item/autoApprovalReview/completed keys off reviewId, not
+            // strict-review-<turnId>, so a streaming chip never settles (CODEX-APP-004).
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
             let itemId = "strict-review-\(turnId.isEmpty ? UUID().uuidString : turnId)"
             events.append(.itemStarted(item: AssistantItem(
                 id: itemId,
                 turnId: turnId,
                 type: .review,
-                state: .streaming,
+                state: .completed,
                 summary: "Strict auto-approval review required",
                 output: Self.jsonString(payload),
                 startedAtMs: now,
-                finishedAtMs: nil
+                finishedAtMs: now
             )))
         case "turn/moderationMetadata", "turn.moderationMetadata":
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
