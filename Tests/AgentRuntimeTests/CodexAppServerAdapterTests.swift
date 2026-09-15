@@ -1022,7 +1022,8 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                       "failed steer must not retarget cancel away from the live session")
         let finished = try await waitForFinish(in: originalSink, timeout: 1)
         XCTAssertEqual(finished.0, .cancelled)
-        XCTAssertNil(await followUpSink.finish,
+        let followUpFinish = await followUpSink.finish
+        XCTAssertNil(followUpFinish,
                      "live finish must not land on the abandoned follow-up callback")
         let followUpEvents = await followUpSink.snapshot()
         XCTAssertTrue(followUpEvents.isEmpty,
