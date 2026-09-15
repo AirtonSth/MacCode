@@ -783,9 +783,13 @@ public final class GrokACPClient: @unchecked Sendable {
     /// reasoning configuration, so no acknowledgement can honestly be claimed.
     static func wireReasoningEffort(
         _ effort: AgentReasoningEffort,
-        modelId: String = ""
+        modelId: String = "",
+        advertisedEfforts: [AgentReasoningEffort] = []
     ) -> String? {
-        GrokRunner.normalizedReasoningEffort(effort, model: modelId)?.rawValue
+        if advertisedEfforts.contains(effort) {
+            return effort.rawValue
+        }
+        return GrokRunner.normalizedReasoningEffort(effort, model: modelId)?.rawValue
     }
 
     /// `reasoningEffort` is the ACP `_meta.reasoningEffort` wire value (grok-build
@@ -838,12 +842,14 @@ public final class GrokACPClient: @unchecked Sendable {
         sessionModel: String,
         requestEffort: AgentReasoningEffort?,
         sessionEffort: AgentReasoningEffort?,
-        prefersConfigOptionEffort: Bool = false
+        prefersConfigOptionEffort: Bool = false,
+        advertisedEfforts: [AgentReasoningEffort] = []
     ) -> ModelEffortBind {
         let model = requestModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let targetModel = model.isEmpty ? sessionModel : model
-        let targetEffort = requestEffort.flatMap {
-            GrokRunner.normalizedReasoningEffort($0, model: targetModel)
+        let targetEffort = requestEffort.flatMap { requested -> AgentReasoningEffort? in
+            if advertisedEfforts.contains(requested) { return requested }
+            return GrokRunner.normalizedReasoningEffort(requested, model: targetModel)
         }
         let needsModelBind = !model.isEmpty && model != sessionModel
         let needsEffortBind = targetEffort != sessionEffort
@@ -851,7 +857,9 @@ public final class GrokACPClient: @unchecked Sendable {
             return .setModel(modelId: targetModel, reasoningEffort: targetEffort)
         }
         if needsEffortBind, let targetEffort,
-           let wire = wireReasoningEffort(targetEffort, modelId: targetModel) {
+           let wire = wireReasoningEffort(
+            targetEffort, modelId: targetModel, advertisedEfforts: advertisedEfforts
+           ) {
             if prefersConfigOptionEffort {
                 return .setConfigOption(
                     configId: "reasoning_effort",

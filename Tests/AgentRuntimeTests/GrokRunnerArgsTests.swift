@@ -181,7 +181,10 @@ final class GrokRunnerArgsTests: XCTestCase {
 
     func test_glmFlashPreservesMaxReasoningEffort() throws {
         let model = "glm-5.3-flash"
-        XCTAssertEqual(GrokRunner.supportedReasoningEfforts(for: model), [.low, .high, .max])
+        XCTAssertEqual(
+            GrokRunner.supportedReasoningEfforts(for: model),
+            [.low, .medium, .high, .xhigh, .max]
+        )
         let args = GrokRunner.buildArgs(req(model: model, effort: .max))
         let index = try XCTUnwrap(args.firstIndex(of: "--reasoning-effort"))
         XCTAssertEqual(args[index + 1], "max")
@@ -191,6 +194,27 @@ final class GrokRunnerArgsTests: XCTestCase {
         let a = GrokRunner.buildArgs(req(model: "grok-composer-2.5-fast", effort: .high))
         XCTAssertNil(a.firstIndex(of: "--reasoning-effort"),
                      "Grok Composer has supports_reasoning_effort=false; do not pass --reasoning-effort")
+    }
+
+    func test_glmMediumWiresMediumNotMax() throws {
+        // WHY: live grok 1.0.30 GLM aliases medium→high. Clamping missing
+        // medium onto max over-reasons cheap turns.
+        for model in ["glm-5.3", "glm-5.3-flash"] {
+            let args = GrokRunner.buildArgs(req(model: model, effort: .medium))
+            let index = try XCTUnwrap(args.firstIndex(of: "--reasoning-effort"))
+            XCTAssertEqual(args[index + 1], "medium", model)
+            XCTAssertEqual(GrokACPClient.wireReasoningEffort(.medium, modelId: model), "medium")
+        }
+    }
+
+    func test_museSparkWiresXhigh() throws {
+        let args = GrokRunner.buildArgs(req(model: "muse-spark-1.3-contributor", effort: .xhigh))
+        let index = try XCTUnwrap(args.firstIndex(of: "--reasoning-effort"))
+        XCTAssertEqual(args[index + 1], "xhigh")
+        XCTAssertNil(
+            GrokRunner.buildArgs(req(model: "qwen38-omlx", effort: .high))
+                .firstIndex(of: "--reasoning-effort")
+        )
     }
 
     func test_unknownCustomModelDoesNotInventReasoningContract() {
@@ -208,10 +232,14 @@ final class GrokRunnerArgsTests: XCTestCase {
         XCTAssertEqual(fourFive.supportedReasoningEfforts, [.low, .medium, .high],
                        "Grok 4.5 menu is low/medium/high only (no Extra High / xhigh in model menu)")
 
-        let composer = try! XCTUnwrap(models.first { $0.id == "grok-composer-2.5-fast" })
-        XCTAssertFalse(composer.supportsReasoning,
-                       "Composer 2.5 Fast must hide the Reasoning effort picker")
-        XCTAssertTrue(composer.supportedReasoningEfforts.isEmpty)
+        XCTAssertNil(models.first { $0.id == "grok-composer-2.5-fast" },
+                     "live grok 1.0.30 no longer lists composer-fast")
+        let glm = try! XCTUnwrap(models.first { $0.id == "glm-5.3" })
+        XCTAssertEqual(glm.supportedReasoningEfforts, [.low, .medium, .high, .xhigh, .max])
+        let muse = try! XCTUnwrap(models.first { $0.id == "muse-spark-1.3-contributor" })
+        XCTAssertEqual(muse.supportedReasoningEfforts, [.low, .medium, .high, .xhigh])
+        let qwen = try! XCTUnwrap(models.first { $0.id == "qwen38-omlx" })
+        XCTAssertTrue(qwen.supportedReasoningEfforts.isEmpty)
 
         let accountDefault = try! XCTUnwrap(models.first { $0.id == "" })
         XCTAssertEqual(accountDefault.supportedReasoningEfforts, [.low, .medium, .high, .xhigh])

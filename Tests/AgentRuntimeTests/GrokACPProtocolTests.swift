@@ -264,6 +264,25 @@ final class GrokACPProtocolTests: XCTestCase {
             .setModel(modelId: model, reasoningEffort: .max)
         )
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.max, modelId: model), "max")
+        XCTAssertEqual(
+            GrokACPClient.modelEffortBind(
+                requestModel: model, sessionModel: model,
+                requestEffort: .medium, sessionEffort: .max,
+                prefersConfigOptionEffort: true
+            ),
+            .setConfigOption(configId: "reasoning_effort", value: "medium", effort: .medium)
+        )
+        XCTAssertEqual(
+            GrokACPClient.modelEffortBind(
+                requestModel: "muse-spark-1.3-contributor",
+                sessionModel: "muse-spark-1.3-contributor",
+                requestEffort: .xhigh,
+                sessionEffort: .low,
+                prefersConfigOptionEffort: true,
+                advertisedEfforts: [.low, .medium, .high, .xhigh]
+            ),
+            .setConfigOption(configId: "reasoning_effort", value: "xhigh", effort: .xhigh)
+        )
     }
 
     func test_regularACPLaunchEmptyModelOmitsModelFlagAndMatchesEffortSemantics() throws {

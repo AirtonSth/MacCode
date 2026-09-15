@@ -91,12 +91,20 @@ public enum GrokReasoningPolicy {
     /// (no `minimal`). Prefer discovered `supportedReasoningEfforts` when present.
     public static let grok46Efforts: [AgentReasoningEffort] = [.low, .medium, .high, .xhigh]
     public static let grok45Efforts: [AgentReasoningEffort] = [.low, .medium, .high]
+    /// Live grok 1.0.30 GLM catalog aliases `medium→high` and `xhigh→max`.
+    /// Keep alias ids selectable so medium is not clamped to max.
+    public static let glm53Efforts: [AgentReasoningEffort] = [.low, .medium, .high, .xhigh, .max]
+    /// Live grok 1.0.30 muse-spark accepts low/medium/high/xhigh (rejects max)
+    /// even when `_meta.reasoningEfforts` is omitted.
+    public static let museSparkEfforts: [AgentReasoningEffort] = [.low, .medium, .high, .xhigh]
 
     public static func supportedEfforts(for model: String) -> [AgentReasoningEffort] {
         let id = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if id.isEmpty || id.hasPrefix("grok-4.6") { return grok46Efforts }
         if id.hasPrefix("grok-4.5") { return grok45Efforts }
-        if id == "glm-5.3-flash" { return [.low, .high, .max] }
+        if id == "glm-5.3" || id.hasPrefix("glm-5.3-") { return glm53Efforts }
+        if id.hasPrefix("muse-spark") { return museSparkEfforts }
+        if id.hasPrefix("qwen38") { return [] }
         if id.hasPrefix("grok-composer") { return [] }
         // A custom/future model has no observable reasoning contract. Fail
         // closed instead of guessing that it inherits a known model's limits.

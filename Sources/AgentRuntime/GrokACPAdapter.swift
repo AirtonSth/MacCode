@@ -142,6 +142,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         var reasoningEffort: AgentReasoningEffort?
         /// True when open advertised a selectable `reasoning_effort` config option.
         let advertisesReasoningEffortConfig: Bool
+        /// Thought-level ids from the open-result config option (and live model catalog).
+        let advertisedEfforts: [AgentReasoningEffort]
         let availableModeIDs: Set<String>
         let planModeID: String?
         var mode: String?
@@ -178,6 +180,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             model: String,
             reasoningEffort: AgentReasoningEffort? = nil,
             advertisesReasoningEffortConfig: Bool = false,
+            advertisedEfforts: [AgentReasoningEffort] = [],
             availableModeIDs: Set<String>,
             planModeID: String?,
             mode: String?,
@@ -193,6 +196,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             self.model = model
             self.reasoningEffort = reasoningEffort
             self.advertisesReasoningEffortConfig = advertisesReasoningEffortConfig
+            self.advertisedEfforts = advertisedEfforts
             self.availableModeIDs = availableModeIDs
             self.planModeID = planModeID
             self.mode = mode
@@ -797,6 +801,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 currentModelId: opened.currentModelId,
                 currentEffortRaw: opened.currentReasoningEffortRaw
             )
+            let advertisedEfforts = opened.advertisedReasoningEffortIds.compactMap(
+                AgentReasoningEffort.init(rawValue:)
+            )
             let session = Session(
                 threadId: request.threadId,
                 providerThreadId: opened.sessionId,
@@ -806,6 +813,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 model: opened.currentModelId ?? request.model,
                 reasoningEffort: seededEffort,
                 advertisesReasoningEffortConfig: opened.advertisesReasoningEffortConfig,
+                advertisedEfforts: advertisedEfforts,
                 availableModeIDs: availableModeIDs,
                 planModeID: planModeID,
                 mode: opened.currentModeId,
@@ -922,7 +930,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 sessionModel: session.model,
                 requestEffort: request.reasoningEffort,
                 sessionEffort: session.reasoningEffort,
-                prefersConfigOptionEffort: session.advertisesReasoningEffortConfig
+                prefersConfigOptionEffort: session.advertisesReasoningEffortConfig,
+                advertisedEfforts: session.advertisedEfforts
             ) {
             case .none:
                 break
