@@ -89,4 +89,85 @@ final class CheckpointSnapshotDecisionTests: XCTestCase {
         XCTAssertEqual(db, .skipMarker(hash: hex(b)))
         XCTAssertNotEqual(da, db, "different content must produce different skip markers")
     }
+
+    func test_checkpointSnapshotByteCap_isOneMebibyte() {
+        XCTAssertEqual(
+            AgentRunCoordinator.checkpointSnapshotByteCap, 1 << 20,
+            "checkpoint snapshots stay at 1 MiB; raising it reintroduces large Data rows"
+        )
+    }
+
+    // CKPT-READ: FileHandle.read(upToCount: cap+1) so a 20 MiB file never
+    // becomes full-file Data. The skip marker hashes the prefix, not the rest.
+    func test_readCheckpointSnapshotPrefix_oversizedFile_readsCapPlusOneAndHashesPrefix() throws {
+        let cap = 32
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-ckpt-prefix-\(UUID().uuidString).txt")
+        let payload = Data(repeating: 0x41, count: 256)
+        try payload.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let prefix = try XCTUnwrap(
+            AgentRunCoordinator.readCheckpointSnapshotPrefix(from: url, cap: cap)
+        )
+        XCTAssertEqual(
+            prefix.count, cap + 1,
+            "must stop at cap+1 so the rest of the file never becomes Data"
+        )
+        XCTAssertEqual(prefix, payload.prefix(cap + 1))
+
+        let decision = AgentRunCoordinator.checkpointSnapshotDecision(
+            byteCount: prefix.count,
+            isBinary: AgentRunCoordinator.dataLooksBinary(prefix),
+            cap: cap,
+            hash: { AgentRunCoordinator.sha256Hex(prefix) }
+        )
+        XCTAssertEqual(decision, .skipMarker(hash: hex(prefix)))
+        XCTAssertNotEqual(
+            hex(prefix), hex(payload),
+            "skip hash must be the FileHandle prefix, not SHA-256 of the full file"
+        )
+    }
+
+    func test_readCheckpointSnapshotPrefix_atCap_returnsWholeFileForSnapshot() throws {
+        let cap = 48
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-ckpt-atcap-\(UUID().uuidString).txt")
+        let payload = Data(repeating: 0x42, count: cap)
+        try payload.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let prefix = try XCTUnwrap(
+            AgentRunCoordinator.readCheckpointSnapshotPrefix(from: url, cap: cap)
+        )
+        XCTAssertEqual(prefix, payload, "a file at the cap must still snapshot in full")
+        let decision = AgentRunCoordinator.checkpointSnapshotDecision(
+            byteCount: prefix.count,
+            isBinary: false,
+            cap: cap,
+            hash: { XCTFail("hash must not run when snapshotting"); return "" }
+        )
+        XCTAssertEqual(decision, .snapshot)
+    }
+
+    func test_captureFileSnapshots_usesPrefixReadNotWholeFileData() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/AgentRuntime/AgentRunCoordinator.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        let marker = try XCTUnwrap(source.range(of: "private func captureFileSnapshots"))
+        let rest = source[marker.lowerBound...]
+        let end = rest.range(of: "\n    enum CheckpointSnapshotDecision")?.lowerBound ?? rest.endIndex
+        let chunk = String(source[marker.lowerBound..<end])
+        XCTAssertFalse(
+            chunk.contains("Data(contentsOf: URL") || chunk.contains("Data(contentsOf: url"),
+            "captureFileSnapshots must not load the whole file into Data"
+        )
+        XCTAssertTrue(
+            chunk.contains("readCheckpointSnapshotPrefix"),
+            "captureFileSnapshots must FileHandle-prefix at cap+1"
+        )
+    }
 }

@@ -734,7 +734,7 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
 
     // MARK: - exportThreadMarkdown
 
-    func test_exportThreadMarkdown_includesAllRoles() throws {
+    func test_exportThreadMarkdown_includesAllRoles() async throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "Export me")
         let tid = try XCTUnwrap(vm.selectedThreadId)
@@ -742,7 +742,8 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         try vm.messageRepo.append(AgentMessage(threadId: tid, role: .assistant, content: "assistant line"))
         try vm.messageRepo.append(AgentMessage(threadId: tid, role: .system, content: "system line"))
 
-        let result = try XCTUnwrap(vm.exportThreadMarkdown(tid))
+        let exported = await vm.exportThreadMarkdown(tid)
+        let result = try XCTUnwrap(exported)
 
         XCTAssertTrue(result.contents.contains("# Export me"),
                       "export must include the thread title as the top-level heading")
@@ -760,20 +761,38 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
                       "exported file must use a .md extension")
     }
 
-    func test_exportThreadMarkdown_sanitizesFileNameSlashes() throws {
+    func test_exportThreadMarkdown_sanitizesFileNameSlashes() async throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "a/b:c")
         let tid = try XCTUnwrap(vm.selectedThreadId)
-        let result = try XCTUnwrap(vm.exportThreadMarkdown(tid))
+        let exported = await vm.exportThreadMarkdown(tid)
+        let result = try XCTUnwrap(exported)
         XCTAssertFalse(result.fileName.contains("/"),
                        "exported file name must strip path-separator characters to prevent accidental directory traversal")
     }
 
-    func test_exportThreadMarkdown_unknownIdReturnsNil() throws {
+    func test_exportThreadMarkdown_unknownIdReturnsNil() async throws {
         let (vm, _) = try makeVM()
-        let result = vm.exportThreadMarkdown(AgentThreadID())
+        let result = await vm.exportThreadMarkdown(AgentThreadID())
         XCTAssertNil(result,
                      "exportThreadMarkdown must return nil for an unknown thread id instead of crashing or returning garbage")
+    }
+
+    func test_exportThreadMarkdown_preservesFullBodyOffMain() async throws {
+        // WHY: export hops listRecent+concat off MainActor, but the durable
+        // retained bodies must stay complete (review: no 128 KiB export loss).
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "Fat export")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        let huge = String(repeating: "x", count: AgentAppViewModel.fullLoadBodyBudgetBytes + 2_048)
+        try vm.messageRepo.append(AgentMessage(threadId: tid, role: .assistant, content: huge))
+
+        let exported = await vm.exportThreadMarkdown(tid)
+        let result = try XCTUnwrap(exported)
+        XCTAssertTrue(result.contents.contains(huge),
+                      "export must keep the full retained body after the off-main hop")
+        XCTAssertFalse(result.contents.contains("truncated in export"),
+                       "export must not inject a display-budget truncation marker")
     }
 
     // MARK: - userMessageBubbleWidthCap

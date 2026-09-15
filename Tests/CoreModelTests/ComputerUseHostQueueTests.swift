@@ -123,6 +123,31 @@ final class ComputerUseHostQueueTests: XCTestCase {
         XCTAssertEqual(order.value, ["first", "second", "third"])
     }
 
+    func test_waitPollInterval_isFiftyMilliseconds() throws {
+        XCTAssertEqual(
+            ComputerUseHostQueue.waitPollIntervalNanoseconds, 50_000_000,
+            "CU-10MS: wait poll is 50 ms so ticket-directory scans drop ~80% vs 10 ms"
+        )
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/CoreModel/ComputerUseHostQueue.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        let marker = try XCTUnwrap(source.range(of: "private func waitForTurn"))
+        let rest = source[marker.lowerBound...]
+        let end = rest.range(of: "\n    private func cleanupStaleTickets")?.lowerBound ?? rest.endIndex
+        let chunk = String(source[marker.lowerBound..<end])
+        XCTAssertTrue(
+            chunk.contains("Self.waitPollIntervalNanoseconds"),
+            "waitForTurn must sleep on the extracted interval so ticket order stays FIFO at 50 ms"
+        )
+        XCTAssertFalse(
+            chunk.contains("10_000_000"),
+            "the 10 ms poll must not remain in waitForTurn"
+        )
+    }
+
     func test_realSubprocessesPreserveSameTargetTicketArrivalOrder() throws {
         // WHY: this compiles only the shipped queue with a tiny temporary
         // helper and proves FIFO across independent OS processes, where an

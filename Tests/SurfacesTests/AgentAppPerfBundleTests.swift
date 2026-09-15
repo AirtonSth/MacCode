@@ -2669,6 +2669,23 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
     }
 
+    func test_botPeerReconciliationInterval_defaultsToFiveSeconds() throws {
+        // WHY: waiting peer markup used to poll SQLite every 1s. Default is 5s;
+        // tests keep the writable override (this suite uses 60s to freeze the loop).
+        let (vm, _) = try makeVM()
+        XCTAssertEqual(
+            vm.botPeerReconciliationIntervalNanoseconds,
+            5_000_000_000,
+            "bot-peer reconcile default must be 5s, not 1s"
+        )
+        vm.botPeerReconciliationIntervalNanoseconds = 60_000_000_000
+        XCTAssertEqual(
+            vm.botPeerReconciliationIntervalNanoseconds,
+            60_000_000_000,
+            "tests must still be able to override the peer interval"
+        )
+    }
+
     /// WHY: peer reconcile used to full-get 26 columns + routing JSON every ~1s
     /// while a peer was waiting, just to copy durable status.
     func test_peerReconcile_usesStatusProbeWithoutDurableGet() async throws {

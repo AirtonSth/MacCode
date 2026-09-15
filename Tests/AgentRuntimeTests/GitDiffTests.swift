@@ -672,4 +672,44 @@ final class GitDiffTests: XCTestCase {
         XCTAssertEqual(upstream.trimmingCharacters(in: .whitespacesAndNewlines), "upstream/pr/8",
                        "the isolated PR branch should track the remote PR ref it fetched from, preserving fork/upstream provenance")
     }
+
+    // DIFF-UNCAPPED: FileHandle prefix must never materialize bytes past maxBytes.
+    func test_readFilePrefix_doesNotMaterializeBytesPastMax() throws {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-git-prefix-\(UUID().uuidString).bin")
+        let payload = Data(repeating: 0x41, count: 256)
+        try payload.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let prefix = try XCTUnwrap(GitDiff.readFilePrefix(at: url, maxBytes: 64))
+        XCTAssertEqual(prefix.count, 64, "prefix read must stop at maxBytes")
+        XCTAssertEqual(prefix, payload.prefix(64))
+    }
+
+    func test_readFilePrefix_shortFile_returnsEntireContents() throws {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-git-prefix-short-\(UUID().uuidString).txt")
+        let payload = Data("hello\n".utf8)
+        try payload.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let prefix = try XCTUnwrap(GitDiff.readFilePrefix(at: url, maxBytes: 512 * 1024))
+        XCTAssertEqual(prefix, payload)
+    }
+
+    func test_readFilePrefix_missingFile_returnsNil() {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-git-prefix-missing-\(UUID().uuidString).bin")
+        XCTAssertNil(
+            GitDiff.readFilePrefix(at: url, maxBytes: 64),
+            "open/read failure must return nil, not empty Data"
+        )
+    }
+
+    func test_untrackedDiffPreviewByteCap_matchesFilePreview512KiB() {
+        XCTAssertEqual(
+            GitDiff.untrackedDiffPreviewByteCap, 512 * 1024,
+            "untracked synthesis must share the 512 KiB FilePreviewSurface cap"
+        )
+    }
 }

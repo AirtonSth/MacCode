@@ -8789,13 +8789,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         files.map { file in
             guard file.kind != GitFileStatus.deleted.rawValue,
                   let url = safeWorkspaceURL(cwd: cwd, relativePath: file.path),
-                  let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
+                  let data = Self.readCheckpointSnapshotPrefix(from: url) else {
                 return AgentTurnCheckpointFileSnapshot(path: file.path, kind: file.kind, contentsBase64: nil)
             }
             // P2: cap transient allocation + DB row size. Large or binary files
             // are not base64'd into the checkpoint; we store a nil-content marker
             // (same restore path as a deleted file -> restore from HEAD) and log
-            // a content hash so the skip is diagnosable.
+            // a content hash so the skip is diagnosable. Oversized files hash
+            // only the FileHandle prefix (CKPT-READ).
             let decision = Self.checkpointSnapshotDecision(
                 byteCount: data.count,
                 isBinary: Self.dataLooksBinary(data),
@@ -8823,6 +8824,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     /// 1 MiB. Files at or under this (and not binary) are snapshotted inline.
     nonisolated static let checkpointSnapshotByteCap = 1 << 20
+
+    /// FileHandle prefix of `cap + 1` bytes. The extra byte distinguishes
+    /// at-cap (snapshot) from over-cap (skip) without a full-file `Data`.
+    nonisolated static func readCheckpointSnapshotPrefix(
+        from url: URL,
+        cap: Int = checkpointSnapshotByteCap
+    ) -> Data? {
+        GitDiff.readFilePrefix(at: url, maxBytes: cap + 1)
+    }
 
     nonisolated static func checkpointSnapshotDecision(
         byteCount: Int,

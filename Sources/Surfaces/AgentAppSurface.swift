@@ -693,7 +693,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var checkpointRevertUndoExpiryTask: Task<Void, Never>?
     private var messageHistoryLoadTask: Task<Void, Never>?
     private var botPeerReconciliationTask: Task<Void, Never>?
-    var botPeerReconciliationIntervalNanoseconds: UInt64 = 1_000_000_000
+    /// Waiting peer markup polls at 5s. Tests override this (keep the field writable).
+    var botPeerReconciliationIntervalNanoseconds: UInt64 = 5_000_000_000
     /// PERF: tracks thread ids whose placeholder titles have already been repaired
     /// so reloadThreads never issues a full messageRepo.list for the same thread twice.
     private var repairedThreadIds: Set<AgentThreadID> = []
@@ -7162,39 +7163,30 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     /// IMP-MAC_AGENT-013: serialize a full thread (read from the durable store,
     /// not the paged in-memory window) to shareable markdown.
+    ///
+    /// SQLite `listRecent` and body concat hop off MainActor (same pattern as
+    /// `loadMessagePagePayloadOffMain`). Bodies stay complete; durable
+    /// `maxMessagesPerThread` is unchanged.
     public func exportThreadMarkdown(
         _ id: AgentThreadID,
         includeTimeline: Bool = false
-    ) -> (fileName: String, contents: String)? {
+    ) async -> (fileName: String, contents: String)? {
         guard let thread = threads.first(where: { $0.id == id }) ?? (try? threadRepo.get(id: id)) else { return nil }
-        // Export only the retained window (newest N), not unbounded history.
-        let rows = (try? messageRepo.listRecent(
+        let repository = messageRepo
+        var contents = await Self.exportThreadMessageMarkdownOffMain(
+            repository: repository,
             threadId: id,
-            limit: AgentMessageRepository.maxMessagesPerThread
-        )) ?? []
-        var lines = ["# \(thread.title)", ""]
-        for message in rows {
-            let heading: String
-            switch message.role {
-            case .user: heading = "## User"
-            case .assistant: heading = "## Assistant"
-            case .system: heading = "## System"
-            }
-            lines.append(heading)
-            lines.append("")
-            lines.append(message.content)
-            lines.append("")
-        }
+            title: thread.title
+        )
         if includeTimeline {
             let tlLines = ThreadMarkdownFormatter.timelineMarkdownLines(
                 turns: timeline.turns,
                 approvals: timeline.pendingRequests
             )
             if !tlLines.isEmpty {
-                lines.append("## Timeline")
-                lines.append("")
-                lines.append(contentsOf: tlLines)
-                lines.append("")
+                contents += "## Timeline\n\n"
+                contents += tlLines.joined(separator: "\n")
+                contents += "\n"
             }
         }
         // PERF: exportThreadMarkdown rebuilt the path-unsafe CharacterSet on
@@ -7204,7 +7196,37 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             .joined(separator: "-")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let fileName = (safeName.isEmpty ? "agent-thread" : safeName) + ".md"
-        return (fileName, lines.joined(separator: "\n"))
+        return (fileName, contents)
+    }
+
+    /// Newest retained window, complete bodies. Runs off MainActor so export
+    /// does not concatenate SQLite rows on the UI actor.
+    nonisolated static func exportThreadMessageMarkdownOffMain(
+        repository: AgentMessageRepository,
+        threadId: AgentThreadID,
+        title: String
+    ) async -> String {
+        await Task.detached(priority: .userInitiated) {
+            let rows = (try? repository.listRecent(
+                threadId: threadId,
+                limit: AgentMessageRepository.maxMessagesPerThread
+            )) ?? []
+            var lines: [String] = ["# \(title)", ""]
+            lines.reserveCapacity(rows.count * 4 + 2)
+            for message in rows {
+                let heading: String
+                switch message.role {
+                case .user: heading = "## User"
+                case .assistant: heading = "## Assistant"
+                case .system: heading = "## System"
+                }
+                lines.append(heading)
+                lines.append("")
+                lines.append(message.content)
+                lines.append("")
+            }
+            return lines.joined(separator: "\n")
+        }.value
     }
 
     private static let exportThreadFilenameSeparators = CharacterSet(charactersIn: "/\\:?%*|\"<>")
@@ -8854,7 +8876,37 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return lastPersistedId == nil
     }
 
-    private func persistFinalAssistantIfMissing(_ text: String, threadId: AgentThreadID) {
+    enum PersistFinalAssistantOffMainResult: Sendable {
+        case alreadyPresent
+        case appended(AgentMessageID)
+    }
+
+    /// `listRecent` + `append` for a finished turn. Same detached hop as
+    /// `loadMessagePagePayloadOffMain`; caller applies session memos on MainActor.
+    nonisolated static func persistFinalAssistantPayloadOffMain(
+        repository: AgentMessageRepository,
+        threadId: AgentThreadID,
+        text: String,
+        shouldReload: Bool
+    ) async -> PersistFinalAssistantOffMainResult {
+        await Task.detached(priority: .userInitiated) {
+            if shouldReload {
+                // Only scan the retained window for duplicate finals.
+                let existing = (try? repository.listRecent(
+                    threadId: threadId,
+                    limit: AgentMessageRepository.maxMessagesPerThread
+                )) ?? []
+                if existing.contains(where: { $0.role == .assistant && $0.content == text }) {
+                    return PersistFinalAssistantOffMainResult.alreadyPresent
+                }
+            }
+            let msg = AgentMessage(threadId: threadId, role: .assistant, content: text)
+            try? repository.append(msg)
+            return .appended(msg.id)
+        }.value
+    }
+
+    private func persistFinalAssistantIfMissing(_ text: String, threadId: AgentThreadID) async {
         let text = AssistantTimelineState.cappedText(text)
         // Fast path: same text already persisted this session — nothing to do.
         if lastPersistedAssistantContentByThread[threadId] == text { return }
@@ -8862,25 +8914,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // state is known — skip O(history) list and append directly.
         // Reload only on first completion in a session (id == nil) to guard
         // against a prior session/path having already written this exact text.
-        if Self.shouldReloadForFinal(
+        let shouldReload = Self.shouldReloadForFinal(
             lastPersistedId: lastPersistedFinalIdByThread[threadId],
             lastPersistedKey: lastPersistedAssistantContentByThread[threadId],
             incomingKey: text
-        ) {
-            // Only scan the retained window for duplicate finals.
-            let existing = (try? messageRepo.listRecent(
-                threadId: threadId,
-                limit: AgentMessageRepository.maxMessagesPerThread
-            )) ?? []
-            guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else {
-                lastPersistedAssistantContentByThread[threadId] = text
-                return
-            }
-        }
-        let msg = AgentMessage(threadId: threadId, role: .assistant, content: text)
-        try? messageRepo.append(msg)
+        )
+        // Claim before the SQLite hop so a concurrent same-text finish cannot
+        // start a second list+append. Matches the original MainActor exclusion.
         lastPersistedAssistantContentByThread[threadId] = text
-        lastPersistedFinalIdByThread[threadId] = msg.id
+        let repository = messageRepo
+        let outcome = await Self.persistFinalAssistantPayloadOffMain(
+            repository: repository,
+            threadId: threadId,
+            text: text,
+            shouldReload: shouldReload
+        )
+        if case .appended(let id) = outcome {
+            lastPersistedFinalIdByThread[threadId] = id
+        }
     }
 
     // MARK: AgentRunObserver
@@ -9523,7 +9574,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 // The coordinator is normally the persistence owner, but
                 // live provider completions can arrive after stream drain on
                 // a background handler. Keep the restart contract here too.
-                self.persistFinalAssistantIfMissing(msg, threadId: finishedTid)
+                await self.persistFinalAssistantIfMissing(msg, threadId: finishedTid)
                 if finishedTid == self.selectedThreadId {
                     self.loadAllMessages(finishedTid)
                     self.suppressPersistedFinalDuplicatedByTimeline()
@@ -11054,10 +11105,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         default:
             return nil
         }
-        let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty,
-              let data = body.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        guard let obj = toolInputObject(for: item) else { return nil }
         for key in ["file_path", "path", "notebook_path"] {
             if let value = (obj[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
                 return .file(value)
@@ -11091,9 +11139,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
            summary.compare("Skill", options: .caseInsensitive) == .orderedSame {
             return true
         }
-        let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let data = body.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let obj = toolInputObject(for: item),
               let skill = (obj["skill"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !skill.isEmpty else {
             return false
@@ -15192,13 +15238,15 @@ public struct AgentAppView: View {
 
     // IMP-MAC_AGENT-013: write a thread's markdown export via a save panel.
     private func exportThread(_ thread: AgentThread) {
-        guard let export = vm.exportThreadMarkdown(thread.id) else { return }
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
-        panel.nameFieldStringValue = export.fileName
-        panel.canCreateDirectories = true
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        try? export.contents.data(using: .utf8)?.write(to: url, options: .atomic)
+        Task { @MainActor in
+            guard let export = await vm.exportThreadMarkdown(thread.id) else { return }
+            let panel = NSSavePanel()
+            panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+            panel.nameFieldStringValue = export.fileName
+            panel.canCreateDirectories = true
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try? export.contents.data(using: .utf8)?.write(to: url, options: .atomic)
+        }
     }
 
     @ViewBuilder

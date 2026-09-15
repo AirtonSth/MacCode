@@ -379,6 +379,34 @@ public enum GitDiff {
         return out
     }
 
+    /// Matches `FilePreviewSurface.maxTextPreviewBytes` (512 KiB). Untracked
+    /// synthesis must not load more than the preview surface would.
+    public static let untrackedDiffPreviewByteCap = 512 * 1024
+
+    /// FileHandle prefix read. Never materializes bytes past `maxBytes`.
+    ///
+    /// WHY: untracked-diff synthesis and checkpoint snapshots used
+    /// `Data(contentsOf:)` on the whole file, so a 10–20 MiB blob became a
+    /// peak Data allocation even when the caller only needed a bounded prefix.
+    public static func readFilePrefix(at url: URL, maxBytes: Int) -> Data? {
+        let limit = max(0, maxBytes)
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var out = Data()
+        if limit == 0 { return out }
+        out.reserveCapacity(min(limit, 64 * 1024))
+        do {
+            while out.count < limit {
+                let chunk = try handle.read(upToCount: limit - out.count) ?? Data()
+                if chunk.isEmpty { break }
+                out.append(chunk)
+            }
+            return out
+        } catch {
+            return nil
+        }
+    }
+
     // MARK: branch / commit / history
 
     public static func branches(in cwd: String) -> GitBranches {
