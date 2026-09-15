@@ -86,9 +86,10 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
 /// runtime and nested CLI middleware. Keeping normalization in CoreModel avoids
 /// the two launch paths silently emitting different, unsupported wire values.
 public enum GrokReasoningPolicy {
-    /// Matches grok-build `SELECTABLE_REASONING_EFFORTS` / session `reasoning_effort`
-    /// config options for Grok 4.6 (includes agent-advertised `minimal`).
-    public static let grok46Efforts: [AgentReasoningEffort] = [.minimal, .low, .medium, .high, .xhigh]
+    /// Static fallback for Grok 4.6 when ACP discovery is unavailable.
+    /// Live grok 1.0.25 advertises `low|medium|high|xhigh` on model `_meta`
+    /// (no `minimal`). Prefer discovered `supportedReasoningEfforts` when present.
+    public static let grok46Efforts: [AgentReasoningEffort] = [.low, .medium, .high, .xhigh]
     public static let grok45Efforts: [AgentReasoningEffort] = [.low, .medium, .high]
 
     public static func supportedEfforts(for model: String) -> [AgentReasoningEffort] {
