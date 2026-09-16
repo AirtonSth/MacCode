@@ -500,7 +500,11 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
 
         do {
-            let turn = try await client.startTurn(providerThreadId: providerThreadId, for: turnRequest)
+            // turn/start returns the turn object immediately; turn/started is
+            // the notification that the turn is actually running. Activate and
+            // emit .turnStarted only from that notification so turn/steer cannot
+            // race a turn that has not started.
+            _ = try await client.startTurn(providerThreadId: providerThreadId, for: turnRequest)
             if shouldSeed {
                 acknowledgeContextSeed(turnRequest, lifecycle: .delivered)
             }
@@ -511,10 +515,6 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                     discloseResumeFallback: resumeFellBackToStart,
                     onEvent: onEvent
                 )
-            }
-            if let turnId = Self.turnId(from: turn), !turnId.isEmpty {
-                setActiveTurn(threadId: request.threadId, turnId: turnId)
-                onEvent(.event(.turnStarted(turnId: turnId)))
             }
         } catch {
             if shouldSeed {
@@ -3888,7 +3888,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case "reasoning", "reasoning_text", "summary_text":
             return joinedStrings(item["content"]) ?? stringBodyFallback(for: item)
         case "commandExecution", "local_shell_call":
-            return string(item, "aggregatedOutput") ?? string(item, "command") ?? stringBodyFallback(for: item)
+            // aggregatedOutput is stdout and may be "" / omitted. Command stays
+            // in summary; never copy it into the output body.
+            return string(item, "aggregatedOutput") ?? stringBodyFallback(for: item)
         case "fileChange":
             // Prefer human-readable patch/diff over opaque JSON so the Agent
             // App can paint a Cursor-style Edit card in the timeline.

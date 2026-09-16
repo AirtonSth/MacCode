@@ -270,6 +270,17 @@ public final class CodexParser {
     }
 
     private static func itemText(from item: [String: Any]) -> String {
+        let kind = item["type"] as? String ?? ""
+        if kind == "command_execution" {
+            // aggregated_output is stdout and may be "" / omitted. Never treat
+            // the command line as output.
+            if let aggregated = item["aggregated_output"] as? String {
+                return aggregated
+            }
+            if let text = item["text"] as? String, !text.isEmpty { return text }
+            if let output = item["output"] as? String, !output.isEmpty { return output }
+            return ""
+        }
         // Prefer command_execution.aggregated_output (openai/codex ThreadItem).
         if let aggregated = item["aggregated_output"] as? String, !aggregated.isEmpty {
             return aggregated

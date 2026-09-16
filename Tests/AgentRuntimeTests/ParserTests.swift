@@ -95,6 +95,10 @@ final class CodexParserTests: XCTestCase {
         let declined = state.turns[0].items.first { $0.id == "item_2" }
         XCTAssertEqual(declined?.state, .cancelled,
                        "declined command_execution must map to cancelled like app-server")
+        XCTAssertEqual(declined?.output ?? "", "",
+                       "empty aggregated_output is empty stdout, not the command line")
+        XCTAssertEqual(declined?.summary, "rm -rf /",
+                       "the command line stays in summary")
 
         XCTAssertEqual(state.turns[0].finalAssistantMessage, "Listed the repo.")
         XCTAssertEqual(state.tokenUsage?.inputTokens, 24763)
@@ -103,6 +107,24 @@ final class CodexParserTests: XCTestCase {
         XCTAssertEqual(state.tokenUsage?.cacheCreationInputTokens, 12,
                        "cache_write_input_tokens maps to cache creation bucket")
         XCTAssertEqual(state.tokenUsage?.outputTokens, 122)
+    }
+
+    func test_realExecSchema_omittedAggregatedOutputIsNotTheCommand() {
+        // WHY: openai/codex may omit aggregated_output while a command is in
+        // progress or printed nothing. Falling through to `command` paints the
+        // argv as fake stdout.
+        let p = CodexParser()
+        var state = AssistantTimelineState()
+        for l in [
+            #"{"type":"thread.started","thread_id":"t-empty"}"#,
+            #"{"type":"turn.started"}"#,
+            #"{"type":"item.completed","item":{"id":"item_empty","type":"command_execution","command":"true","status":"completed"}}"#
+        ] { for ev in p.parseLine(l) { state.apply(ev) } }
+        let item = state.turns[0].items.first { $0.id == "item_empty" }
+        XCTAssertEqual(item?.type, .commandExecution)
+        XCTAssertEqual(item?.summary, "true")
+        XCTAssertEqual(item?.output ?? "", "",
+                       "omitted aggregated_output must not display the command string")
     }
 
     func test_realExecSchema_itemUpdatedTodoList() {
