@@ -786,6 +786,181 @@ final class AgentChatUXPresentationTests: XCTestCase {
         XCTAssertTrue(extracted?.contains("a.ts") == true)
     }
 
+    func test_looksLikeDiff_detectsHeadersAndPlusMinusOnSubstrings() {
+        XCTAssertTrue(AgentFileEditDiffPresentation.looksLikeDiff("diff --git a/a.ts b/a.ts\n"))
+        XCTAssertTrue(AgentFileEditDiffPresentation.looksLikeDiff("@@ -1,2 +1,3 @@\n"))
+        XCTAssertTrue(AgentFileEditDiffPresentation.looksLikeDiff("*** Begin Patch\n*** Update File: a.ts\n"))
+        XCTAssertTrue(
+            AgentFileEditDiffPresentation.looksLikeDiff("+added\n-removed\n context\n"),
+            "plus/minus heuristic must still fire without allocating String per line"
+        )
+        XCTAssertFalse(
+            AgentFileEditDiffPresentation.looksLikeDiff("compiling module A\ncompiling module B\nDone.\n"),
+            "plain build logs are not diffs"
+        )
+        XCTAssertTrue(
+            AgentFileEditDiffPresentation.looksLikeDiff("\n\ndiff --git a/a.ts b/a.ts\n"),
+            "leading blank lines must not hide a real diff header"
+        )
+    }
+
+    func test_firstNonWhitespace_stopsAtPayload() {
+        XCTAssertEqual(AgentFileEditDiffPresentation.firstNonWhitespace(in: "  {\n"), "{")
+        XCTAssertEqual(AgentFileEditDiffPresentation.firstNonWhitespace(in: "\n\n["), "[")
+        XCTAssertEqual(AgentFileEditDiffPresentation.firstNonWhitespace(in: "plain"), "p")
+        XCTAssertNil(AgentFileEditDiffPresentation.firstNonWhitespace(in: "  \n\t"))
+    }
+
+    func test_extractDiffText_trimsPositiveDiffAndSkipsTrimOnPlainMiss() {
+        let padded = "\n\ndiff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-old\n+new\n"
+        let item = AssistantItem(
+            id: "diff-1",
+            turnId: "t1",
+            type: .fileChange,
+            state: .completed,
+            body: padded,
+            startedAtMs: 1
+        )
+        let extracted = AgentFileEditDiffPresentation.extractDiffText(from: item)
+        XCTAssertEqual(extracted?.hasPrefix("diff --git"), true, "positive hits still trim leading blanks")
+
+        let json = "  {\"file_path\":\"a.ts\",\"old_string\":\"x\",\"new_string\":\"y\"}  "
+        let jsonItem = AssistantItem(
+            id: "json-ws",
+            turnId: "t1",
+            type: .tool,
+            state: .completed,
+            summary: "Edit",
+            body: json,
+            startedAtMs: 1
+        )
+        let jsonExtracted = AgentFileEditDiffPresentation.extractDiffText(from: jsonItem)
+        XCTAssertNotNil(jsonExtracted, "leading-whitespace Edit JSON must still extract")
+        XCTAssertTrue(jsonExtracted?.contains("a.ts") == true)
+    }
+
+    func test_microbench_looksLikeDiff_substringBeatsStringCopy() {
+        let log = String(repeating: "plain build log line with no diff markers at all\n", count: 1_200)
+        XCTAssertGreaterThan(log.utf8.count, 40_000)
+        XCTAssertFalse(AgentFileEditDiffPresentation.looksLikeDiff(log))
+
+        let iterations = 400
+        let warmup = 2
+        let samplesN = 5
+
+        /// Frozen pre-r11: two passes, String(line) per scanned line.
+        func legacyLooksLikeDiff(_ text: String) -> Bool {
+            for line in text.lazy.split(separator: "\n", omittingEmptySubsequences: true).prefix(60) {
+                let s = String(line)
+                if s.hasPrefix("diff --git ") || s.hasPrefix("@@") || s.hasPrefix("--- ") || s.hasPrefix("+++ ") {
+                    return true
+                }
+                if s.hasPrefix("*** Begin Patch") || s.hasPrefix("*** Update File:") || s.hasPrefix("*** Add File:") {
+                    return true
+                }
+            }
+            var plus = 0, minus = 0
+            for lazyLine in text.lazy.split(separator: "\n", omittingEmptySubsequences: true).prefix(80) {
+                let line = String(lazyLine)
+                if line.hasPrefix("+") && !line.hasPrefix("++") { plus += 1 }
+                if line.hasPrefix("-") && !line.hasPrefix("--") { minus += 1 }
+            }
+            return plus + minus >= 2 && (plus > 0 || minus > 0)
+        }
+
+        func time(_ shape: (String) -> Bool) -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations { sink &+= shape(log) ? 1 : 0 }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertEqual(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        XCTAssertEqual(legacyLooksLikeDiff(log), AgentFileEditDiffPresentation.looksLikeDiff(log))
+
+        for _ in 0..<warmup { _ = time(legacyLooksLikeDiff); _ = time(AgentFileEditDiffPresentation.looksLikeDiff) }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samplesN {
+            before.append(time(legacyLooksLikeDiff))
+            after.append(time(AgentFileEditDiffPresentation.looksLikeDiff))
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog(
+            "[perf-proof] r11_looksLikeDiff legacy_ms=%@ substring_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+            String(beforeMed), String(afterMed), improvement,
+            String(describing: before), String(describing: after)
+        )
+        XCTAssertGreaterThan(
+            improvement, 15.0,
+            "substring looksLikeDiff must beat String(line) copies by ≥15% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+    }
+
+    func test_microbench_extractDiffText_plainMissSkipsFullTrimCopy() {
+        // Memory, not wall-clock: extractApplyPatchBlock still scans the blob
+        // with contains(), so end-to-end CPU is dominated by that pre-existing
+        // miss tax. The r11 change is skipping trimmingCharacters's 50 KB copy.
+        let log = String(repeating: "plain build log line with no diff markers at all\n", count: 1_200)
+        XCTAssertGreaterThan(log.utf8.count, 40_000)
+        let iterations = 800
+        let warmup = 2
+        let samplesN = 5
+
+        func time(_ work: () -> Int) -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            var sink = 0
+            for _ in 0..<iterations { sink &+= work() }
+            let end = DispatchTime.now().uptimeNanoseconds
+            XCTAssertGreaterThan(sink, 0)
+            return Double(end - start) / 1_000_000.0
+        }
+
+        for _ in 0..<warmup {
+            _ = time { log.trimmingCharacters(in: .whitespacesAndNewlines).utf8.count }
+            _ = time { AgentFileEditDiffPresentation.firstNonWhitespace(in: log) == nil ? 0 : log.utf8.count }
+        }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<samplesN {
+            before.append(time { log.trimmingCharacters(in: .whitespacesAndNewlines).utf8.count })
+            after.append(time {
+                AgentFileEditDiffPresentation.firstNonWhitespace(in: log) == nil ? 0 : log.utf8.count
+            })
+        }
+        let beforeMed = median(before)
+        let afterMed = median(after)
+        let improvement = (beforeMed - afterMed) / beforeMed * 100.0
+        NSLog(
+            "[perf-proof] r11_extractDiffTextTrimIsolated legacy_trim_ms=%@ firstNonWS_ms=%@ improvement_pct=%.2f before=%@ after=%@",
+            String(beforeMed), String(afterMed), improvement,
+            String(describing: before), String(describing: after)
+        )
+        XCTAssertGreaterThan(
+            improvement, 50.0,
+            "isolated skip-trim must beat trimmingCharacters by ≥50% (got \(improvement)%; before=\(beforeMed)ms after=\(afterMed)ms)"
+        )
+        let item = AssistantItem(
+            id: "bash-r11",
+            turnId: "t1",
+            type: .tool,
+            state: .streaming,
+            summary: "Bash",
+            body: "npm run build",
+            output: log,
+            startedAtMs: 1
+        )
+        XCTAssertNil(AgentFileEditDiffPresentation.extractDiffText(from: item))
+    }
+
+    private func median(_ values: [Double]) -> Double {
+        let s = values.sorted()
+        return s[s.count / 2]
+    }
+
     func test_appendFriendlyCompletedWorkBlocks_refreshesPayloadWhenIdsUnchanged() {
         // WHY: token deltas keep item ids; returning previous blocks froze body mid-stream.
         var first = AssistantItem(
