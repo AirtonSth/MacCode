@@ -101,11 +101,22 @@ public final class AgentTranscriptState: ObservableObject {
             if oldValue != messages {
                 contentGeneration &+= 1
                 messagesGeneration &+= 1
+                assistantCharsHot = Self.assistantUTF8Count(messages)
             }
             waitingBotPeerActivity = Self.hasWaitingBotPeerActivity(
                 in: messages,
                 threadId: selectedThreadIdForPeerFlag
             )
+        }
+    }
+    /// UTF-8 length of persisted assistant message bodies. Recomputed only when
+    /// `messagesGeneration` moves so Token Saver footer reloads can pass an Int
+    /// instead of capturing `[AgentMessage]`.
+    public private(set) var assistantCharsHot: Int = 0
+
+    nonisolated static func assistantUTF8Count(_ messages: [AgentMessage]) -> Int {
+        messages.reduce(0) { partial, message in
+            partial + (message.role == .assistant ? message.content.utf8.count : 0)
         }
     }
     /// AA-16: chrome busy must not walk `messages` on every tab poll.
@@ -752,6 +763,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var streamFlushNeeded = false
     /// Counts applied stream events since the last aggregate hot-text budget walk.
     private var streamAggregateBudgetOps = 0
+    /// Bumped when `enforceAggregateHotTextBudget` actually walks. Transcript
+    /// rematerialize uses this to take the full dictionary path after eviction
+    /// that does not change `transcriptSignature`.
+    private(set) var aggregateHotTextBudgetGeneration: UInt64 = 0
     /// Bumped on dispose / thread switch so stale detached applies drop their commit.
     private var streamApplyGeneration: UInt64 = 0
     /// True when the hot UI event queue refused at least one already-durable
@@ -1135,6 +1150,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             hiddenTimelineThreadId = selectedThreadId
             hiddenTimelineOpenGeneration = selectThreadOpenGeneration
             latestHiddenTimeline = timeline
+            timeline = AssistantTimelineState()
             lastHiddenTimelinePublishAt = nil
             hiddenTimelinePublishCountForTesting = 0
             return
@@ -2023,24 +2039,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let measuredLoader = tokenSaverMeasuredLoader
         let threadId = selectedThreadId
         let repo = tokenSaverSavingsRepo
-        // AA-12: snapshot message bodies and sum UTF-8 off-main. The Task
-        // already left MainActor for ledger reads; the reduce used to walk
-        // every assistant message on the click/idle path.
-        let messageSnapshot = messages
-        let turnCountSnapshot = timeline.turns.count
+        // AA-12: assistant UTF-8 is maintained on messages didSet. Capture the
+        // Int + turn count only — do not retain `[AgentMessage]` across the
+        // detached ledger load.
+        let assistantChars = transcriptState.assistantCharsHot
+        let userMessageCount = messages.reduce(0) { $0 + ($1.role == .user ? 1 : 0) }
+        let turnCountSnapshot = max(timeline.turns.count, userMessageCount)
         let usage = timeline.tokenUsage
         let cacheRead = usage?.cacheReadInputTokens ?? 0
         let providerRaw = usage.map { max(0, $0.inputTokens) + max(0, $0.outputTokens) } ?? 0
         let providerBilled = usage.map { $0.billedTotalTokenUnits } ?? 0
         let autoRouting = routingMode == .auto
         // PL-02: `Task { }` here inherits the MainActor, so the "off-main" reads
-        // below ran on main. Detach so eligibility/settings/ledger reads and the
-        // O(messages) reduce never touch the main thread.
+        // below ran on main. Detach so eligibility/settings/ledger reads never
+        // touch the main thread.
         tokenSaverFooterReloadTask = Task.detached(priority: .utility) { [weak self] in
-            let assistantChars = messageSnapshot
-                .filter { $0.role == .assistant }
-                .reduce(0) { $0 + $1.content.utf8.count }
-            let turnCount = max(turnCountSnapshot, messageSnapshot.filter { $0.role == .user }.count)
+            let turnCount = turnCountSnapshot
             let eligible = eligibleCheck?() == true
             let graphifyActive = graphifyCheck?() == true
             let graphifyCount = graphifySignalCountCheck?() ?? 0
@@ -5878,6 +5892,29 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// events written to shared SQLite keep painting without a local coordinator.
     private var scheduledLivePollTask: Task<Void, Never>?
     private var scheduledLiveStreamCount: Int = 0
+    private var scheduledLiveStreamCursor: AgentRunRepository.StreamEventCursor?
+    private(set) var scheduledLiveApplyCountForTesting = 0
+
+    /// Pure replay plan for LaunchAgent live poll. Idle equal counts skip;
+    /// prune, first apply, or overflow of the hot-replay cap full-replay;
+    /// in-cap growth applies only the suffix.
+    enum ScheduledLiveReplayPlan: Equatable, Sendable {
+        case skip
+        case suffix(offset: Int)
+        case fullReplay
+    }
+
+    nonisolated static func scheduledLiveReplayPlan(
+        previousCount: Int,
+        currentCount: Int,
+        cap: Int
+    ) -> ScheduledLiveReplayPlan {
+        if previousCount == currentCount { return .skip }
+        if previousCount == 0 || currentCount < previousCount || currentCount > cap {
+            return .fullReplay
+        }
+        return .suffix(offset: previousCount)
+    }
 
     /// Seed Working-for clock + run id from durable agent_runs and start live poll.
     private func bindScheduledOwnedRun(threadId: AgentThreadID) {
@@ -5906,8 +5943,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private func ensureScheduledLivePoll(for threadId: AgentThreadID) {
         guard scheduledLivePollTask == nil else { return }
-        // COUNT(*) only — do not decode hot-replay payloads just to seed the baseline.
+        // COUNT(*) + cursor only — do not decode hot-replay payloads just to seed.
         scheduledLiveStreamCount = coordinator.countStreamEvents(threadId: threadId)
+        scheduledLiveStreamCursor = coordinator.streamEventCursor(threadId: threadId)
         scheduledLivePollTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 // 2s is enough for LaunchAgent-owned progress; 1s doubled MainActor work.
@@ -5922,6 +5960,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         scheduledLivePollTask?.cancel()
         scheduledLivePollTask = nil
         scheduledLiveStreamCount = 0
+        scheduledLiveStreamCursor = nil
+        scheduledLiveApplyCountForTesting = 0
+    }
+
+    func tickScheduledLivePollForTesting() {
+        tickScheduledLivePoll()
     }
 
     private func tickScheduledLivePoll() {
@@ -5935,22 +5979,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             selectThread(id, markRead: false)
             return
         }
-        // Idle polls: cheap COUNT(*) first. Full latestStreamEvents decode only when count moves.
-        let count = coordinator.countStreamEvents(threadId: id)
-        if Self.shouldRebuildScheduledLiveTimeline(
-            previousCount: scheduledLiveStreamCount,
-            currentCount: count
-        ) {
-            scheduledLiveStreamCount = count
-            let events = coordinator.latestStreamEvents(threadId: id)
-            timeline = AssistantTimelineState()
-            for event in events {
-                timeline.apply(event)
-            }
-            timeline.enforceAggregateHotTextBudget()
-            rehydrateDurableActiveState(threadId: id)
-            scheduleTimelineUpdateTick()
-        }
         if let durable = try? coordinator.durableActiveRunChrome(threadId: id) {
             runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
                 current: runStartedAt,
@@ -5960,6 +5988,104 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             runThreads[durable.id] = id
             if status != .running { status = .running }
         }
+        // Idle polls: cheap COUNT(*) first. Cursor disagreement (window slide at
+        // equal COUNT) fail-closes to a full replay. In-cap growth uses the
+        // attested suffix and never zeros the already-applied prefix.
+        let count = coordinator.countStreamEvents(threadId: id)
+        let cursor = coordinator.streamEventCursor(threadId: id)
+        let previousCount = scheduledLiveStreamCount
+        let previousCursor = scheduledLiveStreamCursor
+        var plan = Self.scheduledLiveReplayPlan(
+            previousCount: previousCount,
+            currentCount: count,
+            cap: AgentRunCoordinator.hotReplayEventCount
+        )
+        if case .skip = plan, previousCursor != cursor {
+            plan = .fullReplay
+        }
+        scheduledLiveApplyCountForTesting = 0
+        switch plan {
+        case .skip:
+            break
+        case .suffix:
+            let suffixEvents = attestedScheduledLiveSuffix(
+                threadId: id,
+                previous: previousCursor,
+                current: cursor
+            )
+            if let suffixEvents {
+                applyScheduledLiveEvents(suffixEvents, resetTimeline: false)
+                scheduledLiveStreamCount = count
+                scheduledLiveStreamCursor = cursor
+                rehydrateDurableActiveState(threadId: id)
+                scheduleTimelineUpdateTick()
+            } else {
+                applyScheduledLiveFullReplay(threadId: id, count: count, cursor: cursor)
+            }
+        case .fullReplay:
+            applyScheduledLiveFullReplay(threadId: id, count: count, cursor: cursor)
+        }
+    }
+
+    private func attestedScheduledLiveSuffix(
+        threadId: AgentThreadID,
+        previous: AgentRunRepository.StreamEventCursor?,
+        current: AgentRunRepository.StreamEventCursor
+    ) -> [AssistantEvent]? {
+        guard let previous,
+              let runId = current.runId,
+              previous.runId == runId,
+              current.sequence > previous.sequence,
+              let previousMutationId = previous.mutationId,
+              let mutationId = current.mutationId
+        else { return nil }
+        let advance = current.sequence - previous.sequence
+        guard let suffix = coordinator.attestedStreamEventSuffix(
+            threadId: threadId,
+            afterMutationId: previousMutationId,
+            throughMutationId: mutationId,
+            runId: runId,
+            startingSequence: previous.sequence + 1,
+            count: advance
+        ), suffix.events.count == advance else { return nil }
+        return suffix.events
+    }
+
+    private func applyScheduledLiveFullReplay(
+        threadId: AgentThreadID,
+        count: Int,
+        cursor: AgentRunRepository.StreamEventCursor
+    ) {
+        applyScheduledLiveEvents(
+            coordinator.latestStreamEvents(threadId: threadId),
+            resetTimeline: true
+        )
+        scheduledLiveStreamCount = count
+        scheduledLiveStreamCursor = cursor
+        rehydrateDurableActiveState(threadId: threadId)
+        scheduleTimelineUpdateTick()
+    }
+
+    private func applyScheduledLiveEvents(_ events: [AssistantEvent], resetTimeline: Bool) {
+        scheduledLiveApplyCountForTesting += events.count
+        if surfaceVisibility == .hidden {
+            var hidden = resetTimeline
+                ? AssistantTimelineState()
+                : (latestHiddenTimeline ?? AssistantTimelineState())
+            for event in events {
+                hidden.apply(event)
+            }
+            hidden.enforceAggregateHotTextBudget()
+            latestHiddenTimeline = hidden
+            return
+        }
+        if resetTimeline {
+            timeline = AssistantTimelineState()
+        }
+        for event in events {
+            timeline.apply(event)
+        }
+        timeline.enforceAggregateHotTextBudget()
     }
 
     public var executionLocked: Bool { providerLocked || selectedThreadRunIsStartingOrRunning }
@@ -9270,28 +9396,46 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if liveBackgroundTasks != reduced.liveBackgroundTasks {
             liveBackgroundTasks = reduced.liveBackgroundTasks
         }
-        if surfaceVisibility == .hidden {
-            latestHiddenTimeline = reduced.timeline
-            let now = nowForTesting()
-            let due = lastHiddenTimelinePublishAt.map {
-                now.timeIntervalSince($0) >= hiddenTimelinePublishIntervalForTesting
-            } ?? true
-            if due {
-                timeline = reduced.timeline
-                lastHiddenTimelinePublishAt = now
-                hiddenTimelinePublishCountForTesting += 1
-            }
-        } else {
-            timeline = reduced.timeline
-        }
         let budget = Self.aggregateBudgetDecision(
             force: reduced.forceAggregateBudget,
             opsSinceLastWalk: streamAggregateBudgetOps,
             appliedEventCount: reduced.appliedEventCount
         )
         streamAggregateBudgetOps = budget.nextOps
+        if surfaceVisibility == .hidden {
+            var hidden = reduced.timeline
+            if budget.runsWalk {
+                hidden.enforceAggregateHotTextBudget(byteLimit: activeAggregateHotTextByteLimit)
+                aggregateHotTextBudgetGeneration &+= 1
+            }
+            latestHiddenTimeline = hidden
+            let now = nowForTesting()
+            let due = lastHiddenTimelinePublishAt.map {
+                now.timeIntervalSince($0) >= hiddenTimelinePublishIntervalForTesting
+            } ?? true
+            if due {
+                lastHiddenTimelinePublishAt = now
+                hiddenTimelinePublishCountForTesting += 1
+            }
+            // Order is load-bearing: the walk above can evict translations, and
+            // the guard below must see the post-eviction hidden buffer.
+            if Self.shouldPublishTokenSaverOptimizationState(
+                timeline: hidden,
+                publishedIds: tokenSaverOptimizedMessageIds,
+                publishedOriginals: tokenSaverOriginalTextsByMessageId
+            ) {
+                refreshTokenSaverOptimizationStateFromTimeline(hidden)
+            }
+            scheduleTimelineUpdateTick()
+            if reduced.hasProposedPlan {
+                scheduleFullAccessPlanAutoImplementIfNeeded()
+            }
+            return
+        }
+        timeline = reduced.timeline
         if budget.runsWalk {
             timeline.enforceAggregateHotTextBudget(byteLimit: activeAggregateHotTextByteLimit)
+            aggregateHotTextBudgetGeneration &+= 1
         }
         // Order is load-bearing: the walk above can evict translations, and the
         // guard below must see the post-eviction timeline so the published cache
@@ -13016,6 +13160,66 @@ public struct AgentAppView: View {
             lock.unlock()
         }
     }
+
+    enum VisibleTranscriptWindowProbe {
+        private static let lock = NSLock()
+        nonisolated(unsafe) private static var count = 0
+
+        static var callCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return count
+        }
+
+        static func reset() {
+            lock.lock()
+            count = 0
+            lock.unlock()
+        }
+
+        static func increment() {
+            lock.lock()
+            count += 1
+            lock.unlock()
+        }
+    }
+
+    enum TranscriptRematerializeProbe {
+        private static let lock = NSLock()
+        nonisolated(unsafe) private static var dictionaryBuilds = 0
+        nonisolated(unsafe) private static var liveTurnPatches = 0
+
+        static var dictionaryBuildCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return dictionaryBuilds
+        }
+
+        static var liveTurnPatchCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return liveTurnPatches
+        }
+
+        static func reset() {
+            lock.lock()
+            dictionaryBuilds = 0
+            liveTurnPatches = 0
+            lock.unlock()
+        }
+
+        static func incrementDictionaryBuild() {
+            lock.lock()
+            dictionaryBuilds += 1
+            lock.unlock()
+        }
+
+        static func incrementLiveTurnPatch() {
+            lock.lock()
+            liveTurnPatches += 1
+            lock.unlock()
+        }
+    }
     #endif
 
     /// Conversation-column paint: order the full merged transcript once, then
@@ -13178,6 +13382,8 @@ public struct AgentAppView: View {
     private final class TranscriptCache {
         var signature: String?
         var entries: [TranscriptEntry] = []
+        var messagesGeneration: UInt64?
+        var aggregateBudgetGeneration: UInt64?
         /// AA-21: paint-order permutation (indices into `entries`) keyed by
         /// structure + completion. `paintOrderedTranscriptEntries` runs the
         /// final-after-turn repair, which normalizes every assistant text in the
@@ -13202,12 +13408,22 @@ public struct AgentAppView: View {
             // CRITICAL: write rematerialized entries BACK into the cache so a turn
             // that completes mid-signature stays baseline-finished and
             // shouldRematerializeTurn stops returning true on every later tick.
+            let messagesUnchanged = transcriptCache.messagesGeneration
+                == vm.transcriptState.messagesGeneration
+            let forceFullPath = transcriptCache.aggregateBudgetGeneration
+                != vm.aggregateHotTextBudgetGeneration
+            let lastLiveId = vm.timeline.turns.last(where: { !$0.finished })?.turnId
             let refreshed = Self.rematerializedTranscriptEntries(
                 cached: transcriptCache.entries,
                 messages: vm.messages,
-                turns: vm.timeline.turns
+                turns: vm.timeline.turns,
+                liveTurnIds: lastLiveId.map { Set([$0]) },
+                messagesGenerationUnchanged: messagesUnchanged,
+                forceFullPath: forceFullPath
             )
             transcriptCache.entries = refreshed
+            transcriptCache.messagesGeneration = vm.transcriptState.messagesGeneration
+            transcriptCache.aggregateBudgetGeneration = vm.aggregateHotTextBudgetGeneration
             return refreshed
         }
         let merged = Self.ensuringTranscriptOrder(
@@ -13215,6 +13431,8 @@ public struct AgentAppView: View {
         )
         transcriptCache.signature = signature
         transcriptCache.entries = merged
+        transcriptCache.messagesGeneration = vm.transcriptState.messagesGeneration
+        transcriptCache.aggregateBudgetGeneration = vm.aggregateHotTextBudgetGeneration
         return merged
     }
 
@@ -13230,9 +13448,26 @@ public struct AgentAppView: View {
         cached: [TranscriptEntry],
         messages: [AgentMessage],
         turns: [AssistantTurnSnapshot],
-        liveTurnIds: Set<String>? = nil
+        liveTurnIds: Set<String>? = nil,
+        messagesGenerationUnchanged: Bool = false,
+        forceFullPath: Bool = false
     ) -> [TranscriptEntry] {
         guard !messages.isEmpty || !turns.isEmpty else { return cached }
+        if !forceFullPath,
+           messagesGenerationUnchanged,
+           let patched = rematerializedLiveTurnOnly(
+               cached: cached,
+               turns: turns,
+               liveTurnIds: liveTurnIds
+           ) {
+            #if DEBUG
+            TranscriptRematerializeProbe.incrementLiveTurnPatch()
+            #endif
+            return patched
+        }
+        #if DEBUG
+        TranscriptRematerializeProbe.incrementDictionaryBuild()
+        #endif
         var messagesById = [AgentMessageID: AgentMessage](minimumCapacity: messages.count)
         for message in messages { messagesById[message.id] = message }
         var turnsById = [String: AssistantTurnSnapshot](minimumCapacity: turns.count)
@@ -13250,6 +13485,39 @@ public struct AgentAppView: View {
                 return entry
             }
         }
+    }
+
+    /// Signature-hit fast path: only the unfinished live turn (or the last
+    /// unfinished) is patched. Finished item trees stay the cached copies.
+    nonisolated static func rematerializedLiveTurnOnly(
+        cached: [TranscriptEntry],
+        turns: [AssistantTurnSnapshot],
+        liveTurnIds: Set<String>?
+    ) -> [TranscriptEntry]? {
+        let liveId: String
+        if let liveTurnIds {
+            guard liveTurnIds.count == 1, let only = liveTurnIds.first else { return nil }
+            liveId = only
+        } else if let last = turns.last, !last.finished,
+                  turns.dropLast().allSatisfy(\.finished) {
+            liveId = last.turnId
+        } else {
+            return nil
+        }
+        guard let live = turns.first(where: { $0.turnId == liveId }), !live.finished else {
+            return nil
+        }
+        var liveIndex: Int?
+        var unfinishedCached = 0
+        for (index, entry) in cached.enumerated() {
+            guard case .turn(let stale) = entry else { continue }
+            if !stale.finished { unfinishedCached += 1 }
+            if stale.turnId == liveId { liveIndex = index }
+        }
+        guard unfinishedCached <= 1, let liveIndex else { return nil }
+        var next = cached
+        next[liveIndex] = .turn(live)
+        return next
     }
 
     /// Pure gate for stream-tick rematerialization scope.
@@ -13339,6 +13607,9 @@ public struct AgentAppView: View {
         runningSlack: TimeInterval = runningTranscriptContextSlack,
         precedingContextCount: Int = followUpPrecedingContextCount
     ) -> [TranscriptEntry] {
+        #if DEBUG
+        VisibleTranscriptWindowProbe.increment()
+        #endif
         // Pending is part of the active follow-up lifecycle (composer send →
         // provider start). Treat it like a live turn so we never flash the
         // idle "last 30" history between send and running.
@@ -14412,11 +14683,6 @@ public struct AgentAppView: View {
                         // property rebuilt two whole-thread dictionaries each read
                         // and used to be read three times per pass.
                         let mergedEntries = transcriptEntries
-                        let visibleEntries = Self.visibleTranscriptWindow(
-                            entries: mergedEntries,
-                            status: vm.status,
-                            runStartedAt: vm.runStartedAt
-                        )
                         let columnPaint = Self.transcriptColumnPaint(
                             mergedEntries: paintOrderedTranscriptEntriesCached(mergedEntries),
                             status: vm.status,
@@ -14426,6 +14692,7 @@ public struct AgentAppView: View {
                         )
                         let allEntries = columnPaint.all
                         let entries = columnPaint.visible
+                        let visibleEntries = columnPaint.visible
                         let hiddenCount = Self.hiddenTranscriptCount(
                             totalCount: allEntries.count,
                             visibleCount: entries.count
@@ -14539,7 +14806,12 @@ public struct AgentAppView: View {
                                 activePlanRow(plan)
                                     .id("agent.activePlan")
                             }
-                            if vm.messages.isEmpty && vm.timeline.turns.isEmpty && vm.timeline.error == nil {
+                            if Self.shouldShowEmptyConversation(
+                                messagesEmpty: vm.messages.isEmpty,
+                                turnsEmpty: vm.timeline.turns.isEmpty,
+                                hasTimelineError: vm.timeline.error != nil,
+                                isHidden: vm.isHiddenFromSurface
+                            ) {
                                 emptyConversation
                                     .id("agent.emptyConversation")
                             }
@@ -14588,6 +14860,7 @@ public struct AgentAppView: View {
             }
         }
         .onChange(of: vm.timeline.turns.count) { _ in
+            guard !vm.isHiddenFromSurface else { return }
             DispatchQueue.main.async {
                 pruneExpandedItemIds()
             }
@@ -15492,6 +15765,18 @@ public struct AgentAppView: View {
             revealedCount: revealedCount
         ))
         .accessibilityIdentifier("agent.runningHiddenTranscript")
+    }
+
+    /// Hide-drop publishes an empty timeline while the run still lives in
+    /// `latestHiddenTimeline`. That 0-turn publish must not paint the empty
+    /// conversation placeholder.
+    nonisolated static func shouldShowEmptyConversation(
+        messagesEmpty: Bool,
+        turnsEmpty: Bool,
+        hasTimelineError: Bool,
+        isHidden: Bool
+    ) -> Bool {
+        !isHidden && messagesEmpty && turnsEmpty && !hasTimelineError
     }
 
     nonisolated static func hiddenTranscriptRevealLabel(
