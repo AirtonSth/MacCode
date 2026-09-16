@@ -728,6 +728,21 @@ final class ProviderProxyPolicyTests: XCTestCase {
             arguments: ["exec", "resume", "sess-1"],
             promptFile: prompt
         ))
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "codex",
+            arguments: [
+                "exec", "--json", "--model", "gpt-5.6-sol",
+                "-c", "model_reasoning_effort=high", "work"
+            ],
+            promptFile: prompt
+        ), "codex exec --json is exec JSONL and must stay raw even when model and effort would otherwise promote")
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "codex",
+            arguments: [
+                "exec", "--json", "--model", "gpt-5.6-sol",
+                "-c", "model_reasoning_effort=high", "work"
+            ]
+        ), "eligibility must reject exec --json before stdin materialization")
         XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
             providerBasename: "grok",
             arguments: ["--help"]

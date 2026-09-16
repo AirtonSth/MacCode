@@ -427,6 +427,10 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         _ = try await adapter.sendTurn(request) { event in
             Task { await sink.record(event) }
         }
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "turn-app-server-1"]
+        ])
         client.notificationHandler?("thread/status/changed", [
             "threadId": "codex-thread-1",
             "status": ["type": "active", "activeFlags": ["runningCommand"]]
@@ -865,6 +869,10 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )) { event in
             Task { await sink.record(event) }
         }
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "turn-app-server-1"]
+        ])
 
         try adapter.interruptTurn(threadId: threadId)
         let deadline = Date().addingTimeInterval(3)
@@ -943,8 +951,62 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
     }
 
+    func test_sendTurn_doesNotActivateTurnFromStartTurnRPC() async throws {
+        // WHY: turn/start returns the turn object immediately; the app-server
+        // emits turn/started when it actually begins. Activating from the RPC
+        // lets a follow-up turn/steer race a turn that is not active yet.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        func makeRequest(_ prompt: String) -> AgentRunRequest {
+            AgentRunRequest(threadId: threadId, provider: .codex, model: "gpt-5.5",
+                            cwd: "/tmp/remotecode-app-server-adapter", prompt: prompt)
+        }
+
+        _ = try await adapter.sendTurn(makeRequest("wait")) { event in
+            Task { await sink.record(event) }
+        }
+        let before = await sink.snapshot()
+        XCTAssertFalse(before.contains {
+            if case .turnStarted = $0 { return true }
+            return false
+        }, "turn/start RPC must not emit turnStarted")
+
+        do {
+            _ = try await adapter.sendTurn(makeRequest("too soon")) { _ in }
+            XCTFail("follow-up before turn/started must not steer")
+        } catch {
+            XCTAssertEqual(client.steeredTurns.count, 0,
+                           "turn/steer requires an active turn from turn/started")
+            XCTAssertEqual(client.startedTurns.count, 1)
+        }
+
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "turn-app-server-1"]
+        ])
+        let afterStart = try await waitForEvents(in: sink, matching: { events in
+            events.contains { if case .turnStarted(let turnId) = $0 { return turnId == "turn-app-server-1" } else { return false } }
+        })
+        XCTAssertTrue(afterStart.contains {
+            if case .turnStarted(let turnId) = $0 { return turnId == "turn-app-server-1" }
+            return false
+        })
+
+        _ = try await adapter.sendTurn(makeRequest("also check tests")) { _ in }
+        XCTAssertEqual(client.startedTurns.count, 1, "the live turn must not be replaced with a second turn/start")
+        XCTAssertEqual(client.steeredTurns.count, 1)
+        XCTAssertEqual(client.steeredTurns.first?.expectedTurnId, "turn-app-server-1")
+        XCTAssertEqual(client.steeredTurns.first?.request.prompt, "also check tests")
+        XCTAssertEqual(client.openedRequests.count, 1, "steer must reuse the open thread")
+    }
+
     func test_sendTurn_steersConcurrentInFlightTurn() async throws {
-        // In-flight Codex follow-up uses turn/steer instead of throwing unsupported.
+        // In-flight Codex follow-up uses turn/steer only after turn/started.
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
@@ -958,6 +1020,10 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         let noop: @Sendable (AgentRunEvent) -> Void = { _ in }
 
         _ = try await adapter.sendTurn(makeRequest("wait"), onEvent: noop)
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "turn-app-server-1"]
+        ])
         _ = try await adapter.sendTurn(makeRequest("also check tests"), onEvent: noop)
 
         XCTAssertEqual(client.startedTurns.count, 1, "the live turn must not be replaced with a second turn/start")
@@ -989,6 +1055,10 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         let handle = try await adapter.sendTurn(makeRequest("wait")) { event in
             Task { await originalSink.record(event) }
         }
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "turn-app-server-1"]
+        ])
 
         do {
             _ = try await adapter.sendTurn(makeRequest("also check tests")) { event in
@@ -3049,6 +3119,65 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(events.contains { if case .turnCompleted(let turnId, let final) = $0 { return turnId == "turn-snapshot-1" && final == "snapshot answer" } else { return false } })
     }
 
+    func test_readThreadEmptyAggregatedOutputIsNotTheCommand() async throws {
+        // WHY: a completed command with empty stdout must not paint `command`
+        // as if it were aggregatedOutput.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        client.readResponse = [
+            "thread": [
+                "id": "codex-thread-1",
+                "turns": [[
+                    "id": "turn-empty-cmd",
+                    "status": "completed",
+                    "items": [
+                        [
+                            "id": "cmd-empty",
+                            "type": "commandExecution",
+                            "command": "true",
+                            "status": "completed",
+                            "aggregatedOutput": ""
+                        ],
+                        [
+                            "id": "cmd-omitted",
+                            "type": "commandExecution",
+                            "command": "mkdir -p /tmp/rc-empty",
+                            "status": "completed"
+                        ]
+                    ]
+                ]]
+            ]
+        ]
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "read empty"
+        )) { _ in }
+
+        let events = try await adapter.readThread(threadId: threadId)
+        let empty = events.compactMap { event -> AssistantItem? in
+            if case .itemStarted(let item) = event, item.id == "cmd-empty" { return item }
+            return nil
+        }.first
+        XCTAssertEqual(empty?.summary, "true")
+        XCTAssertFalse(events.contains {
+            if case .itemDelta(let itemId, _, let output, _) = $0 {
+                return itemId == "cmd-empty" && output == "true"
+            }
+            return false
+        }, "empty aggregatedOutput must not display the command string")
+        XCTAssertFalse(events.contains {
+            if case .itemDelta(let itemId, _, let output, _) = $0 {
+                return itemId == "cmd-omitted" && output == "mkdir -p /tmp/rc-empty"
+            }
+            return false
+        }, "omitted aggregatedOutput must not display the command string")
+    }
+
     func test_readThreadRendersCommonStringAliasesForUncommonSnapshotItems() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         client.readResponse = [
@@ -4239,6 +4368,10 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             cwd: "/tmp/remotecode-app-server-adapter",
             prompt: "/goal finish audit"
         )) { log.record($0) }
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "turn-app-server-1"]
+        ])
 
         func goalItems(summary: String) -> [AssistantItem] {
             log.assistantEvents.compactMap {

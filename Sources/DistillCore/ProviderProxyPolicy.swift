@@ -1439,6 +1439,9 @@ public enum ProviderProxyPolicy {
         guard scan.positionals.first == "exec" else { return false }
         // `codex exec resume` is session continuation — keep raw.
         if scan.positionals.dropFirst().first == "resume" { return false }
+        // `codex exec --json` is exec JSONL (`item` + `aggregated_output`).
+        // Agent App `--output-format json` is a different ABI; keep raw like resume.
+        if scan.flags.contains("--json") { return false }
         return true
     }
 
