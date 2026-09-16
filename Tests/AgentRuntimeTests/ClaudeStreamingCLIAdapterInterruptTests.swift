@@ -1,4 +1,5 @@
 import XCTest
+import Darwin
 import CoreModel
 @testable import AgentRuntime
 
@@ -297,9 +298,19 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
     // MARK: - control_response user-input wire (pure, CLAUDE-CLI-004/005)
 
     func test_controlUserInputResponseLine_askUserQuestionAllowCarriesAnswers() throws {
+        let questions: [[String: Any]] = [[
+            "question": "How should we authenticate?",
+            "header": "Auth",
+            "options": [["label": "OAuth"], ["label": "API key"]],
+            "multiSelect": false
+        ]]
+        let inputJSON = String(
+            data: try JSONSerialization.data(withJSONObject: ["questions": questions]),
+            encoding: .utf8
+        )
         let data = try ClaudeStreamingCLIAdapter.controlUserInputResponseLine(
             requestId: "req-ask-1",
-            kind: .askUserQuestion(toolUseID: "toolu-ask-1"),
+            kind: .askUserQuestion(toolUseID: "toolu-ask-1", inputJSON: inputJSON),
             text: #"{"0":"OAuth"}"#,
             decision: .accept
         )
@@ -311,15 +322,19 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         XCTAssertEqual(result["behavior"] as? String, "allow")
         XCTAssertEqual(result["toolUseID"] as? String, "toolu-ask-1")
         let updated = try XCTUnwrap(result["updatedInput"] as? [String: Any])
+        let echoed = try XCTUnwrap(updated["questions"] as? [[String: Any]])
+        XCTAssertEqual(echoed[0]["question"] as? String, "How should we authenticate?",
+                       "allow must pass through the original questions array")
         let answers = try XCTUnwrap(updated["answers"] as? [String: Any])
-        XCTAssertEqual(answers["0"] as? String, "OAuth",
-                       "JSON answers must land in updatedInput.answers (PermissionResult allow path)")
+        XCTAssertEqual(answers["How should we authenticate?"] as? String, "OAuth",
+                       "answers must be keyed by question text, not index")
+        XCTAssertNil(answers["0"])
     }
 
     func test_controlUserInputResponseLine_askUserQuestionCancelIsDeny() throws {
         let data = try ClaudeStreamingCLIAdapter.controlUserInputResponseLine(
             requestId: "req-ask-2",
-            kind: .askUserQuestion(toolUseID: nil),
+            kind: .askUserQuestion(toolUseID: nil, inputJSON: nil),
             text: nil,
             decision: .cancel
         )
@@ -622,6 +637,59 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
                 mappedSessionIsExact: false
             )
         )
+    }
+
+    func test_interruptPlan_phaseOneIsSigint() {
+        let pids: [Int32] = [501, 502, 500]
+        let plan = ProcessTerminator.interruptPlan(
+            pids: pids,
+            isAlive: { _ in true },
+            graceElapsed: false
+        )
+        XCTAssertEqual(plan, [
+            ProcessTerminationStep(pid: 501, signal: SIGINT),
+            ProcessTerminationStep(pid: 502, signal: SIGINT),
+            ProcessTerminationStep(pid: 500, signal: SIGINT)
+        ])
+        let term = ProcessTerminator.terminationPlan(
+            pids: pids,
+            isAlive: { _ in true },
+            graceElapsed: false
+        )
+        XCTAssertEqual(term.map(\.signal), [SIGTERM, SIGTERM, SIGTERM],
+                       "other-provider terminateTree must still start with SIGTERM")
+    }
+
+    func test_cliForkThread_isKeyedIdempotentAndCompensatable() async throws {
+        let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: "/usr/bin/true")
+        XCTAssertEqual(
+            adapter.forkSafety,
+            .keyedIdempotent(compensationSupported: true)
+        )
+        let source = AgentThreadID()
+        let child = AgentThreadID()
+        let sourceProvider = "11111111-2222-3333-4444-555555555555"
+        let request = AgentProviderForkRequest(
+            sourceThreadId: source,
+            childThreadId: child,
+            idempotencyKey: "remotecode-thread-fork:\(child.value.uuidString.lowercased())",
+            sourceProviderThreadId: sourceProvider
+        )
+        let first = try await adapter.forkThread(request)
+        XCTAssertEqual(first, child.value.uuidString)
+        let replay = try await adapter.forkThread(request)
+        XCTAssertEqual(replay, first)
+        do {
+            _ = try await adapter.forkThread(threadId: source)
+            XCTFail("unkeyed Claude CLI fork must throw")
+        } catch let AgentProviderAdapterError.unsupported(message) {
+            XCTAssertTrue(message.contains("unkeyed"))
+        } catch {
+            XCTFail("expected unsupported unkeyed fork, got \(error)")
+        }
+        try await adapter.compensateFork(request, providerChildThreadId: first)
+        let after = try await adapter.forkThread(request)
+        XCTAssertEqual(after, child.value.uuidString)
     }
 }
 

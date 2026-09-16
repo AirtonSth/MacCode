@@ -1781,6 +1781,10 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
         let source = try String(contentsOf: bridge, encoding: .utf8)
 
+        XCTAssertTrue(source.contains("origin: { kind: 'human' }"),
+                      "host-forwarded SDK user turns must set origin.kind=human")
+        XCTAssertTrue(source.contains("function sdkEffortToken"),
+                      "SDK query effort must coerce ultracode to xhigh")
         XCTAssertTrue(source.contains("hooks: tokenSaverHooks()"),
                       "I2: SDK query options must register the PostToolUse hook so tool_result bytes can be replaced before provider context replay")
         XCTAssertTrue(source.contains("updatedMCPToolOutput"),

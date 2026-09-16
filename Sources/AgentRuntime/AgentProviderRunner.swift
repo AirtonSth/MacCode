@@ -712,6 +712,44 @@ enum ProcessTerminator {
             .map { ProcessTerminationStep(pid: $0, signal: SIGKILL) }
     }
 
+    /// Claude interrupt fallback only: SIGINT ends the in-progress turn
+    /// (SIGTERM leaves it unfinished so `--resume` continues it).
+    /// graceElapsed == false -> SIGINT every pid; true -> SIGKILL survivors.
+    static func interruptPlan(
+        pids: [Int32],
+        isAlive: (Int32) -> Bool,
+        graceElapsed: Bool
+    ) -> [ProcessTerminationStep] {
+        if !graceElapsed {
+            return pids.map { ProcessTerminationStep(pid: $0, signal: SIGINT) }
+        }
+        return pids
+            .filter { isAlive($0) }
+            .map { ProcessTerminationStep(pid: $0, signal: SIGKILL) }
+    }
+
+    /// Claude interrupt fallback. Does not change `terminateTree` (SIGTERM first)
+    /// used by Codex, Grok, and Claude session teardown.
+    static func interruptTree(_ process: Process, grace: TimeInterval = graceInterval, foreignUserUID: uid_t? = nil) {
+        let root = process.processIdentifier
+        let pids = processTreePIDs(root: root)
+
+        for step in interruptPlan(pids: pids, isAlive: { _ in true }, graceElapsed: false) {
+            kill(step.pid, step.signal)
+        }
+
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + grace) {
+            let escalation = interruptPlan(pids: pids, isAlive: Self.isAlive(_:), graceElapsed: true)
+            for step in escalation {
+                kill(step.pid, step.signal)
+            }
+            if let foreignUserUID {
+                let survivors = pids.filter { Self.isAlive($0) }
+                killAsUserProvider(foreignUserUID, SIGKILL, survivors)
+            }
+        }
+    }
+
     // Liveness probe via signal 0 (no signal sent, only error checking).
     static func isAlive(_ pid: Int32) -> Bool {
         if kill(pid, 0) == 0 { return true }

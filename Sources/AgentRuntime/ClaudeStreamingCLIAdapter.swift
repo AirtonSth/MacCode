@@ -16,7 +16,7 @@ struct ClaudeCLIUnavailableError: Error, CustomStringConvertible {
 
 /// Wire kind for control-channel user-input replies (AskUserQuestion vs elicitation vs dialog).
 enum ClaudeControlUserInputKind: Sendable, Equatable {
-    case askUserQuestion(toolUseID: String?)
+    case askUserQuestion(toolUseID: String?, inputJSON: String?)
     case elicitation
     /// CLAUDE-CLI-016: tool-driven blocking dialogs (`request_user_dialog`).
     case userDialog(dialogKind: String)
@@ -178,6 +178,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     // UX-RESUME: set of thread IDs whose last session was killed by interruptTurn.
     // Cleared when sendTurn begins a new session for that thread. Guarded by `lock`.
     private var interruptedThreadIds: Set<AgentThreadID> = []
+    /// Keyed CLI fork: idempotency key -> child provider id. Guarded by `lock`.
+    private var forkChildByKey: [String: String] = [:]
+    /// Child provider id -> source provider id for the first child spawn. Guarded by `lock`.
+    private var forkSourceByChild: [String: String] = [:]
 
     /// CLAUDE-BG-LIFECYCLE: inactivity bound for a withheld finish, fully reset
     /// by stream lines. Quiet background jobs emit nothing until they end; on
@@ -204,6 +208,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         self.interruptGracePeriod = max(0, interruptGracePeriod)
         self.deferredFinishInactivityTimeout = max(0.01, deferredFinishInactivityTimeout)
         self.deferredFinishPostIdleTimeout = max(0.01, deferredFinishPostIdleTimeout)
+    }
+
+    public var forkSafety: AgentProviderForkSafety {
+        .keyedIdempotent(compensationSupported: true)
+    }
+
+    public func forkSafety(threadId: AgentThreadID) -> AgentProviderForkSafety {
+        forkSafety
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
@@ -365,7 +377,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             }
             self.lock.unlock()
             if let sessionToTerminate {
-                self.terminate(session: sessionToTerminate, status: .cancelled)
+                // SIGINT ends the in-progress turn; SIGTERM leaves it unfinished
+                // so `--resume` continues it. Only this receipt-timed grace kill
+                // uses interruptTree — stopSession and other teardowns stay SIGTERM.
+                self.terminate(session: sessionToTerminate, status: .cancelled, interruptFallback: true)
             }
         }
         killBox.item = killWork
@@ -735,6 +750,60 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         terminate(session: session, status: .cancelled)
     }
 
+    public func forkThread(threadId: AgentThreadID) async throws -> String {
+        throw AgentProviderAdapterError.unsupported(
+            "unkeyed Claude CLI fork is unsafe; use the durable AgentProviderForkRequest path"
+        )
+    }
+
+    public func forkThread(_ request: AgentProviderForkRequest) async throws -> String {
+        guard forkSafety(threadId: request.sourceThreadId).supportsDurableFork else {
+            throw AgentProviderAdapterError.unsupported("Claude CLI fork reconciliation contract is unavailable")
+        }
+        lock.lock()
+        let sourceSession = sessions[request.sourceThreadId]
+        let sourceId = request.sourceProviderThreadId ?? sourceSession?.providerThreadId
+        let hasActiveTurn = sourceSession?.inFlightRunId != nil
+        if let existing = forkChildByKey[request.idempotencyKey], !existing.isEmpty {
+            lock.unlock()
+            return existing
+        }
+        lock.unlock()
+        guard let sourceId, !sourceId.isEmpty else {
+            throw AgentProviderAdapterError.sessionNotFound(request.sourceThreadId)
+        }
+        if let expected = request.sourceProviderThreadId, !expected.isEmpty, expected != sourceId {
+            throw AgentProviderAdapterError.unsupported("Claude CLI recovered the wrong parent for fork")
+        }
+        guard !hasActiveTurn else {
+            throw AgentProviderAdapterError.unsupported("Claude CLI cannot fork while the parent turn is active")
+        }
+        let childId = request.childThreadId.value.uuidString
+        guard childId != sourceId else {
+            throw AgentProviderAdapterError.unsupported("provider-native fork did not return a distinct child")
+        }
+        lock.lock()
+        forkChildByKey[request.idempotencyKey] = childId
+        forkSourceByChild[childId] = sourceId
+        lock.unlock()
+        return childId
+    }
+
+    public func compensateFork(
+        _ request: AgentProviderForkRequest,
+        providerChildThreadId: String
+    ) async throws {
+        guard forkSafety(threadId: request.sourceThreadId).supportsCompensation else {
+            throw AgentProviderAdapterError.unsupported("Claude CLI fork compensation contract is unavailable")
+        }
+        lock.lock()
+        if forkChildByKey[request.idempotencyKey] == providerChildThreadId {
+            forkChildByKey.removeValue(forKey: request.idempotencyKey)
+        }
+        forkSourceByChild.removeValue(forKey: providerChildThreadId)
+        lock.unlock()
+    }
+
     public func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {
         guard request.providerThreadId?.isEmpty == false else {
             throw AgentProviderAdapterError.unsupported("Claude streaming recovery requires providerThreadId")
@@ -883,10 +952,16 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let askpass = isForeignUser
             ? RunAsUserProcessBootstrap.materializeAskpass(targetUser: request.runAsUser!.shortName)
             : nil
+        let forkSource: String? = {
+            let childId = request.providerThreadId ?? request.threadId.value.uuidString
+            lock.lock()
+            defer { lock.unlock() }
+            return forkSourceByChild.removeValue(forKey: childId)
+        }()
         let process = try ProviderSubprocessLauncher.makeProcess(
             provider: .claude,
             executablePath: path,
-            arguments: ClaudeRunner.buildStreamingArgs(request),
+            arguments: ClaudeRunner.buildStreamingArgs(request, forkFrom: forkSource),
             currentDirectory: request.cwd,
             environment: thinkingEnvironment,
             runAsUser: request.runAsUser,
@@ -1677,7 +1752,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         concludeTurn(finalMessage: finalMessage, session: session, allowDeferral: false)
     }
 
-    private func terminate(session: Session, status: AgentRunStatus) {
+    private func terminate(session: Session, status: AgentRunStatus, interruptFallback: Bool = false) {
         lock.lock()
         session.status = status
         if status == .cancelled { session.cancellationRequested = true }
@@ -1687,7 +1762,11 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.stdoutPipe.fileHandleForReading.readabilityHandler = nil
         session.stderrPipe.fileHandleForReading.readabilityHandler = nil
         if session.process.isRunning {
-            ProcessTerminator.terminateTree(session.process, foreignUserUID: session.foreignUserUID)
+            if interruptFallback {
+                ProcessTerminator.interruptTree(session.process, foreignUserUID: session.foreignUserUID)
+            } else {
+                ProcessTerminator.terminateTree(session.process, foreignUserUID: session.foreignUserUID)
+            }
         }
     }
 
@@ -1803,13 +1882,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     ) throws -> Data {
         let body: [String: Any]
         switch kind {
-        case .askUserQuestion(let toolUseID):
+        case .askUserQuestion(let toolUseID, let inputJSON):
             switch decision {
             case .accept:
                 body = Self.askUserQuestionPermissionResult(
                     requestId: requestId,
                     toolUseID: toolUseID,
-                    text: text ?? ""
+                    text: text ?? "",
+                    originalInputJSON: inputJSON
                 )
             case .cancel, .decline:
                 body = [
@@ -1859,29 +1939,60 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         return line
     }
 
-    /// Mirrors bridge `askUserQuestionResult`: allow + updatedInput.answers (or response).
+    /// Mirrors bridge `askUserQuestionResult`: allow + original questions + answers
+    /// keyed by question text (index keys from older callers are remapped).
     nonisolated static func askUserQuestionPermissionResult(
         requestId: String,
         toolUseID: String?,
-        text: String
+        text: String,
+        originalInputJSON: String? = nil
     ) -> [String: Any] {
-        var updatedInput: [String: Any] = [:]
+        let original = updatedInputObject(fromJSON: originalInputJSON)
+        var updatedInput = original
+        let questions = original["questions"] as? [[String: Any]] ?? []
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty,
            let data = trimmed.data(using: .utf8),
            let parsed = try? JSONSerialization.jsonObject(with: data),
            let object = parsed as? [String: Any] {
-            updatedInput["answers"] = object
+            updatedInput["answers"] = remapAskUserQuestionAnswers(object, questions: questions)
         } else if !trimmed.isEmpty {
             updatedInput["response"] = text
         } else {
             updatedInput["answers"] = [String: Any]()
+        }
+        if updatedInput["questions"] == nil, !questions.isEmpty {
+            updatedInput["questions"] = questions
         }
         return [
             "behavior": "allow",
             "updatedInput": updatedInput,
             "toolUseID": toolUseID ?? requestId
         ]
+    }
+
+    /// Official AskUserQuestion answers map uses each question's `question` text
+    /// as the key. Host UI already does that; index keys from tests/legacy
+    /// callers are rewritten onto the matching questions entry.
+    nonisolated static func remapAskUserQuestionAnswers(
+        _ answers: [String: Any],
+        questions: [[String: Any]]
+    ) -> [String: Any] {
+        guard !questions.isEmpty else { return answers }
+        var remapped: [String: Any] = [:]
+        for (key, value) in answers {
+            if let index = Int(key), index >= 0, index < questions.count {
+                let question = questions[index]
+                let text = (question["question"] as? String)
+                    ?? (question["prompt"] as? String)
+                    ?? (question["text"] as? String)
+                    ?? key
+                remapped[text] = value
+            } else {
+                remapped[key] = value
+            }
+        }
+        return remapped
     }
 
     /// Mirrors bridge `elicitationContent`: JSON object if parseable, else `{answer: text}`.
@@ -1979,8 +2090,18 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                     ?? (request["toolUseId"] as? String)
                 let normalized = String(toolName.lazy.filter { $0 != "_" && $0 != "-" }).lowercased()
                 if normalized == "askuserquestion" || normalized == "askuser" {
+                    var inputJSON: String?
+                    if let input = request["input"],
+                       JSONSerialization.isValidJSONObject(input),
+                       let data = try? JSONSerialization.data(withJSONObject: input),
+                       let s = String(data: data, encoding: .utf8) {
+                        inputJSON = s
+                    }
                     lock.lock()
-                    session.pendingControlUserInputs[requestId] = .askUserQuestion(toolUseID: toolUseID)
+                    session.pendingControlUserInputs[requestId] = .askUserQuestion(
+                        toolUseID: toolUseID,
+                        inputJSON: inputJSON
+                    )
                     lock.unlock()
                 } else {
                     var suggestionsJSON: String?

@@ -620,18 +620,12 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         guard isSupportedProviderTurn(provider: .claude, arguments: arguments) else {
             return arguments
         }
-        // Reuse the Agent App settings builder so proxy and ClaudeRunner never
-        // drift on hook command, matcher, or timeout.
-        let settingsArgs = ClaudeRunner.ultracodeSettingsArgs(
-            nil,
-            environment: environment
-        )
-        guard settingsArgs.count == 2, settingsArgs[0] == "--settings",
-              let ptuJSON = settingsArgs[1].data(using: .utf8),
-              let ptuObject = try? JSONSerialization.jsonObject(with: ptuJSON) as? [String: Any],
-              let ptuHooks = ptuObject["hooks"] as? [String: Any] else {
+        // Distill-only map so nested proxy merge does not pull filesystem hooks
+        // into the caller argv. Agent App streaming path merges those separately.
+        guard let ptuHooks = ClaudeRunner.tokenSaverDistillHookSettings(environment: environment) else {
             return arguments
         }
+        let settingsArgs = ClaudeRunner.ultracodeSettingsArgs(nil, environment: environment)
         // Merge into the effective (last) inline JSON or JSON settings file.
         // The caller's file is never edited; path-form becomes an equivalent
         // inline object at the same argv position. Both `--settings value` and

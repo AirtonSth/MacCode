@@ -159,8 +159,8 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
 
         let configures = try Self.loggedCommands(at: commandLog, ofType: "rc_configure")
         XCTAssertEqual(configures.count, 1)
-        XCTAssertEqual(configures.first?["effort"] as? String, "ultracode",
-                       "the SDK bridge must preserve Claude Code's native Ultracode selector")
+        XCTAssertEqual(configures.first?["effort"] as? String, "xhigh",
+                       "SDK Options.effort has no ultracode member; wire xhigh and keep settings.ultracode")
         XCTAssertEqual(configures.first?["settings"] as? String, ClaudeRunner.ultracodeSettingsJSON,
                        "ultracode must carry the enableWorkflows settings payload — without it the Workflow tool is never exposed")
         let settingsData = try XCTUnwrap((configures.first?["settings"] as? String)?.data(using: .utf8))
@@ -515,7 +515,7 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
                        "an effort change must respawn the bridge session (one rc_configure per spawn) — the SDK has no live effort control")
         XCTAssertEqual(configures.first?["effort"] as? String, "medium",
                        "the effort flag is never omitted: nil/medium map to 'medium', mirroring ClaudeRunner")
-        XCTAssertEqual(configures.last?["effort"] as? String, "ultracode")
+        XCTAssertEqual(configures.last?["effort"] as? String, "xhigh")
         XCTAssertEqual(configures.last?["settings"] as? String, ClaudeRunner.ultracodeSettingsJSON)
         XCTAssertEqual(configures.last?["provider_thread_id"] as? String, "sdk-effort-session",
                        "the respawned session must resume the previous provider thread so no conversation context is lost")
@@ -577,7 +577,7 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
         try await assertRespawn(
             from: "claude-mythos-preview", to: "claude-fable-5", effort: .ultracode,
             prefix: "sdk-model-workflow", firstExpectedEffort: "high",
-            secondExpectedEffort: "ultracode", secondUsesUltracode: true
+            secondExpectedEffort: "xhigh", secondUsesUltracode: true
         )
     }
 
