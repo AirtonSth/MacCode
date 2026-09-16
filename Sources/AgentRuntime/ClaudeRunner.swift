@@ -107,6 +107,28 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         }
     }
 
+    /// TypeScript `Options.effort` is `low|medium|high|xhigh|max` only.
+    /// Ultracode is settings `ultracode: true`, never `effort: "ultracode"`.
+    static func sdkEffortToken(
+        _ effort: AgentReasoningEffort?,
+        model: String = "opus"
+    ) -> String? {
+        guard let token = effortArgs(effort, model: model).last else { return nil }
+        return token == "ultracode" ? "xhigh" : token
+    }
+
+    /// One-shot CLI fork argv: resume the source, fork, pin the child id.
+    static func buildForkArgs(sourceProviderThreadId: String, childProviderThreadId: String) -> [String] {
+        [
+            "--print",
+            "--output-format", "json",
+            "--verbose",
+            "--resume", sourceProviderThreadId,
+            "--fork-session",
+            "--session-id", childProviderThreadId
+        ]
+    }
+
     /// Claude treats effort and extended thinking as separate controls. Keep
     /// thinking explicitly enabled for every provider session; Ultracode adds
     /// workflow orchestration to the same single settings payload.
@@ -179,10 +201,10 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     /// take `.last` (SDK bridge payload) still receive the JSON string alone.
     static func ultracodeSettingsArgs(
         _ effort: AgentReasoningEffort?,
-        environment: [String: String] = [:]
+        environment: [String: String] = [:],
+        cwd: String? = nil
     ) -> [String] {
         let wantsUltracode = effort == .ultracode
-        let wantsPostToolUse = environment[tokenSaverPostToolUseEnvKey] == "1"
         var settings: [String: Any] = [
             "alwaysThinkingEnabled": true,
             "showThinkingSummaries": true,
@@ -192,53 +214,11 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             settings["ultracode"] = true
             settings["enableWorkflows"] = true
         }
-        if wantsPostToolUse {
-            // Prefer the managed bin stamped on the nested child environment so
-            // provider-proxy Claude hooks hit the same wrappers as PATH wraps.
-            // Fall back to the default ~/.remote-code/bin when the host did not
-            // inject RC_REMOTE_CODE_MANAGED_BIN (primary Agent App turns).
-            let managedOverride = environment["RC_REMOTE_CODE_MANAGED_BIN"]?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let binDirectory: URL
-            if let managedOverride, !managedOverride.isEmpty {
-                binDirectory = URL(fileURLWithPath: managedOverride, isDirectory: true)
-            } else {
-                binDirectory = AgentSkillInstaller.defaultManagedCLIBinDirectory()
-            }
-            let distillPath = binDirectory.appendingPathComponent("distill").path
-            // Claude CLI command hooks take a shell command string; subcommand
-            // args ride on the same string (no separate args field).
-            let command = "\(distillPath) hook post-tool-use"
-            let prePipe = "\(distillPath) hook pre-tool-pipe"
-            // 45s: nested advisors often compress multi-file Read/Grep payloads;
-            // 10s caused silent fail-open (zero model-mode rows on large nested turns).
-            // PreToolUse rewrites wrap-eligible Bash to `| distill` (command rewrite).
-            settings["hooks"] = [
-                "PostToolUse": [
-                    [
-                        "matcher": "*",
-                        "hooks": [
-                            [
-                                "type": "command",
-                                "command": command,
-                                "timeout": 45
-                            ] as [String: Any]
-                        ]
-                    ] as [String: Any]
-                ],
-                "PreToolUse": [
-                    [
-                        "matcher": "Bash",
-                        "hooks": [
-                            [
-                                "type": "command",
-                                "command": prePipe,
-                                "timeout": 5
-                            ] as [String: Any]
-                        ]
-                    ] as [String: Any]
-                ]
-            ]
+        if let distillHooks = tokenSaverDistillHookSettings(environment: environment) {
+            // `--settings` replaces any key it sets. Merge filesystem hooks so
+            // Distill does not wipe user/project/local Stop/PreToolUse/etc.
+            let filesystem = filesystemHookSettings(cwd: cwd, environment: environment)
+            settings["hooks"] = appendingDistillHooks(filesystem, distillHooks)
         }
         guard let data = try? JSONSerialization.data(withJSONObject: settings, options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else {
@@ -246,6 +226,118 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             return []
         }
         return ["--settings", json]
+    }
+
+    /// Distill-only CLI command hooks (PostToolUse + Bash PreToolUse).
+    /// Nested proxy merge uses this map without loading filesystem hooks.
+    static func tokenSaverDistillHookSettings(environment: [String: String]) -> [String: Any]? {
+        guard environment[tokenSaverPostToolUseEnvKey] == "1" else { return nil }
+        let managedOverride = environment["RC_REMOTE_CODE_MANAGED_BIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let binDirectory: URL
+        if let managedOverride, !managedOverride.isEmpty {
+            binDirectory = URL(fileURLWithPath: managedOverride, isDirectory: true)
+        } else {
+            binDirectory = AgentSkillInstaller.defaultManagedCLIBinDirectory()
+        }
+        let distillPath = binDirectory.appendingPathComponent("distill").path
+        let command = "\(distillPath) hook post-tool-use"
+        let prePipe = "\(distillPath) hook pre-tool-pipe"
+        return [
+            "PostToolUse": [
+                [
+                    "matcher": "*",
+                    "hooks": [
+                        [
+                            "type": "command",
+                            "command": command,
+                            "timeout": 45
+                        ] as [String: Any]
+                    ]
+                ] as [String: Any]
+            ],
+            "PreToolUse": [
+                [
+                    "matcher": "Bash",
+                    "hooks": [
+                        [
+                            "type": "command",
+                            "command": prePipe,
+                            "timeout": 5
+                        ] as [String: Any]
+                    ]
+                ] as [String: Any]
+            ]
+        ]
+    }
+
+    static func filesystemHookSettings(
+        cwd: String?,
+        environment: [String: String]
+    ) -> [String: Any] {
+        var merged: [String: Any] = [:]
+        var paths: [String] = []
+        if let home = environment["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !home.isEmpty {
+            paths.append(
+                URL(fileURLWithPath: home, isDirectory: true)
+                    .appendingPathComponent(".claude", isDirectory: true)
+                    .appendingPathComponent("settings.json").path
+            )
+        } else {
+            paths.append(
+                FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent(".claude", isDirectory: true)
+                    .appendingPathComponent("settings.json").path
+            )
+        }
+        if let cwd, !cwd.isEmpty {
+            let claudeDir = URL(fileURLWithPath: cwd, isDirectory: true)
+                .appendingPathComponent(".claude", isDirectory: true)
+            paths.append(claudeDir.appendingPathComponent("settings.json").path)
+            paths.append(claudeDir.appendingPathComponent("settings.local.json").path)
+        }
+        for path in paths {
+            guard let data = FileManager.default.contents(atPath: path),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let hooks = object["hooks"] as? [String: Any] else { continue }
+            merged = mergingHookMaps(merged, hooks)
+        }
+        return merged
+    }
+
+    static func mergingHookMaps(_ base: [String: Any], _ extra: [String: Any]) -> [String: Any] {
+        var out = base
+        for (event, value) in extra {
+            let extraEntries = value as? [[String: Any]] ?? []
+            let existing = out[event] as? [[String: Any]] ?? []
+            if extraEntries.isEmpty { continue }
+            out[event] = existing + extraEntries
+        }
+        return out
+    }
+
+    static func appendingDistillHooks(
+        _ filesystem: [String: Any],
+        _ distill: [String: Any]
+    ) -> [String: Any] {
+        var out = filesystem
+        for (event, value) in distill {
+            let required = value as? [[String: Any]] ?? []
+            let existing = out[event] as? [[String: Any]] ?? []
+            let existingJSON = (try? JSONSerialization.data(
+                withJSONObject: existing,
+                options: [.sortedKeys]
+            )).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            let marker: String
+            switch event {
+            case "PostToolUse": marker = "distill hook post-tool-use"
+            case "PreToolUse": marker = "distill hook pre-tool-pipe"
+            default: marker = "distill hook"
+            }
+            out[event] = existingJSON.contains(marker) ? existing : existing + required
+        }
+        return out
     }
 
     /// RemoteCode owns the single settings payload that configures thinking
@@ -282,7 +374,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         let prompt = request.providerPrompt
         let effort = normalizedReasoningEffort(request.reasoningEffort, model: request.model)
         args.append(contentsOf: effortArgs(effort, model: request.model))
-        args.append(contentsOf: ultracodeSettingsArgs(effort, environment: request.environment))
+        args.append(contentsOf: ultracodeSettingsArgs(effort, environment: request.environment, cwd: request.cwd))
         // Resume the prior session so the model keeps full context.
         if let ptid = request.providerThreadId, !ptid.isEmpty {
             args.append(contentsOf: ["--resume", ptid])
@@ -302,7 +394,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         return args
     }
 
-    public static func buildStreamingArgs(_ request: AgentRunRequest) -> [String] {
+    public static func buildStreamingArgs(_ request: AgentRunRequest, forkFrom sourceProviderThreadId: String? = nil) -> [String] {
         var args: [String] = [
             "--print",
             "--input-format", "stream-json",
@@ -325,8 +417,12 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         args.append(contentsOf: ["--model", request.model])
         let effort = normalizedReasoningEffort(request.reasoningEffort, model: request.model)
         args.append(contentsOf: effortArgs(effort, model: request.model))
-        args.append(contentsOf: ultracodeSettingsArgs(effort, environment: request.environment))
-        if let ptid = request.providerThreadId, !ptid.isEmpty {
+        args.append(contentsOf: ultracodeSettingsArgs(effort, environment: request.environment, cwd: request.cwd))
+        if let source = sourceProviderThreadId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !source.isEmpty,
+           let child = request.providerThreadId, !child.isEmpty {
+            args.append(contentsOf: ["--resume", source, "--fork-session", "--session-id", child])
+        } else if let ptid = request.providerThreadId, !ptid.isEmpty {
             args.append(contentsOf: ["--resume", ptid])
         } else {
             args.append(contentsOf: ["--session-id", request.threadId.value.uuidString])

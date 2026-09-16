@@ -75,4 +75,28 @@ final class ProcessTerminationPlanTests: XCTestCase {
             ProcessTerminationStep(pid: 500, signal: SIGKILL)
         ])
     }
+
+    func testInterruptPlanPhaseOneSendsSigintWithoutChangingSigtermPlan() {
+        let pids: [Int32] = [501, 502, 500]
+        let interrupt = ProcessTerminator.interruptPlan(
+            pids: pids,
+            isAlive: { _ in true },
+            graceElapsed: false
+        )
+        XCTAssertEqual(interrupt, [
+            ProcessTerminationStep(pid: 501, signal: SIGINT),
+            ProcessTerminationStep(pid: 502, signal: SIGINT),
+            ProcessTerminationStep(pid: 500, signal: SIGINT)
+        ])
+        let term = ProcessTerminator.terminationPlan(
+            pids: pids,
+            isAlive: { _ in true },
+            graceElapsed: false
+        )
+        XCTAssertEqual(term, [
+            ProcessTerminationStep(pid: 501, signal: SIGTERM),
+            ProcessTerminationStep(pid: 502, signal: SIGTERM),
+            ProcessTerminationStep(pid: 500, signal: SIGTERM)
+        ])
+    }
 }

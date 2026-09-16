@@ -1729,19 +1729,19 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         if let claudeExecutablePath {
             payload["claude_executable_path"] = claudeExecutablePath
         }
-        // Effort + ultracode settings reuse ClaudeRunner's canonical CLI mapping
-        // (native ultracode effort + {"ultracode":true,"enableWorkflows":true})
-        // so the SDK bridge and the streaming CLI never drift.
+        // Effort + ultracode settings: CLI keeps --effort ultracode; SDK
+        // Options.effort is xhigh plus settings {"ultracode":true,...}.
         let normalizedEffort = ClaudeRunner.normalizedReasoningEffort(
             request.reasoningEffort,
             model: request.model
         )
-        if let effort = ClaudeRunner.effortArgs(normalizedEffort, model: request.model).last {
+        if let effort = ClaudeRunner.sdkEffortToken(normalizedEffort, model: request.model) {
             payload["effort"] = effort
         }
         if let settings = ClaudeRunner.ultracodeSettingsArgs(
             normalizedEffort,
-            environment: request.environment
+            environment: request.environment,
+            cwd: request.cwd
         ).last {
             payload["settings"] = settings
         }
