@@ -1249,6 +1249,254 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
     }
 
+    func test_scheduledLiveReplayPlan_skipSuffixAndFullReplay() {
+        // WHY: growth inside the hot-replay cap must be O(delta); prune, first
+        // apply, and overflow must fail closed to the existing full replay.
+        let cap = AgentRunCoordinator.hotReplayEventCount
+        XCTAssertEqual(
+            AgentAppViewModel.scheduledLiveReplayPlan(previousCount: 10, currentCount: 10, cap: cap),
+            .skip
+        )
+        XCTAssertEqual(
+            AgentAppViewModel.scheduledLiveReplayPlan(previousCount: 10, currentCount: 15, cap: cap),
+            .suffix(offset: 10)
+        )
+        XCTAssertEqual(
+            AgentAppViewModel.scheduledLiveReplayPlan(previousCount: 0, currentCount: 15, cap: cap),
+            .fullReplay,
+            "previous==0 has no applied prefix, so suffix is unsafe"
+        )
+        XCTAssertEqual(
+            AgentAppViewModel.scheduledLiveReplayPlan(previousCount: 100, currentCount: 7, cap: cap),
+            .fullReplay,
+            "prune must full-replay"
+        )
+        XCTAssertEqual(
+            AgentAppViewModel.scheduledLiveReplayPlan(previousCount: 10, currentCount: cap + 1, cap: cap),
+            .fullReplay,
+            "current>cap must full-replay"
+        )
+    }
+
+    func test_tickScheduledLivePoll_growthAppliesSuffixWithoutZeroingTimeline() async throws {
+        // WHY: each COUNT growth used to zero AssistantTimelineState and reapply
+        // every latestStreamEvent. 100+5 must apply only the five new events.
+        let tmp = NSTemporaryDirectory() + "rc2-scheduled-suffix-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coord = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(), cwd: tmp,
+            coordinator: coord, threadRepo: threadRepo, messageRepo: messageRepo
+        )
+        let thread = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "scheduled",
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running
+        )
+        try threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running
+        )
+        try runRepo.upsert(run)
+        try persistScheduledEvents(runRepo: runRepo, run: run, threadId: thread.id, start: 0, count: 100)
+
+        vm.isScheduledThreadRunning = { $0 == thread.id }
+        vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        vm.tickScheduledLivePollForTesting()
+        XCTAssertEqual(vm.scheduledLiveApplyCountForTesting, 0, "idle equal COUNT must skip")
+        let turnsBeforeGrowth = vm.timeline.turns.count
+        XCTAssertGreaterThan(turnsBeforeGrowth, 0, "hydration must already hold the prefix")
+
+        try persistScheduledEvents(runRepo: runRepo, run: run, threadId: thread.id, start: 100, count: 5)
+        vm.tickScheduledLivePollForTesting()
+        XCTAssertEqual(
+            vm.scheduledLiveApplyCountForTesting,
+            5,
+            "in-cap growth must apply only the attested suffix"
+        )
+        XCTAssertEqual(
+            vm.timeline.turns.count,
+            turnsBeforeGrowth + 5,
+            "suffix apply must not zero the already-painted timeline"
+        )
+
+        let delete = try db.prepare("DELETE FROM agent_stream_events WHERE seq > 7;")
+        _ = try delete.step()
+        vm.tickScheduledLivePollForTesting()
+        XCTAssertEqual(
+            vm.scheduledLiveApplyCountForTesting,
+            7,
+            "prune 100→7 must fail closed to one full latestStreamEvents replay"
+        )
+        XCTAssertEqual(vm.timeline.turns.count, 7)
+    }
+
+    func test_tickScheduledLivePoll_hiddenDoesNotRefillPublishedTimeline() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-scheduled-hidden-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coord = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(), cwd: tmp,
+            coordinator: coord, threadRepo: threadRepo, messageRepo: messageRepo
+        )
+        let thread = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "scheduled-hidden",
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running
+        )
+        try threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running
+        )
+        try runRepo.upsert(run)
+        try persistScheduledEvents(runRepo: runRepo, run: run, threadId: thread.id, start: 0, count: 8)
+        vm.isScheduledThreadRunning = { $0 == thread.id }
+        vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        vm.setVisibility(.hidden)
+        XCTAssertTrue(vm.timeline.turns.isEmpty)
+        try persistScheduledEvents(runRepo: runRepo, run: run, threadId: thread.id, start: 8, count: 3)
+        vm.tickScheduledLivePollForTesting()
+        XCTAssertTrue(
+            vm.timeline.turns.isEmpty,
+            "hidden scheduled poll must apply to latestHiddenTimeline, not refill the published tree"
+        )
+        vm.setVisibility(.visible)
+        XCTAssertEqual(vm.timeline.turns.count, 11)
+    }
+
+    func test_rematerialize_liveTurnFastPathSkipsFinishedDictionaries() {
+        // WHY: a signature hit used to rebuild messagesById/turnsById for every
+        // turn on each stream tick. 200 finished + 1 live must patch only the live
+        // turn; a budget-generation bump takes the full path.
+        let finished: [AssistantTurnSnapshot] = (0..<200).map { index in
+            AssistantTurnSnapshot(
+                turnId: "done-\(index)",
+                items: [
+                    AssistantItem(
+                        id: "i-\(index)",
+                        turnId: "done-\(index)",
+                        type: .assistantMessage,
+                        state: .completed,
+                        body: "answer-\(index)",
+                        startedAtMs: Int64(index)
+                    )
+                ],
+                finalAssistantMessage: "answer-\(index)",
+                finished: true
+            )
+        }
+        let liveStale = AssistantTurnSnapshot(
+            turnId: "live",
+            items: [
+                AssistantItem(
+                    id: "live-i",
+                    turnId: "live",
+                    type: .assistantMessage,
+                    body: "Hel",
+                    startedAtMs: 9_000
+                )
+            ]
+        )
+        let liveLive = AssistantTurnSnapshot(
+            turnId: "live",
+            items: [
+                AssistantItem(
+                    id: "live-i",
+                    turnId: "live",
+                    type: .assistantMessage,
+                    body: "Hello streamed",
+                    startedAtMs: 9_000
+                )
+            ]
+        )
+        let cached = (finished + [liveStale]).map(AgentAppView.TranscriptEntry.turn)
+        AgentAppView.TranscriptRematerializeProbe.reset()
+        let patched = AgentAppView.rematerializedTranscriptEntries(
+            cached: cached,
+            messages: [],
+            turns: finished + [liveLive],
+            liveTurnIds: ["live"],
+            messagesGenerationUnchanged: true,
+            forceFullPath: false
+        )
+        XCTAssertEqual(AgentAppView.TranscriptRematerializeProbe.liveTurnPatchCount, 1)
+        XCTAssertEqual(AgentAppView.TranscriptRematerializeProbe.dictionaryBuildCount, 0)
+        guard case .turn(let servedLive) = patched.last else {
+            return XCTFail("live turn stays a turn")
+        }
+        XCTAssertEqual(servedLive.items.first?.body, "Hello streamed")
+        guard case .turn(let servedFinished) = patched[0] else {
+            return XCTFail("finished turn preserved")
+        }
+        XCTAssertEqual(servedFinished.items.first?.body, "answer-0")
+
+        AgentAppView.TranscriptRematerializeProbe.reset()
+        _ = AgentAppView.rematerializedTranscriptEntries(
+            cached: cached,
+            messages: [],
+            turns: finished + [liveLive],
+            liveTurnIds: ["live"],
+            messagesGenerationUnchanged: true,
+            forceFullPath: true
+        )
+        XCTAssertEqual(
+            AgentAppView.TranscriptRematerializeProbe.dictionaryBuildCount,
+            1,
+            "aggregate hot-text budget walk must take the full dictionary path"
+        )
+    }
+
+    private func persistScheduledEvents(
+        runRepo: AgentRunRepository,
+        run: AgentRun,
+        threadId: AgentThreadID,
+        start: Int,
+        count: Int
+    ) throws {
+        let encoder = JSONEncoder()
+        var writes: [AgentRunRepository.StreamWriteIntent] = []
+        writes.reserveCapacity(count)
+        for index in start..<(start + count) {
+            let event = AssistantEvent.turnStarted(turnId: "sched-\(index)")
+            writes.append(.init(
+                seq: index + 1,
+                kind: event.debugDescription,
+                payloadJSON: String(decoding: try encoder.encode(event), as: UTF8.self),
+                providerEvent: nil
+            ))
+        }
+        try runRepo.persistStreamBatch(
+            runId: run.id,
+            threadId: threadId,
+            items: writes,
+            shouldPruneStreamEvents: false
+        )
+    }
+
     // MARK: - Coalesced aggregate hot-text budget walk
 
     private func streamInput(
