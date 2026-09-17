@@ -91,6 +91,26 @@ final class GrokParserTests: XCTestCase {
                        "Grok cost_in_usd_ticks must become integer micros without floating pricing")
     }
 
+    /// WHY: grok-build 1.0 streaming-json emits a per-response `usage` line
+    /// before `end`. Ignoring it leaves Token Saver empty when `end` omits spend.
+    func test_usageEventEmitsTokenUsageWithoutEndingTurn() {
+        let line = #"""
+        {"type":"usage","messageId":"resp_1","stopReason":"end_turn","usage":{"input_tokens":812,"output_tokens":45,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"reasoning_tokens":0}}
+        """#
+        let parser = GrokParser()
+        let events = parser.parseLine(line)
+        let usage = events.compactMap { ev -> AssistantTokenUsage? in
+            if case .tokenUsage(let u) = ev { return u }
+            return nil
+        }.first
+        XCTAssertEqual(usage?.outputTokens, 45)
+        XCTAssertEqual(usage?.inputTokens, 812)
+        XCTAssertFalse(events.contains {
+            if case .turnCompleted = $0 { return true }
+            return false
+        }, "usage is a mid-turn spend stamp, not end_turn")
+    }
+
     func test_tokenUsageFromUsageOnlyObject() {
         let usage = GrokParser.tokenUsage(from: [
             "usage": [

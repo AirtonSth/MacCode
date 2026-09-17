@@ -779,12 +779,16 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                     sessionId: providerThreadId,
                     cwd: request.cwd,
                     noReplay: shouldStartPrompt,
-                    yoloMode: request.permissionMode == .fullAccess
+                    yoloMode: request.permissionMode == .fullAccess,
+                    modelId: request.model,
+                    reasoningEffort: request.reasoningEffort
                 )
             } else {
                 opened = try await client.newSession(
                     cwd: request.cwd,
-                    yoloMode: request.permissionMode == .fullAccess
+                    yoloMode: request.permissionMode == .fullAccess,
+                    modelId: request.model,
+                    reasoningEffort: request.reasoningEffort
                 )
             }
             let mapper = GrokACPEventMapper(sessionId: opened.sessionId)

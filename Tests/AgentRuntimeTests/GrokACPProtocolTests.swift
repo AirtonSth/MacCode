@@ -1621,11 +1621,11 @@ final class GrokACPProtocolTests: XCTestCase {
             prefersConfigOptionEffort: true,
             advertisedEfforts: [.low, .medium, .high, .xhigh]
         )
-        guard case let .setConfigOption(_, value, clamped) = effortOnlyAfterModelSwitch else {
-            return XCTFail("stale grok-4.6 ads on grok-4.5 must still clamp, got \(effortOnlyAfterModelSwitch)")
-        }
-        XCTAssertEqual(value, "high")
-        XCTAssertEqual(clamped, .high)
+        XCTAssertEqual(
+            effortOnlyAfterModelSwitch,
+            .none,
+            "xhigh clamps to grok-4.5 high; session already high so no redundant bind"
+        )
 
         let museEmptyMeta = GrokACPClient.modelEffortBind(
             requestModel: "muse-spark-1.3-contributor",
@@ -1679,6 +1679,92 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(open.advertisedReasoningEffortIds, ["xhigh", "high"])
         XCTAssertEqual(open.currentReasoningEffortRaw, "xhigh")
         XCTAssertTrue(open.advertisesReasoningEffortConfig)
+    }
+
+    /// WHY: live grok 1.0.34 session/new without `_meta.modelId` opens on the
+    /// process default (deepseek-v4.1-flash). configOptions then advertise
+    /// `max`/`none` while grok-4.6 `_meta` is `high` + `low|medium|high|xhigh`.
+    func test_openResultIgnoresForeignModelConfigEffortAds() throws {
+        let result: [String: Any] = [
+            "sessionId": "sid-deepseek-default",
+            "models": [
+                "currentModelId": "grok-4.6",
+                "availableModels": [
+                    [
+                        "modelId": "grok-4.6",
+                        "name": "Grok 4.6",
+                        "_meta": [
+                            "supportsReasoningEffort": true,
+                            "reasoningEffort": "high",
+                            "reasoningEfforts": [
+                                ["id": "xhigh", "value": "xhigh", "default": false],
+                                ["id": "high", "value": "high", "default": true],
+                                ["id": "medium", "value": "medium", "default": false],
+                                ["id": "low", "value": "low", "default": false],
+                            ],
+                        ],
+                    ] as [String: Any],
+                ],
+            ] as [String: Any],
+            "configOptions": [
+                [
+                    "id": "reasoning_effort",
+                    "category": "thought_level",
+                    "currentValue": "max",
+                    "options": [
+                        ["value": "max", "name": "Max"],
+                        ["value": "xhigh", "name": "Extra High"],
+                        ["value": "high", "name": "High"],
+                        ["value": "medium", "name": "Medium"],
+                        ["value": "low", "name": "Low"],
+                        ["value": "none", "name": "None"],
+                    ],
+                ],
+            ],
+        ]
+        let open = try GrokACPClient.openResult(result, fallbackSessionId: nil)
+        XCTAssertEqual(open.currentReasoningEffortRaw, "high",
+                       "config currentValue max is not on grok-4.6 _meta; use model current")
+        XCTAssertEqual(open.advertisedReasoningEffortIds, ["xhigh", "high", "medium", "low"])
+        XCTAssertFalse(open.advertisedReasoningEffortIds.contains("max"))
+        XCTAssertFalse(open.advertisedReasoningEffortIds.contains("none"))
+    }
+
+    /// WHY: grok-build session_setup reads `_meta.modelId` and
+    /// `_meta.reasoningEffort` at spawn. Omitting them leaves the session on
+    /// the process default model until a later set_model.
+    func test_sessionOpenParamsEncodeModelIdAndReasoningEffort() throws {
+        let omitted = GrokACPClient.sessionOpenParams(cwd: "/tmp", mcpServers: [Any]())
+        XCTAssertNil(omitted["_meta"])
+
+        let spawned = GrokACPClient.sessionOpenParams(
+            cwd: "/tmp",
+            mcpServers: [Any](),
+            yoloMode: true,
+            modelId: " grok-4.6 ",
+            reasoningEffort: .high
+        )
+        let meta = try XCTUnwrap(spawned["_meta"] as? [String: Any])
+        XCTAssertEqual(meta["modelId"] as? String, "grok-4.6")
+        XCTAssertEqual(meta["reasoningEffort"] as? String, "high")
+        XCTAssertEqual(meta["yoloMode"] as? Bool, true)
+
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let adapter = try String(
+            contentsOf: root.appendingPathComponent("Sources/AgentRuntime/GrokACPAdapter.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            adapter.contains("modelId: request.model"),
+            "Adapter must pass the thread model into session/new and session/load"
+        )
+        XCTAssertTrue(
+            adapter.contains("reasoningEffort: request.reasoningEffort"),
+            "Adapter must pass thread effort into session/new and session/load"
+        )
     }
 
     /// WHY: warm reattach + prompt still paid full gateway replay unless
