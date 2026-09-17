@@ -497,7 +497,17 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         XCTAssertEqual(eff(.max), "max", "Max must use Claude's native max effort flag")
         XCTAssertEqual(eff(.ultracode), "ultracode",
                        "Claude Code 2.1.203+ accepts ultracode as a native effort value")
-        XCTAssertEqual(eff(nil), "medium", "no effort → a sane default, never omitted")
+        XCTAssertEqual(eff(nil), "high", "omitted effort follows Claude Code's default high")
+        let opus47 = AgentRunRequest(
+            threadId: AgentThreadID(), provider: .claude, model: "claude-opus-4-7",
+            cwd: "/tmp", prompt: "x", permissionMode: .supervised, reasoningEffort: nil
+        )
+        let opus47Args = ClaudeRunner.buildArgs(opus47)
+        XCTAssertEqual(
+            opus47Args[opus47Args.index(after: opus47Args.firstIndex(of: "--effort")!)],
+            "xhigh",
+            "Opus 4.7 omitted effort follows Claude Code's xhigh default"
+        )
     }
 
     func test_effortIsNormalizedToTheSelectedClaudeModel() throws {
