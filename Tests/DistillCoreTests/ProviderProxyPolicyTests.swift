@@ -669,6 +669,30 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ), "Agent App must not invent a receipt for an unknown Codex model contract")
         }
 
+        for catalogModel in ["gpt-6-astra", "gpt-5.3-codex", "gpt-5.2"] {
+            let delegation = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "codex",
+                arguments: [
+                    "exec", "--model", catalogModel,
+                    "-c", "model_reasoning_effort=high", "work"
+                ],
+                promptFile: prompt
+            ), "CodexRunner catalog model \(catalogModel) must be promotable with a representable effort")
+            XCTAssertEqual(delegation.provider, .codex)
+            XCTAssertEqual(delegation.model, catalogModel)
+            XCTAssertEqual(delegation.reasoningEffort, .high)
+        }
+        let astraMax = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "codex",
+            arguments: [
+                "exec", "--model", "gpt-6-astra",
+                "-c", "model_reasoning_effort=max", "work"
+            ],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(astraMax.reasoningEffort, .max,
+                       "gpt-6-astra advertises max in the live catalog snapshot")
+
         let grok = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "grok",
             arguments: [
@@ -728,6 +752,17 @@ final class ProviderProxyPolicyTests: XCTestCase {
             arguments: ["exec", "resume", "sess-1"],
             promptFile: prompt
         ))
+        for subcommand in ["fork", "review", "help"] {
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "codex",
+                arguments: [
+                    "exec", subcommand, "sess-1",
+                    "--model", "gpt-6-astra",
+                    "-c", "model_reasoning_effort=high"
+                ],
+                promptFile: prompt
+            ), "codex exec \(subcommand) must stay on the raw CLI")
+        }
         XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "codex",
             arguments: [
