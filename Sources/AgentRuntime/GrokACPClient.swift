@@ -411,6 +411,10 @@ struct GrokACPSessionOpenResult {
     }
 
     /// Effort ids advertised on the `reasoning_effort` config option, when present.
+    /// Live grok 1.0.34 builds that list from the *session* current model. When
+    /// the process default is not the host model (deepseek `max`/`none` vs
+    /// grok-4.6 `low|medium|high|xhigh`), intersect with the current model's
+    /// `_meta.reasoningEfforts` so stale ads cannot bind.
     var advertisedReasoningEffortIds: [String] {
         guard let option = configOptions.first(where: {
             (($0["id"] as? String) ?? ($0["configId"] as? String)) == "reasoning_effort"
@@ -418,11 +422,18 @@ struct GrokACPSessionOpenResult {
         let values = option["options"] as? [[String: Any]]
             ?? option["values"] as? [[String: Any]]
             ?? []
-        return values.compactMap { raw -> String? in
+        let fromConfig = values.compactMap { raw -> String? in
             let id = (raw["value"] as? String) ?? (raw["id"] as? String)
             let trimmed = id?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return trimmed.isEmpty ? nil : trimmed
         }
+        let trimmedModel = currentModelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let modelIds = (models.first { $0.id == trimmedModel } ?? models.first)?
+            .supportedReasoningEfforts.map(\.rawValue) ?? []
+        guard !modelIds.isEmpty else { return fromConfig }
+        let allowed = Set(modelIds)
+        let intersected = fromConfig.filter { allowed.contains($0) }
+        return intersected.isEmpty ? modelIds : intersected
     }
 }
 
@@ -713,12 +724,17 @@ public final class GrokACPClient: @unchecked Sendable {
     /// load-path skip. Both share one `_meta` object so neither replaces the other.
     /// `autoMode` is intentionally omitted: RemoteCode autoAcceptEdits maps to
     /// `set_mode acceptEdits`, not Grok auto.
+    /// grok-build 1.0.5+ reads `_meta.modelId` and `_meta.reasoningEffort` at
+    /// spawn (`session_setup` / `parse_reasoning_effort_meta`) so the session
+    /// is not created on the process default model (live 1.0.34: deepseek).
     static func sessionOpenParams(
         cwd: String,
         mcpServers: [Any],
         sessionId: String? = nil,
         yoloMode: Bool = false,
-        noReplay: Bool = false
+        noReplay: Bool = false,
+        modelId: String? = nil,
+        reasoningEffort: AgentReasoningEffort? = nil
     ) -> JSONObject {
         var params: JSONObject = [
             "cwd": cwd,
@@ -734,19 +750,34 @@ public final class GrokACPClient: @unchecked Sendable {
         if noReplay {
             meta["noReplay"] = true
         }
+        let trimmedModel = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedModel.isEmpty {
+            meta["modelId"] = trimmedModel
+        }
+        if let reasoningEffort,
+           let wire = wireReasoningEffort(reasoningEffort, modelId: trimmedModel) {
+            meta["reasoningEffort"] = wire
+        }
         if !meta.isEmpty {
             params["_meta"] = meta
         }
         return params
     }
 
-    func newSession(cwd: String, yoloMode: Bool = false) async throws -> GrokACPSessionOpenResult {
+    func newSession(
+        cwd: String,
+        yoloMode: Bool = false,
+        modelId: String? = nil,
+        reasoningEffort: AgentReasoningEffort? = nil
+    ) async throws -> GrokACPSessionOpenResult {
         let result = try await requestJSONObject(
             method: "session/new",
             params: Self.sessionOpenParams(
                 cwd: Self.resolvedSessionCwd(cwd),
                 mcpServers: Self.sessionMCPServers(environment: mcpEnvironment),
-                yoloMode: yoloMode
+                yoloMode: yoloMode,
+                modelId: modelId,
+                reasoningEffort: reasoningEffort
             ),
             timeout: 20
         )
@@ -762,14 +793,18 @@ public final class GrokACPClient: @unchecked Sendable {
         sessionId: String,
         cwd: String,
         noReplay: Bool = false,
-        yoloMode: Bool = false
+        yoloMode: Bool = false,
+        modelId: String? = nil,
+        reasoningEffort: AgentReasoningEffort? = nil
     ) async throws -> GrokACPSessionOpenResult {
         let params = Self.sessionOpenParams(
             cwd: Self.resolvedSessionCwd(cwd),
             mcpServers: Self.sessionMCPServers(environment: mcpEnvironment),
             sessionId: sessionId,
             yoloMode: yoloMode,
-            noReplay: noReplay
+            noReplay: noReplay,
+            modelId: modelId,
+            reasoningEffort: reasoningEffort
         )
         let result = try await requestJSONObject(
             method: "session/load",
@@ -1405,26 +1440,53 @@ public final class GrokACPClient: @unchecked Sendable {
         return ([preferred] + rest, preferred)
     }
 
-    /// Live current effort from typed configOptions, else model `_meta`.
+    /// Live current effort from typed configOptions when it belongs to the
+    /// current model's `_meta.reasoningEfforts`; otherwise that model's
+    /// `_meta.reasoningEffort`. Session-global `currentValue` can be the
+    /// process-default model's token (`max`/`none` on deepseek) while grok-4.6
+    /// `_meta` is `high`.
     static func currentReasoningEffortRaw(
         from state: JSONObject?,
         currentModelId: String?,
         configOptions: [JSONObject] = []
     ) -> String? {
+        let rawModels = state?["availableModels"] as? [JSONObject] ?? []
+        let trimmed = currentModelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let match = rawModels.first { ($0["modelId"] as? String) == trimmed } ?? rawModels.first
+        let metadata = match?["_meta"] as? JSONObject ?? [:]
+        let modelRaw = (metadata["reasoningEffort"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let modelEffortIds: [String] = {
+            let entries = (metadata["reasoningEfforts"] as? [JSONObject])
+                ?? (metadata["supportedReasoningEfforts"] as? [JSONObject])
+                ?? []
+            if !entries.isEmpty {
+                return entries.compactMap { entry in
+                    let id = (entry["id"] as? String)
+                        ?? (entry["value"] as? String)
+                        ?? (entry["reasoningEffort"] as? String)
+                    let trimmedId = id?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    return trimmedId.isEmpty ? nil : trimmedId
+                }
+            }
+            if let strings = metadata["reasoningEfforts"] as? [String]
+                ?? metadata["supportedReasoningEfforts"] as? [String] {
+                return strings.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+            }
+            return []
+        }()
         if let option = configOptions.first(where: {
             (($0["id"] as? String) ?? ($0["configId"] as? String)) == "reasoning_effort"
         }) {
             let current = (option["currentValue"] as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !current.isEmpty { return current }
+            if !current.isEmpty,
+               modelEffortIds.isEmpty || modelEffortIds.contains(current) {
+                return current
+            }
         }
-        let rawModels = state?["availableModels"] as? [JSONObject] ?? []
-        let trimmed = currentModelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let match = rawModels.first { ($0["modelId"] as? String) == trimmed } ?? rawModels.first
-        let metadata = match?["_meta"] as? JSONObject ?? [:]
-        let raw = (metadata["reasoningEffort"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return raw.isEmpty ? nil : raw
+        return modelRaw.isEmpty ? nil : modelRaw
     }
 
     /// Seed open-state effort from live current when advertised; else preferred default (`.first`).

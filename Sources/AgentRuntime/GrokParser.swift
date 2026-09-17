@@ -88,6 +88,13 @@ public final class GrokParser {
             assembledAssistantBody += chunk
             out.append(.itemDelta(itemId: itemId, bodyAppend: chunk, outputAppend: nil, summary: nil))
 
+        case "usage":
+            // grok-build 1.0 streaming-json emits a per-response `usage` line
+            // before `end`. Token Saver rings must not wait for `end` only.
+            if let usage = Self.tokenUsage(from: obj) {
+                out.append(.tokenUsage(usage))
+            }
+
         case "end":
             ensureTurn(&out)
             // Prefer the authoritative session id on end so resume works.
