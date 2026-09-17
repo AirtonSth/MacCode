@@ -5916,6 +5916,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return .suffix(offset: previousCount)
     }
 
+    /// Idle 2s ticks already have run chrome from bindScheduledOwnedRun.
+    /// Re-read durable chrome only when the stream moved or the run id is unset.
+    nonisolated static func shouldRefreshScheduledLiveChrome(
+        countChanged: Bool,
+        hasBoundRunId: Bool
+    ) -> Bool {
+        countChanged || !hasBoundRunId
+    }
+
     /// Seed Working-for clock + run id from durable agent_runs and start live poll.
     private func bindScheduledOwnedRun(threadId: AgentThreadID) {
         let durable = try? coordinator.durableActiveRunChrome(threadId: threadId)
@@ -5979,15 +5988,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             selectThread(id, markRead: false)
             return
         }
-        if let durable = try? coordinator.durableActiveRunChrome(threadId: id) {
-            runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
-                current: runStartedAt,
-                persisted: durable.startedAt
-            )
-            currentRunId = durable.id
-            runThreads[durable.id] = id
-            if status != .running { status = .running }
-        }
         // Idle polls: cheap COUNT(*) first. Cursor disagreement (window slide at
         // equal COUNT) fail-closes to a full replay. In-cap growth uses the
         // attested suffix and never zeros the already-applied prefix.
@@ -6002,6 +6002,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         )
         if case .skip = plan, previousCursor != cursor {
             plan = .fullReplay
+        }
+        if Self.shouldRefreshScheduledLiveChrome(
+            countChanged: plan != .skip,
+            hasBoundRunId: currentRunId != nil
+        ), let durable = try? coordinator.durableActiveRunChrome(threadId: id) {
+            runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
+                current: runStartedAt,
+                persisted: durable.startedAt
+            )
+            currentRunId = durable.id
+            runThreads[durable.id] = id
+            if status != .running { status = .running }
         }
         scheduledLiveApplyCountForTesting = 0
         switch plan {
@@ -14778,7 +14790,8 @@ public struct AgentAppView: View {
                                         row,
                                         columnWidth: timelineColumnWidth,
                                         groupHeader: rowPaintContext.peerGroupHeader(for: row),
-                                        hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row)
+                                        hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row),
+                                        mentionableBots: mentionBots
                                     )
                                     .id(row.id)
                                 }
@@ -14789,7 +14802,8 @@ public struct AgentAppView: View {
                                     row,
                                     columnWidth: timelineColumnWidth,
                                     groupHeader: rowPaintContext.peerGroupHeader(for: row),
-                                    hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row)
+                                    hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row),
+                                    mentionableBots: mentionBots
                                 )
                                 .id(row.id)
                             }
@@ -16032,7 +16046,11 @@ public struct AgentAppView: View {
     }
 
     @ViewBuilder
-    private func messageRow(_ msg: AgentMessage, columnWidth: CGFloat = 10_000) -> some View {
+    private func messageRow(
+        _ msg: AgentMessage,
+        columnWidth: CGFloat = 10_000,
+        mentionableBots: [BotDefinition] = []
+    ) -> some View {
         switch msg.role {
         case .user:
             if Self.isInternalPeerHopUserMessage(msg) {
@@ -16049,7 +16067,7 @@ public struct AgentAppView: View {
             )
             let mentioned = Self.messagedPeer(
                 in: displayText,
-                bots: vm.mentionableBotsProvider()
+                bots: mentionableBots
             )
             AgentChatUserBubble(
                 text: displayText,
@@ -16102,14 +16120,14 @@ public struct AgentAppView: View {
                         avatarSymbol: Self.resolvedPeerAvatarSymbol(
                             handle: activity.handle,
                             encoded: "",
-                            bots: vm.mentionableBotsProvider()
+                            bots: mentionableBots
                         )
                     )
                 } else if let parsed = BotPeerTranscript.parse(msg.content) {
                     let showBadge = Self.showsTokenSaverOptimizedBadge(
                         wasTokenSaverOptimized: vm.tokenSaverOptimizedMessageIds.contains(msg.id)
                     )
-                    let bots = vm.mentionableBotsProvider()
+                    let bots = mentionableBots
                     AgentChatAssistantReply(
                         text: parsed.body,
                         roleIdentifier: "agent.role.assistant",
@@ -16351,7 +16369,8 @@ public struct AgentAppView: View {
         _ entry: TranscriptEntry,
         columnWidth: CGFloat,
         groupHeader: AgentChatPeerGroupHeader? = nil,
-        hideAssistantOutput: Bool = false
+        hideAssistantOutput: Bool = false,
+        mentionableBots: [BotDefinition] = []
     ) -> some View {
         VStack(alignment: .leading, spacing: DS.Space.sm) {
             if let groupHeader {
@@ -16359,7 +16378,7 @@ public struct AgentAppView: View {
             }
             switch entry {
             case .message(let message):
-                messageRow(message, columnWidth: columnWidth)
+                messageRow(message, columnWidth: columnWidth, mentionableBots: mentionableBots)
             case .turn(let turn):
                 turnView(turn, hideAssistantOutput: hideAssistantOutput)
             }
@@ -16371,7 +16390,8 @@ public struct AgentAppView: View {
         _ row: ChatFlowRow,
         columnWidth: CGFloat,
         groupHeader: AgentChatPeerGroupHeader? = nil,
-        hideAssistantOutput: Bool = false
+        hideAssistantOutput: Bool = false,
+        mentionableBots: [BotDefinition] = []
     ) -> some View {
         switch row {
         case .entry(let entry):
@@ -16379,7 +16399,8 @@ public struct AgentAppView: View {
                 entry,
                 columnWidth: columnWidth,
                 groupHeader: groupHeader,
-                hideAssistantOutput: hideAssistantOutput
+                hideAssistantOutput: hideAssistantOutput,
+                mentionableBots: mentionableBots
             )
         case .segment(let segment):
             turnSegmentView(segment, hideAssistantOutput: hideAssistantOutput)

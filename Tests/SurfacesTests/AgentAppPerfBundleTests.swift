@@ -1276,6 +1276,81 @@ final class AgentAppPerfBundleTests: XCTestCase {
             .fullReplay,
             "current>cap must full-replay"
         )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldRefreshScheduledLiveChrome(
+                countChanged: false,
+                hasBoundRunId: true
+            ),
+            "idle bound ticks must not re-read durable chrome"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldRefreshScheduledLiveChrome(
+                countChanged: false,
+                hasBoundRunId: false
+            )
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldRefreshScheduledLiveChrome(
+                countChanged: true,
+                hasBoundRunId: true
+            )
+        )
+    }
+
+    /// WHY: applying 8 new events onto an already-replayed 504-event timeline
+    /// must beat rebuilding all 512 events. This is the LaunchAgent growth tick.
+    func test_scheduledLiveSuffixApply_beatsFullReplayMedian() {
+        func events(_ count: Int) -> [AssistantEvent] {
+            (0..<count).map { index in
+                .turnStarted(turnId: "turn-\(index)")
+            }
+        }
+        let all = events(512)
+        let prefix = Array(all.prefix(504))
+        let suffix = Array(all.suffix(8))
+        func timeMs(_ body: () -> Void) -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            body()
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0
+        }
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        for _ in 0..<2 {
+            _ = AgentAppViewModel.timelineByReplaying(all)
+            var warmed = AgentAppViewModel.timelineByReplaying(prefix)
+            for event in suffix { warmed.apply(event) }
+            warmed.enforceAggregateHotTextBudget()
+        }
+        var before: [Double] = []
+        var growth: [Double] = []
+        let resident = AgentAppViewModel.timelineByReplaying(prefix)
+        for _ in 0..<5 {
+            before.append(timeMs {
+                _ = AgentAppViewModel.timelineByReplaying(all)
+            })
+            growth.append(timeMs {
+                var next = resident
+                for event in suffix { next.apply(event) }
+                next.enforceAggregateHotTextBudget()
+            })
+        }
+        let beforeMed = median(before)
+        let growthMed = median(growth)
+        let improvement = (beforeMed - growthMed) / max(beforeMed, 0.000_001) * 100.0
+        NSLog(
+            "[perf-proof] scheduled-live-poll full_ms=%@ suffix_ms=%@ improvement_pct=%.2f",
+            String(beforeMed),
+            String(growthMed),
+            improvement
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5.0,
+            "suffix apply must beat full replay by ≥5% (got \(improvement)%; full=\(beforeMed)ms suffix=\(growthMed)ms)"
+        )
     }
 
     func test_tickScheduledLivePoll_growthAppliesSuffixWithoutZeroingTimeline() async throws {
