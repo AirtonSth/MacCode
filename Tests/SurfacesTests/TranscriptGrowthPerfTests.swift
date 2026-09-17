@@ -2,6 +2,8 @@ import XCTest
 import AppKit
 import CoreModel
 import DesignSystemKit
+import Persistence
+import AgentRuntime
 @testable import Surfaces
 
 /// Regression pins for TODO.md F2 (2026-09-14): work in the Agent App transcript
@@ -173,6 +175,64 @@ final class TranscriptGrowthPerfTests: XCTestCase {
     }
 
     // MARK: AA-20 source pin
+
+    @MainActor
+    func test_composerSuggestionsMemoHitsOnIdenticalInputs() throws {
+        // WHY: composerSuggestions rebuilt slash/mention matches on every
+        // SwiftUI body pass even when prompt, caret, and bots were unchanged.
+        let tmp = NSTemporaryDirectory() + "rc2-composer-memo-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [:]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(),
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        let bot = BotDefinition(handle: "quinn", name: "Quinn", title: "", description: "")
+        vm.mentionableBotsProvider = { [bot] }
+        vm.prompt = "@q"
+        vm.composerCursorOffset = vm.prompt.utf16.count
+        let first = vm.composerSuggestions
+        let afterFirst = vm.composerSuggestionComputeCountForTesting
+        XCTAssertFalse(first.isEmpty)
+        _ = vm.composerSuggestions
+        _ = vm.composerSuggestions
+        XCTAssertEqual(
+            vm.composerSuggestionComputeCountForTesting,
+            afterFirst,
+            "identical prompt/caret/bots must reuse the memo"
+        )
+        vm.prompt = "@qu"
+        _ = vm.composerSuggestions
+        XCTAssertEqual(
+            vm.composerSuggestionComputeCountForTesting,
+            afterFirst + 1,
+            "a prompt change must recompute suggestions"
+        )
+    }
+
+    func test_messageRowDoesNotCallMentionableBotsProvider() throws {
+        // WHY: each user/peer row used to recopy the bot list. The timeline
+        // column snapshots once and threads the array down.
+        let source = try String(contentsOf: sourceURL("Sources/Surfaces/AgentAppSurface.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "private func messageRow("))
+        let slice = String(source[start.upperBound...].prefix(3_500))
+        XCTAssertFalse(
+            slice.contains("mentionableBotsProvider()"),
+            "messageRow must reuse the parent snapshot"
+        )
+        XCTAssertTrue(slice.contains("mentionableBots: [BotDefinition]"))
+    }
 
     func test_turnViewDoesNotComputeTheFullTurnRenderModel() throws {
         // WHY: `turnView` consumed only `turnPlans` from `turnRenderInputs(for:)`

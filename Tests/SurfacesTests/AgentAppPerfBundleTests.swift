@@ -1249,6 +1249,165 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
     }
 
+    /// WHY (AA-30 residual): COUNT(*) gating still rebuilt the whole hot
+    /// window on +N growth. Same-run contiguous sequence growth must plan a
+    /// suffix; prune / run change / missing watermark stay full; idle equal
+    /// counts skip durable chrome when a run id is already bound.
+    func test_scheduledLivePollRebuildPlan_suffixOnGrowthFullOnPrune() {
+        let run = AgentRunID()
+        XCTAssertEqual(
+            AgentAppViewModel.scheduledLivePollRebuildPlan(
+                previousCount: 40,
+                currentCount: 40,
+                previousRunId: run,
+                currentRunId: run,
+                previousSequence: 40,
+                currentSequence: 40,
+                previousMutationId: 40,
+                currentMutationId: 40
+            ),
+            .none
+        )
+        XCTAssertEqual(
+            AgentAppViewModel.scheduledLivePollRebuildPlan(
+                previousCount: 40,
+                currentCount: 48,
+                previousRunId: run,
+                currentRunId: run,
+                previousSequence: 40,
+                currentSequence: 48,
+                previousMutationId: 100,
+                currentMutationId: 108
+            ),
+            .suffix(advance: 8)
+        )
+        XCTAssertEqual(
+            AgentAppViewModel.scheduledLivePollRebuildPlan(
+                previousCount: 40,
+                currentCount: 12,
+                previousRunId: run,
+                currentRunId: run,
+                previousSequence: 40,
+                currentSequence: 12,
+                previousMutationId: 100,
+                currentMutationId: 12
+            ),
+            .full
+        )
+        XCTAssertEqual(
+            AgentAppViewModel.scheduledLivePollRebuildPlan(
+                previousCount: 10,
+                currentCount: 11,
+                previousRunId: run,
+                currentRunId: AgentRunID(),
+                previousSequence: 10,
+                currentSequence: 1,
+                previousMutationId: 10,
+                currentMutationId: 11
+            ),
+            .full,
+            "a different run must fail closed to a full replay"
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldRefreshScheduledLiveChrome(
+                countChanged: false,
+                hasBoundRunId: true
+            ),
+            "idle bound ticks must not re-read durable chrome"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldRefreshScheduledLiveChrome(
+                countChanged: false,
+                hasBoundRunId: false
+            )
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldRefreshScheduledLiveChrome(
+                countChanged: true,
+                hasBoundRunId: true
+            )
+        )
+    }
+
+    /// WHY: applying 8 new events onto an already-replayed 504-event timeline
+    /// must beat rebuilding all 512 events. This is the user-facing scheduled
+    /// poll growth path (LaunchAgent-owned run).
+    func test_scheduledLiveSuffixApply_beatsFullReplayMedian() {
+        func events(_ count: Int) -> [AssistantEvent] {
+            (0..<count).map { index in
+                .turnStarted(turnId: "turn-\(index)")
+            }
+        }
+        let all = events(512)
+        let prefix = Array(all.prefix(504))
+        let suffix = Array(all.suffix(8))
+        func timeMs(_ body: () -> Void) -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            body()
+            let end = DispatchTime.now().uptimeNanoseconds
+            return Double(end - start) / 1_000_000.0
+        }
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        for _ in 0..<2 {
+            _ = AgentAppViewModel.timelineByReplaying(all)
+            var warmed = AgentAppViewModel.timelineByReplaying(prefix)
+            for event in suffix { warmed.apply(event) }
+            warmed.enforceAggregateHotTextBudget()
+        }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<5 {
+            before.append(timeMs {
+                _ = AgentAppViewModel.timelineByReplaying(all)
+            })
+            after.append(timeMs {
+                var next = AgentAppViewModel.timelineByReplaying(prefix)
+                for event in suffix { next.apply(event) }
+                next.enforceAggregateHotTextBudget()
+            })
+        }
+        // Fair growth tick: prefix is already resident; only the suffix apply
+        // is paid. Replaying prefix inside the after sample would hide the win.
+        var growth: [Double] = []
+        let resident = AgentAppViewModel.timelineByReplaying(prefix)
+        for _ in 0..<5 {
+            growth.append(timeMs {
+                var next = resident
+                for event in suffix { next.apply(event) }
+                next.enforceAggregateHotTextBudget()
+            })
+        }
+        let beforeMed = median(before)
+        let growthMed = median(growth)
+        let improvement = (beforeMed - growthMed) / max(beforeMed, 0.000_001) * 100.0
+        NSLog(
+            "[perf-proof] scheduled-live-poll full_ms=%@ suffix_ms=%@ improvement_pct=%.2f before=%@ growth=%@",
+            String(beforeMed),
+            String(growthMed),
+            improvement,
+            String(describing: before),
+            String(describing: growth)
+        )
+        XCTAssertEqual(
+            AgentAppViewModel.timelineByReplaying(all).turns.count,
+            {
+                var next = resident
+                for event in suffix { next.apply(event) }
+                next.enforceAggregateHotTextBudget()
+                return next.turns.count
+            }(),
+            "suffix apply must land the same turn count as a full replay"
+        )
+        XCTAssertGreaterThan(
+            improvement,
+            5.0,
+            "suffix apply must beat full replay by ≥5% (got \(improvement)%; full=\(beforeMed)ms suffix=\(growthMed)ms)"
+        )
+    }
+
     // MARK: - Coalesced aggregate hot-text budget walk
 
     private func streamInput(

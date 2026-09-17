@@ -5557,17 +5557,57 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public var mentionableBotsProvider: () -> [BotDefinition] = { [] }
 
+    private var composerSuggestionMemo: (
+        prompt: String,
+        cursor: Int?,
+        snapshotId: String?,
+        botsSignature: String,
+        slashCwd: String?,
+        values: [AgentComposerSuggestion]
+    )?
+#if DEBUG
+    public private(set) var composerSuggestionComputeCountForTesting = 0
+#endif
+
+    nonisolated static func mentionableBotsSignature(_ bots: [BotDefinition]) -> String {
+        bots.map { "\($0.id.value.uuidString)|\($0.handle)" }.joined(separator: ",")
+    }
+
     public var composerSuggestions: [AgentComposerSuggestion] {
+        let bots = mentionableBotsProvider()
+        let botsSignature = Self.mentionableBotsSignature(bots)
+        let snapshotId = selectedProviderSnapshot?.id
         let isClaude = selectedProviderSnapshot?.provider == .claude
-        return AgentComposerSuggestions.suggestions(
+        let slashCwd = isClaude ? cwd : nil
+        if let memo = composerSuggestionMemo,
+           memo.prompt == prompt,
+           memo.cursor == composerCursorOffset,
+           memo.snapshotId == snapshotId,
+           memo.botsSignature == botsSignature,
+           memo.slashCwd == slashCwd {
+            return memo.values
+        }
+#if DEBUG
+        composerSuggestionComputeCountForTesting += 1
+#endif
+        let values = AgentComposerSuggestions.suggestions(
             for: prompt,
             cursorOffset: composerCursorOffset,
             snapshot: selectedProviderSnapshot,
             localSlashCommands: Self.localSlashCommands,
             extraCommands: isClaude ? ClaudeSlashCommandDiscovery.builtInClaudeCommands : [],
             extraSkillNames: isClaude ? claudeProjectSlashEntries() : [],
-            mentionableBots: mentionableBotsProvider()
+            mentionableBots: bots
         )
+        composerSuggestionMemo = (
+            prompt: prompt,
+            cursor: composerCursorOffset,
+            snapshotId: snapshotId,
+            botsSignature: botsSignature,
+            slashCwd: slashCwd,
+            values: values
+        )
+        return values
     }
 
     public func applyComposerSuggestion(_ suggestion: AgentComposerSuggestion) {
@@ -5829,6 +5869,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// events written to shared SQLite keep painting without a local coordinator.
     private var scheduledLivePollTask: Task<Void, Never>?
     private var scheduledLiveStreamCount: Int = 0
+    private var scheduledLiveCursor: AgentRunRepository.StreamEventCursor?
+#if DEBUG
+    private(set) var scheduledLiveChromeFetchCountForTesting = 0
+    private(set) var scheduledLiveSuffixEventCountForTesting = 0
+    private(set) var scheduledLiveFullReplayCountForTesting = 0
+#endif
 
     /// Seed Working-for clock + run id from durable agent_runs and start live poll.
     private func bindScheduledOwnedRun(threadId: AgentThreadID) {
@@ -5855,10 +5901,53 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         previousCount != currentCount
     }
 
+    /// AA-30 residual: growth of a contiguous same-run suffix should not
+    /// replay the whole hot window. Prune, run change, or a missing watermark
+    /// fail closed to a full replay.
+    enum ScheduledLivePollRebuild: Equatable {
+        case none
+        case suffix(advance: Int)
+        case full
+    }
+
+    nonisolated static func scheduledLivePollRebuildPlan(
+        previousCount: Int,
+        currentCount: Int,
+        previousRunId: AgentRunID?,
+        currentRunId: AgentRunID?,
+        previousSequence: Int,
+        currentSequence: Int,
+        previousMutationId: Int64?,
+        currentMutationId: Int64?
+    ) -> ScheduledLivePollRebuild {
+        if previousCount == currentCount { return .none }
+        if currentCount < previousCount { return .full }
+        guard previousRunId != nil,
+              previousRunId == currentRunId,
+              currentSequence > previousSequence,
+              let previousMutationId,
+              let currentMutationId,
+              currentMutationId > previousMutationId
+        else { return .full }
+        let advance = currentSequence - previousSequence
+        guard advance > 0 else { return .full }
+        return .suffix(advance: advance)
+    }
+
+    /// Idle 2s ticks already have run chrome from bindScheduledOwnedRun.
+    /// Re-read durable chrome only when the stream moved or the run id is unset.
+    nonisolated static func shouldRefreshScheduledLiveChrome(
+        countChanged: Bool,
+        hasBoundRunId: Bool
+    ) -> Bool {
+        countChanged || !hasBoundRunId
+    }
+
     private func ensureScheduledLivePoll(for threadId: AgentThreadID) {
         guard scheduledLivePollTask == nil else { return }
         // COUNT(*) only — do not decode hot-replay payloads just to seed the baseline.
         scheduledLiveStreamCount = coordinator.countStreamEvents(threadId: threadId)
+        scheduledLiveCursor = coordinator.streamEventCursor(threadId: threadId)
         scheduledLivePollTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 // 2s is enough for LaunchAgent-owned progress; 1s doubled MainActor work.
@@ -5873,6 +5962,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         scheduledLivePollTask?.cancel()
         scheduledLivePollTask = nil
         scheduledLiveStreamCount = 0
+        scheduledLiveCursor = nil
     }
 
     private func tickScheduledLivePoll() {
@@ -5886,22 +5976,77 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             selectThread(id, markRead: false)
             return
         }
-        // Idle polls: cheap COUNT(*) first. Full latestStreamEvents decode only when count moves.
+        // Idle polls: cheap COUNT(*) first. Decode a contiguous suffix when
+        // the same run grew; full latestStreamEvents only on prune/gap.
         let count = coordinator.countStreamEvents(threadId: id)
-        if Self.shouldRebuildScheduledLiveTimeline(
-            previousCount: scheduledLiveStreamCount,
+        let cursor = coordinator.streamEventCursor(threadId: id)
+        let previousCount = scheduledLiveStreamCount
+        let previousCursor = scheduledLiveCursor
+        let plan = Self.scheduledLivePollRebuildPlan(
+            previousCount: previousCount,
+            currentCount: count,
+            previousRunId: previousCursor?.runId,
+            currentRunId: cursor.runId,
+            previousSequence: previousCursor?.sequence ?? 0,
+            currentSequence: cursor.sequence,
+            previousMutationId: previousCursor?.mutationId,
+            currentMutationId: cursor.mutationId
+        )
+        let countChanged = Self.shouldRebuildScheduledLiveTimeline(
+            previousCount: previousCount,
             currentCount: count
-        ) {
-            scheduledLiveStreamCount = count
-            let events = coordinator.latestStreamEvents(threadId: id)
-            timeline = AssistantTimelineState()
-            for event in events {
-                timeline.apply(event)
+        )
+        switch plan {
+        case .none:
+            break
+        case .suffix(let advance):
+            if let previousMutationId = previousCursor?.mutationId,
+               let mutationId = cursor.mutationId,
+               let runId = cursor.runId,
+               let suffix = coordinator.attestedStreamEventSuffix(
+                   threadId: id,
+                   afterMutationId: previousMutationId,
+                   throughMutationId: mutationId,
+                   runId: runId,
+                   startingSequence: (previousCursor?.sequence ?? 0) + 1,
+                   count: advance
+               ) {
+#if DEBUG
+                scheduledLiveSuffixEventCountForTesting += suffix.events.count
+#endif
+                var next = timeline
+                for event in suffix.events {
+                    next.apply(event)
+                }
+                next.enforceAggregateHotTextBudget()
+                timeline = next
+                rehydrateDurableActiveState(threadId: id)
+                scheduleTimelineUpdateTick()
+            } else {
+#if DEBUG
+                scheduledLiveFullReplayCountForTesting += 1
+#endif
+                timeline = Self.timelineByReplaying(coordinator.latestStreamEvents(threadId: id))
+                rehydrateDurableActiveState(threadId: id)
+                scheduleTimelineUpdateTick()
             }
-            timeline.enforceAggregateHotTextBudget()
+        case .full:
+#if DEBUG
+            scheduledLiveFullReplayCountForTesting += 1
+#endif
+            timeline = Self.timelineByReplaying(coordinator.latestStreamEvents(threadId: id))
             rehydrateDurableActiveState(threadId: id)
             scheduleTimelineUpdateTick()
         }
+        scheduledLiveStreamCount = count
+        scheduledLiveCursor = cursor
+        guard Self.shouldRefreshScheduledLiveChrome(
+            countChanged: countChanged,
+            hasBoundRunId: currentRunId != nil
+        ) else { return }
+#if DEBUG
+        scheduledLiveChromeFetchCountForTesting += 1
+#endif
         if let durable = try? coordinator.durableActiveRunChrome(threadId: id) {
             runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
                 current: runStartedAt,
@@ -14334,7 +14479,8 @@ public struct AgentAppView: View {
                                         row,
                                         columnWidth: timelineColumnWidth,
                                         groupHeader: rowPaintContext.peerGroupHeader(for: row),
-                                        hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row)
+                                        hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row),
+                                        mentionableBots: mentionBots
                                     )
                                     .id(row.id)
                                 }
@@ -14345,7 +14491,8 @@ public struct AgentAppView: View {
                                     row,
                                     columnWidth: timelineColumnWidth,
                                     groupHeader: rowPaintContext.peerGroupHeader(for: row),
-                                    hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row)
+                                    hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row),
+                                    mentionableBots: mentionBots
                                 )
                                 .id(row.id)
                             }
@@ -15568,7 +15715,11 @@ public struct AgentAppView: View {
     }
 
     @ViewBuilder
-    private func messageRow(_ msg: AgentMessage, columnWidth: CGFloat = 10_000) -> some View {
+    private func messageRow(
+        _ msg: AgentMessage,
+        columnWidth: CGFloat = 10_000,
+        mentionableBots: [BotDefinition] = []
+    ) -> some View {
         switch msg.role {
         case .user:
             if Self.isInternalPeerHopUserMessage(msg) {
@@ -15585,7 +15736,7 @@ public struct AgentAppView: View {
             )
             let mentioned = Self.messagedPeer(
                 in: displayText,
-                bots: vm.mentionableBotsProvider()
+                bots: mentionableBots
             )
             AgentChatUserBubble(
                 text: displayText,
@@ -15638,14 +15789,14 @@ public struct AgentAppView: View {
                         avatarSymbol: Self.resolvedPeerAvatarSymbol(
                             handle: activity.handle,
                             encoded: "",
-                            bots: vm.mentionableBotsProvider()
+                            bots: mentionableBots
                         )
                     )
                 } else if let parsed = BotPeerTranscript.parse(msg.content) {
                     let showBadge = Self.showsTokenSaverOptimizedBadge(
                         wasTokenSaverOptimized: vm.tokenSaverOptimizedMessageIds.contains(msg.id)
                     )
-                    let bots = vm.mentionableBotsProvider()
+                    let bots = mentionableBots
                     AgentChatAssistantReply(
                         text: parsed.body,
                         roleIdentifier: "agent.role.assistant",
@@ -15887,7 +16038,8 @@ public struct AgentAppView: View {
         _ entry: TranscriptEntry,
         columnWidth: CGFloat,
         groupHeader: AgentChatPeerGroupHeader? = nil,
-        hideAssistantOutput: Bool = false
+        hideAssistantOutput: Bool = false,
+        mentionableBots: [BotDefinition] = []
     ) -> some View {
         VStack(alignment: .leading, spacing: DS.Space.sm) {
             if let groupHeader {
@@ -15895,7 +16047,7 @@ public struct AgentAppView: View {
             }
             switch entry {
             case .message(let message):
-                messageRow(message, columnWidth: columnWidth)
+                messageRow(message, columnWidth: columnWidth, mentionableBots: mentionableBots)
             case .turn(let turn):
                 turnView(turn, hideAssistantOutput: hideAssistantOutput)
             }
@@ -15907,7 +16059,8 @@ public struct AgentAppView: View {
         _ row: ChatFlowRow,
         columnWidth: CGFloat,
         groupHeader: AgentChatPeerGroupHeader? = nil,
-        hideAssistantOutput: Bool = false
+        hideAssistantOutput: Bool = false,
+        mentionableBots: [BotDefinition] = []
     ) -> some View {
         switch row {
         case .entry(let entry):
@@ -15915,7 +16068,8 @@ public struct AgentAppView: View {
                 entry,
                 columnWidth: columnWidth,
                 groupHeader: groupHeader,
-                hideAssistantOutput: hideAssistantOutput
+                hideAssistantOutput: hideAssistantOutput,
+                mentionableBots: mentionableBots
             )
         case .segment(let segment):
             turnSegmentView(segment, hideAssistantOutput: hideAssistantOutput)
