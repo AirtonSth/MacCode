@@ -1437,8 +1437,9 @@ public enum ProviderProxyPolicy {
             return false
         }
         guard scan.positionals.first == "exec" else { return false }
-        // `codex exec resume` is session continuation — keep raw.
-        if scan.positionals.dropFirst().first == "resume" { return false }
+        // openai/codex 0.154 `codex exec` subcommands (resume/fork/review/help)
+        // are session or admin operations, not a new Agent App turn.
+        if Self.nestedCodexExecSubcommandKeepsRawCLI(scan.positionals) { return false }
         // `codex exec --json` is exec JSONL (`item` + `aggregated_output`).
         // Agent App `--output-format json` is a different ABI; keep raw like resume.
         if scan.flags.contains("--json") { return false }
@@ -1562,21 +1563,32 @@ public enum ProviderProxyPolicy {
             || id.hasPrefix("gpt-5.5") || id.hasPrefix("gpt-5.4") {
             return true
         }
-        if id.hasPrefix("gpt-5.3-spark") || id.hasPrefix("gpt-5.3-codex-spark") {
+        if id.hasPrefix("gpt-5.3-spark") || id.hasPrefix("gpt-5.3-codex") {
+            return true
+        }
+        if id.hasPrefix("gpt-5.2") || id.hasPrefix("gpt-6-astra") {
             return true
         }
         return false
     }
 
+    /// openai/codex 0.154 `codex exec` subcommands are not a fresh Agent App turn.
+    private static func nestedCodexExecSubcommandKeepsRawCLI(_ positionals: [String]) -> Bool {
+        guard let subcommand = positionals.dropFirst().first?.lowercased() else { return false }
+        return ["resume", "fork", "review", "help"].contains(subcommand)
+    }
+
     /// Live Codex app-server catalogs advertise `max` and `ultra` only for the
-    /// 5.6 model families below. Unknown/omitted models stay on the raw CLI
-    /// because their effort contract cannot be represented truthfully.
+    /// 5.6 model families below plus gpt-6-astra. Unknown/omitted models stay
+    /// on the raw CLI because their effort contract cannot be represented
+    /// truthfully.
     private static func nestedCodexModelSupportsMax(_ model: String) -> Bool {
         let id = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return id == "gpt-5.6"
             || id.hasPrefix("gpt-5.6-sol")
             || id.hasPrefix("gpt-5.6-terra")
             || id.hasPrefix("gpt-5.6-luna")
+            || id.hasPrefix("gpt-6-astra")
     }
 
     private static func nestedCodexInlinePrompt(arguments: [String]) -> String? {
@@ -1595,7 +1607,8 @@ public enum ProviderProxyPolicy {
             ]
         )
         guard !scan.malformed, scan.positionals.first == "exec" else { return nil }
-        let rest = scan.positionals.dropFirst().filter { $0 != "resume" }
+        if Self.nestedCodexExecSubcommandKeepsRawCLI(scan.positionals) { return nil }
+        let rest = scan.positionals.dropFirst()
         let joined = rest.joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return joined.isEmpty ? nil : joined
