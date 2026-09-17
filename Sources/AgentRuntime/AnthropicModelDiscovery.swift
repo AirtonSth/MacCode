@@ -247,6 +247,7 @@ public enum AnthropicModelDiscovery {
     private static let contextWindowsByIDPrefix: [(prefix: String, tokens: Int)] = [
         ("claude-fable", 1_000_000),
         ("fable", 1_000_000),
+        ("claude-opus-5", 1_000_000),
         ("claude-opus-4-8", 1_000_000),
         ("claude-opus-4-7", 1_000_000),
         ("claude-opus-4-6", 1_000_000),

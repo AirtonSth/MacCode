@@ -226,9 +226,9 @@ be selected by the runtime, report that limitation rather than claiming a switch
 
 | Capability | Codex | Claude Code | Grok |
 | --- | --- | --- | --- |
-| `LIGHT` | `gpt-5.6-luna` / `medium` | `haiku` / `high` | `grok-4.5` / `medium` |
+| `LIGHT` | `gpt-5.6-luna` / `medium` | `sonnet` / `high` | `grok-4.5` / `medium` |
 | `STANDARD` | `gpt-5.6-luna` / `xhigh` | `sonnet` / `high` | `grok-4.5` / `medium` |
-| `DEEP` | `gpt-5.6-luna` / `max` | `opus` / `medium` | `grok-4.5` / `medium` |
+| `DEEP` | `gpt-5.6-luna` / `max` | `opus` / `high` | `grok-4.5` / `medium` |
 | rare escalate | `gpt-5.6-luna` / `max` | `opus` / `xhigh` | `grok-4.5` / `high` |
 | `REVIEWER` | `gpt-6-astra` / `medium` | `opus` / `high` | `grok-4.5` / `high` |
 

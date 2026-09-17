@@ -2712,7 +2712,8 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         XCTAssertEqual(normalized("sonnet[1m]", .xhigh), .xhigh)
         XCTAssertEqual(normalized("best", .ultracode), .ultracode)
         XCTAssertEqual(normalized("claude-opus-4-6", .xhigh), .high)
-        XCTAssertEqual(normalized("claude-sonnet-4-6", nil), .medium)
+        XCTAssertEqual(normalized("claude-sonnet-4-6", nil), .high)
+        XCTAssertEqual(normalized("claude-opus-4-7", nil), .xhigh)
         XCTAssertEqual(normalized("claude-mythos-preview", .xhigh), .high)
         XCTAssertEqual(normalized("claude-opus-4-5", .max), .high)
         XCTAssertNil(normalized("claude-haiku-4-5", .high),

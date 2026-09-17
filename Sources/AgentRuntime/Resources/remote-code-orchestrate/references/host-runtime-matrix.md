@@ -84,16 +84,17 @@ model; pin a full model ID only when the environment requires it.
 
 | Capability / role | Model alias | Effort | Sandbox / notes |
 | --- | --- | --- | --- |
-| `LIGHT` / `fast_scan` | `haiku` | `high` | read-only tools; narrow search and inventory |
+| `LIGHT` / `fast_scan` | `sonnet` | `high` | read-only tools; Haiku has no effort control |
 | `STANDARD` / `routine_worker` | `sonnet` | `high` | default implementation and ordinary tests |
-| `DEEP` / `deep_worker` | `opus` | `medium` | ambiguous, security, architecture, cross-cutting |
+| `DEEP` / `deep_worker` | `opus` | `high` | ambiguous, architecture, cross-cutting |
 | `genius_worker` (rare) | `opus` | `xhigh` | only after `DEEP` is insufficient |
 | `REVIEWER` | `opus` | `high` | read-only / plan-mode independent review |
 | advisor (optional) | `fable` when available, else `opus` | `high` | focused advisory question only |
 
-Rationale: Haiku (high effort) for controller / low-context scans, Sonnet for
-daily coding quality/cost, Opus medium for DEEP production slices, `xhigh`
-reserved for rare genius escalation. Do not default the whole graph to Opus.
+Rationale: Sonnet (high effort) for LIGHT and STANDARD because Haiku exposes
+no effort control. Opus high for DEEP production slices, matching the Agent App
+binder and Claude Code's default effort. `xhigh` is reserved for rare genius
+escalation. Do not default the whole graph to Opus.
 
 ## Grok
 
