@@ -201,8 +201,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         // Upstream base revision; tree digest is recomputed from the embedded package
         // after local contract edits (skill content must stay complete / no Distill-in-skills).
         sourceRevision: "2c77fa48431bc20e5dc841652079594a3ea918c9",
-        sourceTreeSHA256: "310b92e081a792eb0d755153af1ef62fd98f166be6fca669eee90ddd7298ad48",
-        localVersion: "6",
+        sourceTreeSHA256: "4741735ea90ff823f3cf1362245e0e915073af5cf784322a81c5a6932809bbdf",
+        localVersion: "7",
         allowedPaths: [
             "SKILL.md",
             "agents/openai.yaml",
