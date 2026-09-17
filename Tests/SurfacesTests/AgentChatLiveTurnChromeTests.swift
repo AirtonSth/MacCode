@@ -1,5 +1,6 @@
 import XCTest
 import CoreModel
+import SwiftUI
 @testable import Surfaces
 
 final class AgentChatLiveTurnChromeTests: XCTestCase {
@@ -554,6 +555,26 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
         XCTAssertEqual(lowFrequency.next()?.timeIntervalSince(early), 0)
         XCTAssertEqual(lowFrequency.next()?.timeIntervalSince(early), 5,
                        "an occluded/minimized strip must not tick every second")
+    }
+
+    func test_agentAppElapsedTickSchedule_lowFrequencyPinsThe5sCadence() {
+        // WHY: Agent App's private duplicate used to ignore TimelineScheduleMode
+        // and keep 1 Hz tool clocks while occluded. It must match Desk.
+        let start = Date(timeIntervalSince1970: 1_000)
+        let schedule = ElapsedTickSchedule(start: start)
+        let early = start.addingTimeInterval(10)
+
+        var regular = schedule.entries(from: early, mode: .normal)
+        XCTAssertEqual(regular.next()?.timeIntervalSince(early), 0)
+        XCTAssertEqual(regular.next()?.timeIntervalSince(early), 1)
+
+        var lowFrequency = schedule.entries(from: early, mode: .lowFrequency)
+        XCTAssertEqual(lowFrequency.next()?.timeIntervalSince(early), 0)
+        XCTAssertEqual(
+            lowFrequency.next()?.timeIntervalSince(early),
+            5,
+            "Agent App ElapsedTickSchedule lowFrequency first step must be 5s"
+        )
     }
 
     func test_shouldRenderFinalMessage_reusesComposition() {

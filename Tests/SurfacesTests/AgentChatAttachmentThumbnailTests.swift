@@ -22,6 +22,59 @@ final class AgentChatAttachmentThumbnailTests: XCTestCase {
         XCTAssertNotEqual(first, second)
     }
 
+    func test_appKitSVGFallback_sizeGate_skipsAboveTwoMiB() {
+        // WHY: NSImage(contentsOf:) on a large SVG expands XML into an unbounded
+        // bitmap. The gate is a pure size check so the skip does not depend on
+        // AppKit actually parsing the payload.
+        let limit = AgentAttachmentThumbnailLoader.maxAppKitSVGFallbackBytes
+        XCTAssertEqual(limit, 2 * 1_024 * 1_024)
+        XCTAssertTrue(AgentAttachmentThumbnailLoader.allowsAppKitImageFallback(fileSizeBytes: limit))
+        XCTAssertTrue(AgentAttachmentThumbnailLoader.allowsAppKitImageFallback(fileSizeBytes: 1))
+        XCTAssertFalse(AgentAttachmentThumbnailLoader.allowsAppKitImageFallback(fileSizeBytes: limit + 1))
+        XCTAssertFalse(AgentAttachmentThumbnailLoader.allowsAppKitImageFallback(fileSizeBytes: 0))
+        XCTAssertFalse(AgentAttachmentThumbnailLoader.allowsAppKitImageFallback(fileSizeBytes: -1))
+    }
+
+    func test_decodeImage_skipsOversizedSVGFallback_andKeepsImageIO() throws {
+        // WHY: ImageIO remains the path for raster files of any size; only the
+        // AppKit SVG fallback is size-capped. A >2 MiB SVG must not call
+        // NSImage(contentsOf:), which we prove by decode returning nil.
+        let svgFixture = try ThumbnailFixture(pathExtension: "svg")
+        defer { svgFixture.remove() }
+        let overLimit = Int(AgentAttachmentThumbnailLoader.maxAppKitSVGFallbackBytes) + 64
+        var svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\"></svg><!--"
+        svg += String(repeating: "x", count: overLimit)
+        svg += "-->"
+        let svgData = Data(svg.utf8)
+        try svgFixture.install(svgData, modificationOffset: 1)
+        XCTAssertGreaterThan(svgData.count, Int(AgentAttachmentThumbnailLoader.maxAppKitSVGFallbackBytes))
+        XCTAssertFalse(
+            AgentAttachmentThumbnailLoader.allowsAppKitImageFallback(path: svgFixture.imageURL.path)
+        )
+        XCTAssertNil(
+            AgentAttachmentThumbnailLoader.decodeImage(path: svgFixture.imageURL.path, maxPixel: 64),
+            "oversized SVG must skip NSImage(contentsOf:) and return nil"
+        )
+
+        let jpegFixture = try ThumbnailFixture()
+        defer { jpegFixture.remove() }
+        let jpeg = try Self.makeLargeJPEG(width: 2_048, height: 2_048, variant: 9)
+        try jpegFixture.install(jpeg, modificationOffset: 2)
+        let jpegSize = try XCTUnwrap(
+            (FileManager.default.attributesOfItem(atPath: jpegFixture.imageURL.path)[.size] as? NSNumber)?.int64Value
+        )
+        NSLog(
+            "[memperf] thumbnail-svg-skip svg_bytes=%d jpeg_bytes=%d jpeg_over_2mib=%d",
+            svgData.count, jpegSize, jpegSize > AgentAttachmentThumbnailLoader.maxAppKitSVGFallbackBytes ? 1 : 0
+        )
+        let decoded = try XCTUnwrap(
+            AgentAttachmentThumbnailLoader.decodeImage(path: jpegFixture.imageURL.path, maxPixel: 64)
+        )
+        XCTAssertLessThanOrEqual(Int(decoded.image.size.width), 64)
+        XCTAssertLessThanOrEqual(Int(decoded.image.size.height), 64)
+        XCTAssertGreaterThan(decoded.costBytes, 0)
+    }
+
     func test_memoryCache_evictsBeforeExceedingItsStrictCostBudget() {
         // WHY: image chips can span many threads, so decoded pixels must never grow unbounded.
         var cache = AgentAttachmentThumbnailMemoryCache(costLimitBytes: 10, countLimit: 2)

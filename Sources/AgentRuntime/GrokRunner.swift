@@ -39,10 +39,34 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
                 supportsCustomModel: true
             ),
             AgentModelDescriptor(
-                id: "grok-composer-2.5-fast",
-                label: "Grok Composer 2.5 Fast",
+                id: "glm-5.3",
+                label: "GLM 5.3",
+                provider: .grok,
+                supportsReasoning: true,
+                supportedReasoningEfforts: GrokReasoningPolicy.glm53Efforts,
+                supportsCustomModel: true
+            ),
+            AgentModelDescriptor(
+                id: "glm-5.3-flash",
+                label: "GLM 5.3 Flash",
+                provider: .grok,
+                supportsReasoning: true,
+                supportedReasoningEfforts: GrokReasoningPolicy.glm53Efforts,
+                supportsCustomModel: true
+            ),
+            AgentModelDescriptor(
+                id: "qwen38-omlx",
+                label: "Qwen3.8-27B MTPLX 128k",
                 provider: .grok,
                 supportsReasoning: false,
+                supportsCustomModel: true
+            ),
+            AgentModelDescriptor(
+                id: "muse-spark-1.3-contributor",
+                label: "Muse Spark 1.3 Contributor",
+                provider: .grok,
+                supportsReasoning: true,
+                supportedReasoningEfforts: GrokReasoningPolicy.museSparkEfforts,
                 supportsCustomModel: true
             ),
             // Current account default tracks Grok 4.6.
@@ -223,12 +247,18 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
             stdoutReadLock.lock()
-            let tail = BoundedPipeDrain.readRemaining(from: stdoutPipe.fileHandleForReading)
+            let tail = BoundedPipeDrain.readRemaining(
+                from: stdoutPipe.fileHandleForReading,
+                maxBytes: BoundedPipeDrain.defaultStdoutMaxBytes
+            )
             for line in outBuf.take(tail) + outBuf.flush() {
                 emitLine(line)
             }
             stdoutReadLock.unlock()
-            let stderrTail = BoundedPipeDrain.readRemaining(from: stderrPipe.fileHandleForReading)
+            let stderrTail = BoundedPipeDrain.readRemaining(
+                from: stderrPipe.fileHandleForReading,
+                maxBytes: BoundedPipeDrain.defaultStderrMaxBytes
+            )
             if !stderrTail.isEmpty,
                let visible = Self.displayableStderr(String(data: stderrTail, encoding: .utf8) ?? "") {
                 onEvent(.event(.providerRuntime(ProviderStderrClassifier.runtimeEvent(

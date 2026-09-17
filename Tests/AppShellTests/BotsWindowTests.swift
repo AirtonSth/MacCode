@@ -5394,6 +5394,79 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("App-closed schedules stay off"))
     }
 
+    func test_routineTestRunCreatesANewConversationForEveryExecution() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        vm.setDeskProvider(.claude)
+        XCTAssertTrue(vm.send("Continue the current investigation"))
+        let original = try XCTUnwrap(vm.selectedConversation)
+        let originalMessages = vm.deskMessages
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Scan overnight failures"
+        vm.routineSpec.provider = .grok
+        vm.routineSpec.model = "grok-4.6"
+        vm.saveRoutine()
+        let routine = try XCTUnwrap(vm.routines.first)
+
+        vm.requestRoutineTestRun(id: routine.definition.id)
+        let first = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertNotEqual(first.id, original.id)
+        XCTAssertEqual(vm.deskMessages.filter { $0.role == .user }.map(\.text), [routine.definition.prompt])
+        XCTAssertEqual(vm.deskRouting.provider, .grok)
+        XCTAssertEqual(vm.deskRouting.model, "grok-4.6")
+
+        vm.requestRoutineTestRun(id: routine.definition.id)
+        let second = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertNotEqual(second.id, original.id)
+        XCTAssertNotEqual(second.id, first.id)
+        XCTAssertEqual(vm.deskMessages.filter { $0.role == .user }.map(\.text), [routine.definition.prompt])
+        XCTAssertEqual(try context.botStore.listConversations(botID: bot.id).count, 3)
+
+        vm.selectDeskThread(original.id)
+        XCTAssertEqual(vm.deskMessages, originalMessages)
+        XCTAssertEqual(vm.deskRouting.provider, .claude)
+    }
+
+    func test_routineTestRunFromFleetCreatesConversationForTheTaskBot() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Scout")
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer")
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("Piper's existing conversation"))
+        let piperConversation = try XCTUnwrap(vm.selectedConversation)
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Scan overnight failures"
+        vm.routineSpec.provider = .grok
+        vm.routineSpec.model = "grok-4.6"
+        vm.saveRoutine()
+        let routine = try XCTUnwrap(vm.routines.first)
+        vm.openDesk(quinn)
+        XCTAssertTrue(vm.send("Quinn's existing conversation"))
+        let quinnConversation = try XCTUnwrap(vm.selectedConversation)
+        vm.openScheduleTasks()
+
+        vm.requestRoutineTestRun(id: routine.definition.id)
+
+        let created = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+        XCTAssertEqual(created.botID, piper.id)
+        XCTAssertNotEqual(created.id, piperConversation.id)
+        XCTAssertNotEqual(created.id, quinnConversation.id)
+        let threadID = try XCTUnwrap(created.linkedAgentThreadID)
+        XCTAssertNotEqual(threadID, try XCTUnwrap(piperConversation.linkedAgentThreadID))
+        XCTAssertNotEqual(threadID, try XCTUnwrap(quinnConversation.linkedAgentThreadID))
+        XCTAssertEqual(try context.threadRepo.get(id: threadID)?.provider, .grok)
+        XCTAssertEqual(vm.deskMessages.filter { $0.role == .user }.map(\.text), [routine.definition.prompt])
+        XCTAssertEqual(vm.deskRouting.provider, .grok)
+        XCTAssertEqual(vm.deskRouting.model, "grok-4.6")
+        XCTAssertEqual(try context.botStore.listConversations(botID: quinn.id).map(\.id), [quinnConversation.id])
+    }
+
     func test_routineTestRunAcknowledgesOnTheDeskThatOwnsTheTurn() throws {
         // WHY: a routine test is a real Desk turn. Its acknowledgement must
         // describe the destination that owns the persisted transcript.

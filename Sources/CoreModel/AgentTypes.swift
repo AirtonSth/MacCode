@@ -32,6 +32,9 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
     case high
     case xhigh
     case max
+    /// Codex app-server / model-catalog wire value (codex-cli 0.154+). Distinct
+    /// from Claude-only `ultracode`.
+    case ultra
     case ultracode
 
     public static var supportedCases: [AgentReasoningEffort] {
@@ -39,8 +42,9 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
     }
 
     /// `supportedCases` is the conservative provider-neutral fallback. Live
-    /// Codex catalogs may expose `max` for specific models; callers with that
-    /// observable model contract should preserve it rather than using this list.
+    /// Codex catalogs may expose `max` and `ultra` for specific models; callers
+    /// with that observable model contract should preserve them rather than
+    /// using this list.
     /// `ultracode` remains Claude-only and is not Codex's distinct `ultra` value.
     /// Claude Code 2.1.203+ accepts it as a native effort selector meaning
     /// "xhigh effort + standing dynamic workflow orchestration"; RemoteCode also
@@ -59,6 +63,7 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
         case .high: return "High"
         case .xhigh: return "Extra High"
         case .max: return "Max"
+        case .ultra: return "Ultra"
         case .ultracode: return "Ultracode"
         }
     }
@@ -71,6 +76,7 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
         case .high: return "Deeper reasoning for harder tasks"
         case .xhigh: return "Very deep reasoning for hard problems"
         case .max: return "Deepest reasoning the model supports — slowest, most tokens"
+        case .ultra: return "Codex ultra reasoning — beyond max for supported models"
         case .ultracode: return "Extra High effort + autonomous workflow orchestration"
         }
     }
@@ -80,16 +86,25 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
 /// runtime and nested CLI middleware. Keeping normalization in CoreModel avoids
 /// the two launch paths silently emitting different, unsupported wire values.
 public enum GrokReasoningPolicy {
-    /// Matches grok-build `SELECTABLE_REASONING_EFFORTS` / session `reasoning_effort`
-    /// config options for Grok 4.6 (includes agent-advertised `minimal`).
-    public static let grok46Efforts: [AgentReasoningEffort] = [.minimal, .low, .medium, .high, .xhigh]
+    /// Static fallback for Grok 4.6 when ACP discovery is unavailable.
+    /// Live grok 1.0.25 advertises `low|medium|high|xhigh` on model `_meta`
+    /// (no `minimal`). Prefer discovered `supportedReasoningEfforts` when present.
+    public static let grok46Efforts: [AgentReasoningEffort] = [.low, .medium, .high, .xhigh]
     public static let grok45Efforts: [AgentReasoningEffort] = [.low, .medium, .high]
+    /// Live grok 1.0.30 GLM catalog aliases `medium→high` and `xhigh→max`.
+    /// Keep alias ids selectable so medium is not clamped to max.
+    public static let glm53Efforts: [AgentReasoningEffort] = [.low, .medium, .high, .xhigh, .max]
+    /// Live grok 1.0.30 muse-spark accepts low/medium/high/xhigh (rejects max)
+    /// even when `_meta.reasoningEfforts` is omitted.
+    public static let museSparkEfforts: [AgentReasoningEffort] = [.low, .medium, .high, .xhigh]
 
     public static func supportedEfforts(for model: String) -> [AgentReasoningEffort] {
         let id = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if id.isEmpty || id.hasPrefix("grok-4.6") { return grok46Efforts }
         if id.hasPrefix("grok-4.5") { return grok45Efforts }
-        if id == "glm-5.3-flash" { return [.low, .high, .max] }
+        if id == "glm-5.3" || id.hasPrefix("glm-5.3-") { return glm53Efforts }
+        if id.hasPrefix("muse-spark") { return museSparkEfforts }
+        if id.hasPrefix("qwen38") { return [] }
         if id.hasPrefix("grok-composer") { return [] }
         // A custom/future model has no observable reasoning contract. Fail
         // closed instead of guessing that it inherits a known model's limits.
@@ -108,7 +123,7 @@ public enum GrokReasoningPolicy {
             return supported.contains(.low) ? .low : (supported.first ?? deepest)
         case .low, .medium, .high, .xhigh:
             return supported.contains(effort) ? effort : deepest
-        case .max, .ultracode:
+        case .max, .ultra, .ultracode:
             return deepest
         }
     }

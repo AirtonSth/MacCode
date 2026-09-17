@@ -262,7 +262,7 @@ public enum GitDiff {
         var args = ["diff", "HEAD", "--no-color"]
         if ignoreWhitespace { args.append("-w") }
         if let path { args.append("--"); args.append(path) }
-        return run(args, cwd: cwd).stdout
+        return decoratedStdout(run(args, cwd: cwd))
     }
 
     /// Runs a single `git diff HEAD --no-color -- <paths>` and returns a
@@ -279,7 +279,7 @@ public enum GitDiff {
     public static func diffAll(in cwd: String, paths: [String]) -> [String: String] {
         guard isGit(cwd), !paths.isEmpty else { return [:] }
         let args = ["diff", "HEAD", "--no-color", "--"] + paths
-        let combined = run(args, cwd: cwd).stdout
+        let combined = decoratedStdout(run(args, cwd: cwd))
         return Self.splitCombinedDiff(combined)
     }
 
@@ -377,6 +377,34 @@ public enum GitDiff {
             out += "+\(line)\n"
         }
         return out
+    }
+
+    /// Matches `FilePreviewSurface.maxTextPreviewBytes` (512 KiB). Untracked
+    /// synthesis must not load more than the preview surface would.
+    public static let untrackedDiffPreviewByteCap = 512 * 1024
+
+    /// FileHandle prefix read. Never materializes bytes past `maxBytes`.
+    ///
+    /// WHY: untracked-diff synthesis and checkpoint snapshots used
+    /// `Data(contentsOf:)` on the whole file, so a 10–20 MiB blob became a
+    /// peak Data allocation even when the caller only needed a bounded prefix.
+    public static func readFilePrefix(at url: URL, maxBytes: Int) -> Data? {
+        let limit = max(0, maxBytes)
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var out = Data()
+        if limit == 0 { return out }
+        out.reserveCapacity(min(limit, 64 * 1024))
+        do {
+            while out.count < limit {
+                let chunk = try handle.read(upToCount: limit - out.count) ?? Data()
+                if chunk.isEmpty { break }
+                out.append(chunk)
+            }
+            return out
+        } catch {
+            return nil
+        }
     }
 
     // MARK: branch / commit / history
@@ -911,7 +939,7 @@ public enum GitDiff {
         guard isGit(cwd) else { return "" }
         var args = ["show", hash, "--no-color"]
         if ignoreWhitespace { args.append("-w") }
-        return run(args, cwd: cwd).stdout
+        return decoratedStdout(run(args, cwd: cwd))
     }
 
     // MARK: helpers
@@ -998,15 +1026,76 @@ public enum GitDiff {
         return r.exit == 0 && r.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "true"
     }
 
-    private struct ProcessResult { let exit: Int32; let stdout: String; let stderr: String }
+    /// Peak retained git stdout. Prefix keeps `summary` porcelain and the
+    /// start of a patch usable; the fd is still drained to EOF.
+    static let stdoutCaptureMaxBytes = 2 * 1024 * 1024
+    /// Peak retained git stderr (diagnostics). Still drained to EOF.
+    static let stderrCaptureMaxBytes = 1 * 1024 * 1024
+    static let truncationNotice = "\n[RemoteCode] git output truncated; showing the captured prefix.\n"
+
+    private struct ProcessResult {
+        let exit: Int32
+        let stdout: String
+        let stderr: String
+        let stdoutTruncated: Bool
+        let stderrTruncated: Bool
+
+        init(
+            exit: Int32,
+            stdout: String,
+            stderr: String,
+            stdoutTruncated: Bool = false,
+            stderrTruncated: Bool = false
+        ) {
+            self.exit = exit
+            self.stdout = stdout
+            self.stderr = stderr
+            self.stdoutTruncated = stdoutTruncated
+            self.stderrTruncated = stderrTruncated
+        }
+    }
 
     /// Carries the background stderr read back to the caller (PERF-008).
     /// Access is serialized by the serial drain queue + `sync {}` barrier,
     /// so the unchecked-Sendable conformance is safe.
-    private final class DataBox: @unchecked Sendable { var data = Data() }
+    private final class DataBox: @unchecked Sendable {
+        var data = Data()
+        var truncated = false
+    }
 
     private static func run(_ args: [String], cwd: String) -> ProcessResult {
         runCommand(["git"] + args, cwd: cwd, environment: nil)
+    }
+
+    /// Decode a prefix-capped capture without turning a mid-character cut
+    /// into `""`. Trim to a UTF-8 boundary; fall back to lossy decode.
+    static func decodeCapturedUTF8(_ data: Data) -> String {
+        guard !data.isEmpty else { return "" }
+        var end = data.count
+        while end > 0 {
+            if let s = String(data: data.prefix(end), encoding: .utf8) {
+                return s
+            }
+            end -= 1
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Prefix-retain at most `maxBytes` while draining the fd to EOF so a
+    /// verbose child cannot fill the pipe or pin multi-MiB Data in-process.
+    static func readCapped(_ handle: FileHandle, maxBytes: Int) -> (data: Data, truncated: Bool) {
+        var acc = PipeAccumulator(maxBytes: maxBytes, retention: .prefix)
+        while true {
+            let chunk = handle.readData(ofLength: 64 * 1024)
+            if chunk.isEmpty { break }
+            acc.append(chunk)
+        }
+        return (acc.data, acc.truncated)
+    }
+
+    private static func decoratedStdout(_ r: ProcessResult) -> String {
+        guard r.stdoutTruncated else { return r.stdout }
+        return r.stdout + truncationNotice
     }
 
     private static func runCommand(_ args: [String], cwd: String, environment: [String: String]?) -> ProcessResult {
@@ -1032,17 +1121,25 @@ public enum GitDiff {
         // exit. Reading both only after `waitUntilExit()` on a single thread
         // is the classic Process deadlock. A reference box carries the
         // background result back without mutating a captured `var`.
+        // Capture is prefix-capped (PipeAccumulator) so checkpoint enrich
+        // cannot pin an unbounded patch; both fds still drain to EOF.
         let errBox = DataBox()
         let errReader = err.fileHandleForReading
         let q = DispatchQueue(label: "git.pipe.drain")
-        q.async { errBox.data = errReader.readDataToEndOfFile() }
-        let oData = out.fileHandleForReading.readDataToEndOfFile()
+        q.async {
+            let capped = readCapped(errReader, maxBytes: stderrCaptureMaxBytes)
+            errBox.data = capped.data
+            errBox.truncated = capped.truncated
+        }
+        let outCapped = readCapped(out.fileHandleForReading, maxBytes: stdoutCaptureMaxBytes)
         q.sync {}   // barrier: ensure stderr drain finished before reading box.
         p.waitUntilExit()
         let r = ProcessResult(
             exit: p.terminationStatus,
-            stdout: String(data: oData, encoding: .utf8) ?? "",
-            stderr: String(data: errBox.data, encoding: .utf8) ?? ""
+            stdout: decodeCapturedUTF8(outCapped.data),
+            stderr: decodeCapturedUTF8(errBox.data),
+            stdoutTruncated: outCapped.truncated,
+            stderrTruncated: errBox.truncated
         )
         logCommand(args, result: r, elapsed: Date().timeIntervalSince(started))
         return r

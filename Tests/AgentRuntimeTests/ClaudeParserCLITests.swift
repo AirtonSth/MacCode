@@ -111,6 +111,91 @@ final class ClaudeParserCLITests: XCTestCase {
         }, "a non-success result must emit a loud error, not silently complete")
     }
 
+    /// CLAUDE-INT-003: host interrupt `aborted_streaming` is a cancelled completion,
+    /// not a hard provider error (SDK bridge parity).
+    func test_abortedStreamingResult_doesNotEmitHardError() throws {
+        let liveResult = #"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_streaming","result":"","session_id":"388003a9-918d-4850-9190-fdbe2ea6ab53","errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"]}"#
+        let obj = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(liveResult.utf8)) as? [String: Any]
+        )
+        XCTAssertTrue(ClaudeParser.isHostInterruptResult(obj))
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"388003a9-918d-4850-9190-fdbe2ea6ab53"}"#,
+            liveResult
+        ])
+        XCTAssertFalse(evs.contains {
+            if case .error(_, let recoverable) = $0 { return !recoverable }
+            return false
+        }, "aborted_streaming must not surface as a hard error on Stop")
+        XCTAssertTrue(evs.contains {
+            if case .turnCompleted = $0 { return true }
+            return false
+        }, "interrupted result still completes the turn so the host can mark cancelled")
+    }
+
+    /// CLAUDE-INT-002: inbound interrupt receipt is parseable and is not an error event.
+    func test_controlResponseReceipt_parsesLiveInterruptReceipt() throws {
+        let line = #"{"type":"control_response","response":{"subtype":"success","request_id":"3ad25933-b695-4e02-9b43-0ad5c0cf0fcd","response":{"still_queued":[],"cancelled":[]}}}"#
+        let obj = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+        )
+        let receipt = try XCTUnwrap(ClaudeParser.controlResponseReceipt(from: obj))
+        XCTAssertEqual(receipt.requestId, "3ad25933-b695-4e02-9b43-0ad5c0cf0fcd")
+        XCTAssertTrue(receipt.success)
+        XCTAssertEqual(receipt.cancelled, [])
+        XCTAssertEqual(receipt.stillQueued, [])
+        let evs = collect([line])
+        XCTAssertFalse(evs.contains {
+            if case .error = $0 { return true }
+            return false
+        }, "inbound control_response must not emit an error event")
+        XCTAssertNil(
+            ClaudeParser.controlResponseReceipt(from: ["type": "control_request"]),
+            "outbound control_request is not a receipt"
+        )
+    }
+
+    /// CLAUDE-AUTH-001: live unauthenticated CLI 2.1.258 emits a synthetic
+    /// assistant envelope, not `auth_status`. That must fail recoverable, not
+    /// render as a successful assistant reply.
+    func test_authenticationFailedAssistantEnvelope_isRecoverableError() throws {
+        let live = #"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Not logged in · Please run /login"}]},"error":"authentication_failed","is_api_error_message":true,"uuid":"9d8248d5-c007-45f9-a2ae-5b0cebb67ec3"}"#
+        let obj = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(live.utf8)) as? [String: Any]
+        )
+        XCTAssertTrue(ClaudeParser.isAuthenticationFailedAssistantEnvelope(obj))
+        XCTAssertFalse(
+            ClaudeParser.isAuthenticationFailedAssistantEnvelope(
+                ["type": "assistant", "message": ["content": [["type": "text", "text": "pong"]]]]
+            ),
+            "normal assistant text must not be classified as authentication failure"
+        )
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"adf68b25-91dc-4dea-ad48-6b2d4b1c03f0"}"#,
+            live
+        ])
+        XCTAssertTrue(evs.contains {
+            if case .error(let message, let recoverable) = $0 {
+                return recoverable && message.contains("Not logged in")
+            }
+            return false
+        }, "authentication_failed assistant envelope must be a recoverable error")
+        XCTAssertFalse(evs.contains {
+            if case .itemStarted(let item) = $0 {
+                return item.type == .assistantMessage
+            }
+            return false
+        }, "synthetic auth assistant text must not render as an assistant reply")
+        XCTAssertFalse(evs.contains {
+            if case .itemDelta(_, let body, _, _) = $0 { return body?.contains("Not logged in") == true }
+            return false
+        }, "auth-failed body must not stream as assistant deltas")
+        XCTAssertTrue(evs.contains {
+            if case .turnCompleted = $0 { return true }
+            return false
+        }, "auth-failed envelope with no result must still complete the turn")
+    }
+
     func test_toolUseBlock_becomesToolItem() {
         let evs = collect([
             #"{"type":"system","subtype":"init","session_id":"s4"}"#,
@@ -904,4 +989,222 @@ final class ClaudeParserCLITests: XCTestCase {
             return false
         }, "stream_event unwrap must copy parent_tool_use_id onto nested blocks")
     }
+    /// CLAUDE-AUTH-001: bare is_api_error_message without authentication_failed is not auth.
+    func test_isApiErrorMessageAlone_isNotAuthenticationFailure() throws {
+        let rateLimit = #"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Rate limited"}]},"error":"rate_limit","is_api_error_message":true}"#
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(rateLimit.utf8)) as? [String: Any])
+        XCTAssertFalse(
+            ClaudeParser.isAuthenticationFailedAssistantEnvelope(obj),
+            "non-auth API error envelopes must not be classified as authentication failure"
+        )
+        let auth = #"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Not logged in · Please run /login"}]},"error":"authentication_failed","is_api_error_message":true}"#
+        let authObj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(auth.utf8)) as? [String: Any])
+        XCTAssertTrue(ClaudeParser.isAuthenticationFailedAssistantEnvelope(authObj))
+    }
+
+    /// CLAUDE-AUTH-002: live 2.1.270 always follows the AUTH-001 envelope with
+    /// `result terminal_reason=api_error`. That must not become a second
+    /// recoverable:false hard error or a second empty turn.
+    func test_authFailedResultAfterAssistant_doesNotHardErrorOrStartSecondTurn() throws {
+        let assistant = try loadPlanFixture("auth-failed-assistant-20260914.json")
+        let result = try loadPlanFixture("auth-failed-result-20260914.json")
+        let resultObj = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(result.utf8)) as? [String: Any]
+        )
+        XCTAssertTrue(ClaudeParser.isAuthenticationFailedResult(resultObj),
+                      "live 2.1.270 auth result fixture must match AUTH-002 classifier")
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"4d139d35-6f36-4382-91af-070d46344e05"}"#,
+            assistant,
+            result
+        ])
+        let recoverable = evs.filter {
+            if case .error(_, let recoverable) = $0 { return recoverable }
+            return false
+        }
+        XCTAssertEqual(recoverable.count, 1,
+                       "AUTH-001 already emitted the recoverable login error; the result must not add another")
+        XCTAssertFalse(evs.contains {
+            if case .error(_, let recoverable) = $0 { return !recoverable }
+            return false
+        }, "auth result after AUTH-001 must not emit recoverable:false")
+        XCTAssertEqual(evs.filter { if case .turnStarted = $0 { return true }; return false }.count, 1,
+                       "result must not ensureTurn a second empty turn")
+        XCTAssertEqual(evs.filter { if case .turnCompleted = $0 { return true }; return false }.count, 1,
+                       "the AUTH-001 turn remains the only completed turn")
+        XCTAssertFalse(evs.contains {
+            if case .itemStarted(let item) = $0 { return item.type == .assistantMessage }
+            return false
+        }, "synthetic auth text must still not render as an assistant reply")
+    }
+
+    /// CLAUDE-AUTH-002: the live unauth JSONL (hook, init, status, assistant, result)
+    /// must complete as a single recoverable auth failure.
+    func test_liveUnauthStreamJSONL_doesNotHardErrorOrOpenSecondTurn() throws {
+        let jsonl = try loadPlanFixture("live-stream-json-unauth-20260914.jsonl")
+        let lines = jsonl.split(whereSeparator: \.isNewline).map(String.init)
+        XCTAssertGreaterThanOrEqual(lines.count, 6, "live capture is hook/init/status/assistant/result")
+        let evs = collect(lines)
+        XCTAssertFalse(evs.contains {
+            if case .error(_, let recoverable) = $0 { return !recoverable }
+            return false
+        }, "live 2.1.270 unauth stream must not emit a hard error after AUTH-001")
+        XCTAssertEqual(evs.filter { if case .turnStarted = $0 { return true }; return false }.count, 1,
+                       "live result must not open a second turn")
+        XCTAssertEqual(evs.filter {
+            if case .error(let message, let recoverable) = $0 {
+                return recoverable && message.contains("Not logged in")
+            }
+            return false
+        }.count, 1, "exactly one recoverable login error")
+        XCTAssertFalse(evs.contains {
+            if case .providerRuntime(let runtime) = $0 {
+                return runtime.method == "claude.result.permission_denial"
+            }
+            return false
+        }, "empty permission_denials on the live auth result must stay silent")
+    }
+
+    /// CLAUDE-AUTH-002: result-only (no AUTH-001 envelope) with live login
+    /// semantics is still a recoverable auth failure, not a provider crash.
+    func test_authFailedResultAlone_isRecoverableNotHardError() throws {
+        let result = try loadPlanFixture("auth-failed-result-20260914.json")
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"4d139d35-6f36-4382-91af-070d46344e05"}"#,
+            result
+        ])
+        XCTAssertTrue(evs.contains {
+            if case .error(let message, let recoverable) = $0 {
+                return recoverable && message.contains("Not logged in")
+            }
+            return false
+        }, "result-only login failure must be recoverable so login recovery can run")
+        XCTAssertFalse(evs.contains {
+            if case .error(_, let recoverable) = $0 { return !recoverable }
+            return false
+        }, "login result must not be a hard error")
+        XCTAssertEqual(evs.filter { if case .turnStarted = $0 { return true }; return false }.count, 1)
+        XCTAssertTrue(evs.contains {
+            if case .turnCompleted = $0 { return true }
+            return false
+        }, "result-only auth failure still completes the turn")
+    }
+
+    func test_apiErrorWithoutLoginSemantics_isStillHardError() throws {
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(#"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"api_error","result":"HTTP 500 overloaded"}"#.utf8)) as? [String: Any])
+        XCTAssertFalse(
+            ClaudeParser.isAuthenticationFailedResult(obj),
+            "generic api_error must not be classified as login failure"
+        )
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"s-api"}"#,
+            #"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"api_error","result":"HTTP 500 overloaded"}"#
+        ])
+        XCTAssertTrue(evs.contains {
+            if case .error(let message, let recoverable) = $0 {
+                return !recoverable && message.contains("HTTP 500")
+            }
+            return false
+        }, "non-login api_error must stay a loud hard error")
+    }
+
+    /// CLAUDE-PERM-DENIED-001: system/permission_denied is a denial card, not a
+    /// dropped unknown subtype.
+    func test_systemPermissionDenied_emitsRuntimeAndDenialItem() {
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"sess-deny"}"#,
+            #"{"type":"system","subtype":"permission_denied","tool_name":"Read","tool_use_id":"toolu_deny","reason":"path-scoped deny rule"}"#
+        ])
+        XCTAssertTrue(evs.contains {
+            if case .providerRuntime(let runtime) = $0 {
+                return runtime.method == "claude.permission_denied"
+                    && runtime.payloadJSON.contains("Read")
+            }
+            return false
+        }, "system/permission_denied must surface as providerRuntime")
+        XCTAssertTrue(evs.contains {
+            if case .itemStarted(let item) = $0 {
+                return item.type == .error && item.summary?.contains("Read") == true
+            }
+            return false
+        }, "auto-denied tools must open a denial card")
+        XCTAssertFalse(evs.contains {
+            if case .error(_, let recoverable) = $0 { return !recoverable }
+            return false
+        }, "a permission denial is not a hard provider crash")
+    }
+
+    /// CLAUDE-PERM-DENIED-001: result.permission_denials is the authoritative
+    /// record (complete for path-scoped Read/Edit/Write as of 2.1.269).
+    func test_resultPermissionDenials_emitRuntimeEvents() {
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"sess-deny-r"}"#,
+            #"{"type":"result","subtype":"success","is_error":false,"result":"ok","permission_denials":[{"tool_name":"Edit","tool_use_id":"toolu_edit","reason":"path-scoped deny"}]}"#
+        ])
+        XCTAssertTrue(evs.contains {
+            if case .providerRuntime(let runtime) = $0 {
+                return runtime.method == "claude.result.permission_denial"
+                    && runtime.payloadJSON.contains("Edit")
+            }
+            return false
+        }, "non-empty permission_denials must surface")
+        XCTAssertEqual(finalMessage(evs), "ok")
+    }
+
+    func test_emptyPermissionDenials_areSilent() {
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"sess-deny-empty"}"#,
+            #"{"type":"result","subtype":"success","is_error":false,"result":"ok","permission_denials":[]}"#
+        ])
+        XCTAssertFalse(evs.contains {
+            if case .providerRuntime(let runtime) = $0 {
+                return runtime.method == "claude.result.permission_denial"
+                    || runtime.method == "claude.permission_denied"
+            }
+            return false
+        }, "empty permission_denials must not mint denial events")
+    }
+
+    /// CLAUDE-INIT-MCP-001: runtime connect failures are `mcp_servers[].status=failed`,
+    /// not `mcp_server_errors` (those are config-validation skips).
+    func test_systemInitMcpServersFailedStatus_emitsProviderRuntime() throws {
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"sess-mcp","mcp_servers":[{"name":"computer-use-mcp","status":"failed"},{"name":"slack","status":"failed"},{"name":"railway","status":"connected"},{"name":"linear","status":"pending"}]}"#
+        ])
+        let runtime = evs.compactMap { event -> ProviderRuntimeEvent? in
+            if case .providerRuntime(let runtime) = event { return runtime }
+            return nil
+        }.filter { $0.method == "claude.init.mcp_server_error" }
+        XCTAssertEqual(runtime.count, 2, "only status=failed rows emit")
+        XCTAssertTrue(runtime.contains { $0.payloadJSON.contains("computer-use-mcp") })
+        XCTAssertTrue(runtime.contains { $0.payloadJSON.contains("slack") })
+        XCTAssertFalse(runtime.contains { $0.payloadJSON.contains("railway") },
+                       "connected MCP servers must stay silent")
+        XCTAssertFalse(evs.contains {
+            if case .error(_, let recoverable) = $0 { return !recoverable }
+            return false
+        }, "MCP connect failures must not fail the turn")
+    }
+
+    func test_liveSystemInitPendingMcpServers_doNotEmitFailedRuntime() throws {
+        let initJSON = try loadPlanFixture("system-init-20260914.json")
+        let evs = collect([initJSON])
+        XCTAssertFalse(evs.contains {
+            if case .providerRuntime(let runtime) = $0 {
+                return runtime.method == "claude.init.mcp_server_error"
+            }
+            return false
+        }, "live init fixture is pending/connected only — no failed runtime events")
+    }
+
+    private func loadPlanFixture(_ name: String) throws -> String {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Tests/AgentRuntimeTests/Fixtures/claude-auth-20260914/\(name)")
+        let text = try String(contentsOf: url, encoding: .utf8)
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
 }

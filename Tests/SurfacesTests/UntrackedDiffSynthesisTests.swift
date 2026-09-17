@@ -105,4 +105,37 @@ final class UntrackedDiffSynthesisTests: XCTestCase {
         XCTAssertEqual(addLines.count, 0,
                        "an empty file must have zero addition lines — no phantom content")
     }
+
+    /// WHY (DIFF-UNCAPPED): selecting a 10 MiB untracked file used to
+    /// `Data(contentsOf:)` the whole blob before synthesis. The reload path
+    /// must FileHandle-prefix at the 512 KiB preview cap.
+    func test_reloadDiff_untrackedRead_usesBoundedFileHandlePrefix() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/Surfaces/DiffPanelSurface.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        let marker = try XCTUnwrap(source.range(of: "public func reloadDiff()"))
+        let rest = source[marker.lowerBound...]
+        let end = rest.range(of: "\n    public func switchBranch")?.lowerBound ?? rest.endIndex
+        let chunk = String(source[marker.lowerBound..<end])
+        XCTAssertFalse(
+            chunk.contains("Data(contentsOf: URL") || chunk.contains("Data(contentsOf: url"),
+            "untracked reload must not load the whole file into Data"
+        )
+        XCTAssertTrue(
+            chunk.contains("GitDiff.readFilePrefix"),
+            "untracked reload must FileHandle-prefix via GitDiff.readFilePrefix"
+        )
+        XCTAssertTrue(
+            chunk.contains("GitDiff.untrackedDiffPreviewByteCap"),
+            "untracked reload must cap at FilePreviewSurface.maxTextPreviewBytes (512 KiB)"
+        )
+        XCTAssertTrue(
+            chunk.contains("String(decoding: data, as: UTF8.self)"),
+            "prefix decode must keep a valid UTF-8 head instead of nil on a mid-scalar cut"
+        )
+        XCTAssertEqual(GitDiff.untrackedDiffPreviewByteCap, 512 * 1024)
+    }
 }

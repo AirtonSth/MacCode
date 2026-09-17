@@ -8,13 +8,14 @@ public protocol CodexAppServerControlling: AnyObject, Sendable {
     func initialize(clientName: String, clientTitle: String, clientVersion: String) async throws -> CodexAppServerInitializeResult
     func openThread(for request: AgentRunRequest) async throws -> CodexAppServerThreadOpenResult
     func startTurn(providerThreadId: String, for request: AgentRunRequest) async throws -> CodexAppServerClient.JSONObject
+    func steerTurn(providerThreadId: String, expectedTurnId: String, for request: AgentRunRequest) async throws -> CodexAppServerClient.JSONObject
     func interruptTurn(providerThreadId: String, turnId: String) async throws
     func readThread(providerThreadId: String, includeTurns: Bool) async throws -> CodexAppServerClient.JSONObject
     func forkThread(providerThreadId: String, lastTurnId: String?) async throws -> String
     func forkThread(providerThreadId: String, lastTurnId: String?, threadSource: String) async throws -> CodexAppServerThreadSummary
     func listThreads(cursor: String?, archived: Bool) async throws -> CodexAppServerThreadPage
     func deleteThread(providerThreadId: String) async throws
-    func rollbackThread(providerThreadId: String, numTurns: Int) async throws -> CodexAppServerClient.JSONObject
+    func rollbackThread(providerThreadId: String, beforeTurnId: String) async throws -> CodexAppServerClient.JSONObject
     func updateThreadSettings(providerThreadId: String, permissionMode: AgentPermissionMode) async throws
     func stop()
     func stopImmediatelyForAppTermination()
@@ -22,6 +23,10 @@ public protocol CodexAppServerControlling: AnyObject, Sendable {
 
 public extension CodexAppServerControlling {
     var forkProtocolSupport: CodexForkProtocolSupport { .unsupported }
+
+    func steerTurn(providerThreadId: String, expectedTurnId: String, for request: AgentRunRequest) async throws -> CodexAppServerClient.JSONObject {
+        throw AgentProviderAdapterError.unsupported("turn/steer")
+    }
 
     func forkThread(providerThreadId: String, lastTurnId: String?, threadSource: String) async throws -> CodexAppServerThreadSummary {
         throw AgentProviderAdapterError.unsupported("Codex keyed fork RPC")
@@ -157,6 +162,11 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let itemId: String?
         let kind: AssistantRequestKind
         let responseKind: PendingApprovalResponseKind
+        /// `nil` means the field was absent on the request; empty means Codex
+        /// sent an authoritative empty allow-list (do not fall back to proposals).
+        let availableDecisions: [Any]?
+        let proposedExecpolicyAmendment: [String]
+        let proposedNetworkPolicyAmendments: [[String: Any]]
     }
 
     private enum PendingApprovalResponseKind {
@@ -179,7 +189,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case mcpElicitation(requestedSchema: [String: Any]?)
     }
 
-    /// Server-to-client methods in the Codex 0.152.1 app-server schema. Keep the
+    /// Server-to-client methods in the Codex 0.154.0 app-server schema. Keep the
     /// inventory explicit so a protocol upgrade cannot silently fall through as
     /// an unknown callback with no ownership decision.
     static let currentServerRequestMethods: Set<String> = [
@@ -412,6 +422,26 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
         lock.unlock()
         if hasInFlightTurn {
+            if let session,
+               let expectedTurnId = session.activeTurnId,
+               !expectedTurnId.isEmpty {
+                // Steer first. Rebinding runId/onEvent before turn/steer returns
+                // leaves the original handle unable to cancel, and live events
+                // hit the abandoned follow-up callback on steer failure.
+                _ = try await session.client.steerTurn(
+                    providerThreadId: session.providerThreadId,
+                    expectedTurnId: expectedTurnId,
+                    for: request
+                )
+                lock.lock()
+                sessions[request.threadId]?.runId = request.runId
+                sessions[request.threadId]?.onEvent = onEvent
+                lock.unlock()
+                onEvent(.status(.running))
+                return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in
+                    self?.cancel(threadId: request.threadId, runId: request.runId)
+                }
+            }
             throw AgentProviderAdapterError.unsupported("Codex session already has an in-flight turn")
         }
 
@@ -470,7 +500,11 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
 
         do {
-            let turn = try await client.startTurn(providerThreadId: providerThreadId, for: turnRequest)
+            // turn/start returns the turn object immediately; turn/started is
+            // the notification that the turn is actually running. Activate and
+            // emit .turnStarted only from that notification so turn/steer cannot
+            // race a turn that has not started.
+            _ = try await client.startTurn(providerThreadId: providerThreadId, for: turnRequest)
             if shouldSeed {
                 acknowledgeContextSeed(turnRequest, lifecycle: .delivered)
             }
@@ -481,10 +515,6 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                     discloseResumeFallback: resumeFellBackToStart,
                     onEvent: onEvent
                 )
-            }
-            if let turnId = Self.turnId(from: turn), !turnId.isEmpty {
-                setActiveTurn(threadId: request.threadId, turnId: turnId)
-                onEvent(.event(.turnStarted(turnId: turnId)))
             }
         } catch {
             if shouldSeed {
@@ -531,21 +561,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let providerResponse: [String: Any]
         switch pending.responseKind {
         case .legacyDecision:
-            let decision = Self.codexDecision(response, kind: pending.kind)
+            let decision = Self.codexDecision(response, pending: pending)
             payload["decision"] = decision
-            if response == .approveForSession {
-                do {
-                    try await promoteSessionPermission(threadId: threadId, to: .fullAccess)
-                    setSessionPermissionMode(threadId: threadId, permissionMode: .fullAccess)
-                } catch {
-                    pending.continuation.resume(throwing: error)
-                    emit([
-                        runtimeEvent(method: "item/requestApproval/decisionFailed", payload: payload),
-                        .requestResolved(requestId: requestId, state: .declined)
-                    ], threadId: threadId)
-                    throw error
-                }
-            }
             providerResponse = ["decision": decision]
         case .permissions(let requested):
             providerResponse = Self.permissionsApprovalResponse(requested: requested, response: response)
@@ -713,6 +730,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
            !expectedSourceId.isEmpty,
            expectedSourceId != snapshot.providerThreadId {
             throw AgentProviderAdapterError.unsupported("Codex app-server recovered the wrong parent thread for fork")
+        }
+        if Self.isFailedUnforkableThreadStatus(snapshot.threadStatusType) {
+            throw AgentProviderAdapterError.unsupported("Codex app-server cannot fork a thread in systemError")
         }
         guard snapshot.activeTurnId == nil,
               snapshot.pendingFinish == nil,
@@ -900,11 +920,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         guard let targetIndex else {
             throw AgentProviderAdapterError.unsupported("Codex app-server rollback target is not in completed turn history: \(toTurnId)")
         }
-        let numTurns = snapshot.completedTurnIds.distance(from: targetIndex, to: snapshot.completedTurnIds.endIndex) - 1
-        guard numTurns > 0 else { return }
+        let dropIndex = snapshot.completedTurnIds.index(after: targetIndex)
+        guard dropIndex < snapshot.completedTurnIds.endIndex else { return }
+        let beforeTurnId = snapshot.completedTurnIds[dropIndex]
         let client = snapshot.client
         let providerThreadId = snapshot.providerThreadId
-        _ = try await client.rollbackThread(providerThreadId: providerThreadId, numTurns: numTurns)
+        _ = try await client.rollbackThread(providerThreadId: providerThreadId, beforeTurnId: beforeTurnId)
+        _ = try await readThread(threadId: threadId)
     }
 
     public func stopAll() {
@@ -1309,7 +1331,16 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 kind: kind,
                 responseKind: isPermissionsRequest
                     ? .permissions(requested: requestedPermissions ?? [:])
-                    : .legacyDecision
+                    : .legacyDecision,
+                availableDecisions: Self.payloadOptionalMixedArray(
+                    payload, camel: "availableDecisions", snake: "available_decisions"
+                ),
+                proposedExecpolicyAmendment: Self.payloadStringArray(
+                    payload, camel: "proposedExecpolicyAmendment", snake: "proposed_execpolicy_amendment"
+                ),
+                proposedNetworkPolicyAmendments: Self.payloadObjectArray(
+                    payload, camel: "proposedNetworkPolicyAmendments", snake: "proposed_network_policy_amendments"
+                )
             ))
             emit([
                 runtimeEvent(method: method, payload: payload),
@@ -1323,13 +1354,6 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 ))
             ], threadId: threadId)
         }
-    }
-
-    private func promoteSessionPermission(threadId: AgentThreadID, to mode: AgentPermissionMode) async throws {
-        guard let snapshot = sessionSnapshot(threadId: threadId) else {
-            throw AgentProviderAdapterError.sessionNotFound(threadId)
-        }
-        try await snapshot.client.updateThreadSettings(providerThreadId: snapshot.providerThreadId, permissionMode: mode)
     }
 
     private func awaitUserInput(
@@ -1793,9 +1817,14 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             }
         case "mcpServer/oauthLogin/completed", "mcpServer.startupStatus.updated", "mcpServer/startupStatus/updated":
             let turnId = activeTurnId(threadId: threadId) ?? ""
-            let itemId = string(payload, "serverName") ?? string(payload, "server_name") ?? string(payload, "serverId") ?? "mcp-server-\(UUID().uuidString)"
+            let itemId = string(payload, "name")
+                ?? string(payload, "serverName")
+                ?? string(payload, "server_name")
+                ?? string(payload, "serverId")
+                ?? "mcp-server-\(UUID().uuidString)"
             let status = string(payload, "status") ?? string(payload, "state") ?? "completed"
-            events.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .mcpToolCall, state: status == "failed" ? .failed : .completed, summary: "MCP server status", output: Self.jsonString(payload), startedAtMs: now, finishedAtMs: now)))
+            let output = string(payload, "error") ?? Self.jsonString(payload)
+            events.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .mcpToolCall, state: status == "failed" ? .failed : .completed, summary: "MCP server status", output: output, startedAtMs: now, finishedAtMs: now)))
         case "model/rerouted", "model.rerouted":
             let turnId = activeTurnId(threadId: threadId) ?? ""
             let itemId = "model-rerouted-\(turnId.isEmpty ? UUID().uuidString : turnId)"
@@ -1807,6 +1836,54 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 state: .completed,
                 summary: "Model rerouted",
                 output: "Model rerouted: \(reason)",
+                startedAtMs: now,
+                finishedAtMs: now
+            )))
+        case "model/safetyBuffering/updated", "model.safetyBuffering.updated":
+            let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
+            let itemId = "model-safety-buffering-\(turnId.isEmpty ? UUID().uuidString : turnId)"
+            let model = string(payload, "model") ?? string(payload, "fasterModel") ?? "unknown"
+            let showUI = payload["showBufferingUi"] as? Bool ?? payload["showBufferingUI"] as? Bool
+            let reasons = Self.joinedStrings(payload["reasons"]) ?? Self.joinedStrings(payload["useCases"]) ?? ""
+            var output = "Model safety buffering: \(model)"
+            if let showUI { output += showUI ? " (show UI)" : " (hide UI)" }
+            if !reasons.isEmpty { output += " — \(reasons)" }
+            events.append(.itemStarted(item: AssistantItem(
+                id: itemId,
+                turnId: turnId,
+                type: .tool,
+                state: .completed,
+                summary: "Model safety buffering",
+                output: output,
+                startedAtMs: now,
+                finishedAtMs: now
+            )))
+        case "autoApprovalReview/strictReviewRequired", "autoApprovalReview.strictReviewRequired":
+            // Terminal: item/autoApprovalReview/completed keys off reviewId, not
+            // strict-review-<turnId>, so a streaming chip never settles (CODEX-APP-004).
+            let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
+            let itemId = "strict-review-\(turnId.isEmpty ? UUID().uuidString : turnId)"
+            events.append(.itemStarted(item: AssistantItem(
+                id: itemId,
+                turnId: turnId,
+                type: .review,
+                state: .completed,
+                summary: "Strict auto-approval review required",
+                output: Self.jsonString(payload),
+                startedAtMs: now,
+                finishedAtMs: now
+            )))
+        case "turn/moderationMetadata", "turn.moderationMetadata":
+            let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
+            let itemId = "turn-moderation-\(turnId.isEmpty ? UUID().uuidString : turnId)"
+            let metadata = payload["metadata"] ?? payload
+            events.append(.itemStarted(item: AssistantItem(
+                id: itemId,
+                turnId: turnId,
+                type: .tool,
+                state: .completed,
+                summary: "Turn moderation metadata",
+                output: Self.jsonString(metadata),
                 startedAtMs: now,
                 finishedAtMs: now
             )))
@@ -2105,7 +2182,11 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             onEvent?(.event(.requestResolved(requestId: requestId, state: .cancelled)))
             switch pending.responseKind {
             case .legacyDecision:
-                pending.continuation.resume(returning: ["decision": "cancel"])
+                // Use the same dialect as interactive cancel: ReviewDecision
+                // methods need `"abort"`, accept-dialect needs `"cancel"`.
+                pending.continuation.resume(returning: [
+                    "decision": Self.codexDecision(.cancel, pending: pending)
+                ])
             case .permissions:
                 pending.continuation.resume(returning: [
                     "permissions": [String: Any](),
@@ -2138,7 +2219,11 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         emit([.requestResolved(requestId: requestId, state: .cancelled)], threadId: threadId)
         switch pending.responseKind {
         case .legacyDecision:
-            pending.continuation.resume(returning: ["decision": "cancel"])
+            // Use the same dialect as interactive cancel: ReviewDecision
+            // methods need `"abort"`, accept-dialect needs `"cancel"`.
+            pending.continuation.resume(returning: [
+                "decision": Self.codexDecision(.cancel, pending: pending)
+            ])
         case .permissions:
             pending.continuation.resume(returning: [
                 "permissions": [String: Any](),
@@ -2325,6 +2410,22 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     private func updateThreadStatus(threadId: AgentThreadID, statusType: String) -> PendingFinish? {
         lock.lock()
         sessions[threadId]?.threadStatusType = statusType
+        if Self.isFailedUnforkableThreadStatus(statusType) {
+            let existing = sessions[threadId]?.pendingFinish
+            sessions[threadId]?.pendingFinish = nil
+            sessions[threadId]?.pendingFinishWatchdog?.cancel()
+            sessions[threadId]?.pendingFinishWatchdog = nil
+            let turnId = existing?.turnId ?? sessions[threadId]?.activeTurnId
+            let providerThreadId = existing?.providerThreadId ?? sessions[threadId]?.providerThreadId
+            lock.unlock()
+            return PendingFinish(
+                status: .failed,
+                finalMessage: existing?.finalMessage,
+                providerThreadId: providerThreadId,
+                turnId: turnId,
+                deferredAt: existing?.deferredAt ?? Date()
+            )
+        }
         let pending = Self.isIdleThreadStatus(statusType) && sessions[threadId]?.goalActive != true
             ? sessions[threadId]?.pendingFinish
             : nil
@@ -2697,7 +2798,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         lock.lock()
         sessions[threadId]?.status = status
         sessions[threadId]?.activeTurnId = nil
-        sessions[threadId]?.threadStatusType = nil
+        if !Self.isFailedUnforkableThreadStatus(sessions[threadId]?.threadStatusType) {
+            sessions[threadId]?.threadStatusType = nil
+        }
         sessions[threadId]?.goalActive = false
         sessions[threadId]?.pendingFinish = nil
         sessions[threadId]?.pendingFinishWatchdog?.cancel()
@@ -2791,11 +2894,16 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     /// - `item/commandExecution|fileChange|fileRead/...` → accept/acceptForSession/decline/cancel
     /// - legacy `applyPatchApproval` / `execCommandApproval` → ReviewDecision
     ///   (`approved` / `approved_for_session` / `{denied:{rejection}}` / `abort`)
-    private static func codexDecision(_ response: AgentProviderRequestResponse, kind: AssistantRequestKind) -> Any {
-        if usesReviewDecisionDialect(kind) {
+    /// Command-execution Approve may return an offered amendment object instead
+    /// of string accept when Codex included that offer on the request.
+    private static func codexDecision(
+        _ response: AgentProviderRequestResponse,
+        pending: PendingApproval
+    ) -> Any {
+        if usesReviewDecisionDialect(pending.kind) {
             return reviewDecision(response)
         }
-        return acceptDecision(response)
+        return acceptDecision(response, pending: pending)
     }
 
     private static func usesReviewDecisionDialect(_ kind: AssistantRequestKind) -> Bool {
@@ -2807,17 +2915,152 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
     }
 
-    private static func acceptDecision(_ response: AgentProviderRequestResponse) -> String {
+    private static func acceptDecision(
+        _ response: AgentProviderRequestResponse,
+        pending: PendingApproval
+    ) -> Any {
         switch response {
         case .approve:
+            if let amendment = offeredCommandExecutionApproveDecision(pending) {
+                return amendment
+            }
+            // When Codex sent availableDecisions, that allow-list is authoritative:
+            // only emit string accept if it was offered. An empty list must not
+            // invent accept after amendment lookup returned nil.
+            if let available = pending.availableDecisions {
+                if allowListContainsStringDecision(available, "accept") {
+                    return "accept"
+                }
+                return "decline"
+            }
             return "accept"
         case .approveForSession:
+            if let available = pending.availableDecisions {
+                if allowListContainsStringDecision(available, "acceptForSession") {
+                    return "acceptForSession"
+                }
+                return "decline"
+            }
             return "acceptForSession"
         case .decline:
             return "decline"
         case .cancel:
             return "cancel"
         }
+    }
+
+    private static func allowListContainsStringDecision(_ available: [Any], _ name: String) -> Bool {
+        available.contains { raw in
+            if let string = raw as? String { return string == name }
+            return false
+        }
+    }
+
+    /// Auto-select an offered command-execution amendment on plain Approve.
+    /// Never invent payloads that were not on the request. Deny network rules
+    /// are not an Approve of the command.
+    private static func offeredCommandExecutionApproveDecision(_ pending: PendingApproval) -> Any? {
+        guard pending.kind == .commandExecution else { return nil }
+        if let availableDecisions = pending.availableDecisions {
+            // Present allow-list is authoritative, including an empty array.
+            for raw in availableDecisions {
+                if let execpolicy = execpolicyAmendmentDecision(
+                    from: raw,
+                    proposed: pending.proposedExecpolicyAmendment
+                ) {
+                    return execpolicy
+                }
+            }
+            for raw in availableDecisions {
+                if let network = allowNetworkAmendmentDecision(from: raw) {
+                    return network
+                }
+            }
+            return nil
+        }
+        if !pending.proposedExecpolicyAmendment.isEmpty {
+            return [
+                "acceptWithExecpolicyAmendment": [
+                    "execpolicy_amendment": pending.proposedExecpolicyAmendment
+                ]
+            ]
+        }
+        if let rule = pending.proposedNetworkPolicyAmendments.first(where: isAllowNetworkRule) {
+            return [
+                "applyNetworkPolicyAmendment": [
+                    "network_policy_amendment": rule
+                ]
+            ]
+        }
+        return nil
+    }
+
+    private static func execpolicyAmendmentDecision(from raw: Any, proposed: [String]) -> [String: Any]? {
+        guard let object = raw as? [String: Any],
+              object["acceptWithExecpolicyAmendment"] != nil else {
+            return nil
+        }
+        let inner = object["acceptWithExecpolicyAmendment"] as? [String: Any] ?? [:]
+        let listed = stringArray(inner["execpolicy_amendment"])
+        let commands = listed.isEmpty ? proposed : listed
+        guard !commands.isEmpty else { return nil }
+        return [
+            "acceptWithExecpolicyAmendment": [
+                "execpolicy_amendment": commands
+            ]
+        ]
+    }
+
+    private static func allowNetworkAmendmentDecision(from raw: Any) -> [String: Any]? {
+        guard let object = raw as? [String: Any],
+              let inner = object["applyNetworkPolicyAmendment"] as? [String: Any] else {
+            return nil
+        }
+        let rule = (inner["network_policy_amendment"] as? [String: Any]) ?? inner
+        guard isAllowNetworkRule(rule) else { return nil }
+        return [
+            "applyNetworkPolicyAmendment": [
+                "network_policy_amendment": rule
+            ]
+        ]
+    }
+
+    private static func isAllowNetworkRule(_ rule: [String: Any]) -> Bool {
+        guard let host = rule["host"] as? String, !host.isEmpty else { return false }
+        guard let action = rule["action"] as? String else { return false }
+        return action.caseInsensitiveCompare("allow") == .orderedSame
+    }
+
+    private static func payloadMixedArray(_ payload: [String: Any], camel: String, snake: String) -> [Any] {
+        payloadOptionalMixedArray(payload, camel: camel, snake: snake) ?? []
+    }
+
+    /// Distinguishes a missing field (`nil`) from an explicit empty array (`[]`).
+    private static func payloadOptionalMixedArray(
+        _ payload: [String: Any],
+        camel: String,
+        snake: String
+    ) -> [Any]? {
+        guard payload[camel] != nil || payload[snake] != nil else { return nil }
+        let raw = payload[camel] ?? payload[snake]
+        return raw as? [Any] ?? []
+    }
+
+    private static func payloadStringArray(_ payload: [String: Any], camel: String, snake: String) -> [String] {
+        stringArray(payload[camel] ?? payload[snake])
+    }
+
+    private static func payloadObjectArray(_ payload: [String: Any], camel: String, snake: String) -> [[String: Any]] {
+        let raw = payload[camel] ?? payload[snake]
+        if let objects = raw as? [[String: Any]] { return objects }
+        guard let mixed = raw as? [Any] else { return [] }
+        return mixed.compactMap { $0 as? [String: Any] }
+    }
+
+    private static func stringArray(_ raw: Any?) -> [String] {
+        if let strings = raw as? [String] { return strings }
+        guard let mixed = raw as? [Any] else { return [] }
+        return mixed.compactMap { $0 as? String }
     }
 
     private static func reviewDecision(_ response: AgentProviderRequestResponse) -> Any {
@@ -3645,7 +3888,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case "reasoning", "reasoning_text", "summary_text":
             return joinedStrings(item["content"]) ?? stringBodyFallback(for: item)
         case "commandExecution", "local_shell_call":
-            return string(item, "aggregatedOutput") ?? string(item, "command") ?? stringBodyFallback(for: item)
+            // aggregatedOutput is stdout and may be "" / omitted. Command stays
+            // in summary; never copy it into the output body.
+            return string(item, "aggregatedOutput") ?? stringBodyFallback(for: item)
         case "fileChange":
             // Prefer human-readable patch/diff over opaque JSON so the Agent
             // App can paint a Cursor-style Edit card in the timeline.
@@ -3804,6 +4049,20 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let output = int(source["outputTokens"]) ?? int(source["output_tokens"]) ?? 0
         let totalTokens = int(source["totalTokens"]) ?? int(source["total_tokens"]) ?? int(container["usedTokens"]) ?? (input + output)
         guard totalTokens > 0 || input > 0 || output > 0 else { return nil }
+        let cached = int(source["cachedInputTokens"])
+            ?? int(source["cached_input_tokens"])
+            ?? int(total?["cachedInputTokens"])
+            ?? int(total?["cached_input_tokens"])
+            ?? int(container["cachedInputTokens"])
+            ?? int(container["cached_input_tokens"])
+            ?? 0
+        let cacheWrite = int(source["cacheWriteInputTokens"])
+            ?? int(source["cache_write_input_tokens"])
+            ?? int(total?["cacheWriteInputTokens"])
+            ?? int(total?["cache_write_input_tokens"])
+            ?? int(container["cacheWriteInputTokens"])
+            ?? int(container["cache_write_input_tokens"])
+            ?? 0
         let contextWindow = int(container["modelContextWindow"]) ?? int(container["contextWindow"]) ?? int(container["maxTokens"])
         let reportedCostMicros = costMicros(from: source) ?? costMicros(from: container)
         // Context occupancy is always the per-turn `last` bucket when present.
@@ -3826,6 +4085,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             totalTokens: totalTokens,
             contextWindow: contextWindow,
             compactsAutomatically: true,
+            uncachedInputTokens: max(0, input - cached),
+            cacheCreationInputTokens: cacheWrite,
+            cacheReadInputTokens: cached,
             reportedCostMicros: reportedCostMicros,
             contextTokens: contextTokens,
             semantics: .cumulative
@@ -3915,11 +4177,15 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
 
     private static func isActiveThreadStatus(_ statusType: String?) -> Bool {
         guard let statusType else { return false }
-        return statusType == "active" || statusType == "running" || statusType == "busy"
+        return statusType == "active"
     }
 
     private static func isIdleThreadStatus(_ statusType: String) -> Bool {
-        statusType == "idle" || statusType == "completed" || statusType == "complete"
+        statusType == "idle"
+    }
+
+    private static func isFailedUnforkableThreadStatus(_ statusType: String?) -> Bool {
+        statusType == "systemerror"
     }
 
     private static func hookDetail(from payload: [String: Any]) -> String? {

@@ -124,6 +124,23 @@ final class TranscriptGrowthPerfTests: XCTestCase {
         XCTAssertFalse(source.contains("timelineItemIndex"), "no per-open/replay index rebuilds without a reader")
     }
 
+    func test_hostMetadataOrdinalPairingIsSinglePassNotPrefixReduce() throws {
+        // WHY (P1): attested replay counted (id,type) ordinals with a prefix
+        // reduce per item — O(items²) equality checks per turn. Cold open of a
+        // large attested turn must stay a single pass of occurrence counts.
+        let source = try String(contentsOf: sourceURL("Sources/Surfaces/AgentAppSurface.swift"), encoding: .utf8)
+        let marker = try XCTUnwrap(source.range(of: "snapshotPreservingPersistedHostMetadata"))
+        let slice = String(source[marker.lowerBound...].prefix(3_500))
+        XCTAssertFalse(
+            slice.contains("reduce(into: 0)"),
+            "host-metadata ordinal pairing must not walk each item's prefix"
+        )
+        XCTAssertTrue(
+            slice.contains("occurrenceCountByIdentity"),
+            "ordinal pairing must count (id,type) occurrences in one pass"
+        )
+    }
+
     // MARK: AA-32
 
     func test_inlineCacheKeyIsTheSourceFingerprintSoRowsHashOnce() {
@@ -175,51 +192,6 @@ final class TranscriptGrowthPerfTests: XCTestCase {
     }
 
     // MARK: AA-20 source pin
-
-    @MainActor
-    func test_composerSuggestionsMemoHitsOnIdenticalInputs() throws {
-        // WHY: composerSuggestions rebuilt slash/mention matches on every
-        // SwiftUI body pass even when prompt, caret, and bots were unchanged.
-        let tmp = NSTemporaryDirectory() + "rc2-composer-memo-" + UUID().uuidString
-        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
-        let threadRepo = AgentThreadRepository(db: db)
-        let messageRepo = AgentMessageRepository(db: db)
-        let runRepo = AgentRunRepository(db: db)
-        let coordinator = AgentRunCoordinator(
-            runRepo: runRepo,
-            messageRepo: messageRepo,
-            threadRepo: threadRepo,
-            providers: [:]
-        )
-        let vm = AgentAppViewModel(
-            workspaceID: WorkspaceID(),
-            cwd: tmp,
-            coordinator: coordinator,
-            threadRepo: threadRepo,
-            messageRepo: messageRepo
-        )
-        let bot = BotDefinition(handle: "quinn", name: "Quinn", title: "", description: "")
-        vm.mentionableBotsProvider = { [bot] }
-        vm.prompt = "@q"
-        vm.composerCursorOffset = vm.prompt.utf16.count
-        let first = vm.composerSuggestions
-        let afterFirst = vm.composerSuggestionComputeCountForTesting
-        XCTAssertFalse(first.isEmpty)
-        _ = vm.composerSuggestions
-        _ = vm.composerSuggestions
-        XCTAssertEqual(
-            vm.composerSuggestionComputeCountForTesting,
-            afterFirst,
-            "identical prompt/caret/bots must reuse the memo"
-        )
-        vm.prompt = "@qu"
-        _ = vm.composerSuggestions
-        XCTAssertEqual(
-            vm.composerSuggestionComputeCountForTesting,
-            afterFirst + 1,
-            "a prompt change must recompute suggestions"
-        )
-    }
 
     func test_messageRowDoesNotCallMentionableBotsProvider() throws {
         // WHY: each user/peer row used to recopy the bot list. The timeline

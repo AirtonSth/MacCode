@@ -475,6 +475,83 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         )
     }
 
+    /// WHY: result-phase `output +=` copied every stdout chunk unbounded. An
+    /// 8 MiB graphify/tool result used to retain 8 MiB in GraphifyItemBuffer
+    /// while the detect window is 8 KiB. Prefix-cap the stored string to that
+    /// window; keep a running UTF-8 count so answerTokens (Token Saver) does
+    /// not shrink.
+    func test_graphifyBuffer_eightMiBResultStreamRetainsAtMostDetectWindow() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyOutputCap-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+        let itemId = "bash-output-8mib"
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: itemId,
+            bodyAppend: #"{"command":"graphify query where is X"}"#,
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+
+        let totalBytes = 8 * 1_024 * 1_024
+        let chunk = String(repeating: "a", count: 64 * 1_024)
+        let chunkBytes = chunk.utf8.count
+        let fullChunks = totalBytes / chunkBytes
+        let remainder = totalBytes % chunkBytes
+        for _ in 0..<fullChunks {
+            context.recordGraphifyUsageFromItemDelta(
+                itemId: itemId,
+                bodyAppend: nil,
+                outputAppend: chunk,
+                summary: "result",
+                threadId: threadId,
+                runId: runId
+            )
+        }
+        if remainder > 0 {
+            context.recordGraphifyUsageFromItemDelta(
+                itemId: itemId,
+                bodyAppend: nil,
+                outputAppend: String(repeating: "b", count: remainder),
+                summary: "result",
+                threadId: threadId,
+                runId: runId
+            )
+        }
+
+        let stored = context.graphifyBufferStoredOutputUTF8CountForTesting(runId: runId, itemId: itemId)
+        let counted = context.graphifyBufferOutputUTF8CountForTesting(runId: runId, itemId: itemId)
+        let cap = AppContext.graphifyOutputMaxUTF8Bytes
+        XCTAssertEqual(cap, GraphifyUsageDetector.maxHaystackUTF8Bytes)
+        XCTAssertLessThanOrEqual(
+            stored,
+            cap,
+            "8 MiB result stream must retain ≤ the detect-window cap in the stored string"
+        )
+        XCTAssertGreaterThan(stored, 0, "prefix of the result stream must still be retained")
+        XCTAssertEqual(
+            counted,
+            totalBytes,
+            "running UTF-8 count must keep the full 8 MiB so answerTokens do not drop"
+        )
+        XCTAssertEqual(
+            GraphifyUsageDetector.tokensFromUTF8Count(counted),
+            GraphifyUsageDetector.tokensFromUTF8Count(totalBytes),
+            "Token Saver Graphify credit must match the uncapped stream"
+        )
+        NSLog(
+            "[perf-proof] graphifyOutput cap_bytes=%d stored_bytes=%d counted_bytes=%d unbounded_would_be=%d reduction_mib=%.2f",
+            cap, stored, counted, totalBytes,
+            Double(totalBytes - stored) / (1024.0 * 1024.0)
+        )
+    }
+
     /// WHY: live sample spent the ACP parse queue in detect() on a growing
     /// unmatched body. Negative scans must not repeat at stream rate, and a
     /// later graphify command on a new item must still record.
@@ -550,6 +627,90 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
             context.graphifyDetectCountForTesting,
             afterFill,
             "a later item whose command completes as graphify query must still detect"
+        )
+    }
+
+    /// WHY: prefix-capping stored output at 8 KiB used to miss a shell failure
+    /// after that window and still call markSucceeded with the full token count.
+    func test_graphifyBuffer_failureAfter8KiBPrefix_isNotMarkedSucceeded() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyLateFailure-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+        let itemId = "bash-late-failure"
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: itemId,
+            bodyAppend: #"{"command":"graphify query where is X"}"#,
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        let prefix = String(repeating: "a", count: GraphifyUsageDetector.maxHaystackUTF8Bytes)
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: itemId,
+            bodyAppend: nil,
+            outputAppend: prefix,
+            summary: "result",
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertEqual(
+            context.graphifyBufferStoredOutputUTF8CountForTesting(runId: runId, itemId: itemId),
+            GraphifyUsageDetector.maxHaystackUTF8Bytes
+        )
+        XCTAssertFalse(
+            GraphifyUsageDetector.looksLikeFailure(
+                output: GraphifyUsageDetector.cappedHaystack(prefix)
+            )
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: itemId,
+            bodyAppend: nil,
+            outputAppend: "graphify: command not found\n",
+            summary: "result",
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertTrue(
+            context.graphifyBufferSawFailureForTesting(runId: runId, itemId: itemId),
+            "streaming scan must see the failure after the 8 KiB stored prefix"
+        )
+        context.finalizeGraphifyUsageItem(itemId: itemId, runId: runId)
+
+        let okId = "bash-late-success"
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: okId,
+            bodyAppend: #"{"command":"graphify query SidebarView"}"#,
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: okId,
+            bodyAppend: nil,
+            outputAppend: prefix + "NODE SidebarView\n",
+            summary: "result",
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertFalse(context.graphifyBufferSawFailureForTesting(runId: runId, itemId: okId))
+        context.finalizeGraphifyUsageItem(itemId: okId, runId: runId)
+        context.backgroundWriterQueue.sync {}
+        let succeeded = try context.graphifyUsageRepo.signalCount(
+            fromMs: nowMs - 60_000,
+            toMsExclusive: nowMs + 60_000
+        )
+        XCTAssertEqual(
+            succeeded,
+            1,
+            "failure after 8 KiB must not succeed; a later non-failure Graphify result still credits"
         )
     }
 

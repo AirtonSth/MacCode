@@ -528,6 +528,9 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                      "manual/stale Haiku selection must not emit an unsupported effort flag")
         XCTAssertNil(effortFlag(model: "claude-opus-4-1", effort: .high))
         XCTAssertNil(effortFlag(model: "claude-custom-future", effort: .high))
+        XCTAssertEqual(ClaudeRunner.sdkEffortToken(.ultracode, model: "claude-opus-4-7"), "xhigh")
+        XCTAssertEqual(ClaudeRunner.sdkEffortToken(.xhigh, model: "claude-opus-4-7"), "xhigh")
+        XCTAssertEqual(ClaudeRunner.sdkEffortToken(.high, model: "claude-opus-4-7"), "high")
 
         let haikuArgs = ClaudeRunner.buildArgs(AgentRunRequest(
             threadId: AgentThreadID(), provider: .claude, model: "claude-haiku-4-5",
@@ -698,20 +701,33 @@ final class ClaudeRunnerArgsTests: XCTestCase {
 
     // MARK: - Token Saver CLI PostToolUse hook registration
 
+    private func isolatedClaudeHome() -> String {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-claude-home-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url.path
+    }
+
     private func postToolUseReq(
         effort: AgentReasoningEffort? = nil,
         postToolUse: Bool,
-        threadId: AgentThreadID = AgentThreadID()
+        threadId: AgentThreadID = AgentThreadID(),
+        cwd: String = "/tmp",
+        home: String? = nil
     ) -> AgentRunRequest {
-        AgentRunRequest(
+        var environment: [String: String] = ["HOME": home ?? isolatedClaudeHome()]
+        if postToolUse {
+            environment[ClaudeRunner.tokenSaverPostToolUseEnvKey] = "1"
+        }
+        return AgentRunRequest(
             threadId: threadId,
             provider: .claude,
             model: "opus",
-            cwd: "/tmp",
+            cwd: cwd,
             prompt: "build it",
             permissionMode: .supervised,
             reasoningEffort: effort,
-            environment: postToolUse ? [ClaudeRunner.tokenSaverPostToolUseEnvKey: "1"] : [:]
+            environment: environment
         )
     }
 
@@ -806,7 +822,8 @@ final class ClaudeRunnerArgsTests: XCTestCase {
     /// (c) Flag present AND engine .ultracode → exactly one --settings containing
     /// BOTH the PostToolUse hook and the existing ultracode keys.
     func test_postToolUseFlagPresent_ultracodeMergesHookAndUltracodeKeys() throws {
-        let args = ClaudeRunner.buildStreamingArgs(postToolUseReq(effort: .ultracode, postToolUse: true))
+        let request = postToolUseReq(effort: .ultracode, postToolUse: true)
+        let args = ClaudeRunner.buildStreamingArgs(request)
         XCTAssertEqual(settingsFlagCount(args), 1,
                        "ultracode + PostToolUse must merge into a single --settings payload")
         let settings = try parsedSettingsObject(args)
@@ -824,12 +841,81 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         // SDK bridge takes .last of ultracodeSettingsArgs — still the JSON string.
         let settingsArgs = ClaudeRunner.ultracodeSettingsArgs(
             .ultracode,
-            environment: [ClaudeRunner.tokenSaverPostToolUseEnvKey: "1"]
+            environment: request.environment,
+            cwd: request.cwd
         )
         XCTAssertEqual(settingsArgs.first, "--settings")
         XCTAssertEqual(settingsArgs.last, settingsValue(args),
                        "`.last` must remain the JSON payload so ClaudeAgentSDKBridgeAdapter keeps working")
         XCTAssertEqual(settingsArgs.count, 2)
+    }
+
+    func test_postToolUseMergesFilesystemHooksInsteadOfReplacingThem() throws {
+        let home = isolatedClaudeHome()
+        let cwd = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-claude-cwd-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
+        let claudeDir = cwd.appendingPathComponent(".claude", isDirectory: true)
+        try FileManager.default.createDirectory(at: claudeDir, withIntermediateDirectories: true)
+        let projectSettings: [String: Any] = [
+            "hooks": [
+                "Stop": [[
+                    "matcher": "*",
+                    "hooks": [[
+                        "type": "command",
+                        "command": "/tmp/project-stop"
+                    ]]
+                ]]
+            ]
+        ]
+        let data = try JSONSerialization.data(withJSONObject: projectSettings, options: [.sortedKeys])
+        try data.write(to: claudeDir.appendingPathComponent("settings.json"))
+
+        let args = ClaudeRunner.buildStreamingArgs(
+            postToolUseReq(effort: .high, postToolUse: true, cwd: cwd.path, home: home)
+        )
+        let settings = try parsedSettingsObject(args)
+        let hooks = try XCTUnwrap(settings["hooks"] as? [String: Any])
+        let stop = try XCTUnwrap(hooks["Stop"] as? [[String: Any]])
+        XCTAssertEqual(stop.count, 1, "filesystem Stop hooks must survive Token Saver --settings")
+        let stopCommands = stop.flatMap { entry -> [String] in
+            (entry["hooks"] as? [[String: Any]] ?? []).compactMap { $0["command"] as? String }
+        }
+        XCTAssertTrue(stopCommands.contains("/tmp/project-stop"))
+        let post = try XCTUnwrap(hooks["PostToolUse"] as? [[String: Any]])
+        let postCommands = post.flatMap { entry -> [String] in
+            (entry["hooks"] as? [[String: Any]] ?? []).compactMap { $0["command"] as? String }
+        }
+        XCTAssertTrue(postCommands.contains { $0.contains("distill hook post-tool-use") })
+    }
+
+    func test_buildForkArgsAndStreamingForkFromSource() {
+        let source = "11111111-2222-3333-4444-555555555555"
+        let child = AgentThreadID(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!)
+        let forkArgs = ClaudeRunner.buildForkArgs(
+            sourceProviderThreadId: source,
+            childProviderThreadId: child.value.uuidString
+        )
+        XCTAssertTrue(forkArgs.contains("--fork-session"))
+        XCTAssertEqual(forkArgs[forkArgs.index(after: forkArgs.firstIndex(of: "--resume")!)], source)
+        XCTAssertEqual(forkArgs[forkArgs.index(after: forkArgs.firstIndex(of: "--session-id")!)], child.value.uuidString)
+
+        let request = AgentRunRequest(
+            threadId: child,
+            provider: .claude,
+            model: "opus",
+            cwd: "/tmp",
+            prompt: "hello",
+            providerThreadId: child.value.uuidString
+        )
+        let streaming = ClaudeRunner.buildStreamingArgs(request, forkFrom: source)
+        XCTAssertTrue(streaming.contains("--fork-session"))
+        XCTAssertEqual(streaming[streaming.index(after: streaming.firstIndex(of: "--resume")!)], source)
+        XCTAssertEqual(streaming[streaming.index(after: streaming.firstIndex(of: "--session-id")!)], child.value.uuidString)
+        XCTAssertFalse(
+            zip(streaming, streaming.dropFirst()).contains { $0 == "--resume" && $1 == child.value.uuidString },
+            "fork must resume the source, not the child"
+        )
     }
 
     func test_ultracodeIsOfferedToClaudeButNotCodexPicker() {

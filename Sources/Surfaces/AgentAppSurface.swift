@@ -101,11 +101,22 @@ public final class AgentTranscriptState: ObservableObject {
             if oldValue != messages {
                 contentGeneration &+= 1
                 messagesGeneration &+= 1
+                assistantCharsHot = Self.assistantUTF8Count(messages)
             }
             waitingBotPeerActivity = Self.hasWaitingBotPeerActivity(
                 in: messages,
                 threadId: selectedThreadIdForPeerFlag
             )
+        }
+    }
+    /// UTF-8 length of persisted assistant message bodies. Recomputed only when
+    /// `messagesGeneration` moves so Token Saver footer reloads can pass an Int
+    /// instead of capturing `[AgentMessage]`.
+    public private(set) var assistantCharsHot: Int = 0
+
+    nonisolated static func assistantUTF8Count(_ messages: [AgentMessage]) -> Int {
+        messages.reduce(0) { partial, message in
+            partial + (message.role == .assistant ? message.content.utf8.count : 0)
         }
     }
     /// AA-16: chrome busy must not walk `messages` on every tab poll.
@@ -693,7 +704,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var checkpointRevertUndoExpiryTask: Task<Void, Never>?
     private var messageHistoryLoadTask: Task<Void, Never>?
     private var botPeerReconciliationTask: Task<Void, Never>?
-    var botPeerReconciliationIntervalNanoseconds: UInt64 = 1_000_000_000
+    /// Waiting peer markup polls at 5s. Tests override this (keep the field writable).
+    var botPeerReconciliationIntervalNanoseconds: UInt64 = 5_000_000_000
     /// PERF: tracks thread ids whose placeholder titles have already been repaired
     /// so reloadThreads never issues a full messageRepo.list for the same thread twice.
     private var repairedThreadIds: Set<AgentThreadID> = []
@@ -751,6 +763,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var streamFlushNeeded = false
     /// Counts applied stream events since the last aggregate hot-text budget walk.
     private var streamAggregateBudgetOps = 0
+    /// Bumped when `enforceAggregateHotTextBudget` actually walks. Transcript
+    /// rematerialize uses this to take the full dictionary path after eviction
+    /// that does not change `transcriptSignature`.
+    private(set) var aggregateHotTextBudgetGeneration: UInt64 = 0
     /// Bumped on dispose / thread switch so stale detached applies drop their commit.
     private var streamApplyGeneration: UInt64 = 0
     /// True when the hot UI event queue refused at least one already-durable
@@ -1134,6 +1150,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             hiddenTimelineThreadId = selectedThreadId
             hiddenTimelineOpenGeneration = selectThreadOpenGeneration
             latestHiddenTimeline = timeline
+            timeline = AssistantTimelineState()
             lastHiddenTimelinePublishAt = nil
             hiddenTimelinePublishCountForTesting = 0
             return
@@ -2022,24 +2039,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let measuredLoader = tokenSaverMeasuredLoader
         let threadId = selectedThreadId
         let repo = tokenSaverSavingsRepo
-        // AA-12: snapshot message bodies and sum UTF-8 off-main. The Task
-        // already left MainActor for ledger reads; the reduce used to walk
-        // every assistant message on the click/idle path.
-        let messageSnapshot = messages
-        let turnCountSnapshot = timeline.turns.count
+        // AA-12: assistant UTF-8 is maintained on messages didSet. Capture the
+        // Int + turn count only — do not retain `[AgentMessage]` across the
+        // detached ledger load.
+        let assistantChars = transcriptState.assistantCharsHot
+        let userMessageCount = messages.reduce(0) { $0 + ($1.role == .user ? 1 : 0) }
+        let turnCountSnapshot = max(timeline.turns.count, userMessageCount)
         let usage = timeline.tokenUsage
         let cacheRead = usage?.cacheReadInputTokens ?? 0
         let providerRaw = usage.map { max(0, $0.inputTokens) + max(0, $0.outputTokens) } ?? 0
         let providerBilled = usage.map { $0.billedTotalTokenUnits } ?? 0
         let autoRouting = routingMode == .auto
         // PL-02: `Task { }` here inherits the MainActor, so the "off-main" reads
-        // below ran on main. Detach so eligibility/settings/ledger reads and the
-        // O(messages) reduce never touch the main thread.
+        // below ran on main. Detach so eligibility/settings/ledger reads never
+        // touch the main thread.
         tokenSaverFooterReloadTask = Task.detached(priority: .utility) { [weak self] in
-            let assistantChars = messageSnapshot
-                .filter { $0.role == .assistant }
-                .reduce(0) { $0 + $1.content.utf8.count }
-            let turnCount = max(turnCountSnapshot, messageSnapshot.filter { $0.role == .user }.count)
+            let turnCount = turnCountSnapshot
             let eligible = eligibleCheck?() == true
             let graphifyActive = graphifyCheck?() == true
             let graphifyCount = graphifySignalCountCheck?() ?? 0
@@ -2120,11 +2135,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var selectThreadHydrationTask: Task<Void, Never>?
     private var paintedTimelineByThread: [AgentThreadID: AssistantTimelineState] = [:]
     private var paintedTimelineOrder: [AgentThreadID] = []
-    private static let paintedTimelineLimit = 3
+    /// F3: keep at most 2 painted timelines (was 3). Each entry can pin up to
+    /// `aggregateHotTextByteLimit` of hot transcript; dropping one inactive slot
+    /// cuts nominal inactive-cache capacity by ~33% (selected/live may still
+    /// remain above the inactive bound).
+    static let paintedTimelineLimit = 2
     var paintedTimelineCountForTesting: Int { paintedTimelineByThread.count }
 
-    /// AA-07: keep at most 3 painted timelines, plus the selected thread and any
-    /// thread that still has a live run on this surface.
+    /// AA-07 / F3: keep at most `paintedTimelineLimit` painted timelines, plus
+    /// the selected thread and any thread that still has a live run on this surface.
     private func rememberPaintedTimeline(_ id: AgentThreadID, _ timeline: AssistantTimelineState) {
         paintedTimelineByThread[id] = timeline
         paintedTimelineOrder.removeAll { $0 == id }
@@ -3489,20 +3508,29 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let fallback = renderableItemCount(persisted) > 0 ? persisted : providerSnapshot
 
         for (turnOrdinal, persistedTurn) in persistedOccurrences.turns.enumerated() {
-            for (itemIndex, persistedItem) in persistedTurn.items.enumerated()
-            where persistedItem.distillApplied == true {
-                let itemOrdinal = persistedTurn.items[..<itemIndex].reduce(into: 0) { count, item in
-                    if item.id == persistedItem.id, item.type == persistedItem.type {
-                        count += 1
-                    }
+            var occurrenceCountByIdentity: [String: Int] = [:]
+            occurrenceCountByIdentity.reserveCapacity(persistedTurn.items.count)
+            // Pre-index snapshot occurrences once per turn so attested pairing
+            // stays O(items) instead of filtering the whole turn per item.
+            var snapshotItemsByIdentity: [String: [ReplayItemOccurrence]] = [:]
+            if snapshotOccurrences.turns.indices.contains(turnOrdinal) {
+                let snapshotOccurrenceTurn = snapshotOccurrences.turns[turnOrdinal]
+                snapshotItemsByIdentity.reserveCapacity(snapshotOccurrenceTurn.items.count)
+                for item in snapshotOccurrenceTurn.items {
+                    let identity = "\(item.id)\u{1f}\(item.type.rawValue)"
+                    snapshotItemsByIdentity[identity, default: []].append(item)
                 }
+            }
+            for persistedItem in persistedTurn.items {
+                let identity = "\(persistedItem.id)\u{1f}\(persistedItem.type.rawValue)"
+                let itemOrdinal = occurrenceCountByIdentity[identity, default: 0]
+                occurrenceCountByIdentity[identity, default: 0] = itemOrdinal + 1
+                guard persistedItem.distillApplied == true else { continue }
                 guard snapshotOccurrences.turns.indices.contains(turnOrdinal) else {
                     return fallback
                 }
                 let snapshotOccurrenceTurn = snapshotOccurrences.turns[turnOrdinal]
-                let occurrenceMatches = snapshotOccurrenceTurn.items.filter {
-                    $0.id == persistedItem.id && $0.type == persistedItem.type
-                }
+                let occurrenceMatches = snapshotItemsByIdentity[identity] ?? []
                 guard occurrenceMatches.indices.contains(itemOrdinal),
                       replayOccurrenceMatches(
                           persistedItem,
@@ -5557,57 +5585,52 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public var mentionableBotsProvider: () -> [BotDefinition] = { [] }
 
-    private var composerSuggestionMemo: (
-        prompt: String,
-        cursor: Int?,
-        snapshotId: String?,
-        botsSignature: String,
-        slashCwd: String?,
-        values: [AgentComposerSuggestion]
-    )?
-#if DEBUG
-    public private(set) var composerSuggestionComputeCountForTesting = 0
-#endif
-
-    nonisolated static func mentionableBotsSignature(_ bots: [BotDefinition]) -> String {
-        bots.map { "\($0.id.value.uuidString)|\($0.handle)" }.joined(separator: ",")
-    }
+    #if DEBUG
+    /// Test-only: bots-provider invocations from `composerSuggestions`.
+    nonisolated(unsafe) static var composerMentionableBotsProviderCallCountForTesting: UInt64 = 0
+    /// Test-only: Claude slash-catalog loads from `composerSuggestions`.
+    nonisolated(unsafe) static var composerClaudeSlashEntriesCallCountForTesting: UInt64 = 0
+    #endif
 
     public var composerSuggestions: [AgentComposerSuggestion] {
-        let bots = mentionableBotsProvider()
-        let botsSignature = Self.mentionableBotsSignature(bots)
-        let snapshotId = selectedProviderSnapshot?.id
-        let isClaude = selectedProviderSnapshot?.provider == .claude
-        let slashCwd = isClaude ? cwd : nil
-        if let memo = composerSuggestionMemo,
-           memo.prompt == prompt,
-           memo.cursor == composerCursorOffset,
-           memo.snapshotId == snapshotId,
-           memo.botsSignature == botsSignature,
-           memo.slashCwd == slashCwd {
-            return memo.values
+        // F1: ordinary typing has no @ / $ token. Gathering bots + Claude slash
+        // catalogs before `suggestions` can short-circuit wasted work on every
+        // composer body (and every keystroke that republishes suggestions).
+        let token = AgentComposerSuggestions.activeToken(
+            in: prompt,
+            cursorOffset: composerCursorOffset
+        )
+        guard let trigger = token.first, trigger == "@" || trigger == "/" || trigger == "$" else {
+            return []
         }
-#if DEBUG
-        composerSuggestionComputeCountForTesting += 1
-#endif
-        let values = AgentComposerSuggestions.suggestions(
+        let isClaude = selectedProviderSnapshot?.provider == .claude
+        let mentionableBots: [BotDefinition]
+        if trigger == "@" {
+            #if DEBUG
+            Self.composerMentionableBotsProviderCallCountForTesting &+= 1
+            #endif
+            mentionableBots = mentionableBotsProvider()
+        } else {
+            mentionableBots = []
+        }
+        let extraSkillNames: [String]
+        if isClaude && (trigger == "/" || trigger == "$") {
+            #if DEBUG
+            Self.composerClaudeSlashEntriesCallCountForTesting &+= 1
+            #endif
+            extraSkillNames = claudeProjectSlashEntries()
+        } else {
+            extraSkillNames = []
+        }
+        return AgentComposerSuggestions.suggestions(
             for: prompt,
             cursorOffset: composerCursorOffset,
             snapshot: selectedProviderSnapshot,
             localSlashCommands: Self.localSlashCommands,
             extraCommands: isClaude ? ClaudeSlashCommandDiscovery.builtInClaudeCommands : [],
-            extraSkillNames: isClaude ? claudeProjectSlashEntries() : [],
-            mentionableBots: bots
+            extraSkillNames: extraSkillNames,
+            mentionableBots: mentionableBots
         )
-        composerSuggestionMemo = (
-            prompt: prompt,
-            cursor: composerCursorOffset,
-            snapshotId: snapshotId,
-            botsSignature: botsSignature,
-            slashCwd: slashCwd,
-            values: values
-        )
-        return values
     }
 
     public func applyComposerSuggestion(_ suggestion: AgentComposerSuggestion) {
@@ -5869,12 +5892,38 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// events written to shared SQLite keep painting without a local coordinator.
     private var scheduledLivePollTask: Task<Void, Never>?
     private var scheduledLiveStreamCount: Int = 0
-    private var scheduledLiveCursor: AgentRunRepository.StreamEventCursor?
-#if DEBUG
-    private(set) var scheduledLiveChromeFetchCountForTesting = 0
-    private(set) var scheduledLiveSuffixEventCountForTesting = 0
-    private(set) var scheduledLiveFullReplayCountForTesting = 0
-#endif
+    private var scheduledLiveStreamCursor: AgentRunRepository.StreamEventCursor?
+    private(set) var scheduledLiveApplyCountForTesting = 0
+
+    /// Pure replay plan for LaunchAgent live poll. Idle equal counts skip;
+    /// prune, first apply, or overflow of the hot-replay cap full-replay;
+    /// in-cap growth applies only the suffix.
+    enum ScheduledLiveReplayPlan: Equatable, Sendable {
+        case skip
+        case suffix(offset: Int)
+        case fullReplay
+    }
+
+    nonisolated static func scheduledLiveReplayPlan(
+        previousCount: Int,
+        currentCount: Int,
+        cap: Int
+    ) -> ScheduledLiveReplayPlan {
+        if previousCount == currentCount { return .skip }
+        if previousCount == 0 || currentCount < previousCount || currentCount > cap {
+            return .fullReplay
+        }
+        return .suffix(offset: previousCount)
+    }
+
+    /// Idle 2s ticks already have run chrome from bindScheduledOwnedRun.
+    /// Re-read durable chrome only when the stream moved or the run id is unset.
+    nonisolated static func shouldRefreshScheduledLiveChrome(
+        countChanged: Bool,
+        hasBoundRunId: Bool
+    ) -> Bool {
+        countChanged || !hasBoundRunId
+    }
 
     /// Seed Working-for clock + run id from durable agent_runs and start live poll.
     private func bindScheduledOwnedRun(threadId: AgentThreadID) {
@@ -5901,53 +5950,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         previousCount != currentCount
     }
 
-    /// AA-30 residual: growth of a contiguous same-run suffix should not
-    /// replay the whole hot window. Prune, run change, or a missing watermark
-    /// fail closed to a full replay.
-    enum ScheduledLivePollRebuild: Equatable {
-        case none
-        case suffix(advance: Int)
-        case full
-    }
-
-    nonisolated static func scheduledLivePollRebuildPlan(
-        previousCount: Int,
-        currentCount: Int,
-        previousRunId: AgentRunID?,
-        currentRunId: AgentRunID?,
-        previousSequence: Int,
-        currentSequence: Int,
-        previousMutationId: Int64?,
-        currentMutationId: Int64?
-    ) -> ScheduledLivePollRebuild {
-        if previousCount == currentCount { return .none }
-        if currentCount < previousCount { return .full }
-        guard previousRunId != nil,
-              previousRunId == currentRunId,
-              currentSequence > previousSequence,
-              let previousMutationId,
-              let currentMutationId,
-              currentMutationId > previousMutationId
-        else { return .full }
-        let advance = currentSequence - previousSequence
-        guard advance > 0 else { return .full }
-        return .suffix(advance: advance)
-    }
-
-    /// Idle 2s ticks already have run chrome from bindScheduledOwnedRun.
-    /// Re-read durable chrome only when the stream moved or the run id is unset.
-    nonisolated static func shouldRefreshScheduledLiveChrome(
-        countChanged: Bool,
-        hasBoundRunId: Bool
-    ) -> Bool {
-        countChanged || !hasBoundRunId
-    }
-
     private func ensureScheduledLivePoll(for threadId: AgentThreadID) {
         guard scheduledLivePollTask == nil else { return }
-        // COUNT(*) only — do not decode hot-replay payloads just to seed the baseline.
+        // COUNT(*) + cursor only — do not decode hot-replay payloads just to seed.
         scheduledLiveStreamCount = coordinator.countStreamEvents(threadId: threadId)
-        scheduledLiveCursor = coordinator.streamEventCursor(threadId: threadId)
+        scheduledLiveStreamCursor = coordinator.streamEventCursor(threadId: threadId)
         scheduledLivePollTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 // 2s is enough for LaunchAgent-owned progress; 1s doubled MainActor work.
@@ -5962,7 +5969,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         scheduledLivePollTask?.cancel()
         scheduledLivePollTask = nil
         scheduledLiveStreamCount = 0
-        scheduledLiveCursor = nil
+        scheduledLiveStreamCursor = nil
+        scheduledLiveApplyCountForTesting = 0
+    }
+
+    func tickScheduledLivePollForTesting() {
+        tickScheduledLivePoll()
     }
 
     private func tickScheduledLivePoll() {
@@ -5976,78 +5988,25 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             selectThread(id, markRead: false)
             return
         }
-        // Idle polls: cheap COUNT(*) first. Decode a contiguous suffix when
-        // the same run grew; full latestStreamEvents only on prune/gap.
+        // Idle polls: cheap COUNT(*) first. Cursor disagreement (window slide at
+        // equal COUNT) fail-closes to a full replay. In-cap growth uses the
+        // attested suffix and never zeros the already-applied prefix.
         let count = coordinator.countStreamEvents(threadId: id)
         let cursor = coordinator.streamEventCursor(threadId: id)
         let previousCount = scheduledLiveStreamCount
-        let previousCursor = scheduledLiveCursor
-        let plan = Self.scheduledLivePollRebuildPlan(
+        let previousCursor = scheduledLiveStreamCursor
+        var plan = Self.scheduledLiveReplayPlan(
             previousCount: previousCount,
             currentCount: count,
-            previousRunId: previousCursor?.runId,
-            currentRunId: cursor.runId,
-            previousSequence: previousCursor?.sequence ?? 0,
-            currentSequence: cursor.sequence,
-            previousMutationId: previousCursor?.mutationId,
-            currentMutationId: cursor.mutationId
+            cap: AgentRunCoordinator.hotReplayEventCount
         )
-        let countChanged = Self.shouldRebuildScheduledLiveTimeline(
-            previousCount: previousCount,
-            currentCount: count
-        )
-        switch plan {
-        case .none:
-            break
-        case .suffix(let advance):
-            if let previousMutationId = previousCursor?.mutationId,
-               let mutationId = cursor.mutationId,
-               let runId = cursor.runId,
-               let suffix = coordinator.attestedStreamEventSuffix(
-                   threadId: id,
-                   afterMutationId: previousMutationId,
-                   throughMutationId: mutationId,
-                   runId: runId,
-                   startingSequence: (previousCursor?.sequence ?? 0) + 1,
-                   count: advance
-               ) {
-#if DEBUG
-                scheduledLiveSuffixEventCountForTesting += suffix.events.count
-#endif
-                var next = timeline
-                for event in suffix.events {
-                    next.apply(event)
-                }
-                next.enforceAggregateHotTextBudget()
-                timeline = next
-                rehydrateDurableActiveState(threadId: id)
-                scheduleTimelineUpdateTick()
-            } else {
-#if DEBUG
-                scheduledLiveFullReplayCountForTesting += 1
-#endif
-                timeline = Self.timelineByReplaying(coordinator.latestStreamEvents(threadId: id))
-                rehydrateDurableActiveState(threadId: id)
-                scheduleTimelineUpdateTick()
-            }
-        case .full:
-#if DEBUG
-            scheduledLiveFullReplayCountForTesting += 1
-#endif
-            timeline = Self.timelineByReplaying(coordinator.latestStreamEvents(threadId: id))
-            rehydrateDurableActiveState(threadId: id)
-            scheduleTimelineUpdateTick()
+        if case .skip = plan, previousCursor != cursor {
+            plan = .fullReplay
         }
-        scheduledLiveStreamCount = count
-        scheduledLiveCursor = cursor
-        guard Self.shouldRefreshScheduledLiveChrome(
-            countChanged: countChanged,
+        if Self.shouldRefreshScheduledLiveChrome(
+            countChanged: plan != .skip,
             hasBoundRunId: currentRunId != nil
-        ) else { return }
-#if DEBUG
-        scheduledLiveChromeFetchCountForTesting += 1
-#endif
-        if let durable = try? coordinator.durableActiveRunChrome(threadId: id) {
+        ), let durable = try? coordinator.durableActiveRunChrome(threadId: id) {
             runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
                 current: runStartedAt,
                 persisted: durable.startedAt
@@ -6056,6 +6015,89 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             runThreads[durable.id] = id
             if status != .running { status = .running }
         }
+        scheduledLiveApplyCountForTesting = 0
+        switch plan {
+        case .skip:
+            break
+        case .suffix:
+            let suffixEvents = attestedScheduledLiveSuffix(
+                threadId: id,
+                previous: previousCursor,
+                current: cursor
+            )
+            if let suffixEvents {
+                applyScheduledLiveEvents(suffixEvents, resetTimeline: false)
+                scheduledLiveStreamCount = count
+                scheduledLiveStreamCursor = cursor
+                rehydrateDurableActiveState(threadId: id)
+                scheduleTimelineUpdateTick()
+            } else {
+                applyScheduledLiveFullReplay(threadId: id, count: count, cursor: cursor)
+            }
+        case .fullReplay:
+            applyScheduledLiveFullReplay(threadId: id, count: count, cursor: cursor)
+        }
+    }
+
+    private func attestedScheduledLiveSuffix(
+        threadId: AgentThreadID,
+        previous: AgentRunRepository.StreamEventCursor?,
+        current: AgentRunRepository.StreamEventCursor
+    ) -> [AssistantEvent]? {
+        guard let previous,
+              let runId = current.runId,
+              previous.runId == runId,
+              current.sequence > previous.sequence,
+              let previousMutationId = previous.mutationId,
+              let mutationId = current.mutationId
+        else { return nil }
+        let advance = current.sequence - previous.sequence
+        guard let suffix = coordinator.attestedStreamEventSuffix(
+            threadId: threadId,
+            afterMutationId: previousMutationId,
+            throughMutationId: mutationId,
+            runId: runId,
+            startingSequence: previous.sequence + 1,
+            count: advance
+        ), suffix.events.count == advance else { return nil }
+        return suffix.events
+    }
+
+    private func applyScheduledLiveFullReplay(
+        threadId: AgentThreadID,
+        count: Int,
+        cursor: AgentRunRepository.StreamEventCursor
+    ) {
+        applyScheduledLiveEvents(
+            coordinator.latestStreamEvents(threadId: threadId),
+            resetTimeline: true
+        )
+        scheduledLiveStreamCount = count
+        scheduledLiveStreamCursor = cursor
+        rehydrateDurableActiveState(threadId: threadId)
+        scheduleTimelineUpdateTick()
+    }
+
+    private func applyScheduledLiveEvents(_ events: [AssistantEvent], resetTimeline: Bool) {
+        scheduledLiveApplyCountForTesting += events.count
+        if surfaceVisibility == .hidden {
+            var hidden = resetTimeline
+                ? AssistantTimelineState()
+                : (latestHiddenTimeline ?? AssistantTimelineState())
+            for event in events {
+                hidden.apply(event)
+            }
+            hidden.enforceAggregateHotTextBudget()
+            latestHiddenTimeline = hidden
+            return
+        }
+        if resetTimeline {
+            timeline = AssistantTimelineState()
+        }
+        for event in events {
+            timeline.apply(event)
+        }
+        timeline.enforceAggregateHotTextBudget()
     }
 
     public var executionLocked: Bool { providerLocked || selectedThreadRunIsStartingOrRunning }
@@ -7259,39 +7301,30 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     /// IMP-MAC_AGENT-013: serialize a full thread (read from the durable store,
     /// not the paged in-memory window) to shareable markdown.
+    ///
+    /// SQLite `listRecent` and body concat hop off MainActor (same pattern as
+    /// `loadMessagePagePayloadOffMain`). Bodies stay complete; durable
+    /// `maxMessagesPerThread` is unchanged.
     public func exportThreadMarkdown(
         _ id: AgentThreadID,
         includeTimeline: Bool = false
-    ) -> (fileName: String, contents: String)? {
+    ) async -> (fileName: String, contents: String)? {
         guard let thread = threads.first(where: { $0.id == id }) ?? (try? threadRepo.get(id: id)) else { return nil }
-        // Export only the retained window (newest N), not unbounded history.
-        let rows = (try? messageRepo.listRecent(
+        let repository = messageRepo
+        var contents = await Self.exportThreadMessageMarkdownOffMain(
+            repository: repository,
             threadId: id,
-            limit: AgentMessageRepository.maxMessagesPerThread
-        )) ?? []
-        var lines = ["# \(thread.title)", ""]
-        for message in rows {
-            let heading: String
-            switch message.role {
-            case .user: heading = "## User"
-            case .assistant: heading = "## Assistant"
-            case .system: heading = "## System"
-            }
-            lines.append(heading)
-            lines.append("")
-            lines.append(message.content)
-            lines.append("")
-        }
+            title: thread.title
+        )
         if includeTimeline {
             let tlLines = ThreadMarkdownFormatter.timelineMarkdownLines(
                 turns: timeline.turns,
                 approvals: timeline.pendingRequests
             )
             if !tlLines.isEmpty {
-                lines.append("## Timeline")
-                lines.append("")
-                lines.append(contentsOf: tlLines)
-                lines.append("")
+                contents += "## Timeline\n\n"
+                contents += tlLines.joined(separator: "\n")
+                contents += "\n"
             }
         }
         // PERF: exportThreadMarkdown rebuilt the path-unsafe CharacterSet on
@@ -7301,7 +7334,37 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             .joined(separator: "-")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let fileName = (safeName.isEmpty ? "agent-thread" : safeName) + ".md"
-        return (fileName, lines.joined(separator: "\n"))
+        return (fileName, contents)
+    }
+
+    /// Newest retained window, complete bodies. Runs off MainActor so export
+    /// does not concatenate SQLite rows on the UI actor.
+    nonisolated static func exportThreadMessageMarkdownOffMain(
+        repository: AgentMessageRepository,
+        threadId: AgentThreadID,
+        title: String
+    ) async -> String {
+        await Task.detached(priority: .userInitiated) {
+            let rows = (try? repository.listRecent(
+                threadId: threadId,
+                limit: AgentMessageRepository.maxMessagesPerThread
+            )) ?? []
+            var lines: [String] = ["# \(title)", ""]
+            lines.reserveCapacity(rows.count * 4 + 2)
+            for message in rows {
+                let heading: String
+                switch message.role {
+                case .user: heading = "## User"
+                case .assistant: heading = "## Assistant"
+                case .system: heading = "## System"
+                }
+                lines.append(heading)
+                lines.append("")
+                lines.append(message.content)
+                lines.append("")
+            }
+            return lines.joined(separator: "\n")
+        }.value
     }
 
     private static let exportThreadFilenameSeparators = CharacterSet(charactersIn: "/\\:?%*|\"<>")
@@ -8951,7 +9014,37 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return lastPersistedId == nil
     }
 
-    private func persistFinalAssistantIfMissing(_ text: String, threadId: AgentThreadID) {
+    enum PersistFinalAssistantOffMainResult: Sendable {
+        case alreadyPresent
+        case appended(AgentMessageID)
+    }
+
+    /// `listRecent` + `append` for a finished turn. Same detached hop as
+    /// `loadMessagePagePayloadOffMain`; caller applies session memos on MainActor.
+    nonisolated static func persistFinalAssistantPayloadOffMain(
+        repository: AgentMessageRepository,
+        threadId: AgentThreadID,
+        text: String,
+        shouldReload: Bool
+    ) async -> PersistFinalAssistantOffMainResult {
+        await Task.detached(priority: .userInitiated) {
+            if shouldReload {
+                // Only scan the retained window for duplicate finals.
+                let existing = (try? repository.listRecent(
+                    threadId: threadId,
+                    limit: AgentMessageRepository.maxMessagesPerThread
+                )) ?? []
+                if existing.contains(where: { $0.role == .assistant && $0.content == text }) {
+                    return PersistFinalAssistantOffMainResult.alreadyPresent
+                }
+            }
+            let msg = AgentMessage(threadId: threadId, role: .assistant, content: text)
+            try? repository.append(msg)
+            return .appended(msg.id)
+        }.value
+    }
+
+    private func persistFinalAssistantIfMissing(_ text: String, threadId: AgentThreadID) async {
         let text = AssistantTimelineState.cappedText(text)
         // Fast path: same text already persisted this session — nothing to do.
         if lastPersistedAssistantContentByThread[threadId] == text { return }
@@ -8959,25 +9052,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // state is known — skip O(history) list and append directly.
         // Reload only on first completion in a session (id == nil) to guard
         // against a prior session/path having already written this exact text.
-        if Self.shouldReloadForFinal(
+        let shouldReload = Self.shouldReloadForFinal(
             lastPersistedId: lastPersistedFinalIdByThread[threadId],
             lastPersistedKey: lastPersistedAssistantContentByThread[threadId],
             incomingKey: text
-        ) {
-            // Only scan the retained window for duplicate finals.
-            let existing = (try? messageRepo.listRecent(
-                threadId: threadId,
-                limit: AgentMessageRepository.maxMessagesPerThread
-            )) ?? []
-            guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else {
-                lastPersistedAssistantContentByThread[threadId] = text
-                return
-            }
-        }
-        let msg = AgentMessage(threadId: threadId, role: .assistant, content: text)
-        try? messageRepo.append(msg)
+        )
+        // Claim before the SQLite hop so a concurrent same-text finish cannot
+        // start a second list+append. Matches the original MainActor exclusion.
         lastPersistedAssistantContentByThread[threadId] = text
-        lastPersistedFinalIdByThread[threadId] = msg.id
+        let repository = messageRepo
+        let outcome = await Self.persistFinalAssistantPayloadOffMain(
+            repository: repository,
+            threadId: threadId,
+            text: text,
+            shouldReload: shouldReload
+        )
+        if case .appended(let id) = outcome {
+            lastPersistedFinalIdByThread[threadId] = id
+        }
     }
 
     // MARK: AgentRunObserver
@@ -9316,28 +9408,46 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if liveBackgroundTasks != reduced.liveBackgroundTasks {
             liveBackgroundTasks = reduced.liveBackgroundTasks
         }
-        if surfaceVisibility == .hidden {
-            latestHiddenTimeline = reduced.timeline
-            let now = nowForTesting()
-            let due = lastHiddenTimelinePublishAt.map {
-                now.timeIntervalSince($0) >= hiddenTimelinePublishIntervalForTesting
-            } ?? true
-            if due {
-                timeline = reduced.timeline
-                lastHiddenTimelinePublishAt = now
-                hiddenTimelinePublishCountForTesting += 1
-            }
-        } else {
-            timeline = reduced.timeline
-        }
         let budget = Self.aggregateBudgetDecision(
             force: reduced.forceAggregateBudget,
             opsSinceLastWalk: streamAggregateBudgetOps,
             appliedEventCount: reduced.appliedEventCount
         )
         streamAggregateBudgetOps = budget.nextOps
+        if surfaceVisibility == .hidden {
+            var hidden = reduced.timeline
+            if budget.runsWalk {
+                hidden.enforceAggregateHotTextBudget(byteLimit: activeAggregateHotTextByteLimit)
+                aggregateHotTextBudgetGeneration &+= 1
+            }
+            latestHiddenTimeline = hidden
+            let now = nowForTesting()
+            let due = lastHiddenTimelinePublishAt.map {
+                now.timeIntervalSince($0) >= hiddenTimelinePublishIntervalForTesting
+            } ?? true
+            if due {
+                lastHiddenTimelinePublishAt = now
+                hiddenTimelinePublishCountForTesting += 1
+            }
+            // Order is load-bearing: the walk above can evict translations, and
+            // the guard below must see the post-eviction hidden buffer.
+            if Self.shouldPublishTokenSaverOptimizationState(
+                timeline: hidden,
+                publishedIds: tokenSaverOptimizedMessageIds,
+                publishedOriginals: tokenSaverOriginalTextsByMessageId
+            ) {
+                refreshTokenSaverOptimizationStateFromTimeline(hidden)
+            }
+            scheduleTimelineUpdateTick()
+            if reduced.hasProposedPlan {
+                scheduleFullAccessPlanAutoImplementIfNeeded()
+            }
+            return
+        }
+        timeline = reduced.timeline
         if budget.runsWalk {
             timeline.enforceAggregateHotTextBudget(byteLimit: activeAggregateHotTextByteLimit)
+            aggregateHotTextBudgetGeneration &+= 1
         }
         // Order is load-bearing: the walk above can evict translations, and the
         // guard below must see the post-eviction timeline so the published cache
@@ -9620,7 +9730,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 // The coordinator is normally the persistence owner, but
                 // live provider completions can arrive after stream drain on
                 // a background handler. Keep the restart contract here too.
-                self.persistFinalAssistantIfMissing(msg, threadId: finishedTid)
+                await self.persistFinalAssistantIfMissing(msg, threadId: finishedTid)
                 if finishedTid == self.selectedThreadId {
                     self.loadAllMessages(finishedTid)
                     self.suppressPersistedFinalDuplicatedByTimeline()
@@ -10497,7 +10607,9 @@ public enum AgentComposerSuggestions {
         return updated
     }
 
-    private static func activeToken(in text: String, cursorOffset: Int? = nil) -> String {
+    /// Shared with `AgentAppViewModel.composerSuggestions` so the VM can gate
+    /// expensive bot/slash catalog loads before calling `suggestions`.
+    static func activeToken(in text: String, cursorOffset: Int? = nil) -> String {
         guard let range = activeTokenRange(in: text, cursorOffset: cursorOffset) else { return "" }
         return String(text[range])
     }
@@ -10674,6 +10786,10 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
     /// The parser stores a tool_use's input there as JSON (e.g. {"command":"…"} for Bash,
     /// {"file_path":"…"} for Read/Edit). The transcript previously showed only "Ran Bash"
     /// with no command — this surfaces the actual command so the run is legible.
+    ///
+    /// PERF: live tool rows used to `JSONSerialization` this body on every paint
+    /// (~30 Hz × N tools). Route through `toolInputObject` so identical JSON
+    /// parses once and subsequent paints are cache hits.
     static func toolCommandPreview(for item: AssistantItem) -> String? {
         switch item.type {
         case .tool, .mcpToolCall, .dynamicToolCall, .collabToolCall, .commandExecution:
@@ -11145,10 +11261,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         default:
             return nil
         }
-        let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty,
-              let data = body.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        guard let obj = toolInputObject(for: item) else { return nil }
         for key in ["file_path", "path", "notebook_path"] {
             if let value = (obj[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
                 return .file(value)
@@ -11182,9 +11295,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
            summary.compare("Skill", options: .caseInsensitive) == .orderedSame {
             return true
         }
-        let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let data = body.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let obj = toolInputObject(for: item),
               let skill = (obj["skill"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !skill.isEmpty else {
             return false
@@ -13061,6 +13172,66 @@ public struct AgentAppView: View {
             lock.unlock()
         }
     }
+
+    enum VisibleTranscriptWindowProbe {
+        private static let lock = NSLock()
+        nonisolated(unsafe) private static var count = 0
+
+        static var callCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return count
+        }
+
+        static func reset() {
+            lock.lock()
+            count = 0
+            lock.unlock()
+        }
+
+        static func increment() {
+            lock.lock()
+            count += 1
+            lock.unlock()
+        }
+    }
+
+    enum TranscriptRematerializeProbe {
+        private static let lock = NSLock()
+        nonisolated(unsafe) private static var dictionaryBuilds = 0
+        nonisolated(unsafe) private static var liveTurnPatches = 0
+
+        static var dictionaryBuildCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return dictionaryBuilds
+        }
+
+        static var liveTurnPatchCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return liveTurnPatches
+        }
+
+        static func reset() {
+            lock.lock()
+            dictionaryBuilds = 0
+            liveTurnPatches = 0
+            lock.unlock()
+        }
+
+        static func incrementDictionaryBuild() {
+            lock.lock()
+            dictionaryBuilds += 1
+            lock.unlock()
+        }
+
+        static func incrementLiveTurnPatch() {
+            lock.lock()
+            liveTurnPatches += 1
+            lock.unlock()
+        }
+    }
     #endif
 
     /// Conversation-column paint: order the full merged transcript once, then
@@ -13223,6 +13394,8 @@ public struct AgentAppView: View {
     private final class TranscriptCache {
         var signature: String?
         var entries: [TranscriptEntry] = []
+        var messagesGeneration: UInt64?
+        var aggregateBudgetGeneration: UInt64?
         /// AA-21: paint-order permutation (indices into `entries`) keyed by
         /// structure + completion. `paintOrderedTranscriptEntries` runs the
         /// final-after-turn repair, which normalizes every assistant text in the
@@ -13247,12 +13420,22 @@ public struct AgentAppView: View {
             // CRITICAL: write rematerialized entries BACK into the cache so a turn
             // that completes mid-signature stays baseline-finished and
             // shouldRematerializeTurn stops returning true on every later tick.
+            let messagesUnchanged = transcriptCache.messagesGeneration
+                == vm.transcriptState.messagesGeneration
+            let forceFullPath = transcriptCache.aggregateBudgetGeneration
+                != vm.aggregateHotTextBudgetGeneration
+            let lastLiveId = vm.timeline.turns.last(where: { !$0.finished })?.turnId
             let refreshed = Self.rematerializedTranscriptEntries(
                 cached: transcriptCache.entries,
                 messages: vm.messages,
-                turns: vm.timeline.turns
+                turns: vm.timeline.turns,
+                liveTurnIds: lastLiveId.map { Set([$0]) },
+                messagesGenerationUnchanged: messagesUnchanged,
+                forceFullPath: forceFullPath
             )
             transcriptCache.entries = refreshed
+            transcriptCache.messagesGeneration = vm.transcriptState.messagesGeneration
+            transcriptCache.aggregateBudgetGeneration = vm.aggregateHotTextBudgetGeneration
             return refreshed
         }
         let merged = Self.ensuringTranscriptOrder(
@@ -13260,6 +13443,8 @@ public struct AgentAppView: View {
         )
         transcriptCache.signature = signature
         transcriptCache.entries = merged
+        transcriptCache.messagesGeneration = vm.transcriptState.messagesGeneration
+        transcriptCache.aggregateBudgetGeneration = vm.aggregateHotTextBudgetGeneration
         return merged
     }
 
@@ -13275,9 +13460,26 @@ public struct AgentAppView: View {
         cached: [TranscriptEntry],
         messages: [AgentMessage],
         turns: [AssistantTurnSnapshot],
-        liveTurnIds: Set<String>? = nil
+        liveTurnIds: Set<String>? = nil,
+        messagesGenerationUnchanged: Bool = false,
+        forceFullPath: Bool = false
     ) -> [TranscriptEntry] {
         guard !messages.isEmpty || !turns.isEmpty else { return cached }
+        if !forceFullPath,
+           messagesGenerationUnchanged,
+           let patched = rematerializedLiveTurnOnly(
+               cached: cached,
+               turns: turns,
+               liveTurnIds: liveTurnIds
+           ) {
+            #if DEBUG
+            TranscriptRematerializeProbe.incrementLiveTurnPatch()
+            #endif
+            return patched
+        }
+        #if DEBUG
+        TranscriptRematerializeProbe.incrementDictionaryBuild()
+        #endif
         var messagesById = [AgentMessageID: AgentMessage](minimumCapacity: messages.count)
         for message in messages { messagesById[message.id] = message }
         var turnsById = [String: AssistantTurnSnapshot](minimumCapacity: turns.count)
@@ -13295,6 +13497,39 @@ public struct AgentAppView: View {
                 return entry
             }
         }
+    }
+
+    /// Signature-hit fast path: only the unfinished live turn (or the last
+    /// unfinished) is patched. Finished item trees stay the cached copies.
+    nonisolated static func rematerializedLiveTurnOnly(
+        cached: [TranscriptEntry],
+        turns: [AssistantTurnSnapshot],
+        liveTurnIds: Set<String>?
+    ) -> [TranscriptEntry]? {
+        let liveId: String
+        if let liveTurnIds {
+            guard liveTurnIds.count == 1, let only = liveTurnIds.first else { return nil }
+            liveId = only
+        } else if let last = turns.last, !last.finished,
+                  turns.dropLast().allSatisfy(\.finished) {
+            liveId = last.turnId
+        } else {
+            return nil
+        }
+        guard let live = turns.first(where: { $0.turnId == liveId }), !live.finished else {
+            return nil
+        }
+        var liveIndex: Int?
+        var unfinishedCached = 0
+        for (index, entry) in cached.enumerated() {
+            guard case .turn(let stale) = entry else { continue }
+            if !stale.finished { unfinishedCached += 1 }
+            if stale.turnId == liveId { liveIndex = index }
+        }
+        guard unfinishedCached <= 1, let liveIndex else { return nil }
+        var next = cached
+        next[liveIndex] = .turn(live)
+        return next
     }
 
     /// Pure gate for stream-tick rematerialization scope.
@@ -13384,6 +13619,9 @@ public struct AgentAppView: View {
         runningSlack: TimeInterval = runningTranscriptContextSlack,
         precedingContextCount: Int = followUpPrecedingContextCount
     ) -> [TranscriptEntry] {
+        #if DEBUG
+        VisibleTranscriptWindowProbe.increment()
+        #endif
         // Pending is part of the active follow-up lifecycle (composer send →
         // provider start). Treat it like a live turn so we never flash the
         // idle "last 30" history between send and running.
@@ -13597,6 +13835,81 @@ public struct AgentAppView: View {
         var texts: [String] = []
     }
     private let assistantTextsCache = AssistantTextsCache()
+
+    /// F2: memoize `makeChatRowPaintContext` across chrome-only / paint-tick
+    /// body passes when `contentGeneration` and the compact row/bots signature
+    /// are unchanged. Peer-header + hide-set walks are O(visible rows).
+    private final class ChatRowPaintContextCache {
+        var generation: UInt64 = 0
+        var signature: String = ""
+        var context: ChatRowPaintContext?
+    }
+    private let chatRowPaintContextCache = ChatRowPaintContextCache()
+    #if DEBUG
+    /// Test-only: uncached `makeChatRowPaintContext` invocations.
+    static nonisolated(unsafe) var chatRowPaintContextComputeCountForTesting: UInt64 = 0
+    #endif
+
+    /// Signature for F2 paint-context reuse. Includes every bot identity field
+    /// consumed by peer-header derivation (handle/name/symbol), not just ends.
+    nonisolated static func chatRowPaintContextSignature(
+        generation: UInt64,
+        rows: [ChatFlowRow],
+        visibleEntries: [TranscriptEntry],
+        bots: [BotDefinition]
+    ) -> String {
+        var signature = "\(generation)|\(rows.count)|\(visibleEntries.count)|\(bots.count)"
+        if let first = rows.first?.id { signature += "|r0:\(first)" }
+        if let last = rows.last?.id { signature += "|rN:\(last)" }
+        if let first = visibleEntries.first?.id { signature += "|v0:\(first)" }
+        if let last = visibleEntries.last?.id { signature += "|vN:\(last)" }
+        for bot in bots {
+            signature += "|b:\(bot.handle)|\(bot.name)|\(bot.avatarSymbol)"
+        }
+        return signature
+    }
+
+    private func cachedChatRowPaintContext(
+        rows: [ChatFlowRow],
+        visibleEntries: [TranscriptEntry],
+        bots: [BotDefinition]
+    ) -> ChatRowPaintContext {
+        let generation = vm.transcriptState.contentGeneration
+        let signature = Self.chatRowPaintContextSignature(
+            generation: generation,
+            rows: rows,
+            visibleEntries: visibleEntries,
+            bots: bots
+        )
+        if chatRowPaintContextCache.generation == generation,
+           chatRowPaintContextCache.signature == signature,
+           let cached = chatRowPaintContextCache.context {
+            return cached
+        }
+        #if DEBUG
+        Self.chatRowPaintContextComputeCountForTesting &+= 1
+        #endif
+        let context = Self.makeChatRowPaintContext(
+            rows: rows,
+            visibleEntries: visibleEntries,
+            bots: bots
+        )
+        chatRowPaintContextCache.generation = generation
+        chatRowPaintContextCache.signature = signature
+        chatRowPaintContextCache.context = context
+        return context
+    }
+
+    #if DEBUG
+    /// Test seam for F2 cache hit/miss counters.
+    func cachedChatRowPaintContextForTesting(
+        rows: [ChatFlowRow],
+        visibleEntries: [TranscriptEntry],
+        bots: [BotDefinition]
+    ) -> ChatRowPaintContext {
+        cachedChatRowPaintContext(rows: rows, visibleEntries: visibleEntries, bots: bots)
+    }
+    #endif
 
     // F2: per-turn render data, memoized for FINISHED turns (immutable content) so a
     // long completed thread no longer re-derives renderableItems / final-id splitting /
@@ -14382,11 +14695,6 @@ public struct AgentAppView: View {
                         // property rebuilt two whole-thread dictionaries each read
                         // and used to be read three times per pass.
                         let mergedEntries = transcriptEntries
-                        let visibleEntries = Self.visibleTranscriptWindow(
-                            entries: mergedEntries,
-                            status: vm.status,
-                            runStartedAt: vm.runStartedAt
-                        )
                         let columnPaint = Self.transcriptColumnPaint(
                             mergedEntries: paintOrderedTranscriptEntriesCached(mergedEntries),
                             status: vm.status,
@@ -14396,6 +14704,7 @@ public struct AgentAppView: View {
                         )
                         let allEntries = columnPaint.all
                         let entries = columnPaint.visible
+                        let visibleEntries = columnPaint.visible
                         let hiddenCount = Self.hiddenTranscriptCount(
                             totalCount: allEntries.count,
                             visibleCount: entries.count
@@ -14425,7 +14734,9 @@ public struct AgentAppView: View {
                         let liveRows = Self.chatFlowRows(split.liveTail)
                         let allRows = historyRows + liveRows
                         let mentionBots = vm.mentionableBotsProvider()
-                        let rowPaintContext = Self.makeChatRowPaintContext(
+                        // F2: reuse paint context across chrome-only / paint-tick
+                        // passes when contentGeneration is unchanged.
+                        let rowPaintContext = cachedChatRowPaintContext(
                             rows: allRows,
                             visibleEntries: visibleEntries,
                             bots: mentionBots
@@ -14509,7 +14820,12 @@ public struct AgentAppView: View {
                                 activePlanRow(plan)
                                     .id("agent.activePlan")
                             }
-                            if vm.messages.isEmpty && vm.timeline.turns.isEmpty && vm.timeline.error == nil {
+                            if Self.shouldShowEmptyConversation(
+                                messagesEmpty: vm.messages.isEmpty,
+                                turnsEmpty: vm.timeline.turns.isEmpty,
+                                hasTimelineError: vm.timeline.error != nil,
+                                isHidden: vm.isHiddenFromSurface
+                            ) {
                                 emptyConversation
                                     .id("agent.emptyConversation")
                             }
@@ -14558,6 +14874,7 @@ public struct AgentAppView: View {
             }
         }
         .onChange(of: vm.timeline.turns.count) { _ in
+            guard !vm.isHiddenFromSurface else { return }
             DispatchQueue.main.async {
                 pruneExpandedItemIds()
             }
@@ -15208,13 +15525,15 @@ public struct AgentAppView: View {
 
     // IMP-MAC_AGENT-013: write a thread's markdown export via a save panel.
     private func exportThread(_ thread: AgentThread) {
-        guard let export = vm.exportThreadMarkdown(thread.id) else { return }
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
-        panel.nameFieldStringValue = export.fileName
-        panel.canCreateDirectories = true
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        try? export.contents.data(using: .utf8)?.write(to: url, options: .atomic)
+        Task { @MainActor in
+            guard let export = await vm.exportThreadMarkdown(thread.id) else { return }
+            let panel = NSSavePanel()
+            panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+            panel.nameFieldStringValue = export.fileName
+            panel.canCreateDirectories = true
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try? export.contents.data(using: .utf8)?.write(to: url, options: .atomic)
+        }
     }
 
     @ViewBuilder
@@ -15460,6 +15779,18 @@ public struct AgentAppView: View {
             revealedCount: revealedCount
         ))
         .accessibilityIdentifier("agent.runningHiddenTranscript")
+    }
+
+    /// Hide-drop publishes an empty timeline while the run still lives in
+    /// `latestHiddenTimeline`. That 0-turn publish must not paint the empty
+    /// conversation placeholder.
+    nonisolated static func shouldShowEmptyConversation(
+        messagesEmpty: Bool,
+        turnsEmpty: Bool,
+        hasTimelineError: Bool,
+        isHidden: Bool
+    ) -> Bool {
+        !isHidden && messagesEmpty && turnsEmpty && !hasTimelineError
     }
 
     nonisolated static func hiddenTranscriptRevealLabel(
@@ -18803,7 +19134,11 @@ enum ScrollPinPolicy {
 
 // PERF-MAC_AGENT-004: 1s cadence for the first minute, 5s after, so the
 // "Working for Xs" row stops forcing a re-render every second on long runs.
-private struct ElapsedTickSchedule: TimelineSchedule {
+// Perf CH-12: honour `mode == .lowFrequency` (SwiftUI passes it while the
+// view is occluded / its window is minimized) by pinning the 5s cadence, so
+// hidden live tool clocks are not a steady 1s wake-up source. Mirrors
+// `AgentChatElapsedTickSchedule`.
+struct ElapsedTickSchedule: TimelineSchedule {
     let start: Date
 
     func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
@@ -18811,7 +19146,7 @@ private struct ElapsedTickSchedule: TimelineSchedule {
         return AnyIterator {
             let current = next
             let elapsed = current.timeIntervalSince(start)
-            let step: TimeInterval = elapsed < 60 ? 1 : 5
+            let step: TimeInterval = (elapsed < 60 && mode != .lowFrequency) ? 1 : 5
             next = current.addingTimeInterval(step)
             return current
         }

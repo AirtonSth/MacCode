@@ -264,6 +264,25 @@ final class GrokACPProtocolTests: XCTestCase {
             .setModel(modelId: model, reasoningEffort: .max)
         )
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.max, modelId: model), "max")
+        XCTAssertEqual(
+            GrokACPClient.modelEffortBind(
+                requestModel: model, sessionModel: model,
+                requestEffort: .medium, sessionEffort: .max,
+                prefersConfigOptionEffort: true
+            ),
+            .setConfigOption(configId: "reasoning_effort", value: "medium", effort: .medium)
+        )
+        XCTAssertEqual(
+            GrokACPClient.modelEffortBind(
+                requestModel: "muse-spark-1.3-contributor",
+                sessionModel: "muse-spark-1.3-contributor",
+                requestEffort: .xhigh,
+                sessionEffort: .low,
+                prefersConfigOptionEffort: true,
+                advertisedEfforts: [.low, .medium, .high, .xhigh]
+            ),
+            .setConfigOption(configId: "reasoning_effort", value: "xhigh", effort: .xhigh)
+        )
     }
 
     func test_regularACPLaunchEmptyModelOmitsModelFlagAndMatchesEffortSemantics() throws {
@@ -1444,18 +1463,19 @@ final class GrokACPProtocolTests: XCTestCase {
             adapter.contains("modelEffortBind"),
             "Adapter must re-bind effort when it changes even if model id is unchanged"
         )
-        XCTAssertFalse(
-            adapter.contains("setConfigOptionReasoningEffort") || adapter.contains("session.client.setConfigOption"),
-            "Live grok 1.0.13 rejects session/set_config_option with Invalid params; effort-only must use set_model"
+        XCTAssertTrue(
+            adapter.contains("setConfigOption") && source.contains("setConfigOption"),
+            "Live grok 1.0.25 accepts flat set_config_option; adapter must call it when advertised"
         )
     }
 
     /// WHY: ACP and CLI must send only values advertised by the effective
     /// account-default model (Grok 4.6), never stale shared-picker aliases.
-    /// Grok 4.6 advertises `minimal` (grok-build SELECTABLE_REASONING_EFFORTS).
+    /// Live grok 1.0.25 grok-4.6 ads omit `minimal`; static fallback matches.
     func test_wireReasoningEffortNormalizesForDefaultGrok46() {
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.ultracode), "xhigh")
-        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.minimal), "minimal")
+        XCTAssertEqual(GrokACPClient.wireReasoningEffort(.minimal), "low",
+                       "Grok 4.6 live catalog omits minimal; remap to low")
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.low), "low")
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.medium), "medium")
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.high), "high")
@@ -1465,14 +1485,55 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(GrokACPClient.wireReasoningEffort(.minimal, modelId: "grok-4.5"), "low")
     }
 
-    /// WHY: Image #1 Agent App Grok send died at start with
-    /// `Grok ACP RPC error: Invalid params`. New threads always carry a
-    /// composer effort (default medium) while `Session.reasoningEffort` is
-    /// nil, so the first prompt is an effort-only bind. Live grok 1.0.13
-    /// rejects `session/set_config_option` (`-32602` nested `{value:{value:}}`,
-    /// `-32601` ACP string value) and accepts `session/set_model` +
-    /// `_meta.reasoningEffort` for the same model id.
-    func test_modelEffortBindRoutesEffortOnlyToSetModelNotSetConfigOption() {
+    /// WHY: Live grok-4.6 lists efforts as xhigh→…→low with default:true on high.
+    /// Schedulers use `.first`; preserving agent order would seed Extra High.
+    func test_modelDescriptorsPrefersDefaultAndStableOrder() {
+        let models = GrokACPClient.modelDescriptors(from: [
+            "availableModels": [[
+                "modelId": "grok-4.6",
+                "name": "Grok 4.6",
+                "_meta": [
+                    "supportsReasoningEffort": true,
+                    "reasoningEffort": "xhigh",
+                    "reasoningEfforts": [
+                        ["id": "xhigh", "value": "xhigh", "default": false],
+                        ["id": "high", "value": "high", "default": true],
+                        ["id": "medium", "value": "medium", "default": false],
+                        ["id": "low", "value": "low", "default": false],
+                    ],
+                ],
+            ] as [String: Any]],
+        ])
+        let model = try! XCTUnwrap(models.first)
+        // 015: advertised default leads `.first` consumers / drafts.
+        XCTAssertEqual(model.supportedReasoningEfforts.first, .high)
+        // Preserve agent-relative order after lifting preferred (not CaseIterable scramble).
+        XCTAssertEqual(model.supportedReasoningEfforts, [.high, .xhigh, .medium, .low])
+        // 017: seed tracks live current so first-turn default/high still binds.
+        XCTAssertEqual(
+            GrokACPClient.seededReasoningEffort(
+                models: models,
+                currentModelId: "grok-4.6",
+                currentEffortRaw: "xhigh"
+            ),
+            .xhigh
+        )
+        let bindDefaultWhileCurrentXhigh = GrokACPClient.modelEffortBind(
+            requestModel: "grok-4.6",
+            sessionModel: "grok-4.6",
+            requestEffort: .high,
+            sessionEffort: .xhigh
+        )
+        guard case let .setModel(_, boundEffort) = bindDefaultWhileCurrentXhigh else {
+            return XCTFail("request high with session xhigh must bind, got \(bindDefaultWhileCurrentXhigh)")
+        }
+        XCTAssertEqual(boundEffort, .high)
+    }
+
+    /// WHY: Without advertised configOptions, effort-only must keep set_model+_meta
+    /// (older grok 1.0.13 rejected set_config_option). With advertised options,
+    /// prefer flat set_config_option (live 1.0.25).
+    func test_modelEffortBindRoutesEffortOnlyByConfigOptionAvailability() {
         let firstTurn = GrokACPClient.modelEffortBind(
             requestModel: "grok-4.6",
             sessionModel: "grok-4.6",
@@ -1480,35 +1541,47 @@ final class GrokACPProtocolTests: XCTestCase {
             sessionEffort: nil
         )
         guard case let .setModel(firstModel, firstEffort) = firstTurn else {
-            return XCTFail("first-turn effort bind must use set_model, got \(firstTurn)")
+            return XCTFail("first-turn without configOptions must use set_model, got \(firstTurn)")
         }
         XCTAssertEqual(firstModel, "grok-4.6")
         XCTAssertEqual(firstEffort, .medium)
 
-        let effortOnly = GrokACPClient.modelEffortBind(
+        let effortOnlyLegacy = GrokACPClient.modelEffortBind(
             requestModel: "grok-4.6",
             sessionModel: "grok-4.6",
             requestEffort: .high,
-            sessionEffort: .low
+            sessionEffort: .low,
+            prefersConfigOptionEffort: false
         )
-        guard case let .setModel(modelId, reasoningEffort) = effortOnly else {
-            return XCTFail("effort-only must use set_model, got \(effortOnly)")
+        guard case let .setModel(modelId, reasoningEffort) = effortOnlyLegacy else {
+            return XCTFail("legacy effort-only must use set_model, got \(effortOnlyLegacy)")
         }
         XCTAssertEqual(modelId, "grok-4.6")
         XCTAssertEqual(reasoningEffort, .high)
-        XCTAssertEqual(
-            GrokACPClient.wireReasoningEffort(.high, modelId: modelId),
-            "high"
+
+        let effortOnlyModern = GrokACPClient.modelEffortBind(
+            requestModel: "grok-4.6",
+            sessionModel: "grok-4.6",
+            requestEffort: .high,
+            sessionEffort: .low,
+            prefersConfigOptionEffort: true
         )
+        guard case let .setConfigOption(configId, value, effort) = effortOnlyModern else {
+            return XCTFail("modern effort-only must use set_config_option, got \(effortOnlyModern)")
+        }
+        XCTAssertEqual(configId, "reasoning_effort")
+        XCTAssertEqual(value, "high")
+        XCTAssertEqual(effort, .high)
 
         let modelChange = GrokACPClient.modelEffortBind(
             requestModel: "grok-4.5",
             sessionModel: "grok-4.6",
             requestEffort: .medium,
-            sessionEffort: .high
+            sessionEffort: .high,
+            prefersConfigOptionEffort: true
         )
         guard case let .setModel(changedModel, changedEffort) = modelChange else {
-            return XCTFail("model change must use set_model, got \(modelChange)")
+            return XCTFail("model change must use set_model even when configOptions exist, got \(modelChange)")
         }
         XCTAssertEqual(changedModel, "grok-4.5")
         XCTAssertEqual(changedEffort, .medium)
@@ -1517,9 +1590,60 @@ final class GrokACPProtocolTests: XCTestCase {
             requestModel: "grok-4.6",
             sessionModel: "grok-4.6",
             requestEffort: .high,
-            sessionEffort: .high
+            sessionEffort: .high,
+            prefersConfigOptionEffort: true
         )
         XCTAssertEqual(noop, .none)
+    }
+
+    /// WHY: advertisedEfforts is a let from session/new|load and is not
+    /// refreshed after setModel. Opening grok-4.6 advertises xhigh; binding
+    /// grok-4.5 must still clamp instead of returning the stale ad unchanged.
+    func test_modelEffortBindIntersectsStaleAdsWithTargetModelSupportedEfforts() {
+        let grok45FromGrok46Ads = GrokACPClient.modelEffortBind(
+            requestModel: "grok-4.5",
+            sessionModel: "grok-4.6",
+            requestEffort: .xhigh,
+            sessionEffort: .high,
+            advertisedEfforts: [.low, .medium, .high, .xhigh]
+        )
+        guard case let .setModel(modelId, effort) = grok45FromGrok46Ads else {
+            return XCTFail("grok-4.6→4.5 xhigh must bind via set_model, got \(grok45FromGrok46Ads)")
+        }
+        XCTAssertEqual(modelId, "grok-4.5")
+        XCTAssertEqual(effort, .high)
+
+        let effortOnlyAfterModelSwitch = GrokACPClient.modelEffortBind(
+            requestModel: "grok-4.5",
+            sessionModel: "grok-4.5",
+            requestEffort: .xhigh,
+            sessionEffort: .high,
+            prefersConfigOptionEffort: true,
+            advertisedEfforts: [.low, .medium, .high, .xhigh]
+        )
+        guard case let .setConfigOption(_, value, clamped) = effortOnlyAfterModelSwitch else {
+            return XCTFail("stale grok-4.6 ads on grok-4.5 must still clamp, got \(effortOnlyAfterModelSwitch)")
+        }
+        XCTAssertEqual(value, "high")
+        XCTAssertEqual(clamped, .high)
+
+        let museEmptyMeta = GrokACPClient.modelEffortBind(
+            requestModel: "muse-spark-1.3-contributor",
+            sessionModel: "muse-spark-1.3-contributor",
+            requestEffort: .xhigh,
+            sessionEffort: .low,
+            prefersConfigOptionEffort: true,
+            advertisedEfforts: []
+        )
+        guard case let .setConfigOption(_, museValue, museEffort) = museEmptyMeta else {
+            return XCTFail("muse-spark empty _meta must keep museSparkEfforts xhigh, got \(museEmptyMeta)")
+        }
+        XCTAssertEqual(museValue, "xhigh")
+        XCTAssertEqual(museEffort, .xhigh)
+        XCTAssertEqual(
+            GrokReasoningPolicy.supportedEfforts(for: "muse-spark-1.3-contributor"),
+            GrokReasoningPolicy.museSparkEfforts
+        )
     }
 
     /// WHY: session/new|load advertise typed configOptions; ignoring them leaves
@@ -1541,8 +1665,9 @@ final class GrokACPProtocolTests: XCTestCase {
                 [
                     "id": "reasoning_effort",
                     "category": "thought_level",
+                    "currentValue": "xhigh",
                     "options": [
-                        ["value": "minimal", "name": "Minimal"],
+                        ["value": "xhigh", "name": "Extra High"],
                         ["value": "high", "name": "High"],
                     ],
                 ],
@@ -1551,7 +1676,9 @@ final class GrokACPProtocolTests: XCTestCase {
         let open = try GrokACPClient.openResult(result, fallbackSessionId: nil)
         XCTAssertEqual(open.sessionId, "sid-1")
         XCTAssertFalse(open.configOptions.isEmpty)
-        XCTAssertEqual(open.advertisedReasoningEffortIds, ["minimal", "high"])
+        XCTAssertEqual(open.advertisedReasoningEffortIds, ["xhigh", "high"])
+        XCTAssertEqual(open.currentReasoningEffortRaw, "xhigh")
+        XCTAssertTrue(open.advertisesReasoningEffortConfig)
     }
 
     /// WHY: warm reattach + prompt still paid full gateway replay unless

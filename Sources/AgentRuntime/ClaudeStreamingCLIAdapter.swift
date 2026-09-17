@@ -1,5 +1,7 @@
+import CoreGraphics
 import Foundation
 import CoreModel
+import ImageIO
 import os
 
 private let claudeStreamLog = Logger(subsystem: "io.remotecode.agent", category: "claude.stream")
@@ -14,7 +16,7 @@ struct ClaudeCLIUnavailableError: Error, CustomStringConvertible {
 
 /// Wire kind for control-channel user-input replies (AskUserQuestion vs elicitation vs dialog).
 enum ClaudeControlUserInputKind: Sendable, Equatable {
-    case askUserQuestion(toolUseID: String?)
+    case askUserQuestion(toolUseID: String?, inputJSON: String?)
     case elicitation
     /// CLAUDE-CLI-016: tool-driven blocking dialogs (`request_user_dialog`).
     case userDialog(dialogKind: String)
@@ -90,6 +92,12 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         var pendingPermissionMeta: [String: PendingPermissionMeta] = [:]
         var environment: [String: String] = [:]
         var cancellationRequested = false
+        /// Advertised CLI `system/init` capabilities (interrupt_receipt_v1, …).
+        var cliCapabilities = Set<String>()
+        /// request_id of the in-flight host interrupt control_request, if any.
+        var pendingInterruptRequestId: String?
+        /// Grace-period process stop; cancelled when an interrupt receipt arrives.
+        var interruptKillWorkItem: DispatchWorkItem?
         /// Prompt of the in-flight turn — needed to re-drive once after an
         /// ambient task-notification-only CLI exit (see CLAUDE-AMBIENT-TASK-RESULT).
         var lastInFlightPrompt: String?
@@ -170,6 +178,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     // UX-RESUME: set of thread IDs whose last session was killed by interruptTurn.
     // Cleared when sendTurn begins a new session for that thread. Guarded by `lock`.
     private var interruptedThreadIds: Set<AgentThreadID> = []
+    /// Keyed CLI fork: idempotency key -> child provider id. Guarded by `lock`.
+    private var forkChildByKey: [String: String] = [:]
+    /// Child provider id -> source provider id for the first child spawn. Guarded by `lock`.
+    private var forkSourceByChild: [String: String] = [:]
 
     /// CLAUDE-BG-LIFECYCLE: inactivity bound for a withheld finish, fully reset
     /// by stream lines. Quiet background jobs emit nothing until they end; on
@@ -196,6 +208,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         self.interruptGracePeriod = max(0, interruptGracePeriod)
         self.deferredFinishInactivityTimeout = max(0.01, deferredFinishInactivityTimeout)
         self.deferredFinishPostIdleTimeout = max(0.01, deferredFinishPostIdleTimeout)
+    }
+
+    public var forkSafety: AgentProviderForkSafety {
+        .keyedIdempotent(compensationSupported: true)
+    }
+
+    public func forkSafety(threadId: AgentThreadID) -> AgentProviderForkSafety {
+        forkSafety
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
@@ -302,13 +322,73 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             interruptedThreadIds.insert(threadId)
             session?.cancellationRequested = true
         }
+        let cancelQueued = session?.cliCapabilities.contains("interrupt_cancel_queued_v1") ?? false
+        let ownedRunId = session?.inFlightRunId
         lock.unlock()
         guard let session else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
         // Attempt graceful interrupt via stream-json control message first.
         // This lets the Claude CLI finish writing and close cleanly, preserving
         // the warm session for potential resumption. Fall back to process kill
         // only if the stdin write fails (pipe closed, process already dead, etc.).
-        let line = Self.controlInterruptLine()
+        // Publish pendingInterruptRequestId AND the grace-kill work item before the
+        // stdin write becomes visible so a fast control_response can cancel the
+        // same work item (CLAUDE-INT-002 race).
+        let line = Self.controlInterruptLine(cancelQueued: cancelQueued)
+        guard let requestId = Self.controlRequestId(fromInterruptLine: line), !requestId.isEmpty else {
+            // Malformed interrupt payload — fall back to hard stop.
+            try stopSession(threadId: threadId)
+            return
+        }
+        // Box lets the work item re-check that *this* item is still installed
+        // after DispatchWorkItem.cancel() (cancel is a no-op once running).
+        final class InterruptKillBox: @unchecked Sendable {
+            var item: DispatchWorkItem?
+        }
+        let killBox = InterruptKillBox()
+        let killWork = DispatchWorkItem { [weak self, weak session] in
+            guard let self, let session else { return }
+            self.lock.lock()
+            // CLAUDE-INT-002: cancel() does not stop a body that already began.
+            // Ownership of the pending interrupt + installed work item must still
+            // match before we hard-stop; a matching receipt clears both first.
+            let mappedSessionIsExact = self.sessions[threadId] === session
+            let stillOwnsInterrupt = Self.shouldExecuteInterruptGraceKill(
+                sessionStillCurrent: mappedSessionIsExact,
+                inFlightRunId: session.inFlightRunId,
+                ownedRunId: ownedRunId,
+                pendingRequestId: session.pendingInterruptRequestId,
+                scheduledRequestId: requestId,
+                installedWorkItemIsSelf: session.interruptKillWorkItem === killBox.item
+            )
+            var sessionToTerminate: Session? = nil
+            if stillOwnsInterrupt {
+                session.interruptKillWorkItem = nil
+                session.pendingInterruptRequestId = nil
+            }
+            // Remove the exact Session under this lock. stopSession(threadId:)
+            // after unlock re-resolves by id and can terminate a later sendTurn.
+            if Self.shouldRemoveSessionOnInterruptGraceKill(
+                stillOwnsInterrupt: stillOwnsInterrupt,
+                mappedSessionIsExact: mappedSessionIsExact
+            ) {
+                session.cancellationRequested = true
+                self.sessions.removeValue(forKey: threadId)
+                sessionToTerminate = session
+            }
+            self.lock.unlock()
+            if let sessionToTerminate {
+                // SIGINT ends the in-progress turn; SIGTERM leaves it unfinished
+                // so `--resume` continues it. Only this receipt-timed grace kill
+                // uses interruptTree — stopSession and other teardowns stay SIGTERM.
+                self.terminate(session: sessionToTerminate, status: .cancelled, interruptFallback: true)
+            }
+        }
+        killBox.item = killWork
+        lock.lock()
+        session.pendingInterruptRequestId = requestId
+        session.interruptKillWorkItem?.cancel()
+        session.interruptKillWorkItem = killWork
+        lock.unlock()
         let didSend = session.writeQueue.sync {
             (try? GuardedStdinWrite.write(line,
                                           to: session.stdinPipe.fileHandleForWriting,
@@ -316,15 +396,32 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                                           notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) })) != nil
         }
         if !didSend {
+            lock.lock()
+            if session.pendingInterruptRequestId == requestId {
+                session.pendingInterruptRequestId = nil
+            }
+            if session.interruptKillWorkItem === killWork {
+                session.interruptKillWorkItem?.cancel()
+                session.interruptKillWorkItem = nil
+            }
+            lock.unlock()
             try stopSession(threadId: threadId)
             return
         }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + interruptGracePeriod) { [weak self, weak session] in
-            guard let self, let session else { return }
-            self.lock.lock()
-            let stillRunning = self.sessions[threadId] === session && session.inFlightRunId != nil
-            self.lock.unlock()
-            if stillRunning { try? self.stopSession(threadId: threadId) }
+        // Schedule only while this interrupt is still pending. A receipt that
+        // arrived during the write already cleared pending + cancelled killWork.
+        lock.lock()
+        let stillPending = Self.shouldScheduleInterruptGraceKill(
+            pendingRequestId: session.pendingInterruptRequestId,
+            scheduledRequestId: requestId,
+            killWorkStillInstalled: session.interruptKillWorkItem === killWork
+        )
+        lock.unlock()
+        if stillPending {
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + interruptGracePeriod,
+                execute: killWork
+            )
         }
     }
 
@@ -352,8 +449,13 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         }
         // CLAUDE-CLI-015: SDKUserMessage requires parent_tool_use_id (null for
         // top-level host turns). Bridge always sets it; CLI stdin must match.
+        // CLAUDE-ORIGIN-001: unattributed user lines miss human-only CLI gates
+        // (ultracode, queued_turn_count). Host-typed stdin is origin.kind=human
+        // and carries a uuid so reply binding and cancel_queued receipts work.
         return [
             "type": "user",
+            "uuid": UUID().uuidString,
+            "origin": ["kind": "human"],
             "message": [
                 "role": "user",
                 "content": content
@@ -362,7 +464,11 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         ]
     }
 
-    nonisolated static func attachmentContentBlock(_ attachment: AgentAttachment) throws -> [String: Any] {
+    nonisolated static func attachmentContentBlock(
+        _ attachment: AgentAttachment,
+        maxPixel: Int = AgentAttachmentWireImage.maxPixel,
+        maxEncodedBytes: Int = AgentAttachmentWireImage.maxEncodedBytes
+    ) throws -> [String: Any] {
         let mimeType = attachment.mimeType ?? ""
         let isImage = attachment.kind == .image || mimeType.hasPrefix("image/")
         if isImage {
@@ -372,13 +478,23 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                     "Unsupported Claude image attachment type: \(mimeType.isEmpty ? "unknown" : mimeType)"
                 )
             }
-            let data = try Data(contentsOf: URL(fileURLWithPath: attachment.path))
+            let payload: AgentAttachmentWireImage.Payload
+            do {
+                payload = try AgentAttachmentWireImage.encode(
+                    path: attachment.path,
+                    mimeType: mimeType,
+                    maxPixel: maxPixel,
+                    maxEncodedBytes: maxEncodedBytes
+                )
+            } catch let error as AgentAttachmentWireImage.EncodeError {
+                throw AgentProviderAdapterError.unsupported(error.description)
+            }
             return [
                 "type": "image",
                 "source": [
                     "type": "base64",
-                    "media_type": mimeType,
-                    "data": data.base64EncodedString()
+                    "media_type": payload.mediaType,
+                    "data": payload.data.base64EncodedString()
                 ]
             ]
         }
@@ -390,17 +506,115 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
 
     /// Builds the newline-terminated stream-json control interrupt payload.
     /// Pure builder — no I/O, no actor isolation. Extracted for unit testing.
-    nonisolated static func controlInterruptLine() -> Data {
+    /// When `cancelQueued` is true (`interrupt_cancel_queued_v1`), include
+    /// `cancel_queued: true` so queued turns are cancelled with the interrupt.
+    nonisolated static func controlInterruptLine(cancelQueued: Bool = false) -> Data {
         // Claude CLI stream-json / Agent SDK control channel:
         // {"type":"control_request","request_id":"<uuid>","request":{"subtype":"interrupt"}}
+        var request: [String: Any] = ["subtype": "interrupt"]
+        if cancelQueued {
+            request["cancel_queued"] = true
+        }
         let payload: [String: Any] = [
             "type": "control_request",
             "request_id": UUID().uuidString,
-            "request": ["subtype": "interrupt"]
+            "request": request
         ]
         var data = (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
         data.append(0x0A) // newline delimiter
         return data
+    }
+
+    /// request_id from a control interrupt line produced by `controlInterruptLine`.
+    nonisolated static func controlRequestId(fromInterruptLine data: Data) -> String? {
+        let stripped = data.last == 0x0A ? data.dropLast() : Data.SubSequence(data)
+        guard let object = try? JSONSerialization.jsonObject(with: Data(stripped)) as? [String: Any],
+              let requestId = object["request_id"] as? String,
+              !requestId.isEmpty else { return nil }
+        return requestId
+    }
+
+    /// Capabilities advertised on `system/init`. Nil when the object is not init.
+    nonisolated static func initCapabilities(from object: [String: Any]?) -> Set<String>? {
+        guard let object,
+              (object["type"] as? String) == "system",
+              (object["subtype"] as? String) == "init" else { return nil }
+        let raw = object["capabilities"] as? [Any] ?? []
+        return Set(raw.compactMap { $0 as? String }.filter { !$0.isEmpty })
+    }
+
+    /// Cancel the grace kill only for a successful receipt matching the pending interrupt.
+    /// After a successful interrupt stdin write, schedule the grace kill only if
+    /// this request is still pending and still owns the pre-installed work item.
+    nonisolated static func shouldScheduleInterruptGraceKill(
+        pendingRequestId: String?,
+        scheduledRequestId: String,
+        killWorkStillInstalled: Bool
+    ) -> Bool {
+        pendingRequestId == scheduledRequestId && killWorkStillInstalled
+    }
+
+        nonisolated static func shouldCancelInterruptGraceKill(
+        pendingRequestId: String?,
+        receiptRequestId: String?,
+        receiptSuccess: Bool
+    ) -> Bool {
+        guard receiptSuccess,
+              let pending = pendingRequestId, !pending.isEmpty,
+              let receipt = receiptRequestId, receipt == pending else { return false }
+        return true
+    }
+
+    /// Whether a grace-kill work item that has already begun still owns the
+    /// interrupted run. False when a matching interrupt receipt cleared ownership
+    /// (pending id / installed work item) before the body reached this check,
+    /// or when the in-flight run is no longer the interrupted one (emitTerminal
+    /// released it and a later sendTurn started a new turn on the warm session).
+    nonisolated static func shouldExecuteInterruptGraceKill(
+        sessionStillCurrent: Bool,
+        inFlightRunId: AgentRunID?,
+        ownedRunId: AgentRunID?,
+        pendingRequestId: String?,
+        scheduledRequestId: String,
+        installedWorkItemIsSelf: Bool
+    ) -> Bool {
+        sessionStillCurrent
+            && inFlightRunId != nil
+            && inFlightRunId == ownedRunId
+            && pendingRequestId == scheduledRequestId
+            && installedWorkItemIsSelf
+    }
+
+    /// Remove `sessions[threadId]` only for the exact Session that still owns
+    /// the interrupt, under the same lock as the ownership check. Re-resolving
+    /// by threadId after unlock (`stopSession`) would terminate a later sendTurn
+    /// that replaced the map entry between check and remove.
+    nonisolated static func shouldRemoveSessionOnInterruptGraceKill(
+        stillOwnsInterrupt: Bool,
+        mappedSessionIsExact: Bool
+    ) -> Bool {
+        stillOwnsInterrupt && mappedSessionIsExact
+    }
+
+    /// CLAUDE-INT-002: interrupt_receipt_v1 answers with control_response before
+    /// the aborted result. Drop the grace process-stop when the receipt matches.
+    private func applyInterruptReceipt(
+        _ receipt: ClaudeControlResponseReceipt,
+        session: Session
+    ) {
+        lock.lock()
+        let pending = session.pendingInterruptRequestId
+        let shouldCancel = Self.shouldCancelInterruptGraceKill(
+            pendingRequestId: pending,
+            receiptRequestId: receipt.requestId,
+            receiptSuccess: receipt.success
+        )
+        if shouldCancel {
+            session.interruptKillWorkItem?.cancel()
+            session.interruptKillWorkItem = nil
+            session.pendingInterruptRequestId = nil
+        }
+        lock.unlock()
     }
 
     public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
@@ -505,7 +719,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             }
         } else {
             // tool_use path: interrupt the turn (legacy corpus behavior).
-            let line = Self.controlInterruptLine()
+            lock.lock()
+            let cancelQueued = session.cliCapabilities.contains("interrupt_cancel_queued_v1")
+            lock.unlock()
+            let line = Self.controlInterruptLine(cancelQueued: cancelQueued)
             try session.writeQueue.sync {
                 try GuardedStdinWrite.write(
                     line,
@@ -531,6 +748,60 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         lock.unlock()
         guard let session else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
         terminate(session: session, status: .cancelled)
+    }
+
+    public func forkThread(threadId: AgentThreadID) async throws -> String {
+        throw AgentProviderAdapterError.unsupported(
+            "unkeyed Claude CLI fork is unsafe; use the durable AgentProviderForkRequest path"
+        )
+    }
+
+    public func forkThread(_ request: AgentProviderForkRequest) async throws -> String {
+        guard forkSafety(threadId: request.sourceThreadId).supportsDurableFork else {
+            throw AgentProviderAdapterError.unsupported("Claude CLI fork reconciliation contract is unavailable")
+        }
+        lock.lock()
+        let sourceSession = sessions[request.sourceThreadId]
+        let sourceId = request.sourceProviderThreadId ?? sourceSession?.providerThreadId
+        let hasActiveTurn = sourceSession?.inFlightRunId != nil
+        if let existing = forkChildByKey[request.idempotencyKey], !existing.isEmpty {
+            lock.unlock()
+            return existing
+        }
+        lock.unlock()
+        guard let sourceId, !sourceId.isEmpty else {
+            throw AgentProviderAdapterError.sessionNotFound(request.sourceThreadId)
+        }
+        if let expected = request.sourceProviderThreadId, !expected.isEmpty, expected != sourceId {
+            throw AgentProviderAdapterError.unsupported("Claude CLI recovered the wrong parent for fork")
+        }
+        guard !hasActiveTurn else {
+            throw AgentProviderAdapterError.unsupported("Claude CLI cannot fork while the parent turn is active")
+        }
+        let childId = request.childThreadId.value.uuidString
+        guard childId != sourceId else {
+            throw AgentProviderAdapterError.unsupported("provider-native fork did not return a distinct child")
+        }
+        lock.lock()
+        forkChildByKey[request.idempotencyKey] = childId
+        forkSourceByChild[childId] = sourceId
+        lock.unlock()
+        return childId
+    }
+
+    public func compensateFork(
+        _ request: AgentProviderForkRequest,
+        providerChildThreadId: String
+    ) async throws {
+        guard forkSafety(threadId: request.sourceThreadId).supportsCompensation else {
+            throw AgentProviderAdapterError.unsupported("Claude CLI fork compensation contract is unavailable")
+        }
+        lock.lock()
+        if forkChildByKey[request.idempotencyKey] == providerChildThreadId {
+            forkChildByKey.removeValue(forKey: request.idempotencyKey)
+        }
+        forkSourceByChild.removeValue(forKey: providerChildThreadId)
+        lock.unlock()
     }
 
     public func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {
@@ -681,10 +952,16 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let askpass = isForeignUser
             ? RunAsUserProcessBootstrap.materializeAskpass(targetUser: request.runAsUser!.shortName)
             : nil
+        let forkSource: String? = {
+            let childId = request.providerThreadId ?? request.threadId.value.uuidString
+            lock.lock()
+            defer { lock.unlock() }
+            return forkSourceByChild.removeValue(forKey: childId)
+        }()
         let process = try ProviderSubprocessLauncher.makeProcess(
             provider: .claude,
             executablePath: path,
-            arguments: ClaudeRunner.buildStreamingArgs(request),
+            arguments: ClaudeRunner.buildStreamingArgs(request, forkFrom: forkSource),
             currentDirectory: request.cwd,
             environment: thinkingEnvironment,
             runAsUser: request.runAsUser,
@@ -812,6 +1089,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         var armedPostIdleFlush = false
         var isBackgroundLifecycle = false
         if let rawObject {
+            if let caps = Self.initCapabilities(from: rawObject) {
+                lock.lock()
+                session.cliCapabilities = caps
+                lock.unlock()
+            }
+            if let receipt = ClaudeParser.controlResponseReceipt(from: rawObject) {
+                applyInterruptReceipt(receipt, session: session)
+            }
             // CLAUDE-BG-LIFECYCLE: keep the pending-background-work view current
             // BEFORE the parser's turn events are processed below, so a `result`
             // in this same batch is judged against the up-to-date set.
@@ -869,7 +1154,9 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             emit(.event(event), session: session)
             if case .error(_, let recoverable) = event, !recoverable {
                 lock.lock()
-                session.sawError = true
+                if !session.cancellationRequested {
+                    session.sawError = true
+                }
                 lock.unlock()
             }
             if case .threadStarted(_, let providerThreadId) = event {
@@ -929,9 +1216,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             if case .proposedPlan = event {
                 lock.lock()
                 let isPlanSession = session.interactionMode == .plan
+                let cancelQueued = session.cliCapabilities.contains("interrupt_cancel_queued_v1")
                 lock.unlock()
                 if isPlanSession {
-                    let line = Self.controlInterruptLine()
+                    let line = Self.controlInterruptLine(cancelQueued: cancelQueued)
                     _ = session.writeQueue.sync {
                         try? GuardedStdinWrite.write(
                             line,
@@ -1091,6 +1379,11 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.pendingPermissionMeta.removeAll()
         session.pendingBackgroundTaskIds.removeAll()
         session.sawDetachedShellSpawn = false
+        // The interrupted run completed without a control_response receipt.
+        // Drop the grace-kill so a later sendTurn cannot inherit this timer.
+        session.interruptKillWorkItem?.cancel()
+        session.interruptKillWorkItem = nil
+        session.pendingInterruptRequestId = nil
         lock.unlock()
     }
 
@@ -1311,7 +1604,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         // still be reading/parsing — the lock keeps LineBuffer and ClaudeParser
         // access and fd read order serialized so no final line is split or raced.
         session.stdoutReadLock.lock()
-        let tail = BoundedPipeDrain.readRemaining(from: session.stdoutPipe.fileHandleForReading)
+        let tail = BoundedPipeDrain.readRemaining(
+            from: session.stdoutPipe.fileHandleForReading,
+            maxBytes: BoundedPipeDrain.defaultStdoutMaxBytes
+        )
         for line in session.lineBuffer.take(tail) + session.lineBuffer.flush() {
             handleLine(line, session: session)
         }
@@ -1456,7 +1752,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         concludeTurn(finalMessage: finalMessage, session: session, allowDeferral: false)
     }
 
-    private func terminate(session: Session, status: AgentRunStatus) {
+    private func terminate(session: Session, status: AgentRunStatus, interruptFallback: Bool = false) {
         lock.lock()
         session.status = status
         if status == .cancelled { session.cancellationRequested = true }
@@ -1466,7 +1762,11 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.stdoutPipe.fileHandleForReading.readabilityHandler = nil
         session.stderrPipe.fileHandleForReading.readabilityHandler = nil
         if session.process.isRunning {
-            ProcessTerminator.terminateTree(session.process, foreignUserUID: session.foreignUserUID)
+            if interruptFallback {
+                ProcessTerminator.interruptTree(session.process, foreignUserUID: session.foreignUserUID)
+            } else {
+                ProcessTerminator.terminateTree(session.process, foreignUserUID: session.foreignUserUID)
+            }
         }
     }
 
@@ -1582,13 +1882,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     ) throws -> Data {
         let body: [String: Any]
         switch kind {
-        case .askUserQuestion(let toolUseID):
+        case .askUserQuestion(let toolUseID, let inputJSON):
             switch decision {
             case .accept:
                 body = Self.askUserQuestionPermissionResult(
                     requestId: requestId,
                     toolUseID: toolUseID,
-                    text: text ?? ""
+                    text: text ?? "",
+                    originalInputJSON: inputJSON
                 )
             case .cancel, .decline:
                 body = [
@@ -1638,29 +1939,60 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         return line
     }
 
-    /// Mirrors bridge `askUserQuestionResult`: allow + updatedInput.answers (or response).
+    /// Mirrors bridge `askUserQuestionResult`: allow + original questions + answers
+    /// keyed by question text (index keys from older callers are remapped).
     nonisolated static func askUserQuestionPermissionResult(
         requestId: String,
         toolUseID: String?,
-        text: String
+        text: String,
+        originalInputJSON: String? = nil
     ) -> [String: Any] {
-        var updatedInput: [String: Any] = [:]
+        let original = updatedInputObject(fromJSON: originalInputJSON)
+        var updatedInput = original
+        let questions = original["questions"] as? [[String: Any]] ?? []
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty,
            let data = trimmed.data(using: .utf8),
            let parsed = try? JSONSerialization.jsonObject(with: data),
            let object = parsed as? [String: Any] {
-            updatedInput["answers"] = object
+            updatedInput["answers"] = remapAskUserQuestionAnswers(object, questions: questions)
         } else if !trimmed.isEmpty {
             updatedInput["response"] = text
         } else {
             updatedInput["answers"] = [String: Any]()
+        }
+        if updatedInput["questions"] == nil, !questions.isEmpty {
+            updatedInput["questions"] = questions
         }
         return [
             "behavior": "allow",
             "updatedInput": updatedInput,
             "toolUseID": toolUseID ?? requestId
         ]
+    }
+
+    /// Official AskUserQuestion answers map uses each question's `question` text
+    /// as the key. Host UI already does that; index keys from tests/legacy
+    /// callers are rewritten onto the matching questions entry.
+    nonisolated static func remapAskUserQuestionAnswers(
+        _ answers: [String: Any],
+        questions: [[String: Any]]
+    ) -> [String: Any] {
+        guard !questions.isEmpty else { return answers }
+        var remapped: [String: Any] = [:]
+        for (key, value) in answers {
+            if let index = Int(key), index >= 0, index < questions.count {
+                let question = questions[index]
+                let text = (question["question"] as? String)
+                    ?? (question["prompt"] as? String)
+                    ?? (question["text"] as? String)
+                    ?? key
+                remapped[text] = value
+            } else {
+                remapped[key] = value
+            }
+        }
+        return remapped
     }
 
     /// Mirrors bridge `elicitationContent`: JSON object if parseable, else `{answer: text}`.
@@ -1758,8 +2090,18 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                     ?? (request["toolUseId"] as? String)
                 let normalized = String(toolName.lazy.filter { $0 != "_" && $0 != "-" }).lowercased()
                 if normalized == "askuserquestion" || normalized == "askuser" {
+                    var inputJSON: String?
+                    if let input = request["input"],
+                       JSONSerialization.isValidJSONObject(input),
+                       let data = try? JSONSerialization.data(withJSONObject: input),
+                       let s = String(data: data, encoding: .utf8) {
+                        inputJSON = s
+                    }
                     lock.lock()
-                    session.pendingControlUserInputs[requestId] = .askUserQuestion(toolUseID: toolUseID)
+                    session.pendingControlUserInputs[requestId] = .askUserQuestion(
+                        toolUseID: toolUseID,
+                        inputJSON: inputJSON
+                    )
                     lock.unlock()
                 } else {
                     var suggestionsJSON: String?
@@ -2111,6 +2453,162 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         }
     }
 
+}
+
+/// Caps provider-visible image attachment bytes. Original files stay on disk.
+/// ImageIO thumbnail matches `AgentAttachmentThumbnailLoader` (max-pixel,
+/// no source cache, transform-aware) at a 2048px provider-vision budget.
+enum AgentAttachmentWireImage {
+    static let maxPixel = 2048
+    static let maxEncodedBytes = 5 * 1_024 * 1_024
+    static let jpegQualities: [Double] = [0.85, 0.70, 0.55, 0.40, 0.25]
+
+    struct Payload: Equatable {
+        let data: Data
+        let mediaType: String
+        let originalByteCount: Int
+        let downsampled: Bool
+    }
+
+    enum EncodeError: Error, CustomStringConvertible, Equatable {
+        case unreadable(String)
+        case exceedsCap(originalBytes: Int, encodedBytes: Int, capBytes: Int, maxPixel: Int)
+
+        var description: String {
+            switch self {
+            case .unreadable(let path):
+                return "Unable to decode image attachment for the provider wire (original kept on disk): \(path)"
+            case .exceedsCap(let originalBytes, let encodedBytes, let capBytes, let maxPixel):
+                return "Image attachment exceeds the \(capBytes) byte wire cap after \(maxPixel)px downsample (\(encodedBytes) encoded bytes from \(originalBytes) original). Original file kept on disk."
+            }
+        }
+    }
+
+    static func encode(
+        path: String,
+        mimeType: String,
+        maxPixel: Int = maxPixel,
+        maxEncodedBytes: Int = maxEncodedBytes
+    ) throws -> Payload {
+        let url = URL(fileURLWithPath: path)
+        guard let originalByteCount = fileSizeBytes(at: path), originalByteCount > 0 else {
+            throw EncodeError.unreadable(path)
+        }
+        let maxPixel = max(1, maxPixel)
+        let maxEncodedBytes = max(1, maxEncodedBytes)
+        let source = CGImageSourceCreateWithURL(
+            url as CFURL,
+            [kCGImageSourceShouldCache: false] as CFDictionary
+        )
+        let dimensions = source.flatMap(Self.dimensions(of:))
+        let withinByteCap = originalByteCount <= maxEncodedBytes
+        let withinPixelCap = dimensions.map { max($0.width, $0.height) <= maxPixel } ?? true
+        if withinByteCap && withinPixelCap {
+            let data = try readBounded(url: url, maxEncodedBytes: maxEncodedBytes, originalByteCount: originalByteCount)
+            return Payload(
+                data: data,
+                mediaType: mimeType,
+                originalByteCount: originalByteCount,
+                downsampled: false
+            )
+        }
+
+        guard let source,
+              let cgImage = thumbnail(from: source, maxPixel: maxPixel) else {
+            throw EncodeError.unreadable(path)
+        }
+
+        var lastEncodedCount = 0
+        for quality in jpegQualities {
+            guard let encoded = encodeJPEG(cgImage, quality: quality) else { continue }
+            lastEncodedCount = encoded.count
+            if encoded.count <= maxEncodedBytes {
+                return Payload(
+                    data: encoded,
+                    mediaType: "image/jpeg",
+                    originalByteCount: originalByteCount,
+                    downsampled: true
+                )
+            }
+        }
+        throw EncodeError.exceedsCap(
+            originalBytes: originalByteCount,
+            encodedBytes: lastEncodedCount,
+            capBytes: maxEncodedBytes,
+            maxPixel: maxPixel
+        )
+    }
+
+    private static func fileSizeBytes(at path: String) -> Int? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = attributes[.size] as? NSNumber else { return nil }
+        let value = size.intValue
+        return value > 0 ? value : nil
+    }
+
+    private static func readBounded(url: URL, maxEncodedBytes: Int, originalByteCount: Int) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: maxEncodedBytes + 1) ?? Data()
+        guard data.count <= maxEncodedBytes else {
+            throw EncodeError.exceedsCap(
+                originalBytes: originalByteCount,
+                encodedBytes: data.count,
+                capBytes: maxEncodedBytes,
+                maxPixel: maxPixel
+            )
+        }
+        return data
+    }
+
+    private static func dimensions(
+        of source: CGImageSource
+    ) -> (width: Int, height: Int)? {
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(
+            source,
+            0,
+            [kCGImageSourceShouldCache: false] as CFDictionary
+        ) as? [CFString: Any],
+        let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+        let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+        width > 0,
+        height > 0 else {
+            return nil
+        }
+        return (width, height)
+    }
+
+    private static func thumbnail(from source: CGImageSource, maxPixel: Int) -> CGImage? {
+        CGImageSourceCreateThumbnailAtIndex(
+            source,
+            0,
+            [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+                kCGImageSourceShouldCacheImmediately: true,
+            ] as CFDictionary
+        )
+    }
+
+    private static func encodeJPEG(_ image: CGImage, quality: Double) -> Data? {
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            output,
+            "public.jpeg" as CFString,
+            1,
+            nil
+        ) else {
+            return nil
+        }
+        CGImageDestinationAddImage(
+            destination,
+            image,
+            [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary
+        )
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return output as Data
+    }
 }
 
 private extension AgentRunRequest {

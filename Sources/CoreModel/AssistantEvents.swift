@@ -1081,6 +1081,19 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     /// Upper bound of hot-text growth since last exact measure (`apply` event
     /// estimates). Optional for the same Codable compatibility.
     private var aggregateHotTextDirtyBytes: Int? = nil
+    /// Incremental id → (turn, item) coordinates. History replay, progress, and
+    /// deltas targeting older items used to newest-first scan from the live end
+    /// (~N comparisons for an item near the start). The map is derived from
+    /// `turns`, excluded from Codable, and rebuilt after decode/prune.
+    private var itemLocations: [String: ItemLocation] = [:]
+    /// Incremental turnId → index. Same derived/non-persisted contract as
+    /// `itemLocations`; last occurrence wins so it matches newest-first lookup.
+    private var turnLocations: [String: Int] = [:]
+
+    private struct ItemLocation: Sendable, Equatable {
+        var turnIndex: Int
+        var itemIndex: Int
+    }
 
     private struct PendingItemDelta: Codable, Sendable, Equatable {
         var body: String = ""
@@ -1100,6 +1113,98 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         self.sr1TranslationsByMessageId = [:]
         self.pendingItemDeltas = [:]
         self.pendingItemDeltaOrder = []
+    }
+
+    /// Location maps are derived from `turns` and must not bloat persisted
+    /// snapshots. Rebuild after decode so lookups stay O(1) on reopen.
+    private enum CodingKeys: String, CodingKey {
+        case threadId
+        case providerThreadId
+        case turns
+        case workActivities
+        case error
+        case pendingRequests
+        case pendingUserInputs
+        case proposedPlans
+        case activePlan
+        case tokenUsage
+        case contextCompactionSummary
+        case providerRuntimeEvents
+        case sr1TranslationsByItemId
+        case sr1TranslationsByMessageId
+        case pendingItemDeltas
+        case pendingItemDeltaOrder
+        case lastMeasuredAggregateHotTextBytes
+        case aggregateHotTextDirtyBytes
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        threadId = try c.decodeIfPresent(String.self, forKey: .threadId)
+        providerThreadId = try c.decodeIfPresent(String.self, forKey: .providerThreadId)
+        turns = try c.decodeIfPresent([AssistantTurnSnapshot].self, forKey: .turns) ?? []
+        workActivities = try c.decodeIfPresent([AssistantWorkActivity].self, forKey: .workActivities) ?? []
+        error = try c.decodeIfPresent(String.self, forKey: .error)
+        pendingRequests = try c.decodeIfPresent([AssistantPendingRequest].self, forKey: .pendingRequests) ?? []
+        pendingUserInputs = try c.decodeIfPresent([AssistantUserInputRequest].self, forKey: .pendingUserInputs) ?? []
+        proposedPlans = try c.decodeIfPresent([AssistantProposedPlan].self, forKey: .proposedPlans) ?? []
+        activePlan = try c.decodeIfPresent(AssistantActivePlan.self, forKey: .activePlan)
+        tokenUsage = try c.decodeIfPresent(AssistantTokenUsage.self, forKey: .tokenUsage)
+        contextCompactionSummary = try c.decodeIfPresent(String.self, forKey: .contextCompactionSummary)
+        providerRuntimeEvents = try c.decodeIfPresent([ProviderRuntimeEvent].self, forKey: .providerRuntimeEvents) ?? []
+        sr1TranslationsByItemId = try c.decodeIfPresent([String: AssistantSR1Translation].self, forKey: .sr1TranslationsByItemId) ?? [:]
+        sr1TranslationsByMessageId = try c.decodeIfPresent([String: AssistantSR1Translation].self, forKey: .sr1TranslationsByMessageId) ?? [:]
+        pendingItemDeltas = try c.decodeIfPresent([String: PendingItemDelta].self, forKey: .pendingItemDeltas) ?? [:]
+        pendingItemDeltaOrder = try c.decodeIfPresent([String].self, forKey: .pendingItemDeltaOrder) ?? []
+        lastMeasuredAggregateHotTextBytes = try c.decodeIfPresent(Int.self, forKey: .lastMeasuredAggregateHotTextBytes)
+        aggregateHotTextDirtyBytes = try c.decodeIfPresent(Int.self, forKey: .aggregateHotTextDirtyBytes)
+        rebuildLocationIndex()
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encodeIfPresent(threadId, forKey: .threadId)
+        try c.encodeIfPresent(providerThreadId, forKey: .providerThreadId)
+        try c.encode(turns, forKey: .turns)
+        try c.encode(workActivities, forKey: .workActivities)
+        try c.encodeIfPresent(error, forKey: .error)
+        try c.encode(pendingRequests, forKey: .pendingRequests)
+        try c.encode(pendingUserInputs, forKey: .pendingUserInputs)
+        try c.encode(proposedPlans, forKey: .proposedPlans)
+        try c.encodeIfPresent(activePlan, forKey: .activePlan)
+        try c.encodeIfPresent(tokenUsage, forKey: .tokenUsage)
+        try c.encodeIfPresent(contextCompactionSummary, forKey: .contextCompactionSummary)
+        try c.encode(providerRuntimeEvents, forKey: .providerRuntimeEvents)
+        try c.encode(sr1TranslationsByItemId, forKey: .sr1TranslationsByItemId)
+        try c.encode(sr1TranslationsByMessageId, forKey: .sr1TranslationsByMessageId)
+        try c.encode(pendingItemDeltas, forKey: .pendingItemDeltas)
+        try c.encode(pendingItemDeltaOrder, forKey: .pendingItemDeltaOrder)
+        try c.encodeIfPresent(lastMeasuredAggregateHotTextBytes, forKey: .lastMeasuredAggregateHotTextBytes)
+        try c.encodeIfPresent(aggregateHotTextDirtyBytes, forKey: .aggregateHotTextDirtyBytes)
+    }
+
+    /// Derived location maps must not affect semantic equality: two timelines
+    /// with the same persisted/public state compare equal even when one map was
+    /// rebuilt and the other was populated incrementally (or left empty).
+    public static func == (lhs: AssistantTimelineState, rhs: AssistantTimelineState) -> Bool {
+        lhs.threadId == rhs.threadId
+            && lhs.providerThreadId == rhs.providerThreadId
+            && lhs.turns == rhs.turns
+            && lhs.workActivities == rhs.workActivities
+            && lhs.error == rhs.error
+            && lhs.pendingRequests == rhs.pendingRequests
+            && lhs.pendingUserInputs == rhs.pendingUserInputs
+            && lhs.proposedPlans == rhs.proposedPlans
+            && lhs.activePlan == rhs.activePlan
+            && lhs.tokenUsage == rhs.tokenUsage
+            && lhs.contextCompactionSummary == rhs.contextCompactionSummary
+            && lhs.providerRuntimeEvents == rhs.providerRuntimeEvents
+            && lhs.sr1TranslationsByItemId == rhs.sr1TranslationsByItemId
+            && lhs.sr1TranslationsByMessageId == rhs.sr1TranslationsByMessageId
+            && lhs.pendingItemDeltas == rhs.pendingItemDeltas
+            && lhs.pendingItemDeltaOrder == rhs.pendingItemDeltaOrder
+            && lhs.lastMeasuredAggregateHotTextBytes == rhs.lastMeasuredAggregateHotTextBytes
+            && lhs.aggregateHotTextDirtyBytes == rhs.aggregateHotTextDirtyBytes
     }
 
     public var latestAssistantMessage: String? {
@@ -1430,6 +1535,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             }
             if drop > 0 {
                 turns.removeFirst(drop)
+                rebuildLocationIndex()
                 debit(debitSum)
             }
         }
@@ -1452,6 +1558,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         }
         if total > limit {
             turns.removeAll()
+            rebuildLocationIndex()
             total = aggregateHotTextByteCount
         }
         if total > limit {
@@ -1511,6 +1618,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                     applyPendingDelta(pending, to: &started)
                     applyPendingDelta(pendingMetadata, to: &started)
                     turns[idx].items.append(started)
+                    recordItemLocation(started.id, turnIndex: idx, itemIndex: turns[idx].items.count - 1)
                     trimTurnItems(at: idx)
                 }
             }
@@ -1729,9 +1837,10 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     /// AA-27: turn/item lookups on the append path used oldest-first
     /// `firstIndex`, i.e. O(turns) per turnStarted/itemStarted/turnCompleted and
     /// O(items) per itemStarted (O(items²) per turn, paid again on every thread
-    /// open replay). The target is essentially always the newest turn/item and
-    /// ids are unique, so newest-first resolves the same index.
+    /// open replay). The incremental maps make known ids O(1); newest-first
+    /// remains the fallback so a stale map cannot mis-route an event.
     private func turnIndex(_ tid: String) -> Int? {
+        if let idx = resolvedTurnIndex(tid) { return idx }
         for index in turns.indices.reversed() {
             #if DEBUG
             Self.turnLookupComparisonsForTesting &+= 1
@@ -1742,6 +1851,9 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     }
 
     private func itemIndex(_ iid: String, inTurn turnIndex: Int) -> Int? {
+        if let loc = resolvedItemLocation(of: iid), loc.turnIndex == turnIndex {
+            return loc.itemIndex
+        }
         for index in turns[turnIndex].items.indices.reversed() {
             #if DEBUG
             Self.itemLookupComparisonsForTesting &+= 1
@@ -1763,6 +1875,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             turnId: tid,
             startedAtMs: startedAtMs ?? Int64(Date().timeIntervalSince1970 * 1000)
         ))
+        turnLocations[tid] = turns.count - 1
         trimTurns()
     }
 
@@ -1803,6 +1916,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             }
         }
         turns.removeFirst(dropCount)
+        rebuildLocationIndex()
     }
 
     // F10: keep one turn's `items` array bounded (see `liveTurnItemLimit`). Trims
@@ -1825,6 +1939,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                 }
             }
             turns[idx].items.removeSubrange(1..<(1 + dropFromRest))
+            rebuildLocationIndex()
         }
     }
 
@@ -1864,9 +1979,17 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         itemId: String,
         _ mut: (inout AssistantItem) -> Void
     ) -> Bool {
+        if let loc = resolvedItemLocation(of: itemId),
+           turns[loc.turnIndex].turnId == turnId {
+            mut(&turns[loc.turnIndex].items[loc.itemIndex])
+            return true
+        }
         guard let turnIndex = turns.lastIndex(where: { $0.turnId == turnId }) else { return false }
         for itemIndex in turns[turnIndex].items.indices.reversed()
         where turns[turnIndex].items[itemIndex].id == itemId {
+            // Do not overwrite the global newest-occurrence map from a
+            // turn-scoped hit: a reused item id's late host-metadata on an
+            // older turn must not poison subsequent unscoped lookups.
             mut(&turns[turnIndex].items[itemIndex])
             return true
         }
@@ -1875,20 +1998,23 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
 
     @discardableResult
     private mutating func mutateItem(_ iid: String, _ mut: (inout AssistantItem) -> Void) -> Bool {
-        // Streaming itemDeltas target the most-recently-started item, which is the
-        // last appended item in the last turn. Iterate newest-first so the per-delta
-        // lookup is O(1) for the active item instead of O(total accumulated items):
-        // the old oldest-first scan walked every prior turn*item on every token, so
-        // CPU ramped with the transcript and froze long runs (relieved only by Stop).
-        // Item ids are unique (itemStarted merges duplicates within a turn and
-        // provider item ids are globally unique), so newest-first resolves the same
-        // item a full scan would.
+        // Map-first: history replay and deltas to older items used to walk from
+        // the newest end (~N comparisons for an item near the start of a turn).
+        // The incremental location map is O(1) for any known id. Newest-first
+        // remains the fallback so a stale map cannot mutate the wrong item.
+        // Last recorded occurrence wins, matching previous newest-first search
+        // when a provider item id is reused after a turn boundary.
+        if let loc = resolvedItemLocation(of: iid) {
+            mut(&turns[loc.turnIndex].items[loc.itemIndex])
+            return true
+        }
         for ti in turns.indices.reversed() {
             for ii in turns[ti].items.indices.reversed() {
                 #if DEBUG
                 Self.itemLookupComparisonsForTesting &+= 1
                 #endif
                 if turns[ti].items[ii].id == iid {
+                    recordItemLocation(iid, turnIndex: ti, itemIndex: ii)
                     mut(&turns[ti].items[ii])
                     return true
                 }
@@ -1916,9 +2042,9 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     }
 
     private func item(withId iid: String) -> AssistantItem? {
-        // Newest-first for the same reason as mutateItem: lookups during a live run
-        // target the active (last) item, so this stays O(1) instead of scanning the
-        // whole accumulated timeline on every itemProgress/itemCompleted event.
+        if let loc = resolvedItemLocation(of: iid) {
+            return turns[loc.turnIndex].items[loc.itemIndex]
+        }
         for ti in turns.indices.reversed() {
             for ii in turns[ti].items.indices.reversed() {
                 #if DEBUG
@@ -1933,8 +2059,52 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     }
 
     private func item(turnId: String, itemId: String) -> AssistantItem? {
+        if let loc = resolvedItemLocation(of: itemId),
+           turns[loc.turnIndex].turnId == turnId {
+            return turns[loc.turnIndex].items[loc.itemIndex]
+        }
         guard let turn = turns.last(where: { $0.turnId == turnId }) else { return nil }
         return turn.items.last(where: { $0.id == itemId })
+    }
+
+    /// Last occurrence wins so a reused provider item id resolves to the current
+    /// turn, matching the previous newest-first scan.
+    private mutating func recordItemLocation(_ iid: String, turnIndex: Int, itemIndex: Int) {
+        itemLocations[iid] = ItemLocation(turnIndex: turnIndex, itemIndex: itemIndex)
+    }
+
+    private mutating func rebuildLocationIndex() {
+        itemLocations.removeAll(keepingCapacity: true)
+        turnLocations.removeAll(keepingCapacity: true)
+        itemLocations.reserveCapacity(turns.reduce(0) { $0 + $1.items.count })
+        turnLocations.reserveCapacity(turns.count)
+        for ti in turns.indices {
+            turnLocations[turns[ti].turnId] = ti
+            for ii in turns[ti].items.indices {
+                itemLocations[turns[ti].items[ii].id] = ItemLocation(turnIndex: ti, itemIndex: ii)
+            }
+        }
+    }
+
+    private func resolvedTurnIndex(_ tid: String) -> Int? {
+        guard let idx = turnLocations[tid], turns.indices.contains(idx) else { return nil }
+        #if DEBUG
+        Self.turnLookupComparisonsForTesting &+= 1
+        #endif
+        guard turns[idx].turnId == tid else { return nil }
+        return idx
+    }
+
+    private func resolvedItemLocation(of iid: String) -> ItemLocation? {
+        guard let loc = itemLocations[iid],
+              turns.indices.contains(loc.turnIndex),
+              turns[loc.turnIndex].items.indices.contains(loc.itemIndex)
+        else { return nil }
+        #if DEBUG
+        Self.itemLookupComparisonsForTesting &+= 1
+        #endif
+        guard turns[loc.turnIndex].items[loc.itemIndex].id == iid else { return nil }
+        return loc
     }
 
     private mutating func recordActivity(for item: AssistantItem, state: AssistantItemState) {

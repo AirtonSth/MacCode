@@ -740,6 +740,8 @@ function pushPrompt(text, attachments = [], turnContext = undefined) {
   }
   const message = {
     type: 'user',
+    uuid: randomUUID(),
+    origin: { kind: 'human' },
     message: {
       role: 'user',
       content,
@@ -764,6 +766,11 @@ async function* promptStream() {
     if (next.done) return;
     yield next.value;
   }
+}
+
+function sdkEffortToken(value) {
+  if (value === 'ultracode') return 'xhigh';
+  return value;
 }
 
 function sdkPermissionMode(mode, interactionMode) {
@@ -797,9 +804,9 @@ function ensureQuery() {
       tools: { type: 'preset', preset: 'claude_code' },
       mcpServers,
       allowedTools: current.allowedTools,
-      // Reasoning effort for the query ('low'…'max' plus native 'ultracode';
-      // the host also supplies the equivalent ultracode/workflow settings).
-      effort: current.effort,
+      // Reasoning effort for the query ('low'|'medium'|'high'|'xhigh'|'max').
+      // Ultracode is settings.ultracode, never effort: "ultracode".
+      effort: sdkEffortToken(current.effort),
       settings: current.settings,
       // Load filesystem settings so the SDK discovers Agent Skills (e.g. the managed
       // output-distill skill in ~/.claude/skills and project .claude/skills). Without this the

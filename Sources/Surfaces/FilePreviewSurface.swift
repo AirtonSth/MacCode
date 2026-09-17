@@ -256,6 +256,8 @@ public final class FilePreviewSurface: NSObject, Surface {
         pin(iv)
         // Decode off the main thread into a downsampled image rather than synchronously
         // decoding the full-resolution NSImage on the RPC/main path (PERF-MAC_FILES-005).
+        // kCGImageSourceShouldCacheImmediately decodes on this detached task so
+        // first paint does not pay ImageIO on the main thread.
         let url = URL(fileURLWithPath: path)
         Task { [weak self, weak iv] in
             let image = await Task.detached(priority: .userInitiated) {
@@ -269,13 +271,17 @@ public final class FilePreviewSurface: NSObject, Surface {
         }
     }
 
-    private nonisolated static func decodeDownsampled(url: URL) -> NSImage? {
+    /// Longest decoded edge for Files / File Preview thumbs. 4096² RGBA is
+    /// ~64 MiB per image; 2048² is ~16 MiB and still covers Retina preview.
+    nonisolated static let thumbnailMaxPixelSize = 2048
+
+    nonisolated static func decodeDownsampled(url: URL) -> NSImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: 4096
+            kCGImageSourceThumbnailMaxPixelSize: thumbnailMaxPixelSize
         ]
         guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
         return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))

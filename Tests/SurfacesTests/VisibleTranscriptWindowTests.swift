@@ -291,6 +291,72 @@ final class VisibleTranscriptWindowTests: XCTestCase {
         }
     }
 
+    func test_transcriptColumnPaint_windowsOnceAndPaintIdentityMatchesHideSet() {
+        // WHY: the timeline body used to window merge-ordered entries and then
+        // window paint-ordered entries again. One pass must both bound the
+        // walk and keep hide-assistant-output identity on the ordered window.
+        let entries: [AgentAppView.TranscriptEntry] = (0..<40).map { index in
+            messageEntry(secondsSinceEpoch: TimeInterval(index))
+        }
+        AgentAppView.VisibleTranscriptWindowProbe.reset()
+        let column = AgentAppView.transcriptColumnPaint(
+            mergedEntries: entries,
+            status: .completed,
+            runStartedAt: nil,
+            revealCount: 0
+        )
+        XCTAssertEqual(
+            AgentAppView.VisibleTranscriptWindowProbe.callCount,
+            1,
+            "transcriptColumnPaint must compute visibleTranscriptWindow once"
+        )
+        XCTAssertEqual(column.visible.map(\.id), Array(entries.suffix(AgentAppView.idleTranscriptWindowCount)).map(\.id))
+
+        let first = AssistantTurnSnapshot(
+            turnId: "first",
+            items: [
+                AssistantItem(
+                    id: "a1",
+                    turnId: "first",
+                    type: .assistantMessage,
+                    state: .completed,
+                    body: "same answer",
+                    startedAtMs: 1
+                )
+            ],
+            finalAssistantMessage: "same answer",
+            finished: true
+        )
+        let duplicate = AssistantTurnSnapshot(
+            turnId: "duplicate",
+            items: [
+                AssistantItem(
+                    id: "a2",
+                    turnId: "duplicate",
+                    type: .assistantMessage,
+                    state: .completed,
+                    body: "same answer",
+                    startedAtMs: 2
+                )
+            ],
+            finalAssistantMessage: "same answer",
+            finished: true
+        )
+        let paintEntries: [AgentAppView.TranscriptEntry] = [.turn(first), .turn(duplicate)]
+        let rows = paintEntries.map(AgentAppView.ChatFlowRow.entry)
+        let context = AgentAppView.makeChatRowPaintContext(
+            rows: rows,
+            visibleEntries: paintEntries,
+            bots: []
+        )
+        XCTAssertEqual(context.hidesAssistantOutput(for: rows[0]), false)
+        XCTAssertEqual(
+            context.hidesAssistantOutput(for: rows[1]),
+            true,
+            "hide-assistant-output must walk the same ordered window the column paints"
+        )
+    }
+
     private func assistantMessage(content: String, seconds: TimeInterval) -> AgentMessage {
         AgentMessage(
             threadId: Self.threadID,

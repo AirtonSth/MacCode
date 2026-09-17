@@ -390,10 +390,18 @@ struct GrokACPSessionOpenResult {
     let sessionId: String
     let models: [AgentModelDescriptor]
     let currentModelId: String?
+    /// Live current effort: `configOptions.reasoning_effort.currentValue` when
+    /// present, else model `_meta.reasoningEffort` (may differ from option default).
+    let currentReasoningEffortRaw: String?
     let availableModes: [GrokACPSessionMode]
     let currentModeId: String?
     /// Typed ACP `configOptions` from session/new|load (model + reasoning_effort).
     let configOptions: [[String: Any]]
+
+    /// True when session/new|load advertised a selectable `reasoning_effort` option.
+    var advertisesReasoningEffortConfig: Bool {
+        !advertisedReasoningEffortIds.isEmpty
+    }
 
     var planModeId: String? {
         availableModes.first {
@@ -775,16 +783,18 @@ public final class GrokACPClient: @unchecked Sendable {
     /// reasoning configuration, so no acknowledgement can honestly be claimed.
     static func wireReasoningEffort(
         _ effort: AgentReasoningEffort,
-        modelId: String = ""
+        modelId: String = "",
+        advertisedEfforts: [AgentReasoningEffort] = []
     ) -> String? {
-        GrokRunner.normalizedReasoningEffort(effort, model: modelId)?.rawValue
+        if advertisedEfforts.contains(effort) {
+            return effort.rawValue
+        }
+        return GrokRunner.normalizedReasoningEffort(effort, model: modelId)?.rawValue
     }
 
     /// `reasoningEffort` is the ACP `_meta.reasoningEffort` wire value (grok-build
     /// `REASONING_EFFORT_META_KEY`). Omit when the host has nothing to bind.
     /// Values are mapped via `wireReasoningEffort` before the wire call.
-    /// Effort-only rebinds use the same method: live grok 1.0.13 rejects
-    /// `session/set_config_option` (`-32602 Invalid params` / `-32601`).
     func setModel(
         sessionId: String,
         modelId: String,
@@ -798,27 +808,55 @@ public final class GrokACPClient: @unchecked Sendable {
         _ = try await requestJSONObject(method: "session/set_model", params: params, timeout: 15)
     }
 
+    /// Flat-string `session/set_config_option` (live grok 1.0.25+). Nested
+    /// `{value:{value}}` and `optionId` shapes still return `-32602`.
+    func setConfigOption(
+        sessionId: String,
+        configId: String,
+        value: String
+    ) async throws {
+        _ = try await requestJSONObject(
+            method: "session/set_config_option",
+            params: [
+                "sessionId": sessionId,
+                "configId": configId,
+                "value": value,
+            ],
+            timeout: 15
+        )
+    }
+
     /// Pure routing for model/effort binds before a prompt.
-    /// Live grok 1.0.13 `session/set_config_option` is not a working bind
-    /// path (`-32602` on `{value:{value:}}`, `-32601` on the ACP string
-    /// value). Effort-only therefore uses `session/set_model` +
-    /// `_meta.reasoningEffort`, which the same agent accepts without a
-    /// model-id change.
+    /// Prefer flat `session/set_config_option` for effort-only binds when the
+    /// open result advertised `reasoning_effort` (live grok 1.0.25). Fall back
+    /// to `session/set_model` + `_meta.reasoningEffort` for older agents /
+    /// missing configOptions (1.0.13 rejected set_config_option).
     enum ModelEffortBind: Equatable {
         case none
         case setModel(modelId: String, reasoningEffort: AgentReasoningEffort?)
+        case setConfigOption(configId: String, value: String, effort: AgentReasoningEffort)
     }
 
     static func modelEffortBind(
         requestModel: String,
         sessionModel: String,
         requestEffort: AgentReasoningEffort?,
-        sessionEffort: AgentReasoningEffort?
+        sessionEffort: AgentReasoningEffort?,
+        prefersConfigOptionEffort: Bool = false,
+        advertisedEfforts: [AgentReasoningEffort] = []
     ) -> ModelEffortBind {
         let model = requestModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let targetModel = model.isEmpty ? sessionModel : model
-        let targetEffort = requestEffort.flatMap {
-            GrokRunner.normalizedReasoningEffort($0, model: targetModel)
+        // session/new|load ads are not refreshed after setModel; keep only
+        // efforts the target model still supports so grok-4.6 xhigh cannot
+        // skip the grok-4.5 clamp. Empty ads still fall through to
+        // GrokRunner.normalizedReasoningEffort (muse-spark empty _meta).
+        let supported = GrokReasoningPolicy.supportedEfforts(for: targetModel)
+        let targetEffort = requestEffort.flatMap { requested -> AgentReasoningEffort? in
+            if advertisedEfforts.contains(requested), supported.contains(requested) {
+                return requested
+            }
+            return GrokRunner.normalizedReasoningEffort(requested, model: targetModel)
         }
         let needsModelBind = !model.isEmpty && model != sessionModel
         let needsEffortBind = targetEffort != sessionEffort
@@ -826,7 +864,16 @@ public final class GrokACPClient: @unchecked Sendable {
             return .setModel(modelId: targetModel, reasoningEffort: targetEffort)
         }
         if needsEffortBind, let targetEffort,
-           wireReasoningEffort(targetEffort, modelId: targetModel) != nil {
+           let wire = wireReasoningEffort(
+            targetEffort, modelId: targetModel, advertisedEfforts: advertisedEfforts
+           ) {
+            if prefersConfigOptionEffort {
+                return .setConfigOption(
+                    configId: "reasoning_effort",
+                    value: wire,
+                    effort: targetEffort
+                )
+            }
             return .setModel(modelId: targetModel, reasoningEffort: targetEffort)
         }
         return .none
@@ -942,31 +989,109 @@ public final class GrokACPClient: @unchecked Sendable {
                         "Grok ACP \(capabilities.agentVersion ?? "v1") does not support image prompts"
                     )
                 }
-                let data = try Data(contentsOf: URL(fileURLWithPath: attachment.path), options: .mappedIfSafe)
+                let payload: AgentAttachmentWireImage.Payload
+                do {
+                    payload = try AgentAttachmentWireImage.encode(
+                        path: attachment.path,
+                        mimeType: attachment.mimeType ?? "application/octet-stream"
+                    )
+                } catch let error as AgentAttachmentWireImage.EncodeError {
+                    throw GrokACPError.unsupported(error.description)
+                }
                 blocks.append([
                     "type": "image",
-                    "data": data.base64EncodedString(),
-                    "mimeType": attachment.mimeType ?? "application/octet-stream"
+                    "data": payload.data.base64EncodedString(),
+                    "mimeType": payload.mediaType
                 ])
             case .file:
                 guard capabilities.embeddedContext else {
                     throw GrokACPError.unsupported("Grok ACP does not negotiate embedded file context")
                 }
-                let data = try Data(contentsOf: URL(fileURLWithPath: attachment.path), options: .mappedIfSafe)
-                guard let text = String(data: data, encoding: .utf8) else {
-                    throw GrokACPError.unsupported("Grok ACP embedded context requires UTF-8 text: \(attachment.displayName)")
+                let prefix: EmbeddedFilePrefix
+                do {
+                    prefix = try embeddedUTF8FilePrefix(
+                        path: attachment.path,
+                        displayName: attachment.displayName
+                    )
+                } catch let error as EmbeddedFilePrefixError {
+                    throw GrokACPError.unsupported(error.description)
                 }
                 blocks.append([
                     "type": "resource",
                     "resource": [
                         "uri": URL(fileURLWithPath: attachment.path).absoluteString,
                         "mimeType": attachment.mimeType ?? "text/plain",
-                        "text": text
+                        "text": prefix.wireText
                     ]
                 ])
             }
         }
         return blocks
+    }
+
+    static let embeddedFilePrefixBytes = 512 * 1_024
+
+    struct EmbeddedFilePrefix: Equatable {
+        let text: String
+        let originalByteCount: Int
+        let truncated: Bool
+        let path: String
+
+        var wireText: String {
+            guard truncated else { return text }
+            return text
+                + "\n\n[truncated: showing first \(GrokACPClient.embeddedFilePrefixBytes) of \(originalByteCount) bytes; full file remains at \(path)]"
+        }
+    }
+
+    enum EmbeddedFilePrefixError: Error, CustomStringConvertible, Equatable {
+        case notUTF8(String)
+
+        var description: String {
+            switch self {
+            case .notUTF8(let displayName):
+                return "Grok ACP embedded context requires UTF-8 text: \(displayName)"
+            }
+        }
+    }
+
+    static func embeddedUTF8FilePrefix(
+        path: String,
+        displayName: String,
+        maxPrefixBytes: Int = embeddedFilePrefixBytes
+    ) throws -> EmbeddedFilePrefix {
+        let url = URL(fileURLWithPath: path)
+        let originalByteCount: Int
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+           let size = attributes[.size] as? NSNumber {
+            originalByteCount = size.intValue
+        } else {
+            originalByteCount = 0
+        }
+        let maxPrefixBytes = max(1, maxPrefixBytes)
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let prefix = try handle.read(upToCount: maxPrefixBytes) ?? Data()
+        guard let text = Self.utf8StringAllowingPartialTail(prefix) else {
+            throw EmbeddedFilePrefixError.notUTF8(displayName)
+        }
+        return EmbeddedFilePrefix(
+            text: text,
+            originalByteCount: max(originalByteCount, prefix.count),
+            truncated: originalByteCount > maxPrefixBytes,
+            path: path
+        )
+    }
+
+    private static func utf8StringAllowingPartialTail(_ data: Data) -> String? {
+        if let text = String(data: data, encoding: .utf8) { return text }
+        var trimmed = data
+        for _ in 0..<3 {
+            guard !trimmed.isEmpty else { break }
+            trimmed.removeLast()
+            if let text = String(data: trimmed, encoding: .utf8) { return text }
+        }
+        return nil
     }
 
     private func requestJSONObject(
@@ -1172,10 +1297,16 @@ public final class GrokACPClient: @unchecked Sendable {
             return GrokACPSessionMode(id: id, name: name, description: raw["description"] as? String)
         }
         let configOptions = (result["configOptions"] as? [JSONObject]) ?? []
+        let currentModelId = state?["currentModelId"] as? String
         return GrokACPSessionOpenResult(
             sessionId: sessionId,
             models: models,
-            currentModelId: state?["currentModelId"] as? String,
+            currentModelId: currentModelId,
+            currentReasoningEffortRaw: currentReasoningEffortRaw(
+                from: state,
+                currentModelId: currentModelId,
+                configOptions: configOptions
+            ),
             availableModes: availableModes,
             currentModeId: modeState?["currentModeId"] as? String,
             configOptions: configOptions
@@ -1189,12 +1320,25 @@ public final class GrokACPClient: @unchecked Sendable {
             let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !id.isEmpty else { return nil }
             let metadata = raw["_meta"] as? JSONObject ?? [:]
-            let supported = reasoningEfforts(
-                from: metadata["reasoningEfforts"]
-                    ?? metadata["supportedReasoningEfforts"]
-                    ?? raw["reasoningEfforts"]
-                    ?? raw["supportedReasoningEfforts"]
-            )
+            let effortEntries = (metadata["reasoningEfforts"] as? [JSONObject])
+                ?? (metadata["supportedReasoningEfforts"] as? [JSONObject])
+                ?? (raw["reasoningEfforts"] as? [JSONObject])
+                ?? (raw["supportedReasoningEfforts"] as? [JSONObject])
+                ?? []
+            let supported: [AgentReasoningEffort]
+            if effortEntries.isEmpty {
+                supported = reasoningEfforts(
+                    from: metadata["reasoningEfforts"]
+                        ?? metadata["supportedReasoningEfforts"]
+                        ?? raw["reasoningEfforts"]
+                        ?? raw["supportedReasoningEfforts"]
+                )
+            } else {
+                supported = parseReasoningEffortCatalog(
+                    entries: effortEntries,
+                    currentRaw: metadata["reasoningEffort"] as? String
+                ).ordered
+            }
             let speedTiers = (metadata["additionalSpeedTiers"] as? [String])
                 ?? (metadata["additional_speed_tiers"] as? [String])
                 ?? (raw["additionalSpeedTiers"] as? [String])
@@ -1230,14 +1374,85 @@ public final class GrokACPClient: @unchecked Sendable {
         }
     }
 
+    /// Stable effort order with preferred default first so `.first` consumers
+    /// (schedulers, drafts) match the agent-advertised default rather than
+    /// the raw ACP array order (live grok-4.6 lists `xhigh` first).
+    static func parseReasoningEffortCatalog(
+        entries: [JSONObject],
+        currentRaw: String?
+    ) -> (ordered: [AgentReasoningEffort], preferred: AgentReasoningEffort?) {
+        var seen: [AgentReasoningEffort] = []
+        var flaggedDefault: AgentReasoningEffort?
+        for entry in entries {
+            // Prefer `id` over `value` so glm aliases (id=medium,value=high)
+            // keep distinct catalog identities.
+            let raw = ((entry["id"] as? String)
+                ?? (entry["reasoningEffort"] as? String)
+                ?? (entry["value"] as? String))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard let effort = AgentReasoningEffort(rawValue: raw) else { continue }
+            if !seen.contains(effort) { seen.append(effort) }
+            if flaggedDefault == nil, (entry["default"] as? Bool) == true {
+                flaggedDefault = effort
+            }
+        }
+        let current = currentRaw.flatMap { AgentReasoningEffort(rawValue: $0) }
+        let preferred = flaggedDefault
+            ?? (current.flatMap { seen.contains($0) ? $0 : nil })
+            ?? (seen.contains(.high) ? .high : seen.first)
+        guard let preferred else { return ([], nil) }
+        let rest = seen.filter { $0 != preferred }
+        return ([preferred] + rest, preferred)
+    }
+
+    /// Live current effort from typed configOptions, else model `_meta`.
+    static func currentReasoningEffortRaw(
+        from state: JSONObject?,
+        currentModelId: String?,
+        configOptions: [JSONObject] = []
+    ) -> String? {
+        if let option = configOptions.first(where: {
+            (($0["id"] as? String) ?? ($0["configId"] as? String)) == "reasoning_effort"
+        }) {
+            let current = (option["currentValue"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !current.isEmpty { return current }
+        }
+        let rawModels = state?["availableModels"] as? [JSONObject] ?? []
+        let trimmed = currentModelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let match = rawModels.first { ($0["modelId"] as? String) == trimmed } ?? rawModels.first
+        let metadata = match?["_meta"] as? JSONObject ?? [:]
+        let raw = (metadata["reasoningEffort"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return raw.isEmpty ? nil : raw
+    }
+
+    /// Seed open-state effort from live current when advertised; else preferred default (`.first`).
+    static func seededReasoningEffort(
+        models: [AgentModelDescriptor],
+        currentModelId: String?,
+        currentEffortRaw: String? = nil
+    ) -> AgentReasoningEffort? {
+        let trimmed = currentModelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let match = models.first { $0.id == trimmed } ?? models.first
+        let supported = match?.supportedReasoningEfforts ?? []
+        if let raw = currentEffortRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty,
+           let current = AgentReasoningEffort(rawValue: raw),
+           supported.contains(current) {
+            return current
+        }
+        return supported.first
+    }
+
     private static func reasoningEfforts(from value: Any?) -> [AgentReasoningEffort] {
         if let strings = value as? [String] {
             return strings.compactMap(AgentReasoningEffort.init(rawValue:))
         }
         if let objects = value as? [JSONObject] {
             return objects.compactMap {
-                ($0["reasoningEffort"] as? String
-                    ?? $0["id"] as? String
+                ($0["id"] as? String
+                    ?? $0["reasoningEffort"] as? String
                     ?? $0["value"] as? String)
                     .flatMap(AgentReasoningEffort.init(rawValue:))
             }

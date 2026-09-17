@@ -1,53 +1,8 @@
 {
-  "generatedBy": "codex-cli 0.152.1 app-server generate-json-schema --experimental",
+  "generatedBy": "codex-cli 0.154.0 app-server generate-json-schema --experimental",
   "sourceFile": "ServerRequest.json",
-  "sourceSHA256": "38bb1c9dbb1dda2a688a7c8712b04319fe6ee2ed28b54acd2f5fd341d25567ff",
+  "sourceSHA256": "97149b290b077be5d970e7b1ade1e936d1152520b6c0187ce8745cb3d639b2cb",
   "oneOf": [
-    {
-      "properties": {
-        "method": {
-          "enum": [
-            "account/chatgptAuthTokens/refresh"
-          ]
-        }
-      }
-    },
-    {
-      "properties": {
-        "method": {
-          "enum": [
-            "applyPatchApproval"
-          ]
-        }
-      }
-    },
-    {
-      "properties": {
-        "method": {
-          "enum": [
-            "attestation/generate"
-          ]
-        }
-      }
-    },
-    {
-      "properties": {
-        "method": {
-          "enum": [
-            "currentTime/read"
-          ]
-        }
-      }
-    },
-    {
-      "properties": {
-        "method": {
-          "enum": [
-            "execCommandApproval"
-          ]
-        }
-      }
-    },
     {
       "properties": {
         "method": {
@@ -62,6 +17,24 @@
         "method": {
           "enum": [
             "item/fileChange/requestApproval"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "item/tool/requestUserInput"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "mcpServer/elicitation/request"
           ]
         }
       }
@@ -88,7 +61,7 @@
       "properties": {
         "method": {
           "enum": [
-            "item/tool/requestUserInput"
+            "account/chatgptAuthTokens/refresh"
           ]
         }
       }
@@ -97,7 +70,34 @@
       "properties": {
         "method": {
           "enum": [
-            "mcpServer/elicitation/request"
+            "attestation/generate"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "currentTime/read"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "applyPatchApproval"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "execCommandApproval"
           ]
         }
       }

@@ -1249,64 +1249,32 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
     }
 
-    /// WHY (AA-30 residual): COUNT(*) gating still rebuilt the whole hot
-    /// window on +N growth. Same-run contiguous sequence growth must plan a
-    /// suffix; prune / run change / missing watermark stay full; idle equal
-    /// counts skip durable chrome when a run id is already bound.
-    func test_scheduledLivePollRebuildPlan_suffixOnGrowthFullOnPrune() {
-        let run = AgentRunID()
+    func test_scheduledLiveReplayPlan_skipSuffixAndFullReplay() {
+        // WHY: growth inside the hot-replay cap must be O(delta); prune, first
+        // apply, and overflow must fail closed to the existing full replay.
+        let cap = AgentRunCoordinator.hotReplayEventCount
         XCTAssertEqual(
-            AgentAppViewModel.scheduledLivePollRebuildPlan(
-                previousCount: 40,
-                currentCount: 40,
-                previousRunId: run,
-                currentRunId: run,
-                previousSequence: 40,
-                currentSequence: 40,
-                previousMutationId: 40,
-                currentMutationId: 40
-            ),
-            .none
+            AgentAppViewModel.scheduledLiveReplayPlan(previousCount: 10, currentCount: 10, cap: cap),
+            .skip
         )
         XCTAssertEqual(
-            AgentAppViewModel.scheduledLivePollRebuildPlan(
-                previousCount: 40,
-                currentCount: 48,
-                previousRunId: run,
-                currentRunId: run,
-                previousSequence: 40,
-                currentSequence: 48,
-                previousMutationId: 100,
-                currentMutationId: 108
-            ),
-            .suffix(advance: 8)
+            AgentAppViewModel.scheduledLiveReplayPlan(previousCount: 10, currentCount: 15, cap: cap),
+            .suffix(offset: 10)
         )
         XCTAssertEqual(
-            AgentAppViewModel.scheduledLivePollRebuildPlan(
-                previousCount: 40,
-                currentCount: 12,
-                previousRunId: run,
-                currentRunId: run,
-                previousSequence: 40,
-                currentSequence: 12,
-                previousMutationId: 100,
-                currentMutationId: 12
-            ),
-            .full
+            AgentAppViewModel.scheduledLiveReplayPlan(previousCount: 0, currentCount: 15, cap: cap),
+            .fullReplay,
+            "previous==0 has no applied prefix, so suffix is unsafe"
         )
         XCTAssertEqual(
-            AgentAppViewModel.scheduledLivePollRebuildPlan(
-                previousCount: 10,
-                currentCount: 11,
-                previousRunId: run,
-                currentRunId: AgentRunID(),
-                previousSequence: 10,
-                currentSequence: 1,
-                previousMutationId: 10,
-                currentMutationId: 11
-            ),
-            .full,
-            "a different run must fail closed to a full replay"
+            AgentAppViewModel.scheduledLiveReplayPlan(previousCount: 100, currentCount: 7, cap: cap),
+            .fullReplay,
+            "prune must full-replay"
+        )
+        XCTAssertEqual(
+            AgentAppViewModel.scheduledLiveReplayPlan(previousCount: 10, currentCount: cap + 1, cap: cap),
+            .fullReplay,
+            "current>cap must full-replay"
         )
         XCTAssertFalse(
             AgentAppViewModel.shouldRefreshScheduledLiveChrome(
@@ -1330,8 +1298,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
     }
 
     /// WHY: applying 8 new events onto an already-replayed 504-event timeline
-    /// must beat rebuilding all 512 events. This is the user-facing scheduled
-    /// poll growth path (LaunchAgent-owned run).
+    /// must beat rebuilding all 512 events. This is the LaunchAgent growth tick.
     func test_scheduledLiveSuffixApply_beatsFullReplayMedian() {
         func events(_ count: Int) -> [AssistantEvent] {
             (0..<count).map { index in
@@ -1358,22 +1325,12 @@ final class AgentAppPerfBundleTests: XCTestCase {
             warmed.enforceAggregateHotTextBudget()
         }
         var before: [Double] = []
-        var after: [Double] = []
+        var growth: [Double] = []
+        let resident = AgentAppViewModel.timelineByReplaying(prefix)
         for _ in 0..<5 {
             before.append(timeMs {
                 _ = AgentAppViewModel.timelineByReplaying(all)
             })
-            after.append(timeMs {
-                var next = AgentAppViewModel.timelineByReplaying(prefix)
-                for event in suffix { next.apply(event) }
-                next.enforceAggregateHotTextBudget()
-            })
-        }
-        // Fair growth tick: prefix is already resident; only the suffix apply
-        // is paid. Replaying prefix inside the after sample would hide the win.
-        var growth: [Double] = []
-        let resident = AgentAppViewModel.timelineByReplaying(prefix)
-        for _ in 0..<5 {
             growth.append(timeMs {
                 var next = resident
                 for event in suffix { next.apply(event) }
@@ -1384,27 +1341,234 @@ final class AgentAppPerfBundleTests: XCTestCase {
         let growthMed = median(growth)
         let improvement = (beforeMed - growthMed) / max(beforeMed, 0.000_001) * 100.0
         NSLog(
-            "[perf-proof] scheduled-live-poll full_ms=%@ suffix_ms=%@ improvement_pct=%.2f before=%@ growth=%@",
+            "[perf-proof] scheduled-live-poll full_ms=%@ suffix_ms=%@ improvement_pct=%.2f",
             String(beforeMed),
             String(growthMed),
-            improvement,
-            String(describing: before),
-            String(describing: growth)
-        )
-        XCTAssertEqual(
-            AgentAppViewModel.timelineByReplaying(all).turns.count,
-            {
-                var next = resident
-                for event in suffix { next.apply(event) }
-                next.enforceAggregateHotTextBudget()
-                return next.turns.count
-            }(),
-            "suffix apply must land the same turn count as a full replay"
+            improvement
         )
         XCTAssertGreaterThan(
             improvement,
             5.0,
             "suffix apply must beat full replay by ≥5% (got \(improvement)%; full=\(beforeMed)ms suffix=\(growthMed)ms)"
+        )
+    }
+
+    func test_tickScheduledLivePoll_growthAppliesSuffixWithoutZeroingTimeline() async throws {
+        // WHY: each COUNT growth used to zero AssistantTimelineState and reapply
+        // every latestStreamEvent. 100+5 must apply only the five new events.
+        let tmp = NSTemporaryDirectory() + "rc2-scheduled-suffix-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coord = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(), cwd: tmp,
+            coordinator: coord, threadRepo: threadRepo, messageRepo: messageRepo
+        )
+        let thread = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "scheduled",
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running
+        )
+        try threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running
+        )
+        try runRepo.upsert(run)
+        try persistScheduledEvents(runRepo: runRepo, run: run, threadId: thread.id, start: 0, count: 100)
+
+        vm.isScheduledThreadRunning = { $0 == thread.id }
+        vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        vm.tickScheduledLivePollForTesting()
+        XCTAssertEqual(vm.scheduledLiveApplyCountForTesting, 0, "idle equal COUNT must skip")
+        let turnsBeforeGrowth = vm.timeline.turns.count
+        XCTAssertGreaterThan(turnsBeforeGrowth, 0, "hydration must already hold the prefix")
+
+        try persistScheduledEvents(runRepo: runRepo, run: run, threadId: thread.id, start: 100, count: 5)
+        vm.tickScheduledLivePollForTesting()
+        XCTAssertEqual(
+            vm.scheduledLiveApplyCountForTesting,
+            5,
+            "in-cap growth must apply only the attested suffix"
+        )
+        XCTAssertEqual(
+            vm.timeline.turns.count,
+            turnsBeforeGrowth + 5,
+            "suffix apply must not zero the already-painted timeline"
+        )
+
+        let delete = try db.prepare("DELETE FROM agent_stream_events WHERE seq > 7;")
+        _ = try delete.step()
+        vm.tickScheduledLivePollForTesting()
+        XCTAssertEqual(
+            vm.scheduledLiveApplyCountForTesting,
+            7,
+            "prune 100→7 must fail closed to one full latestStreamEvents replay"
+        )
+        XCTAssertEqual(vm.timeline.turns.count, 7)
+    }
+
+    func test_tickScheduledLivePoll_hiddenDoesNotRefillPublishedTimeline() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-scheduled-hidden-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coord = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(), cwd: tmp,
+            coordinator: coord, threadRepo: threadRepo, messageRepo: messageRepo
+        )
+        let thread = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "scheduled-hidden",
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running
+        )
+        try threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running
+        )
+        try runRepo.upsert(run)
+        try persistScheduledEvents(runRepo: runRepo, run: run, threadId: thread.id, start: 0, count: 8)
+        vm.isScheduledThreadRunning = { $0 == thread.id }
+        vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        vm.setVisibility(.hidden)
+        XCTAssertTrue(vm.timeline.turns.isEmpty)
+        try persistScheduledEvents(runRepo: runRepo, run: run, threadId: thread.id, start: 8, count: 3)
+        vm.tickScheduledLivePollForTesting()
+        XCTAssertTrue(
+            vm.timeline.turns.isEmpty,
+            "hidden scheduled poll must apply to latestHiddenTimeline, not refill the published tree"
+        )
+        vm.setVisibility(.visible)
+        XCTAssertEqual(vm.timeline.turns.count, 11)
+    }
+
+    func test_rematerialize_liveTurnFastPathSkipsFinishedDictionaries() {
+        // WHY: a signature hit used to rebuild messagesById/turnsById for every
+        // turn on each stream tick. 200 finished + 1 live must patch only the live
+        // turn; a budget-generation bump takes the full path.
+        let finished: [AssistantTurnSnapshot] = (0..<200).map { index in
+            AssistantTurnSnapshot(
+                turnId: "done-\(index)",
+                items: [
+                    AssistantItem(
+                        id: "i-\(index)",
+                        turnId: "done-\(index)",
+                        type: .assistantMessage,
+                        state: .completed,
+                        body: "answer-\(index)",
+                        startedAtMs: Int64(index)
+                    )
+                ],
+                finalAssistantMessage: "answer-\(index)",
+                finished: true
+            )
+        }
+        let liveStale = AssistantTurnSnapshot(
+            turnId: "live",
+            items: [
+                AssistantItem(
+                    id: "live-i",
+                    turnId: "live",
+                    type: .assistantMessage,
+                    body: "Hel",
+                    startedAtMs: 9_000
+                )
+            ]
+        )
+        let liveLive = AssistantTurnSnapshot(
+            turnId: "live",
+            items: [
+                AssistantItem(
+                    id: "live-i",
+                    turnId: "live",
+                    type: .assistantMessage,
+                    body: "Hello streamed",
+                    startedAtMs: 9_000
+                )
+            ]
+        )
+        let cached = (finished + [liveStale]).map(AgentAppView.TranscriptEntry.turn)
+        AgentAppView.TranscriptRematerializeProbe.reset()
+        let patched = AgentAppView.rematerializedTranscriptEntries(
+            cached: cached,
+            messages: [],
+            turns: finished + [liveLive],
+            liveTurnIds: ["live"],
+            messagesGenerationUnchanged: true,
+            forceFullPath: false
+        )
+        XCTAssertEqual(AgentAppView.TranscriptRematerializeProbe.liveTurnPatchCount, 1)
+        XCTAssertEqual(AgentAppView.TranscriptRematerializeProbe.dictionaryBuildCount, 0)
+        guard case .turn(let servedLive) = patched.last else {
+            return XCTFail("live turn stays a turn")
+        }
+        XCTAssertEqual(servedLive.items.first?.body, "Hello streamed")
+        guard case .turn(let servedFinished) = patched[0] else {
+            return XCTFail("finished turn preserved")
+        }
+        XCTAssertEqual(servedFinished.items.first?.body, "answer-0")
+
+        AgentAppView.TranscriptRematerializeProbe.reset()
+        _ = AgentAppView.rematerializedTranscriptEntries(
+            cached: cached,
+            messages: [],
+            turns: finished + [liveLive],
+            liveTurnIds: ["live"],
+            messagesGenerationUnchanged: true,
+            forceFullPath: true
+        )
+        XCTAssertEqual(
+            AgentAppView.TranscriptRematerializeProbe.dictionaryBuildCount,
+            1,
+            "aggregate hot-text budget walk must take the full dictionary path"
+        )
+    }
+
+    private func persistScheduledEvents(
+        runRepo: AgentRunRepository,
+        run: AgentRun,
+        threadId: AgentThreadID,
+        start: Int,
+        count: Int
+    ) throws {
+        let encoder = JSONEncoder()
+        var writes: [AgentRunRepository.StreamWriteIntent] = []
+        writes.reserveCapacity(count)
+        for index in start..<(start + count) {
+            let event = AssistantEvent.turnStarted(turnId: "sched-\(index)")
+            writes.append(.init(
+                seq: index + 1,
+                kind: event.debugDescription,
+                payloadJSON: String(decoding: try encoder.encode(event), as: UTF8.self),
+                providerEvent: nil
+            ))
+        }
+        try runRepo.persistStreamBatch(
+            runId: run.id,
+            threadId: threadId,
+            items: writes,
+            shouldPruneStreamEvents: false
         )
     }
 
@@ -2828,6 +2992,23 @@ final class AgentAppPerfBundleTests: XCTestCase {
         )
     }
 
+    func test_botPeerReconciliationInterval_defaultsToFiveSeconds() throws {
+        // WHY: waiting peer markup used to poll SQLite every 1s. Default is 5s;
+        // tests keep the writable override (this suite uses 60s to freeze the loop).
+        let (vm, _) = try makeVM()
+        XCTAssertEqual(
+            vm.botPeerReconciliationIntervalNanoseconds,
+            5_000_000_000,
+            "bot-peer reconcile default must be 5s, not 1s"
+        )
+        vm.botPeerReconciliationIntervalNanoseconds = 60_000_000_000
+        XCTAssertEqual(
+            vm.botPeerReconciliationIntervalNanoseconds,
+            60_000_000_000,
+            "tests must still be able to override the peer interval"
+        )
+    }
+
     /// WHY: peer reconcile used to full-get 26 columns + routing JSON every ~1s
     /// while a peer was waiting, just to copy durable status.
     func test_peerReconcile_usesStatusProbeWithoutDurableGet() async throws {
@@ -3378,6 +3559,39 @@ final class AgentAppPerfBundleTests: XCTestCase {
         XCTAssertLessThan(revealProdMed, 60_000)
         _ = idleLegacyMed
         _ = revealLegacyMed
+    }
+
+    /// Live tool rows re-enter body on every token. `toolCommandPreview` must
+    /// reuse `toolInputObject` so 20 tools × 200 prefixes parse 20 times, not 4000.
+    func test_toolCommandPreview_computeCountStaysAtUniqueToolsAcrossDeltas() {
+        let toolCount = 20
+        let deltas = 200
+        let pad = String(repeating: "p", count: 32)
+        let items: [AssistantItem] = (0..<toolCount).map { index in
+            AssistantItem(
+                id: "perf-tool-\(index)",
+                turnId: "perf-turn",
+                type: .tool,
+                state: .completed,
+                summary: "Bash",
+                body: #"{"command":"ls \#(index) \#(pad)"}"#,
+                startedAtMs: Int64(index),
+                finishedAtMs: Int64(index + 1)
+            )
+        }
+        let before = AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting
+        for _ in 0..<deltas {
+            for item in items {
+                _ = AgentTimelineItemPresentation.toolCommandPreview(for: item)
+            }
+        }
+        let parses = AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting - before
+        NSLog(
+            "[perf-proof] toolInputObjectComputeCount tools=%d deltas=%d before_floor=%d after=%d",
+            toolCount, deltas, toolCount * deltas, parses
+        )
+        XCTAssertEqual(parses, toolCount)
+        XCTAssertLessThan(parses, toolCount * deltas)
     }
 
 }

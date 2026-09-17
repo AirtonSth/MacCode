@@ -95,6 +95,10 @@ final class CodexParserTests: XCTestCase {
         let declined = state.turns[0].items.first { $0.id == "item_2" }
         XCTAssertEqual(declined?.state, .cancelled,
                        "declined command_execution must map to cancelled like app-server")
+        XCTAssertEqual(declined?.output ?? "", "",
+                       "empty aggregated_output is empty stdout, not the command line")
+        XCTAssertEqual(declined?.summary, "rm -rf /",
+                       "the command line stays in summary")
 
         XCTAssertEqual(state.turns[0].finalAssistantMessage, "Listed the repo.")
         XCTAssertEqual(state.tokenUsage?.inputTokens, 24763)
@@ -103,6 +107,24 @@ final class CodexParserTests: XCTestCase {
         XCTAssertEqual(state.tokenUsage?.cacheCreationInputTokens, 12,
                        "cache_write_input_tokens maps to cache creation bucket")
         XCTAssertEqual(state.tokenUsage?.outputTokens, 122)
+    }
+
+    func test_realExecSchema_omittedAggregatedOutputIsNotTheCommand() {
+        // WHY: openai/codex may omit aggregated_output while a command is in
+        // progress or printed nothing. Falling through to `command` paints the
+        // argv as fake stdout.
+        let p = CodexParser()
+        var state = AssistantTimelineState()
+        for l in [
+            #"{"type":"thread.started","thread_id":"t-empty"}"#,
+            #"{"type":"turn.started"}"#,
+            #"{"type":"item.completed","item":{"id":"item_empty","type":"command_execution","command":"true","status":"completed"}}"#
+        ] { for ev in p.parseLine(l) { state.apply(ev) } }
+        let item = state.turns[0].items.first { $0.id == "item_empty" }
+        XCTAssertEqual(item?.type, .commandExecution)
+        XCTAssertEqual(item?.summary, "true")
+        XCTAssertEqual(item?.output ?? "", "",
+                       "omitted aggregated_output must not display the command string")
     }
 
     func test_realExecSchema_itemUpdatedTodoList() {
@@ -262,6 +284,46 @@ final class CodexParserTests: XCTestCase {
         XCTAssertEqual(item?.summary, "Unsupported realtime event")
         XCTAssertEqual(item?.body, "Unsupported Codex realtime event: realtime.audio.delta",
                        "unsupported realtime/audio Codex events must be visible instead of silently vanishing")
+    }
+
+    func test_reasoningFileChangeAndWebSearchLandInOutputNotBody() {
+        // WHY: Agent App Thought/edit/search cards read item.output; exec JSONL
+        // used to park these types in body so the UI showed a placeholder.
+        let p = CodexParser()
+        var state = AssistantTimelineState()
+        for l in [
+            #"{"type":"thread.started","thread_id":"t-output"}"#,
+            #"{"type":"turn.started"}"#,
+            #"{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"**Scanning docs**"}}"#,
+            #"{"type":"item.completed","item":{"id":"item_1","type":"file_change","text":"updated App.swift"}}"#,
+            #"{"type":"item.completed","item":{"id":"item_2","type":"web_search","query":"RemoteCode"}}"#,
+            #"{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Done."}}"#,
+            #"{"type":"turn.completed"}"#
+        ] { for ev in p.parseLine(l) { state.apply(ev) } }
+
+        let reasoning = state.turns[0].items.first { $0.id == "item_0" }
+        XCTAssertEqual(reasoning?.type, .reasoning)
+        XCTAssertEqual(reasoning?.output, "**Scanning docs**")
+        XCTAssertEqual(reasoning?.body ?? "", "")
+        let file = state.turns[0].items.first { $0.id == "item_1" }
+        XCTAssertEqual(file?.type, .fileChange)
+        XCTAssertEqual(file?.output, "updated App.swift")
+        let search = state.turns[0].items.first { $0.id == "item_2" }
+        XCTAssertEqual(search?.type, .webSearch)
+        XCTAssertEqual(search?.output, "RemoteCode")
+        XCTAssertEqual(state.turns[0].finalAssistantMessage, "Done.",
+                       "assistant text stays on body/assembled; reasoning must not steal the reply")
+    }
+
+    func test_todoListItemsUseTextAndCompleted() {
+        // WHY: official exec todo_list is items[].{text,completed}, not plan/steps.
+        let p = CodexParser()
+        var state = AssistantTimelineState()
+        state.apply(.turnStarted(turnId: "turn-1"))
+        let events = p.parseLine(#"{"type":"item.updated","item":{"id":"item_2","type":"todo_list","items":[{"text":"Scan protocol","completed":false},{"text":"Patch wire","completed":true}]}}"#)
+        for event in events { state.apply(event) }
+        XCTAssertEqual(state.activePlan?.steps.map(\.title), ["Scan protocol", "Patch wire"])
+        XCTAssertEqual(state.activePlan?.steps.map(\.status), [.pending, .completed])
     }
 }
 

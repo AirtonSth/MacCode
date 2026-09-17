@@ -9396,9 +9396,9 @@ final class AgentAppViewModelTests: XCTestCase {
 
     @MainActor
     func test_paintedTimelineByThread_evictsLRUAndDeletedThreads() throws {
-        // WHY (AA-07): paintedTimelineByThread grew for every thread visited
-        // in the session. Cap at 3 plus the selected/live run, and drop
-        // deleted ids.
+        // WHY (AA-07 / F3): paintedTimelineByThread grew for every thread
+        // visited in the session. Cap at 2 plus the selected/live run, and
+        // drop deleted ids. 3→2 cuts peak switch-cache capacity by ~33%.
         let (vm, repo) = try makeVM()
         var ids: [AgentThreadID] = []
         for index in 0..<5 {
@@ -9414,12 +9414,23 @@ final class AgentAppViewModelTests: XCTestCase {
         }
         XCTAssertLessThanOrEqual(
             vm.paintedTimelineCountForTesting,
-            3,
+            2,
             "visiting 5 threads must not keep every painted timeline"
         )
 
         vm.selectThread(ids[0])
-        XCTAssertLessThanOrEqual(vm.paintedTimelineCountForTesting, 3)
+        XCTAssertLessThanOrEqual(vm.paintedTimelineCountForTesting, 2)
+    }
+
+    @MainActor
+    func test_paintedTimelineLimit_retentionEstimate_3to2() {
+        // WHY: document the F3 inactive-cache capacity cut. Selected/live
+        // timelines can still remain above this inactive bound.
+        let prior = 3
+        let limit = AgentAppViewModel.paintedTimelineLimit
+        let reduction = Double(prior - limit) / Double(prior)
+        XCTAssertEqual(limit, 2)
+        XCTAssertEqual(reduction, 1.0 / 3.0, accuracy: 0.001)
     }
 
     @MainActor
@@ -9523,6 +9534,72 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(botStore.listQueryCountForTesting, 2)
     }
 
+    func test_assistantCharsHot_matchesUTF8ReduceAndFooterDoesNotSnapshotMessages() throws {
+        // WHY: the Token Saver footer used to capture `[AgentMessage]` on every
+        // usage-changed reload. The hot Int must equal the previous reduce so
+        // displayTokens stay unchanged, and reload must not snapshot the array.
+        let (vm, _) = try makeVM()
+        let threadId = AgentThreadID()
+        vm.messages = [
+            AgentMessage(threadId: threadId, role: .user, content: "ask"),
+            AgentMessage(threadId: threadId, role: .assistant, content: "hello world"),
+            AgentMessage(threadId: threadId, role: .assistant, content: "second")
+        ]
+        let reduced = vm.messages
+            .filter { $0.role == .assistant }
+            .reduce(0) { $0 + $1.content.utf8.count }
+        XCTAssertEqual(
+            vm.transcriptState.assistantCharsHot,
+            reduced,
+            "assistantCharsHot must equal filter(role==assistant).utf8.count"
+        )
+        XCTAssertEqual(
+            AgentAppView.tokenSaverThreadFooterDisplayTokens(
+                measuredDelivered: 100,
+                assistantChars: vm.transcriptState.assistantCharsHot,
+                tokenSaverEnabled: true,
+                graphifyActive: false
+            ),
+            AgentAppView.tokenSaverThreadFooterDisplayTokens(
+                measuredDelivered: 100,
+                assistantChars: reduced,
+                tokenSaverEnabled: true,
+                graphifyActive: false
+            ),
+            "footer tokens from the hot Int must equal the previous message reduce"
+        )
+        XCTAssertEqual(
+            AgentAppView.tokenSaverThreadFooterDisplayTokens(
+                measuredDelivered: 100,
+                assistantChars: vm.transcriptState.assistantCharsHot,
+                tokenSaverEnabled: false,
+                graphifyActive: false
+            ),
+            100,
+            "Token Saver off still reports the measured floor, not a invented estimate"
+        )
+
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        let marker = "public func reloadTokenSaverThreadSavings() {"
+        let start = try XCTUnwrap(source.range(of: marker))
+        let body = String(source[start.lowerBound...].prefix(2_400))
+        XCTAssertFalse(
+            body.contains("let messageSnapshot = messages"),
+            "reloadTokenSaverThreadSavings must not capture [AgentMessage]"
+        )
+        XCTAssertTrue(
+            body.contains("assistantCharsHot"),
+            "reload must pass the maintained assistantChars Int"
+        )
+    }
+
     func test_hiddenSurface_coalescesStreamPublishesAndStopsTicks() async throws {
         // WHY: PF-10 — a hidden Agent App tab with a live run used to flush and
         // tick at 30 Hz. Hidden must keep reducing so reveal matches a tab that
@@ -9559,6 +9636,19 @@ final class AgentAppViewModelTests: XCTestCase {
         await settleStream(hidden)
         await settleStream(visible)
 
+        XCTAssertTrue(
+            hidden.timeline.turns.isEmpty,
+            "hide must drop the published timeline so the tab does not retain two trees"
+        )
+        XCTAssertFalse(
+            AgentAppView.shouldShowEmptyConversation(
+                messagesEmpty: hidden.messages.isEmpty,
+                turnsEmpty: hidden.timeline.turns.isEmpty,
+                hasTimelineError: hidden.timeline.error != nil,
+                isHidden: hidden.isHiddenFromSurface
+            ),
+            "a hidden live run must not be treated as an empty conversation"
+        )
         XCTAssertEqual(
             hidden.timelineTickScheduleCountForTesting,
             0,

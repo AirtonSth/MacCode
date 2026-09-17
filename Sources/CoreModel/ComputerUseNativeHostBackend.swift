@@ -48,10 +48,14 @@ public struct ComputerUseNativeWindow: Sendable, Equatable {
 public struct ComputerUseNativeCapture: Sendable, Equatable {
     public let data: String
     public let mimeType: String
+    /// Full-frame pixel size before any zoom crop. Set when the capture
+    /// source retained a live `CGImage` so zoom can skip a second PNG inflate.
+    public let sourcePixelSize: [Int]?
 
-    public init(data: String, mimeType: String) {
+    public init(data: String, mimeType: String, sourcePixelSize: [Int]? = nil) {
         self.data = data
         self.mimeType = mimeType
+        self.sourcePixelSize = sourcePixelSize
     }
 }
 
@@ -389,6 +393,46 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
     static let maximumCaptureBase64Characters =
         ((maximumCaptureEncodedBytes + 2) / 3) * 4
 
+    // PNG-inflate metrics for zoom/screenshot tests. Incremented only when
+    // `NSBitmapImageRep(data:)` expands encoded PNG into pixels — not when a
+    // live `CGImage` is cropped or wrapped for encode.
+    private static let pngInflateLock = NSLock()
+    private static var pngPixelInflateCountStorage = 0
+    private static var lastPNGInflatePixelCountStorage = 0
+
+    static var pngPixelInflateCount: Int {
+        pngInflateLock.lock()
+        defer { pngInflateLock.unlock() }
+        return pngPixelInflateCountStorage
+    }
+
+    static var lastPNGInflatePixelCount: Int {
+        pngInflateLock.lock()
+        defer { pngInflateLock.unlock() }
+        return lastPNGInflatePixelCountStorage
+    }
+
+    static func resetPNGPixelInflateMetrics() {
+        pngInflateLock.lock()
+        pngPixelInflateCountStorage = 0
+        lastPNGInflatePixelCountStorage = 0
+        pngInflateLock.unlock()
+    }
+
+    private static func recordPNGPixelInflate(pixelCount: Int) {
+        pngInflateLock.lock()
+        pngPixelInflateCountStorage += 1
+        lastPNGInflatePixelCountStorage = pixelCount
+        pngInflateLock.unlock()
+    }
+
+    /// Zoom region for the in-flight capture. NativePlatform reads this so a
+    /// live `CGImage` can be cropped before PNG/base64 without changing the
+    /// public capture-hook arity used by DistillService/rc2.
+    enum CaptureZoomContext {
+        @TaskLocal static var region: CGRect?
+    }
+
     public init(hooks: Hooks = Hooks()) {
         self.hooks = hooks
     }
@@ -428,7 +472,9 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             var capture: ComputerUseNativeCapture?
             let captureFailure: String?
             if hooks.screenCapturePermission(), window.isOnScreen, !window.isMinimized {
-                switch await hooks.capture(target) {
+                switch await CaptureZoomContext.$region.withValue(requestedRegion, operation: {
+                    await hooks.capture(target)
+                }) {
                 case .success(let image), .quartzFallback(let image):
                     if Self.captureDataExceedsBudget(image) {
                         capture = nil
@@ -438,6 +484,14 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                         captureFailure = nil
                     }
                 case .unavailable(let reason):
+                    if requestedRegion != nil, reason == Failure.invalid_region.rawValue {
+                        let observation = await makeObservation(
+                            window: window,
+                            kind: .pixel,
+                            content: "<invalid-region>"
+                        )
+                        return failure(.invalid_region, encodeObservation(observation))
+                    }
                     capture = nil
                     captureFailure = reason
                 }
@@ -446,41 +500,29 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                 captureFailure = nil
             }
             var pixelScope: PixelScope?
-            if let captured = capture,
-               let fullImageSize = Self.imageSize(capture: captured) {
-                if let requestedRegion {
-                    guard let cropped = Self.crop(capture: captured, region: requestedRegion) else {
-                        let observation = await makeObservation(
-                            window: window,
-                            kind: .pixel,
-                            content: "<invalid-region>"
-                        )
-                        return failure(.invalid_region, encodeObservation(observation))
-                    }
-                    capture = cropped
+            if let captured = capture {
+                if let applied = Self.applyPixelRegion(captured, region: requestedRegion) {
+                    capture = applied.capture
                     pixelScope = PixelScope(
-                        fullImageSize: fullImageSize,
-                        region: [
-                            Int(requestedRegion.origin.x), Int(requestedRegion.origin.y),
-                            Int(requestedRegion.width), Int(requestedRegion.height),
-                        ]
+                        fullImageSize: applied.fullImageSize,
+                        region: requestedRegion.map {
+                            [
+                                Int($0.origin.x), Int($0.origin.y),
+                                Int($0.width), Int($0.height),
+                            ]
+                        }
                     )
                 } else {
-                    pixelScope = PixelScope(
-                        fullImageSize: fullImageSize,
-                        region: nil
+                    let observation = await makeObservation(
+                        window: window,
+                        kind: .pixel,
+                        content: requestedRegion == nil ? "<pixels-unavailable>" : "<invalid-region>"
+                    )
+                    return failure(
+                        requestedRegion == nil ? .capture_unavailable : .invalid_region,
+                        encodeObservation(observation)
                     )
                 }
-            } else if capture != nil {
-                let observation = await makeObservation(
-                    window: window,
-                    kind: .pixel,
-                    content: requestedRegion == nil ? "<pixels-unavailable>" : "<invalid-region>"
-                )
-                return failure(
-                    requestedRegion == nil ? .capture_unavailable : .invalid_region,
-                    encodeObservation(observation)
-                )
             }
             let observation = await makeObservation(
                 window: window,
@@ -560,39 +602,26 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             if let content {
                 observedContent = content
             } else if renderable {
-                switch await hooks.capture(window.target) {
+                let captureRegion: CGRect? = {
+                    guard let region = pixelScope?.region, region.count == 4 else { return nil }
+                    return CGRect(x: region[0], y: region[1], width: region[2], height: region[3])
+                }()
+                switch await CaptureZoomContext.$region.withValue(captureRegion, operation: {
+                    await hooks.capture(window.target)
+                }) {
                 case .success(let capture), .quartzFallback(let capture):
                     guard !Self.captureDataExceedsBudget(capture) else {
                         observedContent = "<pixels-unavailable>"
                         effectivePixelScope = nil
                         break
                     }
-                    if let fullImageSize = Self.imageSize(capture: capture),
-                       let pixelScope {
-                        if let region = pixelScope.region,
-                           region.count == 4,
-                           let cropped = Self.crop(
-                               capture: capture,
-                               region: CGRect(
-                                   x: region[0], y: region[1],
-                                   width: region[2], height: region[3]
-                               )
-                           ) {
-                            observedContent = cropped.data
-                            effectivePixelScope = PixelScope(
-                                fullImageSize: fullImageSize,
-                                region: pixelScope.region
-                            )
-                        } else if pixelScope.region == nil {
-                            observedContent = capture.data
-                            effectivePixelScope = PixelScope(
-                                fullImageSize: fullImageSize,
-                                region: nil
-                            )
-                        } else {
-                            observedContent = capture.data
-                            effectivePixelScope = nil
-                        }
+                    if let pixelScope,
+                       let applied = Self.applyPixelRegion(capture, region: captureRegion) {
+                        observedContent = applied.capture.data
+                        effectivePixelScope = PixelScope(
+                            fullImageSize: applied.fullImageSize,
+                            region: pixelScope.region
+                        )
                     } else {
                         observedContent = capture.data
                         effectivePixelScope = nil
@@ -1065,14 +1094,78 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         return CGRect(x: x, y: y, width: width, height: height)
     }
 
+    private static func applyPixelRegion(
+        _ capture: ComputerUseNativeCapture,
+        region: CGRect?
+    ) -> (capture: ComputerUseNativeCapture, fullImageSize: [Int])? {
+        guard let fullImageSize = capture.sourcePixelSize ?? imageSize(capture: capture) else {
+            return nil
+        }
+        guard let region else {
+            return (capture, fullImageSize)
+        }
+        if isNativeCroppedCapture(capture, region: region, fullImageSize: fullImageSize) {
+            return (capture, fullImageSize)
+        }
+        guard let cropped = crop(capture: capture, region: region) else {
+            return nil
+        }
+        return (cropped, fullImageSize)
+    }
+
+    private static func isNativeCroppedCapture(
+        _ capture: ComputerUseNativeCapture,
+        region: CGRect,
+        fullImageSize: [Int]
+    ) -> Bool {
+        guard capture.sourcePixelSize != nil,
+              fullImageSize.count == 2,
+              region.origin.x >= 0,
+              region.origin.y >= 0,
+              region.width > 0,
+              region.height > 0,
+              region.maxX <= CGFloat(fullImageSize[0]),
+              region.maxY <= CGFloat(fullImageSize[1]),
+              let data = decodedCaptureData(capture),
+              let encodedSize = pngHeaderPixelSize(data),
+              encodedSize == [Int(region.width), Int(region.height)] else {
+            return false
+        }
+        return true
+    }
+
     private static func crop(
         capture: ComputerUseNativeCapture,
         region: CGRect
     ) -> ComputerUseNativeCapture? {
+        guard let decoded = decodedCaptureImage(capture) else { return nil }
+        return encodeCroppedImage(
+            decoded.image,
+            region: region,
+            sourcePixelSize: decoded.pixelSize
+        )
+    }
+
+    private static func decodedCaptureImage(
+        _ capture: ComputerUseNativeCapture
+    ) -> (image: CGImage, pixelSize: [Int])? {
         guard let data = decodedCaptureData(capture),
               let representation = NSBitmapImageRep(data: data),
               let image = representation.cgImage,
-              region.maxX <= CGFloat(image.width),
+              image.width > 0,
+              image.height > 0 else {
+            return nil
+        }
+        recordPNGPixelInflate(pixelCount: image.width * image.height)
+        return (image, [image.width, image.height])
+    }
+
+    private static func encodeCroppedImage(
+        _ image: CGImage,
+        region: CGRect,
+        sourcePixelSize: [Int]
+    ) -> ComputerUseNativeCapture? {
+        guard region.maxX <= CGFloat(image.width),
               region.maxY <= CGFloat(image.height),
               let cropped = image.cropping(to: CGRect(
                   x: region.origin.x,
@@ -1080,25 +1173,77 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
                   width: region.width,
                   height: region.height
               )),
-              let croppedData = NSBitmapImageRep(cgImage: cropped)
-                .representation(using: .png, properties: [:]) else {
+              case .success(let encoded) = encodePNGCapture(
+                cropped,
+                sourcePixelSize: sourcePixelSize
+              ) else {
             return nil
         }
-        guard croppedData.count <= maximumCaptureEncodedBytes else { return nil }
-        return ComputerUseNativeCapture(
-            data: croppedData.base64EncodedString(),
-            mimeType: "image/png"
-        )
+        return encoded
+    }
+
+    static func encodePreparedCapture(
+        image: CGImage,
+        region: CGRect?
+    ) -> ComputerUseNativeCaptureResult {
+        guard image.width > 0,
+              image.height > 0,
+              image.width <= maximumCapturePixelDimension,
+              image.height <= maximumCapturePixelDimension,
+              image.height <= maximumCapturePixelCount / image.width else {
+            return .unavailable("capture_too_large")
+        }
+        let sourcePixelSize = [image.width, image.height]
+        let output: CGImage
+        if let region {
+            guard region.origin.x >= 0,
+                  region.origin.y >= 0,
+                  region.width > 0,
+                  region.height > 0,
+                  region.maxX <= CGFloat(image.width),
+                  region.maxY <= CGFloat(image.height),
+                  let cropped = image.cropping(to: CGRect(
+                      x: region.origin.x,
+                      y: region.origin.y,
+                      width: region.width,
+                      height: region.height
+                  )) else {
+                return .unavailable("invalid_region")
+            }
+            output = cropped
+        } else {
+            output = image
+        }
+        return encodePNGCapture(output, sourcePixelSize: sourcePixelSize)
+    }
+
+    private static func encodePNGCapture(
+        _ image: CGImage,
+        sourcePixelSize: [Int]
+    ) -> ComputerUseNativeCaptureResult {
+        guard let data = NSBitmapImageRep(cgImage: image)
+            .representation(using: .png, properties: [:]) else {
+            return .unavailable("png_encoding_failed")
+        }
+        guard data.count <= maximumCaptureEncodedBytes else {
+            return .unavailable("capture_too_large")
+        }
+        return .success(ComputerUseNativeCapture(
+            data: data.base64EncodedString(),
+            mimeType: "image/png",
+            sourcePixelSize: sourcePixelSize
+        ))
     }
 
     private static func imageSize(capture: ComputerUseNativeCapture) -> [Int]? {
-        guard let data = decodedCaptureData(capture),
-              let representation = NSBitmapImageRep(data: data),
-              representation.pixelsWide > 0,
-              representation.pixelsHigh > 0 else {
-            return nil
+        if let size = capture.sourcePixelSize,
+           size.count == 2,
+           size[0] > 0,
+           size[1] > 0 {
+            return size
         }
-        return [representation.pixelsWide, representation.pixelsHigh]
+        guard let data = decodedCaptureData(capture) else { return nil }
+        return pngHeaderPixelSize(data)
     }
 
     private static func captureDataExceedsBudget(_ capture: ComputerUseNativeCapture) -> Bool {
@@ -1120,20 +1265,36 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         return data
     }
 
-    private static func encodedImageDimensionsExceedBudget(_ data: Data) -> Bool {
+    private static func pngIHDRDimensions(_ data: Data) -> (width: UInt32, height: UInt32)? {
         let pngSignature: [UInt8] = [
             0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
         ]
         guard data.count >= 24,
               data.prefix(pngSignature.count).elementsEqual(pngSignature) else {
-            return false
+            return nil
         }
         let width = data[16..<20].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
         let height = data[20..<24].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-        guard width > 0, height > 0 else { return true }
-        return width > UInt32(maximumCapturePixelDimension)
-            || height > UInt32(maximumCapturePixelDimension)
-            || UInt64(height) > UInt64(maximumCapturePixelCount) / UInt64(width)
+        return (width, height)
+    }
+
+    private static func pngHeaderPixelSize(_ data: Data) -> [Int]? {
+        guard let dimensions = pngIHDRDimensions(data),
+              dimensions.width > 0,
+              dimensions.height > 0 else {
+            return nil
+        }
+        return [Int(dimensions.width), Int(dimensions.height)]
+    }
+
+    private static func encodedImageDimensionsExceedBudget(_ data: Data) -> Bool {
+        guard let dimensions = pngIHDRDimensions(data) else {
+            return false
+        }
+        guard dimensions.width > 0, dimensions.height > 0 else { return true }
+        return dimensions.width > UInt32(maximumCapturePixelDimension)
+            || dimensions.height > UInt32(maximumCapturePixelDimension)
+            || UInt64(dimensions.height) > UInt64(maximumCapturePixelCount) / UInt64(dimensions.width)
     }
 
     private static func cursorPosition() -> String {
@@ -1452,6 +1613,13 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
         }
 
         public static func capture(target: ComputerUseNativeHostTarget) async -> ComputerUseNativeCaptureResult {
+            await capture(target: target, region: CaptureZoomContext.region)
+        }
+
+        static func capture(
+            target: ComputerUseNativeHostTarget,
+            region: CGRect?
+        ) async -> ComputerUseNativeCaptureResult {
             guard let content = await shareableContent() else {
                 return .unavailable("shareable_content_unavailable")
             }
@@ -1501,22 +1669,17 @@ public final class ComputerUseNativeHostBackend: ComputerUseToolBackend, @unchec
             }
             switch imageResult {
             case .success(let image):
-                guard image.width > 0,
-                      image.height > 0,
-                      image.width <= ComputerUseNativeHostBackend.maximumCapturePixelDimension,
-                      image.height <= ComputerUseNativeHostBackend.maximumCapturePixelDimension,
-                      image.height <= ComputerUseNativeHostBackend.maximumCapturePixelCount / image.width else {
-                    return .unavailable("capture_too_large")
+                switch ComputerUseNativeHostBackend.encodePreparedCapture(
+                    image: image,
+                    region: region
+                ) {
+                case .success(let capture):
+                    return usedQuartzFallback ? .quartzFallback(capture) : .success(capture)
+                case .quartzFallback(let capture):
+                    return .quartzFallback(capture)
+                case .unavailable(let reason):
+                    return .unavailable(reason)
                 }
-                let bitmap = NSBitmapImageRep(cgImage: image)
-                guard let data = bitmap.representation(using: NSBitmapImageRep.FileType.png, properties: [:]) else {
-                    return .unavailable("png_encoding_failed")
-                }
-                guard data.count <= ComputerUseNativeHostBackend.maximumCaptureEncodedBytes else {
-                    return .unavailable("capture_too_large")
-                }
-                let capture = ComputerUseNativeCapture(data: data.base64EncodedString(), mimeType: "image/png")
-                return usedQuartzFallback ? .quartzFallback(capture) : .success(capture)
             case .failure(let reason):
                 return .unavailable(reason.description)
             }

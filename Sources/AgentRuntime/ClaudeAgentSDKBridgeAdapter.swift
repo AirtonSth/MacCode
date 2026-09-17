@@ -1571,7 +1571,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     // yielding "install failed: " with no explanation.
     static func npmInstallFailureText(buffered: LockedDataBuffer, outputPipe: Pipe) -> String {
         var data = buffered.value
-        data.append(BoundedPipeDrain.readRemaining(from: outputPipe.fileHandleForReading))
+        data.append(BoundedPipeDrain.readRemaining(
+            from: outputPipe.fileHandleForReading,
+            maxBytes: BoundedPipeDrain.defaultStdoutMaxBytes
+        ))
         return String(data: data, encoding: .utf8) ?? ""
     }
 
@@ -1726,19 +1729,19 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         if let claudeExecutablePath {
             payload["claude_executable_path"] = claudeExecutablePath
         }
-        // Effort + ultracode settings reuse ClaudeRunner's canonical CLI mapping
-        // (native ultracode effort + {"ultracode":true,"enableWorkflows":true})
-        // so the SDK bridge and the streaming CLI never drift.
+        // Effort + ultracode settings: CLI keeps --effort ultracode; SDK
+        // Options.effort is xhigh plus settings {"ultracode":true,...}.
         let normalizedEffort = ClaudeRunner.normalizedReasoningEffort(
             request.reasoningEffort,
             model: request.model
         )
-        if let effort = ClaudeRunner.effortArgs(normalizedEffort, model: request.model).last {
+        if let effort = ClaudeRunner.sdkEffortToken(normalizedEffort, model: request.model) {
             payload["effort"] = effort
         }
         if let settings = ClaudeRunner.ultracodeSettingsArgs(
             normalizedEffort,
-            environment: request.environment
+            environment: request.environment,
+            cwd: request.cwd
         ).last {
             payload["settings"] = settings
         }
@@ -1894,7 +1897,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         // still be reading/parsing — the lock keeps LineBuffer access and fd
         // read order serialized so no final line is split or reordered.
         session.stdoutReadLock.lock()
-        let tail = BoundedPipeDrain.readRemaining(from: session.stdoutPipe.fileHandleForReading)
+        let tail = BoundedPipeDrain.readRemaining(
+            from: session.stdoutPipe.fileHandleForReading,
+            maxBytes: BoundedPipeDrain.defaultStdoutMaxBytes
+        )
         for line in session.lineBuffer.take(tail) + session.lineBuffer.flush() {
             handleLine(line, session: session)
         }
@@ -1903,7 +1909,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         // (missing module, ESM syntax error, auth failure) writes the only
         // explanation to stderr, and the async handler can lose the race with
         // the teardown above, leaving the bytes undelivered in the pipe.
-        let stderrTail = BoundedPipeDrain.readRemaining(from: session.stderrPipe.fileHandleForReading)
+        let stderrTail = BoundedPipeDrain.readRemaining(
+            from: session.stderrPipe.fileHandleForReading,
+            maxBytes: BoundedPipeDrain.defaultStderrMaxBytes
+        )
         if !stderrTail.isEmpty {
             handleStderr(stderrTail, session: session)
         }

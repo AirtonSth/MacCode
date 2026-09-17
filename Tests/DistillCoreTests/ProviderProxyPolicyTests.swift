@@ -591,7 +591,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
             promptFile: prompt
         ), "the last custom Codex effort is valid to Codex but not representable by Agent App, so promotion must fail closed")
 
-        for unrepresentable in ["minimal", "ultra", "none", "", "custom-future", "ultracode"] {
+        for unrepresentable in ["minimal", "none", "", "custom-future", "ultracode"] {
             XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
                 providerBasename: "codex",
                 arguments: [
@@ -603,11 +603,6 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ), "last Codex effort '\(unrepresentable)' must override max and keep the raw CLI")
         }
 
-        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
-            providerBasename: "codex",
-            arguments: ["exec", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=ultra", "work"],
-            promptFile: prompt
-        ), "Codex ultra is valid but not representable in the current receipt enum; keep the raw CLI")
         let codexAfterUltra = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "codex",
             arguments: [
@@ -619,6 +614,17 @@ final class ProviderProxyPolicyTests: XCTestCase {
         ))
         XCTAssertEqual(codexAfterUltra.reasoningEffort, .high,
                        "a later representable override must supersede ultra exactly like the CLI")
+        let ultraAfterMax = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "codex",
+            arguments: [
+                "exec", "--model", "gpt-5.6-sol",
+                "-c", "model_reasoning_effort=max",
+                "-c", "model_reasoning_effort=ultra", "work"
+            ],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(ultraAfterMax.reasoningEffort, .ultra,
+                       "a later Codex ultra override must promote instead of staying on the raw CLI")
 
         for maxModel in ["gpt-5.6", "gpt-5.6-terra", "gpt-5.6-luna"] {
             let delegation = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
@@ -629,14 +635,30 @@ final class ProviderProxyPolicyTests: XCTestCase {
             XCTAssertEqual(delegation.reasoningEffort, .max,
                            "\(maxModel) advertises max in the live app-server catalog")
         }
-        for restrictedModel in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-spark"] {
+        for ultraModel in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             let delegation = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "codex",
+                arguments: ["exec", "--model", ultraModel, "-c", "model_reasoning_effort=ultra", "work"],
+                promptFile: prompt
+            ))
+            XCTAssertEqual(delegation.reasoningEffort, .ultra,
+                           "\(ultraModel) advertises ultra in the live app-server catalog")
+        }
+        for restrictedModel in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-spark"] {
+            let maxDelegation = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
                 providerBasename: "codex",
                 arguments: ["exec", "--model", restrictedModel, "-c", "model_reasoning_effort=max", "work"],
                 promptFile: prompt
             ))
-            XCTAssertEqual(delegation.reasoningEffort, .xhigh,
+            XCTAssertEqual(maxDelegation.reasoningEffort, .xhigh,
                            "max must clamp when model support is absent or not observable")
+            let ultraDelegation = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "codex",
+                arguments: ["exec", "--model", restrictedModel, "-c", "model_reasoning_effort=ultra", "work"],
+                promptFile: prompt
+            ))
+            XCTAssertEqual(ultraDelegation.reasoningEffort, .xhigh,
+                           "ultra must clamp like max when model support is absent or not observable")
         }
         for unknownModel in ["", "gpt-custom-future"] {
             var arguments = ["exec"]
@@ -706,6 +728,21 @@ final class ProviderProxyPolicyTests: XCTestCase {
             arguments: ["exec", "resume", "sess-1"],
             promptFile: prompt
         ))
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "codex",
+            arguments: [
+                "exec", "--json", "--model", "gpt-5.6-sol",
+                "-c", "model_reasoning_effort=high", "work"
+            ],
+            promptFile: prompt
+        ), "codex exec --json is exec JSONL and must stay raw even when model and effort would otherwise promote")
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "codex",
+            arguments: [
+                "exec", "--json", "--model", "gpt-5.6-sol",
+                "-c", "model_reasoning_effort=high", "work"
+            ]
+        ), "eligibility must reject exec --json before stdin materialization")
         XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
             providerBasename: "grok",
             arguments: ["--help"]
@@ -750,6 +787,10 @@ final class ProviderProxyPolicyTests: XCTestCase {
             providerBasename: "codex",
             arguments: ["exec", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "work"]
         ))
+        XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "codex",
+            arguments: ["exec", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=ultra", "work"]
+        ), "Codex ultra is representable and must promote before stdin materialization")
         XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
             providerBasename: "grok",
             arguments: ["--model", "grok-4.6", "--effort", "high", "--prompt", "work"]

@@ -28,18 +28,18 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                        "a Codex release without threadSource cannot reconcile a lost fork response and must fail closed")
     }
 
-    func test_currentServerRequestInventoryMatchesGeneratedCodexSchema_0_152_1() throws {
+    func test_currentServerRequestInventoryMatchesGeneratedCodexSchema_0_154_0() throws {
         // WHY: a hand-copied expectation can drift in lockstep with the switch.
         // Read the checked-in projection generated from ServerRequest.json so a
         // schema upgrade introduces a failing ownership decision by default.
-        // 0.152.1 still includes currentTime/read; inventory must own that callback.
+        // 0.154.0 still includes currentTime/read; inventory must own that callback.
         let fixture = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
-            .appendingPathComponent("Fixtures/CodexAppServer/ServerRequestMethods-0.152.1.json")
+            .appendingPathComponent("Fixtures/CodexAppServer/ServerRequestMethods-0.154.0.json")
         let data = try Data(contentsOf: fixture)
         let schema = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(schema["generatedBy"] as? String,
-                       "codex-cli 0.152.1 app-server generate-json-schema --experimental")
+                       "codex-cli 0.154.0 app-server generate-json-schema --experimental")
         let variants = try XCTUnwrap(schema["oneOf"] as? [[String: Any]])
         let schemaMethods = Set(variants.compactMap { variant -> String? in
             let properties = variant["properties"] as? [String: Any]
@@ -109,7 +109,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
 
         let version = try runCodex(codex, arguments: ["--version"])
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        XCTAssertEqual(version, "codex-cli 0.152.1",
+        XCTAssertEqual(version, "codex-cli 0.154.0",
                        "the checked-in projection must be regenerated deliberately when the release Codex version changes")
         _ = try runCodex(codex, arguments: [
             "app-server", "generate-json-schema", "--experimental", "--out", output.path
@@ -427,6 +427,10 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         _ = try await adapter.sendTurn(request) { event in
             Task { await sink.record(event) }
         }
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "turn-app-server-1"]
+        ])
         client.notificationHandler?("thread/status/changed", [
             "threadId": "codex-thread-1",
             "status": ["type": "active", "activeFlags": ["runningCommand"]]
@@ -447,12 +451,12 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertNil(prematureFinish,
                      "turn/completed must not finish the local run while Codex still reports the thread active")
 
-        do {
-            _ = try await adapter.sendTurn(request) { _ in }
-            XCTFail("a second Codex turn must be rejected while the previous app-server thread is still active")
-        } catch {
-            // expected: active Codex status keeps the turn in flight.
+        _ = try await adapter.sendTurn(request) { event in
+            Task { await sink.record(event) }
         }
+        XCTAssertEqual(client.steeredTurns.count, 1,
+                       "an in-flight Codex follow-up must use turn/steer instead of throwing unsupported")
+        XCTAssertEqual(client.steeredTurns.first?.expectedTurnId, "turn-app-server-1")
 
         client.notificationHandler?("thread/status/changed", [
             "threadId": "codex-thread-1",
@@ -865,6 +869,10 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )) { event in
             Task { await sink.record(event) }
         }
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "turn-app-server-1"]
+        ])
 
         try adapter.interruptTurn(threadId: threadId)
         let deadline = Date().addingTimeInterval(3)
@@ -943,30 +951,153 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
     }
 
-    func test_sendTurn_rejectsConcurrentInFlightTurn() async throws {
-        // RUN-LIFECYCLE-STREAM-003: a second concurrent turn on a thread with a
-        // live turn must be rejected, not silently replace the session.
+    func test_sendTurn_doesNotActivateTurnFromStartTurnRPC() async throws {
+        // WHY: turn/start returns the turn object immediately; the app-server
+        // emits turn/started when it actually begins. Activating from the RPC
+        // lets a follow-up turn/steer race a turn that is not active yet.
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
             return client
         }
         let threadId = AgentThreadID()
-        func makeRequest() -> AgentRunRequest {
+        let sink = EventSink()
+        func makeRequest(_ prompt: String) -> AgentRunRequest {
             AgentRunRequest(threadId: threadId, provider: .codex, model: "gpt-5.5",
-                            cwd: "/tmp/remotecode-app-server-adapter", prompt: "wait")
+                            cwd: "/tmp/remotecode-app-server-adapter", prompt: prompt)
+        }
+
+        _ = try await adapter.sendTurn(makeRequest("wait")) { event in
+            Task { await sink.record(event) }
+        }
+        let before = await sink.snapshot()
+        XCTAssertFalse(before.contains {
+            if case .turnStarted = $0 { return true }
+            return false
+        }, "turn/start RPC must not emit turnStarted")
+
+        do {
+            _ = try await adapter.sendTurn(makeRequest("too soon")) { _ in }
+            XCTFail("follow-up before turn/started must not steer")
+        } catch {
+            XCTAssertEqual(client.steeredTurns.count, 0,
+                           "turn/steer requires an active turn from turn/started")
+            XCTAssertEqual(client.startedTurns.count, 1)
+        }
+
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "turn-app-server-1"]
+        ])
+        let afterStart = try await waitForEvents(in: sink, matching: { events in
+            events.contains { if case .turnStarted(let turnId) = $0 { return turnId == "turn-app-server-1" } else { return false } }
+        })
+        XCTAssertTrue(afterStart.contains {
+            if case .turnStarted(let turnId) = $0 { return turnId == "turn-app-server-1" }
+            return false
+        })
+
+        _ = try await adapter.sendTurn(makeRequest("also check tests")) { _ in }
+        XCTAssertEqual(client.startedTurns.count, 1, "the live turn must not be replaced with a second turn/start")
+        XCTAssertEqual(client.steeredTurns.count, 1)
+        XCTAssertEqual(client.steeredTurns.first?.expectedTurnId, "turn-app-server-1")
+        XCTAssertEqual(client.steeredTurns.first?.request.prompt, "also check tests")
+        XCTAssertEqual(client.openedRequests.count, 1, "steer must reuse the open thread")
+    }
+
+    func test_sendTurn_steersConcurrentInFlightTurn() async throws {
+        // In-flight Codex follow-up uses turn/steer only after turn/started.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        func makeRequest(_ prompt: String) -> AgentRunRequest {
+            AgentRunRequest(threadId: threadId, provider: .codex, model: "gpt-5.5",
+                            cwd: "/tmp/remotecode-app-server-adapter", prompt: prompt)
         }
         let noop: @Sendable (AgentRunEvent) -> Void = { _ in }
 
-        // First turn starts and stays in flight (autoComplete: false).
-        _ = try await adapter.sendTurn(makeRequest(), onEvent: noop)
+        _ = try await adapter.sendTurn(makeRequest("wait"), onEvent: noop)
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "turn-app-server-1"]
+        ])
+        _ = try await adapter.sendTurn(makeRequest("also check tests"), onEvent: noop)
+
+        XCTAssertEqual(client.startedTurns.count, 1, "the live turn must not be replaced with a second turn/start")
+        XCTAssertEqual(client.steeredTurns.count, 1)
+        XCTAssertEqual(client.steeredTurns.first?.expectedTurnId, "turn-app-server-1")
+        XCTAssertEqual(client.steeredTurns.first?.request.prompt, "also check tests")
+        XCTAssertEqual(client.openedRequests.count, 1, "steer must reuse the open thread")
+    }
+
+    func test_sendTurn_steerFailureKeepsOriginalRunBinding() async throws {
+        // WHY: rebinding runId/onEvent before turn/steer returns abandons the
+        // live run on ActiveTurnNotSteerable — original handle cannot cancel,
+        // and later notifications hit the failed follow-up callback.
+        let client = MockCodexAppServerClient(
+            autoComplete: false,
+            steerTurnError: NSError(domain: "CodexSteer", code: 1)
+        )
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        func makeRequest(_ prompt: String) -> AgentRunRequest {
+            AgentRunRequest(threadId: threadId, provider: .codex, model: "gpt-5.5",
+                            cwd: "/tmp/remotecode-app-server-adapter", prompt: prompt)
+        }
+        let originalSink = EventSink()
+        let followUpSink = EventSink()
+        let handle = try await adapter.sendTurn(makeRequest("wait")) { event in
+            Task { await originalSink.record(event) }
+        }
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "turn-app-server-1"]
+        ])
 
         do {
-            _ = try await adapter.sendTurn(makeRequest(), onEvent: noop)
-            XCTFail("a second concurrent turn on an in-flight thread must be rejected")
+            _ = try await adapter.sendTurn(makeRequest("also check tests")) { event in
+                Task { await followUpSink.record(event) }
+            }
+            XCTFail("steer failure must propagate")
+            return
         } catch {
-            // expected — the adapter throws rather than replacing the live session.
+            XCTAssertEqual(client.steeredTurns.count, 1)
+            XCTAssertEqual(client.steeredTurns.first?.expectedTurnId, "turn-app-server-1")
         }
+
+        client.notificationHandler?("item/agentMessage/delta", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "itemId": "item-1",
+            "delta": "still live"
+        ])
+        _ = try await waitForEvents(in: originalSink, matching: { events in
+            events.contains { event in
+                if case .itemDelta(_, let body, _, _) = event { return body == "still live" }
+                return false
+            }
+        })
+
+        handle.cancel()
+
+        XCTAssertFalse(adapter.hasSession(threadId: threadId),
+                       "the original handle must still cancel after a failed steer")
+        XCTAssertTrue(client.didStop,
+                      "failed steer must not retarget cancel away from the live session")
+        let finished = try await waitForFinish(in: originalSink, timeout: 1)
+        XCTAssertEqual(finished.0, .cancelled)
+        let followUpFinish = await followUpSink.finish
+        XCTAssertNil(followUpFinish,
+                     "live finish must not land on the abandoned follow-up callback")
+        let followUpEvents = await followUpSink.snapshot()
+        XCTAssertTrue(followUpEvents.isEmpty,
+                      "failed steer must not rebind onEvent onto the follow-up callback")
     }
 
     func test_adapterFailsRunWhenAppServerProcessExitsBeforeTurnCompleted() async throws {
@@ -1343,7 +1474,8 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertEqual(client.rolledBackTurns.first?.providerThreadId, "codex-thread-1")
-        XCTAssertEqual(client.rolledBackTurns.first?.numTurns, 2)
+        XCTAssertEqual(client.rolledBackTurns.first?.beforeTurnId, "turn-beta")
+        XCTAssertFalse(client.readCalls.isEmpty, "thread/revert must rehydrate via thread/turns/list")
     }
 
     func test_adapterRecoversAppServerSessionFromProviderThreadIdForReadAndRollback() async throws {
@@ -1395,7 +1527,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertEqual(client.rolledBackTurns.first?.providerThreadId, "codex-thread-recovered")
-        XCTAssertEqual(client.rolledBackTurns.first?.numTurns, 1)
+        XCTAssertEqual(client.rolledBackTurns.first?.beforeTurnId, "turn-beta")
 
         _ = try await adapter.sendTurn(AgentRunRequest(
             threadId: threadId,
@@ -1777,26 +1909,37 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         let rawResponse = try await responseTask.value
         let response = try XCTUnwrap(rawResponse as? [String: Any])
         XCTAssertEqual(response["decision"] as? String, "acceptForSession")
-        let update = try XCTUnwrap(client.updatedThreadSettings.first,
-                                   "Approve Session must update the live Codex thread settings so later approvals in the same turn are auto-approved")
-        XCTAssertEqual(update.providerThreadId, "codex-thread-1")
-        XCTAssertEqual(update.permissionMode, .fullAccess)
-        let autoResponse = try await client.serverRequestHandler?("rpc-3", "item/commandExecution/requestApproval", [
-            "threadId": "codex-thread-1",
-            "turnId": "turn-app-server-1",
-            "itemId": "cmd-2",
-            "command": "npm install"
-        ])
-        let autoDecision = try XCTUnwrap(autoResponse as? [String: Any])
-        XCTAssertEqual(autoDecision["decision"] as? String, "acceptForSession",
-                       "After Approve Session, later approval requests in the same loaded session must be auto-approved instead of surfacing another pending card")
+        XCTAssertTrue(client.updatedThreadSettings.isEmpty,
+                       "acceptForSession is per-kind provider memory; do not promote the thread to fullAccess")
+
+        let secondTask = Task {
+            try await client.serverRequestHandler?("rpc-3", "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-2",
+                "command": "npm install"
+            ])
+        }
+        let secondDeadline = Date().addingTimeInterval(3)
+        var secondRequest: AssistantPendingRequest?
+        while Date() < secondDeadline {
+            let opened = (await sink.snapshot()).compactMap {
+                if case .requestOpened(let request) = $0 { return request }
+                return nil
+            }
+            if let next = opened.first(where: { $0.id != request.id }) {
+                secondRequest = next
+                break
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let second = try XCTUnwrap(secondRequest, "a later command approval must still surface a card")
+        try await adapter.respondToRequest(threadId: threadId, requestId: second.id, response: .approve)
+        let laterRaw = try await secondTask.value
+        let laterDecision = try XCTUnwrap(laterRaw as? [String: Any])
+        XCTAssertEqual(laterDecision["decision"] as? String, "accept")
         let events = await sink.snapshot()
         XCTAssertTrue(events.contains { if case .requestResolved(let id, let state) = $0 { return id == request.id && state == .approved } else { return false } })
-        let openedRequests = events.compactMap {
-            if case .requestOpened(let request) = $0 { return request }
-            return nil
-        }
-        XCTAssertEqual(openedRequests.map(\.id), [request.id])
     }
 
     func test_applyPatchApprovalUsesReviewDecisionDialect() async throws {
@@ -1882,32 +2025,58 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         let aborted = try await decision(method: "execCommandApproval", response: .cancel, itemId: "exec-cancel")
         XCTAssertEqual(aborted["decision"] as? String, "abort")
 
+        // WHY: stopSession / serverRequest/resolved must use the same dialect.
+        // Hard-coding {"decision":"cancel"} is illegal for ReviewDecision methods.
+        // Run before approveForSession so fullAccess auto-approve does not swallow the card.
+        nextRpcId += 1
+        let settleRpcId = "rpc-\(nextRpcId)"
+        let settleTask = Task {
+            try await client.serverRequestHandler?(settleRpcId, "applyPatchApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "patch-settle-abort",
+                "command": "apply_patch"
+            ])
+        }
+        let settleRequest: AssistantPendingRequest = try await {
+            let deadline = Date().addingTimeInterval(3)
+            while Date() < deadline {
+                let events = await sink.snapshot()
+                if let request = events.compactMap({
+                    if case .requestOpened(let request) = $0 { return request }
+                    return nil
+                }).first(where: { !seenRequestIds.contains($0.id) }) {
+                    return request
+                }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            throw CodexAdapterTestWaitError.timedOut("settle approval patch-settle-abort")
+        }()
+        seenRequestIds.insert(settleRequest.id)
+        client.notificationHandler?("serverRequest/resolved", [
+            "threadId": "codex-thread-1",
+            "requestId": settleRpcId
+        ])
+        let settledRaw = try await settleTask.value
+        let settled = try XCTUnwrap(settledRaw as? [String: Any])
+        XCTAssertEqual(settled["decision"] as? String, "abort",
+                       "ReviewDecision settle must send abort, not cancel")
+
         let approvedSession = try await decision(
             method: "applyPatchApproval",
             response: .approveForSession,
             itemId: "patch-session"
         )
         XCTAssertEqual(approvedSession["decision"] as? String, "approved_for_session")
+        XCTAssertTrue(client.updatedThreadSettings.isEmpty,
+                       "approveForSession must not promote the thread to fullAccess")
 
-        // After Approve Session, fullAccess auto-approve must also use ReviewDecision.
-        let autoPatch = try await client.serverRequestHandler?("rpc-5", "applyPatchApproval", [
-            "threadId": "codex-thread-1",
-            "turnId": "turn-app-server-1",
-            "itemId": "patch-auto",
-            "command": "apply_patch"
-        ])
-        let autoPatchDecision = try XCTUnwrap(autoPatch as? [String: Any])
-        XCTAssertEqual(autoPatchDecision["decision"] as? String, "approved_for_session",
-                       "fullAccess auto-approve for applyPatch must use approved_for_session, not acceptForSession")
-
-        let autoExec = try await client.serverRequestHandler?("rpc-6", "execCommandApproval", [
-            "threadId": "codex-thread-1",
-            "turnId": "turn-app-server-1",
-            "itemId": "exec-auto",
-            "command": "ls"
-        ])
-        let autoExecDecision = try XCTUnwrap(autoExec as? [String: Any])
-        XCTAssertEqual(autoExecDecision["decision"] as? String, "approved_for_session")
+        let laterPatch = try await decision(
+            method: "applyPatchApproval",
+            response: .approve,
+            itemId: "patch-after-session"
+        )
+        XCTAssertEqual(laterPatch["decision"] as? String, "approved")
     }
 
     func test_commandExecutionApprovalStillUsesAcceptDialect() async throws {
@@ -1941,6 +2110,219 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(response["decision"] as? String, "accept")
     }
 
+    func test_commandExecutionApproveEmitsExecpolicyAmendmentWhenOffered() async throws {
+        // WHY: Codex offers acceptWithExecpolicyAmendment on command-execution
+        // cards. A string accept drops the persist-amendment path even when the
+        // user taps Approve (CODEX-APP-004). Do not invent the payload.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "cmd"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("rpc-execpolicy", "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-execpolicy",
+                "command": "git status",
+                "proposedExecpolicyAmendment": ["git", "status"],
+                "availableDecisions": [
+                    "accept",
+                    ["acceptWithExecpolicyAmendment": ["execpolicy_amendment": ["git", "status"]]],
+                    "cancel"
+                ]
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approve)
+        let raw = try await responseTask.value
+        let response = try XCTUnwrap(raw as? [String: Any])
+        let decision = try XCTUnwrap(response["decision"] as? [String: Any])
+        let amendment = try XCTUnwrap(decision["acceptWithExecpolicyAmendment"] as? [String: Any])
+        XCTAssertEqual(amendment["execpolicy_amendment"] as? [String], ["git", "status"])
+    }
+
+    func test_commandExecutionApproveEmitsAllowNetworkAmendmentWhenOffered() async throws {
+        // WHY: Network persist-allow is an object decision. Plain Approve should
+        // emit applyNetworkPolicyAmendment when that offer is present and allow.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "cmd"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("rpc-net-allow", "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-net-allow",
+                "command": "curl https://example.com",
+                "proposedNetworkPolicyAmendments": [
+                    ["host": "example.com", "action": "allow"]
+                ]
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approve)
+        let raw = try await responseTask.value
+        let response = try XCTUnwrap(raw as? [String: Any])
+        let decision = try XCTUnwrap(response["decision"] as? [String: Any])
+        let amendment = try XCTUnwrap(decision["applyNetworkPolicyAmendment"] as? [String: Any])
+        let rule = try XCTUnwrap(amendment["network_policy_amendment"] as? [String: Any])
+        XCTAssertEqual(rule["host"] as? String, "example.com")
+        XCTAssertEqual(rule["action"] as? String, "allow")
+    }
+
+    func test_commandExecutionApproveDoesNotInventAmendmentWhenAvailableDecisionsAreAcceptOnly() async throws {
+        // WHY: availableDecisions is the allow-list. A proposed execpolicy must
+        // not be sent when Codex only offered accept.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "cmd"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("rpc-no-invent", "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-no-invent",
+                "command": "git status",
+                "proposedExecpolicyAmendment": ["git", "status"],
+                "availableDecisions": ["accept", "cancel"]
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approve)
+        let raw = try await responseTask.value
+        let response = try XCTUnwrap(raw as? [String: Any])
+        XCTAssertEqual(response["decision"] as? String, "accept")
+    }
+
+    func test_commandExecutionApproveDoesNotInventAmendmentWhenAvailableDecisionsExplicitlyEmpty() async throws {
+        // WHY: Upstream treats Some([]) as an authoritative empty allow-list.
+        // Collapsing that with an absent field would fall back to proposals and
+        // invent either an amendment or string accept Codex did not offer.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "cmd"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("rpc-empty-allowlist", "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-empty-allowlist",
+                "command": "git status",
+                "proposedExecpolicyAmendment": ["git", "status"],
+                "availableDecisions": [] as [Any]
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approve)
+        let raw = try await responseTask.value
+        let response = try XCTUnwrap(raw as? [String: Any])
+        XCTAssertEqual(response["decision"] as? String, "decline",
+                       "empty availableDecisions must not invent accept or an amendment")
+        XCTAssertNil(response["decision"] as? [String: Any])
+    }
+
+    func test_commandExecutionApproveIgnoresDenyNetworkAmendment() async throws {
+        // WHY: applyNetworkPolicyAmendment with deny completes the command as
+        // declined. Approve must keep string accept rather than auto-applying deny.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "cmd"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("rpc-net-deny", "item/commandExecution/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "cmd-net-deny",
+                "command": "curl https://evil.example",
+                "proposedNetworkPolicyAmendments": [
+                    ["host": "evil.example", "action": "deny"]
+                ]
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approve)
+        let raw = try await responseTask.value
+        let response = try XCTUnwrap(raw as? [String: Any])
+        XCTAssertEqual(response["decision"] as? String, "accept")
+    }
+
+    func test_applyPatchApproveKeepsReviewDecisionWhenAmendmentFieldsPresent() async throws {
+        // WHY: ReviewDecision methods do not accept CommandExecutionApprovalDecision
+        // objects. Stray amendment fields on applyPatchApproval must not leak.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "patch"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("rpc-patch-amend", "applyPatchApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "patch-amend",
+                "command": "apply_patch",
+                "proposedExecpolicyAmendment": ["git", "status"]
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approve)
+        let raw = try await responseTask.value
+        let response = try XCTUnwrap(raw as? [String: Any])
+        XCTAssertEqual(response["decision"] as? String, "approved")
+    }
+
     func test_approveForSessionSettingsFailureSettlesProviderContinuation() async throws {
         let client = MockCodexAppServerClient(
             autoComplete: false,
@@ -1965,14 +2347,12 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }
         let request = try await waitForApproval(in: sink)
 
-        do {
-            try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approveForSession)
-            XCTFail("settings promotion failure must be surfaced")
-        } catch { }
-        do {
-            _ = try await responseTask.value
-            XCTFail("the provider continuation must settle with an error when session settings promotion fails")
-        } catch { }
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approveForSession)
+        let raw = try await responseTask.value
+        let response = try XCTUnwrap(raw as? [String: Any])
+        XCTAssertEqual(response["decision"] as? String, "acceptForSession")
+        XCTAssertTrue(client.updatedThreadSettings.isEmpty,
+                       "settings errors must not matter because approveForSession does not update thread settings")
     }
 
     func test_currentPermissionsRequestIsExplicitlyBridged() async throws {
@@ -2737,6 +3117,65 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "browser-1" && output?.contains("127.0.0.1") == true } else { return false } },
                       "unknown app-server snapshot items must still render their body instead of disappearing from restored thread history")
         XCTAssertTrue(events.contains { if case .turnCompleted(let turnId, let final) = $0 { return turnId == "turn-snapshot-1" && final == "snapshot answer" } else { return false } })
+    }
+
+    func test_readThreadEmptyAggregatedOutputIsNotTheCommand() async throws {
+        // WHY: a completed command with empty stdout must not paint `command`
+        // as if it were aggregatedOutput.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        client.readResponse = [
+            "thread": [
+                "id": "codex-thread-1",
+                "turns": [[
+                    "id": "turn-empty-cmd",
+                    "status": "completed",
+                    "items": [
+                        [
+                            "id": "cmd-empty",
+                            "type": "commandExecution",
+                            "command": "true",
+                            "status": "completed",
+                            "aggregatedOutput": ""
+                        ],
+                        [
+                            "id": "cmd-omitted",
+                            "type": "commandExecution",
+                            "command": "mkdir -p /tmp/rc-empty",
+                            "status": "completed"
+                        ]
+                    ]
+                ]]
+            ]
+        ]
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "read empty"
+        )) { _ in }
+
+        let events = try await adapter.readThread(threadId: threadId)
+        let empty = events.compactMap { event -> AssistantItem? in
+            if case .itemStarted(let item) = event, item.id == "cmd-empty" { return item }
+            return nil
+        }.first
+        XCTAssertEqual(empty?.summary, "true")
+        XCTAssertFalse(events.contains {
+            if case .itemDelta(let itemId, _, let output, _) = $0 {
+                return itemId == "cmd-empty" && output == "true"
+            }
+            return false
+        }, "empty aggregatedOutput must not display the command string")
+        XCTAssertFalse(events.contains {
+            if case .itemDelta(let itemId, _, let output, _) = $0 {
+                return itemId == "cmd-omitted" && output == "mkdir -p /tmp/rc-empty"
+            }
+            return false
+        }, "omitted aggregatedOutput must not display the command string")
     }
 
     func test_readThreadRendersCommonStringAliasesForUncommonSnapshotItems() async throws {
@@ -3929,6 +4368,10 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             cwd: "/tmp/remotecode-app-server-adapter",
             prompt: "/goal finish audit"
         )) { log.record($0) }
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turn": ["id": "turn-app-server-1"]
+        ])
 
         func goalItems(summary: String) -> [AssistantItem] {
             log.assistantEvents.compactMap {
@@ -4262,6 +4705,89 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )
     }
 
+    func test_codex154TurnNotificationsEmitAssistantEvents() async throws {
+        // WHY: codex-cli 0.154.0 emits autoApprovalReview/strictReviewRequired,
+        // turn/moderationMetadata, and model/safetyBuffering/updated. The adapter
+        // previously hit `default: break` and dropped them (CODEX-APP-011).
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "codex 0.154 notifications"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("autoApprovalReview/strictReviewRequired", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "startedAtMs": 1
+        ])
+        client.notificationHandler?("turn/moderationMetadata", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "metadata": ["policy": "standard"]
+        ])
+        client.notificationHandler?("model/safetyBuffering/updated", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "model": "gpt-5.5",
+            "showBufferingUi": true,
+            "reasons": ["latency"]
+        ])
+
+        let events = try await waitForEvents(in: sink) { events in
+            let summaries = events.compactMap { event -> String? in
+                if case .itemStarted(let item) = event { return item.summary }
+                return nil
+            }
+            return summaries.contains("Strict auto-approval review required")
+                && summaries.contains("Turn moderation metadata")
+                && summaries.contains("Model safety buffering")
+        }
+        XCTAssertTrue(
+            events.contains {
+                if case .itemStarted(let item) = $0 {
+                    return item.summary == "Strict auto-approval review required"
+                        && item.type == .review
+                        && item.id == "strict-review-turn-app-server-1"
+                        && item.state == .completed
+                        && item.state != .streaming
+                        && item.finishedAtMs != nil
+                }
+                return false
+            },
+            "strictReviewRequired must be a terminal .review item; completed reviewId never matches this chip"
+        )
+        XCTAssertTrue(
+            events.contains {
+                if case .itemStarted(let item) = $0 {
+                    return item.summary == "Turn moderation metadata"
+                        && (item.output?.contains("standard") == true)
+                }
+                return false
+            }
+        )
+        XCTAssertTrue(
+            events.contains {
+                if case .itemStarted(let item) = $0 {
+                    return item.summary == "Model safety buffering"
+                        && (item.output?.contains("gpt-5.5") == true)
+                }
+                return false
+            }
+        )
+    }
+
     func test_autoApprovalReviewUsesReviewIdAndTerminalStatuses() async throws {
         // WHY: ItemGuardianApprovalReviewCompletedNotification carries reviewId +
         // GuardianApprovalReviewStatus (approved/denied/timedOut/aborted). Missing
@@ -4450,7 +4976,13 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                 "state": "compacted",
                 "summary": "Snapshot compacted",
                 "tokenUsage": [
-                    "last": ["inputTokens": 10, "outputTokens": 2, "totalTokens": 12],
+                    "last": [
+                        "inputTokens": 10,
+                        "outputTokens": 2,
+                        "totalTokens": 12,
+                        "cachedInputTokens": 8,
+                        "cacheWriteInputTokens": 1
+                    ],
                     "modelContextWindow": 100
                 ],
                 "turns": []
@@ -4471,8 +5003,103 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         )) { _ in }
 
         let events = try await adapter.readThread(threadId: threadId)
-        XCTAssertTrue(events.contains { if case .tokenUsage(let usage) = $0 { return usage.totalTokens == 12 && usage.contextWindow == 100 } else { return false } })
+        XCTAssertTrue(events.contains { if case .tokenUsage(let usage) = $0 { return usage.totalTokens == 12 && usage.contextWindow == 100 && usage.cacheReadInputTokens == 8 && usage.cacheCreationInputTokens == 1 && usage.uncachedInputTokens == 2 } else { return false } })
         XCTAssertTrue(events.contains { if case .contextCompaction(let summary) = $0 { return summary == "Snapshot compacted" } else { return false } })
+    }
+
+    func test_mcpStartupStatusUsesNameAndSurfacesError() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "mcp"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        client.notificationHandler?("mcpServer/startupStatus/updated", [
+            "name": "filesystem",
+            "status": "failed",
+            "error": "No such file or directory"
+        ])
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let events = await sink.snapshot()
+        XCTAssertTrue(events.contains {
+            if case .itemStarted(let item) = $0 {
+                return item.id == "filesystem"
+                    && item.state == .failed
+                    && item.output == "No such file or directory"
+            }
+            return false
+        })
+    }
+
+    func test_systemErrorFailsTurnAndBlocksFork_notLoadedIsNotIdle() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false, supportsForkReconciliation: true)
+        let adapter = CodexAppServerAdapter(
+            clientFactory: { _, notificationHandler, _ in
+                client.notificationHandler = notificationHandler
+                return client
+            },
+            forkProtocolSupportOverride: client.forkProtocolSupport
+        )
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "status"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "active"]
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "finalMessage": "maybe done"
+        ])
+        try await Task.sleep(nanoseconds: 30_000_000)
+        let stillActive = await sink.finish
+        XCTAssertNil(stillActive, "active status still defers finish")
+
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "notLoaded"]
+        ])
+        try await Task.sleep(nanoseconds: 30_000_000)
+        let stillNotLoaded = await sink.finish
+        XCTAssertNil(stillNotLoaded, "notLoaded is not idle and must not release a withheld finish")
+
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "systemError"]
+        ])
+        let finish = try await waitForFinish(in: sink, timeout: 3)
+        XCTAssertEqual(finish.0, .failed)
+
+        do {
+            _ = try await adapter.forkThread(AgentProviderForkRequest(
+                sourceThreadId: threadId,
+                childThreadId: AgentThreadID(),
+                idempotencyKey: "remotecode-thread-fork:system-error",
+                workingDirectory: "/tmp/remotecode-app-server-adapter"
+            ))
+            XCTFail("systemError threads must be unforkable")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("systemError"))
+        }
     }
 
     /// Shell-detached foreground command_execution (e.g. `cmd > f 2>&1 &` + `PID=$!`)
@@ -5029,7 +5656,12 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     }
     struct RolledBackTurn {
         let providerThreadId: String
-        let numTurns: Int
+        let beforeTurnId: String
+    }
+    struct SteeredTurn {
+        let providerThreadId: String
+        let expectedTurnId: String
+        let request: AgentRunRequest
     }
     struct ReadCall {
         let providerThreadId: String
@@ -5048,6 +5680,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     let autoComplete: Bool
     let interruptDelayNanoseconds: UInt64
     let startTurnError: Error?
+    let steerTurnError: Error?
     let openThreadBehavior: MockOpenThreadBehavior
     let updateSettingsError: Error?
     private let lock = NSLock()
@@ -5060,6 +5693,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     private var _providerChildren: [CodexAppServerThreadSummary] = []
     private var _deletedThreadIds: [String] = []
     private var _rolledBackTurns: [RolledBackTurn] = []
+    private var _steeredTurns: [SteeredTurn] = []
     private var _readCalls: [ReadCall] = []
     private var _updatedThreadSettings: [UpdatedThreadSettings] = []
 
@@ -5067,6 +5701,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
         autoComplete: Bool = true,
         interruptDelayNanoseconds: UInt64 = 0,
         startTurnError: Error? = nil,
+        steerTurnError: Error? = nil,
         openThreadError: Error? = nil,
         openThreadBehavior: MockOpenThreadBehavior? = nil,
         updateSettingsError: Error? = nil,
@@ -5075,6 +5710,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
         self.autoComplete = autoComplete
         self.interruptDelayNanoseconds = interruptDelayNanoseconds
         self.startTurnError = startTurnError
+        self.steerTurnError = steerTurnError
         if let openThreadBehavior {
             self.openThreadBehavior = openThreadBehavior
         } else if let openThreadError {
@@ -5106,6 +5742,11 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     var rolledBackTurns: [RolledBackTurn] {
         lock.lock(); defer { lock.unlock() }
         return _rolledBackTurns
+    }
+
+    var steeredTurns: [SteeredTurn] {
+        lock.lock(); defer { lock.unlock() }
+        return _steeredTurns
     }
 
     var forkedThreadIds: [String] {
@@ -5179,6 +5820,14 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
         }
         let providerThreadId = request.providerThreadId?.isEmpty == false ? request.providerThreadId! : "codex-thread-1"
         return CodexAppServerThreadOpenResult(providerThreadId: providerThreadId, response: ["id": providerThreadId])
+    }
+
+    func steerTurn(providerThreadId: String, expectedTurnId: String, for request: AgentRunRequest) async throws -> CodexAppServerClient.JSONObject {
+        lock.lock()
+        _steeredTurns.append(SteeredTurn(providerThreadId: providerThreadId, expectedTurnId: expectedTurnId, request: request))
+        lock.unlock()
+        if let steerTurnError { throw steerTurnError }
+        return ["turn": ["id": expectedTurnId]]
     }
 
     func startTurn(providerThreadId: String, for request: AgentRunRequest) async throws -> CodexAppServerClient.JSONObject {
@@ -5260,8 +5909,8 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
         }
     }
 
-    func rollbackThread(providerThreadId: String, numTurns: Int) async throws -> CodexAppServerClient.JSONObject {
-        recordRolledBack(RolledBackTurn(providerThreadId: providerThreadId, numTurns: numTurns))
+    func rollbackThread(providerThreadId: String, beforeTurnId: String) async throws -> CodexAppServerClient.JSONObject {
+        recordRolledBack(RolledBackTurn(providerThreadId: providerThreadId, beforeTurnId: beforeTurnId))
         return ["thread": ["id": providerThreadId, "turns": []]]
     }
 

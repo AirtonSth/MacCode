@@ -186,6 +186,59 @@ final class AgentComposerTypingHotspotTests: XCTestCase {
         XCTAssertNil(AgentComposerSuggestionPanel.highlightedSuggestionID(in: rows, index: 9))
     }
 
+    func test_plainTyping_skipsMentionableBotsProvider() throws {
+        // WHY (F1): composerSuggestions used to call mentionableBotsProvider on
+        // every body before suggestions() could short-circuit. Plain typing
+        // must not touch the bots catalog.
+        let (vm, rootURL) = try makeVM()
+        defer {
+            vm.dispose()
+            try? FileManager.default.removeItem(at: rootURL)
+        }
+        var providerCalls = 0
+        vm.mentionableBotsProvider = {
+            providerCalls += 1
+            return []
+        }
+        #if DEBUG
+        let before = AgentAppViewModel.composerMentionableBotsProviderCallCountForTesting
+        #endif
+        vm.prompt = "hello world without mentions"
+        vm.composerCursorOffset = vm.prompt.utf16.count
+        for _ in 0..<50 {
+            _ = vm.composerSuggestions
+        }
+        XCTAssertEqual(providerCalls, 0, "plain typing must not call mentionableBotsProvider")
+        #if DEBUG
+        XCTAssertEqual(
+            AgentAppViewModel.composerMentionableBotsProviderCallCountForTesting,
+            before,
+            "DEBUG counter must stay flat for non-trigger tokens"
+        )
+        #endif
+        XCTAssertTrue(vm.composerSuggestions.isEmpty)
+    }
+
+    func test_atToken_invokesMentionableBotsProviderOncePerRead() throws {
+        // WHY (F1): @ mentions still need the bots catalog; the gate must not
+        // drop that path.
+        let (vm, rootURL) = try makeVM()
+        defer {
+            vm.dispose()
+            try? FileManager.default.removeItem(at: rootURL)
+        }
+        var providerCalls = 0
+        vm.mentionableBotsProvider = {
+            providerCalls += 1
+            return []
+        }
+        vm.prompt = "ask @ceo"
+        vm.composerCursorOffset = vm.prompt.utf16.count
+        _ = vm.composerSuggestions
+        _ = vm.composerSuggestions
+        XCTAssertEqual(providerCalls, 2, "@ token must still load mentionable bots")
+    }
+
     // MARK: - Helpers
 
     private func simulateKeystrokeCursorCallbacks(on state: AgentComposerState, offset: Int) {

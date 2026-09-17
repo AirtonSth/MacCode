@@ -1,4 +1,5 @@
 import XCTest
+import Darwin
 import CoreModel
 @testable import AgentRuntime
 
@@ -29,6 +30,83 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         let request = try XCTUnwrap(object["request"] as? [String: Any])
         XCTAssertEqual(request["subtype"] as? String, "interrupt",
                        "stream-json interrupt request.subtype must be interrupt")
+        XCTAssertNil(request["cancel_queued"],
+                     "cancel_queued must be omitted unless interrupt_cancel_queued_v1 is advertised")
+    }
+
+    /// CLAUDE-INT-001: advertised interrupt_cancel_queued_v1 requires cancel_queued true.
+    func test_controlInterruptLine_includesCancelQueuedWhenRequested() throws {
+        let data = ClaudeStreamingCLIAdapter.controlInterruptLine(cancelQueued: true)
+        let stripped = data.last == 0x0A ? data.dropLast() : data
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(stripped)) as? [String: Any]
+        )
+        XCTAssertEqual(object["type"] as? String, "control_request")
+        let request = try XCTUnwrap(object["request"] as? [String: Any])
+        XCTAssertEqual(request["subtype"] as? String, "interrupt")
+        let cancelQueued = request["cancel_queued"] as? Bool
+            ?? (request["cancel_queued"] as? NSNumber)?.boolValue
+        XCTAssertEqual(cancelQueued, true,
+                       "interrupt_cancel_queued_v1 must set request.cancel_queued true")
+        let requestId = try XCTUnwrap(
+            ClaudeStreamingCLIAdapter.controlRequestId(fromInterruptLine: data)
+        )
+        XCTAssertEqual(object["request_id"] as? String, requestId)
+    }
+
+    func test_initCapabilities_fromSystemInitFixture() {
+        let object: [String: Any] = [
+            "type": "system",
+            "subtype": "init",
+            "capabilities": [
+                "interrupt_receipt_v1",
+                "interrupt_cancel_queued_v1",
+                "msg_lifecycle_v1"
+            ]
+        ]
+        let caps = ClaudeStreamingCLIAdapter.initCapabilities(from: object)
+        XCTAssertEqual(
+            caps,
+            ["interrupt_receipt_v1", "interrupt_cancel_queued_v1", "msg_lifecycle_v1"]
+        )
+        XCTAssertNil(
+            ClaudeStreamingCLIAdapter.initCapabilities(from: ["type": "assistant"]),
+            "non-init lines must not be treated as a capabilities snapshot"
+        )
+    }
+
+    /// CLAUDE-INT-002: only a successful receipt for the pending interrupt cancels the grace kill.
+    func test_shouldCancelInterruptGraceKill_onlyOnMatchingSuccessfulReceipt() {
+        XCTAssertTrue(
+            ClaudeStreamingCLIAdapter.shouldCancelInterruptGraceKill(
+                pendingRequestId: "3ad25933-b695-4e02-9b43-0ad5c0cf0fcd",
+                receiptRequestId: "3ad25933-b695-4e02-9b43-0ad5c0cf0fcd",
+                receiptSuccess: true
+            )
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldCancelInterruptGraceKill(
+                pendingRequestId: "pending-1",
+                receiptRequestId: "other-id",
+                receiptSuccess: true
+            ),
+            "permission or unrelated control_response must not cancel the interrupt kill"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldCancelInterruptGraceKill(
+                pendingRequestId: "pending-1",
+                receiptRequestId: "pending-1",
+                receiptSuccess: false
+            ),
+            "failed interrupt receipt must keep the grace kill fallback"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldCancelInterruptGraceKill(
+                pendingRequestId: nil,
+                receiptRequestId: "pending-1",
+                receiptSuccess: true
+            )
+        )
     }
 
     /// The line must be newline-terminated so the Claude CLI's line reader
@@ -45,11 +123,35 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         // CLAUDE-CLI-015: SDKUserMessage requires parent_tool_use_id (null for host turns).
         XCTAssertTrue(payload["parent_tool_use_id"] is NSNull,
                       "CLI stdin user lines must include parent_tool_use_id: null like the bridge")
+        let origin = try XCTUnwrap(payload["origin"] as? [String: Any])
+        XCTAssertEqual(origin["kind"] as? String, "human",
+                       "CLAUDE-ORIGIN-001: host-typed stdin must set origin.kind=human")
+        let uuid = try XCTUnwrap(payload["uuid"] as? String)
+        XCTAssertFalse(uuid.isEmpty, "CLAUDE-ORIGIN-001: host user lines need a uuid for reply binding")
         let message = try XCTUnwrap(payload["message"] as? [String: Any])
         let content = try XCTUnwrap(message["content"] as? [[String: Any]])
         XCTAssertEqual(content.count, 1, "empty attachments must stay a single text block")
         XCTAssertEqual(content[0]["type"] as? String, "text")
         XCTAssertEqual(content[0]["text"] as? String, "hello")
+    }
+
+    /// CLAUDE-ORIGIN-001: SDK pushPrompt must match CLI stdin origin+uuid so
+    /// ultracode / queued_turn_count human gates work on both hosts.
+    func test_sdkBridgePushPrompt_includesHumanOriginAndUuid() throws {
+        let testsDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        let repoRoot = testsDir.deletingLastPathComponent().deletingLastPathComponent()
+        let bridge = repoRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+        let source = try String(contentsOf: bridge, encoding: .utf8)
+        guard let start = source.range(of: "function pushPrompt(") else {
+            return XCTFail("ClaudeAgentSDKBridge.mjs must define pushPrompt")
+        }
+        let after = source[start.lowerBound...]
+        let end = after.range(of: "\nfunction ")?.lowerBound ?? after.endIndex
+        let body = String(after[..<end])
+        XCTAssertTrue(body.contains("origin: { kind: 'human' }"),
+                      "SDK pushPrompt must set origin.kind=human like CLI stdin")
+        XCTAssertTrue(body.contains("uuid: randomUUID()"),
+                      "SDK pushPrompt must stamp a uuid on host user messages")
     }
 
     func test_userPromptPayload_includesImageAndFileBlocks() throws {
@@ -196,9 +298,19 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
     // MARK: - control_response user-input wire (pure, CLAUDE-CLI-004/005)
 
     func test_controlUserInputResponseLine_askUserQuestionAllowCarriesAnswers() throws {
+        let questions: [[String: Any]] = [[
+            "question": "How should we authenticate?",
+            "header": "Auth",
+            "options": [["label": "OAuth"], ["label": "API key"]],
+            "multiSelect": false
+        ]]
+        let inputJSON = String(
+            data: try JSONSerialization.data(withJSONObject: ["questions": questions]),
+            encoding: .utf8
+        )
         let data = try ClaudeStreamingCLIAdapter.controlUserInputResponseLine(
             requestId: "req-ask-1",
-            kind: .askUserQuestion(toolUseID: "toolu-ask-1"),
+            kind: .askUserQuestion(toolUseID: "toolu-ask-1", inputJSON: inputJSON),
             text: #"{"0":"OAuth"}"#,
             decision: .accept
         )
@@ -210,15 +322,19 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         XCTAssertEqual(result["behavior"] as? String, "allow")
         XCTAssertEqual(result["toolUseID"] as? String, "toolu-ask-1")
         let updated = try XCTUnwrap(result["updatedInput"] as? [String: Any])
+        let echoed = try XCTUnwrap(updated["questions"] as? [[String: Any]])
+        XCTAssertEqual(echoed[0]["question"] as? String, "How should we authenticate?",
+                       "allow must pass through the original questions array")
         let answers = try XCTUnwrap(updated["answers"] as? [String: Any])
-        XCTAssertEqual(answers["0"] as? String, "OAuth",
-                       "JSON answers must land in updatedInput.answers (PermissionResult allow path)")
+        XCTAssertEqual(answers["How should we authenticate?"] as? String, "OAuth",
+                       "answers must be keyed by question text, not index")
+        XCTAssertNil(answers["0"])
     }
 
     func test_controlUserInputResponseLine_askUserQuestionCancelIsDeny() throws {
         let data = try ClaudeStreamingCLIAdapter.controlUserInputResponseLine(
             requestId: "req-ask-2",
-            kind: .askUserQuestion(toolUseID: nil),
+            kind: .askUserQuestion(toolUseID: nil, inputJSON: nil),
             text: nil,
             decision: .cancel
         )
@@ -347,7 +463,10 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         """.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
 
-        let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
+        let adapter = ClaudeStreamingCLIAdapter(
+            binaryNameOverride: script.path,
+            interruptGracePeriod: 0.05
+        )
         let threadId = AgentThreadID()
         let sink = EventSink()
         _ = try await adapter.sendTurn(AgentRunRequest(
@@ -371,8 +490,206 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
 
         try adapter.interruptTurn(threadId: threadId)
 
+        // EPIPE fails the write and stopSession is synchronous. If the write
+        // still reports success (parent still holds the pipe read end), the
+        // short grace kill removes the session.
+        let goneDeadline = Date().addingTimeInterval(1)
+        while Date() < goneDeadline && adapter.hasSession(threadId: threadId) {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
         XCTAssertFalse(adapter.hasSession(threadId: threadId),
                        "closed stdin must trigger the kill fallback and remove the session")
+    }
+
+    /// CLAUDE-INT-002: do not schedule grace kill after a receipt cleared the pending id.
+    func test_shouldScheduleInterruptGraceKill_onlyWhilePendingOwnsWorkItem() {
+        XCTAssertTrue(
+            ClaudeStreamingCLIAdapter.shouldScheduleInterruptGraceKill(
+                pendingRequestId: "pending-1",
+                scheduledRequestId: "pending-1",
+                killWorkStillInstalled: true
+            )
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldScheduleInterruptGraceKill(
+                pendingRequestId: nil,
+                scheduledRequestId: "pending-1",
+                killWorkStillInstalled: true
+            ),
+            "receipt-cleared pending must not schedule the grace kill"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldScheduleInterruptGraceKill(
+                pendingRequestId: "pending-1",
+                scheduledRequestId: "pending-1",
+                killWorkStillInstalled: false
+            ),
+            "cancelled work item must not be rescheduled"
+        )
+    }
+
+    /// CLAUDE-INT-002: a grace-kill body that already started must no-op after a
+    /// matching receipt cleared pending ownership (cancel is ineffective mid-run).
+    func test_shouldExecuteInterruptGraceKill_requiresPendingOwnership() {
+        let runId = AgentRunID()
+        XCTAssertTrue(
+            ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
+                sessionStillCurrent: true,
+                inFlightRunId: runId,
+                ownedRunId: runId,
+                pendingRequestId: "pending-1",
+                scheduledRequestId: "pending-1",
+                installedWorkItemIsSelf: true
+            )
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
+                sessionStillCurrent: true,
+                inFlightRunId: runId,
+                ownedRunId: runId,
+                pendingRequestId: nil,
+                scheduledRequestId: "pending-1",
+                installedWorkItemIsSelf: true
+            ),
+            "receipt-cleared pending must not hard-stop"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
+                sessionStillCurrent: true,
+                inFlightRunId: runId,
+                ownedRunId: runId,
+                pendingRequestId: "pending-1",
+                scheduledRequestId: "pending-1",
+                installedWorkItemIsSelf: false
+            ),
+            "replaced/cancelled work item must not hard-stop"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
+                sessionStillCurrent: true,
+                inFlightRunId: nil,
+                ownedRunId: runId,
+                pendingRequestId: "pending-1",
+                scheduledRequestId: "pending-1",
+                installedWorkItemIsSelf: true
+            )
+        )
+    }
+
+    /// Interrupt scheduled for run A; aborted_streaming/emitTerminal clears
+    /// in-flight; a later sendTurn sets run B. The grace-kill body must not
+    /// treat "in-flight again" as ownership of the interrupted run.
+    func test_shouldExecuteInterruptGraceKill_refusesAfterNewTurnReplacesInFlightRun() {
+        let interruptedRun = AgentRunID()
+        let nextRun = AgentRunID()
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
+                sessionStillCurrent: true,
+                inFlightRunId: nextRun,
+                ownedRunId: interruptedRun,
+                pendingRequestId: "pending-1",
+                scheduledRequestId: "pending-1",
+                installedWorkItemIsSelf: true
+            ),
+            "grace-kill of the interrupted run must not stopSession after a new inFlightRunId"
+        )
+        XCTAssertTrue(
+            ClaudeStreamingCLIAdapter.shouldExecuteInterruptGraceKill(
+                sessionStillCurrent: true,
+                inFlightRunId: interruptedRun,
+                ownedRunId: interruptedRun,
+                pendingRequestId: "pending-1",
+                scheduledRequestId: "pending-1",
+                installedWorkItemIsSelf: true
+            ),
+            "same-run in-flight ownership must still allow the grace kill"
+        )
+    }
+
+    /// Post-check / pre-stop: ownership may still be true while a later sendTurn
+    /// has already replaced the map entry. Removal must require exact identity
+    /// so a threadId re-lookup cannot terminate run B.
+    func test_shouldRemoveSessionOnInterruptGraceKill_requiresExactMappedSession() {
+        XCTAssertTrue(
+            ClaudeStreamingCLIAdapter.shouldRemoveSessionOnInterruptGraceKill(
+                stillOwnsInterrupt: true,
+                mappedSessionIsExact: true
+            ),
+            "owned interrupt on the exact Session must remove that map entry under the lock"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldRemoveSessionOnInterruptGraceKill(
+                stillOwnsInterrupt: true,
+                mappedSessionIsExact: false
+            ),
+            "post-check replacement at threadId must not be removed or terminated"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldRemoveSessionOnInterruptGraceKill(
+                stillOwnsInterrupt: false,
+                mappedSessionIsExact: true
+            ),
+            "lost interrupt ownership must not remove the still-current Session"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.shouldRemoveSessionOnInterruptGraceKill(
+                stillOwnsInterrupt: false,
+                mappedSessionIsExact: false
+            )
+        )
+    }
+
+    func test_interruptPlan_phaseOneIsSigint() {
+        let pids: [Int32] = [501, 502, 500]
+        let plan = ProcessTerminator.interruptPlan(
+            pids: pids,
+            isAlive: { _ in true },
+            graceElapsed: false
+        )
+        XCTAssertEqual(plan, [
+            ProcessTerminationStep(pid: 501, signal: SIGINT),
+            ProcessTerminationStep(pid: 502, signal: SIGINT),
+            ProcessTerminationStep(pid: 500, signal: SIGINT)
+        ])
+        let term = ProcessTerminator.terminationPlan(
+            pids: pids,
+            isAlive: { _ in true },
+            graceElapsed: false
+        )
+        XCTAssertEqual(term.map(\.signal), [SIGTERM, SIGTERM, SIGTERM],
+                       "other-provider terminateTree must still start with SIGTERM")
+    }
+
+    func test_cliForkThread_isKeyedIdempotentAndCompensatable() async throws {
+        let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: "/usr/bin/true")
+        XCTAssertEqual(
+            adapter.forkSafety,
+            .keyedIdempotent(compensationSupported: true)
+        )
+        let source = AgentThreadID()
+        let child = AgentThreadID()
+        let sourceProvider = "11111111-2222-3333-4444-555555555555"
+        let request = AgentProviderForkRequest(
+            sourceThreadId: source,
+            childThreadId: child,
+            idempotencyKey: "remotecode-thread-fork:\(child.value.uuidString.lowercased())",
+            sourceProviderThreadId: sourceProvider
+        )
+        let first = try await adapter.forkThread(request)
+        XCTAssertEqual(first, child.value.uuidString)
+        let replay = try await adapter.forkThread(request)
+        XCTAssertEqual(replay, first)
+        do {
+            _ = try await adapter.forkThread(threadId: source)
+            XCTFail("unkeyed Claude CLI fork must throw")
+        } catch let AgentProviderAdapterError.unsupported(message) {
+            XCTAssertTrue(message.contains("unkeyed"))
+        } catch {
+            XCTFail("expected unsupported unkeyed fork, got \(error)")
+        }
+        try await adapter.compensateFork(request, providerChildThreadId: first)
+        let after = try await adapter.forkThread(request)
+        XCTAssertEqual(after, child.value.uuidString)
     }
 }
 

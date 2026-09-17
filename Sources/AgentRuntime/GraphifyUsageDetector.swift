@@ -82,19 +82,46 @@ public enum GraphifyUsageDetector {
     /// when the shell clearly could not run graphify.
     public static func looksLikeFailure(output: String?) -> Bool {
         guard let o = output?.lowercased(), !o.isEmpty else { return false }
-        let head = String(o.prefix(400))
-        let needles = [
-            "command not found",
-            "not found in path",
-            "no such file or directory",
-            "executable file not found",
-            "is not recognized as an internal or external command",
-            "permission denied: graphify",
-            "graphify: command not found",
-            "graphifyy: command not found",
-        ]
-        return needles.contains { head.contains($0) || o.contains($0) }
+        return failureNeedles.contains { o.contains($0) }
     }
+
+    /// Longest failure needle plus slack so a signature split across stream
+    /// chunks is still visible after the 8 KiB stored prefix is capped.
+    public static let failureScanOverlapUTF8Bytes = 96
+
+    /// Bounded scan of the counted result stream. Stored output is prefix-capped
+    /// at 8 KiB; this state still catches a failure signature after that window.
+    public struct FailureScanState: Sendable, Equatable {
+        public var sawFailure = false
+        public var tail = ""
+        public init() {}
+    }
+
+    public static func ingestFailureScan(_ state: inout FailureScanState, chunk: String) {
+        if state.sawFailure || chunk.isEmpty { return }
+        let combined = state.tail + chunk
+        if looksLikeFailure(output: combined) {
+            state.sawFailure = true
+            state.tail = ""
+            return
+        }
+        if combined.utf8.count <= failureScanOverlapUTF8Bytes {
+            state.tail = combined
+            return
+        }
+        state.tail = String(decoding: combined.utf8.suffix(failureScanOverlapUTF8Bytes), as: UTF8.self)
+    }
+
+    private static let failureNeedles = [
+        "command not found",
+        "not found in path",
+        "no such file or directory",
+        "executable file not found",
+        "is not recognized as an internal or external command",
+        "permission denied: graphify",
+        "graphify: command not found",
+        "graphifyy: command not found",
+    ]
 
     // MARK: - Internals
 
