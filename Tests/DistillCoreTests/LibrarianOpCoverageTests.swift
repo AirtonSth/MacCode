@@ -411,6 +411,103 @@ final class LibrarianOpCoverageTests: XCTestCase {
         XCTAssertTrue(graph.text.contains("WidgetTests.swift"), "call graph must name the real caller")
         XCTAssertTrue(graph.text.contains("publishWidget"), "call graph must name the real callee: \(graph.text)")
     }
+
+    /// WHY: an op that lacks its input must say which input is missing. A
+    /// fabricated success here is worse than an error: the paid model would act
+    /// on invented content.
+    func test_opsWithoutTheirInputsReportHonestMissingArgumentStates() async {
+        let needsArguments: [(op: String, expect: [String])] = [
+            ("workspace_semantic_search", ["missing_query"]),
+            ("repo_map_budget", ["no_repo_files", "unavailable"]),
+            ("encoder_rank", ["missing_query"]),
+            ("lsp_query", ["missing_file", "file_unreadable", "sourcekit_lsp_unavailable", "lsp_"]),
+            ("ast_grep_query", ["missing_pattern"]),
+            ("graphify_query", ["missing_query", "graphify_unavailable", "graphify_failed", "graphify_timeout"]),
+            ("symbol_references", ["missing_symbol"]),
+            ("call_graph", ["missing_symbol"]),
+            ("screenshot_ocr", ["missing_image", "image_not_found"]),
+            ("screenshot_diff_digest", ["two_image_paths_required"]),
+            ("video_keyframe_ocr", ["missing_video", "video_not_found"]),
+            ("audio_transcribe_local", ["missing_audio", "audio_not_found", "speech_"]),
+            ("spreadsheet_extract", ["missing_workbook", "workbook_not_found"]),
+            ("unchanged_reread_stub", ["missing_file"]),
+            ("predicate_watch", ["watch_needs_approved_command"]),
+            ("batch_codemod_apply", ["codemod_needs_paid_rule"]),
+        ]
+        for entry in needsArguments {
+            let result = await dispatch(entry.op) { request in
+                request.root = root.path
+            }
+            XCTAssertNotEqual(result.status, .ok,
+                              "\(entry.op) without inputs must not report success: \(result.text)")
+            let haystack = reasons(result) + result.text
+            let honest = entry.expect.contains { haystack.contains($0) }
+                || haystack.contains("missing")
+                || haystack.contains("unavailable")
+            XCTAssertTrue(honest,
+                          "\(entry.op) must report the real missing-argument state: \(result.text)")
+        }
+    }
+
+    /// The xlsx branch of `spreadsheet_extract` runs a real `unzip` + sheet XML
+    /// parse, not a CSV shortcut.
+    func test_spreadsheetExtractReadsARealXlsxWorkbook() async throws {
+        let workbookDir = root.appendingPathComponent("book", isDirectory: true)
+        let sheetDir = workbookDir.appendingPathComponent("xl/worksheets", isDirectory: true)
+        try FileManager.default.createDirectory(at: sheetDir, withIntermediateDirectories: true)
+        try """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <worksheet><sheetData>
+        <row r="1"><c r="A1" t="inlineStr"><is><t>widget</t></is></c><c r="B1"><v>42</v></c></row>
+        <row r="2"><c r="A2" t="inlineStr"><is><t>bakery</t></is></c><c r="B2"><v>7</v></c></row>
+        </sheetData></worksheet>
+        """.write(to: sheetDir.appendingPathComponent("sheet1.xml"), atomically: true, encoding: .utf8)
+        let workbook = root.appendingPathComponent("book.xlsx")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+        process.arguments = ["-q", "-r", workbook.path, "xl"]
+        process.currentDirectoryURL = workbookDir
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0, "fixture workbook must be zip-able")
+
+        let result = await dispatch("spreadsheet_extract") { request in request.paths = ["book.xlsx"] }
+        XCTAssertEqual(result.status, .ok, result.text)
+        XCTAssertTrue(result.text.contains("format=xlsx"), result.text)
+        XCTAssertTrue(result.text.contains("widget"), result.text)
+        XCTAssertTrue(result.text.contains("42"), result.text)
+    }
+
+    /// The graphify op must actually launch the installed CLI: with an explicit
+    /// (invalid) graph file the CLI runs and fails, which is a launch, not a stub.
+    func test_graphifyQueryLaunchesTheInstalledCLIWhenAGraphPathIsGiven() async throws {
+        let graph = root.appendingPathComponent("not-a-graph.json")
+        try "{}".write(to: graph, atomically: true, encoding: .utf8)
+        let result = await dispatch("graphify_query") { request in
+            request.question = "where is renderWidget defined?"
+            request.paths = ["not-a-graph.json"]
+            // Graphify admission is a run capability: without it the op reports
+            // graphify_inactive before it ever reaches the CLI.
+            request.graphifyEnabled = true
+        }
+        XCTAssertNotEqual(result.status, .ok, "an empty graph cannot answer a query")
+        let haystack = reasons(result) + result.text
+        XCTAssertFalse(haystack.contains("graphify_cli_not_executed"),
+                       "the implementation-missing stub reason must be gone")
+        if LibrarianToolResolver.resolve("graphify") != nil {
+            XCTAssertTrue(
+                haystack.contains("graphify_failed")
+                    || haystack.contains("graphify_timeout")
+                    || haystack.contains("graphify_launch_failed"),
+                "with the CLI installed the op must reach the process layer: \(reasons(result))"
+            )
+        } else {
+            XCTAssertTrue(haystack.contains("graphify_unavailable"),
+                          "without the CLI the op must say so: \(reasons(result))")
+        }
+    }
 }
 
 /// Deterministic media fixtures: a real PNG drawn with CoreGraphics and a real
@@ -480,12 +577,3 @@ enum LibrarianFixtureMedia {
     }
 }
 
-#if canImport(ImageIO)
-import ImageIO
-#endif
-#if canImport(CoreGraphics)
-import CoreGraphics
-#endif
-#if canImport(AppKit)
-import AppKit
-#endif
