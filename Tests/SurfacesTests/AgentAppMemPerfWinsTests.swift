@@ -121,6 +121,25 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
         )
     }
 
+    func test_toolInputObject_whitespaceVariantsReuseTrimmedBodyCache() throws {
+        // WHY: tool bodies can include transport whitespace; trimming must keep
+        // parsed output unchanged and avoid duplicate cache entries.
+        let command = "echo cache-\(UUID().uuidString)"
+        let body = #"{"command":"\#(command)"}"#
+        let before = AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting
+
+        let padded = try XCTUnwrap(AgentTimelineItemPresentation.toolInputObject(forBody: " \n\(body)\t"))
+        let canonical = try XCTUnwrap(AgentTimelineItemPresentation.toolInputObject(forBody: body))
+
+        XCTAssertEqual(padded["command"] as? String, command)
+        XCTAssertEqual(canonical["command"] as? String, command)
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting - before,
+            1,
+            "whitespace-only transport differences should reuse the same parsed body"
+        )
+    }
+
     // MARK: - Win 3: ElapsedTickSchedule lowFrequency
 
     func test_elapsedTickSchedule_lowFrequencyFirstStepIs5s() {
