@@ -419,6 +419,90 @@ final class PaneActionTests: XCTestCase {
         XCTAssertEqual(resolved.password, "legacy-secret")
     }
 
+    /// WHY: `sshHostUpsert` and `sshHostDelete` rewrite the whole `ssh.hosts.*`
+    /// array from what they read. A stored entry the decoder cannot read (schedule
+    /// drift after an app update, a hand-edited row, a torn value) used to come
+    /// back as `[]`, so the next edit silently replaced every saved host with the
+    /// one being added -- and deleting a single host wrote an empty list, taking
+    /// the Keychain password with it. A read that failed is not proof the user has
+    /// no hosts.
+    func test_sshHostCommandsRefuseToEraseHostsTheyCannotRead() throws {
+        let store = FakeSSHPasswordStore()
+        let (ctx, router) = try makeContext(sshPasswordStore: store)
+        let workspace = try router.createWorkspace(name: "ssh-unreadable-hosts", cwd: NSTemporaryDirectory())
+        let key = "ssh.hosts.\(workspace.id.value.uuidString)"
+        let keepID = SSHHostID()
+        let unreadable = """
+        [{"id":{"value":"\(keepID.value.uuidString)"},"label":"Keep Me","destination":"keep.example.invalid"},
+         {"id":{"value":"\(SSHHostID().value.uuidString)"},"label":42,"destination":"broken.example.invalid"}]
+        """
+        try ctx.settingsRepo.set(key, unreadable)
+
+        XCTAssertThrowsError(
+            try router.sshHostUpsert(
+                SSHHostProfile(label: "New Host", destination: "new.example.invalid"),
+                workspace: workspace.id
+            ),
+            "adding a host must not rewrite a list RemoteCode could not read"
+        )
+        XCTAssertEqual(
+            try ctx.settingsRepo.get(key),
+            unreadable,
+            "the stored host entry must survive byte-for-byte when it cannot be decoded -- rewriting it drops the hosts still in there"
+        )
+
+        XCTAssertThrowsError(
+            try router.sshHostDelete(keepID, workspace: workspace.id),
+            "deleting one host must not wipe a list RemoteCode could not read"
+        )
+        XCTAssertEqual(
+            try ctx.settingsRepo.get(key),
+            unreadable,
+            "a refused delete must leave the stored hosts untouched"
+        )
+        XCTAssertFalse(
+            store.deletedAccounts.contains(keepID.value.uuidString),
+            "the Keychain password must not be dropped for a delete that never reached the stored list"
+        )
+    }
+
+    /// LEG-2: the readable path is unchanged -- a new host is appended next to the
+    /// existing ones and a delete removes only its target. Green before and after.
+    func test_sshHostCommandsStillRoundTripAReadableList() throws {
+        let store = FakeSSHPasswordStore()
+        let (ctx, router) = try makeContext(sshPasswordStore: store)
+        let workspace = try router.createWorkspace(name: "ssh-readable-hosts", cwd: NSTemporaryDirectory())
+        let first = try router.sshHostUpsert(
+            SSHHostProfile(label: "First", destination: "one.example.invalid", password: "secret"),
+            workspace: workspace.id
+        )
+        let second = try router.sshHostUpsert(
+            SSHHostProfile(label: "Second", destination: "two.example.invalid"),
+            workspace: workspace.id
+        )
+        XCTAssertEqual(
+            try router.sshHostList(workspace: workspace.id).map(\.id),
+            [first.id, second.id],
+            "a saved host is appended without disturbing the ones already stored"
+        )
+
+        try router.sshHostDelete(first.id, workspace: workspace.id)
+        XCTAssertEqual(
+            try router.sshHostList(workspace: workspace.id).map(\.id),
+            [second.id],
+            "deleting one host removes exactly that host"
+        )
+        XCTAssertTrue(
+            store.deletedAccounts.contains(first.id.value.uuidString),
+            "deleting a host still removes its saved password"
+        )
+        let stored = try XCTUnwrap(ctx.settingsRepo.get("ssh.hosts.\(workspace.id.value.uuidString)"))
+        XCTAssertTrue(
+            stored.contains("two.example.invalid") && !stored.contains("one.example.invalid"),
+            "the delete must rewrite the stored array with only the surviving host"
+        )
+    }
+
     func test_sshOpenNewConnectionUsesCurrentSurfaceThenCreatesNewTabWhenActive() throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "ssh-new-connection", cwd: NSTemporaryDirectory())
@@ -1495,8 +1579,16 @@ final class PaneActionTests: XCTestCase {
                        "the previously selected detached-window tab must clear its selected state without requiring a second click")
         XCTAssertTrue(firstSurfaceView.isDescendant(of: content),
                       "the detached workspace window must mount the newly selected surface content after one tab click")
-        XCTAssertFalse(secondSurfaceView.isDescendant(of: content),
-                       "the previously selected surface content must be removed from the detached workspace window after one tab click")
+        // PF-11 (same rule the pane-level spec
+        // `test_switchingTabsKeepsPreviousViewHiddenInHierarchy` locks):
+        // the previous tab's view stays mounted in the detached window and is
+        // hidden. Asserting removal here contradicted that lock.
+        XCTAssertTrue(secondSurfaceView.isDescendant(of: content),
+                      "the previously selected surface content must stay mounted in the detached workspace window")
+        XCTAssertTrue(secondSurfaceView.isHidden,
+                      "the previously selected surface content must be hidden after one tab click")
+        XCTAssertFalse(firstSurfaceView.isHidden,
+                       "the newly selected surface content must be the visible one")
     }
 
     func test_backButtonFromWorkspaceWindowReturnsToMainSidebarWithoutClosingAppWindow() throws {

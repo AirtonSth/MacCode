@@ -1528,6 +1528,12 @@ final class ActiveHTTPOwnerConnectionRegistry: @unchecked Sendable {
         }
     }
 
+    /// Test seam: how many descriptors currently carry an owner binding.
+    var descriptorCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return ownerByDescriptor.count
+    }
+
     /// Shut down every HTTP socket bound to `ownerFingerprint` except the
     /// revoke request's own fd. Session defer still `Darwin.close`s.
     @discardableResult

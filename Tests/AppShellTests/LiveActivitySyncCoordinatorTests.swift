@@ -1017,7 +1017,7 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let settings = SettingsRepository(db: db)
         let targetStore = PrivatePushTargetStore(repo: settings)
-        targetStore.save(
+        try targetStore.save(
             pushToken: "newest-alert", pushTokenType: "apns",
             liveActivityToken: "newest-legacy-activity", deviceId: "device-1"
         )
@@ -1554,7 +1554,7 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         )
         try await bridge.registerLiveActivityTokenV2(ptsTarget)
 
-        targetStore.save(
+        try targetStore.save(
             pushToken: "alert", pushTokenType: "apns",
             liveActivityToken: "legacy-la", deviceId: "device-1"
         )
@@ -2039,6 +2039,45 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         XCTAssertEqual(
             pending.first?.enqueuedAt,
             Date(timeIntervalSince1970: delivery.projection.updatedAt)
+        )
+    }
+
+    func testUndecodableSnapshotIsDiscardedAndAcceptRewritesIt() throws {
+        // WHY: an undecodable snapshot made `accept` throw on every delivery
+        // (the Live Activity froze on a stale card with no user-visible error)
+        // and left the store with no path to recover. Dropping it invents no
+        // acknowledgement; the next accept persists a readable backlog.
+        let tmp = NSTemporaryDirectory() + "rc2-la-undecodable-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let settings = SettingsRepository(db: db)
+        let store = LiveActivityAcceptanceOutboxStore(settings: settings)
+        try settings.set(
+            "live_activity.acceptance_outbox.v1",
+            "{\"schema\":\"from-a-newer-build\"}"
+        )
+
+        XCTAssertTrue(
+            try store.pending().isEmpty,
+            "an undecodable snapshot must read as an empty backlog, not a wedge"
+        )
+
+        let outbox = LiveActivityAcceptanceOutbox(
+            store: store,
+            retryDelay: { _ in 3600 },
+            schedule: { _, _ in },
+            send: { _ in
+                throw LiveActivityAcceptanceOutboxError.backendDidNotAccept("offline")
+            }
+        )
+        let delivery = makeDelivery(event: .start, generation: 3, revision: 1)
+        XCTAssertNoThrow(
+            try outbox.accept(delivery, targets: [makeTarget(for: delivery)]),
+            "accepting after an undecodable snapshot must not fail forever"
+        )
+        XCTAssertEqual(
+            try store.pending().map(\.delivery.idempotencyKey),
+            [delivery.idempotencyKey],
+            "the accepted delivery must be durable in a readable snapshot"
         )
     }
 

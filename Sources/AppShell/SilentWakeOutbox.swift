@@ -132,6 +132,10 @@ public struct SilentWakeOutboxLimits: Equatable, Sendable {
 
 public final class SilentWakeOutboxStore: @unchecked Sendable {
     private static let key = "silent_wake.outbox.v1"
+    private static let log = Logger(
+        subsystem: "io.remotecode.app",
+        category: "silent-wake-outbox"
+    )
 
     public static var pendingRecordRetention: TimeInterval {
         SilentWakeDeliveryPolicy.pendingRecordRetention
@@ -264,7 +268,18 @@ public final class SilentWakeOutboxStore: @unchecked Sendable {
         guard let json = try settings.get(Self.key),
               !json.isEmpty,
               let data = json.data(using: .utf8) else { return [] }
-        return try decoder.decode([SilentWakeOutboxRecord].self, from: data)
+        do {
+            return try decoder.decode([SilentWakeOutboxRecord].self, from: data)
+        } catch {
+            // A snapshot we cannot decode can never be acknowledged or retried,
+            // and keeping it would fail every enqueue/candidates call forever.
+            // Treat it as an empty backlog (no acknowledgement is invented) so
+            // the next write persists a valid snapshot again.
+            Self.log.error(
+                "silent-wake outbox snapshot undecodable bytes=\(data.count, privacy: .public) error=\(String(describing: error), privacy: .public)"
+            )
+            return []
+        }
     }
 
     private func saveUnlocked(_ records: [SilentWakeOutboxRecord]) throws {

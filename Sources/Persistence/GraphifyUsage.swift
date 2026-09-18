@@ -70,7 +70,14 @@ public final class GraphifyUsageRepository: @unchecked Sendable {
     }
 
     /// Mark tool result success: set answer size and ok=1.
-    public func markSucceeded(runId: String, itemId: String, answerTokens: Int) throws {
+    ///
+    /// Returns whether a counted success row exists for the item afterwards, so a
+    /// caller can tell "flipped the pending row" from "the pending row was never
+    /// written" (its insert failed or was removed). A delivered Graphify answer
+    /// must not disappear from the signal count just because the pending write
+    /// was lost.
+    @discardableResult
+    public func markSucceeded(runId: String, itemId: String, answerTokens: Int) throws -> Bool {
         try db.performSync { database in
             let stmt = try database.prepare("""
                 UPDATE graphify_usage_events
@@ -82,6 +89,17 @@ public final class GraphifyUsageRepository: @unchecked Sendable {
             try stmt.bind(2, runId)
             try stmt.bind(3, itemId)
             _ = try stmt.step()
+
+            let check = try database.prepare("""
+                SELECT COUNT(*)
+                FROM graphify_usage_events
+                WHERE run_id = ? AND item_id = ? AND ok = 1;
+            """)
+            defer { check.reset() }
+            try check.bind(1, runId)
+            try check.bind(2, itemId)
+            _ = try check.step()
+            return check.columnInt64(0) > 0
         }
     }
 

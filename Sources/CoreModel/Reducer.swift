@@ -164,12 +164,23 @@ public struct LayoutReducer {
             guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
             let targetPane = paneID ?? ws.focusedPaneID ?? ws.layout.paneIDs().first
             guard let tp = targetPane else { throw LayoutError.paneNotFound }
+            // addSurface() silently no-ops on a pane id that is not in the
+            // layout. Callers (surface.create / files.open_tab) then report the
+            // tab as created while the layout never gains it — a tab the user
+            // sees on the paired client that does not exist on the Mac. Refuse
+            // the add instead of accepting a surface that cannot be placed.
+            guard ws.layout.find(paneID: tp) != nil else { throw LayoutError.paneNotFound }
             ws.layout = try addSurface(in: ws.layout, paneID: tp, descriptor: descriptor)
             ws.updatedAt = Date()
             next.workspaces[wid] = ws
             return next
         case let .splitPane(wid, paneID, direction, newSurface):
             guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
+            // split() returns the layout untouched when the pane id is not in it,
+            // and the split would then still be reported as applied with the new
+            // pane focused — `focusedPaneID` left pointing at a pane that does
+            // not exist, so the next pane-less add resolves to a ghost pane.
+            guard ws.layout.find(paneID: paneID) != nil else { throw LayoutError.paneNotFound }
             let (newLayout, newPaneID) = try split(in: ws.layout, paneID: paneID, direction: direction, newSurface: newSurface)
             ws.layout = newLayout
             ws.focusedPaneID = newPaneID
@@ -225,6 +236,12 @@ public struct LayoutReducer {
             guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
             guard let desc = findSurface(in: ws.layout, id: sid) else { throw LayoutError.surfaceNotFound }
             ws.layout = try removeSurface(in: ws.layout, surfaceID: sid)
+            // Guard the lone-tab self-move data-loss path (same hole as the
+            // reorder guard below): removing the moved surface can prune its
+            // now-empty pane, so a move into that same pane — or into any pane
+            // that is no longer there — would silently no-op in addSurface and
+            // drop the surface. Refuse instead of losing it.
+            guard ws.layout.find(paneID: target) != nil else { throw LayoutError.paneNotFound }
             ws.layout = try addSurface(in: ws.layout, paneID: target, descriptor: desc)
             next.workspaces[wid] = ws
             return next

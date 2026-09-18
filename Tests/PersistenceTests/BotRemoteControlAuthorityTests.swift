@@ -390,6 +390,112 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertNotNil(items.first?["id"] as? String)
     }
 
+    /// WHY: `bot.remote.queue` is the only copy of a queue that predates
+    /// `bot_queued_follow_ups`. A launch that cannot write those rows must keep
+    /// them (and retry later) instead of clearing the key — clearing it lost the
+    /// user's pending follow-ups with no error and no retry.
+    func test_legacyQueueMigrationKeepsRowsTheStoreRefused() throws {
+        let live = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "migrate-live",
+            "name": "Legacy Queue Bot",
+        ])
+        let liveID = try XCTUnwrap(live["bot_id"] as? String)
+        let deleted = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "migrate-deleted",
+            "name": "Deleted Legacy Bot",
+        ])
+        let deletedID = try XCTUnwrap(deleted["bot_id"] as? String)
+        try store.delete(id: BotID(try XCTUnwrap(UUID(uuidString: deletedID))))
+
+        try seedLegacySidecarQueue([
+            liveID: [
+                ["id": "legacy-1", "text": "first pending"],
+                ["id": "legacy-2", "text": "second pending"],
+            ],
+            deletedID: [["id": "legacy-gone", "text": "belongs to a deleted bot"]],
+        ])
+
+        try db.execute("""
+            CREATE TRIGGER fail_queue_insert
+            BEFORE INSERT ON bot_queued_follow_ups
+            BEGIN
+                SELECT RAISE(ABORT, 'queue write blocked');
+            END;
+            """)
+
+        _ = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: settings,
+            appSupportDirectory: supportDir
+        )
+
+        let kept = try legacySidecarQueue()
+        // Anti-vacuity: the deleted bot's rows go away only because the run
+        // reached them, so this cannot pass on a migration that never ran.
+        XCTAssertNil(kept[deletedID], "a deleted bot's legacy rows are dropped during migration")
+        XCTAssertEqual(
+            kept[liveID]?.compactMap { $0["text"] as? String },
+            ["first pending", "second pending"],
+            "rows the store refused must stay in the sidecar"
+        )
+    }
+
+    /// The healthy path is unchanged: rows land in the store and only then is
+    /// the legacy key cleared.
+    func test_legacyQueueMigrationMovesRowsAndClearsTheKeyOnceTheyLand() throws {
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "migrate-ok",
+            "name": "Legacy Happy Path Bot",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        try seedLegacySidecarQueue([
+            botID: [["id": "legacy-ok", "text": "pending turn"]],
+        ])
+
+        let relaunched = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: settings,
+            appSupportDirectory: supportDir
+        )
+
+        let list = try relaunched.dispatch(method: "bot.queue.list", params: ["bot_id": botID])
+        let items = try XCTUnwrap(list["items"] as? [[String: Any]])
+        XCTAssertEqual(items.compactMap { $0["text"] as? String }, ["pending turn"])
+        XCTAssertEqual(try legacySidecarQueue().isEmpty, true)
+    }
+
+    private func seedLegacySidecarQueue(_ rows: [String: [[String: Any]]]) throws {
+        let data = try JSONSerialization.data(withJSONObject: rows)
+        let text = try XCTUnwrap(String(data: data, encoding: .utf8))
+        try db.performSync { database in
+            let statement = try database.prepare(
+                "INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;"
+            )
+            defer { statement.reset() }
+            try statement.bind(1, "bot.remote.queue")
+            try statement.bind(2, text)
+            try statement.bind(3, ISO8601DateFormatter().string(from: Date()))
+            _ = try statement.step()
+        }
+    }
+
+    private func legacySidecarQueue() throws -> [String: [[String: Any]]] {
+        let text: String? = try db.performSync { database in
+            let statement = try database.prepare("SELECT value FROM settings WHERE key = ? LIMIT 1;")
+            defer { statement.reset() }
+            try statement.bind(1, "bot.remote.queue")
+            guard try statement.step() else { return nil }
+            return statement.columnText(0)
+        }
+        guard let text, let data = text.data(using: .utf8) else { return [:] }
+        guard let rows = try? JSONSerialization.jsonObject(with: data) as? [String: [[String: Any]]] else {
+            return [:]
+        }
+        return rows
+    }
+
     func test_queueControlsPreserveOwnershipOrderAndIdempotentForce() throws {
         let created = try authority.dispatch(method: "bot.create", params: [
             "client_request_id": "queue-create",

@@ -1037,6 +1037,63 @@ final class TokenSaverAppContextTests: XCTestCase {
                       "partial refresh that omits Grok must keep Grok's unexpired weekly % instead of painting 0%")
     }
 
+    /// WHY: the `.accountUsage` event path and the 60 s periodic probe share the
+    /// same write site (`AppContext.recordTokenSaverAccountUsage`), so a provider
+    /// that re-reports the same percentages used to rewrite usage.json from the
+    /// MainActor on every event. The ring must still follow a real change.
+    func test_accountUsageEventsWithUnchangedPercentagesWriteUsageOnce() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverUsageNoop-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+        let file = context.appSupportDirectory
+            .appendingPathComponent("TokenSaver", isDirectory: true)
+            .appendingPathComponent("usage.json", isDirectory: false)
+        let unchanged = AssistantAccountUsage(
+            provider: .claude,
+            weeklyUsedPercent: 57,
+            weeklyWindowDurationMinutes: 10_080,
+            currentSessionUsedPercent: 3
+        )
+
+        context.coordinator.onAssistantEvent?(.accountUsage(unchanged), threadId, runId)
+        let writtenAt = try usageFileModificationDate(of: file)
+        for _ in 0..<10 {
+            context.coordinator.onAssistantEvent?(.accountUsage(unchanged), threadId, runId)
+        }
+        XCTAssertEqual(
+            try usageFileModificationDate(of: file),
+            writtenAt,
+            "ten re-reported account-usage events must not rewrite usage.json ten times"
+        )
+
+        context.coordinator.onAssistantEvent?(
+            .accountUsage(AssistantAccountUsage(
+                provider: .claude,
+                weeklyUsedPercent: 58,
+                weeklyWindowDurationMinutes: 10_080,
+                currentSessionUsedPercent: 3
+            )),
+            threadId,
+            runId
+        )
+        XCTAssertGreaterThan(
+            try usageFileModificationDate(of: file),
+            writtenAt,
+            "a changed percentage must reach usage.json"
+        )
+        XCTAssertEqual(
+            TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+                .load().providers.first { $0.provider == .claude }?.weeklyUsedPercent,
+            58
+        )
+    }
+
+    private func usageFileModificationDate(of url: URL) throws -> Date {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        return try XCTUnwrap(attributes[.modificationDate] as? Date)
+    }
+
     func test_appContextSkipsTokenSaverAccountUsageRefreshWhenNotSignedIn() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverNoAccountUsage-" + UUID().uuidString
         let refresher = FakeTokenSaverAccountUsageRefresher(response: [

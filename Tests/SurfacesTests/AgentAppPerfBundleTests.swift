@@ -3120,13 +3120,23 @@ final class AgentAppPerfBundleTests: XCTestCase {
         try threadRepo.upsert(stored)
         vm.status = .running
         let probesBefore = threadRepo.statusProbeCountForTesting
+        let durableGetsBefore = threadRepo.durableGetCountForTesting
         vm.stop()
         XCTAssertEqual(vm.status, .completed)
         XCTAssertFalse(vm.isStopping)
         XCTAssertEqual(
+            threadRepo.durableGetCountForTesting,
+            durableGetsBefore,
+            "stale Stop must resolve the durable status without the 26-column thread get"
+        )
+        // Exactly one probe, shared: the coordinator's `stopRun(threadId:)` F19
+        // guard reads the status and `clearStaleRunProjection` repaints from that
+        // same value. Two means the sharing broke; a durable get or a third probe
+        // means a column scan came back into the stale Stop path.
+        XCTAssertEqual(
             threadRepo.statusProbeCountForTesting,
             probesBefore + 1,
-            "stale Stop must probe status once instead of a 26-column get"
+            "stale Stop must share the single-column F19 status probe (no re-probe, no durable get)"
         )
     }
 
@@ -3139,8 +3149,11 @@ final class AgentAppPerfBundleTests: XCTestCase {
                 .appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
             encoding: .utf8
         )
-        let range = try XCTUnwrap(source.range(of: "private func clearStaleRunProjection(threadId: AgentThreadID)"))
+        // Signature-agnostic needle: the contract below is the probe, not the
+        // exact parameter list (the coordinator now hands its probe in).
+        let range = try XCTUnwrap(source.range(of: "private func clearStaleRunProjection(threadId:"))
         let body = String(source[range.lowerBound...].prefix(900))
+        XCTAssertTrue(body.contains("durableStatus: AgentRunStatus? = nil"))
         XCTAssertTrue(body.contains("threadRepo.status(of: threadId)"))
         XCTAssertFalse(body.contains("threadRepo.get(id: threadId)"))
     }

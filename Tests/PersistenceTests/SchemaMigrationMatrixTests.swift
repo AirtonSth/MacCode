@@ -602,8 +602,8 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         )
         XCTAssertEqual(Schema.currentVersion, 83)
         XCTAssertEqual(
-            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82],
-            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec; v77 owns nullable agent_runs.terminal_reason; v78 deduplicates savings retries; v79 preserves host attestations outside rolling replay; v80 owns Bot queued follow-ups; v81 indexes running thread IDs; v82 indexes audit_log(action, id)"
+            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83],
+            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec; v77 owns nullable agent_runs.terminal_reason; v78 deduplicates savings retries; v79 preserves host attestations outside rolling replay; v80 owns Bot queued follow-ups; v81 indexes running thread IDs; v82 indexes audit_log(action, id); v83 indexes agent_threads(workspace_id, updated_at DESC, id DESC) for the rail list"
         )
         let v72 = try XCTUnwrap(Schema.steps.first { $0.version == 72 })
         XCTAssertTrue(v72.sql.contains("CHECK(format IN ('human', 'rcw1', 'rcs1'))"))
@@ -1381,7 +1381,9 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             "v81 must show the pre-index full-table scan: \(before)"
         )
 
-        try Schema.migrateSteps(db, Schema.steps)
+        // Scope the migration to the step under test: a later head version must
+        // not silently turn this v82 contract check into a head assertion.
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 82 })
         XCTAssertEqual(try maxVersion(db), 82)
         XCTAssertEqual(try rowCount(db, table: "audit_log"), 512,
                        "v81 to v82 must preserve every audit row")

@@ -2790,6 +2790,7 @@ struct BotDraftPersistenceMetrics: Equatable {
     var encodeCount = 0
     var setCount = 0
     var encodedBytes = 0
+    var searchTextWrites = 0
 }
 
 /// One persistence owner per AppContext. Bot windows keep their visible fields
@@ -2806,6 +2807,8 @@ final class BotDraftPersistenceAuthority {
     private var composerDirty = false
     private var inspectorDirty = false
     private var studioDirty = false
+    private var searchDirty = false
+    private var searchText = ""
     private var flushScheduled = false
     private var flushGeneration: UInt64 = 0
     private var flushTask: Task<Void, Never>?
@@ -2856,6 +2859,18 @@ final class BotDraftPersistenceAuthority {
         studioDirty = true
         scheduleFlush()
     }
+
+    /// Roster search is a per-keystroke write: the field must paint every key
+    /// but the plist only sees the query once the typing settles.
+    func updateSearchText(_ text: String) {
+        searchText = text
+        searchDirty = true
+        scheduleFlush()
+    }
+
+    /// Latest query for this context: the pending one while a write is scheduled,
+    /// else the stored one. Surfaces must not read UserDefaults behind a pending write.
+    var currentSearchText: String { searchText }
 
     func removeDrafts(for botID: BotID) {
         if composerDraftsByBot.removeValue(forKey: botID) != nil {
@@ -2916,6 +2931,9 @@ final class BotDraftPersistenceAuthority {
         if studioDirty {
             persistStudioDrafts()
         }
+        if searchDirty {
+            persistSearchText()
+        }
     }
 
     func resetMetricsForTesting() {
@@ -2934,6 +2952,7 @@ final class BotDraftPersistenceAuthority {
         composerDirty = false
         inspectorDirty = false
         studioDirty = false
+        searchDirty = false
         reloadFromUserDefaults()
     }
 
@@ -2979,6 +2998,17 @@ final class BotDraftPersistenceAuthority {
         persist(payload, key: BotsViewModel.inspectorDraftsDefaultsKey)
     }
 
+    private func persistSearchText() {
+        searchDirty = false
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: BotsViewModel.searchTextDefaultsKey)
+        } else {
+            UserDefaults.standard.set(searchText, forKey: BotsViewModel.searchTextDefaultsKey)
+        }
+        metrics.searchTextWrites += 1
+    }
+
     private func persistStudioDrafts() {
         studioDirty = false
         let payload = Dictionary(uniqueKeysWithValues: studioDraftsByBot.map {
@@ -3019,6 +3049,7 @@ final class BotDraftPersistenceAuthority {
            let botID = draft.botID {
             studioDraftsByBot = [botID: draft]
         }
+        searchText = UserDefaults.standard.string(forKey: BotsViewModel.searchTextDefaultsKey) ?? ""
     }
 
     private func decodeDraftMap<T: Decodable>(_ type: T.Type, key: String) -> [BotID: T] {
@@ -3030,6 +3061,21 @@ final class BotDraftPersistenceAuthority {
             return (BotID(uuid), draft)
         })
     }
+}
+
+/// Facts `BotsViewModel.linkedRun` needs from `agent_runs`, resolved without
+/// main-actor state so a live poller can read them off MainActor.
+struct DeskLinkedRunProbe: Sendable {
+    var run: AgentRun?
+    var memoizedRunID: AgentRunID?
+    var scannedFinished: Bool
+}
+
+/// Facts one desk watch tick reads from SQLite, resolved together off
+/// MainActor: the coordinator's stream cursor and the linked run.
+private struct DeskLiveTurnWatchProbe: Sendable {
+    var cursor: AgentRunRepository.StreamEventCursor
+    var linkedRun: DeskLinkedRunProbe
 }
 
 @MainActor
@@ -3418,6 +3464,14 @@ public final class BotsViewModel: ObservableObject {
     private var liveTimelineRecency: [AgentThreadID] = []
     static let liveTimelineCacheLimit = 6
     var liveTimelineCacheCountForTesting: Int { liveTimelineByThread.count }
+    /// Resident cache entry counts. Each maps 1:1 to one dictionary on purpose:
+    /// a sum would let one cache cover for another, and delete specs must prove
+    /// the deleted teammate's entries go while the remaining teammate's stay.
+    var studioSupportCacheCountForTesting: Int { studioSupportByBot.count }
+    var revisionCacheCountForTesting: Int { revisionByID.count }
+    var attentionStateCacheCountForTesting: Int { attentionStateByBot.count }
+    var lastPreviewCacheCountForTesting: Int { lastPreviewByBot.count }
+    var transcriptCacheCountForTesting: Int { messagesByConversation.count }
 
     private func storeLiveTimeline(_ state: AssistantTimelineState, for threadID: AgentThreadID) {
         liveTimelineByThread[threadID] = state
@@ -5590,6 +5644,7 @@ public final class BotsViewModel: ObservableObject {
             flushPendingDraftPersistence()
             persistStudioFilesLocations()
             syncQueuedFollowUps()
+            forgetResidentCaches(for: id, leaving: leaving)
             // Dest first. Delete used to reloadFleet (every teammate's
             // conversations + recent messages) before Chat could dest the
             // next row, then listAttention after dest already dested.
@@ -5604,6 +5659,53 @@ public final class BotsViewModel: ObservableObject {
             }
         } catch {
             errorMessage = String(describing: error)
+        }
+    }
+
+    /// Resident caches keyed to a teammate otherwise outlive its row for the
+    /// life of the window: the studio snapshot (conversations, memory facts,
+    /// routines, the selected revision), every published revision, the desk
+    /// previews, and each per-conversation transcript plus its per-thread
+    /// probes. Deleting a teammate must drop its share of them so the window's
+    /// footprint follows the live roster instead of every row it ever showed.
+    ///
+    /// `deskRoutingByConversation` is deliberately not pruned: it is persisted
+    /// state, not a resident cache, so dropping it without a write would only
+    /// resurrect the same keys at the next `restoreDeskRoutingIfNeeded`, and
+    /// writing here would add a synchronous encode to the delete path that must
+    /// stay dest-first (see `test_deleteRunsDockerTeardownOffMain_becauseAStuckDaemonMustNotFreezeTheRoster`).
+    private func forgetResidentCaches(for id: BotID, leaving: Bool) {
+        var conversationIDs = Set<BotConversationID>()
+        var threadIDs = Set<AgentThreadID>()
+        func collect(_ rows: [BotConversation]) {
+            for row in rows {
+                conversationIDs.insert(row.id)
+                if let threadID = row.linkedAgentThreadID { threadIDs.insert(threadID) }
+            }
+        }
+        // Only the two cached lists still hold this teammate's conversations:
+        // its studio snapshot, and `conversations` when it is the open desk.
+        if let cached = studioSupportByBot[id] { collect(cached.conversations) }
+        if leaving { collect(conversations) }
+        if let selected = selectedConversationByBot[id] { conversationIDs.insert(selected) }
+        if let last = messagesConversationIDByBot[id] { conversationIDs.insert(last) }
+
+        studioSupportByBot[id] = nil
+        attentionStateByBot[id] = nil
+        lastPreviewByBot[id] = nil
+        lastUpdatedByBot[id] = nil
+        lastLinkedRunIDByBot[id] = nil
+        lastStartedConversationByBot[id] = nil
+        selectedConversationByBot[id] = nil
+        messagesByBot[id] = nil
+        messagesConversationIDByBot[id] = nil
+        revisionByID = revisionByID.filter { $0.value.botID != id }
+        for conversationID in conversationIDs {
+            messagesByConversation[conversationID] = nil
+        }
+        for threadID in threadIDs {
+            clearDeskObservedEvents(threadID: threadID)
+            settledTerminalRunIDByThread[threadID] = nil
         }
     }
 
@@ -5674,15 +5776,14 @@ public final class BotsViewModel: ObservableObject {
         return .agent(name: bot.name)
     }
 
-    /// Test seam (BT-23): one non-terminal watch tick for the selected desk
-    /// thread, without the 2 s cadence or the push-quiet gate.
-    func deskLiveTurnWatchTickForTesting() {
+    /// Test seam (BT-23/BT-28): one watch tick for the selected desk thread,
+    /// without the 2 s cadence or the push-quiet gate. Returns true when the
+    /// watched run is terminal, i.e. when the watch stops.
+    @discardableResult
+    func deskLiveTurnWatchTickForTesting() async -> Bool {
         guard let botID = selectedBotID,
-              let threadID = selectedConversation?.linkedAgentThreadID else { return }
-        deskLiveTurnWatchApplyCountForTesting += 1
-        if applyDeskLiveReplay(botID: botID, threadID: threadID, fetchOffMain: true) {
-            refreshPublishedIdentity(for: botID)
-        }
+              let threadID = selectedConversation?.linkedAgentThreadID else { return false }
+        return await deskLiveTurnWatchTick(botID: botID, threadID: threadID)
     }
 
     public func refreshDeskLiveTurn() {
@@ -6040,16 +6141,15 @@ public final class BotsViewModel: ObservableObject {
             return false
         }
         lastSendAcknowledgedOnScreenForTesting = screen
-        composerText = ""
-        composerCursorOffset = nil
-        attachments = []
-        flushPendingDraftPersistence()
         lastSendStartedProviderRun = false
         lastMentionedBotIDForTesting = nil
         lastHopUserTextForTesting = nil
         lastSupervisedRunUserTextForTesting = nil
         supervisedRunBotIDsForTesting = []
         if deskRunIsLive, text == nil {
+            // The follow-up queue write cannot fail, so the words are already
+            // accounted for and the composer may be consumed before it.
+            consumeComposerForAcceptedSend()
             enqueueFollowUp(
                 BotQueuedFollowUp(text: message, attachments: attached),
                 botID: bot.id
@@ -6059,6 +6159,11 @@ public final class BotsViewModel: ObservableObject {
         do {
             let display = AgentChatTranscriptChrome.displayUserLine(text: message, attachments: attached)
             let conversation = try persistUserMessage(bot: bot, text: display)
+            // WHY here and not before the do: clearing the composer, the staged
+            // attachments and the saved draft used to happen before this write, so
+            // a failed persist left the user with an error message and none of the
+            // words or files they had just sent.
+            consumeComposerForAcceptedSend()
             appendDeskMessage(BotDeskMessage(role: .user, text: display), botID: bot.id, conversationID: conversation.id)
             if let started = try enqueueSupervisedBotRun(
                 bot: bot,
@@ -6073,6 +6178,17 @@ public final class BotsViewModel: ObservableObject {
             errorMessage = String(describing: error)
             return false
         }
+    }
+
+    /// Consumes the composer in the same turn the send becomes the app's:
+    /// the cleared editor and the flushed draft are the visible contract that a
+    /// sent line never comes back as a draft. Only call this once the words are
+    /// durable (persisted message) or queued in memory (live-run follow-up).
+    private func consumeComposerForAcceptedSend() {
+        composerText = ""
+        composerCursorOffset = nil
+        attachments = []
+        flushPendingDraftPersistence()
     }
 
     /// Host-catalog Bot sends use the same persisted user line, compiled Bot
@@ -6799,7 +6915,11 @@ public final class BotsViewModel: ObservableObject {
         fleetReloadCountForTesting += 1
         do {
             let destIDs = Set(bots.map(\.id))
-            bots = try botStore.list(includeHidden: showHidden)
+            // Hide is a roster view, not a delete: a hidden teammate still owns
+            // the user's drafts and queued follow-ups, so the store roster (not
+            // the filtered list) is what pruning may delete against.
+            let roster = try botStore.list(includeHidden: true)
+            bots = showHidden ? roster : roster.filter { !$0.hidden }
             if selectedBotID == nil || !bots.contains(where: { $0.id == selectedBotID }) {
                 restoreSelectedBotIfNeeded()
             }
@@ -6852,11 +6972,12 @@ public final class BotsViewModel: ObservableObject {
             lastUpdatedByBot = updated
             publishRosterIfNeeded()
             rebuildAttentionStates()
-            pruneQueuedFollowUpsToFleet()
-            pruneComposerDraftsToFleet()
-            pruneInspectorDraftsToFleet()
-            pruneStudioDraftsToFleet()
-            pruneUnpublishedNewBotIDs()
+            let liveFleetIDs = Set(roster.map(\.id))
+            pruneQueuedFollowUpsToFleet(live: liveFleetIDs)
+            pruneComposerDraftsToFleet(live: liveFleetIDs)
+            pruneInspectorDraftsToFleet(live: liveFleetIDs)
+            pruneStudioDraftsToFleet(live: liveFleetIDs)
+            pruneUnpublishedNewBotIDs(live: liveFleetIDs)
         } catch {
             errorMessage = String(describing: error)
         }
@@ -6914,7 +7035,15 @@ public final class BotsViewModel: ObservableObject {
         attentionStateByBot = states
     }
 
-    private func applyAttentionState(for botID: BotID, conversations: [BotConversation]) {
+    /// `reload: false` is for callers that touch several teammates in one
+    /// synchronous turn (one handoff delta carries two conversations): the
+    /// roster pass is a SQLite hydration, so it must be paid once per turn,
+    /// not once per teammate.
+    private func applyAttentionState(
+        for botID: BotID,
+        conversations: [BotConversation],
+        reload: Bool = true
+    ) {
         var states = attentionStateByBot
         if activeHandoffBotIDs().contains(botID) {
             states[botID] = .working
@@ -6925,7 +7054,7 @@ public final class BotsViewModel: ObservableObject {
             states[botID] = Self.attentionState(from: conversations, hasOpenAttention: hasOpenAttention)
         }
         attentionStateByBot = states
-        if screen == .activeBots {
+        if reload, screen == .activeBots {
             reloadActiveBotsScreen()
         }
     }
@@ -7217,7 +7346,7 @@ public final class BotsViewModel: ObservableObject {
     private static let studioFilesLocationsDefaultsKey = "bots.studioFilesLocations"
     fileprivate static let inspectorDraftsDefaultsKey = "bots.inspectorDrafts"
     fileprivate static let studioDraftDefaultsKey = "bots.studioDraft"
-    private static let searchTextDefaultsKey = "bots.searchText"
+    fileprivate static let searchTextDefaultsKey = "bots.searchText"
     private static let unpublishedNewBotDefaultsKey = "bots.unpublishedNewBotIDs"
 
     private func persistSelection() {
@@ -7411,8 +7540,7 @@ public final class BotsViewModel: ObservableObject {
         unpublishedNewBotIDs = Set(raw.compactMap { UUID(uuidString: $0).map(BotID.init) })
     }
 
-    private func pruneUnpublishedNewBotIDs() {
-        let live = Set(bots.map(\.id))
+    private func pruneUnpublishedNewBotIDs(live: Set<BotID>) {
         let next = unpublishedNewBotIDs.intersection(live)
         guard next != unpublishedNewBotIDs else { return }
         unpublishedNewBotIDs = next
@@ -7451,24 +7579,18 @@ public final class BotsViewModel: ObservableObject {
         studioDraft = saved
     }
 
-    private func pruneStudioDraftsToFleet() {
-        let live = Set(bots.map(\.id))
+    private func pruneStudioDraftsToFleet(live: Set<BotID>) {
         guard draftPersistenceAuthority.retainStudioDrafts(for: live) else { return }
         studioDraftsByBot = draftPersistenceAuthority.studioDraftsByBot
         flushPendingDraftPersistence()
     }
 
     private func persistSearchText() {
-        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            UserDefaults.standard.removeObject(forKey: Self.searchTextDefaultsKey)
-        } else {
-            UserDefaults.standard.set(searchText, forKey: Self.searchTextDefaultsKey)
-        }
+        draftPersistenceAuthority.updateSearchText(searchText)
     }
 
     private func restoreSearchTextIfNeeded() {
-        searchText = UserDefaults.standard.string(forKey: Self.searchTextDefaultsKey) ?? ""
+        searchText = draftPersistenceAuthority.currentSearchText
     }
 
     private func persistShowHidden() {
@@ -7491,11 +7613,21 @@ public final class BotsViewModel: ObservableObject {
 
     private func persistQueuedFollowUps() {
         let liveIDs = Set(queuedFollowUpsByBot.keys)
-        if let stored = try? botStore.listAllQueuedFollowUps() {
+        let stored = try? botStore.listAllQueuedFollowUps()
+        if let stored {
             for botID in Set(stored.map(\.botID)) where !liveIDs.contains(botID) {
                 try? botStore.deleteQueuedFollowUps(botID: botID)
             }
         }
+        // Rewriting the queue must carry each row's own enqueue moment forward.
+        // `createdAt: Date()` re-dated the rows this mutation did not touch —
+        // including other teammates' — and `created_at` is what `bot.queue.list`
+        // reports to the paired device.
+        let queuedAtByID = Dictionary(
+            (stored ?? []).map { ($0.id.lowercased(), $0.createdAt) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let now = Date()
         for (botID, items) in queuedFollowUpsByBot {
             let records = items.enumerated().map { index, item in
                 BotQueuedFollowUpRecord(
@@ -7505,7 +7637,7 @@ public final class BotsViewModel: ObservableObject {
                     text: item.text,
                     payloadJSON: encodeQueuedFollowUpPayload(item),
                     sortOrder: index,
-                    createdAt: Date()
+                    createdAt: queuedAtByID[item.id.uuidString.lowercased()] ?? now
                 )
             }
             try? botStore.replaceQueuedFollowUps(botID: botID, items: records)
@@ -7574,8 +7706,7 @@ public final class BotsViewModel: ObservableObject {
         )
     }
 
-    private func pruneQueuedFollowUpsToFleet() {
-        let live = Set(bots.map(\.id))
+    private func pruneQueuedFollowUpsToFleet(live: Set<BotID>) {
         let next = queuedFollowUpsByBot.filter { live.contains($0.key) }
         guard next.count != queuedFollowUpsByBot.count else { return }
         queuedFollowUpsByBot = next
@@ -7807,13 +7938,24 @@ public final class BotsViewModel: ObservableObject {
     public var composerSuggestions: [AgentComposerSuggestion] {
         let snapshot = selectedDeskSnapshot
         let isClaude = snapshot?.provider == .claude || deskRouting.provider == .claude
+        // F1 parity with AgentAppViewModel: the composer bar reevaluates this on
+        // every keystroke and every publish behind the Desk TimelineView. Plain
+        // text can never consume the disk-backed catalog, so its fingerprint
+        // (two filesystem stats) must not be read before `suggestions` can
+        // short-circuit on the same token.
+        let token = AgentComposerSuggestions.activeToken(
+            in: composerText,
+            cursorOffset: composerCursorOffset
+        )
+        let trigger = token.first
+        let listsCatalog = trigger == "/" || trigger == "$"
         return AgentComposerSuggestions.suggestions(
             for: composerText,
             cursorOffset: composerCursorOffset,
             snapshot: snapshot,
             localSlashCommands: [],
             extraCommands: isClaude ? ClaudeSlashCommandDiscovery.builtInClaudeCommands : [],
-            extraSkillNames: isClaude ? claudeSlashEntries() : [],
+            extraSkillNames: isClaude && listsCatalog ? claudeSlashEntries() : [],
             mentionableBots: bots.filter { $0.id != selectedBotID }
         )
     }
@@ -8295,8 +8437,7 @@ public final class BotsViewModel: ObservableObject {
         composerDraftsByBot = draftPersistenceAuthority.composerDraftsByBot
     }
 
-    private func pruneComposerDraftsToFleet() {
-        let live = Set(bots.map(\.id))
+    private func pruneComposerDraftsToFleet(live: Set<BotID>) {
         guard draftPersistenceAuthority.retainComposerDrafts(for: live) else { return }
         composerDraftsByBot = draftPersistenceAuthority.composerDraftsByBot
         flushPendingDraftPersistence()
@@ -8354,8 +8495,7 @@ public final class BotsViewModel: ObservableObject {
         inspectorDraftsByBot = draftPersistenceAuthority.inspectorDraftsByBot
     }
 
-    private func pruneInspectorDraftsToFleet() {
-        let live = Set(bots.map(\.id))
+    private func pruneInspectorDraftsToFleet(live: Set<BotID>) {
         guard draftPersistenceAuthority.retainInspectorDrafts(for: live) else { return }
         inspectorDraftsByBot = draftPersistenceAuthority.inspectorDraftsByBot
         flushPendingDraftPersistence()
@@ -8863,9 +9003,11 @@ public final class BotsViewModel: ObservableObject {
         botID: BotID,
         threadID: AgentThreadID,
         reconcileObservedAtTerminal: Bool = false,
-        fetchOffMain: Bool = false
+        fetchOffMain: Bool = false,
+        prefetchedCursor: AgentRunRepository.StreamEventCursor? = nil
     ) -> Bool {
-        let cursor = context.coordinator.streamEventCursor(threadId: threadID)
+        let cursor = prefetchedCursor
+            ?? context.coordinator.streamEventCursor(threadId: threadID)
         let hasUnconfirmedObservedEvents = liveObservedEventsByThread[threadID]?.isEmpty == false
             || liveObservedEventOverflowThreads.contains(threadID)
         let requiresTerminalReconciliation = reconcileObservedAtTerminal
@@ -9094,25 +9236,56 @@ public final class BotsViewModel: ObservableObject {
                    Date().timeIntervalSince(lastPush) < 1 {
                     continue
                 }
-                self.deskLiveTurnWatchApplyCountForTesting += 1
-                // BT-23: a full replay from here runs detached and refreshes the
-                // identity itself once adopted; the incremental path stays sync.
-                if self.applyDeskLiveReplay(botID: botID, threadID: threadID, fetchOffMain: true) {
-                    self.refreshPublishedIdentity(for: botID)
-                }
-                let run = self.linkedRun(for: threadID, botID: botID)
-                if let run, BotsDeskFollowThrough.isTerminal(run.status) {
-                    if self.applyDeskLiveReplay(
-                        botID: botID,
-                        threadID: threadID,
-                        reconcileObservedAtTerminal: true
-                    ) {
-                        self.refreshPublishedIdentity(for: botID)
-                    }
+                if await self.deskLiveTurnWatchTick(botID: botID, threadID: threadID) {
                     return
                 }
             }
         }
+    }
+
+    /// One watch tick. Both SQLite reads (`streamEventCursor` and `linkedRun`)
+    /// happen off MainActor and only their result is applied here, because a
+    /// main-thread probe can stall the UI behind the repo's transient-lock
+    /// retry (8 tries / 2 s) while a turn is writing. Returns true when the
+    /// watched run is terminal, i.e. when the watch must stop.
+    private func deskLiveTurnWatchTick(botID: BotID, threadID: AgentThreadID) async -> Bool {
+        let knownRunID = lastLinkedRunIDByBot[botID]
+        let coordinator = context.coordinator
+        let runRepo = context.runRepo
+        let probe = await Task.detached(priority: .userInitiated) {
+            DeskLiveTurnWatchProbe(
+                cursor: coordinator.streamEventCursor(threadId: threadID),
+                linkedRun: BotsViewModel.resolveLinkedRun(
+                    runRepo: runRepo,
+                    threadID: threadID,
+                    knownRunID: knownRunID
+                )
+            )
+        }.value
+        deskLiveTurnWatchApplyCountForTesting += 1
+        adoptLinkedRunProbe(probe.linkedRun, botID: botID)
+        // BT-23: a full replay from here runs detached and refreshes the
+        // identity itself once adopted; the incremental path stays sync.
+        if applyDeskLiveReplay(
+            botID: botID,
+            threadID: threadID,
+            fetchOffMain: true,
+            prefetchedCursor: probe.cursor
+        ) {
+            refreshPublishedIdentity(for: botID)
+        }
+        guard let run = probe.linkedRun.run,
+              BotsDeskFollowThrough.isTerminal(run.status) else {
+            return false
+        }
+        if applyDeskLiveReplay(
+            botID: botID,
+            threadID: threadID,
+            reconcileObservedAtTerminal: true
+        ) {
+            refreshPublishedIdentity(for: botID)
+        }
+        return true
     }
 
     private func restoreDeskWorkLog(botID: BotID, preferredRun: AgentRun? = nil) {
@@ -9136,24 +9309,48 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func linkedRun(for threadID: AgentThreadID, botID: BotID) -> AgentRun? {
-        if let active = try? context.runRepo.latestActive(for: threadID) {
-            lastLinkedRunIDByBot[botID] = active.id
-            return active
+        let probe = Self.resolveLinkedRun(
+            runRepo: context.runRepo,
+            threadID: threadID,
+            knownRunID: lastLinkedRunIDByBot[botID]
+        )
+        adoptLinkedRunProbe(probe, botID: botID)
+        return probe.run
+    }
+
+    /// The `agent_runs` reads behind `linkedRun`, with no main-actor state so a
+    /// live poller can run them off MainActor — a main-thread probe can stall
+    /// the UI behind the repo's transient-lock retry (8 tries / 2 s) while a
+    /// turn is writing.
+    nonisolated static func resolveLinkedRun(
+        runRepo: AgentRunRepository,
+        threadID: AgentThreadID,
+        knownRunID: AgentRunID?
+    ) -> DeskLinkedRunProbe {
+        if let active = try? runRepo.latestActive(for: threadID) {
+            return DeskLinkedRunProbe(run: active, memoizedRunID: active.id, scannedFinished: false)
         }
-        if let runID = lastLinkedRunIDByBot[botID],
-           let stored = try? context.runRepo.get(id: runID),
+        if let knownRunID,
+           let stored = try? runRepo.get(id: knownRunID),
            stored.threadId == threadID {
-            return stored
+            return DeskLinkedRunProbe(run: stored, memoizedRunID: nil, scannedFinished: false)
         }
+        guard let finished = (try? runRepo.listRecentFinished(limit: 80))?
+            .first(where: { $0.threadId == threadID }) else {
+            return DeskLinkedRunProbe(run: nil, memoizedRunID: nil, scannedFinished: true)
+        }
+        return DeskLinkedRunProbe(run: finished, memoizedRunID: finished.id, scannedFinished: true)
+    }
+
+    /// Main-actor half of `resolveLinkedRun`: the roster-scan counter and the
+    /// remembered run id.
+    private func adoptLinkedRunProbe(_ probe: DeskLinkedRunProbe, botID: BotID) {
         // Roster dest used to scan 80 finished runs on every click when
         // lastLinkedRunID was unset. Remember the first hit.
-        deskFinishedRunScanCountForTesting += 1
-        guard let finished = (try? context.runRepo.listRecentFinished(limit: 80))?
-            .first(where: { $0.threadId == threadID }) else {
-            return nil
+        if probe.scannedFinished { deskFinishedRunScanCountForTesting += 1 }
+        if let memoizedRunID = probe.memoizedRunID {
+            lastLinkedRunIDByBot[botID] = memoizedRunID
         }
-        lastLinkedRunIDByBot[botID] = finished.id
-        return finished
     }
 
     private func appendDeskMessage(
@@ -9442,13 +9639,12 @@ public final class BotsViewModel: ObservableObject {
         try botStore.upsertConversation(working)
         lastStartedConversationByBot[working.botID] = working
         adoptFollowThroughConversation(working)
+        // The attention state settles into one roster pass (see
+        // applyAttentionState); repeating the hydration here paid two.
         applyAttentionState(
             for: working.botID,
             conversations: destConversations(botID: working.botID, patched: working)
         )
-        if screen == .activeBots {
-            reloadActiveBotsScreen()
-        }
         return working
     }
 
@@ -9529,6 +9725,13 @@ public final class BotsViewModel: ObservableObject {
             lastStartedConversationByBot[liveConversation.botID] = liveConversation
             adoptFollowThroughConversation(liveConversation)
         }
+        // The rail memo is filled per id and never re-read: a send that drifts
+        // the model on the existing thread must republish the row it wrote, or
+        // the chip keeps painting the model the thread had before this send.
+        deskThreadRailRoutingCache[thread.id] = BotDeskThreadRailRouting(
+            provider: thread.provider,
+            model: thread.model
+        )
         armExactRun(runID)
         return BotStartedRun(
             conversation: liveConversation,
@@ -10263,10 +10466,17 @@ public final class BotsViewModel: ObservableObject {
     /// Active Bots from the stale attention flag.
     public private(set) var followThroughApplyCountForTesting = 0
 
-    private func adoptLinkedRunTerminal(runId: AgentRunID, threadId: AgentThreadID) {
+    /// `false` only when this terminal already settled — the caller pairs its
+    /// Active Bots refresh with the `true` pass so the duplicate callback does
+    /// not re-run the roster queries.
+    @discardableResult
+    private func adoptLinkedRunTerminal(runId: AgentRunID, threadId: AgentThreadID) -> Bool {
         // BT-24: `didChangeStatus(terminal)` and `didFinish` both deliver the
         // same terminal; the second pass re-ran every restore + SQLite write.
-        guard settledTerminalRunIDByThread[threadId] != runId else { return }
+        // BT-28: that second pass also re-ran `refreshActiveBotCount()`
+        // (two roster queries + coordinator lock); the refresh rides the
+        // first settle now.
+        guard settledTerminalRunIDByThread[threadId] != runId else { return false }
         settledTerminalRunIDByThread[threadId] = runId
         if botStore.cachedBotID(linkedTo: threadId) == nil {
             if screen == .desk,
@@ -10275,7 +10485,7 @@ public final class BotsViewModel: ObservableObject {
                 restoreDeskWorkLog(botID: botID)
                 restoreDeskLiveTurn(botID: botID)
             }
-            return
+            return true
         }
         guard let conversation = try? botStore.conversationLinked(to: threadId) else {
             if screen == .desk,
@@ -10284,16 +10494,17 @@ public final class BotsViewModel: ObservableObject {
                 restoreDeskWorkLog(botID: botID)
                 restoreDeskLiveTurn(botID: botID)
             }
-            return
+            return true
         }
         let bot = bots.first(where: { $0.id == conversation.botID })
             ?? (try? botStore.get(id: conversation.botID))
         let run = try? context.runRepo.get(id: runId)
         if let bot {
             applyFollowThrough(bot: bot, conversation: conversation, run: run)
-            return
+            return true
         }
         reloadActiveBotsScreen()
+        return true
     }
 
     private func repairLegacyUserStopAttentionIfNeeded() {
@@ -10477,14 +10688,22 @@ extension BotsViewModel: BotPeerHandoffAuthorityObserver {
 
         let conversationIDs = [handoff.originConversationID, Optional(handoff.peerConversationID)]
             .compactMap { $0 }
+        var appliedStates = false
         for conversationID in conversationIDs {
             guard let conversation = try? botStore.conversation(id: conversationID) else { continue }
             adoptFollowThroughConversation(conversation)
             applyAttentionState(
                 for: conversation.botID,
-                conversations: destConversations(botID: conversation.botID, patched: conversation)
+                conversations: destConversations(botID: conversation.botID, patched: conversation),
+                reload: false
             )
             refreshPublishedIdentity(for: conversation.botID)
+            appliedStates = true
+        }
+        // One delta is one turn: the states above all landed before this pass,
+        // so Active Bots hydrates once instead of once per conversation.
+        if appliedStates {
+            reloadActiveBotsScreen()
         }
     }
 }
@@ -10584,14 +10803,16 @@ extension BotsViewModel: AgentRunObserver {
         providerThreadId: String?
     ) {
         Task { @MainActor [weak self] in
-            self?.resolveExactRunWaiters(
+            guard let self else { return }
+            self.resolveExactRunWaiters(
                 runID: runId,
                 threadID: threadId,
                 finalMessage: finalMessage,
                 providerThreadID: providerThreadId
             )
-            self?.adoptLinkedRunTerminal(runId: runId, threadId: threadId)
-            self?.refreshActiveBotCount()
+            if self.adoptLinkedRunTerminal(runId: runId, threadId: threadId) {
+                self.refreshActiveBotCount()
+            }
         }
     }
 
@@ -10604,8 +10825,9 @@ extension BotsViewModel: AgentRunObserver {
         Task { @MainActor [weak self] in
             guard let self else { return }
             if BotsDeskFollowThrough.isTerminal(status) {
-                self.adoptLinkedRunTerminal(runId: runId, threadId: threadId)
-                self.refreshActiveBotCount()
+                if self.adoptLinkedRunTerminal(runId: runId, threadId: threadId) {
+                    self.refreshActiveBotCount()
+                }
                 return
             }
             guard let botID = self.botStore.cachedBotID(linkedTo: threadId) else {

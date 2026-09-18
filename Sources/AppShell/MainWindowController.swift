@@ -17,6 +17,52 @@ protocol PaneKeyboardResizeHandling: AnyObject {
     func resizeFocusedPane(_ direction: SplitDirection) -> Bool
 }
 
+/// UX-MAC_SHELL_WINDOW-003/004: keyboard target resolution shared by the main
+/// window and the workspaces detached into their own windows. The keyboard
+/// command belongs to the workspace whose window owns it, so both classes
+/// resolve "the focused pane of *this* workspace" the same way: the workspace's
+/// focused pane, falling back to the first mounted pane.
+@MainActor
+private func keyboardTargetPane(in workspace: Workspace, controllers: [PaneTabsView]) -> PaneTabsView? {
+    let focusedPaneID = workspace.focusedPaneID ?? workspace.layout.paneIDs().first
+    guard let focusedPaneID else { return nil }
+    return controllers.first(where: { $0.pane.id == focusedPaneID }) ?? controllers.first
+}
+
+@MainActor
+private func closeKeyboardTargetSurface(in workspace: Workspace, controllers: [PaneTabsView]) -> Bool {
+    guard let controller = keyboardTargetPane(in: workspace, controllers: controllers) else { return false }
+    return controller.closeSelectedSurface()
+}
+
+@MainActor
+private func splitKeyboardTargetPane(
+    _ direction: SplitDirection,
+    in workspace: Workspace,
+    controllers: [PaneTabsView]
+) -> Bool {
+    guard let controller = keyboardTargetPane(in: workspace, controllers: controllers) else { return false }
+    // UX-P3: default to the active tab's surface type so ⌘D/⌘⇧] mirror
+    // what the mouse split-buttons would open. Fall back to Terminal when
+    // no surface is selected.
+    let selectedSurface = controller.pane.selectedSurfaceID
+        .flatMap { id in controller.pane.surfaces.first(where: { $0.id == id }) }
+        ?? controller.pane.surfaces.first
+    let splitType = selectedSurface?.type ?? .terminal
+    let splitTitle = PaneTabsView.surfaceChoices.first(where: { $0.1 == splitType })?.0 ?? "Terminal"
+    return controller.performSplit(direction, type: splitType, title: splitTitle) != nil
+}
+
+@MainActor
+private func resizeKeyboardTargetPane(
+    _ direction: SplitDirection,
+    in workspace: Workspace,
+    controllers: [PaneTabsView]
+) -> Bool {
+    guard let controller = keyboardTargetPane(in: workspace, controllers: controllers) else { return false }
+    return controller.performKeyboardPaneResize(direction: direction)
+}
+
 final class InteractiveTitlebarWindow: NSWindow {
     /// QA-MAC_SHELL_WINDOW-005: the interactive titlebar band height. The
     /// tab strip / header lives in the top `titlebarBandHeight` points of
@@ -814,7 +860,12 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
 	        panel.canChooseFiles = false
 	        panel.canChooseDirectories = true
 	        if panel.runModal() == .OK, let url = panel.url {
-	            _ = try? router?.createWorkspace(fromFolder: url)
+	            // Header "+" and empty-state "New Workspace" share the sidebar's
+	            // canonical add path: DEDUP-P2 (flash the existing workspace
+	            // instead of duplicating its cwd), File ▸ Open Recent, and a
+	            // visible failure when the folder cannot be added. Creating the
+	            // workspace here directly skipped all three.
+	            sidebar.createWorkspace(fromFolder: url)
 	        }
 	    }
 
@@ -954,54 +1005,66 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     /// UX-MAC_SHELL_WINDOW-003: close the focused pane's selected surface
     /// (with its unsaved-changes confirm). Returns false when there is no
     /// surface to close so ⌘W can fall back to closing the window.
+    ///
+    /// `window` is the window that owns the keyboard (`AppDelegate` passes
+    /// `NSApp.keyWindow`): a workspace detached into its own window owns its
+    /// own panes, so ⌘W must close the tab the user is looking at rather than
+    /// one in the main window behind it. `nil` keeps the main-window target.
     @discardableResult
-    public func closeFocusedSurface() -> Bool {
+    public func closeFocusedSurface(in window: NSWindow? = nil) -> Bool {
+        if let detached = detachedWindowController(owning: window) {
+            return detached.closeFocusedSurface()
+        }
+        // A key bot Desk/Guest window or an additional window presents no tab
+        // of the workspace behind it, and ⌘W belongs to that window (returning
+        // false closes it). Acting on `selectedWorkspaceID` here would close
+        // and delete the persisted history of a surface the user cannot see.
+        guard presentsWorkspacePanes(window) else { return false }
+        // A shell destination (Bots / Schedule Tasks / Active Threads) hides
+        // the workspace panes but keeps their controllers alive, so acting on
+        // `selectedWorkspaceID` here would close a surface the user cannot
+        // see — and that closes and deletes its persisted history.
+        guard shellContentMode == .workspace else { return false }
         guard let ctx = context,
               let wid = ctx.state.window.selectedWorkspaceID,
               let ws = ctx.state.workspaces[wid],
               !detachedWorkspaceIDs.contains(wid) else { return false }
-        let focusedPaneID = ws.focusedPaneID ?? ws.layout.paneIDs().first
-        guard let focusedPaneID,
-              let controller = paneControllers.first(where: { $0.pane.id == focusedPaneID })
-                ?? paneControllers.first else { return false }
-        return controller.closeSelectedSurface()
+        return closeKeyboardTargetSurface(in: ws, controllers: paneControllers)
     }
 
     /// UX-MAC_SHELL_WINDOW-004: split the focused pane (defaulting to a
     /// Terminal surface) via the keyboard. Returns false when there is no
-    /// focused pane controller to split.
+    /// focused pane controller to split. `window` follows the same
+    /// keyboard-owner rule as `closeFocusedSurface(in:)`.
     @discardableResult
-    public func splitFocusedPane(_ direction: SplitDirection) -> Bool {
+    public func splitFocusedPane(_ direction: SplitDirection, in window: NSWindow? = nil) -> Bool {
+        if let detached = detachedWindowController(owning: window) {
+            return detached.splitFocusedPane(direction)
+        }
+        // Same key-window rule as `closeFocusedSurface(in:)`: ⌘D over a bot or
+        // additional window must not split the workspace behind it.
+        guard presentsWorkspacePanes(window) else { return false }
+        // Same off-screen target rule as `closeFocusedSurface()`: ⌘D must not
+        // split a pane that a shell destination is covering.
+        guard shellContentMode == .workspace else { return false }
         guard let ctx = context,
               let wid = ctx.state.window.selectedWorkspaceID,
               let ws = ctx.state.workspaces[wid],
               !detachedWorkspaceIDs.contains(wid) else { return false }
-        let focusedPaneID = ws.focusedPaneID ?? ws.layout.paneIDs().first
-        guard let focusedPaneID,
-              let controller = paneControllers.first(where: { $0.pane.id == focusedPaneID })
-                ?? paneControllers.first else { return false }
-        // UX-P3: default to the active tab's surface type so ⌘D/⌘⇧] mirror
-        // what the mouse split-buttons would open. Fall back to Terminal when
-        // no surface is selected.
-        let selectedSurface = controller.pane.selectedSurfaceID
-            .flatMap { id in controller.pane.surfaces.first(where: { $0.id == id }) }
-            ?? controller.pane.surfaces.first
-        let splitType = selectedSurface?.type ?? .terminal
-        let splitTitle = PaneTabsView.surfaceChoices.first(where: { $0.1 == splitType })?.0 ?? "Terminal"
-        return controller.performSplit(direction, type: splitType, title: splitTitle) != nil
+        return splitKeyboardTargetPane(direction, in: ws, controllers: paneControllers)
     }
 
     @discardableResult
     public func resizeFocusedPane(_ direction: SplitDirection) -> Bool {
+        // Same off-screen target rule as `closeFocusedSurface()`. Detached
+        // windows never reach this entry point: their own
+        // `InteractiveTitlebarWindow` dispatches to their controller.
+        guard shellContentMode == .workspace else { return false }
         guard let ctx = context,
               let wid = ctx.state.window.selectedWorkspaceID,
               let ws = ctx.state.workspaces[wid],
               !detachedWorkspaceIDs.contains(wid) else { return false }
-        let focusedPaneID = ws.focusedPaneID ?? ws.layout.paneIDs().first
-        guard let focusedPaneID,
-              let controller = paneControllers.first(where: { $0.pane.id == focusedPaneID })
-                ?? paneControllers.first else { return false }
-        return controller.performKeyboardPaneResize(direction: direction)
+        return resizeKeyboardTargetPane(direction, in: ws, controllers: paneControllers)
     }
 
     public func repairSelectedTerminalFocus(reason: String) {
@@ -1090,6 +1153,46 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
 
     public func workspaceWindow(for workspaceID: WorkspaceID) -> NSWindow? {
         workspaceWindows[workspaceID]?.window
+    }
+
+    /// The detached workspace window that owns `window`, when `window` is one
+    /// of the workspaces detached into its own window. `nil` for the main
+    /// window, for `nil`, and for any other window (Settings, bot windows).
+    private func detachedWindowController(owning window: NSWindow?) -> WorkspaceWindowController? {
+        guard let window else { return nil }
+        return workspaceWindows.values.first { $0.window === window }
+    }
+
+    /// The workspace a detached window presents; `nil` for the main window, for
+    /// `nil`, and for any other window (Settings, bot windows).
+    private func detachedWorkspaceID(owning window: NSWindow?) -> WorkspaceID? {
+        guard let window else { return nil }
+        return workspaceWindows.first { $0.value.window === window }?.key
+    }
+
+    /// Whether the keyboard target `window` presents this controller's
+    /// workspace panes. `nil` and the main window do; a detached workspace
+    /// window does. A bot Desk/Guest window or an additional window does not:
+    /// it owns the keyboard but shows no tab of the workspace behind it, so
+    /// ⌘W/⌘D must fall through to that window instead of the hidden workspace.
+    /// Sheets and child windows keep the previous main-window target.
+    private func presentsWorkspacePanes(_ window: NSWindow?) -> Bool {
+        guard let window else { return true }
+        if window === self.window { return true }
+        if detachedWorkspaceID(owning: window) != nil { return true }
+        return window.sheetParent != nil || window.parent != nil
+    }
+
+    /// UX-MAC_SHELL_WINDOW-002/003: the workspace whose tabs ⌘⇧[ / ⌘⇧] / ⌘1..9
+    /// step through. The key window picks it, and `nil` means "no target": a
+    /// detached workspace window owns its own tabs, while a bot/additional
+    /// window owns none, so the command must not step the tabs of the workspace
+    /// behind it. A shell destination covering the workspace is refused for the
+    /// same reason as ⌘W/⌘D: the tabs are not on screen.
+    public func tabNavigationWorkspace(in window: NSWindow? = nil) -> WorkspaceID? {
+        if let detachedID = detachedWorkspaceID(owning: window) { return detachedID }
+        guard presentsWorkspacePanes(window), shellContentMode == .workspace else { return nil }
+        return context?.state.window.selectedWorkspaceID
     }
 
     public func isWorkspaceOpenInNewWindow(_ workspaceID: WorkspaceID) -> Bool {
@@ -2150,11 +2253,23 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate, PaneK
     @discardableResult
     func resizeFocusedPane(_ direction: SplitDirection) -> Bool {
         guard let ws = context?.state.workspaces[workspaceID] else { return false }
-        let focusedPaneID = ws.focusedPaneID ?? ws.layout.paneIDs().first
-        guard let focusedPaneID,
-              let controller = paneControllers.first(where: { $0.pane.id == focusedPaneID })
-                ?? paneControllers.first else { return false }
-        return controller.performKeyboardPaneResize(direction: direction)
+        return resizeKeyboardTargetPane(direction, in: ws, controllers: paneControllers)
+    }
+
+    /// UX-MAC_SHELL_WINDOW-003: ⌘W closes the focused tab of the window the
+    /// user is looking at, with the same unsaved-changes confirm the main
+    /// window uses. Returning false lets ⌘W fall back to closing the window.
+    @discardableResult
+    func closeFocusedSurface() -> Bool {
+        guard let ws = context?.state.workspaces[workspaceID] else { return false }
+        return closeKeyboardTargetSurface(in: ws, controllers: paneControllers)
+    }
+
+    /// UX-MAC_SHELL_WINDOW-004: ⌘D splits this window's focused pane.
+    @discardableResult
+    func splitFocusedPane(_ direction: SplitDirection) -> Bool {
+        guard let ws = context?.state.workspaces[workspaceID] else { return false }
+        return splitKeyboardTargetPane(direction, in: ws, controllers: paneControllers)
     }
 
     private func protectedFocusedView() -> NSView? {

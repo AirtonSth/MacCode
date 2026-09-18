@@ -104,6 +104,34 @@ final class SilentWakeOutboxTests: XCTestCase {
         XCTAssertTrue(try store.pending().isEmpty)
     }
 
+    func testUndecodableSnapshotIsDiscardedAndRewrittenByNextEnqueue() throws {
+        // WHY: a snapshot the decoder cannot read can never be delivered or
+        // acknowledged, and keeping it failed every enqueue/drain forever —
+        // wake delivery stayed wedged with no error the user could act on.
+        // Dropping it invents no acknowledgement; it just lets the next write
+        // persist a readable backlog again.
+        let (store, settings) = try makeStoreWithSettings()
+        try settings.set(
+            "silent_wake.outbox.v1",
+            "{\"schema\":\"from-a-newer-build\"}"
+        )
+
+        XCTAssertTrue(
+            try store.pending().isEmpty,
+            "an undecodable snapshot must read as an empty backlog, not a wedge"
+        )
+
+        try store.enqueue(
+            makeRecord(class: .attention, hostHint: "h", idempotencyKey: "k-recovered")
+        )
+
+        XCTAssertEqual(
+            try store.pending().map(\.idempotencyKey),
+            ["k-recovered"],
+            "the next enqueue must persist a readable snapshot"
+        )
+    }
+
     // MARK: - Outbox retry / flag
 
     func testOutboxRetriesWithSameIdempotencyKeyUntilSuccess() async throws {
@@ -292,7 +320,7 @@ final class SilentWakeOutboxTests: XCTestCase {
         let targetStore = PrivatePushTargetStore(repo: settings)
         let api = FailingThenSucceedingPrivateAccountAPI(failAlertCount: 100)
         accountStore.save(api.session)
-        targetStore.save(
+        try targetStore.save(
             pushToken: "apns-token",
             pushTokenType: "apns",
             liveActivityToken: nil,
@@ -351,7 +379,7 @@ final class SilentWakeOutboxTests: XCTestCase {
         let targetStore = PrivatePushTargetStore(repo: settings)
         let api = FailingThenSucceedingPrivateAccountAPI(failAlertCount: 100)
         accountStore.save(api.session)
-        targetStore.save(
+        try targetStore.save(
             pushToken: "apns-token",
             pushTokenType: "apns",
             liveActivityToken: nil,
@@ -388,12 +416,23 @@ final class SilentWakeOutboxTests: XCTestCase {
         now: @escaping () -> Date = { Date() },
         limits: SilentWakeOutboxLimits = SilentWakeOutboxLimits()
     ) throws -> SilentWakeOutboxStore {
+        try makeStoreWithSettings(now: now, limits: limits).store
+    }
+
+    private func makeStoreWithSettings(
+        now: @escaping () -> Date = { Date() },
+        limits: SilentWakeOutboxLimits = SilentWakeOutboxLimits()
+    ) throws -> (store: SilentWakeOutboxStore, settings: SettingsRepository) {
         let tmp = NSTemporaryDirectory() + "rc2-silent-wake-store-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
-        return SilentWakeOutboxStore(
-            settings: SettingsRepository(db: db),
-            now: now,
-            limits: limits
+        let settings = SettingsRepository(db: db)
+        return (
+            SilentWakeOutboxStore(
+                settings: settings,
+                now: now,
+                limits: limits
+            ),
+            settings
         )
     }
 

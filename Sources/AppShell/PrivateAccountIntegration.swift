@@ -648,6 +648,7 @@ public final class URLSessionPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
 }
 
 public final class PrivateAccountSessionStore: @unchecked Sendable {
+    private static let log = Logger(subsystem: "io.remotecode.app", category: "private-account")
     private let repo: SettingsRepository
     private let key = "private.account.session"
     private let decoder = JSONDecoder()
@@ -674,23 +675,37 @@ public final class PrivateAccountSessionStore: @unchecked Sendable {
         return try? decoder.decode(PrivateAccountSession.self, from: data)
     }
 
-    public func save(_ session: PrivateAccountSession) {
+    /// Returns whether the session reached settings. Every reader (`load()`)
+    /// goes through settings, so `false` means the sign-in is not durable —
+    /// callers with a user surface must say so instead of reporting success.
+    @discardableResult
+    public func save(_ session: PrivateAccountSession) -> Bool {
         guard let data = try? encoder.encode(session),
-              let json = String(data: data, encoding: .utf8) else { return }
+              let json = String(data: data, encoding: .utf8) else {
+            Self.log.error("private account session encode failed")
+            return false
+        }
         do {
             try repo.set(key, json)
             publishAccountChanged()
+            return true
         } catch {
-            return
+            Self.log.error("private account session save failed: \(String(describing: error), privacy: .public)")
+            return false
         }
     }
 
-    public func clear() {
+    /// Returns whether the stored session was removed. `false` leaves the old
+    /// session readable, so a caller must not paint a signed-out state.
+    @discardableResult
+    public func clear() -> Bool {
         do {
             try repo.set(key, "")
             publishAccountChanged()
+            return true
         } catch {
-            return
+            Self.log.error("private account session clear failed: \(String(describing: error), privacy: .public)")
+            return false
         }
     }
 
@@ -826,8 +841,18 @@ public final class PrivatePushTargetStore: @unchecked Sendable {
     /// delivery. **Never clobbers a stored Live Activity token with nil/empty** —
     /// iOS often re-registers APNs alert tokens without re-sending the push-to-
     /// start token (especially after a Mac app update when the phone stays idle).
-    public func save(pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceId: String?) {
-        let previous = load()
+    /// Throws when the settings store cannot be read or written: swallowing the
+    /// failure let `privatePushTokenUpdate` answer `{"ok": true}` to iOS while no
+    /// push target was persisted.
+    public func save(pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceId: String?) throws {
+        // A swallowed read failure would drop `previous` and clear the stored
+        // Live Activity token with nil — the case the contract above forbids.
+        let previous: PrivatePushTarget?
+        if let json = try repo.get(key), let data = json.data(using: .utf8) {
+            previous = try? decoder.decode(PrivatePushTarget.self, from: data)
+        } else {
+            previous = nil
+        }
         let resolvedLiveActivityToken: String?
         if let liveActivityToken, !liveActivityToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             resolvedLiveActivityToken = liveActivityToken
@@ -847,9 +872,8 @@ public final class PrivatePushTargetStore: @unchecked Sendable {
             pushTokenType: pushTokenType,
             updatedAt: Date()
         )
-        guard let data = try? encoder.encode(target),
-              let json = String(data: data, encoding: .utf8) else { return }
-        try? repo.set(key, json)
+        let data = try encoder.encode(target)
+        try repo.set(key, String(decoding: data, as: UTF8.self))
     }
 
     public func clear() {

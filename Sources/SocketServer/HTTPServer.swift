@@ -1535,6 +1535,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     static let maximumAcceptedConnections = AcceptedSocketRegistry.defaultMaximumDescriptors
     var acceptedSocketCountForTests: Int { acceptedSockets.count }
+    /// Test seam: descriptors still bound to an owner fingerprint. A closed
+    /// connection must never leave a binding behind — revoke shuts down every
+    /// descriptor an owner still maps, and descriptor numbers are recycled.
+    var httpOwnerBoundDescriptorCountForTests: Int { activeHTTPOwnerConnections.descriptorCount }
     var afterWelcomeWriteForTests: ((String) -> Void)?
     /// Test seam: fires once per WS upgrade with the coalescing window (ms)
     /// that is passed as `WebSocketEventBatcher.delay` after header negotiation.
@@ -3370,6 +3374,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
             handedOff = true
             let ae = headers["accept-encoding"]
             let registry = acceptedSockets
+            // PERF-114 hand-off: this Task owns the fd and closes it directly on
+            // its non-keep-alive exits, so it must drop the owner binding too.
+            // A stale binding survives close(2) and lets a later revoke
+            // SHUT_RDWR a recycled descriptor that now belongs to another peer.
+            let ownerRegistry = activeHTTPOwnerConnections
             let rpcLeftover = leftoverBuffer
             let rpcClientClose = clientRequestsClose
             // Scheduler admission only: bulk snapshot/replay runs at utility
@@ -3379,6 +3388,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let admitStarted = DispatchTime.now().uptimeNanoseconds
             Task(priority: rpcTaskPriority) { [weak self] in
                 guard let self else {
+                    ownerRegistry.unbind(fd)
                     registry.close(fd)
                     return
                 }
@@ -3395,6 +3405,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 let watchdog = Task {
                     while !Task.isCancelled {
                         if !registry.isActive(fd) || !Self.isRPCPeerConnected(fd: fd) {
+                            ownerRegistry.unbind(fd)
                             registry.close(fd)
                             work.cancel()
                             return
@@ -3411,6 +3422,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 _ = await watchdog.result
                 guard registry.isActive(fd) else {
                     self.requestPhaseMetrics.recordCancelled()
+                    ownerRegistry.unbind(fd)
                     registry.close(fd)
                     return
                 }
@@ -3428,10 +3440,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 )
                 if !wrote {
                     self.requestPhaseMetrics.recordWriteAborted()
+                    ownerRegistry.unbind(fd)
                     registry.close(fd)
                     return
                 }
                 if rpcClientClose || !registry.isActive(fd) {
+                    ownerRegistry.unbind(fd)
                     registry.close(fd)
                     return
                 }
@@ -5091,6 +5105,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 // The iOS background callback is deliberately untrusted and
                 // always confirms via authenticated GET. Avoid spending weak
                 // cellular downlink on 50 redundant status envelopes.
+                // `send` emits Content-Length itself; a caller-supplied copy
+                // would duplicate the header on a 204 (RFC 7230 §3.3.2).
                 send(
                     fd: fd,
                     status: 204,
@@ -5098,7 +5114,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     body: Data(),
                     additionalHeaders: [
                         "Cache-Control": "no-store",
-                        "Content-Length": "0",
                     ]
                 )
 

@@ -261,8 +261,14 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.createThread(title: "auth retry")
         vm.prompt = "resume only after auth"
         await vm.send()
+        // Terminal, not `.completed`: CapturingProviderRunner captures requests and
+        // emits no assistant output, and ProviderStderrClassifier reclassifies a silent
+        // `.completed` to `.failed` by contract ("a success with no assistant output is
+        // not success"). Waiting on `.completed` could never settle, which hid the
+        // retry contract this spec is about.
         await waitAsync("initial request completes") {
-            runner.prompts == ["resume only after auth"] && vm.status == .completed
+            runner.prompts == ["resume only after auth"]
+                && AgentRunCoordinator.isTerminalThreadStatus(vm.status)
         }
 
         func authSnapshot(_ authenticated: Bool) -> AgentProviderSnapshot {
@@ -1696,7 +1702,7 @@ final class AgentAppViewModelTests: XCTestCase {
                        "macOS Agent App must surface provider questions so the user can unblock Codex/Claude")
     }
 
-    func test_selectThreadRehydratesPersistedStaleCallbacksIntoTimeline() throws {
+    func test_selectThreadRehydratesPersistedStaleCallbacksIntoTimeline() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-callback-rehydrate-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -1732,6 +1738,7 @@ final class AgentAppViewModelTests: XCTestCase {
                                    pendingCallbackRepo: callbackRepo)
 
         vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
 
         XCTAssertEqual(vm.timeline.pendingRequests.first?.state, .stale,
                        "persisted stale approvals must remain in timeline state for diagnostics after restart/reload")
@@ -1802,6 +1809,7 @@ final class AgentAppViewModelTests: XCTestCase {
                                    threadRepo: threadRepo,
                                    messageRepo: messageRepo)
         vm.createThread(title: "callbacks")
+        await vm.waitForSelectThreadHydrationForTesting()
         vm.timeline.apply(.requestOpened(AssistantPendingRequest(
             id: "approval-1",
             turnId: "turn-1",
@@ -2380,6 +2388,7 @@ final class AgentAppViewModelTests: XCTestCase {
         let adapter = CapturingProviderAdapter(provider: .codex)
         let (vm, _) = try makeVM(adapter: adapter)
         vm.createThread(title: "relaunch")
+        await vm.waitForSelectThreadHydrationForTesting()
         let approval = AssistantPendingRequest(
             id: "stale-approval",
             turnId: "turn-old",
@@ -3022,7 +3031,7 @@ final class AgentAppViewModelTests: XCTestCase {
         }
     }
 
-    func test_reloadThreadsBackfillsPlaceholderTitleFromFirstUserMessage() throws {
+    func test_reloadThreadsBackfillsPlaceholderTitleFromFirstUserMessage() async throws {
         let (vm, repo) = try makeVM()
         let thread = AgentThread(workspaceId: vm.workspaceID, title: "Thread", provider: .claude, model: "fake-model")
         try repo.upsert(thread)
@@ -3030,6 +3039,7 @@ final class AgentAppViewModelTests: XCTestCase {
         try vm.messageRepo.append(AgentMessage(threadId: thread.id, role: .user, content: firstMessage))
 
         vm.reloadThreads()
+        await vm.awaitTitleRepairForTesting()
 
         XCTAssertEqual(vm.threads.first(where: { $0.id == thread.id })?.title, firstMessage,
                        "existing placeholder threads must be repaired from the first user message")
@@ -4390,10 +4400,12 @@ final class AgentAppViewModelTests: XCTestCase {
         await vm.send()
         vm.prompt = "inspect before editing"
         await vm.send()
+        // Terminal, not `.completed`: the capture-only double emits no assistant
+        // output, so the classifier resolves its silent finish to `.failed`.
         await waitAsync("plan mode reaches runner and completes") {
             runner.interactionModes.contains(.plan) &&
             runner.prompts.last == "inspect before editing" &&
-            vm.status == .completed
+            AgentRunCoordinator.isTerminalThreadStatus(vm.status)
         }
 
         vm.prompt = "/default"
@@ -4784,7 +4796,7 @@ final class AgentAppViewModelTests: XCTestCase {
         return rep.representation(using: .png, properties: [:])
     }
 
-    func test_selectThread_marksItRead() throws {
+    func test_selectThread_marksItRead() async throws {
         let (vm, repo) = try makeVM()
         vm.createThread(title: "a")
         let a = vm.selectedThreadId!
@@ -4796,6 +4808,7 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.threads.first { $0.id == a }?.hasUnread ?? false)
         vm.selectThread(b)
         vm.selectThread(a)
+        await vm.waitForSelectThreadHydrationForTesting()
         XCTAssertEqual(try repo.get(id: a)?.hasUnread, false,
                        "opening a thread must clear its unread flag in the store")
         XCTAssertFalse(vm.threads.first { $0.id == a }?.hasUnread ?? true,
@@ -6815,6 +6828,7 @@ final class AgentAppViewModelTests: XCTestCase {
                                            messageRepo: messageRepo)
         reloadedVM.selectThread(streamedThread)
         await reloadedVM.waitForMessageHistoryLoad()
+        await reloadedVM.waitForSelectThreadHydrationForTesting()
 
         XCTAssertTrue(reloadedVM.timeline.turns.flatMap(\.items).contains {
             $0.type == .assistantMessage && $0.body.contains("partial stream")
@@ -6856,6 +6870,7 @@ final class AgentAppViewModelTests: XCTestCase {
                                            coordinator: coordinator, threadRepo: threadRepo,
                                            messageRepo: messageRepo)
         reloadedVM.selectThread(streamedThread)
+        await reloadedVM.waitForSelectThreadHydrationForTesting()
 
         XCTAssertEqual(reloadedVM.contextHealthMessage, "Context 50% · 500 / 1000 tokens · auto-compacts · compacted",
                        "reopening a thread after app restart must replay persisted token/compaction telemetry so long-run context pressure stays visible")
@@ -7645,7 +7660,7 @@ final class AgentAppViewModelTests: XCTestCase {
         restartedAdapter.stopAll()
     }
 
-    func test_selectThreadRehydratesPersistedProposedPlansForMainTimeline() throws {
+    func test_selectThreadRehydratesPersistedProposedPlansForMainTimeline() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-plan-rehydrate-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -7671,6 +7686,7 @@ final class AgentAppViewModelTests: XCTestCase {
                                    proposedPlanRepo: proposedPlanRepo)
 
         vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
 
         XCTAssertEqual(vm.timeline.proposedPlans.map(\.id), ["plan-1"])
         XCTAssertEqual(vm.latestPlanText, "1. Inspect\n2. Patch",
@@ -7894,6 +7910,7 @@ final class AgentAppViewModelTests: XCTestCase {
             binaryPath: "/usr/local/bin/codex"
         )]
         vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
         vm.timeline.apply(.error(message: "Previous provider failure", recoverable: true))
 
         await vm.implementLatestPlan()
@@ -7947,6 +7964,7 @@ final class AgentAppViewModelTests: XCTestCase {
             binaryPath: "/usr/local/bin/codex"
         )]
         vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
         try db.execute("DROP TABLE agent_proposed_plans;")
 
         await vm.implementLatestPlan()
@@ -8097,7 +8115,7 @@ final class AgentAppViewModelTests: XCTestCase {
                       "unimplemented plan stays reviewable for explicit Approve/auto paths")
     }
 
-    func test_supervisedKeepsProposedPlanReviewable() throws {
+    func test_supervisedKeepsProposedPlanReviewable() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-plan-supervised-review-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -8131,6 +8149,7 @@ final class AgentAppViewModelTests: XCTestCase {
         )
         installRunnableProviderFixtures(on: vm)
         vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
         vm.permissionMode = .supervised
         XCTAssertFalse(vm.suppressesProposedPlanReview)
         XCTAssertNotNil(vm.reviewableProposedPlan)
@@ -8384,6 +8403,7 @@ final class AgentAppViewModelTests: XCTestCase {
             capabilitiesOverride: AgentProviderCapabilities(supportsStreaming: true, supportsPlanReview: true)
         )]
         vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
 
         await vm.rejectLatestPlan()
 
@@ -8396,7 +8416,7 @@ final class AgentAppViewModelTests: XCTestCase {
                      "rejecting a plan must not mark it implemented")
     }
 
-    func test_saveLatestProposedPlanWritesMarkdownFile() throws {
+    func test_saveLatestProposedPlanWritesMarkdownFile() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-plan-save-" + UUID().uuidString
         try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(atPath: tmp) }
@@ -8424,8 +8444,11 @@ final class AgentAppViewModelTests: XCTestCase {
                                    messageRepo: messageRepo,
                                    proposedPlanRepo: proposedPlanRepo)
         vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
 
-        let url = URL(fileURLWithPath: tmp).appendingPathComponent(vm.latestProposedPlan!.exportFileName)
+        let plan = try XCTUnwrap(vm.latestProposedPlan,
+                                 "opening a thread must rehydrate its durable proposed plan")
+        let url = URL(fileURLWithPath: tmp).appendingPathComponent(plan.exportFileName)
         try vm.saveLatestProposedPlan(to: url)
 
         XCTAssertEqual(try String(contentsOf: url), markdown,
@@ -8886,7 +8909,7 @@ final class AgentAppViewModelTests: XCTestCase {
                        "selected unsent input remains preserved during deleted-many recovery")
     }
 
-    func test_selectThread_rejectsRepositoryMissingStaleRailRow() throws {
+    func test_selectThread_rejectsRepositoryMissingStaleRailRow() async throws {
         let (vm, threadRepo) = try makeVM()
         let deleted = AgentThread(workspaceId: vm.workspaceID, title: "stale rail", provider: .claude, model: "m")
         try threadRepo.upsert(deleted)
@@ -8901,13 +8924,47 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.threads.contains(where: { $0.id == deleted.id }),
                       "precondition: the failed cross-process reconciliation leaves a stale rail snapshot")
         let reloadFailureStatus = vm.statusMessage
+        vm.seedAdditionalThreadCachesForTesting(deleted.id)
 
         vm.selectThread(deleted.id, markRead: false)
+        await vm.waitForSelectThreadHydrationForTesting()
 
         XCTAssertNil(vm.selectedThreadId,
                      "repository absence must win over stale in-memory rail membership")
         XCTAssertEqual(vm.statusMessage, reloadFailureStatus,
                        "a missing stale row must not overwrite the more relevant reload failure")
+        XCTAssertFalse(vm.threads.contains(where: { $0.id == deleted.id }),
+                       "a stale rail row the store no longer backs must be dropped, not left clickable")
+        XCTAssertFalse(vm.threadCacheResidueForTesting.contains(deleted.id),
+                       "retiring an unbacked rail row must evict its per-thread caches")
+    }
+
+    func test_selectThread_rejectsRailRowThatNowBelongsToAnotherWorkspace() async throws {
+        let (vm, threadRepo) = try makeVM()
+        let moved = AgentThread(workspaceId: vm.workspaceID, title: "moved row", provider: .claude, model: "m")
+        try threadRepo.upsert(moved)
+        vm.reloadThreads()
+        XCTAssertTrue(vm.threads.contains(where: { $0.id == moved.id }),
+                      "precondition: the row is painted on this workspace's rail")
+        // Durable rows never change workspace in place, so re-create the row under
+        // another workspace: the rail snapshot is now the stale half of the pair.
+        var reassigned = moved
+        reassigned.workspaceId = WorkspaceID()
+        try threadRepo.delete(id: moved.id)
+        try threadRepo.upsert(reassigned)
+        vm.seedAdditionalThreadCachesForTesting(moved.id)
+
+        vm.selectThread(moved.id, markRead: false)
+        await vm.waitForSelectThreadHydrationForTesting()
+
+        XCTAssertNil(vm.selectedThreadId,
+                     "a rail row whose durable owner is another workspace must not stay bound")
+        XCTAssertTrue(vm.statusMessage.contains("another workspace"),
+                      "cross-workspace rail rows must fail loud")
+        XCTAssertFalse(vm.threads.contains(where: { $0.id == moved.id }),
+                       "the cross-workspace rail row must be dropped from this surface")
+        XCTAssertFalse(vm.threadCacheResidueForTesting.contains(moved.id),
+                       "a cross-workspace rail row must not keep per-thread caches alive")
     }
 
     func test_selectThread_repositoryFallbackCachesLocalOwnershipAndRejectsForeignRow() throws {

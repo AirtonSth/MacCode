@@ -11,6 +11,11 @@ import SocketServer
 
 public extension Notification.Name {
     static let rc2TokenSaverUsageChanged = Notification.Name("rc2TokenSaverUsageChanged")
+    /// Posted by AppContext only when the provider-account usage refresh reaches
+    /// its terminal state. `rc2TokenSaverUsageChanged` is too broad for that
+    /// job: local paths (enable toggle, `savings_recorded`) post it without
+    /// querying any provider, so it can never prove the probe finished.
+    static let rc2TokenSaverAccountUsageSettled = Notification.Name("rc2TokenSaverAccountUsageSettled")
     /// Posted by AppDelegate's "Toggle Token Saver" menu item (Cmd+Shift+S).
     /// SidebarViewModel observes this and calls setTokenSaverEnabled(!tokenSaverEnabled).
     static let rc2TokenSaverToggle = Notification.Name("rc2TokenSaverToggle")
@@ -156,11 +161,18 @@ public final class SidebarViewModel: ObservableObject {
     /// free disk space. Covers the partial download file and manifest write.
     nonisolated public static let downloadDiskMarginBytes: Int64 = 200_000_000
 
+    /// Sentinel for "the volume query failed" from `volumeFreeDiskBytes()`.
+    /// Free bytes can never be negative, so -1 is unambiguously unknown rather
+    /// than a full disk.
+    nonisolated public static let unknownFreeDiskBytes: Int64 = -1
+
     /// Pure seam: decides whether a multi-GB download may proceed based solely
     /// on arithmetic over byte counts.  No I/O, no UI.
     ///
     /// Returns `.insufficientDisk` when `freeDiskBytes` is less than
-    /// `modelBytes + downloadDiskMarginBytes`. Returns `.confirm` otherwise.
+    /// `modelBytes + downloadDiskMarginBytes`. Returns `.confirm` otherwise,
+    /// including for `unknownFreeDiskBytes`: a volume the probe could not read
+    /// must not be presented as a full disk.
     ///
     /// WHY this exists as a separate function: an accidental click on the
     /// Token Saver card must not silently start a multi-GB download, and a
@@ -169,7 +181,8 @@ public final class SidebarViewModel: ObservableObject {
         modelBytes: Int64,
         freeDiskBytes: Int64
     ) -> DownloadConfirmDecision {
-        freeDiskBytes < modelBytes + downloadDiskMarginBytes ? .insufficientDisk : .confirm
+        guard freeDiskBytes >= 0 else { return .confirm }
+        return freeDiskBytes < modelBytes + downloadDiskMarginBytes ? .insufficientDisk : .confirm
     }
 
     /// Human-readable size string for `approvedModelEstimatedBytes`, e.g. "3.8 GB".
@@ -418,7 +431,17 @@ public final class SidebarViewModel: ObservableObject {
     /// :18 -- Edge auto-scroll direction during a drag. -1 = scroll up (near top),
     /// 0 = no scroll, +1 = scroll down (near bottom). Set by WorkspaceDropDelegate;
     /// observed by SidebarRootView to drive a timer-based NSScrollView scroll.
-    @Published public var dragScrollEdge: Int = 0
+    ///
+    /// `dropUpdated` reports the same direction on every drag tick (60-120 Hz)
+    /// while the pointer stays in the edge zone, and `@Published` would rebuild
+    /// the sidebar body on each of those identical writes. Same-value dedupe as
+    /// `AgentComposerState.cursorOffset` (AA-13).
+    public var dragScrollEdge: Int = 0 {
+        willSet {
+            guard newValue != dragScrollEdge else { return }
+            objectWillChange.send()
+        }
+    }
     private var selectionAnchorID: WorkspaceID?
     /// Session-local undo stack for removed workspaces. Newest entry at end.
     /// Not persisted; cleared on app quit.
@@ -1143,7 +1166,7 @@ public final class SidebarViewModel: ObservableObject {
         guard privateAccountUser != nil else { return }
         tokenSaverAccountUsageIsRefreshing = true
         publishTokenSaverWidgetDigest()
-        // Fire-and-forget: kick the refresh, then observe the usage-changed
+        // Fire-and-forget: kick the refresh, then observe the settle
         // notification to detect completion.  A 90-second timeout ensures the
         // spinner stops even when the CLI probe hangs or the notification is
         // never posted (e.g. signed-out race).
@@ -1153,7 +1176,7 @@ public final class SidebarViewModel: ObservableObject {
             let done = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
                 // One-shot notification observer -- resumes with true on completion.
                 observer = NotificationCenter.default.addObserver(
-                    forName: .rc2TokenSaverUsageChanged,
+                    forName: .rc2TokenSaverAccountUsageSettled,
                     object: nil,
                     queue: .main
                 ) { _ in
@@ -1449,6 +1472,32 @@ public final class SidebarViewModel: ObservableObject {
         tokenSaverInstalledModelSizeCache = TokenSaverInstalledModelSizeCache(url: url, bytes: bytes)
     }
 
+    /// :186 -- Removes the installed Distill model directory and records the
+    /// reclaimed bytes in the installed-size cache. Returns the underlying error
+    /// and drops the cache while the directory survives the removal, so the row
+    /// re-measures what is really on disk instead of claiming a size (or 0
+    /// bytes) for a model that was not fully deleted.
+    @discardableResult
+    func removeInstalledTokenSaverModel(
+        at url: URL,
+        fileManager: FileManager = .default
+    ) -> Error? {
+        do {
+            try fileManager.removeItem(at: url)
+        } catch {
+            if fileManager.fileExists(atPath: url.path) {
+                // A recursive removal can delete the contents and still fail to
+                // unlink the directory, so the surviving size is not knowable
+                // here: force the next read to measure it.
+                invalidateInstalledTokenSaverModelBytes()
+                return error
+            }
+            // Already gone (removed concurrently): recording 0 below is correct.
+        }
+        recordInstalledTokenSaverModelBytes(0, at: url)
+        return nil
+    }
+
     private func validateTokenSaverModel(requireSelectedModel: Bool = false) -> TokenSaverModelValidation {
         if let tokenSaverModelValidationProvider {
             return tokenSaverModelValidationProvider()
@@ -1621,9 +1670,9 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     /// Returns the number of free bytes on the volume that hosts the home
-    /// directory, or 0 when the query fails. Used only for disk-space checks
-    /// before the download confirm dialog; the real disk write can still fail
-    /// if space changes between the check and the download.
+    /// directory, or `unknownFreeDiskBytes` when the query fails. Used only for
+    /// disk-space checks before the download confirm dialog; the real disk write
+    /// can still fail if space changes between the check and the download.
     nonisolated public static func volumeFreeDiskBytes() -> Int64 {
         let url = URL(fileURLWithPath: NSHomeDirectory())
         let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
@@ -1635,7 +1684,7 @@ public final class SidebarViewModel: ObservableObject {
         if let available = basic?.volumeAvailableCapacity {
             return Int64(available)
         }
-        return 0
+        return unknownFreeDiskBytes
     }
 
     /// Blocking NSAlert confirmation shown before a multi-GB Token Saver model
@@ -1763,7 +1812,15 @@ public final class SidebarViewModel: ObservableObject {
         isBotsSelected = false
         // UX-SIDEBAR-COMPLETED-DOT: opening a workspace clears its completed dot.
         completedWorkspaces.remove(wid)
-        try? router?.selectWorkspace(wid)
+        do {
+            try router?.selectWorkspace(wid)
+        } catch {
+            // WHY: the highlight above is painted before the router call so a row
+            // click feels immediate. A rejected select (stale row closed underneath
+            // this list) must not leave that optimistic highlight claiming a
+            // selection the app never made — snap the sidebar back to host truth.
+            reload()
+        }
         onWorkspaceContentActivated?()
     }
 
@@ -1854,8 +1911,28 @@ public final class SidebarViewModel: ObservableObject {
             reload()
             return true
         } catch {
+            // WHY: a stale File ▸ Open Recent entry, or a folder moved/deleted
+            // between the panel and the drop, used to close the panel and do
+            // nothing at all — no row, no error, no explanation.
+            operationErrorPresenter(
+                "Could not add \(url.lastPathComponent)",
+                Self.addWorkspaceFailureDetail(for: error)
+            )
             return false
         }
+    }
+
+    /// User-facing reason a folder could not be added.
+    ///
+    /// `LayoutError` has no `LocalizedError` conformance, so using
+    /// `error.localizedDescription` directly would surface only
+    /// "The operation couldn't be completed. (CoreModel.LayoutError error 0.)"
+    /// for the one failure this path actually hits.
+    nonisolated public static func addWorkspaceFailureDetail(for error: Error) -> String {
+        if let layoutError = error as? LayoutError, layoutError == .workspaceNotFound {
+            return "That folder no longer exists. It may have been moved, renamed or deleted."
+        }
+        return error.localizedDescription
     }
 
     /// Pure helper: returns the ID of the first workspace in `workspaces`
@@ -2350,7 +2427,7 @@ public final class SidebarViewModel: ObservableObject {
         }
     }
 
-    private func showOperationError(_ message: String, detail: String) {
+    func showOperationError(_ message: String, detail: String) {
         operationErrorPresenter(message, detail)
     }
 
@@ -3028,6 +3105,14 @@ public struct SidebarRootView: View {
         .task {
             await tokenSaverDailyRolloverClock()
         }
+        // :18 -- The edge-scroll timer holds the ScrollViewProxy and is only
+        // invalidated by the next dragScrollEdge change. If the sidebar goes
+        // away mid-drag (window close, Agentic/Bots switch) nothing resets that
+        // edge, so the 16 Hz timer would keep running against a dead view.
+        .onDisappear {
+            dragScrollTimer?.invalidate()
+            dragScrollTimer = nil
+        }
     }
 
     @MainActor
@@ -3347,6 +3432,8 @@ public struct SidebarRootView: View {
     // validation cache) after an NSAlert confirmation.
     // Guard: only called from the delete button which is only shown when
     // !tokenSaverEnabled, so we never delete a live or downloading model.
+    // A removal that fails surfaces the error instead of clearing the cached
+    // size for a directory that is still on disk.
     private func deleteTokenSaverModel() {
         guard !vm.tokenSaverEnabled else { return }
         guard let ctx = vm.context else { return }
@@ -3360,8 +3447,12 @@ public struct SidebarRootView: View {
         alert.addButton(withTitle: "Delete")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        try? FileManager.default.removeItem(at: installer.distillDirectory)
-        vm.recordInstalledTokenSaverModelBytes(0, at: installer.distillDirectory)
+        if let error = vm.removeInstalledTokenSaverModel(at: installer.distillDirectory) {
+            vm.showOperationError(
+                "Could not delete Token Saver model",
+                detail: error.localizedDescription
+            )
+        }
     }
 
     private var tokenSaverPillText: String {
@@ -5764,6 +5855,15 @@ public final class SidebarView: NSObject {
 
     public func refresh() {
         viewModel.reload()
+    }
+
+    /// Canonical workspace-add path for shell-level entry points such as the
+    /// header "+" and the empty-state button: DEDUP-P2, File ▸ Open Recent and
+    /// the failure sheet all live in the view model, so creating the workspace
+    /// anywhere else silently duplicates a cwd and hides failures.
+    @discardableResult
+    public func createWorkspace(fromFolder url: URL) -> Bool {
+        viewModel.createWorkspace(fromFolder: url)
     }
 
     public func disableInsomniaForAppClose() {

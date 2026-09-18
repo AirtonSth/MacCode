@@ -170,4 +170,131 @@ final class CheckpointSnapshotDecisionTests: XCTestCase {
             "captureFileSnapshots must FileHandle-prefix at cap+1"
         )
     }
+
+    // MARK: - CKPT-BUDGET: per-checkpoint total snapshot budget
+
+    /// Replays the capture loop's exact fold: per-file decision + running
+    /// budget decremented only by snapshotted bytes.
+    private func replay(
+        _ entries: [(bytes: Int, binary: Bool)],
+        cap: Int = AgentRunCoordinator.checkpointSnapshotByteCap,
+        total: Int = AgentRunCoordinator.checkpointSnapshotTotalByteCap
+    ) -> (decisions: [AgentRunCoordinator.CheckpointSnapshotDecision], storedBytes: Int, remaining: Int) {
+        var remaining = total
+        var stored = 0
+        var decisions: [AgentRunCoordinator.CheckpointSnapshotDecision] = []
+        for entry in entries {
+            let decision = AgentRunCoordinator.checkpointSnapshotBudgetDecision(
+                byteCount: entry.bytes,
+                isBinary: entry.binary,
+                remainingBudget: remaining,
+                cap: cap,
+                hash: { "hash-\(entry.bytes)" }
+            )
+            if decision == .snapshot { remaining -= entry.bytes; stored += entry.bytes }
+            decisions.append(decision)
+        }
+        return (decisions, stored, remaining)
+    }
+
+    // WHY: the per-file cap alone bounded each file, not the turn. A turn that
+    // rewrites many at-cap text files wrote a multi-MiB row every time; the
+    // checkpoint table is the largest in the owner's live store (176 MB of
+    // file_snapshots_json) and 66 rows over 500 KB held 66% of it.
+    func test_manyAtCapFiles_stayWithinCheckpointTotalBudget() {
+        let cap = 1 << 20
+        let total = 1 << 20
+        let entries = Array(repeating: (bytes: cap, binary: false), count: 12)
+        let result = replay(entries, cap: cap, total: total)
+        XCTAssertEqual(result.storedBytes, total, "12 at-cap files must not store 12 MiB")
+        XCTAssertLessThanOrEqual(result.remaining, 0, "budget must be spent, not overrun")
+        XCTAssertEqual(result.decisions.first, .snapshot, "the first file still snapshots exactly")
+        XCTAssertEqual(
+            result.decisions.filter { if case .skipMarker = $0 { return true } else { return false } }.count,
+            11,
+            "the remaining 11 files take the nil-content marker path"
+        )
+    }
+
+    // WHY: a rejected large file must not end the turn's snapshots -- smaller
+    // files after it still fit the leftover budget and keep exact restore.
+    func test_laterSmallFileStillSnapshotsAfterLargeFileIsRejected() {
+        let result = replay(
+            [(bytes: 800, binary: false), (bytes: 300, binary: false), (bytes: 100, binary: false)],
+            cap: 1 << 20,
+            total: 1_000
+        )
+        XCTAssertEqual(result.decisions[0], .snapshot)
+        XCTAssertEqual(result.decisions[1], .skipMarker(hash: "hash-300"))
+        XCTAssertEqual(result.decisions[2], .snapshot, "100 bytes still fit the 200 left")
+        XCTAssertEqual(result.storedBytes, 900)
+        XCTAssertEqual(result.remaining, 100)
+    }
+
+    // Boundary is inclusive, matching the per-file cap: a file that needs
+    // exactly the remaining budget is snapshotted, and the next byte is not.
+    func test_fileExactlyAtRemainingBudget_snapshotsThenExhausts() {
+        let cap = 1 << 20
+        let result = replay([(bytes: 500, binary: false), (bytes: 1, binary: false)], cap: cap, total: 500)
+        XCTAssertEqual(result.decisions[0], .snapshot)
+        XCTAssertEqual(result.remaining, 0)
+        XCTAssertEqual(result.decisions[1], .skipMarker(hash: "hash-1"))
+    }
+
+    // WHY: the budget must only remove bytes, never re-admit what the P2 rule
+    // already refuses -- binary and oversized files skip for their own reason.
+    func test_budgetNeverReAdmitsBinaryOrOversizedFiles() {
+        let cap = 64
+        let result = replay(
+            [(bytes: 16, binary: true), (bytes: cap + 1, binary: false), (bytes: 16, binary: false)],
+            cap: cap,
+            total: 1 << 20
+        )
+        XCTAssertEqual(result.decisions[0], .skipMarker(hash: "hash-16"))
+        XCTAssertEqual(result.decisions[1], .skipMarker(hash: "hash-\(cap + 1)"))
+        XCTAssertEqual(result.decisions[2], .snapshot)
+        XCTAssertEqual(result.storedBytes, 16)
+    }
+
+    // WHY: normal turns (median checkpoint is <10 KB of changed text) must be
+    // untouched; the budget exists for the tail, not to shrink ordinary turns.
+    func test_smallCheckpointWithManyFiles_isUnaffectedByBudget() {
+        let result = replay(Array(repeating: (bytes: 4_096, binary: false), count: 40))
+        XCTAssertEqual(result.decisions.filter { $0 == .snapshot }.count, 40)
+        XCTAssertEqual(result.remaining, (1 << 20) - 40 * 4_096)
+    }
+
+    func test_checkpointSnapshotTotalByteCap_isOneMebibyte() {
+        XCTAssertEqual(
+            AgentRunCoordinator.checkpointSnapshotTotalByteCap, 1 << 20,
+            "one checkpoint stores at most 1 MiB of snapshot bytes; raising it reintroduces multi-MiB rows"
+        )
+    }
+
+    // The capture loop must run the budgeted decision and charge the budget, or
+    // the cap above is a constant nothing enforces.
+    func test_captureFileSnapshots_chargesTheCheckpointBudget() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/AgentRuntime/AgentRunCoordinator.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        let marker = try XCTUnwrap(source.range(of: "private func captureFileSnapshots"))
+        let rest = source[marker.lowerBound...]
+        let end = rest.range(of: "\n    /// P2: per-file checkpoint snapshot decision")?.lowerBound ?? rest.endIndex
+        let chunk = String(source[marker.lowerBound..<end])
+        XCTAssertTrue(
+            chunk.contains("var remainingBudget = Self.checkpointSnapshotTotalByteCap"),
+            "captureFileSnapshots must start each checkpoint from the total budget"
+        )
+        XCTAssertTrue(
+            chunk.contains("remainingBudget -= data.count"),
+            "snapshotted bytes must be charged against the checkpoint budget"
+        )
+        XCTAssertTrue(
+            chunk.contains("checkpointSnapshotBudgetDecision"),
+            "captureFileSnapshots must use the budgeted decision"
+        )
+    }
 }

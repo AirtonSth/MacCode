@@ -81,6 +81,13 @@ final class AgentAppGhostRunLatchTests: XCTestCase {
                                 startedAt: Date().addingTimeInterval(-46 * 3600),
                                 finishedAt: Date().addingTimeInterval(-46 * 3600 + 240))
         try h.runRepo.upsert(finished)
+        // The coordinator stores a stream event before fanning it out to observers
+        // (store-before-loss), so a real surface only ever sees replayed content the
+        // next open bundle already contains. This spec calls the observer directly,
+        // which makes the event non-durable — injecting it into the still-in-flight
+        // open would just be erased by the replay swap, a state production cannot
+        // reach. Settle the seed open first so the paint assertion measures the gate.
+        await h.vm.waitForSelectThreadHydrationForTesting()
 
         h.vm.runCoordinator(h.coordinator, didReceive: mcpStartupEvent(),
                             run: finished.id, threadId: h.threadId)

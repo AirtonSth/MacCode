@@ -385,6 +385,97 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         XCTAssertNotNil(claude["REMOTE_CODE_DISTILL_STATE_PATH"])
     }
 
+    /// WHY: one wrapper pass enumerates every PATH directory, stats the catalog
+    /// candidates and walks every managed link — thousands of syscalls on the
+    /// MainActor before each admitted run, and a second run of the same turn
+    /// redid all of it for a system that had not changed. The pass must still run
+    /// when the system changes (a command installed into a PATH directory is
+    /// wrapped, a link removed from the managed bin comes back), so the reuse is
+    /// keyed on the exact inputs of the pass, not on a session flag.
+    @MainActor
+    func test_commandWrapperPass_reusesUnchangedPathsAndRepeatsWhenTheyChange() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("RC2WrapperReuse-" + UUID().uuidString, isDirectory: true)
+        let pathDirectory = root.appendingPathComponent("pathdir", isDirectory: true)
+        // The managed bin stays the user's own: the installer resolves its service
+        // binary from the running bundle, and the Token Saver runtime gate refuses
+        // to admit a home override. Only the effective PATH is synthetic.
+        let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory()
+        try FileManager.default.createDirectory(at: pathDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Self.writeExecutableProbe(at: pathDirectory.appendingPathComponent("rcprobe-one"))
+        try Self.writeExecutableProbe(at: pathDirectory.appendingPathComponent("rcprobe-two"))
+
+        let context = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support", isDirectory: true).path
+        )
+        let thread = try admittedThread(in: context, provider: .codex)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
+        let base = ["PATH": pathDirectory.path]
+
+        // First admitted turn: the pass runs and wraps what the effective PATH offers.
+        _ = context.tokenSaverAgentEnvironment(
+            provider: .codex, threadId: thread.id, baseEnvironment: base
+        )
+        XCTAssertEqual(context.commandWrapperRefreshCountForTesting, 1)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: managedBin.appendingPathComponent("rcprobe-one").path
+            ),
+            "a command that only exists in the effective PATH must be wrapped"
+        )
+
+        // Second run, unchanged system: reuse the last pass instead of re-enumerating.
+        _ = context.tokenSaverAgentEnvironment(
+            provider: .codex, threadId: thread.id, baseEnvironment: base
+        )
+        XCTAssertEqual(
+            context.commandWrapperRefreshCountForTesting, 1,
+            "an unchanged PATH, binary and managed bin must not re-enumerate every directory"
+        )
+
+        // A command installed into a PATH directory changes that directory: new pass.
+        try Self.writeExecutableProbe(at: pathDirectory.appendingPathComponent("rcprobe-three"))
+        _ = context.tokenSaverAgentEnvironment(
+            provider: .codex, threadId: thread.id, baseEnvironment: base
+        )
+        XCTAssertEqual(
+            context.commandWrapperRefreshCountForTesting, 2,
+            "a newly installed command must still get its wrapper"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: managedBin.appendingPathComponent("rcprobe-three").path
+            )
+        )
+
+        // A link removed from the managed bin changes the managed bin itself.
+        try FileManager.default.removeItem(at: managedBin.appendingPathComponent("rcprobe-two"))
+        _ = context.tokenSaverAgentEnvironment(
+            provider: .codex, threadId: thread.id, baseEnvironment: base
+        )
+        XCTAssertEqual(context.commandWrapperRefreshCountForTesting, 3)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: managedBin.appendingPathComponent("rcprobe-two").path
+            ),
+            "a wrapper removed under us must be repaired"
+        )
+
+        // And the reuse holds again once the system settles.
+        _ = context.tokenSaverAgentEnvironment(
+            provider: .codex, threadId: thread.id, baseEnvironment: base
+        )
+        XCTAssertEqual(context.commandWrapperRefreshCountForTesting, 3)
+    }
+
+    private static func writeExecutableProbe(at url: URL) throws {
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+
     /// WHY: production threads are often projectless (project_id nil). Previously
     /// recovery headers required full project admission, so PATH distill never got
     /// scope and store-before-loss forced every compression to verbatim.

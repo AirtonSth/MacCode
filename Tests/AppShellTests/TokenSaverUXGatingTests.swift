@@ -557,7 +557,12 @@ final class TokenSaverUXGatingTests: XCTestCase {
     }
 
     func test_ringsAccessibilityLabel_qualifiesReductionAsMeasured() {
-        // WHY: VoiceOver must not present a local diagnostic estimate as billed savings.
+        // WHY: VoiceOver must not present a local diagnostic estimate as billed
+        // savings. The rings copy reads "estimated save … local tokens" — the
+        // AGENTS.md contract labels the figure Estimated save and forbids
+        // relabeling it as billed. This spec still demanded the older "measured
+        // save" wording, so it sat red since fixed ring goals shipped
+        // (34fd7fcb) and hid real regressions in the label.
         let label = SidebarRootView.ringsAccessibilityLabel(
             scope: "week",
             savedTokens: 120_000,
@@ -568,7 +573,18 @@ final class TokenSaverUXGatingTests: XCTestCase {
             grokUsedProgress: 0.1
         )
 
-        XCTAssertTrue(label.lowercased().contains("measured save") || label.lowercased().contains("est."))
+        XCTAssertTrue(
+            label.lowercased().contains("estimated save"),
+            "VoiceOver must qualify the figure as an estimate: \(label)"
+        )
+        XCTAssertTrue(
+            label.lowercased().contains("local tokens"),
+            "the figure is a local diagnostic estimate, not billed usage: \(label)"
+        )
+        XCTAssertFalse(
+            label.lowercased().contains("billed"),
+            "the estimate must never be presented as billed savings: \(label)"
+        )
         XCTAssertTrue(label.lowercased().contains("goal") || label.contains("%"))
         XCTAssertFalse(label.lowercased().contains(": saved"))
     }

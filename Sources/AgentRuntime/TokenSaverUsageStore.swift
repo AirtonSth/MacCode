@@ -387,13 +387,7 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
     }
 
     private func loadUnlocked(period: TokenSaverPeriod) -> TokenSaverUsageSnapshot {
-        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
-            return .empty(period: period)
-        }
-        Self.codecLock.lock()
-        let decoded = try? Self.decoder.decode(TokenSaverUsageSnapshot.self, from: data)
-        Self.codecLock.unlock()
-        guard let snapshot = decoded, snapshot.period == period else {
+        guard let snapshot = decodeStoredSnapshot(period: period) else {
             return .empty(period: period)
         }
         // Older usage.json files predate Grok; ensure every managed agent provider
@@ -404,6 +398,21 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
             Self.ensuringManagedProviders(snapshot),
             now: now()
         )
+    }
+
+    /// Exactly what usage.json holds, or nil when it is missing, unreadable, or
+    /// written for another period. Distinct from `loadUnlocked`, which folds
+    /// those cases into `.empty` (whose rows read as 0% and could be mistaken
+    /// for a stored value by a caller deciding whether a write is needed).
+    private func decodeStoredSnapshot(period: TokenSaverPeriod) -> TokenSaverUsageSnapshot? {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
+            return nil
+        }
+        Self.codecLock.lock()
+        let decoded = try? Self.decoder.decode(TokenSaverUsageSnapshot.self, from: data)
+        Self.codecLock.unlock()
+        guard let decoded, decoded.period == period else { return nil }
+        return decoded
     }
 
     /// Zero weekly/session account-usage percents whose reset time is already past.
@@ -666,6 +675,34 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
         }
     }
 
+    /// Would recording these fields leave the stored row byte-identical?
+    /// Optional arguments keep the stored value when nil, so a nil argument can
+    /// never make the row differ.
+    static func accountUsageRowMatches(
+        _ row: TokenSaverProviderUsage,
+        weeklyUsedPercent: Double,
+        weeklyWindowDurationMinutes: Int?,
+        weeklyResetsAt: Date?,
+        currentSessionUsedPercent: Double?,
+        currentSessionResetsAt: Date?
+    ) -> Bool {
+        guard row.weeklyUsedPercent == weeklyUsedPercent else { return false }
+        if let minutes = weeklyWindowDurationMinutes,
+           row.weeklyWindowDurationMinutes != minutes {
+            return false
+        }
+        if let resets = weeklyResetsAt, row.weeklyResetsAt != resets { return false }
+        if let session = currentSessionUsedPercent,
+           row.currentSessionUsedPercent != session {
+            return false
+        }
+        if let sessionResets = currentSessionResetsAt,
+           row.currentSessionResetsAt != sessionResets {
+            return false
+        }
+        return true
+    }
+
     @discardableResult
     public func recordAccountUsage(
         provider: AgentProvider,
@@ -676,7 +713,29 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
         currentSessionResetsAt: Date? = nil,
         period: TokenSaverPeriod = .sevenDays
     ) throws -> TokenSaverUsageSnapshot {
-        try withExclusiveStoreLock {
+        // The periodic probe re-reports the same percentages every minute for as
+        // long as the app is open, and the whole read-modify-write used to run
+        // for each one. `saveUnlocked` replaces usage.json atomically, so this
+        // plain read sees a complete generation, and a stored row that already
+        // holds these fields makes the write a no-op — skipping it cannot lose
+        // an update, because nothing is written either way. A file that is
+        // missing or unreadable decodes to nil, so the first write still lands.
+        if let stored = decodeStoredSnapshot(period: period),
+           let row = stored.providers.first(where: { $0.provider == provider }),
+           Self.accountUsageRowMatches(
+               row,
+               weeklyUsedPercent: weeklyUsedPercent,
+               weeklyWindowDurationMinutes: weeklyWindowDurationMinutes,
+               weeklyResetsAt: weeklyResetsAt,
+               currentSessionUsedPercent: currentSessionUsedPercent,
+               currentSessionResetsAt: currentSessionResetsAt
+           ) {
+            return Self.expiringStaleWeeklyUsage(
+                Self.ensuringManagedProviders(stored),
+                now: now()
+            )
+        }
+        return try withExclusiveStoreLock {
             let snapshot = loadUnlocked(period: period)
             var providers = snapshot.providers
             if let index = providers.firstIndex(where: { $0.provider == provider }) {

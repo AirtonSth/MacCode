@@ -315,6 +315,70 @@ final class AppIdentityNotificationTests: XCTestCase {
                        "macOS optional private login must recover expired access tokens before discarding the account")
     }
 
+    func testPrivateAccountLoginReportsAnUnwritableSessionInsteadOfSuccess() async throws {
+        let dir = NSTemporaryDirectory() + "RC2PrivateAccountSave-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let api = RecordingPrivateAccountAPI()
+        let vm = SettingsViewModel(context: ctx, privateAccountAPI: api)
+        // A full disk / locked DB fails the settings write. The trigger blocks
+        // real writes while reads keep working (DROP TABLE would also kill the
+        // read path under test). The probe proves the fixture is broken.
+        try Self.blockSettingsWrites(ctx)
+        XCTAssertThrowsError(try ctx.settingsRepo.set("private.account.probe", "1"),
+                             "fixture: the settings write must fail for this spec to mean anything")
+
+        vm.privateAccountEmail = "desktop@example.com"
+        vm.privateAccountPassword = "password123"
+        await vm.connectPrivateAccount()
+
+        XCTAssertEqual(api.loginRequests, [["email": "desktop@example.com", "password": "password123"]],
+                       "the credentials reached the backend, so this must be reported as a persistence failure")
+        XCTAssertNil(vm.privateAccountUser,
+                     "no reader can load an unwritten session, so the account panel must not look signed in")
+        XCTAssertEqual(vm.privateAccountStatus, "Signed in, but the session could not be saved",
+                       "a lost session must be named instead of painting 'Subscription active'")
+        XCTAssertTrue(SettingsViewModel.signInFailureStatuses.contains(vm.privateAccountStatus),
+                      "the panel must show the inline failure hint instead of a benign warning pill")
+        XCTAssertNil(PrivateAccountSessionStore(repo: ctx.settingsRepo).load())
+        XCTAssertEqual(vm.privateAccountPassword, "password123",
+                       "keeping the password lets the user retry the write without retyping it")
+    }
+
+    func testPrivateAccountRefreshReportsAnUnwritableRotatedSession() async throws {
+        let dir = NSTemporaryDirectory() + "RC2PrivateAccountRotated-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let api = RecordingPrivateAccountAPI()
+        api.currentUserShouldFail = true
+        XCTAssertTrue(PrivateAccountSessionStore(repo: ctx.settingsRepo).save(api.session),
+                      "fixture: the stale session must be stored before the write failure is injected")
+        let vm = SettingsViewModel(context: ctx, privateAccountAPI: api)
+        XCTAssertNotNil(vm.privateAccountUser, "fixture: the panel starts signed in, so 'Optional' cannot be the end state")
+        try Self.blockSettingsWrites(ctx)
+
+        await vm.refreshPrivateAccount()
+
+        XCTAssertEqual(api.refreshRequests, ["refresh-token"],
+                       "the server already spent the old refresh token, so the stored session is now stale")
+        XCTAssertEqual(vm.privateAccountStatus, "Signed in, but the session could not be saved",
+                       "a rotation that cannot be written must not report 'Subscription active'")
+        XCTAssertNil(vm.privateAccountUser)
+    }
+
+    func testPrivateAccountSessionStoreReportsWriteFailuresInsteadOfSilence() throws {
+        let dir = NSTemporaryDirectory() + "RC2PrivateAccountStore-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let store = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let session = RecordingPrivateAccountAPI().session
+        XCTAssertTrue(store.save(session), "healthy settings must persist, else this spec is vacuous")
+        XCTAssertNotNil(store.load(), "fixture: the session must be readable before the write block is installed")
+        try Self.blockSettingsWrites(ctx)
+        XCTAssertThrowsError(try ctx.settingsRepo.set("private.account.probe", "1"))
+
+        XCTAssertFalse(store.save(session), "an unwritten session must be reported, not swallowed")
+        XCTAssertFalse(store.clear(), "an unwritten clear must be reported, not swallowed")
+        XCTAssertNotNil(store.load(), "a clear that could not be written must leave the session readable")
+    }
+
     func testPrivateBillingPortalUsesBackendPortalAndInjectedOpener() async throws {
         let dir = NSTemporaryDirectory() + "RC2PrivatePortal-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
@@ -376,7 +440,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
         let store = PrivatePushTargetStore(repo: ctx.settingsRepo)
 
-        store.save(
+        try store.save(
             pushToken: "apns-token",
             pushTokenType: "apns",
             liveActivityToken: "start-token",
@@ -384,7 +448,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         )
         // iOS often re-registers the alert APNs token alone (Mac update / phone
         // wake). That must not erase the push-to-start Live Activity token.
-        store.save(
+        try store.save(
             pushToken: "apns-token-rotated",
             pushTokenType: "apns",
             liveActivityToken: nil,
@@ -396,6 +460,71 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertEqual(stored.liveActivityToken, "start-token",
                        "nil liveActivityToken on alert re-register must preserve the stored start token across Mac updates")
         XCTAssertEqual(stored.deviceId, "device-1")
+    }
+
+    /// Blocks every write to the `settings` kv table at the SQLite level, so the
+    /// store's own error path is exercised instead of a mock's opinion of it.
+    private static func blockSettingsWrites(_ ctx: AppContext) throws {
+        try ctx.db.execute("""
+            CREATE TRIGGER fail_settings_insert
+            BEFORE INSERT ON settings
+            BEGIN
+                SELECT RAISE(ABORT, 'settings write blocked');
+            END;
+            """)
+        try ctx.db.execute("""
+            CREATE TRIGGER fail_settings_update
+            BEFORE UPDATE ON settings
+            BEGIN
+                SELECT RAISE(ABORT, 'settings write blocked');
+            END;
+            """)
+    }
+
+    /// A registration that never reached the store must not look saved to its
+    /// caller, and it must not take the previous registration down with it.
+    func testPrivatePushTargetSaveSurfacesWriteFailureAndKeepsTheStoredTarget() throws {
+        let dir = NSTemporaryDirectory() + "RC2PushTokenWriteFailure-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let store = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        try store.save(
+            pushToken: "apns-token",
+            pushTokenType: "apns",
+            liveActivityToken: "start-token",
+            deviceId: "device-1"
+        )
+        try Self.blockSettingsWrites(ctx)
+
+        XCTAssertThrowsError(try store.save(
+            pushToken: "apns-token-rotated",
+            pushTokenType: "apns",
+            liveActivityToken: nil,
+            deviceId: "device-1"
+        ), "a push target that was not persisted must not report success")
+
+        let stored = try XCTUnwrap(store.load())
+        XCTAssertEqual(stored.pushToken, "apns-token",
+                       "a failed write must leave the previous push registration intact")
+        XCTAssertEqual(stored.liveActivityToken, "start-token")
+    }
+
+    /// The iOS-facing registration must fail loudly: answering `{"ok": true}`
+    /// while the settings write was swallowed left the phone believing the Mac
+    /// could receive pushes, with no target stored and nothing to retry.
+    func testPrivatePushTokenUpdateReportsWriteFailureInsteadOfOk() throws {
+        let dir = NSTemporaryDirectory() + "RC2PushTokenRouterFailure-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        try Self.blockSettingsWrites(ctx)
+
+        XCTAssertThrowsError(try router.privatePushTokenUpdate(
+            pushToken: "apns-token",
+            pushTokenType: "apns",
+            liveActivityToken: "activity-token",
+            deviceID: "device-1"
+        ), "the socket reply must not claim ok when the push target was not stored")
+        XCTAssertNil(PrivatePushTargetStore(repo: ctx.settingsRepo).load())
     }
 
     func testPushToStartTokenSurvivesHostRebindAfterMacRelaunchWithoutDuplicatingRows() throws {
@@ -496,7 +625,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
         let api = RecordingPrivateAccountAPI()
         accountStore.save(api.session)
-        targetStore.save(pushToken: "apns-token", pushTokenType: "apns", liveActivityToken: nil, deviceId: "device-1")
+        try targetStore.save(pushToken: "apns-token", pushTokenType: "apns", liveActivityToken: nil, deviceId: "device-1")
         let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
         // Silent catch-up coalesces via process-wide UserDefaults; clear so this
         // case is not starved by earlier suite tests in the same 30s bucket.
@@ -542,7 +671,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
         let api = RecordingPrivateAccountAPI()
         accountStore.save(api.session)
-        targetStore.save(
+        try targetStore.save(
             pushToken: "apns-token",
             pushTokenType: "apns",
             liveActivityToken: "legacy-la-token",
@@ -576,7 +705,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
         let api = RecordingPrivateAccountAPI()
         accountStore.save(api.session)
-        targetStore.save(
+        try targetStore.save(
             pushToken: "apns-token",
             pushTokenType: "apns",
             liveActivityToken: nil,
@@ -711,7 +840,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
         let api = RecordingPrivateAccountAPI()
         accountStore.save(api.session)
-        targetStore.save(pushToken: "apns-token", pushTokenType: "apns", liveActivityToken: "activity-token", deviceId: "device-1")
+        try targetStore.save(pushToken: "apns-token", pushTokenType: "apns", liveActivityToken: "activity-token", deviceId: "device-1")
         let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
 
         let snapshot = try XCTUnwrap(PrivateLiveActivitySnapshot.terminal(threadId: "thread-1", title: "Build fix", phase: .completed))
@@ -738,7 +867,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         accountStore.save(api.session)
         // No liveActivityToken: there is no activity to address, so the push
         // must be skipped rather than sent with an empty token.
-        targetStore.save(pushToken: "apns-token", pushTokenType: "apns", liveActivityToken: nil, deviceId: "device-1")
+        try targetStore.save(pushToken: "apns-token", pushTokenType: "apns", liveActivityToken: nil, deviceId: "device-1")
         let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
 
         let snapshot = try XCTUnwrap(PrivateLiveActivitySnapshot.terminal(threadId: "thread-1", title: "Build fix", phase: .completed))
@@ -756,7 +885,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         let api = RecordingPrivateAccountAPI()
         api.liveActivityResult = PrivatePushDeliveryResult(delivered: false, errorCode: "apns/Unregistered", shouldDropSubscription: true)
         accountStore.save(api.session)
-        targetStore.save(pushToken: "apns-token", pushTokenType: "apns", liveActivityToken: "activity-token", deviceId: "device-1")
+        try targetStore.save(pushToken: "apns-token", pushTokenType: "apns", liveActivityToken: "activity-token", deviceId: "device-1")
         let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
 
         let snapshot = try XCTUnwrap(PrivateLiveActivitySnapshot.terminal(threadId: "thread-1", title: "Build fix", phase: .completed))
@@ -885,7 +1014,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
         let api = RecordingPrivateAccountAPI()
         accountStore.save(api.session)
-        targetStore.save(
+        try targetStore.save(
             pushToken: "apns-token", pushTokenType: "apns",
             liveActivityToken: "legacy-activity-token", deviceId: "legacy-device"
         )
@@ -918,7 +1047,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
         let api = ConcurrentExpiryPrivateAccountAPI()
         accountStore.save(api.session)
-        targetStore.save(
+        try targetStore.save(
             pushToken: "apns-token", pushTokenType: "apns",
             liveActivityToken: nil, deviceId: "device-1"
         )
@@ -947,7 +1076,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
         let api = ConcurrentExpiryPrivateAccountAPI(refreshFails: true)
         accountStore.save(api.session)
-        targetStore.save(
+        try targetStore.save(
             pushToken: "apns-token", pushTokenType: "apns",
             liveActivityToken: nil, deviceId: "device-1"
         )

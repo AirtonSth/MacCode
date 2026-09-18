@@ -176,6 +176,29 @@ final class WorkspaceEditTests: XCTestCase {
                        "dragging a workspace row must update the host window order while preserving pinned-first sorting")
     }
 
+    func test_select_snapsBackToHostTruth_whenRouterRejectsStaleWorkspace() throws {
+        // WHY: a row click paints the highlight before the router call so the click
+        // feels immediate. When the apply is rejected -- the row was closed underneath
+        // this stale list -- leaving that optimistic highlight up would show a
+        // workspace the app never selected, and no reload follows to correct it.
+        let (ctx, router) = try make()
+        let first = try router.createWorkspace(name: "one", cwd: "/tmp")
+        let second = try router.createWorkspace(name: "two", cwd: "/tmp")
+        let vm = SidebarViewModel(context: ctx, router: router)
+        vm.reload()
+
+        try router.closeWorkspaces([second.id])
+        XCTAssertTrue(vm.workspaces.contains { $0.id == second.id },
+                      "fixture: the closed row must still be listed so the stale click can happen")
+
+        vm.select(second.id)
+
+        XCTAssertEqual(vm.selectedWorkspaceID, first.id,
+                       "a rejected selection must leave the host's real selection highlighted")
+        XCTAssertFalse(vm.workspaces.contains { $0.id == second.id },
+                       "the stale row must be dropped once the failed selection snaps back to truth")
+    }
+
     // MARK: - Most-recently-used sidebar order
 
     private func mruWorkspace(_ name: String, activity: Int64? = nil, pinned: Bool = false) -> Workspace {
@@ -382,7 +405,12 @@ final class WorkspaceEditTests: XCTestCase {
             .appendingPathComponent("RC2DroppedFile-\(UUID().uuidString).txt")
         try "not a workspace".write(to: file, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: file) }
-        let vm = SidebarViewModel(context: ctx, router: router)
+        // WHY the presenter seam: the rejection is what the user sees. Without it
+        // this spec reaches the default presenter, whose headless fallback is
+        // `NSAlert.runModal()` — with no key window in the test process that call
+        // never returns, so the whole run hangs instead of failing. The message
+        // itself is asserted by test_staleFolderAdd_surfacesTheFailureInsteadOfDoingNothing.
+        let vm = SidebarViewModel(context: ctx, router: router, operationErrorPresenter: { _, _ in })
 
         XCTAssertFalse(vm.createWorkspace(fromFolder: file),
                        "dropping a regular file must not create a broken workspace")

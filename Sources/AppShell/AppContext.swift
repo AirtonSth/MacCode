@@ -11,6 +11,7 @@ import DistillCore
 import os
 
 private let appContextRuntimeLog = Logger(subsystem: "io.remotecode.agent", category: "app-context")
+private let graphifyUsageLog = Logger(subsystem: "io.remotecode.agent", category: "graphify-usage")
 
 private final class AgentRunStartedDeduplicator: @unchecked Sendable {
     private let lock = NSLock()
@@ -477,6 +478,18 @@ public final class AppContext {
     private static let completedUsageTombstoneLimit = 256
     private var sessionLearnInputTokensByRun: [AgentRunID: Int] = [:]
     private var pendingUsageFlushTask: Task<Void, Never>?
+    /// Consecutive failed usage writes, driving the retry backoff. Without it a
+    /// failed write was retried every debounce window forever, which is ~80
+    /// wakeups a minute — each one a cross-process flock, a decode and a failed
+    /// atomic write — for as long as the store stays unwritable. Reset by a
+    /// successful write.
+    private var tokenSaverUsageConsecutiveWriteFailures = 0
+    /// Test seam: retry delays scheduled after failed usage writes, in order.
+    /// Production reads nothing from it.
+    var tokenSaverUsageRetryDelaysForTesting: [TimeInterval] = []
+    var tokenSaverUsageConsecutiveWriteFailuresForTesting: Int {
+        tokenSaverUsageConsecutiveWriteFailures
+    }
     /// Test seam used to deterministically fail a usage write before the real
     /// store mutation. Production never sets this.
     var beforeTokenSaverUsageWriteForTesting: (@Sendable () throws -> Void)?
@@ -608,6 +621,32 @@ public final class AppContext {
     private static var didLogEmptyTokenSaverLaneState = false
     /// Debounce window for coalescing per-token usage writes into one disk write.
     private static let tokenSaverUsageDebounceInterval: TimeInterval = 0.75
+    /// Ceiling for the failed-write retry backoff. The retry never gives up: the
+    /// pending delta is real provider usage, and dropping it would understate the
+    /// ledger. It just stops being retried at the debounce rate.
+    private static let tokenSaverUsageRetryMaxInterval: TimeInterval = 60
+
+    /// Delay before retrying a failed usage write: the debounce window doubled
+    /// per consecutive failure, capped at `tokenSaverUsageRetryMaxInterval`. The
+    /// first retry keeps the debounce window, so a single transient failure
+    /// behaves exactly as it did before the backoff existed.
+    nonisolated static func tokenSaverUsageRetryDelay(
+        consecutiveFailures: Int
+    ) -> TimeInterval {
+        let failures = max(1, min(consecutiveFailures, 20))
+        let doubled = tokenSaverUsageDebounceInterval * pow(2, Double(failures - 1))
+        return min(doubled, tokenSaverUsageRetryMaxInterval)
+    }
+
+    /// Stamp of the last managed-command-wrapper pass: service binary, managed
+    /// bin plus every PATH directory with that directory's modification date.
+    /// One pass enumerates all of them and walks every managed link (~2k on a
+    /// developer Mac), so a second admitted run used to redo all of it on the
+    /// MainActor for an unchanged system. The pass repeats whenever PATH, the
+    /// binary or any directory entry changes.
+    private var commandWrapperState: [String]?
+    /// Test seam: managed-command-wrapper passes performed for admitted turns.
+    var commandWrapperRefreshCountForTesting = 0
 
     // PERF: agent.item.started EventBus publish encodes AssistantItem on every
     // tool/assistant item during agent runs. Encode once then JSONSerialization +
@@ -756,12 +795,20 @@ public final class AppContext {
         var createdAtMs: Int64
         var recordedInvocation: Bool = false
         var recordedExploration: Bool = false
+        /// Subcommands whose pending (ok=0) row this item recorded. Kept on the
+        /// buffer because the success path runs in a later `processGraphifyBuffer`
+        /// call: if that pending insert never landed, the delivered answer still
+        /// has to be counted instead of shrinking the Graphify signal count.
+        var pendingInvocationSubcommands: [String] = []
         /// True after a capped haystack was scanned with no Graphify match
         /// (or the window filled without the substring). Later itemDelta must
         /// not re-parse/split a growing body on the ACP parse queue.
         var scannedNegative: Bool = false
         /// Failure signatures after the 8 KiB stored prefix still set this.
         var failureScan = GraphifyUsageDetector.FailureScanState()
+        /// Last event that mutated this entry. The reclamation sweep only drops
+        /// an entry the item stopped touching, never a stream still arriving.
+        var lastTouchedMs: Int64 = 0
 
         /// Same window as command-body detect (`GraphifyUsageDetector.maxHaystackUTF8Bytes`).
         static let maxOutputUTF8Bytes = GraphifyUsageDetector.maxHaystackUTF8Bytes
@@ -791,6 +838,15 @@ public final class AppContext {
     }
     private var graphifyItemBuffers: [String: GraphifyItemBuffer] = [:]
     private let graphifyItemBuffersLock = NSLock()
+    /// How long an entry survives without a further event for its item. One
+    /// entry is ~16 KiB (detect window + capped output); 15 min is far beyond
+    /// any real gap between two chunks of the same tool item.
+    static let graphifyBufferStaleAfterMs: Int64 = 15 * 60 * 1000
+    var graphifyBufferCapacity = 512
+    /// Test seam: entries reclaimed because the item stopped sending events.
+    var graphifyBuffersDroppedStaleForTesting = 0
+    /// Test seam: entries reclaimed because the map outgrew its capacity.
+    var graphifyBuffersDroppedOverCapacityForTesting = 0
     /// Graphify usage recording gate. `SettingsStore(db:)` is a new instance
     /// (empty cache) so itemDelta used to SQLite-load settings at stream rate.
     private var graphifyUsageAdmissionCache: (
@@ -842,6 +898,56 @@ public final class AppContext {
         graphifyItemBuffersLock.lock()
         defer { graphifyItemBuffersLock.unlock() }
         return graphifyItemBuffers[key]?.failureScan.sawFailure ?? false
+    }
+
+    /// Test seam: resident Graphify item buffers.
+    func graphifyBufferCountForTesting() -> Int {
+        graphifyItemBuffersLock.lock()
+        defer { graphifyItemBuffersLock.unlock() }
+        return graphifyItemBuffers.count
+    }
+
+    /// Test seam: age one entry as if its item had stopped sending events
+    /// `ms` ago. Elapsed time is the only thing a cleanup spec cannot wait for.
+    func graphifyBufferBackdateForTesting(runId: AgentRunID, itemId: String, byMs: Int64) {
+        let key = "\(runId.value.uuidString)|\(itemId)"
+        graphifyItemBuffersLock.lock()
+        defer { graphifyItemBuffersLock.unlock() }
+        guard var buf = graphifyItemBuffers[key] else { return }
+        buf.lastTouchedMs -= byMs
+        graphifyItemBuffers[key] = buf
+    }
+
+    /// Reclaim entries the item abandoned. A buffer normally dies on its own
+    /// terminal event (`finalizeGraphifyUsageItem` / `failGraphifyUsageItem`),
+    /// but a run stopped mid-item never sends one, so the map used to grow with
+    /// every interrupted run. `force` also runs the stale pass below capacity
+    /// (run finish); otherwise it only runs once the map reached capacity.
+    private func sweepGraphifyItemBuffers(nowMs: Int64, force: Bool = false) {
+        graphifyItemBuffersLock.lock()
+        defer { graphifyItemBuffersLock.unlock() }
+        guard force || graphifyItemBuffers.count >= graphifyBufferCapacity else { return }
+        let staleBefore = nowMs - Self.graphifyBufferStaleAfterMs
+        // A pending ok=0 row still needs its flip to `ok=1`; that flip is the
+        // Graphify credit, so no pass here may strand one.
+        let staleKeys = graphifyItemBuffers.compactMap { key, buf -> String? in
+            guard !(buf.recordedInvocation || buf.recordedExploration) else { return nil }
+            return buf.lastTouchedMs <= staleBefore ? key : nil
+        }
+        for key in staleKeys {
+            graphifyItemBuffers.removeValue(forKey: key)
+            graphifyBuffersDroppedStaleForTesting += 1
+        }
+        let overflow = graphifyItemBuffers.count - graphifyBufferCapacity
+        guard overflow > 0 else { return }
+        let oldest = graphifyItemBuffers
+            .filter { !($0.value.recordedInvocation || $0.value.recordedExploration) }
+            .sorted { $0.value.lastTouchedMs < $1.value.lastTouchedMs }
+            .prefix(overflow)
+        for (key, _) in oldest {
+            graphifyItemBuffers.removeValue(forKey: key)
+            graphifyBuffersDroppedOverCapacityForTesting += 1
+        }
     }
 
     public init(
@@ -1396,7 +1502,15 @@ public final class AppContext {
                 if let explanation = plan.explanation { payload["explanation"] = .string(explanation) }
                 EventBus.shared.publish(kind: .agentPlanActiveUpdated, payload: .object(payload))
             case .requestOpened(let request):
-                try? self.providerPendingCallbackRepo.record(threadId: tid, request: request)
+                do {
+                    try self.providerPendingCallbackRepo.record(threadId: tid, request: request)
+                } catch {
+                    // The row is what the paired device hydrates; log instead of
+                    // letting a failed write vanish (the live stream still has it).
+                    appContextRuntimeLog.error(
+                        "provider_pending_callback.record_failed kind=approval thread=\(t, privacy: .public) request=\(request.id, privacy: .public) error=\(String(describing: error), privacy: .public)"
+                    )
+                }
                 var requestPayload: [String: JSONValue] = [
                     "thread_id": .string(t),
                     "request_id": .string(request.id),
@@ -1414,14 +1528,28 @@ public final class AppContext {
                     actionTitle: "Approve: \(PetApprovalActionLabel.label(for: request.kind))"
                 )
             case .requestResolved(let requestId, let state):
-                try? self.providerPendingCallbackRepo.resolve(threadId: tid, requestId: requestId, kind: .approval, state: state)
+                do {
+                    try self.providerPendingCallbackRepo.resolve(threadId: tid, requestId: requestId, kind: .approval, state: state)
+                } catch {
+                    // A resolve that does not land leaves the request pending for the
+                    // paired device's next hydrate; never swallow that silently.
+                    appContextRuntimeLog.error(
+                        "provider_pending_callback.resolve_failed kind=approval thread=\(t, privacy: .public) request=\(requestId, privacy: .public) state=\(state.rawValue, privacy: .public) error=\(String(describing: error), privacy: .public)"
+                    )
+                }
                 EventBus.shared.publish(kind: .agentRequestResolved, payload: .object([
                     "thread_id": .string(t),
                     "request_id": .string(requestId),
                     "state": .string(state.rawValue)
                 ]))
             case .userInputRequested(let request):
-                try? self.providerPendingCallbackRepo.record(threadId: tid, userInput: request)
+                do {
+                    try self.providerPendingCallbackRepo.record(threadId: tid, userInput: request)
+                } catch {
+                    appContextRuntimeLog.error(
+                        "provider_pending_callback.record_failed kind=user_input thread=\(t, privacy: .public) request=\(request.id, privacy: .public) error=\(String(describing: error), privacy: .public)"
+                    )
+                }
                 var userInputPayload: [String: JSONValue] = [
                     "thread_id": .string(t),
                     "request_id": .string(request.id),
@@ -1455,7 +1583,13 @@ public final class AppContext {
                     actionTitle: request.isSecret ? "Secret input requested" : "Input requested"
                 )
             case .userInputResolved(let requestId, let answer):
-                try? self.providerPendingCallbackRepo.resolve(threadId: tid, requestId: requestId, kind: .userInput, state: .resolved)
+                do {
+                    try self.providerPendingCallbackRepo.resolve(threadId: tid, requestId: requestId, kind: .userInput, state: .resolved)
+                } catch {
+                    appContextRuntimeLog.error(
+                        "provider_pending_callback.resolve_failed kind=user_input thread=\(t, privacy: .public) request=\(requestId, privacy: .public) error=\(String(describing: error), privacy: .public)"
+                    )
+                }
                 EventBus.shared.publish(kind: .agentUserInputResolved, payload: .object([
                     "thread_id": .string(t),
                     "request_id": .string(requestId),
@@ -1874,7 +2008,12 @@ public final class AppContext {
     }
 
     func cancelQueueDrainWaiterIfQueueEmpty(threadId: AgentThreadID) {
-        guard ((try? queuedMessageRepo.list(threadId: threadId)) ?? []).isEmpty else { return }
+        // An unreadable queue is not an empty one. The waiter and the promotion it
+        // owns are live scheduling state and the rows are still there to read
+        // again, so a transient read failure retains both — same rule as
+        // `pendingDeletedThreadRetirements`.
+        guard let queued = try? queuedMessageRepo.list(threadId: threadId),
+              queued.isEmpty else { return }
         deferredQueuePromotions.removeValue(forKey: threadId)
         cancelQueueDrainWaiter(threadId: threadId)
     }
@@ -2110,9 +2249,11 @@ public final class AppContext {
             let installer = makeAgentSkillInstaller()
             // Automatic reinstall for any user on every admitted turn: missing
             // or dangling ~/.remote-code/bin/distill is repaired before PATH is
-            // stamped (PostToolUse + `| distill` need a live binary).
+            // stamped (PostToolUse + `| distill` need a live binary). This probe
+            // stays unconditional; only the wrapper enumeration below is reused.
+            var managedDistill: URL?
             do {
-                _ = try installer.ensureDistillCLI()
+                managedDistill = try installer.ensureDistillCLI()
             } catch {
                 NSLog(
                     "RemoteCode: ensureDistillCLI before agent turn failed: \(error.localizedDescription)"
@@ -2125,40 +2266,36 @@ public final class AppContext {
                 )
                 .split(separator: ":")
                 .map(String.init)
-                _ = try installer.installCommandWrappers(
-                    searchDirectoriesOverride: searchDirectories
+                let stamp = commandWrapperStateStamp(
+                    installer: installer,
+                    searchDirectories: searchDirectories,
+                    serviceBinary: managedDistill
                 )
+                if stamp != commandWrapperState {
+                    _ = try installer.installCommandWrappers(
+                        searchDirectoriesOverride: searchDirectories
+                    )
+                    // Captured after the pass: it creates/repairs links in the
+                    // managed bin, which is one of the stamped directories.
+                    commandWrapperState = commandWrapperStateStamp(
+                        installer: installer,
+                        searchDirectories: searchDirectories,
+                        serviceBinary: managedDistill
+                    )
+                    commandWrapperRefreshCountForTesting += 1
+                }
             } catch {
                 NSLog(
                     "RemoteCode: command wrapper refresh before agent turn failed: \(error.localizedDescription)"
                 )
             }
             do {
-                try installer.installBotSelfConfigMCP()
+                // One pass over both shared configs; the per-server entry
+                // points each re-read and re-scanned the same two files.
+                try installer.stripManagedBotMCPResidue()
             } catch {
                 NSLog(
-                    "RemoteCode: installBotSelfConfigMCP before agent turn failed: \(error.localizedDescription)"
-                )
-            }
-            do {
-                try installer.installBotBrowserMCP()
-            } catch {
-                NSLog(
-                    "RemoteCode: installBotBrowserMCP before agent turn failed: \(error.localizedDescription)"
-                )
-            }
-            do {
-                try installer.installBotComputerMCP()
-            } catch {
-                NSLog(
-                    "RemoteCode: installBotComputerMCP before agent turn failed: \(error.localizedDescription)"
-                )
-            }
-            do {
-                try installer.installBotWebMCP()
-            } catch {
-                NSLog(
-                    "RemoteCode: installBotWebMCP before agent turn failed: \(error.localizedDescription)"
+                    "RemoteCode: stripManagedBotMCPResidue before agent turn failed: \(error.localizedDescription)"
                 )
             }
             let managedBin = installer.managedCLIBinURL.path
@@ -2182,6 +2319,27 @@ public final class AppContext {
                 .path
         }
         return env
+    }
+
+    /// Everything the wrapper pass derives its link set from: the service
+    /// binary it points links at, and the directory listing of the managed bin
+    /// plus each PATH directory (a directory's modification date moves when an
+    /// entry is added, removed or renamed). Reads only `stat`-level metadata so
+    /// the reuse check stays off the enumeration cost it replaces.
+    private func commandWrapperStateStamp(
+        installer: AgentSkillInstaller,
+        searchDirectories: [String],
+        serviceBinary: URL?
+    ) -> [String] {
+        var stamp = [serviceBinary?.path ?? "-"]
+        for path in [installer.managedCLIBinURL.path] + searchDirectories {
+            let modified = try? URL(fileURLWithPath: path)
+                .resourceValues(forKeys: [.contentModificationDateKey])
+                .contentModificationDate
+            stamp.append(path)
+            stamp.append(modified.map { String(Int($0.timeIntervalSince1970 * 1000)) } ?? "-")
+        }
+        return stamp
     }
 
     /// Nested orchestration workers (subagents) carry a parent receipt. Main
@@ -2283,31 +2441,12 @@ public final class AppContext {
             }
         }
         do {
-            try installer.installBotSelfConfigMCP()
+            // Same single pass as the pre-turn env: nested launches share the
+            // provider configs, and each per-server call re-scanned both.
+            try installer.stripManagedBotMCPResidue()
         } catch {
             NSLog(
-                "RemoteCode: installBotSelfConfigMCP before subagent env failed: \(error.localizedDescription)"
-            )
-        }
-        do {
-            try installer.installBotBrowserMCP()
-        } catch {
-            NSLog(
-                "RemoteCode: installBotBrowserMCP before subagent env failed: \(error.localizedDescription)"
-            )
-        }
-        do {
-            try installer.installBotComputerMCP()
-        } catch {
-            NSLog(
-                "RemoteCode: installBotComputerMCP before subagent env failed: \(error.localizedDescription)"
-            )
-        }
-        do {
-            try installer.installBotWebMCP()
-        } catch {
-            NSLog(
-                "RemoteCode: installBotWebMCP before subagent env failed: \(error.localizedDescription)"
+                "RemoteCode: stripManagedBotMCPResidue before subagent env failed: \(error.localizedDescription)"
             )
         }
         let managedBin = installer.managedCLIBinURL.path
@@ -2977,24 +3116,9 @@ public final class AppContext {
             NSLog("RemoteCode: legacy computer-use MCP cleanup failed: \(error.localizedDescription)")
         }
         do {
-            try installer.installBotSelfConfigMCP()
+            try installer.stripManagedBotMCPResidue()
         } catch {
-            NSLog("RemoteCode: installBotSelfConfigMCP failed: \(error.localizedDescription)")
-        }
-        do {
-            try installer.installBotBrowserMCP()
-        } catch {
-            NSLog("RemoteCode: installBotBrowserMCP failed: \(error.localizedDescription)")
-        }
-        do {
-            try installer.installBotComputerMCP()
-        } catch {
-            NSLog("RemoteCode: installBotComputerMCP failed: \(error.localizedDescription)")
-        }
-        do {
-            try installer.installBotWebMCP()
-        } catch {
-            NSLog("RemoteCode: installBotWebMCP failed: \(error.localizedDescription)")
+            NSLog("RemoteCode: stripManagedBotMCPResidue failed: \(error.localizedDescription)")
         }
     }
 
@@ -3220,6 +3344,11 @@ public final class AppContext {
                     detail: acceptedUsages.isEmpty ? "empty" : nil,
                     providers: acceptedUsages.map(\.provider.rawValue)
                 )
+                // Only a real provider probe settles the details refresh. The
+                // generic `.rc2TokenSaverUsageChanged` is also posted by local
+                // paths (enable toggle, `savings_recorded`), so waiting on it
+                // stamped a fresh "updated just now" for a probe still running.
+                NotificationCenter.default.post(name: .rc2TokenSaverAccountUsageSettled, object: nil)
                 if let periodicCycleID,
                    self.tokenSaverPeriodicAccountUsageCycle?.id == periodicCycleID {
                     self.tokenSaverPeriodicAccountUsageCycle?.otherProvidersFinished = true
@@ -5193,11 +5322,22 @@ public final class AppContext {
     }
 
     /// Schedules a debounced flush; resets the timer on each call so many rapid
-    /// events coalesce into a single disk write after the quiet window.
-    private func schedulePendingUsageFlush() {
+    /// events coalesce into a single disk write after the quiet window. A retry
+    /// after a failed write backs off instead of reusing the quiet window, so an
+    /// unwritable store cannot spin at the debounce rate. New token events still
+    /// schedule the quiet-window flush: they are real traffic, not a timer.
+    private func schedulePendingUsageFlush(retryAfterFailure: Bool = false) {
+        let delay = retryAfterFailure
+            ? Self.tokenSaverUsageRetryDelay(
+                consecutiveFailures: tokenSaverUsageConsecutiveWriteFailures
+            )
+            : Self.tokenSaverUsageDebounceInterval
+        if retryAfterFailure {
+            tokenSaverUsageRetryDelaysForTesting.append(delay)
+        }
         pendingUsageFlushTask?.cancel()
         pendingUsageFlushTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(Self.tokenSaverUsageDebounceInterval * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled else { return }
             await MainActor.run { [weak self] in
                 self?.flushPendingTokenSaverUsage()
@@ -5303,6 +5443,12 @@ public final class AppContext {
 
     private func finishPendingTokenSaverUsage(runId: AgentRunID) {
         forgetTokenSaverObservation(runId: runId)
+        // A run stopped mid-item never sends the item's own terminal event, so
+        // its Graphify buffers are reclaimed here (run finish is terminal).
+        sweepGraphifyItemBuffers(
+            nowMs: Int64(Date().timeIntervalSince1970 * 1000),
+            force: true
+        )
         if var pending = pendingUsageByRun[runId] {
             pending.finished = true
             pendingUsageByRun[runId] = pending
@@ -5326,6 +5472,7 @@ public final class AppContext {
         }
         pending.writeInFlight = false
         if succeeded {
+            tokenSaverUsageConsecutiveWriteFailures = 0
             pending.persisted = AssistantTokenUsage.merging(
                 pending.persisted,
                 with: snapshot.target
@@ -5350,7 +5497,8 @@ public final class AppContext {
             if succeeded {
                 flushPendingTokenSaverUsage(runId: snapshot.runId)
             } else {
-                schedulePendingUsageFlush()
+                tokenSaverUsageConsecutiveWriteFailures += 1
+                schedulePendingUsageFlush(retryAfterFailure: true)
             }
         } else if pending.finished {
             archiveCompletedUsage(runId: snapshot.runId, pending: pending)
@@ -5794,6 +5942,7 @@ public final class AppContext {
             buf.body = GraphifyUsageDetector.cappedHaystack(item.body)
         }
         if let o = item.output, !o.isEmpty { buf.replaceResultOutput(o) }
+        buf.lastTouchedMs = createdAtMs
         graphifyItemBuffers[bufferKey] = buf
         graphifyItemBuffersLock.unlock()
 
@@ -5806,6 +5955,9 @@ public final class AppContext {
             runKey: runKey,
             finalizeOutput: finalizeNow
         )
+        // After processing: the pending ledger row of this item is already
+        // flagged, so the sweep cannot reclaim an entry that still owes a flip.
+        sweepGraphifyItemBuffers(nowMs: createdAtMs)
     }
 
     /// Codex/Grok often stream command text and output via itemDelta only.
@@ -5845,6 +5997,7 @@ public final class AppContext {
                 }
             }
             if let o = outputAppend, resultPhase { existing.appendResultOutput(o) }
+            existing.lastTouchedMs = nowMs
             graphifyItemBuffers[bufferKey] = existing
             graphifyItemBuffersLock.unlock()
             if bodyClosed, !finalize { return }
@@ -5883,6 +6036,7 @@ public final class AppContext {
                 buf.body = GraphifyUsageDetector.appendCapped(buf.body, o)
             }
         }
+        buf.lastTouchedMs = nowMs
         graphifyItemBuffers[bufferKey] = buf
         graphifyItemBuffersLock.unlock()
 
@@ -5892,6 +6046,7 @@ public final class AppContext {
             runKey: runKey,
             finalizeOutput: finalize
         )
+        sweepGraphifyItemBuffers(nowMs: nowMs)
     }
 
     /// Complete a successful tool item: mark pending graphify/exploration rows ok.
@@ -5991,35 +6146,50 @@ public final class AppContext {
                 guard let self else { return }
                 if willRecordInvocation {
                     for inv in invocations {
-                        try? self.graphifyUsageRepo.insert(
-                            GraphifyUsageEvent(
-                                createdAtMs: createdAtMs,
-                                provider: provider,
-                                runId: runKey,
-                                itemId: itemId,
-                                subcommand: inv.subcommand,
-                                answerTokens: 0,
-                                source: "event_stream",
-                                ok: false
+                        do {
+                            try self.graphifyUsageRepo.insert(
+                                GraphifyUsageEvent(
+                                    createdAtMs: createdAtMs,
+                                    provider: provider,
+                                    runId: runKey,
+                                    itemId: itemId,
+                                    subcommand: inv.subcommand,
+                                    answerTokens: 0,
+                                    source: "event_stream",
+                                    ok: false
+                                )
                             )
-                        )
+                        } catch {
+                            graphifyUsageLog.error(
+                                "graphify.usage.pending_insert_failed run=\(runKey, privacy: .public) item=\(itemId, privacy: .public) subcommand=\(inv.subcommand, privacy: .public) error=\(String(describing: error), privacy: .public)"
+                            )
+                        }
                     }
                 }
                 if willRecordExploration {
-                    try? self.graphifyUsageRepo.insertExplorationSample(
-                        createdAtMs: createdAtMs,
-                        provider: provider,
-                        runId: runKey,
-                        itemId: itemId,
-                        answerTokens: 0,
-                        toolName: summary ?? "tool",
-                        ok: false
-                    )
+                    do {
+                        try self.graphifyUsageRepo.insertExplorationSample(
+                            createdAtMs: createdAtMs,
+                            provider: provider,
+                            runId: runKey,
+                            itemId: itemId,
+                            answerTokens: 0,
+                            toolName: summary ?? "tool",
+                            ok: false
+                        )
+                    } catch {
+                        graphifyUsageLog.error(
+                            "graphify.usage.exploration_insert_failed run=\(runKey, privacy: .public) item=\(itemId, privacy: .public) error=\(String(describing: error), privacy: .public)"
+                        )
+                    }
                 }
             }
             graphifyItemBuffersLock.lock()
             if var b = graphifyItemBuffers[bufferKey] {
-                if willRecordInvocation { b.recordedInvocation = true }
+                if willRecordInvocation {
+                    b.recordedInvocation = true
+                    b.pendingInvocationSubcommands = invocations.map(\.subcommand)
+                }
                 if willRecordExploration { b.recordedExploration = true }
                 graphifyItemBuffers[bufferKey] = b
             }
@@ -6037,6 +6207,7 @@ public final class AppContext {
         let finalOutput = finalBuf?.output ?? output
         let finalOutputUTF8Count = finalBuf?.outputUTF8Count ?? outputUTF8Count
         let streamedFailure = finalBuf?.failureScan.sawFailure ?? false
+        let pendingInvocationSubcommands = finalBuf?.pendingInvocationSubcommands ?? []
         graphifyItemBuffersLock.unlock()
 
         guard hadInterest else {
@@ -6069,11 +6240,39 @@ public final class AppContext {
         // Enqueue after pending inserts (serial queue) so markSucceeded finds rows.
         backgroundWriterQueue.async { [weak self] in
             guard let self else { return }
-            try? self.graphifyUsageRepo.markSucceeded(
-                runId: runKey,
-                itemId: itemId,
-                answerTokens: answerTokens
-            )
+            do {
+                let credited = try self.graphifyUsageRepo.markSucceeded(
+                    runId: runKey,
+                    itemId: itemId,
+                    answerTokens: answerTokens
+                )
+                if !credited {
+                    // The pending row never landed. This answer was delivered, so
+                    // record the success row directly rather than dropping the
+                    // signal (and with it the Graphify leg of the estimated save).
+                    for subcommand in pendingInvocationSubcommands {
+                        try self.graphifyUsageRepo.insert(
+                            GraphifyUsageEvent(
+                                createdAtMs: createdAtMs,
+                                provider: provider,
+                                runId: runKey,
+                                itemId: itemId,
+                                subcommand: subcommand,
+                                answerTokens: answerTokens,
+                                source: "event_stream",
+                                ok: true
+                            )
+                        )
+                    }
+                    graphifyUsageLog.error(
+                        "graphify.usage.success_row_recovered run=\(runKey, privacy: .public) item=\(itemId, privacy: .public) subcommands=\(pendingInvocationSubcommands.count, privacy: .public)"
+                    )
+                }
+            } catch {
+                graphifyUsageLog.error(
+                    "graphify.usage.mark_succeeded_failed run=\(runKey, privacy: .public) item=\(itemId, privacy: .public) error=\(String(describing: error), privacy: .public)"
+                )
+            }
             DispatchQueue.main.async { [weak self] in
                 self?.scheduleTokenSaverDailyEconomyRecompute()
             }

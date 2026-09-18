@@ -2732,8 +2732,14 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
     }
 
     public func ensureDefaults(projectID: String) throws {
-        Self.bumpRevision()
         try db.performSync { database in
+            // `SidebarView.reloadTokenSaverGovernance()` calls this once per
+            // scoped project on every Token Saver popover open. The seed and
+            // repair writes below are idempotent, so probe first: a project
+            // already in the target state needs no transaction, no WAL append,
+            // and no revision bump.
+            guard try self.needsDefaults(database: database, projectID: projectID) else { return }
+            Self.bumpRevision()
             try database.transaction {
                 try self.insertDefaults(database: database, projectID: projectID)
                 // Upgrade pre-fix factory rows that INSERT OR IGNORE left at
@@ -2786,6 +2792,44 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
                 _ = try promoteWire.step()
             }
         }
+    }
+
+    /// Whether `ensureDefaults` would actually change anything for `projectID`:
+    /// a missing factory lane, an unrepaired factory wrapper row, or an
+    /// un-promoted RCW1 wire row. Mirrors the three writes in
+    /// `ensureDefaults(projectID:)` and shares `defaultLanes` with
+    /// `insertDefaults` so the two cannot drift.
+    fileprivate func needsDefaults(database: SQLiteDB, projectID: String) throws -> Bool {
+        let lanePlaceholders = Array(repeating: "?", count: Self.defaultLanes.count).joined(separator: ", ")
+        let statement = try database.prepare("""
+            SELECT
+              (SELECT COUNT(*) FROM token_saver_lane_state
+                 WHERE project_id = ? AND lane IN (\(lanePlaceholders))),
+              (SELECT COUNT(*) FROM token_saver_lane_state
+                 WHERE project_id = ?
+                   AND lane = 'deterministic_wrapper'
+                   AND reason = 'owner_and_scorecard_required'
+                   AND opted_out = 0
+                   AND retention_days = 0
+                   AND kill_switch_active = 1),
+              (SELECT COUNT(*) FROM token_saver_lane_state
+                 WHERE project_id = ?
+                   AND lane IN ('wire-encode', 'wire-render-english')
+                   AND reason = 'native_wire_v1_recovery'
+                   AND opted_out = 0
+                   AND kill_switch_active = 0);
+        """)
+        defer { statement.reset() }
+        try statement.bind(1, projectID)
+        for (index, lane) in Self.defaultLanes.enumerated() {
+            try statement.bind(Int32(index + 2), lane.name)
+        }
+        try statement.bind(Int32(Self.defaultLanes.count + 2), projectID)
+        try statement.bind(Int32(Self.defaultLanes.count + 3), projectID)
+        guard try statement.step() else { return true }
+        return statement.columnInt64(0) < Int64(Self.defaultLanes.count)
+            || statement.columnInt64(1) > 0
+            || statement.columnInt64(2) > 0
     }
 
     public func setOptOut(projectID: String, optedOut: Bool, now: Date = Date()) throws {
@@ -2849,27 +2893,41 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
         }
     }
 
+    fileprivate struct DefaultLane {
+        let name: String
+        let state: String
+        let reason: String
+        let evidence: String
+        let owner: String
+        let retention: Int
+        let killSwitch: Bool
+    }
+
+    /// Factory lanes per project. Shared by `insertDefaults` and the
+    /// `needsDefaults` probe so a new lane cannot be seeded without the probe
+    /// noticing a project that still needs it.
+    fileprivate static let defaultLanes: [DefaultLane] = [
+        .init(name: "measurement", state: "shadow_only", reason: "content_free_exact_scope_observation_only", evidence: "diagnostic_heuristic", owner: "Measurement Owner", retention: 0, killSwitch: false),
+        .init(name: "provider_native", state: "shadow_only", reason: "shadow_observation_no_provider_behavior_change", evidence: "unavailable", owner: "Provider Compatibility Owner", retention: 0, killSwitch: true),
+        // Core tool-output Token Saver must retain a recovery window even before
+        // scorecard promotion. retention=0 + kill_switch here previously made
+        // every store-before-loss prepare fail durable readback after ensureDefaults.
+        .init(name: "deterministic_wrapper", state: "off", reason: "owner_and_scorecard_required", evidence: "unavailable", owner: "Operations Owner", retention: 7, killSwitch: false),
+        .init(name: "exact_repetition", state: "off", reason: "owner_and_scorecard_required", evidence: "unavailable", owner: "Security Owner", retention: 0, killSwitch: true),
+        .init(name: "lexical_retrieval", state: "off", reason: "owner_and_scorecard_required", evidence: "unavailable", owner: "Product Owner", retention: 0, killSwitch: true),
+        .init(name: "rollover_capsule", state: "off", reason: "owner_and_scorecard_required", evidence: "unavailable", owner: "Provider Compatibility Owner", retention: 0, killSwitch: true),
+        .init(name: "session_learn", state: "off", reason: "owner_and_scorecard_required", evidence: "unavailable", owner: "Security Owner", retention: 0, killSwitch: true),
+        .init(name: "semantic_prose", state: "off", reason: "owner_and_scorecard_required", evidence: "unavailable", owner: "Model Supply-Chain Owner", retention: 0, killSwitch: true),
+        // Seed recoverable RCW1 rows; ensureDefaults stamps the built-in
+        // v1 release receipt in the same transaction unless an operator has
+        // already opted out or changed the factory state.
+        .init(name: "wire-encode", state: "off", reason: "native_wire_v1_recovery", evidence: "unavailable", owner: "Operations Owner", retention: 7, killSwitch: false),
+        .init(name: "wire-render-english", state: "off", reason: "native_wire_v1_recovery", evidence: "unavailable", owner: "Operations Owner", retention: 7, killSwitch: false),
+        .init(name: "adaptive_effort", state: "off", reason: "owner_and_scorecard_required", evidence: "unavailable", owner: "Product Owner", retention: 0, killSwitch: true),
+        .init(name: "visual_artifact", state: "off", reason: "owner_and_scorecard_required", evidence: "unavailable", owner: "Model Supply-Chain Owner", retention: 0, killSwitch: true),
+    ]
+
     fileprivate func insertDefaults(database: SQLiteDB, projectID: String, now: Date = Date()) throws {
-        let defaults: [(lane: String, state: String, reason: String, evidence: String, owner: String, retention: Int, killSwitch: Bool)] = [
-            ("measurement", "shadow_only", "content_free_exact_scope_observation_only", "diagnostic_heuristic", "Measurement Owner", 0, false),
-            ("provider_native", "shadow_only", "shadow_observation_no_provider_behavior_change", "unavailable", "Provider Compatibility Owner", 0, true),
-            // Core tool-output Token Saver must retain a recovery window even before
-            // scorecard promotion. retention=0 + kill_switch here previously made
-            // every store-before-loss prepare fail durable readback after ensureDefaults.
-            ("deterministic_wrapper", "off", "owner_and_scorecard_required", "unavailable", "Operations Owner", 7, false),
-            ("exact_repetition", "off", "owner_and_scorecard_required", "unavailable", "Security Owner", 0, true),
-            ("lexical_retrieval", "off", "owner_and_scorecard_required", "unavailable", "Product Owner", 0, true),
-            ("rollover_capsule", "off", "owner_and_scorecard_required", "unavailable", "Provider Compatibility Owner", 0, true),
-            ("session_learn", "off", "owner_and_scorecard_required", "unavailable", "Security Owner", 0, true),
-            ("semantic_prose", "off", "owner_and_scorecard_required", "unavailable", "Model Supply-Chain Owner", 0, true),
-            // Seed recoverable RCW1 rows; ensureDefaults stamps the built-in
-            // v1 release receipt in the same transaction unless an operator has
-            // already opted out or changed the factory state.
-            ("wire-encode", "off", "native_wire_v1_recovery", "unavailable", "Operations Owner", 7, false),
-            ("wire-render-english", "off", "native_wire_v1_recovery", "unavailable", "Operations Owner", 7, false),
-            ("adaptive_effort", "off", "owner_and_scorecard_required", "unavailable", "Product Owner", 0, true),
-            ("visual_artifact", "off", "owner_and_scorecard_required", "unavailable", "Model Supply-Chain Owner", 0, true),
-        ]
         let statement = try database.prepare("""
             INSERT OR IGNORE INTO token_saver_lane_state
                 (project_id, lane, state, reason, evidence_level, owner_role,
@@ -2878,10 +2936,10 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
             VALUES (?, ?, ?, ?, ?, ?, 'project', ?, 0, ?, ?);
         """)
         defer { statement.reset() }
-        for item in defaults {
+        for item in Self.defaultLanes {
             statement.reset()
             try statement.bind(1, projectID)
-            try statement.bind(2, item.lane)
+            try statement.bind(2, item.name)
             try statement.bind(3, item.state)
             try statement.bind(4, item.reason)
             try statement.bind(5, item.evidence)

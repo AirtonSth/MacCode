@@ -227,9 +227,15 @@ final class MainWindowControllerRebuildCountTests: XCTestCase {
             "If this fails, every tab click performs a full container teardown/rebuild.")
     }
 
-    /// WHY: the same fast path that prevents a full rebuild must still replace
-    /// the visible content view. Otherwise a clicked tab looks selected while
-    /// the pane keeps rendering the old tab's surface.
+    /// WHY: the same fast path that prevents a full rebuild must still switch
+    /// the *visible* content. Otherwise a clicked tab looks selected while the
+    /// pane keeps rendering the old tab's surface.
+    ///
+    /// PF-11: the switch keeps the previous tab's view mounted and hides it.
+    /// Asserting removal here contradicted `PaneTabsView.installSelectedContent`
+    /// and its PF-11 lock `PaneActionTests.test_switchingTabsKeepsPreviousViewHiddenInHierarchy`
+    /// -- tearing the view down relayouts the whole Agent App transcript on
+    /// every tab click, which is exactly what PF-11 forbids.
     func test_focusSurfaceUpdatesVisibleContentWithoutFullRebuild() throws {
         let (ctx, router, wc) = try makeController(prefix: "focusSurfaceContent")
         let ws = try router.createWorkspace(name: "ws-content", cwd: NSTemporaryDirectory())
@@ -262,10 +268,14 @@ final class MainWindowControllerRebuildCountTests: XCTestCase {
 
         XCTAssertEqual(wc.rebuildCount, countBefore,
                        "tab selection must stay on the in-place reconcile path, not hide the bug behind a full rebuild")
-        XCTAssertFalse(liveSubviews.contains { $0 === firstView },
-                       "the previously selected tab's surface must be removed from the content area")
+        XCTAssertTrue(liveSubviews.contains { $0 === firstView },
+                      "PF-11: the previously selected tab's surface must stay mounted so the click does not relayout the whole transcript")
+        XCTAssertTrue(firstView.isHidden,
+                      "the previously selected tab's surface must be hidden so the pane paints only the selected tab")
         XCTAssertTrue(liveSubviews.contains { $0 === secondView },
                       "the newly selected tab's surface must be mounted so selected chrome and visible content match")
+        XCTAssertFalse(secondView.isHidden,
+                       "the newly selected tab's surface must be the visible one")
     }
 
     /// WHY: clicking a pane to focus it (focusPane) changes only focusedPaneID --

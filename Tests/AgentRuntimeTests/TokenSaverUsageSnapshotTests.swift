@@ -452,6 +452,192 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         )
     }
 
+    /// WHY: `AppDelegate.tokenSaverAccountUsageRefreshInterval` is 60 s, so the
+    /// probe re-records the same percentages ~1.440×/day while the app is open,
+    /// and each repeat used to run the whole read-modify-write (cross-process
+    /// flock + encode + atomic replace of the file) on the MainActor for a row
+    /// that did not change. Live evidence for the redundancy: in the owner's DB
+    /// (26 days, `agent_stream_events`), 56 of 80 `.accountUsage` events repeated
+    /// the previous percentage for the same provider.
+    func test_recordAccountUsage_unchangedPercentagesLeaveTheFileUntouched() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ts-account-usage-noop-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = TokenSaverUsageStore(appSupportDirectory: directory)
+        let file = directory
+            .appendingPathComponent("TokenSaver", isDirectory: true)
+            .appendingPathComponent("usage.json", isDirectory: false)
+
+        _ = try store.recordAccountUsage(
+            provider: .claude,
+            weeklyUsedPercent: 57,
+            weeklyWindowDurationMinutes: 10_080,
+            currentSessionUsedPercent: 3
+        )
+        let writtenBytes = try Data(contentsOf: file)
+        let writtenAt = try modificationDate(of: file)
+
+        let started = Date()
+        for _ in 0..<50 {
+            _ = try store.recordAccountUsage(
+                provider: .claude,
+                weeklyUsedPercent: 57,
+                weeklyWindowDurationMinutes: 10_080,
+                currentSessionUsedPercent: 3
+            )
+        }
+        let repeatedWallClock = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(
+            try modificationDate(of: file),
+            writtenAt,
+            "a probe that re-reports the same percentages must not rewrite usage.json"
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: file),
+            writtenBytes,
+            "skipped writes must leave the stored bytes identical, not merely equivalent"
+        )
+
+        // A real change still lands immediately, and the file is rewritten.
+        _ = try store.recordAccountUsage(
+            provider: .claude,
+            weeklyUsedPercent: 58,
+            weeklyWindowDurationMinutes: 10_080,
+            currentSessionUsedPercent: 3
+        )
+        XCTAssertGreaterThan(
+            try modificationDate(of: file),
+            writtenAt,
+            "a changed percentage must still be persisted"
+        )
+        let reloaded = try XCTUnwrap(
+            store.load().providers.first { $0.provider == .claude }
+        )
+        XCTAssertEqual(reloaded.weeklyUsedPercent, 58)
+        XCTAssertEqual(
+            reloaded.currentSessionUsedPercent,
+            3,
+            "the no-op path must not drop the fields it did not touch"
+        )
+        NSLog(
+            "[perf-proof] accountUsage noop_wall_clock_ms=%.2f for 50 repeats, file_bytes=%d",
+            repeatedWallClock * 1000,
+            writtenBytes.count
+        )
+    }
+
+    /// WHY: nil arguments mean "keep the stored value", so a probe that omits
+    /// them cannot make the row differ — it must take the same no-op path and
+    /// still preserve what is on disk.
+    func test_recordAccountUsage_nilFieldsKeepStoredValuesAndSkipTheWrite() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ts-account-usage-nil-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = TokenSaverUsageStore(appSupportDirectory: directory)
+        let file = directory
+            .appendingPathComponent("TokenSaver", isDirectory: true)
+            .appendingPathComponent("usage.json", isDirectory: false)
+
+        let resetsAt = Date(timeIntervalSince1970: 1_800_000_000)
+        _ = try store.recordAccountUsage(
+            provider: .grok,
+            weeklyUsedPercent: 40,
+            weeklyWindowDurationMinutes: 10_080,
+            weeklyResetsAt: resetsAt,
+            currentSessionUsedPercent: 12,
+            currentSessionResetsAt: resetsAt
+        )
+        let writtenAt = try modificationDate(of: file)
+
+        _ = try store.recordAccountUsage(provider: .grok, weeklyUsedPercent: 40)
+
+        XCTAssertEqual(
+            try modificationDate(of: file),
+            writtenAt,
+            "weeklyUsedPercent alone, equal to the stored value, is a no-op write"
+        )
+        let stored = try XCTUnwrap(store.load().providers.first { $0.provider == .grok })
+        XCTAssertEqual(stored.weeklyWindowDurationMinutes, 10_080)
+        XCTAssertEqual(stored.weeklyResetsAt, resetsAt)
+        XCTAssertEqual(stored.currentSessionUsedPercent, 12)
+    }
+
+    /// WHY: `.empty` covers a missing, unreadable and wrong-period file, and its
+    /// rows read as 0%. A 0% report with no window attached is exactly the shape
+    /// that matches such a row, so deciding from `.empty` would skip the write
+    /// that creates usage.json. The comparison must run against a decode that
+    /// really happened.
+    func test_recordAccountUsage_zeroPercentOnMissingFileStillCreatesTheFile() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ts-account-usage-missing-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = TokenSaverUsageStore(appSupportDirectory: directory)
+        let file = directory
+            .appendingPathComponent("TokenSaver", isDirectory: true)
+            .appendingPathComponent("usage.json", isDirectory: false)
+
+        _ = try store.recordAccountUsage(provider: .codex, weeklyUsedPercent: 0)
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: file.path),
+            "recording 0% with no usage.json on disk must still create it"
+        )
+        let stored = try XCTUnwrap(store.load().providers.first { $0.provider == .codex })
+        XCTAssertEqual(stored.weeklyUsedPercent, 0)
+    }
+
+    /// WHY: the no-op decision must compare against what the file holds, not
+    /// against the read model `load()` exposes. An expired weekly window reads as
+    /// 0% (`expiringStaleWeeklyUsage`), so comparing the folded value would treat
+    /// a real 45% → 0% write as a no-op and leave the stale 45% on disk.
+    func test_recordAccountUsage_expiredWindowStillPersistsTheZeroItReports() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ts-account-usage-expired-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = TokenSaverUsageStore(appSupportDirectory: directory)
+        let file = directory
+            .appendingPathComponent("TokenSaver", isDirectory: true)
+            .appendingPathComponent("usage.json", isDirectory: false)
+
+        let expired = Date(timeIntervalSince1970: 1_600_000_000)
+        _ = try store.recordAccountUsage(
+            provider: .claude,
+            weeklyUsedPercent: 45,
+            weeklyWindowDurationMinutes: 10_080,
+            weeklyResetsAt: expired
+        )
+        XCTAssertEqual(
+            store.load().providers.first { $0.provider == .claude }?.weeklyUsedPercent,
+            0,
+            "fixture check: the read model folds the expired window to 0%"
+        )
+
+        _ = try store.recordAccountUsage(provider: .claude, weeklyUsedPercent: 0)
+
+        let persisted = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any]
+        let providers = (persisted?["providers"] as? [[String: Any]]) ?? []
+        let claude = providers.first { $0["provider"] as? String == "claude" }
+        XCTAssertEqual(
+            (claude?["weeklyUsedPercent"] as? NSNumber)?.doubleValue,
+            0,
+            "the reported 0% must reach the file, not be folded away by the comparison"
+        )
+    }
+
+    private func modificationDate(of url: URL) throws -> Date {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        return try XCTUnwrap(attributes[.modificationDate] as? Date)
+    }
+
     func test_crossProcessLock_serializesEveryMutationWhileReadsRemainComplete() throws {
         // WHY: provider proxies and the app update the same usage.json. Without
         // one stable cross-process lock, two valid read-modify-writes can each

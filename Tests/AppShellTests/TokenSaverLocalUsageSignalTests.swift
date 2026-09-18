@@ -74,6 +74,72 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         )
     }
 
+    /// WHY: opening the Token Saver details popover stamps "Account usage
+    /// updated just now" when the provider probe finishes. The probe used to
+    /// treat ANY `rc2TokenSaverUsageChanged` as that completion, but local
+    /// paths post the same notification (`savings_recorded` during a run, the
+    /// enable/disable toggle) without querying a provider — so the popover
+    /// asserted a fresh account query that was still in flight.
+    func test_detailsProbe_ignoresLocalUsageNotificationWhileProbeIsInFlight() async throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2TokenSaverDetailsProbe-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let refresher = GatedAccountUsageRefresher()
+        let context = try AppContext(
+            channel: .debug,
+            appSupportOverride: appSupport.path,
+            tokenSaverAccountUsageRefresher: refresher
+        )
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        PrivateAccountSessionStore(repo: context.settingsRepo).save(PrivateAccountSession(
+            accessToken: "tok",
+            refreshToken: "ref",
+            user: PrivateAccountUser(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "paid@example.com",
+                id: "paid",
+                subscribed: true
+            )
+        ))
+        let viewModel = SidebarViewModel(
+            context: context,
+            router: router,
+            insomniaPower: FakeInsomniaPowerManager(),
+            powerMonitor: FakeExternalPowerMonitor()
+        )
+        viewModel.reload()
+        XCTAssertNotNil(viewModel.privateAccountUser, "probe precondition: a signed-in account")
+        XCTAssertNil(viewModel.tokenSaverAccountUsageLastUpdated, "probe precondition: nothing stamped yet")
+
+        viewModel.refreshTokenSaverAccountUsageForDetails()
+        XCTAssertTrue(viewModel.tokenSaverAccountUsageIsRefreshing)
+        // The probe registers its one-shot observer from a MainActor Task, so
+        // wait for the gated provider call before posting: a notification sent
+        // before registration would be missed and prove nothing.
+        let probeInFlight = await waitUntilAsync { await refresher.hasStarted() }
+        XCTAssertTrue(probeInFlight, "the provider probe must be running before the local event is posted")
+
+        // A local savings_recorded event (or the enable toggle) posts the same
+        // notification the probe used to accept as completion.
+        NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertNil(
+            viewModel.tokenSaverAccountUsageLastUpdated,
+            "WHY: a local usage event must not stamp the account-usage timestamp while the provider probe is still running"
+        )
+
+        await refresher.release()
+        let settled = await waitUntil { viewModel.tokenSaverAccountUsageLastUpdated != nil }
+        XCTAssertTrue(settled, "the probe must stamp freshness once the real provider refresh finishes")
+        XCTAssertFalse(
+            viewModel.tokenSaverAccountUsageIsRefreshing,
+            "the spinner must stop on the real settle, not on a local usage event"
+        )
+    }
+
     func test_accountOnlyNotificationDoesNotInventLocalProviderActivity() async throws {
         let (context, viewModel, appSupport) = try makeViewModel()
         defer { try? FileManager.default.removeItem(at: appSupport) }
@@ -714,6 +780,352 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         )
     }
 
+    /// WHY: Graphify credits the estimated save from counted rows only
+    /// (`ok = 1` on query/path/explain). The pending row exists to hold the credit
+    /// back until the tool result is known good, but if that pending write fails
+    /// the success path used to update zero rows and say nothing: a Graphify
+    /// answer the user really got silently vanished from `signalCount`, which
+    /// lowers the Graphify leg of the estimated save -- the figure that must never
+    /// go down. The delivered answer must still be credited.
+    func test_graphifyUsageCreditsAnswerWhosePendingInsertFailed() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyPendingInsertLost-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        // Only the pending (ok=0) insert is refused, so the recovered success row
+        // can still land: this is a lost pending write, not a dead database.
+        try context.db.execute("""
+            CREATE TRIGGER fail_graphify_usage_pending_insert
+            BEFORE INSERT ON graphify_usage_events
+            WHEN NEW.ok = 0
+            BEGIN
+                SELECT RAISE(ABORT, 'graphify usage pending insert blocked');
+            END;
+            """)
+        // Anti-vacuity: the trigger has to really refuse the pending write.
+        XCTAssertThrowsError(
+            try context.graphifyUsageRepo.insert(
+                GraphifyUsageEvent(
+                    createdAtMs: Int64(Date().timeIntervalSince1970 * 1000),
+                    provider: "claude",
+                    runId: "probe-run",
+                    itemId: "probe-item",
+                    subcommand: "query",
+                    answerTokens: 0,
+                    source: "event_stream",
+                    ok: false
+                )
+            ),
+            "the fixture must block the ok=0 insert, otherwise this spec proves nothing"
+        )
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+        let itemId = "bash-lost-pending-row"
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: itemId,
+            bodyAppend: #"{"command":"graphify query where is X"}"#,
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: itemId,
+            bodyAppend: nil,
+            outputAppend: "NODE X\n",
+            summary: "result",
+            threadId: threadId,
+            runId: runId
+        )
+        XCTAssertGreaterThan(
+            context.graphifyDetectCountForTesting,
+            0,
+            "the Graphify query must be detected, otherwise no credit was ever at stake"
+        )
+        context.finalizeGraphifyUsageItem(itemId: itemId, runId: runId)
+        context.backgroundWriterQueue.sync {}
+
+        let signals = try context.graphifyUsageRepo.signalCount(
+            fromMs: nowMs - 60_000,
+            toMsExclusive: nowMs + 60_000
+        )
+        XCTAssertEqual(
+            signals,
+            1,
+            "a delivered Graphify query must stay counted even when its pending row could not be written -- losing it lowers the estimated save"
+        )
+        XCTAssertGreaterThan(
+            try context.graphifyUsageRepo.answerTokensSum(
+                fromMs: nowMs - 60_000,
+                toMsExclusive: nowMs + 60_000
+            ),
+            0,
+            "the recovered row must carry the measured answer size, not a zero-token placeholder"
+        )
+    }
+
+    /// LEG-2: the normal path (pending row lands, then flips to ok=1) is unchanged
+    /// by the recovery above -- exactly one counted row, no duplicate insert and no
+    /// recovery bookkeeping. Green before and after the change.
+    func test_graphifyUsageCreditsOnceWhenThePendingInsertLanded() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyPendingInsertLanded-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+        let itemId = "bash-pending-row-landed"
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: itemId,
+            bodyAppend: #"{"command":"graphify query where is X"}"#,
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: itemId,
+            bodyAppend: nil,
+            outputAppend: "NODE X\n",
+            summary: "result",
+            threadId: threadId,
+            runId: runId
+        )
+        context.finalizeGraphifyUsageItem(itemId: itemId, runId: runId)
+        context.backgroundWriterQueue.sync {}
+
+        XCTAssertEqual(
+            try context.graphifyUsageRepo.signalCount(fromMs: nowMs - 60_000, toMsExclusive: nowMs + 60_000),
+            1,
+            "one delivered Graphify query is one signal"
+        )
+        let rows = try context.db.prepare("SELECT COUNT(*) FROM graphify_usage_events WHERE run_id = ? AND item_id = ?;")
+        try rows.bind(1, runId.value.uuidString)
+        try rows.bind(2, itemId)
+        _ = try rows.step()
+        XCTAssertEqual(
+            rows.columnInt64(0),
+            1,
+            "the landed path must not add a second row through recovery"
+        )
+    }
+
+    /// WHY: a buffer is only dropped by its own item's terminal event, and a run
+    /// stopped mid-item never emits one. Every interrupted run therefore left a
+    /// ~16 KiB entry behind for the life of the app (nothing ever revisited it).
+    /// The run-finish hook is terminal, so that is where they are reclaimed.
+    func test_graphifyBuffer_runStoppedMidItemIsReclaimedAtRunFinish() async throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyRunStopReclaim-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        let thread = AgentThread(title: "stopped mid item", provider: .codex, model: "m")
+        try context.threadRepo.upsert(thread)
+        var run = AgentRun(threadId: thread.id, provider: .codex, model: "m",
+                           status: .running, startedAt: Date())
+        try context.runRepo.upsert(run)
+        let itemId = "bash-interrupted"
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: itemId,
+            bodyAppend: String(repeating: "npm run build ", count: 64),
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: thread.id,
+            runId: run.id
+        )
+        XCTAssertEqual(
+            context.graphifyBufferCountForTesting(),
+            1,
+            "fixture check: the streaming item is resident while the run is alive"
+        )
+        context.graphifyBufferBackdateForTesting(
+            runId: run.id,
+            itemId: itemId,
+            byMs: AppContext.graphifyBufferStaleAfterMs + 1
+        )
+
+        run.status = .cancelled
+        run.finishedAt = Date()
+        try context.runRepo.upsert(run)
+        context.coordinator.onRunFinished?(thread.id, run.id, .cancelled)
+
+        await waitForGraphifyBufferCount(0, in: context)
+        XCTAssertEqual(
+            context.graphifyBuffersDroppedStaleForTesting,
+            1,
+            "the interrupted item's entry must be the one reclaimed"
+        )
+    }
+
+    /// WHY: capacity is the backstop for entries no run-finish hook ever sees
+    /// (a provider crash leaves the run unclosed). Keep the newest stream: the
+    /// oldest entry is the one whose item stopped sending events.
+    func test_graphifyBuffer_capacityReclaimsTheOldestAndKeepsTheLiveStream() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyCapacity-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        context.graphifyBufferCapacity = 1
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "abandoned", bodyAppend: String(repeating: "old ", count: 64),
+            outputAppend: nil, summary: "Bash", threadId: threadId, runId: runId
+        )
+        context.graphifyBufferBackdateForTesting(
+            runId: runId, itemId: "abandoned", byMs: AppContext.graphifyBufferStaleAfterMs + 1
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "live", bodyAppend: String(repeating: "new ", count: 64),
+            outputAppend: nil, summary: "Bash", threadId: threadId, runId: runId
+        )
+
+        XCTAssertEqual(
+            context.graphifyBufferBodyUTF8CountForTesting(runId: runId, itemId: "abandoned"),
+            0,
+            "the entry whose item stopped sending events must be the one reclaimed"
+        )
+        XCTAssertGreaterThan(
+            context.graphifyBufferBodyUTF8CountForTesting(runId: runId, itemId: "live"),
+            0,
+            "the item still streaming must keep its buffer"
+        )
+        XCTAssertEqual(context.graphifyBufferCountForTesting(), 1, "capacity must bound the map")
+        XCTAssertEqual(context.graphifyBuffersDroppedStaleForTesting, 1)
+        XCTAssertEqual(context.graphifyBuffersDroppedOverCapacityForTesting, 0)
+    }
+
+    /// WHY: a pending ok=0 row is only credited when its item finalizes, so a
+    /// sweep that dropped the buffer of a recorded Graphify invocation would
+    /// strand the row and shrink the Graphify credit. Backstop pressure must
+    /// drop abandoned entries around it instead.
+    func test_graphifyBuffer_pendingGraphifyRowIsNeverSwept() throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2GraphifyPendingRow-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true, graphifyEnabled: true))
+        // Every insert is over capacity, so both the stale pass and the
+        // capacity backstop run on each one.
+        context.graphifyBufferCapacity = 0
+        let threadId = AgentThreadID()
+        let runId = AgentRunID()
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "graphify-call",
+            bodyAppend: #"{"command":"graphify query where is X"}"#,
+            outputAppend: nil,
+            summary: "Bash",
+            threadId: threadId,
+            runId: runId
+        )
+        // Result phase: the flip to ok=1 only happens with real tool output.
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "graphify-call",
+            bodyAppend: nil,
+            outputAppend: "NODE SidebarView\n",
+            summary: "result",
+            threadId: threadId,
+            runId: runId
+        )
+        context.graphifyBufferBackdateForTesting(
+            runId: runId, itemId: "graphify-call", byMs: AppContext.graphifyBufferStaleAfterMs + 1
+        )
+        context.recordGraphifyUsageFromItemDelta(
+            itemId: "abandoned", bodyAppend: String(repeating: "noise ", count: 64),
+            outputAppend: nil, summary: "Bash", threadId: threadId, runId: runId
+        )
+
+        XCTAssertGreaterThan(
+            context.graphifyBufferBodyUTF8CountForTesting(runId: runId, itemId: "graphify-call"),
+            0,
+            "a stale entry holding a pending Graphify row must survive the sweep"
+        )
+        XCTAssertEqual(
+            context.graphifyBufferBodyUTF8CountForTesting(runId: runId, itemId: "abandoned"),
+            0,
+            "the abandoned entry without a pending row is the one dropped"
+        )
+        XCTAssertEqual(context.graphifyBuffersDroppedStaleForTesting, 0)
+        XCTAssertEqual(context.graphifyBuffersDroppedOverCapacityForTesting, 1)
+
+        // The stranded row would never be credited: prove the flip still lands.
+        context.finalizeGraphifyUsageItem(itemId: "graphify-call", runId: runId)
+        context.backgroundWriterQueue.sync {}
+        XCTAssertEqual(
+            try context.graphifyUsageRepo.signalCount(
+                fromMs: nowMs - 60_000,
+                toMsExclusive: nowMs + 60_000
+            ),
+            1,
+            "the Graphify credit must survive the sweep"
+        )
+    }
+
+    private func waitForGraphifyBufferCount(
+        _ expected: Int,
+        in context: AppContext,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            if context.graphifyBufferCountForTesting() == expected { return }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(
+            context.graphifyBufferCountForTesting(),
+            expected,
+            "resident Graphify buffers never reached \(expected)",
+            file: file,
+            line: line
+        )
+    }
+
+    /// Holds the provider probe open until the test releases it, so the
+    /// completion signal can be observed while a refresh is genuinely running.
+    private actor GatedAccountUsageRefresher: TokenSaverAccountUsageRefreshing {
+        private var started = false
+        private var released = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func hasStarted() -> Bool { started }
+
+        func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
+            started = true
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                if released {
+                    continuation.resume()
+                } else {
+                    waiters.append(continuation)
+                }
+            }
+            return [AssistantAccountUsage(
+                provider: .claude,
+                weeklyUsedPercent: 55,
+                weeklyWindowDurationMinutes: 10_080,
+                currentSessionUsedPercent: 4
+            )]
+        }
+
+        func release() {
+            released = true
+            for waiter in waiters { waiter.resume() }
+            waiters.removeAll()
+        }
+    }
+
     private func makeViewModel() throws -> (AppContext, SidebarViewModel, URL) {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2TokenSaverLocalSignal-\(UUID().uuidString)", isDirectory: true)
@@ -740,5 +1152,17 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
         return condition()
+    }
+
+    private func waitUntilAsync(
+        timeout: TimeInterval = 2,
+        condition: @escaping () async -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await condition() { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return await condition()
     }
 }
