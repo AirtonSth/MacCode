@@ -15,7 +15,8 @@ enum LibrarianHandlers {
         _ request: LibrarianRequest,
         function: LibrarianFunction,
         store: LibrarianHandleStore,
-        generate: (any LibrarianGenerating)?
+        generate: (any LibrarianGenerating)?,
+        environment: LibrarianOpEnvironment = .live
     ) async -> LibrarianHandlerOutput {
         let resolved = resolve(
             request,
@@ -44,13 +45,13 @@ enum LibrarianHandlers {
         case "source_skeleton":
             return crush(resolved, transform: { SourceCodeSkeletonizer.skeletonize($0, droppedHandle: resolved.handle) }, store: store)
         case "encoder_rank":
-            return encoderRank(request, resolved: resolved)
+            return await LibrarianWorkspaceOps.encoderRank(request, resolved: resolved, store: store, env: environment)
         case "toon_codec":
             return crush(resolved, transform: { ToonCodec.encodeIfEfficient($0) }, store: store)
         case "graphify_query":
-            return unavailableHost(resolved, reason: "graphify_cli_not_executed")
+            return await LibrarianNavigationOps.graphifyQuery(request, store: store, env: environment)
         case "path_wrappers":
-            return unavailableHost(resolved, reason: "path_wrap_is_host_PATH")
+            return await LibrarianHostOps.pathWrappers(request, store: store, env: environment)
         case "nli_gate":
             return nliGate(resolved)
         case "notebook_crusher":
@@ -66,17 +67,17 @@ enum LibrarianHandlers {
         case "secret_redact_view":
             return crush(resolved, transform: { Optional(secretRedact($0)) }, store: store)
         case "screenshot_ocr":
-            return unavailableHost(resolved, reason: "vision_ocr_needs_image_bytes")
+            return await LibrarianMediaOps.screenshotOCR(request, store: store, env: environment)
         case "doc_text_extract":
             return hostProcess(resolved, tool: "textutil", extra: ["pdftotext"])
         case "semantic_cache_lookup":
             return semanticCache(request, resolved: resolved, store: store)
         case "workspace_semantic_search":
-            return searchStore(request, store: store)
+            return await LibrarianWorkspaceOps.workspaceSemanticSearch(request, store: store, env: environment)
         case "repo_map_budget":
-            return crush(resolved, transform: { SourceCodeSkeletonizer.skeletonize($0, droppedHandle: resolved.handle) }, store: store)
+            return await LibrarianWorkspaceOps.repoMapBudget(request, store: store, env: environment)
         case "stale_tool_result_evict":
-            return unavailableHost(resolved, reason: "host_resume_evict_not_in_sidecar")
+            return await LibrarianHostOps.staleToolResultEvict(request, resolved: resolved, store: store)
         case "retrieve_range":
             return retrieveRange(request, store: store)
         case "handle_grep":
@@ -86,7 +87,7 @@ enum LibrarianHandlers {
         case "handle_token_estimate":
             return tokenEstimate(resolved)
         case "session_transcript_search", "history_recall_search":
-            return searchStore(request, store: store)
+            return await LibrarianWorkspaceOps.transcriptSearch(request, env: environment)
         case "repeated_failure_notice":
             return textNotice(resolved, text: "notice: similar failure may already exist in store; ignore if new")
         case "identifier_alias_codec":
@@ -96,23 +97,27 @@ enum LibrarianHandlers {
         case "padded_table_compact":
             return crush(resolved, transform: compactTable, store: store)
         case "workspace_change_notice":
-            return unavailableHost(resolved, reason: "fsevents_watch_is_host")
-        case "audio_transcribe_local", "video_keyframe_ocr":
-            return unavailableHost(resolved, reason: "media_bytes_required")
+            return await LibrarianNavigationOps.workspaceChangeNotice(request, store: store, env: environment)
+        case "audio_transcribe_local":
+            return await LibrarianMediaOps.audioTranscribeLocal(request, store: store, env: environment)
+        case "video_keyframe_ocr":
+            return await LibrarianMediaOps.videoKeyframeOCR(request, store: store, env: environment)
         case "screenshot_diff_digest":
-            return unavailableHost(resolved, reason: "two_image_handles_required")
+            return await LibrarianMediaOps.screenshotDiffDigest(request, store: store, env: environment)
         case "write_ack_verify":
             return writeAck(resolved)
         case "unchanged_reread_stub":
-            return unavailableHost(resolved, reason: "claude_posttooluse_only")
+            return await LibrarianHostOps.unchangedRereadStub(request, store: store, env: environment)
         case "stdout_budget_elide":
             return crush(resolved, transform: { stdoutElide($0, handle: resolved.handle) }, store: store)
         case "predicate_watch":
-            return unavailableHost(resolved, reason: "host_watch_not_local_suggested")
+            return await LibrarianHostOps.predicateWatch(request, store: store, env: environment)
         case "attachment_handle_intake", "terminal_scrollback_intake":
             return intake(resolved, store: store)
-        case "lsp_query", "ast_grep_query":
-            return unavailableHost(resolved, reason: "host_language_tool_required")
+        case "lsp_query":
+            return await LibrarianNavigationOps.lspQuery(request, store: store, env: environment)
+        case "ast_grep_query":
+            return await LibrarianNavigationOps.astGrepQuery(request, store: store, env: environment)
         case "svg_crusher":
             return crush(resolved, transform: svgCrush, store: store)
         case "error_site_autoquote":
@@ -120,11 +125,11 @@ enum LibrarianHandlers {
         case "schema_validate_eval":
             return schemaValidate(request, resolved: resolved)
         case "batch_codemod_apply":
-            return unavailableHost(resolved, reason: "host_codemod_not_local_authored")
+            return await LibrarianHostOps.batchCodemodApply(request, store: store, env: environment)
         case "stale_tool_args_evict":
-            return unavailableHost(resolved, reason: "host_resume_args_evict_not_in_sidecar")
+            return await LibrarianHostOps.staleToolArgsEvict(request, resolved: resolved, store: store)
         case "spreadsheet_extract":
-            return unavailableHost(resolved, reason: "workbook_bytes_required")
+            return await LibrarianMediaOps.spreadsheetExtract(request, store: store, env: environment)
         case "test_baseline_diff":
             return testBaseline(request, resolved: resolved, store: store)
         case "correction_exemplar_store":
@@ -142,6 +147,20 @@ enum LibrarianHandlers {
             return crush(resolved, transform: compactSpan, store: store)
         case "wire_encode":
             return crush(resolved, transform: { Optional("WIRE\n" + $0.split(whereSeparator: \.isNewline).prefix(12).joined(separator: "\n")) }, store: store)
+        case "project_commands":
+            return await LibrarianWorkspaceOps.projectCommands(request, env: environment)
+        case "branch_files":
+            return await LibrarianWorkspaceOps.branchFiles(request, env: environment)
+        case "symbol_references":
+            return await LibrarianWorkspaceOps.symbolReferences(request, store: store, env: environment)
+        case "test_mapping":
+            return await LibrarianWorkspaceOps.testMapping(request, env: environment)
+        case "ownership_lookup":
+            return await LibrarianWorkspaceOps.ownership(request, env: environment)
+        case "orphan_files":
+            return await LibrarianWorkspaceOps.orphanFiles(request, store: store, env: environment)
+        case "call_graph":
+            return await LibrarianWorkspaceOps.callGraph(request, store: store, env: environment)
         default:
             if LibrarianCatalog.disabledOnNineB.contains(function.id) {
                 return unavailableHost(resolved, reason: "disabled_on_ornith_9b")
@@ -153,19 +172,14 @@ enum LibrarianHandlers {
         }
     }
 
-    private struct Resolved {
-        let text: String
-        let handle: String
-        let original: String
-    }
 
     private static func resolve(
         _ request: LibrarianRequest,
         store: LibrarianHandleStore,
         storeMissing: Bool = true
-    ) -> Resolved {
+    ) -> ResolvedBox {
         if let handle = request.handle, let blob = store.get(handle) {
-            return Resolved(text: blob, handle: handle, original: blob)
+            return ResolvedBox(text: blob, handle: handle, original: blob)
         }
         let text = request.input
         // duplicate_handle_notice must inspect the pre-existing store. Inserting
@@ -173,12 +187,12 @@ enum LibrarianHandlers {
         // established resolve behavior for every other operation.
         let handle = storeMissing ? (request.handle ?? store.put(text)) : LibrarianHandleStore.makeHandle(text)
         if storeMissing, store.get(handle) == nil { _ = store.put(text, handle: handle) }
-        return Resolved(text: text, handle: handle, original: text)
+        return ResolvedBox(text: text, handle: handle, original: text)
     }
 
     private static func duplicateHandleNotice(
         _ request: LibrarianRequest,
-        resolved: Resolved,
+        resolved: ResolvedBox,
         store: LibrarianHandleStore
     ) -> LibrarianHandlerOutput {
         let original = request.input.isEmpty ? resolved.original : request.input
@@ -278,7 +292,7 @@ enum LibrarianHandlers {
         handleGrep(request, store: store)
     }
 
-    private static func tokenEstimate(_ resolved: Resolved) -> LibrarianHandlerOutput {
+    private static func tokenEstimate(_ resolved: ResolvedBox) -> LibrarianHandlerOutput {
         let tokens = TokenEstimator.estimate(resolved.text)
         let lines = resolved.text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).map(String.init)
         let head = lines.prefix(8).joined(separator: "\n")
@@ -287,16 +301,7 @@ enum LibrarianHandlers {
         return LibrarianHandlerOutput(status: .ok, text: text, handle: resolved.handle, originalForSavings: resolved.original)
     }
 
-    private static func encoderRank(_ request: LibrarianRequest, resolved: Resolved) -> LibrarianHandlerOutput {
-        let chunks = resolved.text.split(whereSeparator: \.isNewline).enumerated().map { idx, line in
-            QueryAwareChunk(id: "\(idx+1)", text: String(line), position: idx)
-        }
-        let ranked = QueryAwareChunkRanker().rank(chunks: chunks, query: request.question ?? "")
-        let text = ranked.prefix(8).map { "\($0.chunk.id)\t\($0.finalScore)\t\($0.chunk.text)" }.joined(separator: "\n")
-        return LibrarianHandlerOutput(status: .ok, text: text, handle: resolved.handle, originalForSavings: resolved.original)
-    }
-
-    private static func nliGate(_ resolved: Resolved) -> LibrarianHandlerOutput {
+    private static func nliGate(_ resolved: ResolvedBox) -> LibrarianHandlerOutput {
         let result = FaithfulnessGate.validate(original: resolved.original, compressed: resolved.text)
         let status: LibrarianStatus = result.accepted ? .ok : .unavailable
         return LibrarianHandlerOutput(
@@ -308,7 +313,7 @@ enum LibrarianHandlers {
         )
     }
 
-    private static func crush(_ resolved: Resolved, transform: (String) -> String?, store: LibrarianHandleStore) -> LibrarianHandlerOutput {
+    private static func crush(_ resolved: ResolvedBox, transform: (String) -> String?, store: LibrarianHandleStore) -> LibrarianHandlerOutput {
         let handle = store.put(resolved.original, handle: resolved.handle)
         guard let out = transform(resolved.text), out.utf8.count < resolved.text.utf8.count else {
             return LibrarianHandlerOutput(status: .ok, text: resolved.text, handle: handle, stage: .verbatim, originalForSavings: resolved.original)
@@ -317,7 +322,7 @@ enum LibrarianHandlers {
         return LibrarianHandlerOutput(status: .ok, text: withHandle, handle: handle, originalForSavings: resolved.original)
     }
 
-    private static func textNotice(_ resolved: Resolved, text: String) -> LibrarianHandlerOutput {
+    private static func textNotice(_ resolved: ResolvedBox, text: String) -> LibrarianHandlerOutput {
         LibrarianHandlerOutput(
             status: .ok,
             text: resolved.original,
@@ -327,7 +332,7 @@ enum LibrarianHandlers {
         )
     }
 
-    private static func unavailableHost(_ resolved: Resolved, reason: String) -> LibrarianHandlerOutput {
+    private static func unavailableHost(_ resolved: ResolvedBox, reason: String) -> LibrarianHandlerOutput {
         LibrarianHandlerOutput(
             status: .unavailable,
             text: resolved.text,
@@ -338,46 +343,46 @@ enum LibrarianHandlers {
         )
     }
 
-    private static func hostProcess(_ resolved: Resolved, tool: String, extra: [String]) -> LibrarianHandlerOutput {
+    private static func hostProcess(_ resolved: ResolvedBox, tool: String, extra: [String]) -> LibrarianHandlerOutput {
         unavailableHost(resolved, reason: "\(tool)_not_executed_on_handle")
     }
 
-    private static func stubHandle(_ resolved: Resolved, kind: String) -> LibrarianHandlerOutput {
+    private static func stubHandle(_ resolved: ResolvedBox, kind: String) -> LibrarianHandlerOutput {
         unavailableHost(resolved, reason: "\(kind)_not_executed")
     }
 
-    private static func intake(_ resolved: Resolved, store: LibrarianHandleStore) -> LibrarianHandlerOutput {
+    private static func intake(_ resolved: ResolvedBox, store: LibrarianHandleStore) -> LibrarianHandlerOutput {
         let handle = store.put(resolved.text, kind: "attachment")
         let preview = "kind=text size=\(resolved.text.utf8.count) handle=\(handle)"
         return LibrarianHandlerOutput(status: .ok, text: preview, handle: handle, originalForSavings: resolved.original)
     }
 
-    private static func writeAck(_ resolved: Resolved) -> LibrarianHandlerOutput {
+    private static func writeAck(_ resolved: ResolvedBox) -> LibrarianHandlerOutput {
         let lines = resolved.text.split(whereSeparator: \.isNewline).count
         let text = "{\"lines\":\(lines),\"hash\":\"\(LibrarianHandleStore.makeHandle(resolved.text))\"}"
         return LibrarianHandlerOutput(status: .ok, text: text, handle: resolved.handle, originalForSavings: resolved.original)
     }
 
-    private static func generatedAsset(_ resolved: Resolved, store: LibrarianHandleStore) -> LibrarianHandlerOutput {
+    private static func generatedAsset(_ resolved: ResolvedBox, store: LibrarianHandleStore) -> LibrarianHandlerOutput {
         let handle = store.put(resolved.original, handle: resolved.handle)
         let text = "generated/minified asset size=\(resolved.text.utf8.count) hash=\(handle) [[rc:\(handle)]]"
         return LibrarianHandlerOutput(status: .ok, text: text, handle: handle, originalForSavings: resolved.original)
     }
 
-    private static func semanticCache(_ request: LibrarianRequest, resolved: Resolved, store: LibrarianHandleStore) -> LibrarianHandlerOutput {
+    private static func semanticCache(_ request: LibrarianRequest, resolved: ResolvedBox, store: LibrarianHandleStore) -> LibrarianHandlerOutput {
         if let dup = store.findDuplicate(of: resolved.text) {
             return textNotice(resolved, text: "semantic cache notice: similar blob at \(dup); never substitutes bytes")
         }
         return searchStore(request, store: store)
     }
 
-    private static func flag(_ resolved: Resolved, on: Bool, label: String) -> LibrarianHandlerOutput {
+    private static func flag(_ resolved: ResolvedBox, on: Bool, label: String) -> LibrarianHandlerOutput {
         let view = on ? secretRedact(resolved.text) : resolved.text
         let text = "\(label)=\(on) \n\(view)"
         return LibrarianHandlerOutput(status: .ok, text: text, handle: resolved.handle, originalForSavings: resolved.original)
     }
 
-    private static func schemaValidate(_ request: LibrarianRequest, resolved: Resolved) -> LibrarianHandlerOutput {
+    private static func schemaValidate(_ request: LibrarianRequest, resolved: ResolvedBox) -> LibrarianHandlerOutput {
         guard let schema = request.schema, let data = resolved.text.data(using: .utf8),
               (try? JSONSerialization.jsonObject(with: data)) != nil else {
             return LibrarianHandlerOutput(status: .ok, text: "schema errors: input is not JSON", handle: resolved.handle, originalForSavings: resolved.original)
@@ -386,7 +391,7 @@ enum LibrarianHandlers {
         return LibrarianHandlerOutput(status: .ok, text: text, handle: resolved.handle, originalForSavings: resolved.original)
     }
 
-    private static func testBaseline(_ request: LibrarianRequest, resolved: Resolved, store: LibrarianHandleStore) -> LibrarianHandlerOutput {
+    private static func testBaseline(_ request: LibrarianRequest, resolved: ResolvedBox, store: LibrarianHandleStore) -> LibrarianHandlerOutput {
         let current = Set(TestReportCrusher.crush(resolved.text, handle: resolved.handle)?.split(whereSeparator: \.isNewline).map(String.init) ?? [])
         let baselineText = request.handles.last.flatMap { store.get($0) } ?? ""
         let baseline = Set(baselineText.split(whereSeparator: \.isNewline).map(String.init))
@@ -395,7 +400,7 @@ enum LibrarianHandlers {
         return LibrarianHandlerOutput(status: .ok, text: text, handle: resolved.handle, originalForSavings: resolved.original)
     }
 
-    private static func errorSiteQuote(_ resolved: Resolved) -> LibrarianHandlerOutput {
+    private static func errorSiteQuote(_ resolved: ResolvedBox) -> LibrarianHandlerOutput {
         let pattern = Self.errorSitePattern
         let ns = resolved.text as NSString
         var quotes: [String] = []
@@ -516,7 +521,7 @@ enum LibrarianHandlers {
     private static func generateOp(
         _ request: LibrarianRequest,
         function: LibrarianFunction,
-        resolved: Resolved,
+        resolved: ResolvedBox,
         store: LibrarianHandleStore,
         generate: (any LibrarianGenerating)?
     ) async -> LibrarianHandlerOutput {

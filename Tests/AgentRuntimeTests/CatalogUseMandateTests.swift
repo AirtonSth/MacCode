@@ -6,8 +6,11 @@ import CoreModel
 /// each paid provider receives the by-default mandate in the prompt it actually
 /// runs with, and never while Token Saver is off.
 final class CatalogUseMandateTests: XCTestCase {
-    private let byDefaultWording = "BY DEFAULT whenever they are listed, without the user asking"
-    private let catalogToolNames = ["rc_stats", "rc_search", "rc_catalog", "rc_ask", "rc_retrieve", "rc_compress"]
+    private let byDefaultWording = "BY DEFAULT whenever listed, without the user asking"
+    private let catalogToolNames = [
+        "rc_stats", "rc_search", "rc_catalog", "rc_ask",
+        "rc_extract", "rc_digest", "rc_pick", "rc_retrieve", "rc_compress"
+    ]
 
     private func admittedEnvironment() -> [String: String] {
         [

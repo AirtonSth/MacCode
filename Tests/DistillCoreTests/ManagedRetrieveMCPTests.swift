@@ -98,7 +98,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         XCTAssertEqual(firstLine, secondLine, "tools/list must be byte-stable for the same capability scope")
         let obj = try parse(firstLine)
         let tools = try XCTUnwrap((obj["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_search", "rc_catalog", "rc_ask"])
+        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_search", "rc_catalog", "rc_ask", "rc_extract", "rc_digest", "rc_pick"])
     }
 
     func test_unscopedRetrieveToolIsRejectedEvenWhenLegacyClosureCanReturnOriginal() async throws {
@@ -111,7 +111,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let srv = server(["rcv1.capability": "exact original"], scoped: true)
         let listed = try parse(await srv.handle(#"{"jsonrpc":"2.0","id":20,"method":"tools/list"}"#))
         let tools = try XCTUnwrap((listed["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_search", "rc_catalog", "rc_ask", "rc_retrieve", "rc_compress"])
+        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_search", "rc_catalog", "rc_ask", "rc_extract", "rc_digest", "rc_pick", "rc_retrieve", "rc_compress"])
 
         let called = try parse(await srv.handle(
             #"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"rc_retrieve","arguments":{"handle":"rcv1.capability"}}}"#
@@ -170,7 +170,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
         let op = try XCTUnwrap(properties["op"] as? [String: Any])
         XCTAssertEqual(op["type"] as? String, "string")
-        XCTAssertNil(op["enum"], "the 168-id catalog must be discovered just in time via rc_catalog")
+        XCTAssertNil(op["enum"], "the exposed catalog must be discovered just in time via rc_catalog")
         let description = try XCTUnwrap(op["description"] as? String)
         for id in LibrarianCatalog.hotHintIDs {
             XCTAssertTrue(description.contains(id), "missing hot hint \(id)")
@@ -215,7 +215,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         } while cursor != nil
 
         XCTAssertEqual(ids, LibrarianCatalog.implementedIDs)
-        XCTAssertEqual(Set(ids).count, 168)
+        XCTAssertEqual(Set(ids).count, 175)
         XCTAssertTrue(Set(ids).isDisjoint(with: LibrarianCatalog.forbiddenIDs))
         XCTAssertTrue(Set(ids).isDisjoint(with: LibrarianCatalog.disabledOnNineB))
     }
@@ -271,7 +271,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let recorder = AskRecorder()
         let srv = ManagedRetrieveMCP(
             retrieve: { _ in nil },
-            ask: { op, _, _, _ in await recorder.answer(op: op) }
+            ask: { call in ManagedRetrieveMCP.OpAnswer(status: "ok", text: await recorder.answer(op: call.op)) }
         )
 
         _ = try parse(await srv.handle(try callLine(
@@ -294,7 +294,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let recorder = AskRecorder()
         let srv = ManagedRetrieveMCP(
             retrieve: { _ in nil },
-            ask: { op, _, _, _ in await recorder.answer(op: op) }
+            ask: { call in ManagedRetrieveMCP.OpAnswer(status: "ok", text: await recorder.answer(op: call.op)) }
         )
 
         for (offset, op) in LibrarianCatalog.implementedIDs.enumerated() {

@@ -98,7 +98,17 @@ let package = Package(
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Tokenizers", package: "swift-transformers")
             ],
-            path: "Sources/DistillCore"
+            path: "Sources/DistillCore",
+            linkerSettings: [
+                // Read-only transcript search over the host database, Vision OCR,
+                // AVFoundation keyframes and the TCC-gated speech recognizer.
+                .linkedLibrary("sqlite3"),
+                .linkedFramework("Vision"),
+                .linkedFramework("AVFoundation"),
+                .linkedFramework("Speech"),
+                .linkedFramework("CoreGraphics"),
+                .linkedFramework("CoreMedia")
+            ]
         ),
         .executableTarget(
             name: "RemoteCodeScheduledTaskAgent",
