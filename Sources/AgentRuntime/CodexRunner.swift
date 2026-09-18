@@ -164,6 +164,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         }
         args += botCatalogMCPOverrides(environment: request.environment)
         args += computerUseMCPOverrides(environment: request.environment)
+        args += distillMCPOverrides(environment: request.environment)
         if !resuming {
             let model = request.model.trimmingCharacters(in: .whitespaces)
             if !model.isEmpty, model.lowercased() != "default" {
@@ -250,6 +251,27 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         }
     }
 
+    /// The Distill librarian MCP (`RemoteCodeDistillService mcp`, the
+    /// 01-catalogo.html surface), admitted per process under the same Token
+    /// Saver gate as Claude (`--mcp-config` / SDK `mcp_servers`) and Grok
+    /// (ACP `session/new`). Carries the run's recovery scope so `rc_retrieve`
+    /// and `rc_ask` resolve against this exact workspace/thread.
+    public static func distillMCPOverrides(
+        command: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String] {
+        guard DistillMCPAdmit.isEnabled(environment: environment) else { return [] }
+        let resolved = command
+            ?? AgentSkillInstaller.resolveServiceBinary()?.path
+            ?? DistillMCPAdmit.fallbackCommand
+        return stdioMCPServerOverrides(
+            serverName: DistillMCPAdmit.codexServerName,
+            cliArgument: DistillMCPAdmit.cliArgument,
+            command: resolved,
+            environment: DistillMCPAdmit.recoveryEnvironment(environment)
+        )
+    }
+
     /// `codex app-server` accepts the same `-c` overrides as `exec`. Keep the
     /// subcommand first so fork-protocol probing can still recognize production
     /// app-server argv (`arguments.first == "app-server"`).
@@ -257,7 +279,9 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         command: String? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String] {
-        ["app-server"] + botCatalogMCPOverrides(command: command, environment: environment)
+        ["app-server"]
+            + botCatalogMCPOverrides(command: command, environment: environment)
+            + distillMCPOverrides(command: command, environment: environment)
     }
 
     static func stdioMCPServerOverrides(

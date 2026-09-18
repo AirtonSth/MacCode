@@ -258,6 +258,134 @@ final class CodexRunnerArgsTests: XCTestCase {
         )
     }
 
+    /// WHY: Codex must reach the 01-catalogo.html librarian on its own launch
+    /// surfaces. A config.toml-only entry leaves the run without a recovery
+    /// scope (rc_retrieve/rc_ask cannot resolve the run) and leaks into
+    /// ChatGPT.app; the per-process `-c` overlay carries this run's scope. It
+    /// reuses the installed table name so Codex sees ONE librarian server, not
+    /// one per name — Codex merges `-c` into the existing table (probed on
+    /// codex-cli 0.154.0).
+    func test_distillLibrarianMCPIsAdmittedPerProcessOnlyWithTokenSaver() {
+        XCTAssertEqual(
+            DistillMCPAdmit.codexServerName,
+            AgentSkillInstaller.retrieveMCPName,
+            "the -c overlay must override the installed librarian table, not add a second server"
+        )
+
+        let environment = [
+            DistillMCPAdmit.tokenSaverHintEnvironmentKey: "1",
+            "RC_TOKEN_SAVER_WORKSPACE_ID": "ws-1",
+            "RC_TOKEN_SAVER_PROJECT_ID": "proj-1",
+            "RC_TOKEN_SAVER_THREAD_ID": "thread-1",
+            "REMOTE_CODE_AGENT_PROVIDER": "codex",
+            "RC_TOKEN_SAVER_ATTEMPT_ID": "attempt-1",
+            "RC_TOKEN_SAVER_ROOT_RUN_ID": "root-1",
+            "UNRELATED_SECRET": "must-not-be-forwarded",
+        ]
+        let prefix = "mcp_servers.\(DistillMCPAdmit.codexServerName)"
+        let overrides = CodexRunner.distillMCPOverrides(
+            command: "/tmp/RemoteCodeDistillService",
+            environment: environment
+        )
+        XCTAssertEqual(
+            overrides,
+            [
+                "-c", "\(prefix).command=\"/tmp/RemoteCodeDistillService\"",
+                "-c", "\(prefix).args=[\"mcp\"]",
+                "-c", "\(prefix).env.RC_TOKEN_SAVER_ATTEMPT_ID=\"attempt-1\"",
+                "-c", "\(prefix).env.RC_TOKEN_SAVER_PROJECT_ID=\"proj-1\"",
+                "-c", "\(prefix).env.RC_TOKEN_SAVER_ROOT_RUN_ID=\"root-1\"",
+                "-c", "\(prefix).env.RC_TOKEN_SAVER_THREAD_ID=\"thread-1\"",
+                "-c", "\(prefix).env.RC_TOKEN_SAVER_WORKSPACE_ID=\"ws-1\"",
+                "-c", "\(prefix).env.REMOTE_CODE_AGENT_PROVIDER=\"codex\"",
+            ],
+            "Codex must receive the librarian command, the mcp arg, and only the run's recovery scope"
+        )
+        XCTAssertFalse(overrides.contains { $0.contains("UNRELATED_SECRET") },
+                       "unrelated environment must never be forwarded into the provider MCP child")
+
+        // Both live Codex launch surfaces carry it without any user request.
+        var request = req()
+        request = AgentRunRequest(
+            threadId: request.threadId,
+            provider: .codex,
+            model: request.model,
+            cwd: request.cwd,
+            prompt: request.prompt,
+            permissionMode: request.permissionMode,
+            reasoningEffort: request.reasoningEffort,
+            serviceTier: request.serviceTier,
+            environment: environment
+        )
+        let execArgs = CodexRunner.buildArgs(request)
+        XCTAssertTrue(execArgs.contains { $0.hasPrefix("\(prefix).command=") },
+                      "`codex exec` argv must admit the librarian per process")
+        XCTAssertTrue(execArgs.contains { $0.hasPrefix("\(prefix).env.RC_TOKEN_SAVER_THREAD_ID=") },
+                      "the exec overlay must carry the run's recovery scope")
+
+        let appServer = CodexRunner.appServerArguments(command: "/tmp/RemoteCodeDistillService", environment: environment)
+        XCTAssertEqual(appServer.first, "app-server", "the subcommand must stay first for fork-protocol probing")
+        XCTAssertTrue(appServer.contains { $0.hasPrefix("\(prefix).command=") },
+                      "`codex app-server` argv must admit the librarian per process")
+        XCTAssertTrue(appServer.contains { $0.hasPrefix("\(prefix).args=") && $0.contains("\"mcp\"") })
+        XCTAssertTrue(appServer.contains { $0.hasPrefix("\(prefix).env.RC_TOKEN_SAVER_THREAD_ID=") },
+                      "the app-server overlay must carry the run's recovery scope too")
+
+        // Token Saver off → no librarian entry on either surface (paid gate).
+        XCTAssertTrue(CodexRunner.distillMCPOverrides(command: "/tmp/RemoteCodeDistillService", environment: [:]).isEmpty,
+                      "Token Saver off must not admit the librarian to Codex")
+        XCTAssertFalse(CodexRunner.buildArgs(req()).contains { $0.hasPrefix("\(prefix).command=") },
+                       "a run without the Token Saver hint must not see the librarian on exec")
+        XCTAssertFalse(
+            CodexRunner.appServerArguments(command: "/tmp/RemoteCodeDistillService", environment: [:])
+                .contains { $0.hasPrefix("\(prefix).command=") },
+            "a run without the Token Saver hint must not see the librarian on app-server"
+        )
+    }
+
+    /// WHY: raw nested `codex` launches bypass CodexRunner/app-server. They go
+    /// through the proxy overlay, which must add the librarian under its own
+    /// gate even when the bot catalog is already pinned on the caller argv.
+    func test_rawCodexProxyOverlayAddsLibrarianIndependentlyOfBotCatalog() {
+        let environment = [
+            DistillMCPAdmit.tokenSaverHintEnvironmentKey: "1",
+            "RC_TOKEN_SAVER_THREAD_ID": "thread-raw",
+        ]
+        var arguments = ["exec", "--json"]
+        for botServer in [
+            BotSelfConfigMCPAdmit.serverName,
+            BotBrowserMCPAdmit.serverName,
+            BotComputerMCPAdmit.serverName,
+            BotWebMCPAdmit.serverName,
+        ] {
+            arguments += ["-c", "mcp_servers.\(botServer).command=\"/tmp/RemoteCodeDistillService\""]
+        }
+        arguments.append("continue")
+        let rewritten = AgentSkillInstaller.providerProxyArguments(
+            provider: .codex,
+            arguments: arguments,
+            environment: environment
+        )
+        XCTAssertTrue(
+            rewritten.contains { $0.hasPrefix("mcp_servers.\(DistillMCPAdmit.codexServerName).command=") },
+            "a raw codex turn with the Token Saver hint must still receive the librarian overlay"
+        )
+        XCTAssertTrue(
+            rewritten.contains { $0.hasPrefix("mcp_servers.\(DistillMCPAdmit.codexServerName).env.RC_TOKEN_SAVER_THREAD_ID=") },
+            "the raw overlay must carry the run's recovery scope"
+        )
+
+        let off = AgentSkillInstaller.providerProxyArguments(
+            provider: .codex,
+            arguments: arguments,
+            environment: [:]
+        )
+        XCTAssertFalse(
+            off.contains { $0.hasPrefix("mcp_servers.\(DistillMCPAdmit.codexServerName).command=") },
+            "Token Saver off must leave raw codex argv without the librarian"
+        )
+    }
+
     func test_computerUseMCPOverrideStaysHostGated() {
         XCTAssertEqual(
             CodexRunner.computerUseMCPOverrides(environment: [:], command: "/tmp/RemoteCodeDistillService"),

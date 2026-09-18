@@ -676,7 +676,7 @@ public final class GrokACPClient: @unchecked Sendable {
         )
         // The librarian MCP is Token Saver surface: admitted only while the
         // run carries the Token Saver hint, matching Claude (--mcp-config /
-        // SDK mcp_servers) and Codex (config.toml install lifecycle).
+        // SDK mcp_servers) and Codex (-c mcp_servers.<name>.* per process).
         let withDistill = DistillMCPAdmit.isEnabled(environment: environment)
             ? DistillMCPAdmit.admitGrokACP(
                 existing: withWeb,

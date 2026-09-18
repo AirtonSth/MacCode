@@ -500,11 +500,11 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     /// librarian server (rc_stats/rc_search/rc_ask/rc_retrieve/rc_compress —
     /// the 01-catalogo.html surface) through the documented per-process
     /// `--mcp-config` input so every CLI turn gets the exact run context
-    /// authored by the host. Codex reads the librarian from config.toml and
-    /// Grok admits it per ACP session, both under the same Token Saver gate;
-    /// without this entry Claude was the only provider that never saw the
-    /// catalog tools. User/project MCP sources remain enabled because this is
-    /// not strict mode.
+    /// authored by the host. Codex admits the same server per process via
+    /// `-c mcp_servers.<name>.*` (CodexRunner.distillMCPOverrides) and Grok per
+    /// ACP session, all under the same Token Saver gate; without this entry
+    /// Claude was the only provider that never saw the catalog tools.
+    /// User/project MCP sources remain enabled because this is not strict mode.
     /// Provider tool names auto-approved for supervised Claude runs: the bot
     /// peer tools always, plus the librarian tools while Token Saver is on
     /// (matching the servers actually admitted for the run).
