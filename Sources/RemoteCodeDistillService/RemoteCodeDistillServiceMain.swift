@@ -827,6 +827,15 @@ struct RemoteCodeDistillServiceMain {
                 if !call.arguments.isEmpty { payload["arguments"] = call.arguments }
                 if let topK = call.topK { payload["top_k"] = topK }
                 if let budget = call.budgetTokens { payload["budget_tokens"] = budget }
+                if let startLine = call.startLine { payload["start_line"] = startLine }
+                if let endLine = call.endLine { payload["end_line"] = endLine }
+                if let startByte = call.startByte { payload["start_byte"] = startByte }
+                if let endByte = call.endByte { payload["end_byte"] = endByte }
+                if let claim = call.claim { payload["claim"] = claim }
+                if let schema = call.schema { payload["schema"] = schema }
+                if let scope = call.scopeToThread { payload["scope_to_thread"] = scope }
+                if let interval = call.watchIntervalSeconds { payload["watch_interval_seconds"] = interval }
+                if let timeout = call.watchTimeoutSeconds { payload["watch_timeout_seconds"] = timeout }
                 request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
                 guard let (data, response) = try? await session.data(for: request),
                       (response as? HTTPURLResponse)?.statusCode == 200,

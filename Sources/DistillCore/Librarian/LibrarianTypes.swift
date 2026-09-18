@@ -13,6 +13,10 @@ public struct LibrarianHTTPBody: Codable, Sendable {
     public var pattern: String?
     public var startLine: Int?
     public var endLine: Int?
+    public var startByte: Int?
+    public var endByte: Int?
+    public var claim: String?
+    public var schema: String?
     public var root: String?
     public var paths: [String]?
     public var symbol: String?
@@ -35,6 +39,9 @@ public struct LibrarianHTTPBody: Codable, Sendable {
         case threadID = "thread_id"
         case startLine = "start_line"
         case endLine = "end_line"
+        case startByte = "start_byte"
+        case endByte = "end_byte"
+        case claim, schema
         case fileName = "file_name"
         case baseRef = "base_ref"
         case since

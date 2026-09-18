@@ -34,6 +34,15 @@ public struct ManagedRetrieveMCP: Sendable {
         public var arguments: [String]
         public var topK: Int?
         public var budgetTokens: Int?
+        public var startLine: Int?
+        public var endLine: Int?
+        public var startByte: Int?
+        public var endByte: Int?
+        public var claim: String?
+        public var schema: String?
+        public var scopeToThread: Bool?
+        public var watchIntervalSeconds: Double?
+        public var watchTimeoutSeconds: Int?
 
         public init(
             op: String,
@@ -52,7 +61,16 @@ public struct ManagedRetrieveMCP: Sendable {
             navigation: String? = nil,
             arguments: [String] = [],
             topK: Int? = nil,
-            budgetTokens: Int? = nil
+            budgetTokens: Int? = nil,
+            startLine: Int? = nil,
+            endLine: Int? = nil,
+            startByte: Int? = nil,
+            endByte: Int? = nil,
+            claim: String? = nil,
+            schema: String? = nil,
+            scopeToThread: Bool? = nil,
+            watchIntervalSeconds: Double? = nil,
+            watchTimeoutSeconds: Int? = nil
         ) {
             self.op = op
             self.input = input
@@ -71,6 +89,15 @@ public struct ManagedRetrieveMCP: Sendable {
             self.arguments = arguments
             self.topK = topK
             self.budgetTokens = budgetTokens
+            self.startLine = startLine
+            self.endLine = endLine
+            self.startByte = startByte
+            self.endByte = endByte
+            self.claim = claim
+            self.schema = schema
+            self.scopeToThread = scopeToThread
+            self.watchIntervalSeconds = watchIntervalSeconds
+            self.watchTimeoutSeconds = watchTimeoutSeconds
         }
     }
 
@@ -115,6 +142,9 @@ public struct ManagedRetrieveMCP: Sendable {
     public static let pickToolName = "rc_pick"
     /// Every tool a catalog `mcp:` reference can name.
     public static let catalogOpToolNames = [askToolName, extractToolName, digestToolName, pickToolName]
+    /// One handle store per MCP session: a handle minted by a locally served op
+    /// must stay retrievable through `rc_retrieve` for the life of this child.
+    private let localStore = LibrarianHandleStore()
     private let retrieve: RetrieveFn
     private let search: SearchFn
     private let stats: StatsFn
@@ -176,6 +206,15 @@ public struct ManagedRetrieveMCP: Sendable {
             "arguments": ["type": "array", "items": ["type": "string"]],
             "top_k": ["type": "integer"],
             "budget_tokens": ["type": "integer"],
+            "start_line": ["type": "integer"],
+            "end_line": ["type": "integer"],
+            "start_byte": ["type": "integer"],
+            "end_byte": ["type": "integer"],
+            "claim": ["type": "string"],
+            "schema": ["type": "string", "description": "JSON schema for schema_validate_eval."],
+            "scope_to_thread": ["type": "boolean", "description": "Restrict transcript/session search to this thread."],
+            "watch_interval_seconds": ["type": "number"],
+            "watch_timeout_seconds": ["type": "integer"],
         ]
     }
 
@@ -199,15 +238,31 @@ public struct ManagedRetrieveMCP: Sendable {
             navigation: arguments?["navigation"] as? String,
             arguments: (arguments?["arguments"] as? [String]) ?? [],
             topK: (arguments?["top_k"] as? Int) ?? (arguments?["topK"] as? Int),
-            budgetTokens: (arguments?["budget_tokens"] as? Int) ?? (arguments?["budgetTokens"] as? Int)
+            budgetTokens: (arguments?["budget_tokens"] as? Int) ?? (arguments?["budgetTokens"] as? Int),
+            startLine: (arguments?["start_line"] as? Int) ?? (arguments?["startLine"] as? Int),
+            endLine: (arguments?["end_line"] as? Int) ?? (arguments?["endLine"] as? Int),
+            startByte: (arguments?["start_byte"] as? Int) ?? (arguments?["startByte"] as? Int),
+            endByte: (arguments?["end_byte"] as? Int) ?? (arguments?["endByte"] as? Int),
+            claim: arguments?["claim"] as? String,
+            schema: arguments?["schema"] as? String,
+            scopeToThread: arguments?["scope_to_thread"] as? Bool,
+            watchIntervalSeconds: arguments?["watch_interval_seconds"] as? Double,
+            watchTimeoutSeconds: arguments?["watch_timeout_seconds"] as? Int
         )
     }
 
     /// In-process dispatch for hosts that inject no sidecar transport (tests and
     /// the standalone `mcp` probe): the same dispatcher the server uses.
-    static func dispatchLocally(call: OpCall, retrieve: RetrieveFn) async -> OpAnswer? {
-        let store = LibrarianHandleStore()
-        if !call.input.isEmpty {
+    static func dispatchLocally(
+        call: OpCall,
+        retrieve: RetrieveFn,
+        store: LibrarianHandleStore = LibrarianHandleStore()
+    ) async -> OpAnswer? {
+        // Never let a second call replace the bytes behind an existing handle:
+        // caller-supplied handles must not be substitutable content.
+        if let handle = call.handle, store.get(handle) != nil {
+            // already bound in this session; keep the original bytes
+        } else if !call.input.isEmpty {
             _ = store.put(call.input, handle: call.handle)
         } else if let handle = call.handle, let recovered = await retrieve(handle) {
             _ = store.put(recovered, handle: handle)
@@ -222,10 +277,13 @@ public struct ManagedRetrieveMCP: Sendable {
             retrieveAvailable: true,
             verifiedRecoveryHandle: call.handle,
             command: call.arguments.first,
-            schema: call.payload,
-            startLine: nil,
-            endLine: nil,
+            schema: call.schema ?? call.payload,
+            startLine: call.startLine,
+            endLine: call.endLine,
+            startByte: call.startByte,
+            endByte: call.endByte,
             pattern: call.pattern,
+            claim: call.claim,
             root: call.root,
             paths: call.paths,
             symbol: call.symbol,
@@ -237,7 +295,10 @@ public struct ManagedRetrieveMCP: Sendable {
             navigationOperation: call.navigation,
             arguments: call.arguments,
             topK: call.topK,
-            budgetTokens: call.budgetTokens
+            budgetTokens: call.budgetTokens,
+            scopeToThread: call.scopeToThread ?? false,
+            watchIntervalSeconds: call.watchIntervalSeconds,
+            watchTimeoutSeconds: call.watchTimeoutSeconds
         )
         let result = await dispatcher.dispatch(request)
         return OpAnswer(
@@ -483,7 +544,7 @@ public struct ManagedRetrieveMCP: Sendable {
                     // No sidecar lease (standalone `mcp` child, test harness) or the
                     // sidecar is down: the shipped dispatcher still serves every
                     // deterministic and workspace op locally.
-                    answer = await Self.dispatchLocally(call: call, retrieve: retrieve)
+                    answer = await Self.dispatchLocally(call: call, retrieve: retrieve, store: localStore)
                 }
                 guard let answer else {
                     return reply(id: id, result: [
@@ -503,7 +564,7 @@ public struct ManagedRetrieveMCP: Sendable {
             guard name == Self.toolName, let handleArg = args?["handle"] as? String else {
                 return errorReply(id: id, code: -32602, message: "unknown tool or missing handle")
             }
-            let original = await retrieve(handleArg)
+            let original = await retrieve(handleArg) ?? localStore.get(handleArg)
             return reply(id: id, result: [
                 "content": [["type": "text", "text": original ?? "original unavailable; the visible summary is all that remains"]],
                 "isError": original == nil,

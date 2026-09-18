@@ -601,4 +601,78 @@ final class ManagedRetrieveMCPTests: XCTestCase {
             "world-readable receipt state must disable lossy MCP compression"
         )
     }
+
+    /// WHY: the op tools are the model's only way to pass structured arguments.
+    /// A dropped `start_line`/`end_line` silently returned the whole blob instead
+    /// of the requested slice, which is worse than failing.
+    func test_opToolsForwardRangeAndWorkspaceArgumentsToTheDispatcher() async throws {
+        let srv = ManagedRetrieveMCP(retrieve: { _ in nil })
+
+        let sliced = try parse(await srv.handle(try callLine(
+            id: 300,
+            name: "rc_ask",
+            arguments: [
+                "op": "retrieve_range",
+                "input": "line1\nline2\nline3\nline4",
+                "handle": "range-handle",
+                "start_line": 2,
+                "end_line": 3,
+            ]
+        )))
+        let sliceText = try text(of: sliced)
+        XCTAssertEqual(sliceText, "line2\nline3",
+                       "retrieve_range must receive start_line/end_line through the MCP tool surface")
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-mcp-args-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "public func renderWidget() {}\n".write(
+            to: root.appendingPathComponent("Widget.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let extract = try parse(await srv.handle(try callLine(
+            id: 301,
+            name: "rc_extract",
+            arguments: ["op": "symbol_references", "symbol": "renderWidget", "root": root.path]
+        )))
+        let extractText = try text(of: extract)
+        XCTAssertTrue(extractText.contains("renderWidget"),
+                      "rc_extract must forward symbol/root to the workspace op: \(extractText)")
+        XCTAssertTrue(extractText.contains("Widget.swift"), extractText)
+    }
+
+    /// WHY: handles are the recovery contract. A later call must not be able to
+    /// replace the bytes behind an existing handle, and a handle minted by a
+    /// locally served op must stay retrievable in the same MCP session.
+    func test_mcpSessionKeepsHandlesAndNeverSubstitutesTheirBytes() async throws {
+        // Scoped capability on: rc_retrieve is only offered with recovery scope.
+        let srv = ManagedRetrieveMCP(retrieve: { _ in nil }, scopedRecoveryAvailable: true)
+
+        _ = try parse(await srv.handle(try callLine(
+            id: 310,
+            name: "rc_ask",
+            arguments: ["op": "handle_grep", "input": "alpha\nbeta\ngamma", "pattern": "beta", "handle": "session-handle"]
+        )))
+        _ = try parse(await srv.handle(try callLine(
+            id: 311,
+            name: "rc_ask",
+            arguments: ["op": "handle_grep", "input": "attacker-controlled", "pattern": "alpha", "handle": "session-handle"]
+        )))
+
+        let retrieved = try parse(await srv.handle(try callLine(
+            id: 312,
+            name: "rc_retrieve",
+            arguments: ["handle": "session-handle"]
+        )))
+        XCTAssertEqual(try text(of: retrieved), "alpha\nbeta\ngamma",
+                       "an existing handle must keep its original bytes for the session")
+    }
+
+    private func text(of response: [String: Any]) throws -> String {
+        let result = try XCTUnwrap(response["result"] as? [String: Any])
+        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+        return try XCTUnwrap(content.first?["text"] as? String)
+    }
 }

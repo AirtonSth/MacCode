@@ -103,12 +103,26 @@ final class LibrarianHotLaneTests: XCTestCase {
         return "[" + rows.joined(separator: ",\n") + "]"
     }()
 
+    /// A real linter repeats identical findings across files, which is exactly
+    /// what the log crusher collapses.
     private let lintReport: String = {
         var lines = ["Linting FixtureKit (swiftlint)"]
-        for index in 0..<140 {
-            lines.append("Sources/Widget.swift:\(index):1: warning: unused variable widget\(index)")
+        // Retry/repeat-dominated lint output: the same warning run-length repeated.
+        for _ in 0..<140 {
+            lines.append("Sources/Widget.swift:12:1: warning: line_length violation exceeds 120 characters")
         }
         lines.append("140 problems (1 error, 139 warnings)")
+        return lines.joined(separator: "\n")
+    }()
+
+    /// A lint report with no repetition has nothing for a deterministic crusher
+    /// to collapse: it must not mint a librarian row.
+    private let nonReducibleLint: String = {
+        var lines = ["Linting FixtureKit (swiftlint)"]
+        for index in 0..<140 {
+            lines.append("Sources/Widget\(index).swift:\(index):1: warning: unique finding number \(index)")
+        }
+        lines.append("140 problems")
         return lines.joined(separator: "\n")
     }()
 
@@ -138,6 +152,7 @@ final class LibrarianHotLaneTests: XCTestCase {
             ("lint report", lintReport, ["librarian.log_crusher", "librarian.progress_bar_crusher", "librarian.test_crusher"])
         ]
 
+        var rowsBefore = 0
         for testCase in cases {
             let context = testRecoveryContext()
             let (status, body) = try await post(port: port, input: testCase.input, context: context)
@@ -148,12 +163,15 @@ final class LibrarianHotLaneTests: XCTestCase {
                               "\(testCase.name) reduction must shrink the payload")
 
             let modes = await records.modes()
-            let matched = modes.contains { mode in
-                testCase.expectedModes.contains { mode.hasPrefix($0) }
-            }
+            XCTAssertEqual(
+                modes.count, rowsBefore + 1,
+                "\(testCase.name) must record exactly one ledger row for one delivery: \(modes)"
+            )
+            rowsBefore = modes.count
+            let newMode = modes.last ?? ""
             XCTAssertTrue(
-                matched,
-                "\(testCase.name) must record one of \(testCase.expectedModes); recorded: \(modes)"
+                testCase.expectedModes.contains { newMode.hasPrefix($0) },
+                "\(testCase.name) must be recorded by its hot-lane op \(testCase.expectedModes); recorded: \(newMode)"
             )
             // Store-before-loss: the delivered handle must resolve to the original bytes.
             if let handle = body.originalHandle {
@@ -169,8 +187,15 @@ final class LibrarianHotLaneTests: XCTestCase {
             )
         }
 
-        let modes = await records.modes()
-        XCTAssertEqual(Set(modes).count, modes.count, "one row per delivery, no double counting: \(modes)")
+        // Payloads no deterministic catalog op can reduce must not mint rows.
+        let prose = (0..<80).map { "We discussed the widget roadmap and agreed to revisit the bakery next week (\($0))." }
+            .joined(separator: "\n")
+        for (label, payload) in [("prose", prose), ("non-reducible lint", nonReducibleLint)] {
+            _ = try await post(port: port, input: payload, context: testRecoveryContext())
+            let modes = await records.modes()
+            XCTAssertEqual(modes.count, rowsBefore,
+                           "\(label) must not add a librarian row: \(modes)")
+        }
     }
 
     func test_operatorApprovedCommandOutputStillRoutesAndKeepsExactOutputToolsOut() async throws {
