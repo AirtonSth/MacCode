@@ -1,5 +1,16 @@
 import Foundation
 import CoreModel
+import os
+
+private let sidecarQueueLog = Logger(
+    subsystem: "io.remotecode.persistence",
+    category: "bot-sidecar-queue-migration"
+)
+
+private let botRemoteControlLog = Logger(
+    subsystem: "io.remotecode.persistence",
+    category: "bot-remote-control"
+)
 
 /// Host-authoritative paired Bot remote-control engine.
 ///
@@ -1183,7 +1194,15 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             runtimeReadback = try onForceQueuedFollowUp?(bot.id, itemID)
                 ?? ["force_status": "queued"]
         } catch {
-            try? store.replaceQueuedFollowUps(botID: bot.id, items: originalRows)
+            do {
+                try store.replaceQueuedFollowUps(botID: bot.id, items: originalRows)
+            } catch let rollbackError {
+                // The forced order stays in the queue after a failed force; the
+                // caller only sees the original error, so report the mismatch.
+                botRemoteControlLog.error(
+                    "bot.queue.force_now_rollback_failed bot=\(bot.id.value.uuidString, privacy: .public) item=\(itemID, privacy: .public) error=\(String(describing: rollbackError), privacy: .public)"
+                )
+            }
             throw error
         }
         var extra = runtimeReadback
@@ -3475,31 +3494,66 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
     }
 
+    /// Moves the legacy sidecar queue into `bot_queued_follow_ups`.
+    ///
+    /// The sidecar is the only copy of those pending follow-ups, so a row stays
+    /// in it until the store accepted it: a failed read (bot lookup or queue
+    /// list) or a failed insert must never erase it. Dropping the sidecar
+    /// wholesale used to make a transient write failure lose the user's queue
+    /// with no error and no retry.
     private func migrateSidecarQueueIfNeeded() {
         guard let data = loadData("bot.remote.queue"),
               let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: [[String: Any]]]
         else { return }
+        var unmigrated: [String: [[String: Any]]] = [:]
         for (botRaw, items) in decoded {
             guard let uuid = UUID(uuidString: botRaw) else { continue }
             let botID = BotID(uuid)
-            guard (try? store.get(id: botID))?.deletedAt == nil else { continue }
-            if ((try? store.listQueuedFollowUps(botID: botID)) ?? []).isEmpty == false { continue }
+            // A failed read is not proof that the bot is gone: keep the rows.
+            guard let bot = try? store.get(id: botID) else {
+                unmigrated[botRaw] = items
+                continue
+            }
+            guard bot.deletedAt == nil else { continue }
+            // A failed read must not pass for an empty queue either: enqueueing
+            // again would duplicate rows the store may already hold.
+            guard let existing = try? store.listQueuedFollowUps(botID: botID) else {
+                unmigrated[botRaw] = items
+                continue
+            }
+            if !existing.isEmpty { continue }
+            var pending: [[String: Any]] = []
             for item in items {
                 let text = item["text"] as? String ?? ""
                 guard !text.isEmpty else { continue }
-                _ = try? store.enqueueQueuedFollowUp(
-                    BotQueuedFollowUpRecord(
-                        id: item["id"] as? String ?? UUID().uuidString.lowercased(),
-                        botID: botID,
-                        conversationID: item["conversation_id"] as? String,
-                        text: text,
-                        payloadJSON: jsonString(["attachments": item["attachments"] as Any]) ?? "{}",
-                        createdAt: Date()
+                do {
+                    _ = try store.enqueueQueuedFollowUp(
+                        BotQueuedFollowUpRecord(
+                            id: item["id"] as? String ?? UUID().uuidString.lowercased(),
+                            botID: botID,
+                            conversationID: item["conversation_id"] as? String,
+                            text: text,
+                            payloadJSON: jsonString(["attachments": item["attachments"] as Any]) ?? "{}",
+                            createdAt: Date()
+                        )
                     )
-                )
+                } catch {
+                    sidecarQueueLog.error(
+                        "bot.remote.queue.migration.failed bot=\(botRaw, privacy: .public) error=\(String(describing: error), privacy: .public)"
+                    )
+                    pending.append(item)
+                }
             }
+            if !pending.isEmpty { unmigrated[botRaw] = pending }
         }
-        saveJSON("bot.remote.queue", [String: Any]())
+        if unmigrated.isEmpty {
+            saveJSON("bot.remote.queue", [String: Any]())
+        } else {
+            sidecarQueueLog.error(
+                "bot.remote.queue.migration.deferred bots=\(unmigrated.count, privacy: .public)"
+            )
+            _ = saveJSON("bot.remote.queue", unmigrated)
+        }
     }
 
     @discardableResult

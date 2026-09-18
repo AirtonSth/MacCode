@@ -2285,13 +2285,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let context = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
-        context.coordinator.replaceProviderAdapter(
-            .codex,
-            adapter: TerminalRetiringOneShotAdapter(runner: hostRunner)
-        )
         router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
             AgentProviderSnapshotFactory.snapshot(
                 provider: provider,
@@ -2306,6 +2301,12 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let quinn = try botsViewModel.create(name: "Quinn", title: "CRM Controller", provider: .claude)
         botsViewModel.openDesk(quinn)
         botsViewModel.setDeskProvider(.claude)
+        wireCallerThreadHandoff(
+            context: context,
+            peer: quinn,
+            peerRunner: peerRunner,
+            hostRunner: hostRunner
+        )
         let workspace = try router.createWorkspace(name: "t005 agent delete", cwd: workspaceDirectory.path)
         let victimThread = try router.createAgentThread(
             workspace: workspace.id,
@@ -2354,20 +2355,24 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         )
         let siblingOccupying = try XCTUnwrap(siblingOccupyingResult.runId)
 
-        async let victimDispatch: Void = router.dispatchAgentAppBotMentions(
-            peers: [quinn],
-            text: "@\(quinn.handle) T005_DELETE_AGENT_VICTIM",
-            threadId: victimThread.id,
-            onto: surface,
-            continueHost: true
-        )
-        async let siblingDispatch: Void = router.dispatchAgentAppBotMentions(
-            peers: [quinn],
-            text: "@\(quinn.handle) T005_DELETE_AGENT_SIBLING",
-            threadId: siblingThread.id,
-            onto: surface,
-            continueHost: true
-        )
+        let victimDispatch = MilestoneBoundedHandoffDispatch {
+            await router.dispatchAgentAppBotMentions(
+                peers: [quinn],
+                text: "@\(quinn.handle) T005_DELETE_AGENT_VICTIM",
+                threadId: victimThread.id,
+                onto: surface,
+                continueHost: true
+            )
+        }
+        let siblingDispatch = MilestoneBoundedHandoffDispatch {
+            await router.dispatchAgentAppBotMentions(
+                peers: [quinn],
+                text: "@\(quinn.handle) T005_DELETE_AGENT_SIBLING",
+                threadId: siblingThread.id,
+                onto: surface,
+                continueHost: true
+            )
+        }
         let bothPeersStarted = await waitUntil(timeout: 5) {
             peerRunner.requests.contains { $0.prompt.contains("T005_DELETE_AGENT_VICTIM") }
                 && peerRunner.requests.contains { $0.prompt.contains("T005_DELETE_AGENT_SIBLING") }
@@ -2396,7 +2401,10 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 && (try? context.queuedMessageRepo.get(id: AgentQueuedMessageID(siblingRunID.value))) != nil
         }
         XCTAssertTrue(bothHostsQueued)
-        _ = await (victimDispatch, siblingDispatch)
+        let victimDispatchSettled = await victimDispatch.settle(timeout: 5)
+        XCTAssertTrue(victimDispatchSettled, "WHY: the victim dispatch must reach its milestone; an unbounded wait would hang the class instead of reporting")
+        let siblingDispatchSettled = await siblingDispatch.settle(timeout: 5)
+        XCTAssertTrue(siblingDispatchSettled, "WHY: the sibling dispatch must reach its milestone; an unbounded wait would hang the class instead of reporting")
         let victimHandoff = try XCTUnwrap(botsViewModel.peerHandoffSnapshotsForTesting(
             originConversationID: nil,
             originThreadID: victimThread.id
@@ -2469,13 +2477,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let context = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
         let router = AppCommandRouter(context: context)
         context.router = router
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
-        context.coordinator.replaceProviderAdapter(
-            .codex,
-            adapter: TerminalRetiringOneShotAdapter(runner: hostRunner)
-        )
         router.rememberProviderSnapshotsForSend(AgentProvider.allCases.map { provider in
             AgentProviderSnapshotFactory.snapshot(
                 provider: provider,
@@ -2490,6 +2493,12 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let quinn = try botsViewModel.create(name: "Quinn", title: "CRM Controller", provider: .claude)
         botsViewModel.openDesk(quinn)
         botsViewModel.setDeskProvider(.claude)
+        wireCallerThreadHandoff(
+            context: context,
+            peer: quinn,
+            peerRunner: peerRunner,
+            hostRunner: hostRunner
+        )
         let workspace = try router.createWorkspace(name: "t005 surface delete", cwd: workspaceDirectory.path)
         let victimThread = try router.createAgentThread(
             workspace: workspace.id,
@@ -2527,20 +2536,24 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         )
         let occupyingRunID = try XCTUnwrap(occupyingResult.runId)
 
-        async let victimDispatch: Void = router.dispatchAgentAppBotMentions(
-            peers: [quinn],
-            text: "@\(quinn.handle) T005_SURFACE_DELETE_VICTIM",
-            threadId: victimThread.id,
-            onto: surface,
-            continueHost: true
-        )
-        async let siblingDispatch: Void = router.dispatchAgentAppBotMentions(
-            peers: [quinn],
-            text: "@\(quinn.handle) T005_SURFACE_DELETE_SIBLING",
-            threadId: siblingThread.id,
-            onto: surface,
-            continueHost: true
-        )
+        let victimDispatch = MilestoneBoundedHandoffDispatch {
+            await router.dispatchAgentAppBotMentions(
+                peers: [quinn],
+                text: "@\(quinn.handle) T005_SURFACE_DELETE_VICTIM",
+                threadId: victimThread.id,
+                onto: surface,
+                continueHost: true
+            )
+        }
+        let siblingDispatch = MilestoneBoundedHandoffDispatch {
+            await router.dispatchAgentAppBotMentions(
+                peers: [quinn],
+                text: "@\(quinn.handle) T005_SURFACE_DELETE_SIBLING",
+                threadId: siblingThread.id,
+                onto: surface,
+                continueHost: true
+            )
+        }
         let bothPeersStarted = await waitUntil(timeout: 5) {
             peerRunner.requests.contains { $0.prompt.contains("T005_SURFACE_DELETE_VICTIM") }
                 && peerRunner.requests.contains { $0.prompt.contains("T005_SURFACE_DELETE_SIBLING") }
@@ -2621,13 +2634,15 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             siblingPeerRunID
         )
         XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
-        _ = await victimDispatch
+        let victimDispatchSettled = await victimDispatch.settle(timeout: 5)
+        XCTAssertTrue(victimDispatchSettled, "WHY: the victim dispatch must reach its milestone; an unbounded wait would hang the class instead of reporting")
         XCTAssertTrue(peerRunner.finish(
             runID: siblingPeerRunID,
             status: .cancelled,
             reply: nil
         ))
-        _ = await siblingDispatch
+        let siblingDispatchSettled = await siblingDispatch.settle(timeout: 5)
+        XCTAssertTrue(siblingDispatchSettled, "WHY: the sibling dispatch must reach its milestone; an unbounded wait would hang the class instead of reporting")
         try await router.deleteAgentThread(thread: siblingThread.id)
     }
 
@@ -2640,7 +2655,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             .appendingPathComponent("t005-delete-rollback-fence-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         defer { closeAndUnregisterAllSurfaces() }
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(
             provider: .codex,
             defersCancellationForTesting: true
@@ -2649,10 +2664,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             root: root,
             peerRunner: peerRunner,
             hostRunner: hostRunner
-        )
-        fixture.context.coordinator.replaceProviderAdapter(
-            .codex,
-            adapter: TerminalRetiringOneShotAdapter(runner: hostRunner)
         )
         let victimThread = try XCTUnwrap(fixture.context.threadRepo.get(id: fixture.threadID))
         let workspaceID = try XCTUnwrap(victimThread.workspaceId)
@@ -2674,20 +2685,24 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         )
         let occupyingRunID = try XCTUnwrap(occupying.runId)
 
-        async let victimDispatch: Void = fixture.router.dispatchAgentAppBotMentions(
-            peers: [fixture.peer],
-            text: "@\(fixture.peer.handle) T005_ROLLBACK_VICTIM",
-            threadId: fixture.threadID,
-            onto: fixture.surface,
-            continueHost: true
-        )
-        async let siblingDispatch: Void = fixture.router.dispatchAgentAppBotMentions(
-            peers: [fixture.peer],
-            text: "@\(fixture.peer.handle) T005_ROLLBACK_SIBLING",
-            threadId: siblingThread.id,
-            onto: fixture.surface,
-            continueHost: true
-        )
+        let victimDispatch = MilestoneBoundedHandoffDispatch {
+            await fixture.router.dispatchAgentAppBotMentions(
+                peers: [fixture.peer],
+                text: "@\(fixture.peer.handle) T005_ROLLBACK_VICTIM",
+                threadId: fixture.threadID,
+                onto: fixture.surface,
+                continueHost: true
+            )
+        }
+        let siblingDispatch = MilestoneBoundedHandoffDispatch {
+            await fixture.router.dispatchAgentAppBotMentions(
+                peers: [fixture.peer],
+                text: "@\(fixture.peer.handle) T005_ROLLBACK_SIBLING",
+                threadId: siblingThread.id,
+                onto: fixture.surface,
+                continueHost: true
+            )
+        }
         let bothPeersStarted = await waitUntil(timeout: 5) {
             peerRunner.requests.contains { $0.prompt.contains("T005_ROLLBACK_VICTIM") }
                 && peerRunner.requests.contains { $0.prompt.contains("T005_ROLLBACK_SIBLING") }
@@ -2824,13 +2839,15 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertEqual(peerRunner.requests.filter { $0.runId == siblingPeerRunID }.count, 1)
         XCTAssertEqual(UserDefaults.standard.data(forKey: "bots.peerTurns"), legacyBytes)
 
-        _ = await victimDispatch
+        let victimDispatchSettled = await victimDispatch.settle(timeout: 5)
+        XCTAssertTrue(victimDispatchSettled, "WHY: the victim dispatch must reach its milestone; an unbounded wait would hang the class instead of reporting")
         XCTAssertTrue(peerRunner.finish(
             runID: siblingPeerRunID,
             status: .cancelled,
             reply: nil
         ))
-        _ = await siblingDispatch
+        let siblingDispatchSettled = await siblingDispatch.settle(timeout: 5)
+        XCTAssertTrue(siblingDispatchSettled, "WHY: the sibling dispatch must reach its milestone; an unbounded wait would hang the class instead of reporting")
     }
 
     func test_peerHandoffAtomicCommitCutsConvergeSQLiteMirrorAndFreshAuthoritiesBeforeDispatch() async throws {
@@ -2906,12 +2923,19 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 failCommit = true
             }
 
-            let accepted = fixture.viewModel.send("@\(quinn.handle) T005_ATOMIC_\(cut.rawValue)")
+            let accepted = try submitT005DeskPeerMention(
+                context: fixture.context,
+                viewModel: fixture.viewModel,
+                host: piper,
+                peer: quinn,
+                provider: .claude,
+                text: "@\(quinn.handle) T005_ATOMIC_\(cut.rawValue)"
+            )
             fixture.context.db.beforeExecuteForTesting = nil
             fixture.context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = nil
             failCommit = false
             XCTAssertNotNil(capturedCandidate, "\(cut.rawValue) must reach the exact candidate mirror gate")
-            XCTAssertFalse(accepted, "\(cut.rawValue) must reject the uncommitted handoff")
+            XCTAssertNil(accepted, "\(cut.rawValue) must reject the uncommitted handoff")
 
             _ = await waitUntil(timeout: 0.2) { !dispatches.isEmpty }
             XCTAssertTrue(dispatches.isEmpty, "\(cut.rawValue) must not cross the provider boundary")
@@ -2998,7 +3022,15 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             candidateBytes = data
             throw NSError(domain: "T005.FutureFixture", code: 1)
         }
-        XCTAssertFalse(fixture.viewModel.send("@\(quinn.handle) T005_CAPTURE_FUTURE_CANDIDATE"))
+        let accepted = try submitT005DeskPeerMention(
+            context: fixture.context,
+            viewModel: fixture.viewModel,
+            host: piper,
+            peer: quinn,
+            provider: .claude,
+            text: "@\(quinn.handle) T005_CAPTURE_FUTURE_CANDIDATE"
+        )
+        XCTAssertNil(accepted, "the candidate must be refused while the mirror commit fails")
         fixture.context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = nil
         XCTAssertTrue(initialDispatches.isEmpty)
 
@@ -3028,8 +3060,15 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         relaunch.viewModel.openDesk(piper)
         relaunch.viewModel.setDeskProvider(.codex)
         relaunch.viewModel.createDeskThread()
-        let accepted = relaunch.viewModel.send("@\(quinn.handle) T005_FUTURE_MUST_NOT_MUTATE")
-        XCTAssertFalse(accepted, "future/opaque divergence must refuse a down-level mutation")
+        let relaunchAccepted = try submitT005DeskPeerMention(
+            context: relaunch.context,
+            viewModel: relaunch.viewModel,
+            host: piper,
+            peer: quinn,
+            provider: .claude,
+            text: "@\(quinn.handle) T005_FUTURE_MUST_NOT_MUTATE"
+        )
+        XCTAssertNil(relaunchAccepted, "future/opaque divergence must refuse a down-level mutation")
         _ = await waitUntil(timeout: 0.2) { !relaunchDispatches.isEmpty }
         XCTAssertTrue(relaunchDispatches.isEmpty, "fail-closed restore must precede provider dispatch")
         XCTAssertTrue(relaunch.viewModel.peerHandoffSnapshotsForTesting().isEmpty)
@@ -3074,8 +3113,15 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 throw NSError(domain: "T005.PostCacheOpaqueMirror", code: 1)
             }
         }
-        let accepted = fixture.viewModel.send("@\(fixture.quinn.handle) POST_CACHE_OPAQUE_MUST_FAIL")
-        XCTAssertFalse(accepted)
+        let accepted = try submitT005DeskPeerMention(
+            context: fixture.context,
+            viewModel: fixture.viewModel,
+            host: fixture.piper,
+            peer: fixture.quinn,
+            provider: .claude,
+            text: "@\(fixture.quinn.handle) POST_CACHE_OPAQUE_MUST_FAIL"
+        )
+        XCTAssertNil(accepted, "opaque mirror bytes must refuse the mutation")
         _ = await waitUntil(timeout: 0.2) { !fixture.dispatches.runIDs.isEmpty }
         XCTAssertEqual(mirrorGateCalls, 0)
         XCTAssertTrue(fixture.dispatches.runIDs.isEmpty)
@@ -3117,8 +3163,15 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 throw NSError(domain: "T005.CachedCASMismatch", code: 1)
             }
         }
-        let staleAccepted = fixture.viewModel.send("@\(fixture.quinn.handle) STALE_CANDIDATE_MUST_LOSE")
-        guard !staleAccepted else {
+        let staleAccepted = try submitT005DeskPeerMention(
+            context: fixture.context,
+            viewModel: fixture.viewModel,
+            host: fixture.piper,
+            peer: fixture.quinn,
+            provider: .claude,
+            text: "@\(fixture.quinn.handle) STALE_CANDIDATE_MUST_LOSE"
+        )
+        guard staleAccepted == nil else {
             if let peerRunID = fixture.peerRunner.requests.first?.runId {
                 _ = fixture.peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil)
             }
@@ -3136,13 +3189,27 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             "refresh must adopt the exact externally committed sibling"
         )
 
-        XCTAssertTrue(fixture.viewModel.send("@\(fixture.quinn.handle) FRESH_CANDIDATE_MAY_WIN"))
+        let freshAccepted = try submitT005DeskPeerMention(
+            context: fixture.context,
+            viewModel: fixture.viewModel,
+            host: fixture.piper,
+            peer: fixture.quinn,
+            provider: .claude,
+            text: "@\(fixture.quinn.handle) FRESH_CANDIDATE_MAY_WIN"
+        )
+        XCTAssertNotNil(freshAccepted, "a fresh candidate over the refreshed canonical state must commit")
+        // The submit commits synchronously; later phase writes also mirror, so
+        // only this reading isolates the mutation's own gate call.
+        XCTAssertEqual(mirrorGateCalls, 1, "only the fresh candidate may reach the mirror gate")
         let dispatched = await waitUntil(timeout: 5) { fixture.dispatches.runIDs.count == 1 }
         XCTAssertTrue(dispatched)
-        XCTAssertEqual(mirrorGateCalls, 1)
-        if let peerRunID = fixture.peerRunner.requests.first?.runId {
-            XCTAssertTrue(fixture.peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil))
-        }
+        let peerStarted = await waitUntil(timeout: 5) { !fixture.peerRunner.requests.isEmpty }
+        XCTAssertTrue(
+            peerStarted,
+            "the committed peer run must reach the runner the origin thread's provider selects"
+        )
+        let peerRunID = try XCTUnwrap(fixture.peerRunner.requests.first?.runId)
+        XCTAssertTrue(fixture.peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil))
     }
 
     func test_peerHandoffSupportedMirrorDivergenceRepairsCanonicalWithoutApplyingFirstStaleMutation() async throws {
@@ -3173,8 +3240,15 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 throw NSError(domain: "T005.SupportedMirrorDrift", code: 1)
             }
         }
-        let staleAccepted = fixture.viewModel.send("@\(fixture.quinn.handle) REPAIR_BEFORE_MUTATION")
-        guard !staleAccepted else {
+        let staleAccepted = try submitT005DeskPeerMention(
+            context: fixture.context,
+            viewModel: fixture.viewModel,
+            host: fixture.piper,
+            peer: fixture.quinn,
+            provider: .claude,
+            text: "@\(fixture.quinn.handle) REPAIR_BEFORE_MUTATION"
+        )
+        guard staleAccepted == nil else {
             if let peerRunID = fixture.peerRunner.requests.first?.runId {
                 _ = fixture.peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil)
             }
@@ -3191,13 +3265,27 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             }
         )
 
-        XCTAssertTrue(fixture.viewModel.send("@\(fixture.quinn.handle) FRESH_AFTER_REPAIR"))
+        let freshAccepted = try submitT005DeskPeerMention(
+            context: fixture.context,
+            viewModel: fixture.viewModel,
+            host: fixture.piper,
+            peer: fixture.quinn,
+            provider: .claude,
+            text: "@\(fixture.quinn.handle) FRESH_AFTER_REPAIR"
+        )
+        XCTAssertNotNil(freshAccepted, "a candidate rebuilt after the repair must commit")
+        // The submit commits synchronously; later phase writes also mirror, so
+        // only this reading isolates the mutation's own gate call.
+        XCTAssertEqual(mirrorGateCalls, 1, "only the candidate rebuilt after the repair may reach the mirror gate")
         let dispatched = await waitUntil(timeout: 5) { fixture.dispatches.runIDs.count == 1 }
         XCTAssertTrue(dispatched)
-        XCTAssertEqual(mirrorGateCalls, 1)
-        if let peerRunID = fixture.peerRunner.requests.first?.runId {
-            XCTAssertTrue(fixture.peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil))
-        }
+        let peerStarted = await waitUntil(timeout: 5) { !fixture.peerRunner.requests.isEmpty }
+        XCTAssertTrue(
+            peerStarted,
+            "the committed peer run must reach the runner the origin thread's provider selects"
+        )
+        let peerRunID = try XCTUnwrap(fixture.peerRunner.requests.first?.runId)
+        XCTAssertTrue(fixture.peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil))
     }
 
     func test_deleteThreadSuppressesQueuedDrainBeforeAwaitingProviderTermination() async throws {
@@ -5491,7 +5579,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             .appendingPathComponent("t005-blocked-checkpoint-enrichment-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         defer { closeAndUnregisterAllSurfaces() }
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
         let fixture = try makeT005AgentMentionFixture(
             root: root,
@@ -5583,7 +5671,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             .appendingPathComponent("t005-minimal-checkpoint-failure-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         defer { closeAndUnregisterAllSurfaces() }
-        let peerRunner = ControlledBotHandoffRunner(provider: .claude)
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
         let hostRunner = ControlledBotHandoffRunner(provider: .codex)
         let fixture = try makeT005AgentMentionFixture(
             root: root,
@@ -5758,6 +5846,77 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertEqual(finishes.records.count, 1, "a retained retry must not duplicate the stale terminal release")
     }
 
+    /// WHY: desk mentions no longer dispatch the peer at send time — `sendMention`
+    /// was replaced by tool-based delegation (`814506c7`), so a mention compiles a
+    /// turn directive and the host agent reaches this same persist path through
+    /// `askBotPeer` → `askPeerFromActiveProvider`. That path hands the origin Bot
+    /// conversation and thread to `submitAgentAppMention`; `provider` is the one
+    /// the peer's desk was pinned to, since the delegation derives the peer route
+    /// from the origin thread (`BotDeskRouting` falls back to `thread.provider`).
+    private func submitT005DeskPeerMention(
+        context: AppContext,
+        viewModel: BotsViewModel,
+        host: BotDefinition,
+        peer: BotDefinition,
+        provider: AgentProvider,
+        text: String
+    ) throws -> Task<Void, Never>? {
+        let conversation = try XCTUnwrap(viewModel.selectedConversation)
+        var origin = conversation
+        let thread: AgentThread
+        if let linkedID = conversation.linkedAgentThreadID,
+           let linked = try context.threadRepo.get(id: linkedID) {
+            thread = linked
+        } else {
+            thread = try XCTUnwrap(context.router).createAgentThread(
+                workspace: nil,
+                title: conversation.title,
+                provider: provider,
+                model: "fake-model",
+                permissionMode: .supervised,
+                reasoningEffort: .medium,
+                routingConfiguration: nil,
+                quiet: true
+            )
+            origin.linkedAgentThreadID = thread.id
+            try context.botStore.upsertConversation(origin)
+        }
+        return context.botPeerHandoffAuthority.submitAgentAppMention(
+            peer: peer,
+            text: text,
+            peerText: text,
+            originThread: thread,
+            activityID: AgentMessageID(),
+            hostRunID: nil,
+            providerSnapshots: [],
+            resumeHostAfterPeer: false,
+            originBot: host,
+            originConversation: origin
+        )
+    }
+
+    /// A peer handoff run inherits the origin thread's provider (`BotDeskRouting`
+    /// falls back to `thread.provider` because this seam dispatches a future host
+    /// run id), so host and peer runs share one provider. Both runners register on
+    /// that provider and the bot id the run carries in its environment picks the
+    /// peer runner — the same seam `AgentAppBotMentionTests` exercises.
+    private func wireCallerThreadHandoff(
+        context: AppContext,
+        peer: BotDefinition,
+        peerRunner: ControlledBotHandoffRunner,
+        hostRunner: ControlledBotHandoffRunner
+    ) {
+        context.coordinator.replaceProviderAdapter(
+            hostRunner.provider,
+            adapter: TerminalRetiringOneShotAdapter(
+                runner: CallerThreadHandoffRunner(
+                    hostRunner: hostRunner,
+                    peerRunners: [peer.id: peerRunner]
+                )
+            )
+        )
+    }
+
     private func makeT005AgentMentionFixture(
         root: URL,
         peerRunner: ControlledBotHandoffRunner,
@@ -5775,8 +5934,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let context = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
         let router = AppCommandRouter(context: context)
         context.router = router
-        context.coordinator.replaceProvider(.claude, runner: peerRunner)
-        context.coordinator.replaceProvider(.codex, runner: hostRunner)
         context.coordinator.replaceProvider(
             .grok,
             runner: FakeProviderRunner(provider: .grok, scenario: .simpleAssistant(reply: "unused"))
@@ -5795,6 +5952,12 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let peer = try botsViewModel.create(name: "Quinn", title: "CRM Controller", provider: .claude)
         botsViewModel.openDesk(peer)
         botsViewModel.setDeskProvider(.claude)
+        wireCallerThreadHandoff(
+            context: context,
+            peer: peer,
+            peerRunner: peerRunner,
+            hostRunner: hostRunner
+        )
         let workspace = try router.createWorkspace(name: "t005 checkpoint", cwd: workspaceDirectory.path)
         let thread = try router.createAgentThread(
             workspace: workspace.id,
@@ -5893,7 +6056,15 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             candidateBytes = data
             throw NSError(domain: "T005.CachedPeerFixture", code: 1)
         }
-        XCTAssertFalse(base.viewModel.send("@\(quinn.handle) CAPTURE_SUPPORTED_CACHE_ROW"))
+        let capturedHandoff = try submitT005DeskPeerMention(
+            context: base.context,
+            viewModel: base.viewModel,
+            host: piper,
+            peer: quinn,
+            provider: .claude,
+            text: "@\(quinn.handle) CAPTURE_SUPPORTED_CACHE_ROW"
+        )
+        XCTAssertNil(capturedHandoff, "the refused mirror commit must reject the handoff")
         base.context.botPeerHandoffAuthority.peerHandoffMirrorCommitGateForTesting = nil
         XCTAssertTrue(dispatches.runIDs.isEmpty)
         XCTAssertTrue(base.peerRunner.requests.isEmpty)
@@ -6075,6 +6246,33 @@ private struct T005CachedPeerHandoffFixture {
     let seedBytes: Data
     let seedActivityID: UUID
     let dispatches: T005PeerDispatchRecorder
+}
+
+/// A handoff dispatch only resumes when the handoff reaches a milestone
+/// (`hostRunning`, `completed` or `needsAttention`). A peer run the spec never
+/// finishes leaves that await pending forever, so a spec that waits on the
+/// dispatch unbounded reports nothing at all and hangs the whole class. Bounding
+/// it turns "no verdict" into a named failure the round can attribute.
+@MainActor
+final class MilestoneBoundedHandoffDispatch {
+    private(set) var isSettled = false
+
+    init(_ body: @escaping @MainActor () async -> Void) {
+        Task { @MainActor [self] in
+            await body()
+            isSettled = true
+        }
+    }
+
+    /// False when the dispatch never reached its milestone within `timeout`.
+    func settle(timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if isSettled { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return isSettled
+    }
 }
 
 private final class T005PeerDispatchRecorder: @unchecked Sendable {

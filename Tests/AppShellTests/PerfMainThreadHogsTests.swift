@@ -211,7 +211,7 @@ final class PerfMainThreadHogsTests: XCTestCase {
 
         let fetchesBefore = h.vm.deskLiveReplayFetchCountForTesting
         let offMainBefore = h.vm.deskLiveReplayOffMainFetchCountForTesting
-        h.vm.deskLiveTurnWatchTickForTesting()
+        await h.vm.deskLiveTurnWatchTickForTesting()
         XCTAssertEqual(h.vm.deskLiveReplayOffMainFetchCountForTesting, offMainBefore + 1, "the watch must take the detached fetch path")
         XCTAssertEqual(h.vm.deskLiveReplayFetchCountForTesting, fetchesBefore + 1)
         XCTAssertFalse(
@@ -227,6 +227,69 @@ final class PerfMainThreadHogsTests: XCTestCase {
         XCTAssertTrue(
             h.vm.deskLiveTimeline.turns.contains(where: { $0.items.contains(where: { $0.id == "r-late" }) }),
             "the replayed durable event must be adopted on the main actor"
+        )
+    }
+
+    // MARK: BT-28
+
+    func test_deskLiveTurnWatchTickResolvesAgentRunsOffTheMainThread() async throws {
+        // WHY: each 2 s watch tick read `agent_runs` twice on the MainActor
+        // (`streamEventCursor` and `linkedRun` -> `latestActive`). A main-thread
+        // probe can stall the UI behind the repo's transient-lock retry
+        // (8 tries / 2 s) while a turn writes. Both reads must resolve off
+        // MainActor, and the tick must still stop the watch on a terminal run
+        // the app never got a callback for.
+        let h = try makeDeskHarness()
+        let run = AgentRun(
+            threadId: h.thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: Date()
+        )
+        try h.context.runRepo.upsert(run)
+        h.vm.openDesk(h.bot)
+        h.vm.selectDeskThread(h.conversation.id)
+        XCTAssertEqual(h.vm.selectedConversation?.linkedAgentThreadID, h.thread.id)
+        XCTAssertTrue(h.vm.deskRunIsLive, "the fixture must be on the watch's live path")
+
+        let probesBefore = h.context.runRepo.latestActiveProbeCountForTesting
+        let mainThreadBefore = h.context.runRepo.latestActiveMainThreadProbeCountForTesting
+        let stoppedWhileRunning = await h.vm.deskLiveTurnWatchTickForTesting()
+        XCTAssertFalse(stoppedWhileRunning, "a running run must not stop the watch")
+        XCTAssertEqual(
+            h.context.runRepo.latestActiveProbeCountForTesting,
+            probesBefore + 1,
+            "the tick must still resolve the linked run, else the main-thread assertion is vacuous"
+        )
+        XCTAssertEqual(
+            h.context.runRepo.latestActiveMainThreadProbeCountForTesting,
+            mainThreadBefore,
+            "the watch tick must not read agent_runs on the main thread"
+        )
+
+        XCTAssertTrue(try h.context.runRepo.stampTerminal(
+            id: run.id,
+            status: .completed,
+            finishedAt: Date(),
+            errorMessage: nil,
+            terminalReason: nil
+        ))
+        let probesBeforeTerminal = h.context.runRepo.latestActiveProbeCountForTesting
+        let mainThreadBeforeTerminal = h.context.runRepo.latestActiveMainThreadProbeCountForTesting
+        let stoppedAtTerminal = await h.vm.deskLiveTurnWatchTickForTesting()
+        XCTAssertTrue(
+            stoppedAtTerminal,
+            "the off-main probe must still catch a terminal run and stop the watch"
+        )
+        XCTAssertEqual(
+            h.context.runRepo.latestActiveProbeCountForTesting,
+            probesBeforeTerminal + 1
+        )
+        XCTAssertEqual(
+            h.context.runRepo.latestActiveMainThreadProbeCountForTesting,
+            mainThreadBeforeTerminal,
+            "the terminal tick must not read agent_runs on the main thread either"
         )
     }
 

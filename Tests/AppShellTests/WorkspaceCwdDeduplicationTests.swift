@@ -122,4 +122,52 @@ final class WorkspaceCwdDeduplicationIntegrationTests: XCTestCase {
         XCTAssertEqual(ctx.state.workspaces.count, 2,
             "two different folders must produce two separate workspaces — dedup must not over-suppress")
     }
+
+    // FAIL-LOUD: a folder that cannot be added must say so.
+    func test_staleFolderAdd_surfacesTheFailureInsteadOfDoingNothing() throws {
+        let (ctx, router) = try make()
+        let stale = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RC2Stale-\(UUID().uuidString)", isDirectory: true)
+        var messages: [String] = []
+        var details: [String] = []
+        let vm = SidebarViewModel(
+            context: ctx,
+            router: router,
+            operationErrorPresenter: { message, detail in
+                messages.append(message)
+                details.append(detail)
+            }
+        )
+
+        XCTAssertFalse(vm.createWorkspace(fromFolder: stale),
+                       "a folder that does not exist must not report success")
+        XCTAssertEqual(ctx.state.workspaces.count, 0, "a failed add must not create a workspace")
+
+        XCTAssertEqual(messages.count, 1,
+            "WHY: the picker closes on the user's gesture, so silently returning false leaves them with no row, no error and no idea what happened — the same path serves drag-drop and a stale File ▸ Open Recent entry")
+        XCTAssertEqual(messages.first, "Could not add \(stale.lastPathComponent)")
+        XCTAssertEqual(details.first,
+            "That folder no longer exists. It may have been moved, renamed or deleted.",
+            "WHY: LayoutError has no LocalizedError conformance, so the raw localizedDescription would only name the enum case")
+    }
+
+    // Unrelated failures must keep their own message, not claim the folder vanished.
+    //
+    // NOTE: this spec references `addWorkspaceFailureDetail(for:)`, which the fix
+    // introduced, so it cannot compile against the pre-fix source and has no
+    // "before" of its own. The behavioural before/after lives in
+    // `test_staleFolderAdd_surfacesTheFailureInsteadOfDoingNothing`, which uses
+    // only API that already existed.
+    func test_addWorkspaceFailureDetail_keepsUnderlyingMessageForOtherErrors() throws {
+        struct OtherError: LocalizedError {
+            var errorDescription: String? { "db is locked" }
+        }
+
+        XCTAssertEqual(SidebarViewModel.addWorkspaceFailureDetail(for: OtherError()), "db is locked")
+        XCTAssertEqual(
+            SidebarViewModel.addWorkspaceFailureDetail(for: LayoutError.workspaceNotFound),
+            "That folder no longer exists. It may have been moved, renamed or deleted.",
+            "only the stale-folder case is translated; a true disk/db failure must not be reported as a missing folder"
+        )
+    }
 }

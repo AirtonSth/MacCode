@@ -241,6 +241,58 @@ final class DeviceRevokeClosesChannelsTests: XCTestCase {
     }
 
     @MainActor
+    func test_rpcConnectionClose_releasesHTTPOwnerBinding() async throws {
+        // WHY: the /v1/rpc hand-off Task owns the fd, so every exit that closes
+        // it must also drop the owner binding. A binding left behind survives
+        // close(2): trackedOwnerFingerprints() reports a ghost owner and a later
+        // revoke's SHUT_RDWR can land on a recycled descriptor that now belongs
+        // to a different peer.
+        let auth = RevokeAuth(devices: [(id: deviceA, token: tokenA)])
+        let port = UInt16.random(in: 33_000...44_000)
+        let server = DirectHTTPServer(
+            port: port,
+            loopbackOnly: false,
+            dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+            auth: auth,
+            serverId: "owner-release-host",
+            bootEpoch: 19
+        )
+        try server.start()
+        defer { server.stop() }
+        try await waitUntilHealthy(port: port)
+
+        let fd = try connectLoopback(port: port)
+        defer { Darwin.close(fd) }
+        setReceiveTimeout(fd, seconds: 2)
+
+        // postJSON sends `Connection: close`, which is the hand-off exit that
+        // closes the fd without re-entering the keep-alive session.
+        let response = try await postJSON(
+            port: port,
+            path: "/v1/rpc",
+            body: [
+                "jsonrpc": "2.0",
+                "id": "owner-release",
+                "method": "workspace.list",
+                "params": [String: Any](),
+            ],
+            token: tokenA
+        )
+        XCTAssertEqual(response.status, 200, "the bearer-authenticated RPC must succeed")
+
+        var bound = server.httpOwnerBoundDescriptorCountForTests
+        let deadline = Date().addingTimeInterval(2)
+        while bound != 0, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            bound = server.httpOwnerBoundDescriptorCountForTests
+        }
+        XCTAssertEqual(
+            bound, 0,
+            "a closed RPC connection must release its owner binding, not just its descriptor"
+        )
+    }
+
+    @MainActor
     func test_deviceRevoke_closesOwnerWebSocketBefore200_leavesOtherDevice_rejectsRevokedToken() async throws {
         // WHY: after POST /v1/devices/revoke returns 200, device A's WS must
         // already be unable to receive the next EventBus sentinel; device B

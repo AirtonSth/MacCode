@@ -192,40 +192,10 @@ public final class AgentAppReadGateway: @unchecked Sendable {
 
     public func listPendingCallbacks(threadId: AgentThreadID) async throws -> AssistantPendingCallbacksSnapshot {
         try await execute {
-            var requests: [AssistantPendingRequest] = []
-            var userInputs: [AssistantUserInputRequest] = []
-            for callback in try ProviderPendingCallbackRepository(db: self.db).listVisible(threadId: threadId) {
-                guard let data = callback.payloadJSON.data(using: .utf8) else { continue }
-                switch callback.kind {
-                case .approval:
-                    guard var request = try? self.pendingCallbackDecoder.decode(
-                        AssistantPendingRequest.self,
-                        from: data
-                    ) else { continue }
-                    request.state = callback.state
-                    request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
-                    if callback.state == .stale, let reason = callback.staleReason {
-                        if let detail = request.detail {
-                            request.detail = detail + "\n" + reason
-                        } else {
-                            request.detail = reason
-                        }
-                    }
-                    requests.append(request)
-                case .userInput:
-                    guard var input = try? self.pendingCallbackDecoder.decode(
-                        AssistantUserInputRequest.self,
-                        from: data
-                    ) else { continue }
-                    input.state = callback.state
-                    input.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
-                    if callback.state == .stale, let reason = callback.staleReason, input.answer == nil {
-                        input.answer = reason
-                    }
-                    userInputs.append(input)
-                }
-            }
-            return AssistantPendingCallbacksSnapshot(requests: requests, userInputs: userInputs)
+            PendingCallbackSnapshotMapper.snapshot(
+                from: try ProviderPendingCallbackRepository(db: self.db).listVisible(threadId: threadId),
+                decoder: self.pendingCallbackDecoder
+            )
         }
     }
 
@@ -255,6 +225,80 @@ public final class AgentAppReadGateway: @unchecked Sendable {
                 }
             }
         }
+    }
+}
+
+/// Maps stored provider callbacks into the snapshot the paired device hydrates.
+///
+/// A row whose `payload_json` no longer decodes still names a request the run is
+/// waiting on (`Repositories.row` even normalizes a NULL payload to `"{}"`, which
+/// does not decode either), so it must never be dropped from the snapshot: an
+/// unreadable payload is not proof that the request does not exist. The degraded
+/// entry keeps identity, state, and timing so the request stays answerable by id.
+enum PendingCallbackSnapshotMapper {
+    static func snapshot(
+        from callbacks: [ProviderPendingCallback],
+        decoder: JSONDecoder
+    ) -> AssistantPendingCallbacksSnapshot {
+        var requests: [AssistantPendingRequest] = []
+        var userInputs: [AssistantUserInputRequest] = []
+        for callback in callbacks {
+            let data = Data(callback.payloadJSON.utf8)
+            switch callback.kind {
+            case .approval:
+                var request: AssistantPendingRequest
+                if let decoded = try? decoder.decode(AssistantPendingRequest.self, from: data) {
+                    request = decoded
+                } else {
+                    reportUnreadable(callback)
+                    request = AssistantPendingRequest(
+                        id: callback.requestId,
+                        turnId: nil,
+                        kind: .dynamic,
+                        title: "Approval request",
+                        detail: Self.unreadablePayloadDetail,
+                        createdAtMs: Int64(callback.createdAt.timeIntervalSince1970 * 1000)
+                    )
+                }
+                request.state = callback.state
+                request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
+                if callback.state == .stale, let reason = callback.staleReason {
+                    request.detail = [request.detail, reason].compactMap { $0 }.joined(separator: "\n")
+                }
+                requests.append(request)
+            case .userInput:
+                var input: AssistantUserInputRequest
+                if let decoded = try? decoder.decode(AssistantUserInputRequest.self, from: data) {
+                    input = decoded
+                } else {
+                    reportUnreadable(callback)
+                    input = AssistantUserInputRequest(
+                        id: callback.requestId,
+                        turnId: nil,
+                        prompt: Self.unreadableUserInputPrompt,
+                        createdAtMs: Int64(callback.createdAt.timeIntervalSince1970 * 1000)
+                    )
+                }
+                input.state = callback.state
+                input.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
+                if callback.state == .stale, let reason = callback.staleReason, input.answer == nil {
+                    input.answer = reason
+                }
+                userInputs.append(input)
+            }
+        }
+        return AssistantPendingCallbacksSnapshot(requests: requests, userInputs: userInputs)
+    }
+
+    // English product copy, same as the rest of the callback surfaces. Never
+    // carries payload text or paths.
+    static let unreadablePayloadDetail = "Stored request payload could not be read; approve or decline to unblock the run."
+    static let unreadableUserInputPrompt = "Input requested (stored payload could not be read)"
+
+    private static func reportUnreadable(_ callback: ProviderPendingCallback) {
+        appRouterLog.error(
+            "pending_callback.payload_unreadable thread=\(callback.threadId.value.uuidString, privacy: .public) request=\(callback.requestId, privacy: .public) kind=\(callback.kind.rawValue, privacy: .public) state=\(callback.state.rawValue, privacy: .public) bytes=\(callback.payloadJSON.utf8.count, privacy: .public)"
+        )
     }
 }
 
@@ -1447,6 +1491,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func createSurface(workspace: WorkspaceID, type: SurfaceType, paneID: PaneID?, title: String?) throws -> SurfaceDescriptor {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        // Refuse a pane id that is not in the layout BEFORE building the
+        // runtime: `surface.create` / `files.open_tab` take a client-supplied
+        // pane id, and a stale one used to no-op inside the reducer while this
+        // method still returned a created descriptor (and registered a live
+        // surface) for a tab the layout never gained.
+        if let paneID, let ws = ctx.state.workspaces[workspace], ws.layout.find(paneID: paneID) == nil {
+            throw LayoutError.paneNotFound
+        }
         let desc = makeSurface(type: type, title: title, workspace: workspace, cwd: ctx.state.workspaces[workspace]?.cwd ?? "/")
         try ctx.apply(.addSurface(workspace, paneID: paneID, descriptor: desc))
         windowController?.refreshFromState()
@@ -1535,6 +1587,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func splitPane(workspace: WorkspaceID, paneID: PaneID, direction: SplitDirection, surfaceType: SurfaceType, title: String?) throws -> SurfaceDescriptor {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        // Same refusal as createSurface: `surface.split` supplies the pane id, and
+        // a stale one must not build a runtime for a pane that is not there.
+        if let ws = ctx.state.workspaces[workspace], ws.layout.find(paneID: paneID) == nil {
+            throw LayoutError.paneNotFound
+        }
         let desc = makeSurface(type: surfaceType, title: title, workspace: workspace, cwd: ctx.state.workspaces[workspace]?.cwd ?? "/")
         try ctx.apply(.splitPane(workspace, paneID: paneID, direction: direction, newSurface: desc))
         windowController?.refreshFromState()
@@ -1773,7 +1830,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             ? entry.descriptor.metadata["selected_thread"].flatMap(UUID.init).map(AgentThreadID.init)
             : nil
         let desc = makeSurface(type: entry.descriptor.type, title: entry.descriptor.title,
-                               workspace: workspace, cwd: cwd, initialThreadId: reopenThreadId)
+                               workspace: workspace, cwd: cwd, initialThreadId: reopenThreadId,
+                               restoringFrom: entry.descriptor)
         try ctx.apply(.addSurface(workspace, paneID: nil, descriptor: desc))
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
@@ -5943,30 +6001,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func listAgentPendingCallbacks(thread: AgentThreadID) throws -> AssistantPendingCallbacksSnapshot {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        var requests: [AssistantPendingRequest] = []
-        var userInputs: [AssistantUserInputRequest] = []
-        for callback in try ctx.providerPendingCallbackRepo.listVisible(threadId: thread) {
-            guard let data = callback.payloadJSON.data(using: .utf8) else { continue }
-            switch callback.kind {
-            case .approval:
-                guard var request = try? settingsJSONDecoder.decode(AssistantPendingRequest.self, from: data) else { continue }
-                request.state = callback.state
-                request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
-                if callback.state == .stale, let reason = callback.staleReason {
-                    request.detail = [request.detail, reason].compactMap { $0 }.joined(separator: "\n")
-                }
-                requests.append(request)
-            case .userInput:
-                guard var input = try? settingsJSONDecoder.decode(AssistantUserInputRequest.self, from: data) else { continue }
-                input.state = callback.state
-                input.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
-                if callback.state == .stale, let reason = callback.staleReason, input.answer == nil {
-                    input.answer = reason
-                }
-                userInputs.append(input)
-            }
-        }
-        return AssistantPendingCallbacksSnapshot(requests: requests, userInputs: userInputs)
+        return PendingCallbackSnapshotMapper.snapshot(
+            from: try ctx.providerPendingCallbackRepo.listVisible(threadId: thread),
+            decoder: settingsJSONDecoder
+        )
     }
 
     public func listAgentPendingCallbacksOffMain(thread: AgentThreadID) async throws -> AssistantPendingCallbacksSnapshot {
@@ -7988,7 +8026,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 try store.upsert(target)
             }
         }
-        store.save(
+        // Persist the legacy target before answering ok: iOS must not believe a
+        // push registration landed when the settings write failed.
+        try store.save(
             pushToken: pushToken,
             pushTokenType: pushTokenType,
             liveActivityToken: liveActivityToken,
@@ -8166,7 +8206,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func makeSurface(type: SurfaceType, title: String?, workspace: WorkspaceID, cwd: String, initialThreadId: AgentThreadID? = nil) -> SurfaceDescriptor {
+    /// `restoringFrom` carries the descriptor of a closed tab (⌘⇧T), so the new
+    /// surface re-derives the target/state the descriptor kept (`url`, `path`,
+    /// `files_state`, ssh profile) exactly like `reinstantiateRestoredSurfaces`.
+    private func makeSurface(type: SurfaceType, title: String?, workspace: WorkspaceID, cwd: String, initialThreadId: AgentThreadID? = nil, restoringFrom restore: SurfaceDescriptor? = nil) -> SurfaceDescriptor {
         let baseTitle = title ?? defaultTitle(for: type)
         let descriptor = SurfaceDescriptor(type: type, title: baseTitle, iconName: type.rawValue, metadata: ["workspace": workspace.value.uuidString, "cwd": cwd])
         let terminalFontSize = context.map { SettingsStore(db: $0.db).load().terminalFontSize } ?? 0
@@ -8180,17 +8223,30 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     workspace: workspace
                 )
             case .ssh:
-                surface = try SSHSurface(
-                    workspaceID: workspace,
-                    cwd: cwd,
-                    title: baseTitle,
-                    router: self,
-                    historyRepo: context?.terminalOutputRepo,
-                    settingsRepo: context?.settingsRepo,
-                    terminalFontSize: terminalFontSize
-                )
+                // A tab that was connected carries its profile in metadata:
+                // reopen it as the live ssh terminal it was, not as the
+                // profile picker (mirrors reinstantiateRestoredSurfaces).
+                if let profile = restore.flatMap(sshProfile(from:)) {
+                    surface = configureTerminalSurface(
+                        try TerminalSurface(workspaceID: workspace, title: baseTitle, launch: .ssh(profile: profile, cwd: cwd), historyRepo: context?.terminalOutputRepo, settingsRepo: context?.settingsRepo, terminalFontSize: terminalFontSize),
+                        workspace: workspace
+                    )
+                } else {
+                    surface = try SSHSurface(
+                        workspaceID: workspace,
+                        cwd: cwd,
+                        title: baseTitle,
+                        router: self,
+                        historyRepo: context?.terminalOutputRepo,
+                        settingsRepo: context?.settingsRepo,
+                        terminalFontSize: terminalFontSize
+                    )
+                }
             case .browser:
-                surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle))
+                // bot_id keeps the reopened tab on the bot's WKWebView data
+                // store (cookies/session) and its BotBrowserStore target.
+                let botID = restore?.metadata["bot_id"].flatMap { UUID(uuidString: $0) }.map(BotID.init)
+                surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: restore.flatMap(restoredBrowserURL(from:)), title: baseTitle, botID: botID))
             case .agentApp:
                 guard let ctx = context else { return descriptor }
                 let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, draftRepo: AgentThreadDraftRepository(db: ctx.db), attachmentStore: AgentAttachmentStore(root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)), queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId, orchestrationRuntime: ctx.orchestrationRuntime)
@@ -8314,12 +8370,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
                 surface = agent
             case .files:
-                surface = FilesSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self, initialState: nil, selectedPath: nil)
+                surface = FilesSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self, initialState: restore?.metadata["files_state"], selectedPath: restore?.metadata["selected_path"] ?? restore?.metadata["selected_relative_path"])
             case .markdown:
-                let path = title // optional: pass file path via title for now
+                let path = restore?.metadata["path"] ?? title // optional: pass file path via title for now
                 surface = MarkdownSurface(workspaceID: workspace, filePath: path, title: baseTitle)
             case .filePreview:
-                surface = FilePreviewSurface(workspaceID: workspace, filePath: title, title: baseTitle)
+                surface = FilePreviewSurface(workspaceID: workspace, filePath: restore?.metadata["path"] ?? title, title: baseTitle)
             case .rightSidebarTool:
                 // Tool selection is encoded in the title for V1 — keeps
                 // the JSON-RPC payload simple. Default is the diff panel.
@@ -8351,7 +8407,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     surface = DiffPanelSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, settings: context.map { SettingsStore(db: $0.db) })
                 }
             }
-            let finalDescriptor = SurfaceDescriptor(id: surface.descriptor.id, type: type, title: baseTitle, iconName: surface.descriptor.iconName, metadata: surface.descriptor.metadata)
+            var finalDescriptor = SurfaceDescriptor(id: surface.descriptor.id, type: type, title: baseTitle, iconName: surface.descriptor.iconName, metadata: surface.descriptor.metadata)
+            if let restore {
+                // Two keys the surfaces cannot re-derive at init: the browser
+                // target is only written on the first navigation callback (see
+                // makeBrowserSurface), and the files revision mirrors the
+                // restored blob for the connection snapshot.
+                if finalDescriptor.metadata["url"] == nil {
+                    finalDescriptor.metadata["url"] = restore.metadata["url"]
+                }
+                if finalDescriptor.metadata["files_state_revision"] == nil {
+                    finalDescriptor.metadata["files_state_revision"] = restore.metadata["files_state_revision"]
+                }
+            }
             SurfaceRegistry.shared.register(surface)
             return finalDescriptor
         } catch {
@@ -8410,7 +8478,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func readSSHHosts(workspace: WorkspaceID, from repo: SettingsRepository) throws -> [SSHHostProfile] {
         guard let raw = try repo.get(sshHostsKey(workspace: workspace)),
               let data = raw.data(using: .utf8) else { return [] }
-        return (try? settingsJSONDecoder.decode([SSHHostProfile].self, from: data)) ?? []
+        // A payload that cannot be read back is NOT an empty host list: upsert and
+        // delete rewrite whatever this returns, so answering `[]` erased the saved
+        // hosts the user still had (and orphaned their Keychain passwords). Fail
+        // loudly and leave the stored bytes for the user to repair.
+        do {
+            return try settingsJSONDecoder.decode([SSHHostProfile].self, from: data)
+        } catch {
+            throw JSONRPCError(
+                code: JSONRPCError.internalError.code,
+                message: "The saved SSH hosts for this workspace could not be read, so RemoteCode left them untouched. The stored entry has to be repaired before hosts can be edited."
+            )
+        }
     }
 
     private func writeSSHHosts(_ hosts: [SSHHostProfile], workspace: WorkspaceID, to repo: SettingsRepository) throws {

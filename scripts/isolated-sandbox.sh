@@ -134,6 +134,35 @@ require_sandbox_tree() {
   die "refusing $COMMAND in the primary checkout $(repo_root). Run: cd \"\$(scripts/isolated-sandbox.sh ensure)\"  (set RC2_SANDBOX_ALLOW_PRIMARY=1 only for a dedicated clone)"
 }
 
+# Vendor .a archives are LFS-tracked build inputs. This repo's local git config
+# installs LFS with --skip-smudge, so every checkout (git worktree add included)
+# writes the 133-byte pointer file instead of the archive and the build fails.
+lfs_pointer_paths() {
+  local target="$1" path tracked
+  command -v git-lfs >/dev/null 2>&1 || return 0
+  tracked="$(git -C "$target" lfs ls-files -n 2>/dev/null || true)"
+  [ -n "$tracked" ] || return 0
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    [ -f "$target/$path" ] || continue
+    if head -c 64 "$target/$path" 2>/dev/null | grep -q "git-lfs.github.com/spec"; then
+      printf '%s\n' "$path"
+    fi
+  done <<<"$tracked"
+}
+
+materialize_lfs() {
+  local target="$1" pointers
+  pointers="$(lfs_pointer_paths "$target")"
+  [ -n "$pointers" ] || return 0
+  echo "[sandbox] materializing $(printf '%s\n' "$pointers" | wc -l | tr -d ' ') LFS pointer file(s) in $target" >&2
+  git -C "$target" lfs fetch --all >&2
+  git -C "$target" lfs checkout >&2
+  pointers="$(lfs_pointer_paths "$target")"
+  [ -z "$pointers" ] || die "LFS objects still missing after fetch/checkout: $(printf '%s' "$pointers" | tr '\n' ' ')"
+  echo "[sandbox] LFS artifacts ready" >&2
+}
+
 print_identity() {
   require_git
   cat <<EOF
@@ -159,6 +188,7 @@ cmd_ensure() {
   root="$(repo_root)"
   if is_linked_worktree; then
     echo "[sandbox] already in linked worktree" >&2
+    materialize_lfs "$(pwd -P)"
     pwd -P
     return 0
   fi
@@ -175,6 +205,7 @@ cmd_ensure() {
   git worktree add -b "$branch" "$wt" "$ref" >&2
   echo "[sandbox] created $wt from $ref on $branch" >&2
   echo "[sandbox] edit/test/run only inside this path" >&2
+  materialize_lfs "$wt"
   (cd "$wt" && pwd -P)
 }
 
@@ -184,6 +215,7 @@ cmd_test() {
   ensure_developer_dir
   local root support test_user_home
   root="$(repo_root)"
+  materialize_lfs "$root"
   support="$(app_support_dir)"
   test_user_home="$(test_user_home_dir)"
   mkdir -p "$support" "$test_user_home/Library/Preferences"
@@ -207,6 +239,7 @@ cmd_build() {
   ensure_developer_dir
   local root output
   root="$(repo_root)"
+  materialize_lfs "$root"
   output="$(app_path)"
   cd "$root"
   RC2_BUNDLE_ID="$BUNDLE_ID" \

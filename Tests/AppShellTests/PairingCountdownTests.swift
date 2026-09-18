@@ -68,6 +68,34 @@ final class PairingCountdownTests: XCTestCase {
         XCTAssertEqual(expired.label, "Expired")
     }
 
+    func test_pairingQR_disappearsWithTheCode() {
+        // WHY: the QR is a scannable shortcut for the same pairing URL. Showing it
+        // past expiry invites the user to scan a code the server already rejects,
+        // so the view must drop it at the exact instant the code greys out.
+        let expiresAt = epoch.addingTimeInterval(60)
+        let payload = "remotecode://pair?code=ABC"
+        let live = PairingCodeCountdownPresentation(
+            expiresAt: expiresAt,
+            now: expiresAt.addingTimeInterval(-0.2)
+        )
+        XCTAssertFalse(live.expired)
+        XCTAssertEqual(live.livePairingQRPayload(payload), payload,
+                       "a live code must keep its QR")
+        XCTAssertNil(live.livePairingQRPayload(nil),
+                     "no payload means no QR")
+
+        XCTAssertNil(
+            PairingCodeCountdownPresentation(expiresAt: expiresAt, now: expiresAt)
+                .livePairingQRPayload(payload),
+            "the QR must be gone at the exact expiry instant"
+        )
+        XCTAssertNil(
+            PairingCodeCountdownPresentation(expiresAt: expiresAt, now: expiresAt.addingTimeInterval(120))
+                .livePairingQRPayload(payload),
+            "the QR must stay gone after expiry"
+        )
+    }
+
     func test_microbenchPairingCodeTimelineSchedule_eliminatesExpiredInvalidations() {
         let warmups = 2
         let samples = 7

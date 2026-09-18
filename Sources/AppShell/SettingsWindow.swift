@@ -449,11 +449,16 @@ public final class SettingsViewModel: ObservableObject {
 
     static let accountLog = Logger(subsystem: "io.remotecode.app", category: "private-account")
 
+    /// The server accepted the credentials but the Mac could not write the
+    /// session to settings. Distinct from a sign-in failure: retrying the
+    /// credentials is not the fix, and the account is not usable locally.
+    static let sessionNotPersistedStatus = "Signed in, but the session could not be saved"
+
     /// Status strings that represent a sign-in/refresh failure (used by the
     /// signed-out form to decide whether to show the inline error hint).
     static let signInFailureStatuses: Set<String> = [
         "Sign in failed", "No internet connection", "Too many attempts, wait a minute",
-        "Service unavailable", "Service error", "Session expired"
+        "Service unavailable", "Service error", "Session expired", sessionNotPersistedStatus
     ]
 
     /// Maps transport/API errors to distinct, actionable status copy so 401,
@@ -1278,7 +1283,15 @@ public final class SettingsViewModel: ObservableObject {
             let session = try await privateAccountAPI.login(email: email, password: privateAccountPassword)
             let user = try await privateAccountAPI.currentUser(accessToken: session.accessToken)
             let verified = PrivateAccountSession(accessToken: session.accessToken, refreshToken: session.refreshToken, user: user)
-            privateAccountStore.save(verified)
+            // Every consumer (router, usage refresh, push) reloads the session
+            // from settings, so an unwritten login is not a login: keep the
+            // password for a retry and say the session was not saved.
+            guard privateAccountStore.save(verified) else {
+                privateAccountUser = nil
+                privateBillingPortalURL = nil
+                privateAccountStatus = Self.sessionNotPersistedStatus
+                return
+            }
             privateAccountPassword = ""
             privateAccountUser = verified.user
             privateAccountStatus = verified.user.subscribed ? "Subscription active" : "Signed in; subscription required for backend push"
@@ -1307,7 +1320,14 @@ public final class SettingsViewModel: ObservableObject {
         } catch {
             do {
                 let refreshed = try await privateAccountAPI.refresh(refreshToken: stored.refreshToken)
-                privateAccountStore.save(refreshed)
+                // The server already consumed the old refresh token, so
+                // dropping this write leaves a stale session on disk.
+                guard privateAccountStore.save(refreshed) else {
+                    privateAccountUser = nil
+                    privateBillingPortalURL = nil
+                    privateAccountStatus = Self.sessionNotPersistedStatus
+                    return
+                }
                 privateAccountUser = refreshed.user
                 privateAccountEmail = refreshed.user.email
                 privateAccountStatus = refreshed.user.subscribed ? "Subscription active" : "Signed in; subscription required for backend push"
@@ -1495,6 +1515,13 @@ struct PairingCodeCountdownPresentation: Equatable {
     var expired: Bool { remaining <= 0 }
     var label: String {
         expired ? "Expired" : String(format: "Expires in %d:%02d", remaining / 60, remaining % 60)
+    }
+
+    /// The QR encodes the same pairing URL the user can type, so it has to
+    /// disappear the instant the code does: a scannable QR for a code the
+    /// server already rejects invites a dead pairing attempt.
+    func livePairingQRPayload(_ payload: String?) -> String? {
+        expired ? nil : payload
     }
 }
 
@@ -2471,14 +2498,15 @@ public struct SettingsView: View {
                             .font(DS.Font.caption)
                             .foregroundColor(countdown.expired ? DS.Palette.danger : DS.Palette.textTertiary)
                     }
-                }
-                // QR code: shown while the code is live; hidden once expired.
-                // WHY: the QR encodes the same pairing URL the user can type manually,
-                // so scanning it is strictly an ergonomic shortcut — the security
-                // boundary is unchanged (code still expires in 600 s).
-                if let payload = vm.pairingQRPayload {
-                    PairingQRView(payload: payload)
-                        .accessibilityIdentifier("settings.pairing.qr")
+                    // QR code: shown while the code is live; hidden once expired.
+                    // WHY: the QR encodes the same pairing URL the user can type manually,
+                    // so scanning it is strictly an ergonomic shortcut — the security
+                    // boundary is unchanged (code still expires in 600 s).
+                    // Inside the timeline so the expiry instant itself removes it.
+                    if let payload = countdown.livePairingQRPayload(vm.pairingQRPayload) {
+                        PairingQRView(payload: payload)
+                            .accessibilityIdentifier("settings.pairing.qr")
+                    }
                 }
             } else {
                 Button("Generate pairing code") { vm.createPairingCode() }
@@ -3089,6 +3117,8 @@ public struct AccountView: View {
         case "Too many attempts, wait a minute": return "Too many attempts. Wait a minute, then try again."
         case "Service unavailable", "Service error": return "The service is unavailable right now. Try again shortly."
         case "Session expired": return "Your session expired. Sign in again."
+        case SettingsViewModel.sessionNotPersistedStatus:
+            return "This Mac could not save the session to disk. Check free disk space, then sign in again."
         default: return "Check the email and password, then try again."
         }
     }

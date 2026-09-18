@@ -1751,6 +1751,45 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_deskThreadRailRouting_followsTheModelTheSendWroteToTheThread() throws {
+        // WHY: the memo is filled per id, and a send that drifts the model on
+        // the existing thread was the one writer that never touched it. The rail
+        // kept painting the model the thread had before the send, so the user
+        // read a route their thread no longer used.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        let conversation = BotConversation(
+            botID: bot.id,
+            title: "Standup",
+            linkedAgentThreadID: thread.id
+        )
+        try context.botStore.upsertConversation(conversation)
+        vm.openDesk(bot)
+        let painted = try XCTUnwrap(vm.conversations.first(where: { $0.id == conversation.id }))
+
+        vm.setDeskModel("sonnet")
+        XCTAssertEqual(vm.deskThreadRailRouting(for: painted).model, "opus",
+                       "fixture: a pending composer choice must not repaint a thread that has not run on it")
+
+        vm.composerText = "ship it"
+        XCTAssertTrue(vm.send())
+        XCTAssertEqual(
+            try context.threadRepo.get(id: thread.id)?.model,
+            "sonnet",
+            "fixture: the send must drift the linked thread onto the selected model"
+        )
+        XCTAssertEqual(
+            vm.deskThreadRailRouting(for: painted).model,
+            "sonnet",
+            "WHY: the chip must follow the thread row the send just wrote, not the model it had before"
+        )
+    }
+
     func test_deskThreadRailOrdersWorkingFirst_becauseActiveMustStayOnTop() throws {
         // WHY: + / a newer idle dest thread used to insert at index 0 and
         // bury the live spinner. Dest must use the shared active-first sort
@@ -3202,6 +3241,95 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.screen, .desk)
     }
 
+    func test_deleteDropsTheDeletedTeammatesResidentCaches_becauseTheWindowMustNotOutgrowTheRoster() throws {
+        // WHY: delete dropped the row, the drafts, and the queue, but every
+        // resident cache keyed to that teammate stayed for the life of the
+        // window — the studio snapshot (conversations, memory facts, routines,
+        // selected revision), each published revision, the desk preview, and
+        // the per-conversation transcripts. A session that creates and deletes
+        // teammates must not keep paying for rows that are gone.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+
+        // Warm Piper alone first: its counts are the floor the delete of
+        // another teammate must preserve exactly.
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.send("Please look at the failing test"))
+        let studioFloor = vm.studioSupportCacheCountForTesting
+        let revisionFloor = vm.revisionCacheCountForTesting
+        let transcriptFloor = vm.transcriptCacheCountForTesting
+        let previewFloor = vm.lastPreviewCacheCountForTesting
+
+        // Then warm Quinn. These are the fixture proof: Quinn owns resident
+        // entries the delete has something to drop, so a green after-assertion
+        // cannot come from an empty cache.
+        vm.openDesk(quinn)
+        XCTAssertTrue(vm.send("Second teammate"))
+        XCTAssertGreaterThan(
+            vm.studioSupportCacheCountForTesting,
+            studioFloor,
+            "fixture: Quinn must own a studio snapshot to drop"
+        )
+        XCTAssertGreaterThan(
+            vm.revisionCacheCountForTesting,
+            revisionFloor,
+            "fixture: Quinn must own a published revision to drop"
+        )
+        XCTAssertGreaterThan(
+            vm.transcriptCacheCountForTesting,
+            transcriptFloor,
+            "fixture: Quinn must own a transcript to drop"
+        )
+        XCTAssertGreaterThan(
+            vm.lastPreviewCacheCountForTesting,
+            previewFloor,
+            "fixture: Quinn must own a desk preview to drop"
+        )
+        // `attentionStateByBot` is a whole-roster projection, not a per-teammate
+        // cache: one key per live teammate. Same invariant before and after.
+        XCTAssertEqual(
+            vm.attentionStateCacheCountForTesting,
+            vm.fleet.count,
+            "the attention projection must cover exactly the live roster"
+        )
+        XCTAssertEqual(vm.fleet.count, 2, "fixture: both teammates are live here")
+
+        // Hand the desk back so the delete does not navigate and this spec
+        // measures the caches rather than the adopt path.
+        vm.openDesk(piper)
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+
+        vm.delete(id: quinn.id)
+
+        XCTAssertEqual(
+            vm.studioSupportCacheCountForTesting,
+            studioFloor,
+            "delete must drop the deleted teammate's studio snapshot"
+        )
+        XCTAssertEqual(
+            vm.revisionCacheCountForTesting,
+            revisionFloor,
+            "delete must drop the deleted teammate's published revisions"
+        )
+        XCTAssertEqual(
+            vm.transcriptCacheCountForTesting,
+            transcriptFloor,
+            "delete must drop the deleted teammate's transcripts"
+        )
+        XCTAssertEqual(
+            vm.lastPreviewCacheCountForTesting,
+            previewFloor,
+            "delete must drop the deleted teammate's desk preview"
+        )
+        XCTAssertEqual(
+            vm.attentionStateCacheCountForTesting,
+            vm.fleet.count,
+            "delete must drop the deleted teammate's attention state"
+        )
+    }
+
     func test_hidingTheLastVisibleBotKeepsEmptyDesk_becauseTheRosterHasNoRemainingRow() throws {
         // WHY: empty desk is honest only when Hide leaves zero visible teammates.
         let context = try makeContext()
@@ -3640,6 +3768,112 @@ final class BotsWindowTests: XCTestCase {
         vm.reloadActiveBotsScreen()
         XCTAssertEqual(vm.activeBotsHydrationCountForTesting, before)
         XCTAssertEqual(vm.screen, .desk)
+    }
+
+    func test_handoffDeltaHydratesActiveBotsOnce_becauseOneDeltaIsOneTurn() async throws {
+        // WHY: a peer-handoff delta carries both conversations, and the
+        // observer settled each one with its own attention state — so a single
+        // publish paid two full Active Bots roster passes (liveWorkingBots +
+        // listRecentFinished) on the main actor with no run-loop turn between
+        // them. Both states must still land; the roster must hydrate once.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: peerRunner)
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        XCTAssertTrue(vm.createDeskThread())
+        let origin = try XCTUnwrap(vm.selectedConversation)
+
+        vm.openActiveBots()
+        XCTAssertEqual(vm.screen, .activeBots)
+        vm.reconcilePeerHandoffsForTesting()
+        let before = vm.activeBotsHydrationCountForTesting
+
+        // The publish inside this call is synchronous, so the count read below
+        // sees exactly the delta's own hydration — no async run-status traffic.
+        let milestone = try submitPeerHandoffForTesting(
+            context: context,
+            router: router,
+            viewModel: vm,
+            peer: quinn,
+            prompt: "@\(quinn.handle) check the inbox"
+        )
+
+        // Fixture: the delta really carried two conversations and both rows
+        // exist, so the observer's per-conversation pass was not a no-op.
+        let snapshot = try XCTUnwrap(
+            vm.peerHandoffSnapshotsForTesting(originConversationID: origin.id).first
+        )
+        XCTAssertNotNil(try? context.botStore.conversation(id: origin.id))
+        XCTAssertNotNil(try? context.botStore.conversation(id: snapshot.peerConversationID))
+        XCTAssertEqual(snapshot.peerBotID, quinn.id)
+
+        XCTAssertEqual(
+            vm.activeBotsHydrationCountForTesting,
+            before + 1,
+            "one handoff delta must hydrate Active Bots once, not once per conversation"
+        )
+
+        let peerStarted = await waitUntil(timeout: 5) { !peerRunner.requests.isEmpty }
+        XCTAssertTrue(peerStarted)
+        if let peerRunID = peerRunner.requests.first?.runId {
+            _ = peerRunner.finish(runID: peerRunID, status: .cancelled, reply: nil)
+        }
+        await milestone.value
+    }
+
+    func test_deskSendIntoActiveBotsHydratesOncePerTurn_becauseThePersistAlreadyReloaded() async throws {
+        // WHY: the persisted working conversation settles the bot's attention
+        // state, and that already hydrates Active Bots while the roster is up —
+        // the next line hydrated it a second time. One synchronous turn paid two
+        // full roster passes (liveWorkingBots + listRecentFinished) for one row.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            )
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.setDeskProvider(.claude)
+
+        vm.openActiveBots()
+        XCTAssertEqual(vm.screen, .activeBots)
+        let before = vm.activeBotsHydrationCountForTesting
+
+        _ = try vm.enqueueHostMessage(
+            botID: bot.id,
+            text: "go",
+            conversationID: nil,
+            routing: BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+        )
+
+        let started = await waitUntil(timeout: 5) { vm.lastSendStartedProviderRun }
+        XCTAssertTrue(started, "fixture: the send really reached the provider")
+        // One pass for the run-status broadcast, one for the persisted working
+        // conversation. Nothing else touches the roster before the run settles.
+        XCTAssertEqual(
+            vm.activeBotsHydrationCountForTesting,
+            before + 2,
+            "a desk send into Active Bots must hydrate the roster once per turn, not twice for the persist"
+        )
+
+        if let runID = runner.requests.first?.runId {
+            _ = runner.finish(runID: runID, status: .cancelled, reply: nil)
+        }
     }
 
     func test_didChangeStatusSkipsConversationLinkedWhenThreadHasNoBot() async throws {
@@ -4178,6 +4412,86 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(
             try context.botStore.listConversations(botID: piper.id).first?.attentionState,
             BotAttentionState.none
+        )
+    }
+
+    func test_terminalDeliveredTwiceRefreshesActiveBotCountOnce_becauseTheSecondCallbackIsADuplicate() async throws {
+        // WHY (perf BT-28): `didChangeStatus(terminal)` and `didFinish` deliver
+        // the same terminal. `adoptLinkedRunTerminal` already dedupes the
+        // settle (BT-24), but the refresh that followed re-ran
+        // `liveWorkingBots()` — two roster SQLite queries plus the coordinator
+        // lock — for the duplicate callback.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .grok)
+        let thread = AgentThread(title: "Night scan", provider: .grok, model: "grok-4.6")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .grok,
+            model: "grok-4.6",
+            status: .running
+        )
+        try context.runRepo.upsert(run)
+        try context.botStore.upsertConversation(
+            BotConversation(
+                botID: piper.id,
+                title: "Night scan",
+                attentionState: .working,
+                linkedAgentThreadID: thread.id
+            )
+        )
+        vm.openDesk(piper)
+        XCTAssertEqual(
+            vm.attentionState(for: piper), .working,
+            "fixture: the terminal callback must have a live Working row to settle"
+        )
+        XCTAssertEqual(
+            vm.followThroughApplyCountForTesting, 0,
+            "fixture: no terminal settle may run before the terminal is persisted"
+        )
+
+        // The coordinator persists the terminal row first, then broadcasts the
+        // two callbacks for the same run.
+        var terminal = run
+        terminal.status = .completed
+        terminal.finishedAt = Date()
+        try context.runRepo.upsert(terminal)
+
+        let baseline = vm.liveWorkingBotsCountForTesting
+        vm.runCoordinator(
+            context.coordinator,
+            didChangeStatus: .completed,
+            runId: run.id,
+            threadId: thread.id
+        )
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let afterFirst = vm.liveWorkingBotsCountForTesting
+        XCTAssertGreaterThan(
+            afterFirst, baseline,
+            "fixture: the first terminal callback must refresh the live roster"
+        )
+        XCTAssertNotEqual(
+            vm.attentionState(for: piper), .working,
+            "fixture: the first callback must settle the terminal, not bounce off the dedupe"
+        )
+
+        vm.runCoordinator(
+            context.coordinator,
+            didFinish: run.id,
+            threadId: thread.id,
+            status: .completed,
+            finalMessage: nil,
+            providerThreadId: nil
+        )
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(
+            vm.followThroughApplyCountForTesting, 1,
+            "fixture: the second callback is the same terminal, not a second settle"
+        )
+        XCTAssertEqual(
+            vm.liveWorkingBotsCountForTesting, afterFirst,
+            "the duplicate terminal callback must not re-run the Active Bots roster queries"
         )
     }
 
@@ -7717,6 +8031,50 @@ final class BotsWindowTests: XCTestCase {
         vm.setDeskProvider(.grok)
         _ = vm.composerSuggestions
         XCTAssertEqual(discoveryCount, 6, "non-Claude providers must not touch the Claude filesystem")
+    }
+
+    func test_deskComposerOrdinaryTypingDoesNotLoadTheClaudeCatalog_becauseEveryRepaintReevaluates() throws {
+        // WHY: the Desk composer bar reads `composerSuggestions` on every
+        // keystroke and on every repaint behind its TimelineView. Loading the
+        // disk-backed Claude catalog before `suggestions` can short-circuit on
+        // the active token made ordinary text pay the catalog fingerprint (two
+        // filesystem stats) for a suggestion list that is always empty.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller")
+        vm.openDesk(piper)
+        vm.setDeskProvider(.claude)
+        var revisionReads = 0
+        var discoveries = 0
+        vm.claudeSlashCacheTimeForTesting = { 100 }
+        vm.claudeSlashCatalogRevisionForTesting = { _ in
+            revisionReads += 1
+            return "fingerprint"
+        }
+        vm.claudeSlashDiscoveryForTesting = { _ in
+            discoveries += 1
+            return ["sam-work"]
+        }
+
+        vm.composerText = "resuma o inbox do Quinn"
+        XCTAssertTrue(vm.composerSuggestions.isEmpty)
+        XCTAssertEqual(revisionReads, 0, "plain text must not fingerprint the Claude catalog")
+        XCTAssertEqual(discoveries, 0, "plain text must not discover the Claude catalog")
+
+        // Fixture: the same evaluation path loads the catalog as soon as the
+        // active token can consume it — the zeros above are the gate, not a
+        // dead catalog path.
+        vm.composerText = "/sam"
+        XCTAssertTrue(vm.composerSuggestions.contains { $0.insertText == "/sam-work " })
+        XCTAssertEqual(revisionReads, 1)
+        XCTAssertEqual(discoveries, 1)
+
+        // The fingerprint still runs on every catalog evaluation: a commands
+        // file installed or removed mid-TTL must invalidate before the bound.
+        vm.composerText = "/sam-w"
+        _ = vm.composerSuggestions
+        XCTAssertEqual(revisionReads, 2)
+        XCTAssertEqual(discoveries, 1, "an unchanged fingerprint must still reuse discovery")
     }
 
     func test_deskApplyComposerSuggestionUsesCursorOffset() throws {
@@ -12892,6 +13250,56 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_queueMutationKeepsTheEnqueueMomentOfEveryRowItDidNotTouch() throws {
+        // WHY: `created_at` is the moment the user's words entered the queue,
+        // and it is what `bot.queue.list` reports to the paired device.
+        // `persistQueuedFollowUps` rewrote every bot's table with
+        // `createdAt: Date()`, so removing one follow-up re-dated the rows that
+        // survived — and every other teammate's rows — to now.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+
+        let queuedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let firstID = "11111111-1111-1111-1111-111111111111"
+        let secondID = "22222222-2222-2222-2222-222222222222"
+        let otherID = "33333333-3333-3333-3333-333333333333"
+        for (id, botID, text) in [
+            (firstID, piper.id, "first on piper"),
+            (secondID, piper.id, "second on piper"),
+            (otherID, quinn.id, "only on quinn"),
+        ] {
+            try context.botStore.enqueueQueuedFollowUp(BotQueuedFollowUpRecord(
+                id: id,
+                botID: botID,
+                text: text,
+                createdAt: queuedAt
+            ))
+        }
+        vm.reloadQueuedFollowUpsFromStore()
+        XCTAssertEqual(
+            vm.queuedFollowUps.map { $0.id.uuidString.lowercased() },
+            [firstID, secondID],
+            "fixture: the queued words must be in memory, not only in SQLite"
+        )
+
+        vm.removeQueuedFollowUp(try XCTUnwrap(vm.queuedFollowUps.last))
+
+        let stored = try context.botStore.listAllQueuedFollowUps()
+        XCTAssertEqual(
+            stored.first { $0.id == firstID }?.createdAt,
+            queuedAt,
+            "removing one follow-up must not re-date the survivor to now"
+        )
+        XCTAssertEqual(
+            stored.first { $0.id == otherID }?.createdAt,
+            queuedAt,
+            "a queue mutation must not re-date another teammate's queued words"
+        )
+    }
+
     func test_deletedBotDropsItsQueuedFollowUp_becauseTheTeammateIsGone() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
@@ -12918,6 +13326,80 @@ final class BotsWindowTests: XCTestCase {
         reopened.openDesk(quinn)
         XCTAssertTrue(reopened.queuedFollowUps.isEmpty)
         XCTAssertFalse(reopened.deskMessages.contains { $0.text == "orphan this" })
+    }
+
+    func test_hidingATeammateKeepsTheQueuedFollowUp_becauseHideIsARosterViewNotADelete() throws {
+        // WHY: hiding a teammate only filters the roster. reloadFleet pruned the
+        // follow-up queue against that filtered list, so the next reload deleted
+        // the rows the user typed — the queue was gone even after showing hidden.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        _ = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        try context.runRepo.upsert(AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: Date()
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(botID: piper.id, title: "Standup", linkedAgentThreadID: thread.id)
+        )
+        vm.openDesk(piper)
+        vm.composerText = "keep while hidden"
+        vm.send()
+        XCTAssertEqual(vm.queuedFollowUps.map(\.text), ["keep while hidden"])
+
+        vm.setHidden(id: piper.id, hidden: true)
+        vm.reload()
+
+        XCTAssertTrue(
+            try context.botStore.listAllQueuedFollowUps().contains { $0.botID == piper.id },
+            "hiding a teammate must not delete the follow-up the user queued"
+        )
+
+        vm.showHidden = true
+        vm.reload()
+        vm.openDesk(piper)
+        XCTAssertEqual(vm.queuedFollowUps.map(\.text), ["keep while hidden"])
+
+        let reopened = BotsViewModel(context: context)
+        reopened.showHidden = true
+        reopened.openDesk(piper)
+        XCTAssertEqual(
+            reopened.queuedFollowUps.map(\.text),
+            ["keep while hidden"],
+            "the queued line must survive relaunch after the teammate was hidden"
+        )
+    }
+
+    func test_hidingATeammateKeepsTheComposerDraft_becauseHideIsARosterViewNotADelete() throws {
+        // WHY: the unsent composer line is user work too. Hiding its teammate
+        // dropped the stored draft on the next reload, so showing hidden again
+        // gave back an empty composer.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        vm.openDesk(piper)
+        vm.composerText = "unsent on Piper"
+        vm.openDesk(quinn)
+        XCTAssertEqual(vm.composerText, "")
+
+        vm.setHidden(id: piper.id, hidden: true)
+        vm.reload()
+        vm.showHidden = true
+        vm.reload()
+        vm.openDesk(piper)
+
+        XCTAssertEqual(
+            vm.composerText,
+            "unsent on Piper",
+            "hiding a teammate must not delete the draft the user typed"
+        )
     }
 
     func test_composerDraftStaysOnOwningBot_becauseDeskMustNotLeakUnsentWords() throws {
@@ -12970,6 +13452,47 @@ final class BotsWindowTests: XCTestCase {
         reopened.openDesk(bot)
         XCTAssertEqual(reopened.composerText, "", "a sent line must not come back as a draft")
         XCTAssertTrue(reopened.deskMessages.contains { $0.text == "send then forget" })
+    }
+
+    func test_failedSendKeepsComposerWordsAttachmentsAndDraft_becauseNothingWasWritten() throws {
+        // WHY: send() used to empty the composer, drop the staged attachments and
+        // flush the (then empty) draft BEFORE the durable write. When that write
+        // failed the user got an error message over an empty composer: the line and
+        // the files they had just sent were gone and had to be produced again.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        let file = (directory as NSString).appendingPathComponent("retry-me.txt")
+        FileManager.default.createFile(atPath: file, contents: Data("keep me".utf8))
+        vm.addAttachments([file])
+        vm.composerText = "these words must survive a failed send"
+        XCTAssertEqual(vm.attachments.map(\.displayName), ["retry-me.txt"],
+                       "fixture: the staged file must be attached")
+
+        // A real failing write, not a mock: the store's own conversation insert aborts.
+        try context.db.execute("""
+            CREATE TRIGGER t_fail_bot_conversation_insert
+            BEFORE INSERT ON bot_conversations
+            BEGIN
+                SELECT RAISE(ABORT, 'send must fail');
+            END;
+            """)
+
+        XCTAssertFalse(vm.send(), "the aborted conversation write must report failure")
+        XCTAssertNotNil(vm.errorMessage)
+
+        XCTAssertEqual(vm.composerText, "these words must survive a failed send",
+                       "WHY: nothing was written, so the words are still the user's to retry")
+        XCTAssertEqual(vm.attachments.map(\.displayName), ["retry-me.txt"],
+                       "WHY: a failed send must not consume the staged files either")
+
+        try context.db.execute("DROP TRIGGER t_fail_bot_conversation_insert")
+        vm.flushDraftPersistenceForTesting()
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(bot)
+        XCTAssertEqual(reopened.composerText, "these words must survive a failed send",
+                       "WHY: the failed send must not have consumed the persisted draft")
     }
 
     func test_inspectorDraftsStayOnOwningBot_becauseMemorySkillsRoutinesMustNotLeak() throws {
@@ -13056,6 +13579,95 @@ final class BotsWindowTests: XCTestCase {
         let data = try XCTUnwrap(UserDefaults.standard.data(forKey: "bots.composerDrafts"))
         let stored = try JSONDecoder().decode([String: BotComposerDraft].self, from: data)
         XCTAssertEqual(stored[bot.id.value.uuidString.lowercased()]?.text, "xxxxxx")
+    }
+
+    func test_searchTextCoalescesUntilDeadline_becauseTypingMustNotWritePerKey() throws {
+        // WHY: `searchText` is a per-keystroke @Published field; every key used to
+        // hit UserDefaults immediately, so typing a 30-char query wrote the plist
+        // 30 times. The field must stay immediate; the write must be the settled one.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.flushDraftPersistenceForTesting()
+        let clock = BotDraftManualClock()
+        vm.draftPersistenceScheduleForTesting = { delay, action in
+            clock.schedule(afterNanoseconds: delay, action)
+        }
+        vm.resetDraftPersistenceMetricsForTesting()
+
+        for _ in 0..<6 {
+            vm.searchText.append("x")
+            clock.advance(byNanoseconds: 40_000_000)
+        }
+        XCTAssertEqual(vm.searchText, "xxxxxx", "the in-memory query must be immediate")
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.searchTextWrites, 0)
+        XCTAssertEqual(clock.pendingCount, 1)
+
+        clock.advance(byNanoseconds: 10_000_000)
+        XCTAssertEqual(vm.draftPersistenceMetricsForTesting.searchTextWrites, 1)
+        XCTAssertEqual(
+            UserDefaults.standard.string(forKey: "bots.searchText"),
+            "xxxxxx",
+            "fixture: the one coalesced write must carry the whole settled query"
+        )
+    }
+
+    func test_pendingSearchTextFlushesOnCloseAndQuit_becauseTheQueryMustSurviveRelaunch() throws {
+        // WHY: the roster query is workflow state; the deferred write must not be
+        // lost when the window closes or the app quits before the deadline fires.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.flushDraftPersistenceForTesting()
+        let clock = BotDraftManualClock()
+        vm.draftPersistenceScheduleForTesting = { delay, action in
+            clock.schedule(afterNanoseconds: delay, action)
+        }
+
+        vm.searchText = "piper"
+        XCTAssertNil(
+            UserDefaults.standard.string(forKey: "bots.searchText"),
+            "fixture: nothing is stored before the deadline or a lifecycle flush"
+        )
+        NotificationCenter.default.post(name: NSWindow.willCloseNotification, object: nil)
+        XCTAssertEqual(UserDefaults.standard.string(forKey: "bots.searchText"), "piper")
+
+        vm.searchText = "quinn"
+        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
+        XCTAssertEqual(UserDefaults.standard.string(forKey: "bots.searchText"), "quinn")
+
+        vm.searchText = "   "
+        NotificationCenter.default.post(name: NSWindow.willCloseNotification, object: nil)
+        XCTAssertNil(
+            UserDefaults.standard.string(forKey: "bots.searchText"),
+            "WHY: a blank query must clear the key instead of restoring whitespace"
+        )
+    }
+
+    func test_searchTextPendingWriteIsVisibleToTheNextSurface_becauseADeferredQueryMustNotGoStale() throws {
+        // WHY: the query lands in UserDefaults only after typing settles. A surface
+        // opened inside that window must read the pending query, not the older value
+        // the plist still holds.
+        let context = try makeContext()
+        let first = BotsViewModel(context: context)
+        // Drop the deadline the restore already armed, so the fake clock owns it.
+        first.flushDraftPersistenceForTesting()
+        let clock = BotDraftManualClock()
+        first.draftPersistenceScheduleForTesting = { delay, action in
+            clock.schedule(afterNanoseconds: delay, action)
+        }
+        first.searchText = "piper"
+        XCTAssertNil(
+            UserDefaults.standard.string(forKey: "bots.searchText"),
+            "fixture: the write is still pending, so only the context holds the query"
+        )
+
+        let second = BotsViewModel(context: context)
+        XCTAssertEqual(second.searchText, "piper",
+                       "WHY: the newest surface must not resurrect the settled-out query")
+
+        clock.advance(byNanoseconds: 250_000_000)
+        XCTAssertEqual(UserDefaults.standard.string(forKey: "bots.searchText"), "piper")
+        let third = BotsViewModel(context: context)
+        XCTAssertEqual(third.searchText, "piper", "the settled write must serve later surfaces")
     }
 
     func test_pendingDraftsFlushBeforeBotSwitch_becauseOwnershipMustNotLeakOrLoseWork() throws {

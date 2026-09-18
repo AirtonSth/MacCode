@@ -503,6 +503,29 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
         XCTAssertTrue(context.hasCompletedUsageTombstoneForTesting(runId: runId))
     }
 
+    /// Waits until `expected` usage writes have failed. Unlike a wall-clock wait
+    /// for the retry timer, this observes the failure counter: the retry interval
+    /// is asserted from the scheduled delay, so no spec has to sit out a 60 s cap.
+    private func waitForUsageWriteFailures(
+        _ expected: Int,
+        in context: AppContext,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let deadline = Date().addingTimeInterval(2)
+        while context.tokenSaverUsageConsecutiveWriteFailuresForTesting < expected,
+              Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertGreaterThanOrEqual(
+            context.tokenSaverUsageConsecutiveWriteFailuresForTesting,
+            expected,
+            "expected \(expected) failed usage writes",
+            file: file,
+            line: line
+        )
+    }
+
     private func waitForProviderTokens(
         _ expected: Int,
         provider: AgentProvider,
@@ -558,5 +581,103 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
         XCTAssertEqual(claude?.actualProviderTokens, 1_640)
         XCTAssertEqual(claude?.actualProviderBilledTokenUnits ?? 0, 1_560, accuracy: 0.001)
         XCTAssertEqual(claude?.estimatedRawBilledTokenUnits ?? 0, 1_560, accuracy: 0.001)
+    }
+
+    // MARK: - failed-write retry backs off instead of spinning
+
+    /// WHY: a write can fail for a reason that outlives the request (read-only or
+    /// full App Support). Retrying it every debounce window is ~80 wakeups a
+    /// minute, each one a cross-process flock plus a failed atomic write, for as
+    /// long as the app stays open. The retry must slow down, and a later success
+    /// must restore the prompt window rather than inherit the grown one.
+    func test_failedUsageWritesBackOffAndASuccessResetsTheRetryWindow() async throws {
+        enum ForcedWriteFailure: Error { case expected }
+
+        let appSupport = NSTemporaryDirectory() + "RC2UsageBackoff-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        let thread = AgentThread(title: "usage backoff", provider: .codex, model: "m")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m",
+                           status: .running, startedAt: Date())
+        try context.runRepo.upsert(run)
+
+        context.beforeTokenSaverUsageWriteForTesting = { throw ForcedWriteFailure.expected }
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(.init(totalTokens: 100, semantics: .cumulative)),
+            thread.id,
+            run.id
+        )
+
+        for failures in 1...3 {
+            context.flushPendingTokenSaverUsage(runId: run.id)
+            await waitForUsageWriteFailures(failures, in: context)
+        }
+
+        let scheduled = Array(context.tokenSaverUsageRetryDelaysForTesting.prefix(3))
+        XCTAssertEqual(scheduled.count, 3, "three failed writes must schedule three retries")
+        for (index, expected) in [0.75, 1.5, 3.0].enumerated() where index < scheduled.count {
+            XCTAssertEqual(
+                scheduled[index], expected, accuracy: 0.0001,
+                "retry \(index + 1) must wait \(expected) s, not the debounce window"
+            )
+        }
+
+        // A successful write restores the prompt retry window.
+        context.beforeTokenSaverUsageWriteForTesting = nil
+        context.flushPendingTokenSaverUsage(runId: run.id)
+        await waitForProviderTokens(100, provider: .codex, appSupport: context.appSupportDirectory)
+        XCTAssertEqual(context.tokenSaverUsageConsecutiveWriteFailuresForTesting, 0)
+
+        // A fresh delta failing again starts the backoff over at the window.
+        let scheduledBeforeFinalFailure = context.tokenSaverUsageRetryDelaysForTesting.count
+        context.beforeTokenSaverUsageWriteForTesting = { throw ForcedWriteFailure.expected }
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(.init(totalTokens: 200, semantics: .cumulative)),
+            thread.id,
+            run.id
+        )
+        context.flushPendingTokenSaverUsage(runId: run.id)
+        await waitForUsageWriteFailures(1, in: context)
+        let restartedRetry = context.tokenSaverUsageRetryDelaysForTesting
+            .dropFirst(scheduledBeforeFinalFailure)
+            .first ?? -1
+        XCTAssertEqual(restartedRetry, 0.75, accuracy: 0.0001)
+
+        // The backoff must not drop or duplicate the pending delta: the tokens
+        // parked across the failed attempts land exactly once when the store
+        // becomes writable again.
+        context.beforeTokenSaverUsageWriteForTesting = nil
+        context.flushPendingTokenSaverUsage(runId: run.id)
+        await waitForProviderTokens(200, provider: .codex, appSupport: context.appSupportDirectory)
+        try await Task.sleep(for: .milliseconds(50))
+        let codex = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+            .load().providers.first { $0.provider == .codex }
+        XCTAssertEqual(codex?.actualProviderTokens, 200)
+        XCTAssertEqual(codex?.eligibleRuns, 1)
+    }
+
+    func test_usageWriteRetryDelayDoublesAndSaturatesAtTheCap() {
+        let window = AppContext.tokenSaverUsageRetryDelay(consecutiveFailures: 1)
+        XCTAssertEqual(window, 0.75, accuracy: 0.0001,
+                       "the first retry keeps the debounce window")
+        XCTAssertEqual(
+            AppContext.tokenSaverUsageRetryDelay(consecutiveFailures: 0),
+            window,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            AppContext.tokenSaverUsageRetryDelay(consecutiveFailures: -3),
+            window,
+            accuracy: 0.0001
+        )
+        for (failures, expected) in [(2, 1.5), (3, 3.0), (7, 48.0), (8, 60.0), (1_000, 60.0)] {
+            XCTAssertEqual(
+                AppContext.tokenSaverUsageRetryDelay(consecutiveFailures: failures),
+                expected,
+                accuracy: 0.0001,
+                "\(failures) consecutive failures"
+            )
+        }
     }
 }

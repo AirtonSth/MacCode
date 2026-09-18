@@ -73,4 +73,26 @@ final class MessageOrderingTieBreakerTests: XCTestCase {
             "list() must preserve strict insertion order across distinct timestamps; " +
             "any change to its ORDER BY that swaps rowid for id would break this")
     }
+
+    // The bounded newest-window reader is the third reader of the same table and
+    // must not reintroduce the UUID tie-breaker the other two already fixed.
+    func test_sameSecond_listRecent_returnsInsertionOrder() throws {
+        let (db, tid) = try makeDB()
+        let mr = AgentMessageRepository(db: db)
+
+        let sharedDate = Date(timeIntervalSinceReferenceDate: 700_000_000)
+        // UUID order is intentionally inverse to insertion order (F > A).
+        let idFirst  = AgentMessageID(UUID(uuidString: "FFFFFFFF-0000-0000-0000-000000000001")!)
+        let idSecond = AgentMessageID(UUID(uuidString: "A0000000-0000-0000-0000-000000000002")!)
+
+        try mr.append(AgentMessage(id: idFirst,  threadId: tid, role: .user,      content: "z-first",  createdAt: sharedDate))
+        try mr.append(AgentMessage(id: idSecond, threadId: tid, role: .assistant, content: "a-second", createdAt: sharedDate))
+
+        // listRecent() returns the window oldest→newest, so an id-ordered
+        // tie-breaker inverts the pair and the UI paints the reply above its prompt.
+        let recent = try mr.listRecent(threadId: tid, limit: 8)
+        XCTAssertEqual(recent.map(\.content), ["z-first", "a-second"],
+            "listRecent() must tie-break on rowid (insertion order) like list()/listPage(); " +
+            "an id DESC tie-breaker would return [a-second, z-first]")
+    }
 }

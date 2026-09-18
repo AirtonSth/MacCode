@@ -185,6 +185,10 @@ public struct LiveActivityAcceptanceOutboxLimits: Equatable, Sendable {
 
 public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
     private static let key = "live_activity.acceptance_outbox.v1"
+    private static let log = Logger(
+        subsystem: "io.remotecode.app",
+        category: "live-activity-acceptance"
+    )
 
     public static var pendingRecordRetention: TimeInterval {
         LiveActivityDeliveryPolicy.pendingRecordRetention
@@ -342,7 +346,18 @@ public final class LiveActivityAcceptanceOutboxStore: @unchecked Sendable {
         guard let json = try settings.get(Self.key),
               !json.isEmpty,
               let data = json.data(using: .utf8) else { return [] }
-        return try decoder.decode([LiveActivityAcceptanceRecord].self, from: data)
+        do {
+            return try decoder.decode([LiveActivityAcceptanceRecord].self, from: data)
+        } catch {
+            // A snapshot we cannot decode can never be acknowledged or retried,
+            // and keeping it would fail every enqueue/candidates call forever.
+            // Treat it as an empty backlog (no acknowledgement is invented) so
+            // the next write persists a valid snapshot again.
+            Self.log.error(
+                "live-activity outbox snapshot undecodable bytes=\(data.count, privacy: .public) error=\(String(describing: error), privacy: .public)"
+            )
+            return []
+        }
     }
 
     private func saveUnlocked(_ records: [LiveActivityAcceptanceRecord]) throws {

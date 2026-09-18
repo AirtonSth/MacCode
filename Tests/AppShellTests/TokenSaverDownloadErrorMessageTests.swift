@@ -234,6 +234,28 @@ final class TokenSaverDownloadConfirmDecisionTests: XCTestCase {
         )
     }
 
+    func test_downloadConfirmDecision_confirm_whenFreeDiskIsUnknown() {
+        // WHY: `volumeFreeDiskBytes()` cannot measure the volume when the
+        // resource-value query fails, and reports its unknown sentinel (-1).
+        // Reading that sentinel as "full" showed the blocking "Not enough disk
+        // space" alert -- whose only button is OK -- to a user whose disk was
+        // fine. Unknown must fall through to the normal confirm dialog; if the
+        // disk really is full the download fails loudly on the write.
+        XCTAssertGreaterThanOrEqual(
+            SidebarViewModel.volumeFreeDiskBytes(),
+            0,
+            "a readable home volume must report real free bytes, never the sentinel"
+        )
+        XCTAssertEqual(
+            SidebarViewModel.downloadConfirmDecision(
+                modelBytes: SidebarViewModel.approvedModelEstimatedBytes,
+                freeDiskBytes: -1
+            ),
+            .confirm,
+            "an unmeasurable volume must not be reported as insufficient disk"
+        )
+    }
+
     // MARK: - Confirm (enough space)
 
     func test_downloadConfirmDecision_confirm_whenFreeEqualsModelPlusMargin() {

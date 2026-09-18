@@ -218,4 +218,31 @@ final class SidebarRefreshPerfGuardTests: XCTestCase {
             "unchanged reload must not invalidate the sidebar SwiftUI tree"
         )
     }
+
+    /// WHY: `WorkspaceDropDelegate.dropUpdated` runs on every drag tick (60-120
+    /// Hz) and reports the same direction while the pointer holds inside the
+    /// 40-pt edge zone. Each identical write rebuilt the sidebar body, so
+    /// holding a drag near the edge invalidated the list up to 120 times/second
+    /// while the user was only scrolling.
+    func test_dragScrollEdge_repeatedSameDirectionDoesNotPublish() throws {
+        let (_, _, vm) = try make(prefix: "drag-edge-publish")
+        var publishes = 0
+        let sub = vm.objectWillChange.sink { publishes += 1 }
+
+        vm.dragScrollEdge = -1
+        XCTAssertEqual(publishes, 1, "entering the edge zone must publish once")
+
+        for _ in 0..<120 {  // one second of drag ticks at 120 Hz
+            vm.dragScrollEdge = -1
+        }
+        XCTAssertEqual(
+            publishes,
+            1,
+            "an unchanged drag edge must not invalidate the sidebar SwiftUI tree"
+        )
+
+        vm.dragScrollEdge = 0
+        XCTAssertEqual(publishes, 2, "leaving the edge zone must publish once")
+        _ = sub
+    }
 }

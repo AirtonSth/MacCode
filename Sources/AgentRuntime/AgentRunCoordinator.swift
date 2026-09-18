@@ -1260,6 +1260,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// through minimal checkpoint identity persistence. Durable stale-release
     /// must not synthesize a callback while this attempt is still authoritative.
     private var terminalCheckpointAttempts: Set<AgentRunID> = []
+    /// Single-flight lease for a *detached durability retry*'s terminal commit.
+    /// `scheduleTerminalDurabilityRetry` frees its marker when the task is taken, not
+    /// when the task returns, and `.finished` re-entry is allowed while final-response
+    /// translation is off — so two retries can adopt the same retained event and publish
+    /// the terminal twice (test_stopCannotOvertakeTerminalWaitingForDurabilityBarrier:
+    /// `.completed` published twice). Only retries take and observe this lease:
+    /// `reconcilePendingTerminalBeforeStart` is documented as intentionally synchronous
+    /// and outranking the detached retry, so it must never be refused by it.
+    private var terminalCommitsInFlight: Set<AgentRunID> = []
     /// A provider start can fail while SQLite is temporarily unavailable. Keep
     /// the complete failure transition until its run/thread/session/error graph
     /// commits; a new run on the same thread must not overtake it.
@@ -2826,7 +2835,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
     }
 
-    public func stopRun(threadId: AgentThreadID) {
+    /// Returns the durable status the F19 guard read when Stop had nothing to
+    /// interrupt; nil on every path that touched state. The guard returns before
+    /// writing anything, so a repaint that runs right after this call can take
+    /// the value instead of paying a second single-column probe.
+    @discardableResult
+    public func stopRun(threadId: AgentThreadID) -> AgentRunStatus? {
         // RPC/iOS Stop must cancel surface-preflight reservations even when no
         // durable/pending/active run exists yet (Graphify await window).
         cancelPreparation(threadId: threadId)
@@ -2879,7 +2893,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             } else {
                 handle.cancel()
             }
-            return
+            return nil
         }
         // F19: nothing to stop unless the thread is actually running/pending. A
         // second Stop click, or a stop for a long-finished thread, previously fell
@@ -2894,20 +2908,20 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.lock()
             pendingThreadStops.remove(threadId)
             lock.unlock()
-            return
+            return durableStatus
         }
         if pendingStart != nil && !hasDurableRunningState {
             lock.lock()
             _ = applyPreparationLocked(threadId: threadId, event: .stopRequested)
             pendingThreadStops.insert(threadId)
             lock.unlock()
-            return
+            return nil
         }
         if let adapter = try? adapterForThread(threadId), adapter.hasSession(threadId: threadId) {
             do {
                 try adapter.stopSession(threadId: threadId)
                 markStopRequested(threadId: threadId, runId: nil)
-                return
+                return nil
             } catch {
                 // One-shot runners can expose a session before the local run handle exists.
                 // Keep the pending stop so handle registration cancels the run.
@@ -2950,6 +2964,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         pendingThreadStops.insert(threadId)
         lock.unlock()
         markStopRequested(threadId: threadId, runId: nil)
+        return nil
     }
 
     /// Stop a thread and do not return until the provider has acknowledged a
@@ -6690,7 +6705,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         providerTerminalAcknowledged: Bool = true,
         continuationSourceFinalMessage: String? = nil,
         distillReceiptPrepared: Bool = false,
-        hostDistillMetadataTrusted: Bool = false
+        hostDistillMetadataTrusted: Bool = false,
+        isDurabilityRetry: Bool = false
     ) {
         guard let lease = admitRunCallback(runId: runId, threadId: threadId) else { return }
         #if DEBUG
@@ -7397,9 +7413,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
             lock.lock()
             let pendingTerminal = pendingTerminalEvents[runId]
+            let commitOwnedElsewhere = isDurabilityRetry && terminalCommitsInFlight.contains(runId)
+            if isDurabilityRetry, pendingTerminal != nil, !commitOwnedElsewhere {
+                terminalCommitsInFlight.insert(runId)
+            }
             lock.unlock()
-            guard var pendingTerminal else {
-                // Slot vanished (ownership released elsewhere); nothing to commit.
+            guard var pendingTerminal, !commitOwnedElsewhere else {
+                // Slot vanished (ownership released elsewhere), or another retry owns the
+                // commit: it either publishes this terminal or releases the lease and
+                // re-schedules, so nothing retained here can be dropped.
                 return
             }
             // Policy BEFORE durable persist: run/thread/session rows must match
@@ -7441,6 +7463,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 streamFlushError = flushPendingStreamWrites(runId: runId, threadId: threadId)
             }
             if streamFlushError != nil {
+                if isDurabilityRetry {
+                    lock.lock()
+                    terminalCommitsInFlight.remove(runId)
+                    lock.unlock()
+                }
                 scheduleTerminalDurabilityRetry(runId: runId, threadId: threadId)
                 return
             }
@@ -7458,6 +7485,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             } catch {
                 lock.lock()
                 terminalCheckpointAttempts.remove(runId)
+                if isDurabilityRetry { terminalCommitsInFlight.remove(runId) }
                 lock.unlock()
                 emitPersistenceIssue("run.terminal_graph.commit", error: error, runId: runId, threadId: threadId)
                 scheduleTerminalDurabilityRetry(runId: runId, threadId: threadId)
@@ -7543,6 +7571,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             pendingTerminalEvents.removeValue(forKey: runId)
             terminalRetryScheduled.remove(runId)
             terminalCheckpointAttempts.remove(runId)
+            if isDurabilityRetry { terminalCommitsInFlight.remove(runId) }
             deferredProviderTerminalEvents.removeValue(forKey: runId)
             deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
             providerTextTranslationsInFlight.removeValue(forKey: runId)
@@ -8178,7 +8207,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 threadId: threadId,
                 allowFinalResponseTranslation: false,
                 providerTerminalAcknowledged: pending.providerTerminalAcknowledged,
-                continuationSourceFinalMessage: pending.continuationSourceFinalMessage
+                continuationSourceFinalMessage: pending.continuationSourceFinalMessage,
+                isDurabilityRetry: true
             )
         }
     }
@@ -8786,7 +8816,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     private func captureFileSnapshots(files: [AgentTurnCheckpointFile], cwd: String) -> [AgentTurnCheckpointFileSnapshot] {
-        files.map { file in
+        // CKPT-BUDGET: the per-file cap alone still let one turn write a
+        // multi-MiB row when it touched many ~1 MiB text files. Budget the
+        // whole checkpoint instead; files that no longer fit take the same
+        // nil-content marker path as oversized/binary ones.
+        var remainingBudget = Self.checkpointSnapshotTotalByteCap
+        return files.map { file in
             guard file.kind != GitFileStatus.deleted.rawValue,
                   let url = safeWorkspaceURL(cwd: cwd, relativePath: file.path),
                   let data = Self.readCheckpointSnapshotPrefix(from: url) else {
@@ -8797,17 +8832,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // (same restore path as a deleted file -> restore from HEAD) and log
             // a content hash so the skip is diagnosable. Oversized files hash
             // only the FileHandle prefix (CKPT-READ).
-            let decision = Self.checkpointSnapshotDecision(
+            let decision = Self.checkpointSnapshotBudgetDecision(
                 byteCount: data.count,
                 isBinary: Self.dataLooksBinary(data),
+                remainingBudget: remainingBudget,
                 cap: Self.checkpointSnapshotByteCap,
                 hash: { Self.sha256Hex(data) }
             )
             switch decision {
             case .snapshot:
+                remainingBudget -= data.count
                 return AgentTurnCheckpointFileSnapshot(path: file.path, kind: file.kind, contentsBase64: data.base64EncodedString())
             case .skipMarker(let hash):
-                agentRunLog.info("checkpoint.snapshot.skipped path=\(file.path, privacy: .public) bytes=\(data.count, privacy: .public) hash=\(hash, privacy: .public)")
+                agentRunLog.info("checkpoint.snapshot.skipped path=\(file.path, privacy: .public) bytes=\(data.count, privacy: .public) budget_remaining=\(remainingBudget, privacy: .public) hash=\(hash, privacy: .public)")
                 return AgentTurnCheckpointFileSnapshot(path: file.path, kind: file.kind, contentsBase64: nil)
             }
         }
@@ -8824,6 +8861,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     /// 1 MiB. Files at or under this (and not binary) are snapshotted inline.
     nonisolated static let checkpointSnapshotByteCap = 1 << 20
+
+    /// CKPT-BUDGET: 1 MiB of snapshot bytes per checkpoint (raw file bytes; the
+    /// stored base64 JSON is ~4/3 of it). Without a total, a turn touching many
+    /// at-cap text files wrote a multi-MiB row every turn: the live store showed
+    /// 66 checkpoints over 500 KB carrying 66% of a 176 MB snapshot column.
+    nonisolated static let checkpointSnapshotTotalByteCap = 1 << 20
 
     /// FileHandle prefix of `cap + 1` bytes. The extra byte distinguishes
     /// at-cap (snapshot) from over-cap (skip) without a full-file `Data`.
@@ -8844,6 +8887,23 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return .skipMarker(hash: hash())
         }
         return .snapshot
+    }
+
+    /// CKPT-BUDGET: the P2 per-file rule plus the checkpoint-wide byte budget.
+    /// A file that does not fit the remaining budget is skipped even when it is
+    /// small text, so one turn can never write more than the total. Later
+    /// smaller files still snapshot: the budget only rejects what does not fit.
+    nonisolated static func checkpointSnapshotBudgetDecision(
+        byteCount: Int,
+        isBinary: Bool,
+        remainingBudget: Int,
+        cap: Int,
+        hash: () -> String
+    ) -> CheckpointSnapshotDecision {
+        if byteCount > remainingBudget {
+            return .skipMarker(hash: hash())
+        }
+        return checkpointSnapshotDecision(byteCount: byteCount, isBinary: isBinary, cap: cap, hash: hash)
     }
 
     /// Matches the repo's text/binary convention (GitDiff): a NUL byte anywhere

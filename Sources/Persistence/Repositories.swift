@@ -3299,7 +3299,11 @@ public final class AgentMessageRepository: @unchecked Sendable {
     /// Backs the bounded message window (B4 pagination).
     public func listRecent(threadId: AgentThreadID, limit: Int) throws -> [AgentMessage] {
         listRecentCountForTesting += 1
-        let st = try db.prepare("SELECT id, thread_id, role, content, created_at, attachments_json FROM agent_messages WHERE thread_id = ? ORDER BY created_at DESC, id DESC LIMIT ?;")
+        // PERSISTENCE-DATA-004, same rule list()/listPage() already follow:
+        // created_at is stored at second precision, so the tie-breaker must be
+        // rowid (insertion order), not the message UUID. See
+        // MessageOrderingTieBreakerTests.
+        let st = try db.prepare("SELECT id, thread_id, role, content, created_at, attachments_json FROM agent_messages WHERE thread_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?;")
         try st.bind(1, threadId.value.uuidString)
         try st.bind(2, max(0, limit))
         var out: [AgentMessage] = []
@@ -4615,6 +4619,11 @@ public final class AgentRunRepository: @unchecked Sendable {
     public private(set) var errorMessageProbeCountForTesting = 0
     public private(set) var hasActiveProbeCountForTesting = 0
     public private(set) var activeChromeProbeCountForTesting = 0
+    /// `latestActive` probes split by thread. Live pollers must read
+    /// `agent_runs` off MainActor: a main-thread probe can stall the UI behind
+    /// the transient-lock retry (8 tries / 2 s) while a turn is writing.
+    public private(set) var latestActiveProbeCountForTesting = 0
+    public private(set) var latestActiveMainThreadProbeCountForTesting = 0
     public private(set) var routeProbeCountForTesting = 0
     public private(set) var promotePendingStartToRunningCountForTesting = 0
     public private(set) var stampTerminalCountForTesting = 0
@@ -5049,6 +5058,8 @@ public final class AgentRunRepository: @unchecked Sendable {
     /// scheduled runs, but `agent_runs` is shared SQLite. UI needs this for
     /// "Working for Xs" and Stop targeting without inventing a local session.
     public func latestActive(for threadId: AgentThreadID) throws -> AgentRun? {
+        latestActiveProbeCountForTesting += 1
+        if Thread.isMainThread { latestActiveMainThreadProbeCountForTesting += 1 }
         let st = try db.prepare("""
             SELECT id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message, terminal_reason
             FROM agent_runs

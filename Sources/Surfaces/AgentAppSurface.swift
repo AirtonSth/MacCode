@@ -712,6 +712,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Programmatic loads and mirror updates also trigger SwiftUI's onChange.
     /// Consume the matching callback once so they never echo as a second save.
     private var ignoredPlanNotesSave: (threadId: AgentThreadID, notes: String)?
+    /// Last notes value known for a thread (hydrated read or local save).
+    /// A thread switch repoints the editor from this cache before the open
+    /// bundle lands: the leaving thread's notes must never paint on the newly
+    /// selected thread, and a DB read on the click turn is forbidden.
+    private var planNotesByThread: [AgentThreadID: String] = [:]
 
     // Monotonic ticket for user callback actions (approval responses, user-input
     // answers). respondToPendingRequest resolves async; this seq lets its failure
@@ -728,11 +733,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Cache-first workspace membership for coordinator/event fan-out.
     /// A miss probes `workspace_id` only — never the 26-column + routing `get`.
     private func resolvedWorkspaceID(for threadId: AgentThreadID) -> WorkspaceID? {
+        resolvedWorkspaceID(for: threadId, retainingForeignProbe: true)
+    }
+
+    /// `retainingForeignProbe: false` keeps another workspace's thread from
+    /// entering this surface's caches; an already-learned membership is still
+    /// reused, and a local hit is always cached.
+    private func resolvedWorkspaceID(
+        for threadId: AgentThreadID,
+        retainingForeignProbe: Bool
+    ) -> WorkspaceID? {
         if let cached = threadWorkspaceCache[threadId] {
             return cached
         }
         let workspaceID = try? threadRepo.workspaceId(of: threadId)
-        if let workspaceID {
+        if let workspaceID, retainingForeignProbe || workspaceID == self.workspaceID {
             threadWorkspaceCache[threadId] = workspaceID
         }
         return workspaceID
@@ -2163,8 +2178,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let idx = threads.firstIndex(where: { $0.id == threadId }) else { return }
         guard threads[idx].status != status else { return }
         threads[idx].status = status
+        // The coordinator persists status and read state together
+        // (`AgentRunCoordinator.hasUnread(for:)`), so a status-only event must
+        // mirror that rule here too: without the unread half the rail keeps a
+        // stale badge until the next full list, which X-02 no longer triggers.
+        threads[idx].hasUnread = Self.railUnread(for: status)
         threads[idx].updatedAt = Date()
     }
+
+    /// Read state the coordinator stores with each run status.
+    nonisolated static func railUnread(for status: AgentRunStatus) -> Bool {
+        switch status {
+        case .completed, .failed, .interrupted: return true
+        case .pending, .running, .cancelled: return false
+        }
+    }
+
     /// True when the last `selectThread` used the in-memory rail instead of a full `get`.
     private(set) var lastThreadSelectionUsedRailForTesting = false
     /// Count of durable `threadRepo.get` lookups from `selectThread` (cache misses).
@@ -2319,6 +2348,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         worktreePath = selectedThread.worktreePath
         status = selectedThread.status
         restoreComposerDraft(for: selectedThread)
+        // Plan notes are per-thread: repoint the editor on the switch turn so the
+        // leaving thread's notes cannot be read (or saved) as the opened thread's.
+        // Cache miss paints empty until the open bundle's read lands.
+        setPlanNotesWithoutSaving(planNotesByThread[id] ?? "", threadId: id)
         if let trackedRunId = trackedRunId(for: id) {
             // UX-XPLAT-008: the persisted run start time is read off-main by the
             // open bundle and resolved when it applies, so "Working for Xs"
@@ -2404,12 +2437,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                         if self.statusMessage.isEmpty {
                             self.statusMessage = "Could not open thread: The thread is no longer available."
                         }
+                        // The stale rail row was already bound before this probe ran,
+                        // so a missing durable row must undo the selection instead of
+                        // leaving the surface open on a thread the store no longer has.
+                        self.retireUnbackedRailRow(id)
                         return
                     }
                     guard durableWorkspace == self.workspaceID else {
                         if self.statusMessage.isEmpty {
                             self.statusMessage = "Could not open thread: The thread belongs to another workspace."
                         }
+                        // The durable owner wins over the rail row: this surface must
+                        // not stay bound to — or keep painting — another workspace's
+                        // thread, and the row is stale here for the same reason.
+                        self.retireUnbackedRailRow(id)
                         return
                     }
                 } catch {
@@ -2655,6 +2696,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // One publish of a fully-built timeline (not empty → apply-tick cascade).
         let paintedErrorBeforeOpen = timeline.error
         timeline = bundle.replayedTimeline
+        // The replay read predates anything painted while it was in flight, so a
+        // live error that landed during the open is strictly newer than the
+        // bundle's error field (nil here when the replay window carries none).
+        // Dropping it hides the run's failure and its Sign in / Retry action
+        // until the next reload; the replay still wins when it has an error.
+        if let paintedErrorBeforeOpen, timeline.error == nil {
+            timeline.error = paintedErrorBeforeOpen
+        }
         // The stream path may have displayed a NEWER error while the bundle was
         // in flight (its replay read predates that event; the re-replay loop
         // narrows but cannot fully close that window). The recoverability flag
@@ -2703,6 +2752,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // not masquerade as absent notes and then overwrite the durable value.
         setPlanNotesWithoutSaving(bundle.planNotes ?? "", threadId: id)
         if bundle.planNotesFailed {
+            // The value is unknown, not empty: never let the next switch paint
+            // this failed read as the thread's cached notes.
+            planNotesByThread.removeValue(forKey: id)
             statusMessage = "Could not load plan notes"
         }
         // Subagents is thread-scoped chrome: rebuild after first paint so
@@ -2809,6 +2861,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         do {
             try planNotesStore.save(planNotes, threadId: id)
+            planNotesByThread[id] = planNotes
             onPlanNotesPersisted?(id, planNotes)
         } catch {
             statusMessage = "Could not save plan notes: \(error)"
@@ -2824,6 +2877,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private func setPlanNotesWithoutSaving(_ notes: String, threadId: AgentThreadID) {
         ignoredPlanNotesSave = (threadId, notes)
+        planNotesByThread[threadId] = notes
         planNotes = notes
     }
 
@@ -6915,6 +6969,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         ids.formUnion(lastPersistedFinalIdByThread.keys)
         ids.formUnion(queueStatusByThread.keys)
         ids.formUnion(providerThreadSnapshotConfirmedAtByThread.keys)
+        ids.formUnion(planNotesByThread.keys)
         ids.formUnion(runThreads.values)
         return ids
     }
@@ -6989,6 +7044,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         recoverDeletedSelectionIfNeeded(deletedIDs)
     }
 
+    /// Retires a rail row the durable store no longer backs — deleted, or owned by
+    /// another workspace — with the same three steps as a committed delete: per-thread
+    /// caches, the row itself, then the selection. The existence probe binds the rail
+    /// row before it runs, so stopping at the selection left a phantom row that stayed
+    /// clickable (and kept its draft/queue/plan caches) until a later rail reload
+    /// happened to succeed.
+    private func retireUnbackedRailRow(_ id: AgentThreadID) {
+        evictThreadCaches([id])
+        threads.removeAll { $0.id == id }
+        recoverDeletedSelectionIfNeeded([id])
+    }
+
     /// The repository transaction is authoritative for the victim list. Retire
     /// global runtime state before local cache eviction or lifecycle fan-out so a
     /// failed rail reload cannot leave a deleted provider session behind.
@@ -7030,6 +7097,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             lastPersistedFinalIdByThread.removeValue(forKey: id)
             queueStatusByThread.removeValue(forKey: id)
             providerThreadSnapshotConfirmedAtByThread.removeValue(forKey: id)
+            planNotesByThread.removeValue(forKey: id)
             surfacePreparationStates.removeValue(forKey: id)
             preparingRunThreads.remove(id)
             preparingRunGeneration.removeValue(forKey: id)
@@ -7577,7 +7645,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let threadId,
               let uuid = UUID(uuidString: threadId) else { return }
         let eventThreadId = AgentThreadID(uuid)
-        let eventWorkspaceID = resolvedWorkspaceID(for: eventThreadId)
+        let eventWorkspaceID = resolvedWorkspaceID(for: eventThreadId, retainingForeignProbe: false)
         guard eventWorkspaceID == workspaceID else { return }
         switch kind {
         case "agent.message.queue.failed":
@@ -7665,7 +7733,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
         // S5: refuse concurrent preparation only (active runs may still queue).
+        // The preparation latch outlives the "Loading…" chrome: it is held until
+        // the provider start returns, while a tracked run already renders
+        // "Working…". Raw preparation membership therefore refused every
+        // follow-up sent during the start window with "Stop it first, or wait."
+        // and the queue never received it. A thread that already owns a run is
+        // not a competing start — only preparation with no run at all is a race.
+        let followUpCanQueue = sendThreadId.map {
+            isThreadStartingOrRunning($0) && queuedMessageRepo != nil
+        } ?? false
         if let sendThreadId,
+           !followUpCanQueue,
            preparingRunThreads.contains(sendThreadId)
             || coordinator.isPreparingProviderStart(threadId: sendThreadId) {
             statusMessage = "A run is already preparing. Stop it first, or wait."
@@ -8886,8 +8964,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // can still be registered under a runId whose thread mapping was
             // already released, and only stopRun(runId:) can cancel that orphan.
             if let localRunId { coordinator.stopRun(localRunId) }
-            coordinator.stopRun(threadId: tid)
-            clearStaleRunProjection(threadId: tid)
+            // The F19 guard's status probe is the repaint's status too: that path
+            // returned before writing anything, so a second probe here is pure
+            // overhead on every stale Stop.
+            let guardStatus = coordinator.stopRun(threadId: tid)
+            clearStaleRunProjection(threadId: tid, durableStatus: guardStatus)
             return
         }
         // Path B: scheduled runs are owned by the LaunchAgent. Prefer XPC stop
@@ -8941,7 +9022,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     /// Drop every run projection this surface holds for `threadId` and repaint the
     /// thread from its durable status. Used when Stop finds no live run.
-    private func clearStaleRunProjection(threadId: AgentThreadID) {
+    ///
+    /// `durableStatus` is the status a caller already read (the coordinator's F19
+    /// guard hands its probe back); nil re-probes here, so a throwing read keeps
+    /// today's behavior of leaving the painted status alone.
+    private func clearStaleRunProjection(threadId: AgentThreadID, durableStatus: AgentRunStatus? = nil) {
         for (runId, mapped) in runThreads where mapped == threadId {
             runThreads[runId] = nil
             terminalRunIds = Self.boundedTerminalRunIds(existing: terminalRunIds, adding: runId)
@@ -8950,8 +9035,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             currentRunId = nil
             runStartedAt = nil
             isStopping = false
-            if let durableStatus = try? threadRepo.status(of: threadId) {
+            if let durableStatus {
                 status = durableStatus
+            } else if let probedStatus = try? threadRepo.status(of: threadId) {
+                status = probedStatus
             }
             clearActivePlanFollowUpSuppressionIfSafe()
         }
@@ -10607,9 +10694,10 @@ public enum AgentComposerSuggestions {
         return updated
     }
 
-    /// Shared with `AgentAppViewModel.composerSuggestions` so the VM can gate
-    /// expensive bot/slash catalog loads before calling `suggestions`.
-    static func activeToken(in text: String, cursorOffset: Int? = nil) -> String {
+    /// Shared with `AgentAppViewModel.composerSuggestions` and
+    /// `BotsViewModel.composerSuggestions` so a VM can gate expensive
+    /// bot/slash catalog loads before calling `suggestions`.
+    nonisolated public static func activeToken(in text: String, cursorOffset: Int? = nil) -> String {
         guard let range = activeTokenRange(in: text, cursorOffset: cursorOffset) else { return "" }
         return String(text[range])
     }

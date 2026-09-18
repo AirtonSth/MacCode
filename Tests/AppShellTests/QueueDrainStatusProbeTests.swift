@@ -65,6 +65,112 @@ final class QueueDrainStatusProbeTests: XCTestCase {
         XCTAssertEqual(failures.count, 1, "a running thread must not emit a stop-timeout failure")
     }
 
+    func test_unreadableQueueIsNotAnEmptyQueue_becauseAFailedReadMustNotDropTheDrainWaiter() throws {
+        // WHY: the check read the queue with `try? … ?? []`, so a transient SQLite
+        // failure looked exactly like an empty queue and threw away the drain
+        // waiter plus the deferred promotion it owns. Both are live scheduling
+        // state and the rows were still there to be read again — the same rule the
+        // code already applies to deleted threads: "a transient readback failure
+        // cannot safely decide ownership".
+        let tmp = NSTemporaryDirectory() + "rc2-queue-drain-unreadable-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: tmp)
+        let thread = AgentThread(
+            title: "unreadable-queue",
+            provider: .codex,
+            model: "fake-model",
+            status: .running
+        )
+        try ctx.threadRepo.upsert(thread)
+        let queued = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "keep this queued intent",
+            attachments: [],
+            interactionMode: .default
+        )
+        // Park the waiter: it must not retire itself mid-spec.
+        ctx.queueDrainSleepForTesting = { _, _ in
+            try await Task.sleep(nanoseconds: 30_000_000_000)
+            return .zero
+        }
+        ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread.id)
+        XCTAssertEqual(
+            ctx.queueDrainWaiterCountForTesting,
+            1,
+            "fixture: a queued intent must arm exactly one drain waiter"
+        )
+        ctx.deferQueuePromotion(
+            id: AgentQueuedMessageID(),
+            after: queued.id,
+            threadId: thread.id
+        )
+
+        // A real read failure, not a mock: the queue table stops resolving.
+        try ctx.db.execute("ALTER TABLE agent_queued_messages RENAME TO agent_queued_messages_unreadable;")
+        XCTAssertThrowsError(
+            try ctx.queuedMessageRepo.list(threadId: thread.id),
+            "fixture: the mutation must really make the queue unreadable"
+        )
+
+        ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread.id)
+
+        XCTAssertEqual(
+            ctx.queueDrainWaiterCountForTesting,
+            1,
+            "WHY: an unreadable queue must not cancel the waiter that would drain it"
+        )
+        XCTAssertNotNil(
+            ctx.deferredQueuePromotion(threadId: thread.id, ownerId: queued.id),
+            "WHY: the promotion is the user's chosen target; a failed read must not drop it"
+        )
+    }
+
+    func test_drainedQueueStillRetiresTheWaiter_becauseOnlyAFailedReadIsNotEmptiness() throws {
+        // Guards the fix above from the other side: when the read succeeds and the
+        // queue really is empty, the waiter and its promotion must still go away —
+        // otherwise the waiter would outlive the intent it exists for.
+        let tmp = NSTemporaryDirectory() + "rc2-queue-drain-drained-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: tmp)
+        let thread = AgentThread(
+            title: "drained-queue",
+            provider: .codex,
+            model: "fake-model",
+            status: .running
+        )
+        try ctx.threadRepo.upsert(thread)
+        let queued = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "drain me",
+            attachments: [],
+            interactionMode: .default
+        )
+        ctx.queueDrainSleepForTesting = { _, _ in
+            try await Task.sleep(nanoseconds: 30_000_000_000)
+            return .zero
+        }
+        ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread.id)
+        XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 1,
+                       "fixture: a queued intent must arm exactly one drain waiter")
+        ctx.deferQueuePromotion(
+            id: AgentQueuedMessageID(),
+            after: queued.id,
+            threadId: thread.id
+        )
+
+        _ = try ctx.queuedMessageRepo.delete(id: queued.id)
+        XCTAssertTrue(
+            try ctx.queuedMessageRepo.list(threadId: thread.id).isEmpty,
+            "fixture: the queue must really be empty, and readable"
+        )
+        ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread.id)
+
+        XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 0,
+                       "WHY: an empty queue must not keep a waiter alive for an intent that is gone")
+        XCTAssertNil(
+            ctx.deferredQueuePromotion(threadId: thread.id, ownerId: queued.id),
+            "WHY: the promotion is scoped to the deleted intent"
+        )
+    }
+
     func test_queueDrainTimeout_sourceUsesStatusProbe() throws {
         let source = try String(
             contentsOf: URL(fileURLWithPath: #filePath)

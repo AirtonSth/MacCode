@@ -1928,6 +1928,54 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         try installCodexComputerUseMCP(binary: binary)
     }
 
+    /// One managed bot MCP older installers persisted into the shared configs.
+    private struct ManagedBotMCPResidue {
+        let serverName: String
+        let tomlBeginMarker: String
+        let tomlEndMarker: String
+    }
+
+    private static let selfConfigMCPResidue = ManagedBotMCPResidue(
+        serverName: BotSelfConfigMCPAdmit.serverName,
+        tomlBeginMarker: BotSelfConfigMCPAdmit.tomlBeginMarker,
+        tomlEndMarker: BotSelfConfigMCPAdmit.tomlEndMarker
+    )
+    private static let browserMCPResidue = ManagedBotMCPResidue(
+        serverName: BotBrowserMCPAdmit.serverName,
+        tomlBeginMarker: BotBrowserMCPAdmit.tomlBeginMarker,
+        tomlEndMarker: BotBrowserMCPAdmit.tomlEndMarker
+    )
+    private static let computerMCPResidue = ManagedBotMCPResidue(
+        serverName: BotComputerMCPAdmit.serverName,
+        tomlBeginMarker: BotComputerMCPAdmit.tomlBeginMarker,
+        tomlEndMarker: BotComputerMCPAdmit.tomlEndMarker
+    )
+    private static let webMCPResidue = ManagedBotMCPResidue(
+        serverName: BotWebMCPAdmit.serverName,
+        tomlBeginMarker: BotWebMCPAdmit.tomlBeginMarker,
+        tomlEndMarker: BotWebMCPAdmit.tomlEndMarker
+    )
+
+    /// Strip every managed bot MCP residue in a single pass over the shared
+    /// configs. The per-server entry points each opened and scanned both files,
+    /// so running them back to back read `~/.claude/settings.json` and
+    /// `~/.codex/config.toml` four times on the pre-turn path. This pass leaves
+    /// the same bytes (the removals are idempotent and target disjoint entries)
+    /// and rewrites each file at most once.
+    public func stripManagedBotMCPResidue() throws {
+        try stripManagedBotMCPResidue([
+            Self.selfConfigMCPResidue,
+            Self.browserMCPResidue,
+            Self.computerMCPResidue,
+            Self.webMCPResidue,
+        ])
+    }
+
+    private func stripManagedBotMCPResidue(_ residues: [ManagedBotMCPResidue]) throws {
+        try stripClaudeManagedMCP(serverNames: residues.map(\.serverName))
+        try stripCodexManagedMCP(residues: residues)
+    }
+
     /// Bot catalog MCP is per-process on every provider:
     /// Claude `--mcp-config` / SDK `mcp_servers`, Codex `-c`, Grok ACP `session/new`.
     /// `~/.claude/settings.json` is a dead location (`claude mcp list` omits it;
@@ -1936,49 +1984,38 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// Grok never had a global file. Install strips legacy Claude/Codex entries.
     public func installBotSelfConfigMCP(serviceBinaryURL: URL? = nil) throws {
         _ = serviceBinaryURL
-        try stripClaudeManagedMCP(serverName: BotSelfConfigMCPAdmit.serverName)
-        try stripCodexManagedMCP(
-            begin: BotSelfConfigMCPAdmit.tomlBeginMarker,
-            end: BotSelfConfigMCPAdmit.tomlEndMarker,
-            tableName: "mcp_servers.\(BotSelfConfigMCPAdmit.serverName)"
-        )
+        try stripManagedBotMCPResidue([Self.selfConfigMCPResidue])
     }
 
     public func installBotBrowserMCP(serviceBinaryURL: URL? = nil) throws {
         _ = serviceBinaryURL
-        try stripClaudeManagedMCP(serverName: BotBrowserMCPAdmit.serverName)
-        try stripCodexManagedMCP(
-            begin: BotBrowserMCPAdmit.tomlBeginMarker,
-            end: BotBrowserMCPAdmit.tomlEndMarker,
-            tableName: "mcp_servers.\(BotBrowserMCPAdmit.serverName)"
-        )
+        try stripManagedBotMCPResidue([Self.browserMCPResidue])
     }
 
     public func installBotComputerMCP(serviceBinaryURL: URL? = nil) throws {
         _ = serviceBinaryURL
-        try stripClaudeManagedMCP(serverName: BotComputerMCPAdmit.serverName)
-        try stripCodexManagedMCP(
-            begin: BotComputerMCPAdmit.tomlBeginMarker,
-            end: BotComputerMCPAdmit.tomlEndMarker,
-            tableName: "mcp_servers.\(BotComputerMCPAdmit.serverName)"
-        )
+        try stripManagedBotMCPResidue([Self.computerMCPResidue])
     }
 
     public func installBotWebMCP(serviceBinaryURL: URL? = nil) throws {
         _ = serviceBinaryURL
-        try stripClaudeManagedMCP(serverName: BotWebMCPAdmit.serverName)
-        try stripCodexManagedMCP(
-            begin: BotWebMCPAdmit.tomlBeginMarker,
-            end: BotWebMCPAdmit.tomlEndMarker,
-            tableName: "mcp_servers.\(BotWebMCPAdmit.serverName)"
-        )
+        try stripManagedBotMCPResidue([Self.webMCPResidue])
     }
 
+    /// Remove the pre-native managed host entry from the shared configs once.
+    /// Runtime admission is process-local, so this only ever deletes residue —
+    /// and it must not rewrite a config it has nothing to delete from. Both
+    /// branches ran on every launch: the Claude one re-serialized the user's
+    /// `settings.json` whenever it had any `mcpServers` (reformatting a file
+    /// Claude Code owns), and the Codex one replaced the 16 KB
+    /// `~/.codex/config.toml` that ChatGPT.app shares, byte for byte, opening a
+    /// lost-update window against a concurrent writer for no reason.
     public func uninstallComputerUseMCP() throws {
         let claude = claudeSettingsURL()
         if let data = try? Data(contentsOf: claude, options: .mappedIfSafe),
            var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-           var servers = root["mcpServers"] as? [String: Any] {
+           var servers = root["mcpServers"] as? [String: Any],
+           servers[ComputerUseMCPAdmit.serverName] != nil {
             servers.removeValue(forKey: ComputerUseMCPAdmit.serverName)
             root["mcpServers"] = servers
             if let out = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys]) {
@@ -1992,6 +2029,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
                 begin: ComputerUseMCPAdmit.tomlBeginMarker,
                 end: ComputerUseMCPAdmit.tomlEndMarker
             )
+            guard stripped != text else { return }
             try? Data(stripped.utf8).write(to: codex, options: .atomic)
         }
     }
@@ -2021,38 +2059,66 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// ChatGPT.app and RemoteCode-spawned Codex share `~/.codex/config.toml`.
     /// Persisting host-catalog MCP there leaks one stdio child per Codex
     /// conversation. Strip legacy managed blocks; admit per-process instead.
-    private func stripCodexManagedMCP(
-        begin: String,
-        end: String,
-        tableName: String
-    ) throws {
+    /// One read and at most one rewrite for the whole residue set.
+    private func stripCodexManagedMCP(residues: [ManagedBotMCPResidue]) throws {
         let url = codexConfigURL()
         guard fileManager.fileExists(atPath: url.path),
               let text = (try? Data(contentsOf: url, options: .mappedIfSafe))
                 .flatMap({ String(data: $0, encoding: .utf8) })
         else { return }
-        let stripped = Self.removingManagedMCP(
-            text,
-            begin: begin,
-            end: end,
-            tableName: tableName
-        )
+        // Coarse gate over the whole set: every marker carries the markers'
+        // shared prefix and every table header spells a server name verbatim,
+        // so a text without either cannot carry any of these residues. Clean
+        // configs (the per-turn case) stop here instead of paying the line scan
+        // and Foundation's per-residue searches. Both needles are derived from
+        // the catalog, so renaming a server cannot strand a residue.
+        let markerNeedle = Self.sharedPrefix(of: residues.flatMap { [$0.tomlBeginMarker, $0.tomlEndMarker] })
+        let leafNeedle = Self.sharedPrefix(of: residues.map(\.serverName))
+        guard (!markerNeedle.isEmpty && text.contains(markerNeedle))
+                || (!leafNeedle.isEmpty && text.contains(leafNeedle))
+        else { return }
+        var stripped = text
+        for residue in residues {
+            stripped = Self.removingManagedMCP(
+                stripped,
+                begin: residue.tomlBeginMarker,
+                end: residue.tomlEndMarker,
+                tableName: "mcp_servers.\(residue.serverName)"
+            )
+        }
         guard stripped != text else { return }
         try Data(stripped.utf8).write(to: url, options: .atomic)
+    }
+
+    /// Longest common prefix of `values`; empty when they share nothing.
+    private static func sharedPrefix(of values: [String]) -> String {
+        guard var prefix = values.first else { return "" }
+        for value in values.dropFirst() {
+            while !value.hasPrefix(prefix) {
+                guard !prefix.isEmpty else { return "" }
+                prefix.removeLast()
+            }
+        }
+        return prefix
     }
 
     /// Claude Code does not spawn `mcpServers` from settings.json (live:
     /// `claude mcp list` omits RemoteCode bot entries). Strip leftover keys so
     /// a future Claude that starts reading this file cannot leak stdio servers
     /// into interactive `claude` / Claude.app the way Codex leaked into ChatGPT.
-    private func stripClaudeManagedMCP(serverName: String) throws {
+    /// One read and at most one rewrite for the whole residue set.
+    private func stripClaudeManagedMCP(serverNames: [String]) throws {
         let url = claudeSettingsURL()
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
               var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              var servers = root["mcpServers"] as? [String: Any],
-              servers[serverName] != nil
+              var servers = root["mcpServers"] as? [String: Any]
         else { return }
-        servers.removeValue(forKey: serverName)
+        var removedAny = false
+        for serverName in serverNames where servers[serverName] != nil {
+            servers.removeValue(forKey: serverName)
+            removedAny = true
+        }
+        guard removedAny else { return }
         root["mcpServers"] = servers
         guard let out = try? JSONSerialization.data(
             withJSONObject: root,
@@ -2061,12 +2127,19 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         try out.write(to: url, options: .atomic)
     }
 
+    /// Purge the legacy global librarian MCP from the shared configs. Runs on
+    /// every Token Saver lifecycle application with the feature off, so it must
+    /// not rewrite a config it has nothing to delete from: the Claude branch
+    /// re-serialized (and reformatted) a `settings.json` that Claude Code owns,
+    /// and the Codex branch replaced the `~/.codex/config.toml` that
+    /// ChatGPT.app shares, byte for byte, opening a lost-update window.
     public func uninstallRetrieveMCP() throws {
         // Claude: drop only our server key, keep the rest of settings.json.
         let claude = claudeSettingsURL()
         if let data = try? Data(contentsOf: claude, options: .mappedIfSafe),
            var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-           var servers = root["mcpServers"] as? [String: Any] {
+           var servers = root["mcpServers"] as? [String: Any],
+           servers[Self.retrieveMCPName] != nil {
             servers.removeValue(forKey: Self.retrieveMCPName)
             root["mcpServers"] = servers
             if let out = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys]) {
@@ -2077,6 +2150,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         let codex = codexConfigURL()
         if let text = (try? Data(contentsOf: codex, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) } {
             let stripped = Self.removingMarkerBlock(text, begin: Self.mcpBeginMarker, end: Self.mcpEndMarker)
+            guard stripped != text else { return }
             try? Data(stripped.utf8).write(to: codex, options: .atomic)
         }
     }
@@ -2113,12 +2187,23 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// Remove every legacy managed block plus the equivalent unmarked TOML
     /// table. The latter is the live Codex format written by older installers;
     /// marker-only stripping left that table active in the shared config.
+    /// Returns `text` untouched unless one of the three passes below can match.
     private static func removingManagedMCP(
         _ text: String,
         begin: String,
         end: String,
         tableName: String
     ) -> String {
+        // A marker block needs `begin`, a dangling marker needs `end`, and a
+        // table header always spells its leaf name verbatim (quoted or spaced
+        // headers still carry the name). Without any of the three the line scan
+        // and the rewrites below cannot change a byte, so a clean shared config
+        // — the per-turn case — skips the scan entirely.
+        let leaf = tomlTableLeaf(tableName)
+        guard text.range(of: begin) != nil
+                || text.range(of: end) != nil
+                || (!leaf.isEmpty && text.range(of: leaf) != nil)
+        else { return text }
         var result = text
         while let start = result.range(of: begin) {
             if let stop = result.range(of: end, range: start.upperBound..<result.endIndex) {
@@ -2149,6 +2234,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         }
         let base = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return base.isEmpty ? block + "\n" : base + "\n\n" + block + "\n"
+    }
+
+    private static func tomlTableLeaf(_ tableName: String) -> Substring {
+        guard let separator = tableName.firstIndex(of: ".") else { return tableName[...] }
+        return tableName[tableName.index(after: separator)...]
     }
 
     private static func removingTOMLTable(_ text: String, named tableName: String) -> String {

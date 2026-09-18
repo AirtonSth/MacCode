@@ -1855,21 +1855,30 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         _ = try? router.createSurface(workspace: wid, type: type, paneID: nil, title: nil)
     }
 
-    // UX-MAC_SHELL_WINDOW-004: keyboard split entry points.
+    // UX-MAC_SHELL_WINDOW-004: keyboard split entry points. The key window
+    // decides which workspace the split lands in: a detached workspace window
+    // owns its own panes.
     @objc private func splitFocusedPaneRight() {
-        if windowController?.splitFocusedPane(.right) != true { NSSound.beep() }
+        let keyWindow = keyWindowProviderForTests?() ?? NSApp.keyWindow
+        if windowController?.splitFocusedPane(.right, in: keyWindow) != true { NSSound.beep() }
     }
 
     @objc private func splitFocusedPaneDown() {
-        if windowController?.splitFocusedPane(.down) != true { NSSound.beep() }
+        let keyWindow = keyWindowProviderForTests?() ?? NSApp.keyWindow
+        if windowController?.splitFocusedPane(.down, in: keyWindow) != true { NSSound.beep() }
     }
 
     // MARK: - Tab keyboard navigation (UX-MAC_SHELL_WINDOW-002/003)
 
     /// The focused pane of the selected workspace, plus its ordered
     /// surfaces and the currently selected surface index.
+    ///
+    /// The window that owns the keyboard picks the workspace: with a workspace
+    /// detached into its own window (or a bot window in front), stepping the
+    /// main window's tabs would change a tab the user is not looking at.
     private func focusedPaneContext() -> (workspace: WorkspaceID, surfaces: [SurfaceDescriptor], selectedIndex: Int)? {
-        guard let wid = context?.state.window.selectedWorkspaceID,
+        let keyWindow = keyWindowProviderForTests?() ?? NSApp.keyWindow
+        guard let wid = windowController?.tabNavigationWorkspace(in: keyWindow),
               let ws = context?.state.workspaces[wid] else { return nil }
         let paneID = ws.focusedPaneID ?? ws.layout.paneIDs().first
         guard let paneID, let pane = ws.layout.find(paneID: paneID),
@@ -1903,8 +1912,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
         // Route through the window controller so the focused pane's
         // unsaved-changes confirm runs; fall back to closing the key
-        // window only when no surface is open.
-        if windowController?.closeFocusedSurface() == true { return }
+        // window only when no surface is open. The key window picks the
+        // target: with a workspace detached into its own window, ⌘W closes a
+        // tab of THAT window, not of the main window behind it.
+        if windowController?.closeFocusedSurface(in: keyWindow) == true { return }
         (keyWindow ?? window)?.performClose(nil)
     }
 

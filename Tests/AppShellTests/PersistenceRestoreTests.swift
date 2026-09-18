@@ -193,6 +193,72 @@ final class PersistenceRestoreTests: XCTestCase {
         XCTAssertEqual(visible.userInputs.first?.state, .stale)
     }
 
+    /// The snapshot below is what the paired device hydrates. A pending callback
+    /// whose stored payload no longer decodes must stay in it — the run is still
+    /// waiting on the answer, and "payload unreadable" is not "no request".
+    func test_pendingCallbacksWithUnreadablePayloadStayVisibleToThePairedDevice() async throws {
+        let dir = NSTemporaryDirectory() + "RC2CallbackUnreadable-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router = AppCommandRouter(context: ctx)
+        let thread = AgentThread(title: "callback", provider: .codex, model: "gpt-5.5")
+        try ctx.threadRepo.upsert(thread)
+        try ctx.providerPendingCallbackRepo.record(threadId: thread.id, request: AssistantPendingRequest(
+            id: "approval-1",
+            turnId: "turn-1",
+            kind: .commandExecution,
+            title: "Run command",
+            detail: "swift test",
+            createdAtMs: 1_000
+        ))
+        try ctx.providerPendingCallbackRepo.record(threadId: thread.id, request: AssistantPendingRequest(
+            id: "approval-2",
+            turnId: "turn-1",
+            kind: .commandExecution,
+            title: "Run command",
+            detail: "swift test",
+            createdAtMs: 1_500
+        ))
+        try ctx.providerPendingCallbackRepo.record(threadId: thread.id, userInput: AssistantUserInputRequest(
+            id: "question-1",
+            turnId: "turn-1",
+            prompt: "Continue?",
+            options: ["Plan", "Run"],
+            createdAtMs: 2_000
+        ))
+        // "{}" is exactly what the row mapper yields for a payload that never
+        // landed (`Repositories.row` falls back to "{}"); the truncated JSON is a
+        // torn write. Neither decodes.
+        try ctx.db.execute("UPDATE provider_pending_callbacks SET payload_json = '{}' WHERE request_id = 'approval-1';")
+        try ctx.db.execute("UPDATE provider_pending_callbacks SET payload_json = '{\"id\": \"question-1\"' WHERE request_id = 'question-1';")
+        let corrupted = try XCTUnwrap(try ctx.providerPendingCallbackRepo.get(
+            threadId: thread.id,
+            requestId: "approval-1",
+            kind: .approval
+        ))
+        XCTAssertEqual(corrupted.payloadJSON, "{}", "fixture must actually corrupt the stored payload")
+
+        let hydrated = try await router.listAgentPendingCallbacksOffMain(thread: thread.id)
+        XCTAssertEqual(hydrated.requests.map(\.id), ["approval-1", "approval-2"],
+                       "an unreadable payload must not erase a pending approval from the paired device's hydrate")
+        XCTAssertEqual(hydrated.userInputs.map(\.id), ["question-1"],
+                       "an unreadable payload must not erase a pending question from the paired device's hydrate")
+        XCTAssertEqual(hydrated.requests.first?.state, .pending)
+        XCTAssertEqual(hydrated.requests.first?.createdAtMs, 1_000,
+                       "the degraded entry keeps the stored request identity and timing")
+        XCTAssertTrue(hydrated.requests.first?.detail?.contains("could not be read") == true,
+                      "the degraded entry must say the payload could not be read instead of inventing provider text")
+        XCTAssertEqual(hydrated.requests.last?.title, "Run command",
+                       "a readable payload still decodes exactly as before")
+        XCTAssertEqual(hydrated.requests.last?.detail, "swift test",
+                       "a readable payload still decodes exactly as before")
+
+        // The host (MainActor) path must agree with the off-main gateway.
+        let host = try router.listAgentPendingCallbacks(thread: thread.id)
+        XCTAssertEqual(host.requests.map(\.id), ["approval-1", "approval-2"])
+        XCTAssertEqual(host.userInputs.map(\.id), ["question-1"])
+        XCTAssertEqual(host.userInputs.first?.prompt, "Input requested (stored payload could not be read)")
+    }
+
     func test_failedProviderCallbackResponseMarksStoredCallbackStale() async throws {
         let dir = NSTemporaryDirectory() + "RC2CallbackFailure-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)

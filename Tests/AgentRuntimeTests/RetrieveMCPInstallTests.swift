@@ -162,6 +162,100 @@ final class RetrieveMCPInstallTests: XCTestCase {
         """))
     }
 
+    /// Bytes + mtime + inode: an atomic replace swaps the inode, so a no-op pass
+    /// has to leave all three alone. The live files are user-owned: Claude Code
+    /// reads settings.json and ChatGPT.app shares config.toml.
+    private func snapshot(_ urls: [URL]) throws -> [String: (bytes: Data, modifiedAt: Date, inode: UInt64)] {
+        var snapshots: [String: (bytes: Data, modifiedAt: Date, inode: UInt64)] = [:]
+        for url in urls {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            snapshots[url.lastPathComponent] = (
+                bytes: try Data(contentsOf: url),
+                modifiedAt: try XCTUnwrap(attributes[.modificationDate] as? Date),
+                inode: try XCTUnwrap(attributes[.systemFileNumber] as? NSNumber).uint64Value
+            )
+        }
+        return snapshots
+    }
+
+    private func assertUnchanged(
+        _ urls: [URL],
+        against snapshots: [String: (bytes: Data, modifiedAt: Date, inode: UInt64)],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        for url in urls {
+            let expected = try XCTUnwrap(snapshots[url.lastPathComponent], file: file, line: line)
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            XCTAssertEqual(
+                try XCTUnwrap(attributes[.systemFileNumber] as? NSNumber, file: file, line: line).uint64Value,
+                expected.inode,
+                "\(url.lastPathComponent) was rewritten (inode changed) with nothing to remove",
+                file: file,
+                line: line
+            )
+            XCTAssertEqual(
+                try XCTUnwrap(attributes[.modificationDate] as? Date, file: file, line: line),
+                expected.modifiedAt,
+                "\(url.lastPathComponent) was rewritten (mtime changed) with nothing to remove",
+                file: file,
+                line: line
+            )
+            XCTAssertEqual(
+                try Data(contentsOf: url),
+                expected.bytes,
+                "\(url.lastPathComponent) bytes changed with nothing to remove",
+                file: file,
+                line: line
+            )
+        }
+    }
+
+    /// A user-owned pair with no RemoteCode residue: `mcpServers` holds only the
+    /// user's server and the Codex config carries only user tables.
+    private func makeCleanUserConfigs(_ home: URL) throws -> [URL] {
+        let claudeSettings = home.appendingPathComponent(".claude/settings.json")
+        try FileManager.default.createDirectory(at: claudeSettings.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(#"{"theme":"dark","mcpServers":{"other":{"command":"x"}}}"#.utf8).write(to: claudeSettings)
+        let codexConfig = home.appendingPathComponent(".codex/config.toml")
+        try FileManager.default.createDirectory(at: codexConfig.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("model = \"gpt\"\n\n[mcp_servers.user-linear]\ncommand = \"npx\"\n".utf8).write(to: codexConfig)
+        return [claudeSettings, codexConfig]
+    }
+
+    func test_uninstallRetrieveMCP_leavesCleanSharedConfigsUntouched() throws {
+        let home = tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let configs = try makeCleanUserConfigs(home)
+        let before = try snapshot(configs)
+
+        try AgentSkillInstaller(homeDirectory: home).uninstallRetrieveMCP()
+
+        try assertUnchanged(configs, against: before)
+    }
+
+    func test_uninstallRetrieveMCP_secondPassLeavesAlreadyCleanedConfigsUntouched() throws {
+        let home = tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let binary = home.appendingPathComponent("bin/RemoteCodeDistillService")
+        try FileManager.default.createDirectory(at: binary.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("binary".utf8).write(to: binary)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+        let configs = try makeCleanUserConfigs(home)
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        try installer.installRetrieveMCP(serviceBinaryURL: binary)
+
+        // Anti-vacuous: install must have written the managed block we then purge.
+        let codex = try String(contentsOf: home.appendingPathComponent(".codex/config.toml"), encoding: .utf8)
+        XCTAssertTrue(codex.contains(AgentSkillInstaller.mcpBeginMarker), "fixture never got the managed block")
+        try installer.uninstallRetrieveMCP()
+
+        let cleaned = try snapshot(configs)
+        try installer.uninstallRetrieveMCP()
+
+        try assertUnchanged(configs, against: cleaned)
+    }
+
     private func makeFixture(
         codexConfig contents: String
     ) throws -> (home: URL, binary: URL, codexConfig: URL, installer: AgentSkillInstaller) {

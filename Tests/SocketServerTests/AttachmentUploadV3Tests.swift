@@ -1018,6 +1018,60 @@ final class AttachmentUploadV3Tests: XCTestCase {
         XCTAssertEqual((putResponse as? HTTPURLResponse)?.statusCode, 204)
         XCTAssertTrue(putData.isEmpty)
 
+        // WHY: the completed single-chunk upload retires its manifest, and
+        // URLSession normalizes duplicated framing headers, so the 204 a
+        // background chunk PUT really puts on the wire is read off a socket
+        // for a second, still-open upload (RFC 7230 §3.3.2).
+        let rawUploadId = UUID().uuidString.lowercased()
+        let rawVector = try makeVector(
+            uploadId: rawUploadId,
+            plaintext: Data("raw chunk framing".utf8)
+        )
+        let rawPrepareHead = try rawRequest(
+            port: port,
+            method: "POST",
+            path: "/v1/agent/attachment-uploads/v3/\(rawUploadId)/prepare",
+            headers: [
+                "Authorization": "Bearer \(token)",
+                "X-RC2-Expected-Host-ID": serverId,
+                "Idempotency-Key": rawUploadId,
+                "Content-Type": "application/json",
+            ],
+            body: try JSONEncoder().encode(rawVector.request)
+        )
+        XCTAssertTrue(
+            rawPrepareHead.hasPrefix("HTTP/1.1 200"),
+            "raw prepare must succeed, got: \(rawPrepareHead)"
+        )
+        let rawSealedSHA256 = sha256Hex(rawVector.sealed)
+        let rawHead = try rawRequest(
+            port: port,
+            method: "PUT",
+            path: "/v1/agent/attachment-uploads/v3/\(rawUploadId)/chunks/0",
+            headers: [
+                "Authorization": "Bearer \(token)",
+                "Content-Type": "application/octet-stream",
+                "X-RC2-Chunk-Capability": base64URL(rawVector.capability),
+                "X-RC2-Sealed-SHA256": rawSealedSHA256,
+                "X-RC2-Sealed-Bytes": String(rawVector.sealed.count),
+                "Idempotency-Key": AttachmentUploadV3Store.idempotencyKey(
+                    uploadId: rawUploadId,
+                    chunkIndex: 0,
+                    sealedSHA256: rawSealedSHA256
+                ),
+            ],
+            body: rawVector.sealed
+        )
+        XCTAssertTrue(
+            rawHead.hasPrefix("HTTP/1.1 204"),
+            "raw chunk PUT must answer 204, got: \(rawHead)"
+        )
+        XCTAssertEqual(
+            rawHead.components(separatedBy: "Content-Length:").count - 1,
+            1,
+            "a chunk 204 must carry exactly one Content-Length, got: \(rawHead)"
+        )
+
         var status = URLRequest(url: uploadURL)
         status.setValue(
             "Bearer \(token)",
@@ -1258,6 +1312,87 @@ final class AttachmentUploadV3Tests: XCTestCase {
             capability: capability,
             sealed: combined
         )
+    }
+
+    /// Issue one HTTP/1.1 request over a raw socket and return the response
+    /// head exactly as it went on the wire. URLSession hides duplicated
+    /// framing headers, so framing contracts have to be read here.
+    private func rawRequest(
+        port: UInt16,
+        method: String,
+        path: String,
+        headers: [String: String],
+        body: Data
+    ) throws -> String {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw POSIXError(.EIO) }
+        defer { Darwin.close(fd) }
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(port).bigEndian
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let connected = withUnsafePointer(to: &address) { pointer -> Int32 in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(
+                    fd,
+                    $0,
+                    socklen_t(MemoryLayout<sockaddr_in>.size)
+                )
+            }
+        }
+        guard connected == 0 else { throw POSIXError(.ECONNREFUSED) }
+
+        var head = "\(method) \(path) HTTP/1.1\r\n"
+        head += "Host: 127.0.0.1:\(port)\r\n"
+        for (name, value) in headers {
+            head += "\(name): \(value)\r\n"
+        }
+        head += "Content-Length: \(body.count)\r\n\r\n"
+        var request = Data(head.utf8)
+        request.append(body)
+        try writeAllBytes(request, to: fd)
+        return try readResponseHead(fd)
+    }
+
+    private func writeAllBytes(_ data: Data, to fd: Int32) throws {
+        try data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var written = 0
+            while written < data.count {
+                let count = Darwin.write(
+                    fd,
+                    base.advanced(by: written),
+                    data.count - written
+                )
+                if count < 0, errno == EINTR { continue }
+                guard count > 0 else {
+                    throw POSIXError(
+                        POSIXErrorCode(rawValue: errno) ?? .EIO
+                    )
+                }
+                written += count
+            }
+        }
+    }
+
+    private func readResponseHead(_ fd: Int32) throws -> String {
+        let deadline = Date().addingTimeInterval(5)
+        var received = Data()
+        var buffer = [UInt8](repeating: 0, count: 1024)
+        while received.range(of: Data("\r\n\r\n".utf8)) == nil {
+            guard Date() < deadline else { throw POSIXError(.ETIMEDOUT) }
+            let count = Darwin.recv(fd, &buffer, buffer.count, MSG_DONTWAIT)
+            if count > 0 {
+                received.append(buffer, count: count)
+            } else if count == 0 {
+                throw POSIXError(.ECONNRESET)
+            } else if errno != EAGAIN, errno != EWOULDBLOCK {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            } else {
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+        }
+        return String(decoding: received, as: UTF8.self)
     }
 
     private func sha256Hex(_ data: Data) -> String {
