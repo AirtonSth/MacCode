@@ -1484,6 +1484,250 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}")
     }
 
+    // MARK: - hook post-tool-use-grok (grok-build ≥ 1.0.34 updatedToolOutput)
+
+    /// Analyzed ReadFile result: the model receives `content`, while
+    /// `absolute_path` / `offset` / `total_lines` / `raw_output` are recovered scope
+    /// the replacement must preserve byte for byte.
+    private func grokReadFileEnvelope(content: String, raw: String = "raw bytes") -> [String: Any] {
+        [
+            "hookEventName": "post_tool_use",
+            "hook_event_name": "PostToolUse",
+            "toolName": "read_file",
+            "tool_name": "read_file",
+            "toolInput": ["target_file": "Sources/Big.swift"],
+            "toolResultTruncated": false,
+            "toolResult": [
+                "type": "ReadFile",
+                "FileContent": [
+                    "content": content,
+                    "content_concise": content,
+                    "absolute_path": "/tmp/Sources/Big.swift",
+                    "offset": NSNull(),
+                    "raw_output": raw,
+                    "total_lines": 200,
+                ],
+            ],
+        ]
+    }
+
+    private func grokResponse(output: String, handle: String) -> Data {
+        let response = DistillResponse(
+            requestID: UUID(),
+            output: output,
+            inputCharacters: 4_000,
+            inputTokens: 1_000,
+            outputTokens: 80,
+            originalHandle: handle,
+            recoveryIdempotencyKey: "grok-delivery-key",
+            routeStage: .deterministic
+        )
+        return try! JSONEncoder().encode(response)
+    }
+
+    func test_hookPostToolUseGrok_readFile_replacesContentAndKeepsRecoveryScope() async throws {
+        let content = String(repeating: "1→line of body text that compresses away\n", count: 60)
+        let envelope = grokReadFileEnvelope(content: content)
+        let stdin = try JSONSerialization.data(withJSONObject: envelope)
+        let compressed = "SIGNATURE: func thing()"
+        let recorder = RequestRecorder()
+
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use-grok"],
+            stdin: stdin,
+            state: state
+        ) { request in
+            if let body = request.httpBody,
+               let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
+                await recorder.append(decoded)
+            }
+            return (self.grokResponse(output: compressed, handle: "grok1"), 200)
+        }
+
+        let (out, code) = await cli.run()
+
+        XCTAssertEqual(code, 0)
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: out) as? [String: Any])
+        let hookOut = try XCTUnwrap(object["hookSpecificOutput"] as? [String: Any])
+        XCTAssertEqual(hookOut["hookEventName"] as? String, "PostToolUse")
+        let updated = try XCTUnwrap(hookOut["updatedToolOutput"] as? [String: Any])
+        XCTAssertEqual(updated["type"] as? String, "ReadFile", "replacement must keep grok's tagged shape")
+        let fileContent = try XCTUnwrap(updated["FileContent"] as? [String: Any])
+        let replaced = try XCTUnwrap(fileContent["content"] as? String)
+        XCTAssertTrue(replaced.hasPrefix(compressed))
+        XCTAssertTrue(replaced.contains("[[rc:grok1]]"), "lossy grok output must keep its recovery handle")
+        XCTAssertTrue(DistillAppliedReceipt.containsMarker(replaced))
+        XCTAssertLessThan(replaced.utf8.count, content.utf8.count)
+        XCTAssertEqual(
+            fileContent["content_concise"] as? String,
+            replaced,
+            "both model-facing copies must agree"
+        )
+        XCTAssertEqual(fileContent["absolute_path"] as? String, "/tmp/Sources/Big.swift")
+        XCTAssertEqual(fileContent["total_lines"] as? Int, 200)
+        XCTAssertEqual(fileContent["raw_output"] as? String, "raw bytes")
+        XCTAssertTrue(fileContent["offset"] is NSNull)
+
+        let requests = await recorder.all()
+        XCTAssertEqual(requests.first?.provider, "grok", "grok hook compression is attributed to grok")
+        XCTAssertEqual(requests.first?.recordSavings, true)
+    }
+
+    func test_hookPostToolUseGrok_listDir_replacesContentAndKeepsRootPath() async throws {
+        let content = String(repeating: "- Sources/SomeDirectory/File.swift\n", count: 80)
+        let stdin = try JSONSerialization.data(withJSONObject: [
+            "hookEventName": "post_tool_use",
+            "toolName": "list_dir",
+            "toolResult": [
+                "type": "ListDir",
+                "Content": [
+                    "content": content,
+                    "absolute_root_path": "/tmp/repo/.",
+                ],
+            ],
+        ])
+        let compressed = "- Sources/SomeDirectory/"
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use-grok"],
+            stdin: stdin,
+            state: state
+        ) { _ in (self.grokResponse(output: compressed, handle: "grok2"), 200) }
+
+        let (out, code) = await cli.run()
+
+        XCTAssertEqual(code, 0)
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: out) as? [String: Any])
+        let hookOut = try XCTUnwrap(object["hookSpecificOutput"] as? [String: Any])
+        let updated = try XCTUnwrap(hookOut["updatedToolOutput"] as? [String: Any])
+        let listed = try XCTUnwrap(updated["Content"] as? [String: Any])
+        XCTAssertTrue(try XCTUnwrap(listed["content"] as? String).hasPrefix(compressed))
+        XCTAssertEqual(listed["absolute_root_path"] as? String, "/tmp/repo/.")
+    }
+
+    func test_hookPostToolUseGrok_webFetch_replacesContentAndKeepsMetadata() async throws {
+        let content = "<html>" + String(repeating: "<div class=\"nav\">chrome</div>", count: 120)
+        let stdin = try JSONSerialization.data(withJSONObject: [
+            "hookEventName": "post_tool_use",
+            "toolName": "web_fetch",
+            "toolResult": [
+                "type": "WebFetch",
+                "Content": [
+                    "url": "https://example.invalid/docs",
+                    "content": content,
+                    "content_type": "text/html",
+                    "status_code": 200,
+                    "bytes": content.utf8.count,
+                ],
+            ],
+        ])
+        let compressed = "Docs: install steps and API signature."
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use-grok"],
+            stdin: stdin,
+            state: state
+        ) { _ in (self.grokResponse(output: compressed, handle: "grok3"), 200) }
+
+        let (out, code) = await cli.run()
+
+        XCTAssertEqual(code, 0)
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: out) as? [String: Any])
+        let hookOut = try XCTUnwrap(object["hookSpecificOutput"] as? [String: Any])
+        let updated = try XCTUnwrap(hookOut["updatedToolOutput"] as? [String: Any])
+        let payload = try XCTUnwrap(updated["Content"] as? [String: Any])
+        XCTAssertTrue(try XCTUnwrap(payload["content"] as? String).hasPrefix(compressed))
+        XCTAssertEqual(payload["url"] as? String, "https://example.invalid/docs")
+        XCTAssertEqual(payload["status_code"] as? Int, 200)
+    }
+
+    /// Shell (byte-exact), search matches, mutation and unknown variants must never
+    /// be rewritten: they fail open before any transport call.
+    func test_hookPostToolUseGrok_unverifiedVariants_failOpenWithoutTransport() async throws {
+        let cases: [[String: Any]] = [
+            ["type": "Bash", "output": [1, 2, 3], "output_for_prompt": "exit: 0\n", "exit_code": 0],
+            ["type": "GrepSearch", "stdout": [1, 2, 3], "match_count": 1],
+            ["type": "EditsApplied", "EditsApplied": ["old_string": "a", "new_string": "b"]],
+            ["type": "FutureVariant", "Content": ["content": String(repeating: "x", count: 4_000)]],
+        ]
+        for result in cases {
+            let stdin = try JSONSerialization.data(withJSONObject: [
+                "hookEventName": "post_tool_use",
+                "toolName": "run_terminal_command",
+                "toolResult": result,
+            ])
+            let cli = ManagedDistillCLI(
+                arguments: ["hook", "post-tool-use-grok"],
+                stdin: stdin,
+                state: state
+            ) { _ in
+                XCTFail("variant \(result["type"] ?? "?") must not call Distill transport")
+                return nil
+            }
+            let (out, code) = await cli.run()
+            XCTAssertEqual(code, 0)
+            XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}", "variant \(result["type"] ?? "?")")
+        }
+    }
+
+    func test_hookPostToolUseGrok_truncatedResult_failsOpenWithoutTransport() async throws {
+        let content = String(repeating: "1→long file read output\n", count: 60)
+        var envelope = grokReadFileEnvelope(content: content)
+        envelope["toolResultTruncated"] = true
+        let stdin = try JSONSerialization.data(withJSONObject: envelope)
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use-grok"],
+            stdin: stdin,
+            state: state
+        ) { _ in
+            XCTFail("a truncated tool result is not the full output and must not be rewritten")
+            return nil
+        }
+
+        let (out, code) = await cli.run()
+
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}")
+    }
+
+    func test_hookPostToolUseGrok_smallOutput_failsOpenBelowThreshold() async throws {
+        let stdin = try JSONSerialization.data(withJSONObject: grokReadFileEnvelope(content: "1→tiny\n2→file\n"))
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use-grok"],
+            stdin: stdin,
+            state: state
+        ) { _ in
+            XCTFail("below-threshold reads must not call Distill transport")
+            return nil
+        }
+
+        let (out, code) = await cli.run()
+
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(String(decoding: out, as: UTF8.self), "{}")
+    }
+
+    /// The provider-visible replacement must always carry both the applied receipt
+    /// and the recovery handle, whatever the sidecar body looked like.
+    func test_hookPostToolUseGrok_replacementAlwaysCarriesReceiptAndHandle() async throws {
+        let content = String(repeating: "1→line of body text that compresses away\n", count: 60)
+        let stdin = try JSONSerialization.data(withJSONObject: grokReadFileEnvelope(content: content))
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use-grok"],
+            stdin: stdin,
+            state: state
+        ) { _ in (self.grokResponse(output: "unreceipted compression", handle: "grok4"), 200) }
+
+        let (out, code) = await cli.run()
+
+        XCTAssertEqual(code, 0)
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: out) as? [String: Any])
+        let hookOut = try XCTUnwrap(object["hookSpecificOutput"] as? [String: Any])
+        let updated = try XCTUnwrap(hookOut["updatedToolOutput"] as? [String: Any])
+        let fileContent = try XCTUnwrap(updated["FileContent"] as? [String: Any])
+        let replaced = try XCTUnwrap(fileContent["content"] as? String)
+        XCTAssertTrue(DistillAppliedReceipt.containsMarker(replaced))
+        XCTAssertTrue(replaced.contains("[[rc:grok4]]"))
+    }
+
     func test_retrieve_success_returnsOriginal() async {
         let json = #"{"handle":"h","found":true,"original":"the original bytes"}"#
         let cli = ManagedDistillCLI(arguments: ["retrieve", "h"], stdin: Data(), state: state) { request in
