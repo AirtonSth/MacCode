@@ -3014,6 +3014,64 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return .removed
     }
 
+    /// Managed Grok PostToolUse hook that compresses built-in tool results
+    /// (`read_file` / `list_dir` / `web_fetch`) through `updatedToolOutput`.
+    /// Token Saver reconcile installs this; Token Saver off removes it.
+    public static let grokPostToolUseHookFileName = "remotecode-token-saver-posttool.json"
+
+    /// Built-in Grok tools whose replacement shape is verified. Shell
+    /// (`run_terminal_command`) stays on the wrapper/PreToolUse pipe lane, and
+    /// `grep` (search matches) plus mutation tools stay byte-exact.
+    public static let grokPostToolUseHookMatcher = "read_file|list_dir|web_fetch"
+
+    public func grokPostToolUseHookURL() -> URL {
+        grokHooksDirectory().appendingPathComponent(Self.grokPostToolUseHookFileName)
+    }
+
+    public static func grokPostToolUseHookCommand(distillPath: String) -> String {
+        "\(distillPath) hook post-tool-use-grok"
+    }
+
+    /// Install the trusted global Grok PostToolUse replacement hook
+    /// (`~/.grok/hooks/…`). Grok ≥ 1.0.34 delivers a settings-file hook's
+    /// `updatedToolOutput` to the model after validating it against the ran tool's
+    /// own output shape; the hook binary re-checks live admission and fail-opens
+    /// when Token Saver is off, the sidecar is down, or the shape is not one of the
+    /// verified ones.
+    public func installGrokPostToolUseHook() throws {
+        try fileManager.createDirectory(at: grokHooksDirectory(), withIntermediateDirectories: true)
+        let command = Self.grokPostToolUseHookCommand(distillPath: distillCLIURL().path)
+        let payload: [String: Any] = [
+            "hooks": [
+                "PostToolUse": [
+                    [
+                        "matcher": Self.grokPostToolUseHookMatcher,
+                        "hooks": [
+                            [
+                                "type": "command",
+                                "command": command,
+                                "timeout": 45,
+                            ] as [String: Any],
+                        ],
+                    ] as [String: Any],
+                ],
+            ] as [String: Any],
+        ]
+        let data = try JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        )
+        try data.write(to: grokPostToolUseHookURL(), options: .atomic)
+    }
+
+    @discardableResult
+    public func uninstallGrokPostToolUseHook() throws -> AgentSkillUninstallResult {
+        let url = grokPostToolUseHookURL()
+        guard fileManager.fileExists(atPath: url.path) else { return .notPresent }
+        try fileManager.removeItem(at: url)
+        return .removed
+    }
+
     /// PATH-reachable symlink that bridges the managed CLI into the shell (`~/.local/bin/distill`).
     public func distillPathLinkURL() -> URL {
         pathBinDirectory.appendingPathComponent("distill")

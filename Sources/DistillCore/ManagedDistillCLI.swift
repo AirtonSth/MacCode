@@ -247,6 +247,8 @@ public struct ManagedDistillCLI: Sendable {
         switch arguments.first {
         case "post-tool-use":
             return await hookPostToolUse()
+        case "post-tool-use-grok":
+            return await hookPostToolUseGrok()
         case "pre-tool-pipe":
             return hookPreToolPipe()
         default:
@@ -431,8 +433,167 @@ public struct ManagedDistillCLI: Sendable {
         )
     }
 
-    static func stripTrailingNewlines(_ s: String) -> String {
-        var t = s
+    /// Verified Grok built-in tool-result variant whose model-facing text can be
+    /// replaced through PostToolUse `updatedToolOutput`.
+    ///
+    /// Grok validates a replacement against the ran tool's own serialized shape,
+    /// so only variants whose replacement shape was observed accepted end to end
+    /// are listed. Everything else fails open, including `Bash` (byte-exact shell),
+    /// `GrepSearch` (search matches) and `EditsApplied` (mutation).
+    struct GrokToolOutputShape: Sendable {
+        let variant: String
+        /// Path to the model-facing text inside `toolResult`.
+        let textPath: [String]
+        /// Second copy of the same text some variants carry (`content_concise`).
+        let mirrorTextPath: [String]?
+
+        var policyToolName: String {
+            switch variant {
+            case "ReadFile": return "read_file"
+            case "ListDir": return "list_dir"
+            case "WebFetch": return "web_fetch"
+            default: return variant.lowercased()
+            }
+        }
+    }
+
+    static let grokReplaceableShapes: [String: GrokToolOutputShape] = [
+        "ReadFile": GrokToolOutputShape(
+            variant: "ReadFile",
+            textPath: ["FileContent", "content"],
+            mirrorTextPath: ["FileContent", "content_concise"]
+        ),
+        "ListDir": GrokToolOutputShape(
+            variant: "ListDir",
+            textPath: ["Content", "content"],
+            mirrorTextPath: nil
+        ),
+        "WebFetch": GrokToolOutputShape(
+            variant: "WebFetch",
+            textPath: ["Content", "content"],
+            mirrorTextPath: nil
+        ),
+    ]
+
+    /// Grok PostToolUse handler (grok-build ≥ 1.0.34).
+    ///
+    /// Grok's PostToolUse hook genuinely replaces a built-in tool's output when the
+    /// hook returns `hookSpecificOutput.updatedToolOutput` from a settings-file hook;
+    /// the replacement is validated against the tool's own output shape and the
+    /// original is kept when it does not match. `read_file` is the largest
+    /// provider-visible tool class on Grok and no PATH wrapper can reach it, so this
+    /// lane is where those bytes are won.
+    ///
+    /// Fail-open: any parse, policy, sidecar, shrink, or receipt failure yields `{}`
+    /// and exit 0. `toolResultTruncated` results are never rewritten because the hook
+    /// did not receive the full output.
+    private func hookPostToolUseGrok() async -> RunResult {
+        let emptyOK = Self.emptyJSONOK
+        guard distillAdmission() else { return emptyOK }
+        guard let envelope = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any] else {
+            return emptyOK
+        }
+        guard Self.hookEventToken(envelope) == "posttooluse" else { return emptyOK }
+        if let truncated = envelope["toolResultTruncated"] as? Bool, truncated {
+            return emptyOK
+        }
+        guard let result = (envelope["toolResult"] ?? envelope["tool_response"]) as? [String: Any],
+              let variant = result["type"] as? String,
+              let shape = Self.grokReplaceableShapes[variant],
+              let rawOutput = Self.grokString(at: shape.textPath, in: result),
+              !rawOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return emptyOK
+        }
+        if Self.toolResponseContainsImage(rawOutput) {
+            return emptyOK
+        }
+
+        let toolName = Self.hookToolName(envelope)
+        let argsSummary = Self.summarizeToolInput(envelope["toolInput"] ?? envelope["tool_input"])
+        let decision = ToolOutputCompressionPolicy(
+            minBytes: CommandWrapPolicy.defaultMinBytes,
+            minLines: CommandWrapPolicy.defaultMinLines,
+            reversibleStoreMinBytes: reversibleStoreMinBytes ?? CommandWrapPolicy.reversibleStoreFloorBytes
+        ).decision(
+            toolName: toolName.isEmpty ? shape.policyToolName : toolName,
+            output: rawOutput,
+            toolArgumentsSummary: argsSummary.isEmpty ? nil : argsSummary
+        )
+        guard decision.shouldCompress else {
+            return emptyOK
+        }
+
+        let maxChars = max(512, min(rawOutput.count, 48_000))
+        let nested = ManagedDistillCLI(
+            arguments: [decision.contractQuestion],
+            stdin: Data(rawOutput.utf8),
+            state: state,
+            rootRunID: rootRunID,
+            provider: provider ?? "grok",
+            recoveryContext: recoveryContext,
+            invocationID: invocationID,
+            maxOutputCharacters: maxChars,
+            reversibleStoreMinBytes: decision.reversibleStoreMinBytes,
+            distillAdmission: distillAdmission,
+            transport: transport
+        )
+        let nestedResult = await nested.runResult()
+        guard nestedResult.exitCode == 0 else { return emptyOK }
+
+        let compressed = String(decoding: nestedResult.stdout, as: UTF8.self)
+        guard !compressed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              nestedResult.stdout != Data(rawOutput.utf8),
+              DistillAppliedReceipt.containsMarker(compressed),
+              compressed.utf8.count < rawOutput.utf8.count else {
+            return emptyOK
+        }
+
+        var replaced = Self.grokSetting(compressed, at: shape.textPath, in: result)
+        if let mirror = shape.mirrorTextPath,
+           Self.grokString(at: mirror, in: replaced) != nil {
+            replaced = Self.grokSetting(compressed, at: mirror, in: replaced)
+        }
+        let payload: [String: Any] = [
+            "hookSpecificOutput": [
+                "hookEventName": "PostToolUse",
+                "updatedToolOutput": replaced,
+            ] as [String: Any],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+            return emptyOK
+        }
+        return RunResult(
+            stdout: data,
+            exitCode: 0,
+            deferredSideEffect: nestedResult.deferredSideEffect
+        )
+    }
+
+    static func grokString(at path: [String], in object: [String: Any]) -> String? {
+        var current: Any = object
+        for key in path {
+            guard let dict = current as? [String: Any], let next = dict[key] else { return nil }
+            current = next
+        }
+        return current as? String
+    }
+
+    /// Returns `object` with the value at `path` replaced. The verified Grok shapes
+    /// are one nesting level deep; deeper paths are walked the same way.
+    static func grokSetting(_ value: String, at path: [String], in object: [String: Any]) -> [String: Any] {
+        guard let head = path.first else { return object }
+        if path.count == 1 {
+            var updated = object
+            updated[head] = value
+            return updated
+        }
+        guard let child = object[head] as? [String: Any] else { return object }
+        var updated = object
+        updated[head] = grokSetting(value, at: Array(path.dropFirst()), in: child)
+        return updated
+    }
+
+    static func stripTrailingNewlines(_ s: String) -> String {        var t = s
         while t.hasSuffix("\n") || t.hasSuffix("\r") {
             t.removeLast()
         }

@@ -2831,6 +2831,9 @@ public final class AppContext {
             capture("Grok PreToolUse pipe hook cleanup") {
                 _ = try installer.uninstallGrokPreToolPipeHook()
             }
+            capture("Grok PostToolUse output hook cleanup") {
+                _ = try installer.uninstallGrokPostToolUseHook()
+            }
         }
 
         if tokenSaverEnabled {
@@ -2871,6 +2874,9 @@ public final class AppContext {
             }
             capture("Grok PreToolUse pipe hook") {
                 try installer.installGrokPreToolPipeHook()
+            }
+            capture("Grok PostToolUse output hook") {
+                try installer.installGrokPostToolUseHook()
             }
             LoginShellEnvironment.prewarm()
             if let appPrivateResult {

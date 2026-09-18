@@ -143,8 +143,9 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         switch normalize(toolName) {
         case "grep", "glob":
             return .conservative
-        case "bash", "read", "runterminalcommand", "shell", "terminal", "localshell":
-            // Read: extractive keep (skeleton/BERT); Bash/Grok/Codex shell: noise collapse.
+        case "bash", "read", "readfile", "listdir", "runterminalcommand", "shell", "terminal", "localshell":
+            // Read / Grok read_file / Grok list_dir: extractive keep (skeleton/BERT);
+            // Bash/Grok/Codex shell: noise collapse.
             return .moderate
         case "webfetch":
             return .aggressive
@@ -182,7 +183,7 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         case .conservative:
             return "Compress search output without dropping any match line. Preserve paths, line numbers, matched text, and quoted strings verbatim; only collapse duplicate/context noise. \(DistillPrompt.densityMarker) if every match line still fits.\(suffix)"
         case .moderate:
-            if normalize(toolName) == "read" {
+            if normalize(toolName) == "read" || normalize(toolName) == "readfile" {
                 return "Compress file read output for the current task. Prefer signatures, exports, types, and task-relevant spans; elide large bodies only when a retrieve handle covers the original; preserve paths, line numbers, identifiers, and quoted strings verbatim. \(DistillPrompt.densityMarker) if those literals still fit.\(suffix)"
             }
             return "Compress command output. Preserve exit codes, failing test names, errors, warnings, assertions, numbers, paths, and quoted strings verbatim; collapse repeated progress noise. \(DistillPrompt.densityMarker) if those literals still fit.\(suffix)"

@@ -112,6 +112,33 @@ final class ManagedDistillCLIInstallTests: XCTestCase {
         XCTAssertEqual(try installer.uninstallGrokPreToolPipeHook(), .notPresent)
     }
 
+    func test_installGrokPostToolUseHook_writesReplacementHookAndUninstalls() throws {
+        let home = tempHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        try installer.installGrokPostToolUseHook()
+        let url = installer.grokPostToolUseHookURL()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+        let hooks = try XCTUnwrap(object?["hooks"] as? [String: Any])
+        let post = try XCTUnwrap(hooks["PostToolUse"] as? [[String: Any]])
+        XCTAssertEqual(
+            post.first?["matcher"] as? String,
+            "read_file|list_dir|web_fetch",
+            "only shapes verified against grok's own result shapes may be rewritten"
+        )
+        XCTAssertNil(hooks["PreToolUse"], "the output hook must not carry the shell pipe lane")
+        let handlers = try XCTUnwrap(post.first?["hooks"] as? [[String: Any]])
+        XCTAssertEqual(
+            handlers.first?["command"] as? String,
+            AgentSkillInstaller.grokPostToolUseHookCommand(distillPath: installer.distillCLIURL().path)
+        )
+        XCTAssertEqual(handlers.first?["timeout"] as? Int, 45)
+        XCTAssertEqual(try installer.uninstallGrokPostToolUseHook(), .removed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertEqual(try installer.uninstallGrokPostToolUseHook(), .notPresent)
+    }
+
     func test_installCommandWrappers_alwaysInstallsDistillBesideWrappers() throws {
         let home = tempHome()
         defer { try? FileManager.default.removeItem(at: home) }
