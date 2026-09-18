@@ -467,9 +467,14 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             ],
             environment: env
         )
-        XCTAssertEqual(args[2], "developer_instructions=\"SHADOWED\"")
-        XCTAssertTrue(args[3].hasPrefix("--config=developer_instructions=\"EFFECTIVE\\n\\n"))
-        XCTAssertTrue(args[3].contains("TOKEN_SAVER_SAFETY_ABI_V1"))
+        // Locate by content: the proxy also appends process-scoped MCP overlays,
+        // so this contract is about WHICH override is merged, not argv index.
+        XCTAssertTrue(args.contains("developer_instructions=\"SHADOWED\""),
+                      "the shadowed earlier override must stay untouched")
+        let effective = args.first { $0.hasPrefix("--config=developer_instructions=") }
+        XCTAssertTrue(effective?.hasPrefix("--config=developer_instructions=\"EFFECTIVE\\n\\n") == true,
+                      "the last inline override wins and must be the one merged")
+        XCTAssertTrue(effective?.contains("TOKEN_SAVER_SAFETY_ABI_V1") == true)
         XCTAssertEqual(
             AgentSkillInstaller.providerProxyArguments(
                 provider: .codex,
@@ -495,12 +500,14 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             environment: env
         )
 
+        let override = args.first { $0.hasPrefix(#"--config=developer_instructions="""#) }
         XCTAssertTrue(
-            args[1].hasPrefix(#"--config=developer_instructions="""KEEP_CALLER\n\n"#),
+            override?.hasPrefix(#"--config=developer_instructions="""KEEP_CALLER\n\n"#) == true,
             "the existing triple-quoted value must remain the effective prefix"
         )
-        XCTAssertTrue(args[1].hasSuffix(#""""#), "the TOML multiline delimiter must remain balanced")
-        XCTAssertTrue(args[1].contains("TOKEN_SAVER_SAFETY_ABI_V1"))
+        XCTAssertTrue(override?.hasSuffix(#""""#) == true,
+                      "the TOML multiline delimiter must remain balanced")
+        XCTAssertTrue(override?.contains("TOKEN_SAVER_SAFETY_ABI_V1") == true)
     }
 
     func test_providerProxyArguments_nestedCodexMergesLiteralAndSpacedDeveloperInstructions() {
@@ -515,10 +522,11 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
                 arguments: ["exec", "-c", override, "do work"],
                 environment: env
             )
-            XCTAssertEqual(args.filter { $0 == "-c" }.count, 1,
+            XCTAssertEqual(args.filter { $0.contains("developer_instructions=") }.count, 1,
                            "the effective caller override must be merged in place")
-            XCTAssertTrue(args[2].hasPrefix("developer_instructions=\"KEEP_"))
-            XCTAssertTrue(args[2].contains("TOKEN_SAVER_SAFETY_ABI_V1"), override)
+            let merged = args.first { $0.hasPrefix("developer_instructions=\"KEEP_") }
+            XCTAssertTrue(merged != nil, "the caller value must stay the effective override")
+            XCTAssertTrue(merged?.contains("TOKEN_SAVER_SAFETY_ABI_V1") == true, override)
             XCTAssertEqual(
                 AgentSkillInstaller.providerProxyArguments(
                     provider: .codex,
@@ -545,10 +553,11 @@ final class TokenSaverCrossProviderMatrixTests: XCTestCase {
             arguments: original,
             environment: env
         )
-        XCTAssertTrue(args[2].hasPrefix("developer_instructions=\"KEEP_CALLER\\n\\n"))
-        XCTAssertTrue(args[2].contains("MANDATORY default-pipe:"),
+        let merged = args.first { $0.hasPrefix("developer_instructions=\"KEEP_CALLER") }
+        XCTAssertTrue(merged?.hasPrefix("developer_instructions=\"KEEP_CALLER\\n\\n") == true)
+        XCTAssertTrue(merged?.contains("MANDATORY default-pipe:") == true,
                       "a marker in a TOML comment must not bypass the semantic Distill prompt")
-        XCTAssertTrue(args[2].hasSuffix("# \(comment)"),
+        XCTAssertTrue(merged?.hasSuffix("# \(comment)") == true,
                       "merging the semantic value must preserve the caller's trailing comment")
         XCTAssertEqual(
             AgentSkillInstaller.providerProxyArguments(

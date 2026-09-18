@@ -184,7 +184,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     public static let distillCLIEndMarker = "# RemoteCode managed distill CLI: end"
     public static let mcpBeginMarker = "# RemoteCode managed MCP: begin"
     public static let mcpEndMarker = "# RemoteCode managed MCP: end"
-    public static let retrieveMCPName = "remotecode-distill-retrieve"
+    public static let retrieveMCPName = DistillMCPAdmit.codexServerName
     public static let computerUseMCPName = ComputerUseMCPAdmit.serverName
     public static let legacyExternalHostSkillID = "macos-harness"
     /// Environment signal set only for a logical Desktop (This Mac) run. It is
@@ -246,7 +246,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`.
     - Wait for `distill` before continuing when you did pipe it.
 
-    Local librarian catalog (01-catalogo.html, Token Saver Distill MCP `remotecode-distill` / `remotecode-distill-retrieve`) — MANDATORY when these tools are listed:
+    Local librarian catalog (01-catalogo.html, Token Saver Distill MCP `remotecode-distill` / `remotecode-distill-retrieve`) — use it by default on every turn, without the user asking, whenever these tools are listed:
     - Use the FULL tool surface, not just one tool: `rc_search` (find stored handles/blobs BEFORE re-deriving or re-reading), `rc_catalog` (discover enabled catalog operations by id/summary), `rc_ask` (run a discovered op over a handle), `rc_compress` (shrink a large blob before quoting it), `rc_retrieve` (byte-exact original behind `[[rc:handle]]` — whole-blob retrieval is the exception, justify it), `rc_stats` (ledger/handle stats).
     - `rc_ask.op` is a catalog function id. Use the eight schema hints for common work; query `rc_catalog` just in time for other extract/digest/classify/rank/diff/grep-in-handle/draft operations, then call the returned id (examples: test_verdict, ci_job_failures, handle_grep, retrieve_range, extract_schema, pick_candidates, cite_spans, multi_handle_ask). Doing one manually on handle-backed content is a policy violation, same as skipping `| distill`.
     - Generate ops run on the Distill model selected in Settings (1.7B / E4B / OpenAI-compatible API).
@@ -276,7 +276,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     NEVER Distill skill content: Skill tool output and requested/returned SKILL bodies must stay complete/verbatim (no summary, `[[rc:]]` handle, truncation, or savings accounting).
     Never invoke Node/tsx/npm/bun or a source-checkout `distill`.
     Host/runtime carries the ordinary-output Distill policy; do not require every worker prompt to restate it.
-    Distill MCP catalog tools are MANDATORY when listed: `rc_search` stored handles; `rc_catalog` cold ops by id/summary; `rc_ask` extract/digest/classify/rank/diff/grep/draft with a hot hint or returned id; `rc_compress` big blobs; `rc_retrieve` exact bytes; `rc_stats` ledger. Doing this manually on handle content is a policy violation. Generate uses the Settings Distill model. Host-only may be unavailable — never fake success; forbidden ops are refused. Recover `[[rc:<handle>]]` with `rc_retrieve` or `distill retrieve <handle>`. Wait when used.
+    Distill MCP catalog tools are used BY DEFAULT whenever they are listed, without the user asking: `rc_search` stored handles; `rc_catalog` cold ops by id/summary; `rc_ask` extract/digest/classify/rank/diff/grep/draft with a hot hint or returned id; `rc_compress` big blobs; `rc_retrieve` exact bytes; `rc_stats` ledger. Doing this manually on handle content is a policy violation. Generate uses the Settings Distill model. Host-only may be unavailable — never fake success; forbidden ops are refused. Recover `[[rc:<handle>]]` with `rc_retrieve` or `distill retrieve <handle>`. Wait when used.
     Details and examples live in the managed `distill` SKILL.md.
     <!-- distill skill: end -->
     """
@@ -382,7 +382,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         guard !prompt.isEmpty,
               isSupportedProviderTurn(provider: provider, arguments: rewritten)
         else {
-            return ensuringCodexBotCatalogMCP(
+            return ensuringCodexProcessMCPOverlays(
                 provider: provider,
                 arguments: rewritten,
                 environment: environment
@@ -408,7 +408,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             let withInstructions: [String]
             let scan = scanProviderArguments(provider: provider, arguments: rewritten)
             guard !scan.malformed else {
-                return ensuringCodexBotCatalogMCP(
+                return ensuringCodexProcessMCPOverlays(
                     provider: provider,
                     arguments: rewritten,
                     environment: environment
@@ -433,7 +433,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
                     + "\""
                 withInstructions = ["--config", "developer_instructions=\(quoted)"] + rewritten
             }
-            return ensuringCodexBotCatalogMCP(
+            return ensuringCodexProcessMCPOverlays(
                 provider: provider,
                 arguments: withInstructions,
                 environment: environment
@@ -444,8 +444,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// Raw nested Codex invocations do not pass through `CodexRunner` or the
     /// app-server adapter. Admit the same four bot MCPs on the process argv so
     /// `codex exec resume` and other strict/raw turns retain the host catalog
-    /// without consulting the shared `~/.codex/config.toml`.
-    static func ensuringCodexBotCatalogMCP(
+    /// without consulting the shared `~/.codex/config.toml`, plus the Token
+    /// Saver librarian (with the run's recovery scope) under its own gate.
+    static func ensuringCodexProcessMCPOverlays(
         provider: AgentProvider,
         arguments: [String],
         environment: [String: String]
@@ -499,10 +500,17 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         let hasScopedBotID = { (name: String) in
             arguments.contains { $0.contains("mcp_servers.\(name).env.\(BotSelfConfigCatalog.callerEnvironmentKey)=") }
         }
-        guard names.contains(where: { !hasManagedCommand($0) || (callerIsScoped && !hasScopedBotID($0)) }) else {
-            return arguments
+        var overrides: [String] = []
+        if names.contains(where: { !hasManagedCommand($0) || (callerIsScoped && !hasScopedBotID($0)) }) {
+            overrides += CodexRunner.botCatalogMCPOverrides(environment: environment)
         }
-        let overrides = CodexRunner.botCatalogMCPOverrides(environment: environment)
+        // The librarian keeps its own presence check and its own Token Saver
+        // gate (`distillMCPOverrides` returns [] when the hint is absent), so a
+        // raw argv that already pinned the bot catalog still receives the
+        // librarian overlay, and a Token Saver-off run still receives neither.
+        if !hasManagedCommand(DistillMCPAdmit.codexServerName) {
+            overrides += CodexRunner.distillMCPOverrides(environment: environment)
+        }
         guard !overrides.isEmpty else { return arguments }
         switch arguments[subcommandIndex] {
         case "exec":
@@ -1893,10 +1901,13 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     }
 
     /// Install the librarian MCP server (`RemoteCodeDistillService mcp`) into Codex
-    /// config.toml. Idempotent; preserves any user-authored entries. Codex is the only
-    /// provider that reads it from a config file: Claude does NOT read `mcpServers`
-    /// from settings.json (an installed entry never spawned and `claude mcp list`
-    /// omits it), so both Claude engines admit the server per spawn instead
+    /// config.toml as the file-level fallback. Idempotent; preserves any
+    /// user-authored entries. RemoteCode-spawned Codex turns get the same
+    /// server per process instead (`CodexRunner.distillMCPOverrides`, which
+    /// also carries the run's recovery scope and replaces this table by name);
+    /// Claude does NOT read `mcpServers` from settings.json (an installed entry
+    /// never spawned and `claude mcp list` omits it), so both Claude engines
+    /// admit the server per spawn instead
     /// (ClaudeRunner.botPeerMCPConfigJSON / ClaudeAgentSDKBridgeAdapter.botPeerMCPServers),
     /// and Grok admits it per ACP session (GrokACPClient.sessionMCPServers).
     /// `uninstallRetrieveMCP` still purges the legacy Claude settings.json entry.

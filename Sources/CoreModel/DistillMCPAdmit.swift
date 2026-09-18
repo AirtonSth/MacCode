@@ -4,6 +4,16 @@ import Foundation
 public enum DistillMCPAdmit: Sendable {
     public static let serverName = "remotecode-distill"
     public static let cliArgument = "mcp"
+    public static let fallbackCommand = "RemoteCodeDistillService"
+
+    /// Codex's table name for the same librarian server. Codex deep-merges
+    /// `-c mcp_servers.<name>.*` over `~/.codex/config.toml` (probed live on
+    /// codex-cli 0.154.0: a `-c` override of an existing table merges, a
+    /// different name adds a second server). Reusing the installed entry's
+    /// name means the per-process admission replaces that definition — command,
+    /// args, and the run's recovery env — instead of spawning one librarian
+    /// sidecar per name.
+    public static let codexServerName = "remotecode-distill-retrieve"
 
     /// Token Saver activation signal: set to "1" on every admitted run's
     /// environment by the execution receipt when the distill capability is on.
@@ -68,7 +78,10 @@ public enum DistillMCPAdmit: Sendable {
         )
     }
 
-    private static func recoveryEnvironment(_ environment: [String: String]) -> [String: String] {
+    /// The run's recovery scope, limited to `recoveryEnvKeys`. Every provider
+    /// admission (Claude config JSON, Grok ACP server, Codex `-c` env) forwards
+    /// exactly this map so a scoped `rc_retrieve`/`rc_ask` works on all three.
+    public static func recoveryEnvironment(_ environment: [String: String]) -> [String: String] {
         var extra: [String: String] = [:]
         for key in recoveryEnvKeys {
             if let value = environment[key], !value.isEmpty {
