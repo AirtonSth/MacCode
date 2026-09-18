@@ -6,17 +6,20 @@ public final class LibrarianDispatcher: @unchecked Sendable {
     public let analytics: LibrarianAnalyticsLedger
     public var generate: (any LibrarianGenerating)?
     public var persist: LibrarianSavingsPersist?
+    public var environment: LibrarianOpEnvironment
 
     public init(
         store: LibrarianHandleStore = LibrarianHandleStore(),
         analytics: LibrarianAnalyticsLedger = LibrarianAnalyticsLedger(),
         generate: (any LibrarianGenerating)? = nil,
-        persist: LibrarianSavingsPersist? = nil
+        persist: LibrarianSavingsPersist? = nil,
+        environment: LibrarianOpEnvironment = .live
     ) {
         self.store = store
         self.analytics = analytics
         self.generate = generate
         self.persist = persist
+        self.environment = environment
     }
 
     public func dispatch(_ request: LibrarianRequest) async -> LibrarianResult {
@@ -125,7 +128,13 @@ public final class LibrarianDispatcher: @unchecked Sendable {
                 originalForSavings: request.input
             )
         }
-        return await LibrarianHandlers.run(request, function: fn, store: store, generate: generate)
+        return await LibrarianHandlers.run(
+            request,
+            function: fn,
+            store: store,
+            generate: generate,
+            environment: environment
+        )
     }
 
     // PERF: JSONEncoder sortedKeys is ICU-heavy. Share one behind lock.

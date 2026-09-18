@@ -833,6 +833,17 @@ public final class DistillHTTPServer: @unchecked Sendable {
         let message: String
     }
 
+    /// Bounded encode batch: one /v1/embed call must not become an unbounded GPU job.
+    static let maxEmbedInputs = 64
+
+    /// A scoped lossy delivery plus whether the librarian op already recorded its
+    /// own `librarian.<op>` row (so the caller must not add a second row for one
+    /// delivery).
+    struct ScopedLossyDelivery {
+        let response: DistillResponse
+        let recordedByLibrarian: Bool
+    }
+
     private struct RetrieveResponse: Codable {
         let handle: String
         let found: Bool
@@ -866,6 +877,9 @@ public final class DistillHTTPServer: @unchecked Sendable {
     private let onSavingsRecord: SavingsRecordHandler?
     private let onAuditEvent: AuditEventHandler?
     private let librarianGenerate: (any LibrarianGenerating)?
+    /// Host seams for the librarian ops: real transcript DB, real encoder lane,
+    /// real graphify/sourcekit-lsp. Built lazily from the service configuration.
+    private let librarianEnvironmentOverride: LibrarianOpEnvironment?
     private let reversibleStore: ReversibleStoring?
     private let scopedRecoveryStore: TokenSaverScopedRecoveryStoring?
     private let statsProvider: DistillStatsProviding?
@@ -890,6 +904,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         onSavingsRecord: SavingsRecordHandler? = nil,
         onAuditEvent: AuditEventHandler? = nil,
         librarianGenerate: (any LibrarianGenerating)? = nil,
+        librarianEnvironment: LibrarianOpEnvironment? = nil,
         distillAdmission: @escaping DistillAdmission = { true }
     ) {
         self.configuration = configuration
@@ -906,6 +921,23 @@ public final class DistillHTTPServer: @unchecked Sendable {
         self.onSavingsRecord = onSavingsRecord
         self.onAuditEvent = onAuditEvent
         self.librarianGenerate = librarianGenerate
+        self.librarianEnvironmentOverride = librarianEnvironment
+    }
+
+    /// Environment for the librarian ops. The sidecar executable injects the real
+    /// one (MLX encoder lane, read-only transcript DB); a bare server keeps host
+    /// I/O only, so tests never trigger a model download and `/v1/embed` reports
+    /// `available: false` instead of inventing vectors.
+    private func librarianEnvironment() -> LibrarianOpEnvironment {
+        if let librarianEnvironmentOverride { return librarianEnvironmentOverride }
+        var environment = LibrarianOpEnvironment.live
+        let databasePath = URL(fileURLWithPath: configuration.appSupportDirectory, isDirectory: true)
+            .appendingPathComponent("remotecode.sqlite")
+            .path
+        if FileManager.default.fileExists(atPath: databasePath) {
+            environment.transcript = LibrarianTranscriptSQLite(dbPath: databasePath).store
+        }
+        return environment
     }
 
     /// Flip readiness on once the runtime is warm. Until then /readyz returns 503
@@ -1159,7 +1191,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
             case "/v1/rank":
                 handleRank(request: request, connection: connection)
             case "/v1/embed":
-                handleEmbed(request: request, connection: connection)
+                await handleEmbed(request: request, connection: connection)
             default:
                 await handleDistill(request: request, connection: connection)
             }
@@ -1205,25 +1237,47 @@ public final class DistillHTTPServer: @unchecked Sendable {
             }
             let dispatcher = LibrarianDispatcher(
                 store: store,
-                generate: librarianGenerate
+                generate: librarianGenerate,
+                environment: librarianEnvironment()
             )
             let op = (body.op?.isEmpty == false ? body.op : nil) ?? body.id
-            var req = LibrarianRequest(
+            let req = LibrarianRequest(
                 id: op,
                 input: text,
                 question: body.question,
                 handle: body.handle,
+                handles: body.handles ?? [],
                 provider: body.provider ?? "unknown",
                 threadID: body.threadID ?? "",
                 admitted: true,
                 retrieveAvailable: verifiedRecoveryHandle != nil,
                 verifiedRecoveryHandle: verifiedRecoveryHandle,
-                graphifyEnabled: ProcessInfo.processInfo.environment["RC_GRAPHIFY_ENABLED"] == "1"
+                graphifyEnabled: ProcessInfo.processInfo.environment["RC_GRAPHIFY_ENABLED"] == "1",
+                command: body.command,
+                schema: body.schema,
+                op: body.op,
+                startLine: body.startLine,
+                endLine: body.endLine,
+                startByte: body.startByte,
+                endByte: body.endByte,
+                pattern: body.pattern,
+                claim: body.claim,
+                root: body.root,
+                paths: body.paths ?? [],
+                symbol: body.symbol,
+                fileName: body.fileName,
+                baseRef: body.baseRef,
+                since: body.since,
+                locale: body.locale,
+                payload: body.payload,
+                navigationOperation: body.navigation,
+                arguments: body.arguments ?? [],
+                topK: body.topK,
+                budgetTokens: body.budgetTokens,
+                scopeToThread: body.scopeToThread ?? false,
+                watchIntervalSeconds: body.watchIntervalSeconds,
+                watchTimeoutSeconds: body.watchTimeoutSeconds
             )
-            req.command = body.command
-            req.pattern = body.pattern
-            req.startLine = body.startLine
-            req.endLine = body.endLine
             let result = await dispatcher.dispatch(req)
             if let record = result.analytics.record, let onSavingsRecord {
                 await onSavingsRecord(record)
@@ -1344,7 +1398,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         scopedContext: TokenSaverRecoveryRequestContext?,
         scopedRecoveryStore: TokenSaverScopedRecoveryStoring?,
         deferDeliveryConfirmation: Bool
-    ) async -> DistillResponse? {
+    ) async -> ScopedLossyDelivery? {
         guard request.mode == .commandOutput,
               request.effectiveRunMode == .optimize,
               let scopedContext,
@@ -1361,7 +1415,13 @@ public final class DistillHTTPServer: @unchecked Sendable {
                 || Self.newlineSeparatedComponentCount(input, atLeast: 30) else {
             return nil
         }
-        guard CommandOutputLossyRouter.isLossyCandidate(input) else { return nil }
+        // Hot-lane catalog ops extend the lossy set: a matching test report,
+        // lint/build log, JSON blob or large listing is processed by its own
+        // catalog op (and records a `librarian.<op>` row) even when the generic
+        // crusher set would not claim it.
+        let isLossyCandidate = CommandOutputLossyRouter.isLossyCandidate(input)
+        let hotLaneOp = LibrarianHotLane.opID(for: input, question: request.question)
+        guard isLossyCandidate || hotLaneOp != nil else { return nil }
         guard distillAdmission() else { return nil }
 
         do {
@@ -1380,7 +1440,18 @@ public final class DistillHTTPServer: @unchecked Sendable {
                   ) == originalBytes else {
                 return nil
             }
-            guard let routed = CommandOutputLossyRouter.routeIfBeneficial(
+            if let librarian = await librarianHotLaneDelivery(
+                input: input,
+                question: request.question,
+                preparation: preparation,
+                scopedContext: scopedContext,
+                scopedRecoveryStore: scopedRecoveryStore,
+                deferDeliveryConfirmation: deferDeliveryConfirmation,
+                request: request
+            ) {
+                return librarian
+            }
+            guard isLossyCandidate, let routed = CommandOutputLossyRouter.routeIfBeneficial(
                 input: input,
                 handle: preparation.capability,
                 query: request.question
@@ -1399,21 +1470,77 @@ public final class DistillHTTPServer: @unchecked Sendable {
             }
             let inputTokens = TokenEstimator.estimate(input)
             let outputTokens = TokenEstimator.estimate(routed.output)
-            return DistillResponse(
-                requestID: request.id,
-                output: routed.output,
-                inputCharacters: input.count,
-                inputTokens: inputTokens,
-                outputTokens: outputTokens,
-                originalHandle: preparation.capability,
-                recoveryIdempotencyKey: preparation.idempotencyKey,
-                runMode: .optimize,
-                routeStage: .deterministic
+            return ScopedLossyDelivery(
+                response: DistillResponse(
+                    requestID: request.id,
+                    output: routed.output,
+                    inputCharacters: input.count,
+                    inputTokens: inputTokens,
+                    outputTokens: outputTokens,
+                    originalHandle: preparation.capability,
+                    recoveryIdempotencyKey: preparation.idempotencyKey,
+                    runMode: .optimize,
+                    routeStage: .deterministic
+                ),
+                recordedByLibrarian: false
             )
         } catch {
             // Fail open to EncoderFirst / model path.
             return nil
         }
+    }
+
+    /// Hot-lane librarian delivery for scoped lossy command output: the mapped
+    /// catalog op produces the delivered text and records its own ledger row.
+    private func librarianHotLaneDelivery(
+        input: String,
+        question: String?,
+        preparation: TokenSaverScopedPreparation,
+        scopedContext: TokenSaverRecoveryRequestContext,
+        scopedRecoveryStore: TokenSaverScopedRecoveryStoring,
+        deferDeliveryConfirmation: Bool,
+        request: DistillRequest
+    ) async -> ScopedLossyDelivery? {
+        guard LibrarianHotLane.opID(for: input, question: question) != nil else { return nil }
+        let capability = preparation.capability
+        let store = LibrarianHandleStore()
+        _ = store.put(input, handle: capability)
+        let dispatcher = LibrarianDispatcher(store: store, environment: librarianEnvironment())
+        guard let result = await LibrarianHotLane.route(
+            text: input,
+            question: question,
+            handle: capability,
+            dispatcher: dispatcher
+        ) else {
+            return nil
+        }
+        if !deferDeliveryConfirmation {
+            guard (try? scopedRecoveryStore.markDelivered(
+                capability: preparation.capability,
+                idempotencyKey: preparation.idempotencyKey,
+                context: scopedContext,
+                outcome: .sentUnknown
+            )) == true else {
+                return nil
+            }
+        }
+        if let record = result.analytics.record {
+            await onSavingsRecord?(record)
+        }
+        return ScopedLossyDelivery(
+            response: DistillResponse(
+                requestID: request.id,
+                output: result.text,
+                inputCharacters: input.count,
+                inputTokens: TokenEstimator.estimate(input),
+                outputTokens: TokenEstimator.estimate(result.text),
+                originalHandle: result.handle ?? capability,
+                recoveryIdempotencyKey: capability,
+                runMode: .optimize,
+                routeStage: result.analytics.record?.routeStage ?? .deterministic
+            ),
+            recordedByLibrarian: true
+        )
     }
 
     /// LOSSLESS-ONLY UNSCOPED TIER.
@@ -1688,11 +1815,13 @@ public final class DistillHTTPServer: @unchecked Sendable {
                 if distillRequest.mode == .commandOutput {
                     await metrics.recordToolOutputCompressed()
                 }
-                if let onSuccess {
-                    await onSuccess(distillRequest, early, savingsThreadID)
+                // A librarian-routed delivery already persisted its own
+                // `librarian.<op>` row; a second row would double count it.
+                if !early.recordedByLibrarian, let onSuccess {
+                    await onSuccess(distillRequest, early.response, savingsThreadID)
                 }
                 await metrics.recordSuccess()
-                send(status: 200, body: early, connection: connection)
+                send(status: 200, body: early.response, connection: connection)
                 return
             }
 
@@ -1855,19 +1984,58 @@ public final class DistillHTTPServer: @unchecked Sendable {
         }
     }
 
-    private func handleEmbed(request: HTTPRequest, connection: NWConnection) {
+    private func handleEmbed(request: HTTPRequest, connection: NWConnection) async {
         guard request.body.count <= requestBodyLimitBytes else {
             send(status: 413, body: ErrorBody(error: "payload_too_large", message: "embed request body exceeds limit"), connection: connection)
             return
         }
         do {
             let embedRequest = try decoder.decode(DistillEmbedRequest.self, from: request.body)
+            let inputs = Array(embedRequest.inputs.prefix(DistillHTTPServer.maxEmbedInputs))
+            guard !inputs.isEmpty else {
+                send(
+                    status: 200,
+                    body: DistillEmbedResponse(
+                        available: false,
+                        encoderLane: embedRequest.encoderLane,
+                        message: "no inputs"
+                    ),
+                    connection: connection
+                )
+                return
+            }
+            guard let provider = librarianEnvironment().embedder else {
+                send(
+                    status: 200,
+                    body: DistillEmbedResponse(
+                        available: false,
+                        encoderLane: embedRequest.encoderLane,
+                        message: "encoder lane unavailable; no synthetic embeddings returned"
+                    ),
+                    connection: connection
+                )
+                return
+            }
+            guard let vectors = await provider.embed(inputs), vectors.count == inputs.count else {
+                send(
+                    status: 200,
+                    body: DistillEmbedResponse(
+                        available: false,
+                        encoderLane: embedRequest.encoderLane,
+                        message: "encoder inference failed; no synthetic embeddings returned"
+                    ),
+                    connection: connection
+                )
+                return
+            }
             send(
                 status: 200,
                 body: DistillEmbedResponse(
-                    available: false,
-                    encoderLane: embedRequest.encoderLane,
-                    message: "encoder lane unavailable; no synthetic embeddings returned"
+                    available: true,
+                    encoderLane: provider.model,
+                    dimensions: vectors.first?.count ?? 0,
+                    embeddings: vectors,
+                    message: nil
                 ),
                 connection: connection
             )

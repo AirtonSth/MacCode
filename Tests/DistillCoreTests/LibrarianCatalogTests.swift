@@ -4,8 +4,8 @@ import CoreModel
 
 final class LibrarianCatalogTests: XCTestCase {
     func test_catalogHas188UniqueIDs() {
-        XCTAssertEqual(LibrarianCatalog.all.count, 188)
-        XCTAssertEqual(Set(LibrarianCatalog.ids).count, 188)
+        XCTAssertEqual(LibrarianCatalog.all.count, 195)
+        XCTAssertEqual(Set(LibrarianCatalog.ids).count, 195)
         XCTAssertEqual(LibrarianCatalog.forbiddenIDs.count, 19)
     }
 
@@ -13,8 +13,8 @@ final class LibrarianCatalogTests: XCTestCase {
         // WHY: rc_ask no longer pays to advertise every id in tools/list. The
         // on-demand catalog must still make every callable operation reachable,
         // while forbidden and runtime-disabled operations remain undiscoverable.
-        XCTAssertEqual(LibrarianCatalog.implementedIDs.count, 168)
-        XCTAssertEqual(Set(LibrarianCatalog.implementedIDs).count, 168)
+        XCTAssertEqual(LibrarianCatalog.implementedIDs.count, 175)
+        XCTAssertEqual(Set(LibrarianCatalog.implementedIDs).count, 175)
         XCTAssertEqual(
             LibrarianCatalog.implementedIDs,
             LibrarianCatalog.all.filter {
@@ -400,8 +400,8 @@ final class LibrarianCatalogTests: XCTestCase {
     func test_probeAllCatalogIDs() async throws {
         let dispatcher = LibrarianDispatcher(generate: LibrarianScriptedGenerate())
         let rows = await LibrarianProbe.runAll(dispatcher: dispatcher)
-        XCTAssertEqual(rows.count, 188)
-        XCTAssertEqual(Set(rows.map(\.id)).count, 188)
+        XCTAssertEqual(rows.count, 195)
+        XCTAssertEqual(Set(rows.map(\.id)).count, 195)
         let forbidden = rows.filter { $0.safety == "forbidden" }
         XCTAssertEqual(forbidden.count, 19)
         XCTAssertTrue(forbidden.allSatisfy { $0.status == "refused" || $0.status == "unavailable" })

@@ -1065,19 +1065,25 @@ private extension TokenSaverRound2BenchmarkTests {
                 guard let data = try? recovery.retrieve(capability: handle) else { return nil }
                 return String(data: data, encoding: .utf8)
             },
-            ask: { op, input, question, handle in
+            ask: { call in
                 let result = await dispatcher.dispatch(LibrarianRequest(
-                    id: op,
-                    input: input,
-                    question: question,
-                    handle: handle,
+                    id: call.op,
+                    input: call.input,
+                    question: call.question,
+                    handle: call.handle,
                     provider: "round2-benchmark",
                     threadID: item.id,
                     admitted: true,
                     retrieveAvailable: true,
-                    verifiedRecoveryHandle: handle
+                    verifiedRecoveryHandle: call.handle
                 ))
-                return result.envelope?.jsonString() ?? result.text
+                return ManagedRetrieveMCP.OpAnswer(
+                    status: result.status.rawValue,
+                    text: result.text,
+                    envelope: result.envelope?.jsonString(),
+                    savedTokens: result.analytics.savedTokens,
+                    mode: result.analytics.mode
+                )
             },
             scopedRecoveryAvailable: true,
             distillAdmission: { true }
@@ -1127,13 +1133,19 @@ private extension TokenSaverRound2BenchmarkTests {
                 guard let data = try? recovery.retrieve(capability: handle) else { return nil }
                 return String(data: data, encoding: .utf8)
             },
-            ask: { op, input, question, handle in
+            ask: { call in
                 let result = await unavailable.dispatch(LibrarianRequest(
-                    id: op, input: input, question: question, handle: handle,
+                    id: call.op, input: call.input, question: call.question, handle: call.handle,
                     provider: "round2-benchmark", threadID: item.id,
-                    admitted: true, retrieveAvailable: true, verifiedRecoveryHandle: handle
+                    admitted: true, retrieveAvailable: true, verifiedRecoveryHandle: call.handle
                 ))
-                return result.envelope?.jsonString() ?? result.text
+                return ManagedRetrieveMCP.OpAnswer(
+                    status: result.status.rawValue,
+                    text: result.text,
+                    envelope: result.envelope?.jsonString(),
+                    savedTokens: result.analytics.savedTokens,
+                    mode: result.analytics.mode
+                )
             },
             scopedRecoveryAvailable: true,
             distillAdmission: { true }

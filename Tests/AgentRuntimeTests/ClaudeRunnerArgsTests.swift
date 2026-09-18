@@ -196,9 +196,11 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                 ManagedRetrieveMCP.searchToolName,
                 ManagedRetrieveMCP.catalogToolName,
                 ManagedRetrieveMCP.askToolName,
+                ManagedRetrieveMCP.extractToolName,
+                ManagedRetrieveMCP.digestToolName,
+                ManagedRetrieveMCP.pickToolName,
                 ManagedRetrieveMCP.toolName,
-                ManagedRetrieveMCP.compressToolName,
-            ]),
+                ManagedRetrieveMCP.compressToolName]),
             "CoreModel cannot import DistillCore, so the duplicated tool-name list must be pinned to the real server surface"
         )
     }

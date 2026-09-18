@@ -13,7 +13,111 @@ public struct ManagedRetrieveMCP: Sendable {
     public typealias SearchFn = @Sendable (_ query: String, _ topK: Int) async -> [CCRSearchResult]
     public typealias StatsFn = @Sendable () async -> DistillStatsSnapshot?
     public typealias CompressFn = @Sendable (_ request: DistillRequest) async -> DistillResponse?
-    public typealias AskFn = @Sendable (_ op: String, _ input: String, _ question: String, _ handle: String?) async -> String?
+    /// One catalog-op invocation with every argument a workspace / host op may
+    /// need. `rc_ask`, `rc_extract`, `rc_digest` and `rc_pick` all funnel here so
+    /// op behavior lives in exactly one dispatch path.
+    public struct OpCall: Sendable {
+        public var op: String
+        public var input: String
+        public var question: String?
+        public var handle: String?
+        public var paths: [String]
+        public var root: String?
+        public var symbol: String?
+        public var pattern: String?
+        public var fileName: String?
+        public var baseRef: String?
+        public var since: String?
+        public var locale: String?
+        public var payload: String?
+        public var navigation: String?
+        public var arguments: [String]
+        public var topK: Int?
+        public var budgetTokens: Int?
+        public var startLine: Int?
+        public var endLine: Int?
+        public var startByte: Int?
+        public var endByte: Int?
+        public var claim: String?
+        public var schema: String?
+        public var scopeToThread: Bool?
+        public var watchIntervalSeconds: Double?
+        public var watchTimeoutSeconds: Int?
+
+        public init(
+            op: String,
+            input: String = "",
+            question: String? = nil,
+            handle: String? = nil,
+            paths: [String] = [],
+            root: String? = nil,
+            symbol: String? = nil,
+            pattern: String? = nil,
+            fileName: String? = nil,
+            baseRef: String? = nil,
+            since: String? = nil,
+            locale: String? = nil,
+            payload: String? = nil,
+            navigation: String? = nil,
+            arguments: [String] = [],
+            topK: Int? = nil,
+            budgetTokens: Int? = nil,
+            startLine: Int? = nil,
+            endLine: Int? = nil,
+            startByte: Int? = nil,
+            endByte: Int? = nil,
+            claim: String? = nil,
+            schema: String? = nil,
+            scopeToThread: Bool? = nil,
+            watchIntervalSeconds: Double? = nil,
+            watchTimeoutSeconds: Int? = nil
+        ) {
+            self.op = op
+            self.input = input
+            self.question = question
+            self.handle = handle
+            self.paths = paths
+            self.root = root
+            self.symbol = symbol
+            self.pattern = pattern
+            self.fileName = fileName
+            self.baseRef = baseRef
+            self.since = since
+            self.locale = locale
+            self.payload = payload
+            self.navigation = navigation
+            self.arguments = arguments
+            self.topK = topK
+            self.budgetTokens = budgetTokens
+            self.startLine = startLine
+            self.endLine = endLine
+            self.startByte = startByte
+            self.endByte = endByte
+            self.claim = claim
+            self.schema = schema
+            self.scopeToThread = scopeToThread
+            self.watchIntervalSeconds = watchIntervalSeconds
+            self.watchTimeoutSeconds = watchTimeoutSeconds
+        }
+    }
+
+    public struct OpAnswer: Sendable {
+        public let status: String
+        public let text: String
+        public let envelope: String?
+        public let savedTokens: Int
+        public let mode: String
+
+        public init(status: String, text: String, envelope: String? = nil, savedTokens: Int = 0, mode: String = "") {
+            self.status = status
+            self.text = text
+            self.envelope = envelope
+            self.savedTokens = savedTokens
+            self.mode = mode
+        }
+    }
+
+    public typealias AskFn = @Sendable (_ call: OpCall) async -> OpAnswer?
     public typealias DistillAdmission = @Sendable () -> Bool
     public typealias DeferredSideEffect = @Sendable () async -> Void
 
@@ -33,6 +137,14 @@ public struct ManagedRetrieveMCP: Sendable {
     public static let catalogToolName = "rc_catalog"
     public static let compressToolName = "rc_compress"
     public static let askToolName = "rc_ask"
+    public static let extractToolName = "rc_extract"
+    public static let digestToolName = "rc_digest"
+    public static let pickToolName = "rc_pick"
+    /// Every tool a catalog `mcp:` reference can name.
+    public static let catalogOpToolNames = [askToolName, extractToolName, digestToolName, pickToolName]
+    /// One handle store per MCP session: a handle minted by a locally served op
+    /// must stay retrievable through `rc_retrieve` for the life of this child.
+    private let localStore = LibrarianHandleStore()
     private let retrieve: RetrieveFn
     private let search: SearchFn
     private let stats: StatsFn
@@ -70,6 +182,134 @@ public struct ManagedRetrieveMCP: Sendable {
 
     /// Production transport seam: callers write `response` first, then await the
     /// deferred ledger side effect. Non-compress tools have no deferred work.
+    /// Argument surface shared by rc_ask / rc_extract / rc_digest / rc_pick: the
+    /// op id plus whatever the op needs (payload, handle, workspace root, path…).
+    static func opToolProperties() -> [String: Any] {
+        [
+            "op": [
+                "type": "string",
+                "description": "Catalog id. Common: \(LibrarianCatalog.hotHintIDs.joined(separator: ", ")). Use rc_catalog for the complete enabled list.",
+            ],
+            "input": ["type": "string"],
+            "question": ["type": "string"],
+            "handle": ["type": "string"],
+            "paths": ["type": "array", "items": ["type": "string"]],
+            "root": ["type": "string", "description": "Workspace root for workspace/navigation ops."],
+            "symbol": ["type": "string"],
+            "pattern": ["type": "string"],
+            "file_name": ["type": "string"],
+            "base_ref": ["type": "string"],
+            "since": ["type": "string"],
+            "locale": ["type": "string"],
+            "payload": ["type": "string", "description": "Structured op payload (JSON) for batch_codemod_apply and friends."],
+            "navigation": ["type": "string", "description": "LSP operation (documentSymbol|definition|references|hover) or graphify subcommand (query|path|explain)."],
+            "arguments": ["type": "array", "items": ["type": "string"]],
+            "top_k": ["type": "integer"],
+            "budget_tokens": ["type": "integer"],
+            "start_line": ["type": "integer"],
+            "end_line": ["type": "integer"],
+            "start_byte": ["type": "integer"],
+            "end_byte": ["type": "integer"],
+            "claim": ["type": "string"],
+            "schema": ["type": "string", "description": "JSON schema for schema_validate_eval."],
+            "scope_to_thread": ["type": "boolean", "description": "Restrict transcript/session search to this thread."],
+            "watch_interval_seconds": ["type": "number"],
+            "watch_timeout_seconds": ["type": "integer"],
+        ]
+    }
+
+    /// Map MCP tool arguments onto the shared op call.
+    static func opCall(op: String, arguments: [String: Any]?) -> OpCall {
+        let paths = (arguments?["paths"] as? [String]) ?? []
+        return OpCall(
+            op: op,
+            input: (arguments?["input"] as? String) ?? "",
+            question: arguments?["question"] as? String,
+            handle: arguments?["handle"] as? String,
+            paths: paths,
+            root: arguments?["root"] as? String,
+            symbol: arguments?["symbol"] as? String,
+            pattern: arguments?["pattern"] as? String,
+            fileName: (arguments?["file_name"] as? String) ?? (arguments?["fileName"] as? String),
+            baseRef: (arguments?["base_ref"] as? String) ?? (arguments?["baseRef"] as? String),
+            since: arguments?["since"] as? String,
+            locale: arguments?["locale"] as? String,
+            payload: arguments?["payload"] as? String,
+            navigation: arguments?["navigation"] as? String,
+            arguments: (arguments?["arguments"] as? [String]) ?? [],
+            topK: (arguments?["top_k"] as? Int) ?? (arguments?["topK"] as? Int),
+            budgetTokens: (arguments?["budget_tokens"] as? Int) ?? (arguments?["budgetTokens"] as? Int),
+            startLine: (arguments?["start_line"] as? Int) ?? (arguments?["startLine"] as? Int),
+            endLine: (arguments?["end_line"] as? Int) ?? (arguments?["endLine"] as? Int),
+            startByte: (arguments?["start_byte"] as? Int) ?? (arguments?["startByte"] as? Int),
+            endByte: (arguments?["end_byte"] as? Int) ?? (arguments?["endByte"] as? Int),
+            claim: arguments?["claim"] as? String,
+            schema: arguments?["schema"] as? String,
+            scopeToThread: arguments?["scope_to_thread"] as? Bool,
+            watchIntervalSeconds: arguments?["watch_interval_seconds"] as? Double,
+            watchTimeoutSeconds: arguments?["watch_timeout_seconds"] as? Int
+        )
+    }
+
+    /// In-process dispatch for hosts that inject no sidecar transport (tests and
+    /// the standalone `mcp` probe): the same dispatcher the server uses.
+    static func dispatchLocally(
+        call: OpCall,
+        retrieve: RetrieveFn,
+        store: LibrarianHandleStore = LibrarianHandleStore()
+    ) async -> OpAnswer? {
+        // Never let a second call replace the bytes behind an existing handle:
+        // caller-supplied handles must not be substitutable content.
+        if let handle = call.handle, store.get(handle) != nil {
+            // already bound in this session; keep the original bytes
+        } else if !call.input.isEmpty {
+            _ = store.put(call.input, handle: call.handle)
+        } else if let handle = call.handle, let recovered = await retrieve(handle) {
+            _ = store.put(recovered, handle: handle)
+        }
+        let dispatcher = LibrarianDispatcher(store: store, environment: .live)
+        let request = LibrarianRequest(
+            id: call.op,
+            input: call.input,
+            question: call.question,
+            handle: call.handle,
+            admitted: true,
+            retrieveAvailable: true,
+            verifiedRecoveryHandle: call.handle,
+            command: call.arguments.first,
+            schema: call.schema ?? call.payload,
+            startLine: call.startLine,
+            endLine: call.endLine,
+            startByte: call.startByte,
+            endByte: call.endByte,
+            pattern: call.pattern,
+            claim: call.claim,
+            root: call.root,
+            paths: call.paths,
+            symbol: call.symbol,
+            fileName: call.fileName,
+            baseRef: call.baseRef,
+            since: call.since,
+            locale: call.locale,
+            payload: call.payload,
+            navigationOperation: call.navigation,
+            arguments: call.arguments,
+            topK: call.topK,
+            budgetTokens: call.budgetTokens,
+            scopeToThread: call.scopeToThread ?? false,
+            watchIntervalSeconds: call.watchIntervalSeconds,
+            watchTimeoutSeconds: call.watchTimeoutSeconds
+        )
+        let result = await dispatcher.dispatch(request)
+        return OpAnswer(
+            status: result.status.rawValue,
+            text: result.text,
+            envelope: result.envelope?.jsonString(),
+            savedTokens: result.analytics.savedTokens,
+            mode: result.analytics.mode
+        )
+    }
+
     public func handleForDelivery(_ line: String) async -> HandleResult {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let data = trimmed.data(using: .utf8),
@@ -167,6 +407,22 @@ public struct ManagedRetrieveMCP: Sendable {
                     "required": ["op"],
                 ],
             ])
+
+            for (toolName, toolDescription) in [
+                (Self.extractToolName, "Run an extraction catalog op over input or a handle and return only the extracted fields. Discover ops with rc_catalog."),
+                (Self.digestToolName, "Run a digest/summarize catalog op over input or a handle. Discover ops with rc_catalog."),
+                (Self.pickToolName, "Run a ranking/selection catalog op (encoder_rank, chunk_select, grep_hits_rank, context_pack…) over input or a handle."),
+            ] {
+                tools.append([
+                    "name": toolName,
+                    "description": toolDescription,
+                    "inputSchema": [
+                        "type": "object",
+                        "properties": Self.opToolProperties(),
+                        "required": ["op"],
+                    ],
+                ])
+            }
             if scopedRecoveryAvailable {
                 tools.append([
                     "name": Self.toolName,
@@ -199,7 +455,7 @@ public struct ManagedRetrieveMCP: Sendable {
             guard name == Self.statsToolName
                     || name == Self.searchToolName
                     || name == Self.catalogToolName
-                    || name == Self.askToolName
+                    || Self.catalogOpToolNames.contains(name ?? "")
                     || name == Self.compressToolName
                     || (scopedRecoveryAvailable && name == Self.toolName) else {
                 return errorReply(
@@ -269,7 +525,7 @@ public struct ManagedRetrieveMCP: Sendable {
                     return errorReply(id: id, code: -32602, message: "invalid catalog cursor")
                 }
             }
-            if name == Self.askToolName {
+            if let name, Self.catalogOpToolNames.contains(name) {
                 guard let op = args?["op"] as? String, !op.isEmpty else {
                     return errorReply(id: id, code: -32602, message: "missing op")
                 }
@@ -279,37 +535,26 @@ public struct ManagedRetrieveMCP: Sendable {
                         "isError": true,
                     ])
                 }
-                let input = args?["input"] as? String ?? ""
-                let question = args?["question"] as? String ?? op
-                let handle = args?["handle"] as? String
-                let text: String
+                let call = Self.opCall(op: op, arguments: args)
+                var answer: OpAnswer?
                 if let ask {
-                    guard let answered = await ask(op, input, question, handle) else {
-                        return reply(id: id, result: [
-                            "content": [["type": "text", "text": "catalog generate unavailable"]],
-                            "isError": true,
-                        ])
-                    }
-                    text = answered
-                } else {
-                    let store = LibrarianHandleStore()
-                    if !input.isEmpty {
-                        _ = store.put(input, handle: handle)
-                    } else if let handle, let recovered = await retrieve(handle) {
-                        _ = store.put(recovered, handle: handle)
-                    }
-                    let dispatcher = LibrarianDispatcher(store: store)
-                    let result = await dispatcher.dispatch(LibrarianRequest(
-                        id: op,
-                        input: input,
-                        question: question,
-                        handle: handle,
-                        admitted: true
-                    ))
-                    text = result.envelope?.jsonString() ?? result.text
+                    answer = await ask(call)
                 }
+                if answer == nil {
+                    // No sidecar lease (standalone `mcp` child, test harness) or the
+                    // sidecar is down: the shipped dispatcher still serves every
+                    // deterministic and workspace op locally.
+                    answer = await Self.dispatchLocally(call: call, retrieve: retrieve, store: localStore)
+                }
+                guard let answer else {
+                    return reply(id: id, result: [
+                        "content": [["type": "text", "text": "catalog op unavailable: \(op)"]],
+                        "isError": true,
+                    ])
+                }
+                let payload = answer.envelope ?? answer.text
                 return reply(id: id, result: [
-                    "content": [["type": "text", "text": text]],
+                    "content": [["type": "text", "text": payload]],
                     "isError": false,
                 ])
             }
@@ -319,7 +564,7 @@ public struct ManagedRetrieveMCP: Sendable {
             guard name == Self.toolName, let handleArg = args?["handle"] as? String else {
                 return errorReply(id: id, code: -32602, message: "unknown tool or missing handle")
             }
-            let original = await retrieve(handleArg)
+            let original = await retrieve(handleArg) ?? localStore.get(handleArg)
             return reply(id: id, result: [
                 "content": [["type": "text", "text": original ?? "original unavailable; the visible summary is all that remains"]],
                 "isError": original == nil,

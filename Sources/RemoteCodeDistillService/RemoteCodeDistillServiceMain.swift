@@ -183,6 +183,47 @@ private final class LiveTokenSaverDistillAdmission: @unchecked Sendable {
 
 @main
 struct RemoteCodeDistillServiceMain {
+    /// Host seams for the librarian ops: read-only transcript DB, the MLX encoder
+    /// lane for real embeddings, graphify / sourcekit-lsp / speech when installed.
+    /// The encoder loads lazily on first use and never blocks a turn that does not
+    /// need embeddings.
+    static func makeLibrarianEnvironment(appSupportDirectory: String) -> LibrarianOpEnvironment {
+        var environment = LibrarianOpEnvironment.live
+        let databasePath = URL(fileURLWithPath: appSupportDirectory, isDirectory: true)
+            .appendingPathComponent("remotecode.sqlite")
+            .path
+        if FileManager.default.fileExists(atPath: databasePath) {
+            environment.transcript = LibrarianTranscriptSQLite(dbPath: databasePath).store
+        }
+        environment.embedder = makeLibrarianEmbedder()
+        return environment
+    }
+
+    private static let librarianEmbedderLock = NSLock()
+    private static var librarianEmbedderBackend: MLXEmbeddingBackend?
+
+    private static func makeLibrarianEmbedder() -> LibrarianEmbeddingProvider? {
+        let model = TokenSaverApprovedEncoderManifests.defaultEmbedder.id
+        return LibrarianEmbeddingProvider(model: model) { texts in
+            librarianEmbedderLock.lock()
+            let backend: MLXEmbeddingBackend
+            if let existing = librarianEmbedderBackend {
+                backend = existing
+            } else {
+                guard let created = try? MLXEmbeddingBackend() else {
+                    librarianEmbedderLock.unlock()
+                    return nil
+                }
+                librarianEmbedderBackend = created
+                backend = created
+            }
+            librarianEmbedderLock.unlock()
+            guard let vectors = try? await backend.embed(texts) else { return nil }
+            return vectors.map { $0.map(Double.init) }
+        }
+    }
+
+
     static func main() async {
         // CLI mode: invoked as `distill` (the installed symlink's basename) or with a
         // leading `cli` arg. Native Swift, fail-open — replaces the old Python CLI (N1).
@@ -392,6 +433,9 @@ struct RemoteCodeDistillServiceMain {
                     FileHandle.standardError.write(Data("RemoteCodeDistillService savings record failed: \(error)\n".utf8))
                 }
             }
+            let librarianEnvironment = Self.makeLibrarianEnvironment(
+                appSupportDirectory: configuration.appSupportDirectory
+            )
             let librarianGenerate = LibrarianDistillRuntimeAdapter(
                 runtime: DeadlineDistillRuntime(
                     wrapping: recordedRuntime,
@@ -436,6 +480,7 @@ struct RemoteCodeDistillServiceMain {
                     }
                 },
                 librarianGenerate: librarianGenerate,
+                librarianEnvironment: librarianEnvironment,
                 distillAdmission: { liveDistillAdmission?.isAdmitted() == true }
             )
             let ready = try await server.start()
@@ -752,7 +797,7 @@ struct RemoteCodeDistillServiceMain {
                 defer { mcpCodecLock.unlock() }
                 return try? mcpDecoder.decode(DistillResponse.self, from: data)
             },
-            ask: { op, input, question, handle in
+            ask: { call in
                 guard admission?.isAdmitted() == true else { return nil }
                 guard let state, let url = URL(string: state.baseURL + "/v1/librarian") else { return nil }
                 var request = URLRequest(url: url)
@@ -761,23 +806,49 @@ struct RemoteCodeDistillServiceMain {
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 applyRecoveryHeaders(to: &request, environment: environment)
                 var payload: [String: Any] = [
-                    "id": op,
-                    "op": op,
-                    "input": input,
-                    "question": question,
+                    "id": call.op,
+                    "op": call.op,
+                    "input": call.input,
                     "provider": environment["REMOTE_CODE_AGENT_PROVIDER"] ?? "unknown",
                     "thread_id": environment["RC_TOKEN_SAVER_THREAD_ID"] ?? "",
                 ]
-                if let handle, !handle.isEmpty {
-                    payload["handle"] = handle
-                }
+                if let question = call.question { payload["question"] = question }
+                if let handle = call.handle, !handle.isEmpty { payload["handle"] = handle }
+                if let root = call.root, !root.isEmpty { payload["root"] = root }
+                if !call.paths.isEmpty { payload["paths"] = call.paths }
+                if let symbol = call.symbol { payload["symbol"] = symbol }
+                if let pattern = call.pattern { payload["pattern"] = pattern }
+                if let fileName = call.fileName { payload["file_name"] = fileName }
+                if let baseRef = call.baseRef { payload["base_ref"] = baseRef }
+                if let since = call.since { payload["since"] = since }
+                if let locale = call.locale { payload["locale"] = locale }
+                if let opPayload = call.payload { payload["payload"] = opPayload }
+                if let navigation = call.navigation { payload["navigation"] = navigation }
+                if !call.arguments.isEmpty { payload["arguments"] = call.arguments }
+                if let topK = call.topK { payload["top_k"] = topK }
+                if let budget = call.budgetTokens { payload["budget_tokens"] = budget }
+                if let startLine = call.startLine { payload["start_line"] = startLine }
+                if let endLine = call.endLine { payload["end_line"] = endLine }
+                if let startByte = call.startByte { payload["start_byte"] = startByte }
+                if let endByte = call.endByte { payload["end_byte"] = endByte }
+                if let claim = call.claim { payload["claim"] = claim }
+                if let schema = call.schema { payload["schema"] = schema }
+                if let scope = call.scopeToThread { payload["scope_to_thread"] = scope }
+                if let interval = call.watchIntervalSeconds { payload["watch_interval_seconds"] = interval }
+                if let timeout = call.watchTimeoutSeconds { payload["watch_timeout_seconds"] = timeout }
                 request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
                 guard let (data, response) = try? await session.data(for: request),
                       (response as? HTTPURLResponse)?.statusCode == 200,
                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                     return nil
                 }
-                return (obj["envelope"] as? String) ?? (obj["text"] as? String)
+                return ManagedRetrieveMCP.OpAnswer(
+                    status: obj["status"] as? String ?? "ok",
+                    text: obj["text"] as? String ?? "",
+                    envelope: obj["envelope"] as? String,
+                    savedTokens: obj["saved_tokens"] as? Int ?? 0,
+                    mode: obj["mode"] as? String ?? ""
+                )
             },
             scopedRecoveryAvailable: hasCompleteRecoveryScope(environment: environment),
             rootRunID: environment["RC_TOKEN_SAVER_ROOT_RUN_ID"],

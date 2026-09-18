@@ -98,7 +98,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         XCTAssertEqual(firstLine, secondLine, "tools/list must be byte-stable for the same capability scope")
         let obj = try parse(firstLine)
         let tools = try XCTUnwrap((obj["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_search", "rc_catalog", "rc_ask"])
+        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_search", "rc_catalog", "rc_ask", "rc_extract", "rc_digest", "rc_pick"])
     }
 
     func test_unscopedRetrieveToolIsRejectedEvenWhenLegacyClosureCanReturnOriginal() async throws {
@@ -111,7 +111,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let srv = server(["rcv1.capability": "exact original"], scoped: true)
         let listed = try parse(await srv.handle(#"{"jsonrpc":"2.0","id":20,"method":"tools/list"}"#))
         let tools = try XCTUnwrap((listed["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_search", "rc_catalog", "rc_ask", "rc_retrieve", "rc_compress"])
+        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_stats", "rc_search", "rc_catalog", "rc_ask", "rc_extract", "rc_digest", "rc_pick", "rc_retrieve", "rc_compress"])
 
         let called = try parse(await srv.handle(
             #"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"rc_retrieve","arguments":{"handle":"rcv1.capability"}}}"#
@@ -170,7 +170,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
         let op = try XCTUnwrap(properties["op"] as? [String: Any])
         XCTAssertEqual(op["type"] as? String, "string")
-        XCTAssertNil(op["enum"], "the 168-id catalog must be discovered just in time via rc_catalog")
+        XCTAssertNil(op["enum"], "the exposed catalog must be discovered just in time via rc_catalog")
         let description = try XCTUnwrap(op["description"] as? String)
         for id in LibrarianCatalog.hotHintIDs {
             XCTAssertTrue(description.contains(id), "missing hot hint \(id)")
@@ -215,7 +215,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         } while cursor != nil
 
         XCTAssertEqual(ids, LibrarianCatalog.implementedIDs)
-        XCTAssertEqual(Set(ids).count, 168)
+        XCTAssertEqual(Set(ids).count, 175)
         XCTAssertTrue(Set(ids).isDisjoint(with: LibrarianCatalog.forbiddenIDs))
         XCTAssertTrue(Set(ids).isDisjoint(with: LibrarianCatalog.disabledOnNineB))
     }
@@ -271,7 +271,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let recorder = AskRecorder()
         let srv = ManagedRetrieveMCP(
             retrieve: { _ in nil },
-            ask: { op, _, _, _ in await recorder.answer(op: op) }
+            ask: { call in ManagedRetrieveMCP.OpAnswer(status: "ok", text: await recorder.answer(op: call.op)) }
         )
 
         _ = try parse(await srv.handle(try callLine(
@@ -294,7 +294,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let recorder = AskRecorder()
         let srv = ManagedRetrieveMCP(
             retrieve: { _ in nil },
-            ask: { op, _, _, _ in await recorder.answer(op: op) }
+            ask: { call in ManagedRetrieveMCP.OpAnswer(status: "ok", text: await recorder.answer(op: call.op)) }
         )
 
         for (offset, op) in LibrarianCatalog.implementedIDs.enumerated() {
@@ -600,5 +600,79 @@ final class ManagedRetrieveMCPTests: XCTestCase {
             tools.contains { ($0["name"] as? String) == "rc_compress" },
             "world-readable receipt state must disable lossy MCP compression"
         )
+    }
+
+    /// WHY: the op tools are the model's only way to pass structured arguments.
+    /// A dropped `start_line`/`end_line` silently returned the whole blob instead
+    /// of the requested slice, which is worse than failing.
+    func test_opToolsForwardRangeAndWorkspaceArgumentsToTheDispatcher() async throws {
+        let srv = ManagedRetrieveMCP(retrieve: { _ in nil })
+
+        let sliced = try parse(await srv.handle(try callLine(
+            id: 300,
+            name: "rc_ask",
+            arguments: [
+                "op": "retrieve_range",
+                "input": "line1\nline2\nline3\nline4",
+                "handle": "range-handle",
+                "start_line": 2,
+                "end_line": 3,
+            ]
+        )))
+        let sliceText = try text(of: sliced)
+        XCTAssertEqual(sliceText, "line2\nline3",
+                       "retrieve_range must receive start_line/end_line through the MCP tool surface")
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-mcp-args-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "public func renderWidget() {}\n".write(
+            to: root.appendingPathComponent("Widget.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let extract = try parse(await srv.handle(try callLine(
+            id: 301,
+            name: "rc_extract",
+            arguments: ["op": "symbol_references", "symbol": "renderWidget", "root": root.path]
+        )))
+        let extractText = try text(of: extract)
+        XCTAssertTrue(extractText.contains("renderWidget"),
+                      "rc_extract must forward symbol/root to the workspace op: \(extractText)")
+        XCTAssertTrue(extractText.contains("Widget.swift"), extractText)
+    }
+
+    /// WHY: handles are the recovery contract. A later call must not be able to
+    /// replace the bytes behind an existing handle, and a handle minted by a
+    /// locally served op must stay retrievable in the same MCP session.
+    func test_mcpSessionKeepsHandlesAndNeverSubstitutesTheirBytes() async throws {
+        // Scoped capability on: rc_retrieve is only offered with recovery scope.
+        let srv = ManagedRetrieveMCP(retrieve: { _ in nil }, scopedRecoveryAvailable: true)
+
+        _ = try parse(await srv.handle(try callLine(
+            id: 310,
+            name: "rc_ask",
+            arguments: ["op": "handle_grep", "input": "alpha\nbeta\ngamma", "pattern": "beta", "handle": "session-handle"]
+        )))
+        _ = try parse(await srv.handle(try callLine(
+            id: 311,
+            name: "rc_ask",
+            arguments: ["op": "handle_grep", "input": "attacker-controlled", "pattern": "alpha", "handle": "session-handle"]
+        )))
+
+        let retrieved = try parse(await srv.handle(try callLine(
+            id: 312,
+            name: "rc_retrieve",
+            arguments: ["handle": "session-handle"]
+        )))
+        XCTAssertEqual(try text(of: retrieved), "alpha\nbeta\ngamma",
+                       "an existing handle must keep its original bytes for the session")
+    }
+
+    private func text(of response: [String: Any]) throws -> String {
+        let result = try XCTUnwrap(response["result"] as? [String: Any])
+        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+        return try XCTUnwrap(content.first?["text"] as? String)
     }
 }

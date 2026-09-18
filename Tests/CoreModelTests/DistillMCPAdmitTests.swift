@@ -34,7 +34,7 @@ final class DistillMCPAdmitTests: XCTestCase {
     func test_claudeAutomaticallyAllowedToolsUseServerScopedNames() {
         XCTAssertEqual(
             DistillMCPAdmit.toolNames,
-            ["rc_stats", "rc_search", "rc_catalog", "rc_ask", "rc_retrieve", "rc_compress"]
+            ["rc_stats", "rc_search", "rc_catalog", "rc_ask", "rc_extract", "rc_digest", "rc_pick", "rc_retrieve", "rc_compress"]
         )
         XCTAssertEqual(
             Set(DistillMCPAdmit.claudeAutomaticallyAllowedTools),
