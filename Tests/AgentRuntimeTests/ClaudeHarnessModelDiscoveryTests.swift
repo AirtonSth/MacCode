@@ -12,7 +12,7 @@ final class ClaudeHarnessModelDiscoveryTests: XCTestCase {
         try #"""
         #!/bin/sh
         IFS= read -r request
-        printf '%s\n' '{"type":"control_response","response":{"subtype":"success","response":{"models":[{"value":"default","displayName":"Default","description":"Account default","supportsEffort":false,"supportedEffortLevels":[]},{"value":"opus[1m]","displayName":"Opus","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max","ultracode"]},{"value":"claude-fable-5-1[1m]","displayName":"Claude Fable 5.1","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max","ultracode"]},{"value":"sonnet","displayName":"Sonnet","supportsEffort":true,"supportedEffortLevels":["medium"]},{"value":"haiku","displayName":"Haiku","supportsEffort":false,"supportedEffortLevels":[]}]}}}'
+        printf '%s\n' '{"type":"control_response","response":{"subtype":"success","response":{"models":[{"value":"default","displayName":"Default","description":"Account default","resolvedModel":"claude-opus-5-5","supportsEffort":false,"supportedEffortLevels":[]},{"value":"opus[1m]","displayName":"Opus","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max","ultracode"]},{"value":"claude-fable-5-1[1m]","displayName":"Claude Fable 5.1","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max","ultracode"]},{"value":"sonnet","displayName":"Sonnet","supportsEffort":true,"supportedEffortLevels":["medium"]},{"value":"haiku","displayName":"Haiku","supportsEffort":false,"supportedEffortLevels":[]}]}}}'
         """#.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
 
@@ -28,8 +28,8 @@ final class ClaudeHarnessModelDiscoveryTests: XCTestCase {
         XCTAssertEqual(fable.supportedReasoningEfforts, [.low, .medium, .high, .xhigh, .max, .ultracode])
         XCTAssertTrue(fable.supportsReasoning)
         XCTAssertTrue(fable.supportsCustomModel)
-        XCTAssertNil(models.first { $0.id == "default" }?.contextWindowTokens,
-                     "catalog may lead with id default; unknown windows must stay nil")
+        XCTAssertEqual(models.first { $0.id == "default" }?.contextWindowTokens, 1_000_000,
+                       "the live CLI's resolvedModel should provide the default alias context window")
         XCTAssertEqual(models.first { $0.id == "opus[1m]" }?.contextWindowTokens, 1_000_000)
         XCTAssertEqual(fable.contextWindowTokens, 1_000_000)
         XCTAssertEqual(models.first { $0.id == "sonnet" }?.contextWindowTokens, 1_000_000)
