@@ -127,6 +127,23 @@ final class CodexParserTests: XCTestCase {
                        "omitted aggregated_output must not display the command string")
     }
 
+    func test_realExecSchema_camelCaseCommandExecutionIsNotAssistantText() {
+        // WHY: app-server ThreadItem uses camelCase commandExecution. After
+        // lowercasing, that is "commandexecution", which used to miss
+        // command_execution and fall through to assistantMessage.
+        let p = CodexParser()
+        var state = AssistantTimelineState()
+        for l in [
+            #"{"type":"thread.started","thread_id":"t-camel"}"#,
+            #"{"type":"turn.started"}"#,
+            #"{"type":"item.completed","item":{"id":"item_camel","type":"commandExecution","command":"ls","aggregated_output":"README.md","status":"completed"}}"#
+        ] { for ev in p.parseLine(l) { state.apply(ev) } }
+        let item = state.turns[0].items.first { $0.id == "item_camel" }
+        XCTAssertEqual(item?.type, .commandExecution)
+        XCTAssertEqual(item?.summary, "ls")
+        XCTAssertEqual(item?.output, "README.md")
+    }
+
     func test_realExecSchema_itemUpdatedTodoList() {
         let p = CodexParser()
         var state = AssistantTimelineState()

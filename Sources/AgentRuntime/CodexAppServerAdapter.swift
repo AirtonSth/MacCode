@@ -1472,7 +1472,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             )))
         }
         switch method {
-        case "thread/started":
+        case "thread/started", "thread.started":
             if let providerThreadId = string(payload, "threadId") ?? (payload["thread"] as? [String: Any]).flatMap({ string($0, "id") }),
                !isAwaitingSeedPublish(threadId: threadId) {
                 events.append(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId))
@@ -3711,8 +3711,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case "agentMessage", "assistantMessage", "agent_message", "assistant_message", "message": return .assistantMessage
         case "plan": return .plan
         case "reasoning", "reasoning_text", "summary_text": return .reasoning
-        case "commandExecution", "local_shell_call", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output": return .commandExecution
-        case "fileChange": return .fileChange
+        case "commandExecution", "command_execution", "local_shell_call", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output": return .commandExecution
+        case "fileChange", "file_change": return .fileChange
         case "mcpToolCall", "mcp_call": return .mcpToolCall
         case "dynamicToolCall", "imageGeneration": return .dynamicToolCall
         case "collabAgentToolCall": return .collabToolCall
@@ -3843,13 +3843,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             return "Plan"
         case "reasoning", "reasoning_text", "summary_text":
             return joinedStrings(item["summary"]) ?? "Reasoning"
-        case "commandExecution", "local_shell_call":
+        case "commandExecution", "command_execution", "local_shell_call":
             return string(item, "command") ?? string(item, "status")
         case "function_call", "custom_tool_call":
             return string(item, "name") ?? string(item, "call_id") ?? "Tool call"
         case "function_call_output", "custom_tool_call_output":
             return string(item, "call_id") ?? "Tool output"
-        case "fileChange":
+        case "fileChange", "file_change":
             if let changes = item["changes"] as? [[String: Any]] {
                 return "\(changes.count) file change\(changes.count == 1 ? "" : "s")"
             }
@@ -3887,11 +3887,14 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 ?? string(item, "markdown")
         case "reasoning", "reasoning_text", "summary_text":
             return joinedStrings(item["content"]) ?? stringBodyFallback(for: item)
-        case "commandExecution", "local_shell_call":
+        case "commandExecution", "command_execution", "local_shell_call":
             // aggregatedOutput is stdout and may be "" / omitted. Command stays
             // in summary; never copy it into the output body.
-            return string(item, "aggregatedOutput") ?? stringBodyFallback(for: item)
-        case "fileChange":
+            if let aggregated = string(item, "aggregatedOutput") ?? string(item, "aggregated_output") {
+                return aggregated
+            }
+            return stringBodyFallback(for: item)
+        case "fileChange", "file_change":
             // Prefer human-readable patch/diff over opaque JSON so the Agent
             // App can paint a Cursor-style Edit card in the timeline.
             if let patch = string(item, "patch") ?? string(item, "diff") ?? string(item, "unified_diff"),

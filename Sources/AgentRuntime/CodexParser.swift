@@ -349,18 +349,18 @@ public final class CodexParser {
         switch s.lowercased() {
         case "reasoning": return .reasoning
         case "plan", "todo_list", "plan_update": return .plan
-        case "command", "command_execution": return .commandExecution
-        case "file_change", "patch", "apply_patch": return .fileChange
-        case "mcp", "mcp_tool_call": return .mcpToolCall
-        case "dynamic", "dynamic_tool_call": return .dynamicToolCall
-        case "collab", "collab_tool_call": return .collabToolCall
-        case "web_search": return .webSearch
-        case "image_view": return .imageView
+        case "command", "command_execution", "commandexecution": return .commandExecution
+        case "file_change", "filechange", "patch", "apply_patch": return .fileChange
+        case "mcp", "mcp_tool_call", "mcptoolcall": return .mcpToolCall
+        case "dynamic", "dynamic_tool_call", "dynamictoolcall": return .dynamicToolCall
+        case "collab", "collab_tool_call", "collabtoolcall", "collabagenttoolcall": return .collabToolCall
+        case "web_search", "websearch": return .webSearch
+        case "image_view", "imageview": return .imageView
         case "review": return .review
-        case "context_compaction": return .contextCompaction
+        case "context_compaction", "contextcompaction": return .contextCompaction
         case "error": return .error
         case "tool", "tool_call": return .tool
-        case "agent_message", "assistantmessage", "assistant", "message", "text":
+        case "agent_message", "agentmessage", "assistantmessage", "assistant", "message", "text":
             return .assistantMessage
         default: return .assistantMessage
         }

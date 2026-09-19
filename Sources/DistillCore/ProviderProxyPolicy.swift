@@ -1416,20 +1416,30 @@ public enum ProviderProxyPolicy {
         }
     }
 
+    /// openai/codex 0.154 `codex exec` value flags. Unknown dash flags still
+    /// fail closed (malformed → raw CLI).
+    private static let nestedCodexValueOptions: Set<String> = [
+        "--sandbox", "-s", "--ask-for-approval", "-a", "--config", "-c",
+        "--model", "-m", "--image", "-i", "--color", "--cd", "-C",
+        "--profile", "-p",
+        "--enable", "--disable", "--local-provider", "--add-dir",
+        "--thread-source", "--output-schema", "--output-last-message", "-o"
+    ]
+
+    private static let nestedCodexFlagOptions: Set<String> = [
+        "--dangerously-bypass-approvals-and-sandbox", "--ephemeral",
+        "--full-auto", "--help", "-h", "--ignore-user-config", "--json",
+        "--oss", "--search", "--skip-git-repo-check", "--strict-config",
+        "--version", "-V",
+        "--worktree", "--approve-for-me", "--dangerously-bypass-hook-trust",
+        "--ignore-rules"
+    ]
+
     private static func nestedCodexAgentAppEligible(arguments: [String]) -> Bool {
         let scan = scanNestedArguments(
             arguments,
-            valueOptions: [
-                "--sandbox", "--ask-for-approval", "-a", "--config", "-c",
-                "--model", "-m", "--image", "--color", "--cd", "-C",
-                "--profile", "-p"
-            ],
-            flagOptions: [
-                "--dangerously-bypass-approvals-and-sandbox", "--ephemeral",
-                "--full-auto", "--help", "-h", "--ignore-user-config", "--json",
-                "--oss", "--search", "--skip-git-repo-check", "--strict-config",
-                "--version", "-V"
-            ]
+            valueOptions: nestedCodexValueOptions,
+            flagOptions: nestedCodexFlagOptions
         )
         guard !scan.malformed else { return false }
         if scan.flags.contains("--version") || scan.flags.contains("-V")
@@ -1453,17 +1463,8 @@ public enum ProviderProxyPolicy {
         guard nestedCodexAgentAppEligible(arguments: arguments) else { return nil }
         let scan = scanNestedArguments(
             arguments,
-            valueOptions: [
-                "--sandbox", "--ask-for-approval", "-a", "--config", "-c",
-                "--model", "-m", "--image", "--color", "--cd", "-C",
-                "--profile", "-p"
-            ],
-            flagOptions: [
-                "--dangerously-bypass-approvals-and-sandbox", "--ephemeral",
-                "--full-auto", "--help", "-h", "--ignore-user-config", "--json",
-                "--oss", "--search", "--skip-git-repo-check", "--strict-config",
-                "--version", "-V"
-            ]
+            valueOptions: nestedCodexValueOptions,
+            flagOptions: nestedCodexFlagOptions
         )
         guard !scan.malformed else { return nil }
         let model = scan.optionValues["--model"]?.last
@@ -1594,17 +1595,8 @@ public enum ProviderProxyPolicy {
     private static func nestedCodexInlinePrompt(arguments: [String]) -> String? {
         let scan = scanNestedArguments(
             arguments,
-            valueOptions: [
-                "--sandbox", "--ask-for-approval", "-a", "--config", "-c",
-                "--model", "-m", "--image", "--color", "--cd", "-C",
-                "--profile", "-p"
-            ],
-            flagOptions: [
-                "--dangerously-bypass-approvals-and-sandbox", "--ephemeral",
-                "--full-auto", "--help", "-h", "--ignore-user-config", "--json",
-                "--oss", "--search", "--skip-git-repo-check", "--strict-config",
-                "--version", "-V"
-            ]
+            valueOptions: nestedCodexValueOptions,
+            flagOptions: nestedCodexFlagOptions
         )
         guard !scan.malformed, scan.positionals.first == "exec" else { return nil }
         if Self.nestedCodexExecSubcommandKeepsRawCLI(scan.positionals) { return nil }
