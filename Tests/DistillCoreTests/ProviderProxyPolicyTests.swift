@@ -706,6 +706,38 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertEqual(grok.permissionMode, .fullAccess)
         XCTAssertNil(grok.runtimeProfile)
 
+        let grokYolo = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.6", "--reasoning-effort", "high",
+                "--prompt", "investigate", "--yolo"
+            ],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(grokYolo.permissionMode, .fullAccess,
+                       "grok-build clap alias --yolo must map like --always-approve")
+        XCTAssertEqual(grokYolo.reasoningEffort, .high)
+
+        let grokMaxTurns = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.6", "--effort", "high",
+                "--max-turns", "2", "--prompt", "investigate"
+            ],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(grokMaxTurns.provider, .grok)
+        XCTAssertEqual(grokMaxTurns.permissionMode, .supervised)
+
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.6", "--effort", "high",
+                "--prompt", "investigate", "--not-a-real-flag"
+            ],
+            promptFile: prompt
+        ), "unknown grok dash flags must stay malformed and raw")
+
         XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "grok",
             arguments: ["--prompt", "investigate", "--always-approve"],

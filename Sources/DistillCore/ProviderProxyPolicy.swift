@@ -717,7 +717,7 @@ public enum ProviderProxyPolicy {
                 ]
             case .grok:
                 return [
-                    "--always-approve", "--no-memory", "--no-subagents", "--no-auto-update",
+                    "--always-approve", "--yolo", "--no-memory", "--no-subagents", "--no-auto-update",
                     "--disable-web-search", "--fullscreen", "--minimal", "--no-alt-screen",
                     "--no-plan", "--verbatim", "--help", "-h", "--version", "-v"
                 ]
@@ -1049,7 +1049,7 @@ public enum ProviderProxyPolicy {
             "--profile", "--add-dir", "--local-provider", "--color"
         ]
         let otherBooleanFlags: Set<String> = [
-            "--always-approve", "--no-memory", "--no-subagents",
+            "--always-approve", "--yolo", "--no-memory", "--no-subagents",
             "--no-auto-update", "--print", "--verbose",
             "--no-session-persistence", "--json", "--full-auto",
             "--dangerously-bypass-approvals-and-sandbox",
@@ -1614,6 +1614,35 @@ public enum ProviderProxyPolicy {
         return joined.isEmpty ? nil : joined
     }
 
+    /// grok-build 1.0.34 / live grok CLI flags used by nested Agent App promotion.
+    /// Keep in sync with the permission-admission grok value set plus prompt aliases.
+    private static let nestedGrokValueOptions: Set<String> = [
+        "--prompt-file", "--prompt", "-p", "--rules",
+        "--permission-mode", "--sandbox", "--model", "-m",
+        "--effort", "--reasoning-effort", "--output-format",
+        "--input-format", "--disallowed-tools", "--allowed-tools",
+        "--allow", "--deny", "--tools", "--json-schema",
+        "--max-turns", "--prompt-json", "--system-prompt-override",
+        "--cwd", "--worktree", "-w", "--worktree-ref", "--debug-file",
+        "--leader-socket", "--agent", "--agents",
+        "--settings", "--resume", "-r", "--session-id"
+    ]
+
+    /// `--yolo` is grok-build's clap alias of `--always-approve`.
+    private static let nestedGrokFlagOptions: Set<String> = [
+        "--always-approve", "--yolo", "--auto-update", "--continue", "-c",
+        "--help", "-h", "--list-models", "--memory", "--no-auto-update",
+        "--no-memory", "--no-plan", "--no-subagents", "--plan",
+        "--subagents", "--version", "-V", "-v",
+        "--verbatim", "--disable-web-search", "--fullscreen", "--minimal",
+        "--no-alt-screen", "--fork-session", "--include-partial-messages",
+        "--debug"
+    ]
+
+    private static func nestedGrokAlwaysApprove(_ scan: NestedArgScan) -> Bool {
+        scan.flags.contains("--always-approve") || scan.flags.contains("--yolo")
+    }
+
     private static func nestedGrokAgentAppEligible(arguments: [String]) -> Bool {
         if samGrokWorkerAgentAppDelegation(
             providerBasename: "grok",
@@ -1623,27 +1652,17 @@ public enum ProviderProxyPolicy {
         }
         let scan = scanNestedArguments(
             arguments,
-            valueOptions: [
-                "--prompt-file", "--prompt", "-p", "--rules",
-                "--permission-mode", "--sandbox", "--model", "-m",
-                "--effort", "--reasoning-effort", "--output-format",
-                "--input-format", "--disallowed-tools", "--allowed-tools",
-                "--settings", "--resume", "-r", "--session-id"
-            ],
-            flagOptions: [
-                "--always-approve", "--auto-update", "--continue",
-                "--help", "-h", "--list-models", "--memory", "--no-auto-update",
-                "--no-memory", "--no-plan", "--no-subagents", "--plan",
-                "--subagents", "--version", "-V"
-            ]
+            valueOptions: nestedGrokValueOptions,
+            flagOptions: nestedGrokFlagOptions
         )
         guard !scan.malformed else { return false }
         if scan.flags.contains("--version") || scan.flags.contains("-V")
+            || scan.flags.contains("-v")
             || scan.flags.contains("--help") || scan.flags.contains("-h")
             || scan.flags.contains("--list-models") {
             return false
         }
-        if !scan.flags.isDisjoint(with: ["--resume", "-r", "--continue", "--session-id", "--fork-session"]) {
+        if !scan.flags.isDisjoint(with: ["--resume", "-r", "--continue", "-c", "--session-id", "--fork-session"]) {
             return false
         }
         // Agent turn needs an explicit prompt channel (file, flag, or stdin later).
@@ -1657,7 +1676,7 @@ public enum ProviderProxyPolicy {
         // agent shape — not bare `grok` with nothing.
         if hasPromptChannel { return true }
         return scan.optionValues["--model"]?.isEmpty == false
-            || scan.flags.contains("--always-approve")
+            || nestedGrokAlwaysApprove(scan)
             || scan.optionValues["--sandbox"] != nil
     }
 
@@ -1674,19 +1693,8 @@ public enum ProviderProxyPolicy {
         guard nestedGrokAgentAppEligible(arguments: arguments) else { return nil }
         let scan = scanNestedArguments(
             arguments,
-            valueOptions: [
-                "--prompt-file", "--prompt", "-p", "--rules",
-                "--permission-mode", "--sandbox", "--model", "-m",
-                "--effort", "--reasoning-effort", "--output-format",
-                "--input-format", "--disallowed-tools", "--allowed-tools",
-                "--settings", "--resume", "-r", "--session-id"
-            ],
-            flagOptions: [
-                "--always-approve", "--auto-update", "--continue",
-                "--help", "-h", "--list-models", "--memory", "--no-auto-update",
-                "--no-memory", "--no-plan", "--no-subagents", "--plan",
-                "--subagents", "--version", "-V"
-            ]
+            valueOptions: nestedGrokValueOptions,
+            flagOptions: nestedGrokFlagOptions
         )
         guard !scan.malformed else { return nil }
         guard let model = scan.optionValues["--model"]?.last
@@ -1699,7 +1707,7 @@ public enum ProviderProxyPolicy {
               requestedEffort != .ultracode else { return nil }
         let effort = GrokReasoningPolicy.normalizedEffort(requestedEffort, model: model)
         let permission: AgentPermissionMode = {
-            if scan.flags.contains("--always-approve") { return .fullAccess }
+            if nestedGrokAlwaysApprove(scan) { return .fullAccess }
             switch (scan.optionValues["--permission-mode"]?.last ?? "").lowercased() {
             case "acceptedits", "accept-edits", "auto", "workspace":
                 return .autoAcceptEdits
@@ -1730,19 +1738,8 @@ public enum ProviderProxyPolicy {
     private static func nestedGrokInlinePrompt(arguments: [String]) -> String? {
         let scan = scanNestedArguments(
             arguments,
-            valueOptions: [
-                "--prompt-file", "--prompt", "-p", "--rules",
-                "--permission-mode", "--sandbox", "--model", "-m",
-                "--effort", "--reasoning-effort", "--output-format",
-                "--input-format", "--disallowed-tools", "--allowed-tools",
-                "--settings", "--resume", "-r", "--session-id"
-            ],
-            flagOptions: [
-                "--always-approve", "--auto-update", "--continue",
-                "--help", "-h", "--list-models", "--memory", "--no-auto-update",
-                "--no-memory", "--no-plan", "--no-subagents", "--plan",
-                "--subagents", "--version", "-V"
-            ]
+            valueOptions: nestedGrokValueOptions,
+            flagOptions: nestedGrokFlagOptions
         )
         guard !scan.malformed else { return nil }
         if let prompt = scan.optionValues["--prompt"]?.last
@@ -1918,7 +1915,7 @@ public enum ProviderProxyPolicy {
                 "--permission-mode", "--disallowed-tools", "--allowed-tools", "--rules"
             ]
             booleanFlags = [
-                "--always-approve", "--no-memory", "--no-subagents",
+                "--always-approve", "--yolo", "--no-memory", "--no-subagents",
                 "--no-auto-update"
             ]
         case AgentProvider.claude.rawValue:
