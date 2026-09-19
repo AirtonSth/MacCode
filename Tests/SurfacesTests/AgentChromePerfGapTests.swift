@@ -45,6 +45,64 @@ struct AgentChromePerfGapTests {
         )
     }
 
+    @Test("toolInputCache and assistant-text caches key by fingerprint, not full body")
+    func cacheKeys_areFingerprintsNotFullBodies() throws {
+        // WHY: NSCache totalCostLimit ignores key bytes. Body-as-NSString keys
+        // retained a second UTF-16 copy of every cached JSON / assistant body.
+        let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
+        let toolStart = try #require(source.range(of: "static func toolInputObject(for item: AssistantItem)"))
+        let toolRest = source[toolStart.lowerBound...]
+        let toolEnd = toolRest.range(of: "static func intMillis(from value: Any?)")?.lowerBound ?? toolRest.endIndex
+        let toolChunk = String(source[toolStart.lowerBound..<toolEnd])
+        #expect(toolChunk.contains("AgentMessageMarkdown.cacheKey(for: body)"))
+        #expect(!toolChunk.contains("let key = body as NSString"))
+
+        let normStart = try #require(source.range(of: "private static func normalizedAssistantText(_ text: String)"))
+        let normRest = source[normStart.lowerBound...]
+        let normEnd = normRest.range(of: "private static func makeNormalizedAssistantText")?.lowerBound ?? normRest.endIndex
+        let normChunk = String(source[normStart.lowerBound..<normEnd])
+        #expect(normChunk.contains("AgentMessageMarkdown.cacheKey(for: text)"))
+        #expect(!normChunk.contains("let key = text as NSString"))
+    }
+
+    @Test("header and transcript column snapshot mentionableBots; composer @ stays live")
+    func mentionableBots_headerAndColumnUseGenerationSnapshot() throws {
+        // WHY: live provider calls on every timeline/VM publish recopied the
+        // catalog (lock + array) even when contentGeneration was unchanged.
+        let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
+        let headerStart = try #require(source.range(of: "private var header: some View {"))
+        let headerRest = source[headerStart.lowerBound...]
+        let headerEnd = headerRest.range(of: "private var fullAccessBanner")?.lowerBound ?? headerRest.endIndex
+        let header = String(source[headerStart.lowerBound..<headerEnd])
+        #expect(header.contains("snapshotMentionableBots()"))
+        #expect(!header.contains("mentionableBotsProvider()"))
+
+        let columnMarker = "let historyRows = Self.chatFlowRows(split.history)"
+        let columnStart = try #require(source.range(of: columnMarker))
+        let columnRest = source[columnStart.lowerBound...]
+        let columnEnd = columnRest.range(of: "VStack(alignment: .leading, spacing: 32)")?.lowerBound ?? columnRest.endIndex
+        let column = String(source[columnStart.lowerBound..<columnEnd])
+        #expect(column.contains("snapshotMentionableBots()"))
+        #expect(!column.contains("mentionableBotsProvider()"))
+        #expect(source.contains("mentionableBots = mentionableBotsProvider()"))
+    }
+
+    @Test("cachedChatRowPaintContext returns on generation+counts before building the signature")
+    func paintContext_shortCircuitsSignatureBuilder() throws {
+        // WHY: the F2 signature concatenated every bot identity on every column
+        // body, including tool-body-only ticks that already knew generation and
+        // row/visible counts. Count match must win before that String alloc.
+        let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
+        let start = try #require(source.range(of: "private func cachedChatRowPaintContext("))
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "private func snapshotMentionableBots()")?.lowerBound ?? rest.endIndex
+        let chunk = String(source[start.lowerBound..<end])
+        let counts = try #require(chunk.range(of: "chatRowPaintContextCache.rowCount == rows.count"))
+        let signature = try #require(chunk.range(of: "Self.chatRowPaintContextSignature("))
+        #expect(counts.lowerBound < signature.lowerBound)
+        #expect(chunk.contains("chatRowPaintContextSignatureBuilderCountForTesting"))
+    }
+
     @Test("live tool preview uses toolInputObject cache, not a second JSONSerialization")
     func toolCommandPreview_routesThroughToolInputObject() throws {
         let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")

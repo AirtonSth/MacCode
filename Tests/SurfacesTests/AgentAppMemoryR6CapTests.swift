@@ -28,6 +28,34 @@ final class AgentAppMemoryR6CapTests: XCTestCase {
         XCTAssertEqual(AgentAppView.assistantTextDedupeCacheCountLimit, 128)
     }
 
+    func test_assistantTextDedupeCache_keysAreFingerprintsNotFullBodies() throws {
+        // WHY: costLimit bounds values, not keys. Full-body NSString keys
+        // duplicated up to 2×128 KiB of source text. Markdown cacheKey is
+        // `"utf8Count:hash"` (~20–40 B × 128 × 2 ≈ 10 KiB).
+        let body = String(repeating: "x", count: 4_096)
+        let key = AgentMessageMarkdown.cacheKey(for: body)
+        XCTAssertEqual(key as String, "\(body.utf8.count):\(AgentMessageMarkdown.sourceFingerprint(for: body))")
+        XCTAssertLessThan((key as String).utf8.count, 80)
+        let beforeKeyBytes = 2 * AgentAppView.assistantTextDedupeCacheCostLimit
+        let afterKeyBytes = 2 * AgentAppView.assistantTextDedupeCacheCountLimit * (key as String).utf8.count
+        XCTAssertEqual(beforeKeyBytes, 256 * 1024)
+        XCTAssertLessThan(afterKeyBytes, 20 * 1024)
+
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("let key = AgentMessageMarkdown.cacheKey(for: text)"))
+        XCTAssertFalse(
+            source.contains("let key = text as NSString"),
+            "normalized/compact caches must not key by the full body NSString"
+        )
+    }
+
     func test_retentionEstimate_streamBatch_32MiBTo2MiB() {
         let prior = 32 * 1_024 * 1_024
         let limit = StreamEventBatch.Limits().maxBufferedBytes
