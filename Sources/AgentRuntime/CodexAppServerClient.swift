@@ -1019,16 +1019,27 @@ public final class CodexAppServerClient: @unchecked Sendable {
         return params
     }
 
+    /// openai/codex 0.154 UserInput.Text JSON schema uses `text_elements`.
+    /// Later serde camelCase peers read `textElements`. UserInput does not
+    /// deny unknown fields, so send both empty arrays when unused.
+    private static func textInputItem(_ text: String) -> JSONObject {
+        [
+            "type": "text",
+            "text": text,
+            "textElements": [Any](),
+            "text_elements": [Any]()
+        ]
+    }
+
     public static func turnStartParams(providerThreadId: String, for request: AgentRunRequest) -> JSONObject {
         var input: [JSONObject] = []
         if let seed = request.preparedContextSeed?.encoded.trimmingCharacters(in: .whitespacesAndNewlines),
            !seed.isEmpty {
-            input.append(["type": "text", "text": seed, "text_elements": [Any]()])
+            input.append(Self.textInputItem(seed))
         }
         let prompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if !prompt.isEmpty {
-            // Codex 0.146 UserInput text requires text_elements (empty when unused).
-            input.append(["type": "text", "text": prompt, "text_elements": [Any]()])
+            input.append(Self.textInputItem(prompt))
         }
         for attachment in request.attachments where attachment.kind == .image {
             input.append([

@@ -1023,6 +1023,30 @@ final class ProviderProxyPolicyTests: XCTestCase {
         ))
         XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
             providerBasename: "codex",
+            arguments: [
+                "exec", "--enable", "web_search_cached",
+                "--add-dir", "/tmp/extra",
+                "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high",
+                "work"
+            ]
+        ), "openai/codex 0.154 exec flags must not mark nested promotion malformed")
+        XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "codex",
+            arguments: [
+                "exec", "-s", "workspace-write", "-i", "/tmp/shot.png",
+                "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high",
+                "work"
+            ]
+        ), "0.154 short aliases -s/--sandbox and -i/--image must not mark nested promotion malformed")
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "codex",
+            arguments: [
+                "exec", "--not-a-real-flag", "--model", "gpt-5.6-sol",
+                "-c", "model_reasoning_effort=high", "work"
+            ]
+        ), "unknown dash flags still fail closed to the raw CLI")
+        XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "codex",
             arguments: ["exec", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=ultra", "work"]
         ), "Codex ultra is representable and must promote before stdin materialization")
         XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(

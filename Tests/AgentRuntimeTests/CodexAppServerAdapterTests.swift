@@ -3178,6 +3178,55 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }, "omitted aggregatedOutput must not display the command string")
     }
 
+    func test_readThreadSnakeCaseCommandExecutionUsesAggregatedOutput() async throws {
+        // WHY: exec JSONL / mixed snapshots use command_execution + aggregated_output.
+        // Mapping only commandExecution left those items as generic tools and
+        // dropped stdout.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        client.readResponse = [
+            "thread": [
+                "id": "codex-thread-1",
+                "turns": [[
+                    "id": "turn-snake-cmd",
+                    "status": "completed",
+                    "items": [
+                        [
+                            "id": "cmd-snake",
+                            "type": "command_execution",
+                            "command": "swift test",
+                            "status": "completed",
+                            "aggregated_output": "ok\n"
+                        ]
+                    ]
+                ]]
+            ]
+        ]
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "read snake"
+        )) { _ in }
+
+        let events = try await adapter.readThread(threadId: threadId)
+        XCTAssertTrue(events.contains {
+            if case .itemStarted(let item) = $0 {
+                return item.id == "cmd-snake" && item.type == .commandExecution && item.summary == "swift test"
+            }
+            return false
+        })
+        XCTAssertTrue(events.contains {
+            if case .itemDelta(let itemId, _, let output, _) = $0 {
+                return itemId == "cmd-snake" && output == "ok\n"
+            }
+            return false
+        }, "aggregated_output must become command stdout")
+    }
+
     func test_readThreadRendersCommonStringAliasesForUncommonSnapshotItems() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         client.readResponse = [
