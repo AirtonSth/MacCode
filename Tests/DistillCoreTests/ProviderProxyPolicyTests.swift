@@ -705,6 +705,18 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertEqual(grok.permissionMode, .fullAccess)
         XCTAssertNil(grok.runtimeProfile)
 
+        let grokYolo = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.5", "--effort", "high",
+                "--prompt", "investigate", "--yolo", "--max-turns", "8"
+            ],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(grokYolo.permissionMode, .fullAccess,
+                       "grok-build clap aliases --yolo to --always-approve")
+        XCTAssertEqual(grokYolo.reasoningEffort, .high)
+
         XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "grok",
             arguments: ["--prompt", "investigate", "--always-approve"],

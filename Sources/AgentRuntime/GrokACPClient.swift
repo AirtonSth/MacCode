@@ -762,9 +762,7 @@ public final class GrokACPClient: @unchecked Sendable {
            let wire = wireReasoningEffort(reasoningEffort, modelId: trimmedModel) {
             meta["reasoningEffort"] = wire
         }
-        if !meta.isEmpty {
-            params["_meta"] = meta
-        }
+        params["_meta"] = meta
         return params
     }
 

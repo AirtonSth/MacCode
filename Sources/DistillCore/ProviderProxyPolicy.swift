@@ -727,7 +727,7 @@ public enum ProviderProxyPolicy {
                 ]
             case .grok:
                 return [
-                    "--always-approve", "--no-memory", "--no-subagents", "--no-auto-update",
+                    "--always-approve", "--yolo", "--no-memory", "--no-subagents", "--no-auto-update",
                     "--disable-web-search", "--fullscreen", "--minimal", "--no-alt-screen",
                     "--no-plan", "--verbatim", "--help", "-h", "--version", "-v"
                 ]
@@ -1063,10 +1063,11 @@ public enum ProviderProxyPolicy {
             "--output-format", "--input-format", "--permission-mode",
             "--sandbox", "--ask-for-approval", "-a", "--config", "-c",
             "--effort", "--reasoning-effort", "--image", "--cd", "-C",
-            "--profile", "--add-dir", "--local-provider", "--color"
+            "--profile", "--add-dir", "--local-provider", "--color",
+            "--max-turns"
         ]
         let otherBooleanFlags: Set<String> = [
-            "--always-approve", "--no-memory", "--no-subagents",
+            "--always-approve", "--yolo", "--no-memory", "--no-subagents",
             "--no-auto-update", "--print", "--verbose",
             "--no-session-persistence", "--json", "--full-auto",
             "--dangerously-bypass-approvals-and-sandbox",
@@ -1631,7 +1632,7 @@ public enum ProviderProxyPolicy {
         "--effort", "--reasoning-effort", "--output-format",
         "--input-format", "--disallowed-tools", "--allowed-tools",
         "--settings", "--resume", "-r", "--session-id", "-s",
-        "--max-turns", "--json-schema", "--prompt-json", "--cwd",
+        "--json-schema", "--prompt-json", "--cwd",
         "--tools", "--allow", "--deny", "--allowedTools", "--disallowedTools",
         "--system-prompt-override",
         "--system-prompt", "--debug-file", "--leader-socket",
@@ -1963,10 +1964,11 @@ public enum ProviderProxyPolicy {
             valueFlags = [
                 "--prompt-file", "-p", "--model", "-m", "--effort",
                 "--reasoning-effort", "--output-format", "--sandbox",
-                "--permission-mode", "--disallowed-tools", "--allowed-tools", "--rules"
+                "--permission-mode", "--disallowed-tools", "--allowed-tools", "--rules",
+                "--max-turns"
             ]
             booleanFlags = [
-                "--always-approve", "--no-memory", "--no-subagents",
+                "--always-approve", "--yolo", "--no-memory", "--no-subagents",
                 "--no-auto-update"
             ]
         case AgentProvider.claude.rawValue:

@@ -1744,6 +1744,7 @@ final class GrokACPProtocolTests: XCTestCase {
                        "absent yoloMode inherits grok-build default_yolo_mode")
         XCTAssertEqual(omittedMeta["autoMode"] as? Bool, false)
         XCTAssertNil(omittedMeta["modelId"])
+        XCTAssertNil(omittedMeta["reasoningEffort"])
 
         let spawned = GrokACPClient.sessionOpenParams(
             cwd: "/tmp",
