@@ -261,7 +261,9 @@ public enum AnthropicModelDiscovery {
 
     /// Nil when the window is unknown so the picker hides the context pill
     /// instead of showing a fabricated number.
-    private static func contextWindowTokens(forID id: String) -> Int? {
+    /// Shared with `ClaudeHarnessModelDiscovery` so live CLI catalog rows keep
+    /// the same ctx pill as the static alias fallback.
+    static func contextWindowTokens(forID id: String) -> Int? {
         let lower = id.lowercased()
         return contextWindowsByIDPrefix.first { lower.hasPrefix($0.prefix) }?.tokens
     }

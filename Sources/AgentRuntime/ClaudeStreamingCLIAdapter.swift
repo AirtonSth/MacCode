@@ -443,7 +443,13 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     /// ClaudeAgentSDKBridge.mjs attachmentBlock (CLAUDE-CLI-009).
     nonisolated static func userPromptPayload(text: String, attachments: [AgentAttachment] = []) throws -> [String: Any] {
         try ClaudeAgentSDKBridgeAdapter.validateAttachments(attachments)
-        var content: [[String: Any]] = [["type": "text", "text": text]]
+        // Claude Code rejects empty text content blocks ("text content blocks
+        // must be non-empty"), including on later resume turns. Agent App
+        // admits attach-only sends, so omit a blank text block.
+        var content: [[String: Any]] = []
+        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            content.append(["type": "text", "text": text])
+        }
         for attachment in attachments {
             content.append(try attachmentContentBlock(attachment))
         }

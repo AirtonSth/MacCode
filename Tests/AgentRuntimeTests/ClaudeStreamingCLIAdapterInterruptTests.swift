@@ -152,6 +152,32 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
                       "SDK pushPrompt must set origin.kind=human like CLI stdin")
         XCTAssertTrue(body.contains("uuid: randomUUID()"),
                       "SDK pushPrompt must stamp a uuid on host user messages")
+        XCTAssertTrue(
+            body.contains("typeof text === 'string' && text.trim()")
+                || body.contains("text.trim()"),
+            "SDK pushPrompt must omit empty text content blocks"
+        )
+    }
+
+    func test_userPromptPayload_omitsEmptyTextBlockWhenAttachmentsPresent() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-claude-cli-empty-text-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let pngData = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")!
+        let png = tmp.appendingPathComponent("dot.png")
+        try pngData.write(to: png)
+
+        let payload = try ClaudeStreamingCLIAdapter.userPromptPayload(
+            text: "   ",
+            attachments: [
+                AgentAttachment(path: png.path, displayName: "dot.png", kind: .image, mimeType: "image/png")
+            ]
+        )
+        let content = try XCTUnwrap((payload["message"] as? [String: Any])?["content"] as? [[String: Any]])
+        XCTAssertEqual(content.count, 1, "blank prompt must not add an empty text block beside attachments")
+        XCTAssertEqual(content[0]["type"] as? String, "image")
+        XCTAssertFalse(content.contains { ($0["type"] as? String) == "text" && ($0["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true })
     }
 
     func test_userPromptPayload_includesImageAndFileBlocks() throws {

@@ -28,6 +28,14 @@ final class ClaudeHarnessModelDiscoveryTests: XCTestCase {
         XCTAssertEqual(fable.supportedReasoningEfforts, [.low, .medium, .high, .xhigh, .max, .ultracode])
         XCTAssertTrue(fable.supportsReasoning)
         XCTAssertTrue(fable.supportsCustomModel)
+        // WHY: ClaudeRunner prefers this harness catalog over static aliases
+        // whenever `claude` answers initialize. Nil windows hid the ctx pill
+        // for live Claude models that AnthropicModelDiscovery already labels.
+        XCTAssertNil(models.first { $0.id == "default" }?.contextWindowTokens)
+        XCTAssertEqual(models.first { $0.id == "opus[1m]" }?.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(fable.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(models.first { $0.id == "sonnet" }?.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(models.first { $0.id == "haiku" }?.contextWindowTokens, 200_000)
     }
 
     func test_claudeRunnerUsesHarnessBeforeApiFallback() async throws {

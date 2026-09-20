@@ -727,7 +727,10 @@ function attachmentBlock(attachment) {
 }
 
 function pushPrompt(text, attachments = [], turnContext = undefined) {
-  const content = [{ type: 'text', text }];
+  const content = [];
+  if (typeof text === 'string' && text.trim()) {
+    content.push({ type: 'text', text });
+  }
   for (const attachment of attachments) {
     const block = attachmentBlock(attachment);
     if (block) content.push(block);
