@@ -266,30 +266,38 @@ public enum AgentChatLiveTurnChrome {
     /// bodies + final of a turn. The row paint context recomputes these for
     /// every visible turn on every body pass — a per-scalar walk over all
     /// visible assistant text per frame. Finished turns are immutable in
-    /// practice, so their result is memoized by (turnId, items.count, final
-    /// length); live turns are always recomputed.
+    /// practice, so their result is memoized by (turnId, items.count, content
+    /// fingerprints); live turns are always recomputed.
+    /// Peak entries / UTF-8 cost of stored normalized strings.
+    nonisolated static let normalizedFinalsMemoCountLimit = 128
+    nonisolated static let normalizedFinalsMemoCostLimit = 128 * 1024
     private static let normalizedFinalsMemo: NSCache<NSString, NSArray> = {
         let cache = NSCache<NSString, NSArray>()
-        cache.countLimit = 512
+        cache.countLimit = normalizedFinalsMemoCountLimit
+        cache.totalCostLimit = normalizedFinalsMemoCostLimit
         return cache
     }()
     public private(set) nonisolated(unsafe) static var normalizedFinalsComputeCountForTesting = 0
 
     public static func normalizedAssistantFinals(for turn: AssistantTurnSnapshot) -> [String] {
         let key: NSString? = turn.finished
-            ? "\(turn.turnId)|\(turn.items.count)|\(turn.finalAssistantMessage?.utf8.count ?? -1)" as NSString
+            ? "\(turn.turnId)|\(turn.items.count)|\(AgentMessageMarkdown.sourceFingerprint(for: turn.finalAssistantMessage ?? ""))" as NSString
             : nil
         if let key, let cached = normalizedFinalsMemo.object(forKey: key) as? [String] {
             return cached
         }
         normalizedFinalsComputeCountForTesting &+= 1
         var result: [String] = []
+        var cost = 0
         for body in assistantBodies(in: turn) {
             let normalized = AgentTranscriptOrder.normalizedFinalText(body)
-            if !normalized.isEmpty { result.append(normalized) }
+            if !normalized.isEmpty {
+                result.append(normalized)
+                cost += normalized.utf8.count
+            }
         }
         if let key {
-            normalizedFinalsMemo.setObject(result as NSArray, forKey: key)
+            normalizedFinalsMemo.setObject(result as NSArray, forKey: key, cost: max(1, cost))
         }
         return result
     }
