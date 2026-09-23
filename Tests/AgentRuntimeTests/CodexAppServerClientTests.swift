@@ -576,7 +576,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
         XCTAssertEqual(params["threadId"] as? String, "thread-app-server-1")
         XCTAssertEqual(params["approvalPolicy"] as? String, "on-request")
-        XCTAssertNil(params["collaborationMode"], "0.157.0 TurnStartParams has no collaborationMode")
+        XCTAssertNil(params["collaborationMode"], "turn/start instructions are provided by the current supported thread protocol")
         XCTAssertEqual(params["serviceTier"] as? String, "fast")
         XCTAssertEqual(params["effort"] as? String, "high")
         XCTAssertEqual((params["sandboxPolicy"] as? [String: Any])?["type"] as? String, "workspaceWrite")
@@ -610,7 +610,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(start["approvalPolicy"] as? String, "on-request")
         XCTAssertTrue(
             (start["developerInstructions"] as? String)?.contains("Plan only") == true,
-            "Plan mode must travel as thread/start developerInstructions (Codex 0.157), not turn/start collaborationMode"
+            "New threads receive the selected mode in thread/start developerInstructions"
         )
     }
 
@@ -954,9 +954,8 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         defer { client.stop() }
         _ = try await client.initialize()
 
-        // WHY: Distill is paid (Token Saver). developerInstructions on thread/start
-        // carry language + `| distill` only when RC_TOKEN_SAVER_DISTILL_HINT=1 —
-        // never via ~/.codex/skills.
+        // WHY: Distill is paid (Token Saver). Instructions carry language + `| distill`
+        // only when RC_TOKEN_SAVER_DISTILL_HINT=1 — never via ~/.codex/skills.
         let withHintRequest = AgentRunRequest(
             threadId: AgentThreadID(),
             provider: .codex,

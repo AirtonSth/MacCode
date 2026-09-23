@@ -1007,8 +1007,8 @@ public final class CodexAppServerClient: @unchecked Sendable {
         if request.serviceTier == .fast {
             params["serviceTier"] = "fast"
         }
-        // Codex 0.157 ThreadStartParams: developerInstructions is first-class.
-        // collaborationMode is not a TurnStartParams field on 0.157.0.
+        // Codex 0.156+ accepts developerInstructions on thread/start.
+        // Per-turn instructions also belong on collaborationMode for reused threads.
         let instructions = developerInstructions(
             for: request.interactionMode,
             environment: request.environment

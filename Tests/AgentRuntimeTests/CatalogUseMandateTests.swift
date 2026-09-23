@@ -57,7 +57,7 @@ final class CatalogUseMandateTests: XCTestCase {
             provider: "Claude SDK bridge"
         )
 
-        // Codex: `developerInstructions` on the app-server thread start (0.157).
+        // Codex: `developerInstructions` on the app-server thread start.
         let params = CodexAppServerClient.threadStartParams(
             for: request(.codex, environment: environment)
         )

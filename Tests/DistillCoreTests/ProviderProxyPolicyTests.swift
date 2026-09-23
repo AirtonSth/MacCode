@@ -943,6 +943,36 @@ final class ProviderProxyPolicyTests: XCTestCase {
         }
     }
 
+    func test_nestedCodexAgentAppEligible_acceptsCodex156ExecFlags() {
+        // WHY: openai/codex 0.156 added -s/-i/--enable/--disable/--add-dir/
+        // --worktree/--thread-source/--output-schema/--approve-for-me. The
+        // nested scanner used to fail-close those as malformed and skip Agent App.
+        let arguments = [
+            "exec", "-s", "workspace-write", "-i", "/tmp/shot.png",
+            "--add-dir", "/tmp/extra", "--enable", "web_search_tool",
+            "--disable", "view_image_tool", "--worktree",
+            "--thread-source", "api", "--output-schema", "/tmp/schema.json",
+            "--approve-for-me",
+            "--model", "gpt-6-astra",
+            "-c", "model_reasoning_effort=high",
+            "work"
+        ]
+        XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "codex",
+            arguments: arguments
+        ))
+        XCTAssertNotNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "codex",
+            arguments: arguments,
+            promptFile: "/tmp/rc-nested-prompt.txt"
+        ))
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "codex",
+            arguments: arguments + ["--unknown-dash-flag"],
+            promptFile: "/tmp/rc-nested-prompt.txt"
+        ), "unknown remaining dash flags must still fail closed")
+    }
+
     func test_nestedEligibilityRejectsRawFallbackContractsBeforeReadingPromptInput() {
         // WHY: ProviderProxyRunner reads stdin only after this preflight. A
         // mapping that later returns nil would otherwise consume stdin and fail

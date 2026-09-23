@@ -713,7 +713,8 @@ public enum ProviderProxyPolicy {
                 return [
                     "--full-auto", "--strict-config", "--oss", "--skip-git-repo-check",
                     "--ephemeral", "--ignore-user-config", "--ignore-rules", "--json",
-                    "--no-alt-screen", "--help", "-h", "--version", "-V"
+                    "--no-alt-screen", "--help", "-h", "--version", "-V",
+                    "--worktree", "--approve-for-me"
                 ]
             case .claude:
                 return [
@@ -1433,8 +1434,7 @@ public enum ProviderProxyPolicy {
         }
     }
 
-    /// openai/codex 0.157 `codex exec` value flags. Unknown remaining dash
-    /// flags stay fail-closed so nested Agent App promotion does not invent a receipt.
+    /// Recognized Codex `exec` value flags; unsupported options stay fail-closed.
     private static let nestedCodexExecValueOptions: Set<String> = [
         "--sandbox", "-s", "--ask-for-approval", "-a", "--config", "-c",
         "--model", "-m", "--image", "-i", "--color", "--cd", "-C",
@@ -1937,7 +1937,8 @@ public enum ProviderProxyPolicy {
                 "--config", "-c", "--image", "-i", "--model", "-m",
                 "--profile", "-p", "--sandbox", "-s", "--cd", "-C",
                 "--add-dir", "--local-provider", "--output-schema",
-                "--color", "--output-last-message", "-o"
+                "--color", "--output-last-message", "-o",
+                "--enable", "--disable", "--thread-source"
             ]
             var sawJSON = false
             var firstPositional: String?
