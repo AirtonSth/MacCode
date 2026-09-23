@@ -22,7 +22,7 @@ final class AnthropicModelDiscoveryDescriptorTests: XCTestCase {
         // advertise the full Claude effort set or the feature disappears.
         for id in [
             "claude-fable-5", "claude-mythos-5", "claude-opus-4-8",
-            "claude-opus-5", "claude-sonnet-5"
+            "claude-opus-5", "claude-opus-5-5", "claude-sonnet-5"
         ] {
             let d = descriptor(id: id)
             XCTAssertEqual(d?.supportsReasoning, true, "\(id) must support reasoning")
@@ -75,11 +75,12 @@ final class AnthropicModelDiscoveryDescriptorTests: XCTestCase {
         // WHY: the model pill renders contextWindowTokens ("200k ctx"); a
         // hardcoded 200k misinforms the user on every 1M-context tier.
         XCTAssertEqual(descriptor(id: "claude-fable-5")?.contextWindowTokens, 1_000_000)
-        XCTAssertEqual(descriptor(id: "claude-opus-5")?.contextWindowTokens, 1_000_000)
         XCTAssertEqual(descriptor(id: "claude-opus-5-5")?.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(descriptor(id: "claude-opus-5")?.contextWindowTokens, 1_000_000)
         XCTAssertEqual(descriptor(id: "claude-opus-4-8")?.contextWindowTokens, 1_000_000)
         XCTAssertEqual(descriptor(id: "claude-sonnet-5")?.contextWindowTokens, 1_000_000)
         XCTAssertEqual(descriptor(id: "claude-haiku-4-5")?.contextWindowTokens, 200_000)
+        XCTAssertEqual(AnthropicModelDiscovery.contextWindowTokens(forID: "claude-opus-5-5"), 1_000_000)
     }
 
     func test_contextWindow_aliases_matchLatestFamilyWindow() {

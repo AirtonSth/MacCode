@@ -159,6 +159,30 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         )
     }
 
+    func test_userPromptPayload_emptyTextKeepsFileAttachmentAndOmitsEmptyContent() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-claude-cli-empty-file-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let note = root.appendingPathComponent("note.txt")
+        try "hello file".write(to: note, atomically: true, encoding: .utf8)
+
+        let payload = try ClaudeStreamingCLIAdapter.userPromptPayload(
+            text: "",
+            attachments: [AgentAttachment(path: note.path, displayName: "note.txt", kind: .file, mimeType: "text/plain")]
+        )
+        let content = try XCTUnwrap((payload["message"] as? [String: Any])?["content"] as? [[String: Any]])
+        XCTAssertEqual(content.count, 1)
+        XCTAssertEqual(content[0]["type"] as? String, "text")
+        let fileText = try XCTUnwrap(content[0]["text"] as? String)
+        XCTAssertTrue(fileText.contains("note.txt"))
+        XCTAssertTrue(fileText.contains(note.path))
+
+        let empty = try ClaudeStreamingCLIAdapter.userPromptPayload(text: "")
+        let emptyContent = try XCTUnwrap((empty["message"] as? [String: Any])?["content"] as? [[String: Any]])
+        XCTAssertTrue(emptyContent.isEmpty)
+    }
+
     /// CLAUDE-ORIGIN-001: SDK pushPrompt must match CLI stdin origin+uuid so
     /// ultracode / queued_turn_count human gates work on both hosts.
     func test_sdkBridgePushPrompt_includesHumanOriginAndUuid() throws {
