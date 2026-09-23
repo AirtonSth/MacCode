@@ -722,8 +722,10 @@ public final class GrokACPClient: @unchecked Sendable {
     /// ACP `session/new` / `session/load` params. `yoloMode` is spawn-time
     /// always-approve (grok-build `_meta.yoloMode`); `noReplay` is the existing
     /// load-path skip. Both share one `_meta` object so neither replaces the other.
-    /// `autoMode` is intentionally omitted: RemoteCode autoAcceptEdits maps to
-    /// `set_mode acceptEdits`, not Grok auto.
+    /// Stamp `yoloMode` for both polarities: omitting the key inherits
+    /// grok-build `default_yolo_mode`. `autoMode` is always false — RemoteCode
+    /// autoAcceptEdits maps to `set_mode acceptEdits`, not Grok auto, and an
+    /// omitted key inherits `default_auto_mode`.
     /// grok-build 1.0.5+ reads `_meta.modelId` and `_meta.reasoningEffort` at
     /// spawn (`session_setup` / `parse_reasoning_effort_meta`) so the session
     /// is not created on the process default model (live 1.0.34: deepseek).
@@ -743,10 +745,10 @@ public final class GrokACPClient: @unchecked Sendable {
         if let sessionId {
             params["sessionId"] = sessionId
         }
-        var meta: JSONObject = [:]
-        if yoloMode {
-            meta["yoloMode"] = true
-        }
+        var meta: JSONObject = [
+            "yoloMode": yoloMode,
+            "autoMode": false,
+        ]
         if noReplay {
             meta["noReplay"] = true
         }
@@ -787,8 +789,8 @@ public final class GrokACPClient: @unchecked Sendable {
     /// When `noReplay` is true, params include `_meta.noReplay` (grok-build
     /// mvp_agent `parse_no_replay`) so the agent skips gateway history replay.
     /// Default false preserves full replay for recover/readThread paths.
-    /// When `yoloMode` is true, params also include `_meta.yoloMode` so cold
-    /// load re-stamps always-approve for the resident session.
+    /// `_meta.yoloMode` is stamped for both polarities so cold load does not
+    /// inherit grok-build `default_yolo_mode`.
     func loadSession(
         sessionId: String,
         cwd: String,

@@ -199,6 +199,44 @@ public final class GrokParser {
             out.append(.itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: payload, summary: nil))
             out.append(.itemCompleted(itemId: itemId, finalState: .completed))
 
+        case "plan":
+            // grok-build streaming-json AcpLine::Plan { entries }.
+            ensureTurn(&out)
+            let entries = obj["entries"] as? [[String: Any]] ?? []
+            let steps = entries.enumerated().compactMap { index, entry -> AssistantPlanStep? in
+                guard let content = entry["content"] as? String else { return nil }
+                let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return nil }
+                let statusRaw = entry["status"] as? String ?? "pending"
+                let status = AssistantPlanStepStatus(rawValue: statusRaw)
+                    ?? (statusRaw == "inProgress" ? .inProgress : .pending)
+                return AssistantPlanStep(id: "\(index)-\(trimmed)", title: trimmed, status: status)
+            }
+            if !steps.isEmpty {
+                out.append(.activePlanUpdated(AssistantActivePlan(
+                    steps: steps,
+                    updatedAtMs: now
+                )))
+            }
+
+        case "available_commands":
+            let data = (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])) ?? Data()
+            out.append(.providerRuntime(ProviderRuntimeEvent(
+                provider: .grok,
+                source: "grok.streaming-json",
+                method: "available_commands",
+                payloadJSON: String(data: data, encoding: .utf8) ?? "{}",
+                receivedAtMs: now
+            )))
+
+        case "max_turns_reached":
+            ensureTurn(&out)
+            closeOpenItems(&out, toolFinalState: .completed)
+            if let turnId = currentTurnId, !turnFinished {
+                turnFinished = true
+                out.append(.turnCompleted(turnId: turnId, finalMessage: resolvedFinalMessage()))
+            }
+
         default:
             break
         }
