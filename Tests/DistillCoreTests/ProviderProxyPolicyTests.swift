@@ -669,7 +669,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ), "Agent App must not invent a receipt for an unknown Codex model contract")
         }
 
-        for catalogModel in ["gpt-6-astra", "gpt-5.3-codex", "gpt-5.2"] {
+        for catalogModel in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.3-codex", "gpt-5.2"] {
             let delegation = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
                 providerBasename: "codex",
                 arguments: [
@@ -796,6 +796,36 @@ final class ProviderProxyPolicyTests: XCTestCase {
             providerBasename: "claude",
             arguments: ["--print", "--model", "opus", "--effort", "high"]
         ))
+    }
+
+    func test_nestedCodexAgentAppEligible_acceptsCodex156ExecFlags() {
+        // WHY: openai/codex 0.156.1 added -s/-i/--enable/--disable/--add-dir/
+        // --worktree/--thread-source/--output-schema/--approve-for-me/--ignore-rules.
+        // The nested scanner used to fail-close those as malformed and skip Agent App.
+        let arguments = [
+            "exec", "-s", "workspace-write", "-i", "/tmp/shot.png",
+            "--add-dir", "/tmp/extra", "--enable", "web_search_tool",
+            "--disable", "view_image_tool", "--worktree",
+            "--thread-source", "api", "--output-schema", "/tmp/schema.json",
+            "--approve-for-me", "--ignore-rules",
+            "--model", "gpt-6-sol",
+            "-c", "model_reasoning_effort=high",
+            "work"
+        ]
+        XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "codex",
+            arguments: arguments
+        ))
+        XCTAssertNotNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "codex",
+            arguments: arguments,
+            promptFile: "/tmp/rc-nested-prompt.txt"
+        ))
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "codex",
+            arguments: arguments + ["--unknown-dash-flag"],
+            promptFile: "/tmp/rc-nested-prompt.txt"
+        ), "unknown remaining dash flags must still fail closed")
     }
 
     func test_nestedEligibilityRejectsRawFallbackContractsBeforeReadingPromptInput() {

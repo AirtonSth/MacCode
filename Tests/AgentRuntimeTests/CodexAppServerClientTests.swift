@@ -530,6 +530,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
         XCTAssertEqual(params["threadId"] as? String, "thread-app-server-1")
         XCTAssertEqual(params["approvalPolicy"] as? String, "on-request")
+        XCTAssertNil(params["collaborationMode"], "0.156.1 TurnStartParams has no collaborationMode")
         XCTAssertEqual(params["serviceTier"] as? String, "fast")
         XCTAssertEqual(params["effort"] as? String, "high")
         XCTAssertEqual((params["sandboxPolicy"] as? [String: Any])?["type"] as? String, "workspaceWrite")
@@ -548,13 +549,23 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(input[2]["name"] as? String, "notes.txt")
         XCTAssertEqual(input[2]["path"] as? String, "/tmp/notes.txt")
 
-        let collaboration = try XCTUnwrap(params["collaborationMode"] as? [String: Any])
-        XCTAssertEqual(collaboration["mode"] as? String, "plan")
-        let settings = try XCTUnwrap(collaboration["settings"] as? [String: Any])
-        XCTAssertEqual(settings["model"] as? String, "gpt-5.5")
-        XCTAssertEqual(settings["reasoning_effort"] as? String, "high")
-        XCTAssertTrue((settings["developer_instructions"] as? String)?.contains("Plan only") == true,
-                      "Plan mode must travel as app-server collaborationMode, not only as prompt text")
+        let start = CodexAppServerClient.threadStartParams(
+            for: AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-test",
+                prompt: "draft a plan",
+                permissionMode: .autoAcceptEdits,
+                reasoningEffort: .high,
+                interactionMode: .plan
+            )
+        )
+        XCTAssertEqual(start["approvalPolicy"] as? String, "on-request")
+        XCTAssertTrue(
+            (start["developerInstructions"] as? String)?.contains("Plan only") == true,
+            "Plan mode must travel as thread/start developerInstructions (Codex 0.156), not turn/start collaborationMode"
+        )
     }
 
     func test_turnStartParams_preservesUltraReasoningEffort() throws {
@@ -572,16 +583,12 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             )
         )
         XCTAssertEqual(params["effort"] as? String, "ultra")
-        let collaboration = try XCTUnwrap(params["collaborationMode"] as? [String: Any])
-        let settings = try XCTUnwrap(collaboration["settings"] as? [String: Any])
-        XCTAssertEqual(settings["reasoning_effort"] as? String, "ultra")
+        XCTAssertNil(params["collaborationMode"])
     }
 
     func test_turnStartParams_emptyModelUsesBuiltInDefaultInCollaborationMode() throws {
-        // WHY: top-level model is omitted for account-default, but upstream
-        // Settings.model is required inside collaborationMode. A stale gpt-5.5
-        // hardcode overrode the account default and disagreed with
-        // AgentDefaultModelSelection.codexBuiltInDefault.
+        // WHY: top-level model is omitted for account-default. turn/start must
+        // not invent collaborationMode.settings.model.
         for empty in ["", "  ", "default", "Default"] {
             let params = CodexAppServerClient.turnStartParams(
                 providerThreadId: "thread-default-model",
@@ -594,14 +601,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                 )
             )
             XCTAssertNil(params["model"], "empty/default must omit top-level model (\(empty))")
-            let collaboration = try XCTUnwrap(params["collaborationMode"] as? [String: Any])
-            let settings = try XCTUnwrap(collaboration["settings"] as? [String: Any])
-            XCTAssertEqual(
-                settings["model"] as? String,
-                AgentDefaultModelSelection.codexBuiltInDefault,
-                "collaborationMode.settings.model must use codexBuiltInDefault for empty model (\(empty))"
-            )
-            XCTAssertNotEqual(settings["model"] as? String, "gpt-5.5")
+            XCTAssertNil(params["collaborationMode"], "turn/start must not send collaborationMode (\(empty))")
         }
     }
 
@@ -630,10 +630,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
         XCTAssertEqual(params["effort"] as? String, "low",
                        "Codex app-server enables provider tools such as image_gen/web_search; minimal effort makes native compaction fail.")
-        let collaboration = try XCTUnwrap(params["collaborationMode"] as? [String: Any])
-        let settings = try XCTUnwrap(collaboration["settings"] as? [String: Any])
-        XCTAssertEqual(settings["reasoning_effort"] as? String, "low",
-                       "Manual/native compaction inherits collaborationMode settings, so the clamped effort must be present there too.")
+        XCTAssertNil(params["collaborationMode"])
     }
 
     func test_threadReadRollbackAndInterruptUseNativeCodexAppServerMethods() async throws {
@@ -913,18 +910,21 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
 
         // WHY: Distill is paid (Token Saver). developer_instructions carry language +
         // `| distill` only when RC_TOKEN_SAVER_DISTILL_HINT=1 — never via ~/.codex/skills.
-        let withHint = try await client.startTurn(
-            providerThreadId: "thread-app-server-1",
-            for: AgentRunRequest(
-                threadId: AgentThreadID(),
-                provider: .codex,
-                model: "gpt-5.5",
-                cwd: "/tmp/remotecode-app-server-test",
-                prompt: "explore",
-                environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
-            )
+        let withHintRequest = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-test",
+            prompt: "explore",
+            environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
         )
-        let hintInstructions = try XCTUnwrap(collaborationSettings(from: withHint)["developer_instructions"] as? String)
+        _ = try await client.startTurn(
+            providerThreadId: "thread-app-server-1",
+            for: withHintRequest
+        )
+        let hintInstructions = try XCTUnwrap(
+            CodexAppServerClient.threadStartParams(for: withHintRequest)["developerInstructions"] as? String
+        )
         XCTAssertTrue(
             hintInstructions.contains("| distill"),
             "Token Saver on: Codex developer_instructions must instruct `| distill`"
@@ -947,18 +947,19 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         )
 
         // Token Saver off → base mode instructions only, no Distill.
-        let withoutHint = try await client.startTurn(
+        let withoutHintRequest = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-test",
+            prompt: "explore"
+        )
+        _ = try await client.startTurn(
             providerThreadId: "thread-app-server-1",
-            for: AgentRunRequest(
-                threadId: AgentThreadID(),
-                provider: .codex,
-                model: "gpt-5.5",
-                cwd: "/tmp/remotecode-app-server-test",
-                prompt: "explore"
-            )
+            for: withoutHintRequest
         )
         let emptyEnvInstructions = try XCTUnwrap(
-            try collaborationSettings(from: withoutHint)["developer_instructions"] as? String
+            CodexAppServerClient.threadStartParams(for: withoutHintRequest)["developerInstructions"] as? String
         )
         XCTAssertFalse(
             emptyEnvInstructions.contains("| distill"),
@@ -984,19 +985,20 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         _ = try await client.initialize()
 
         let turnContext = "REMOTE CODE RESOLVED IDENTITY ONLY: @quinn is Quinn"
-        let response = try await client.startTurn(
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-test",
+            prompt: "explore",
+            environment: [BotPeerDelegation.turnContextEnvironmentKey: turnContext]
+        )
+        _ = try await client.startTurn(
             providerThreadId: "thread-app-server-1",
-            for: AgentRunRequest(
-                threadId: AgentThreadID(),
-                provider: .codex,
-                model: "gpt-5.5",
-                cwd: "/tmp/remotecode-app-server-test",
-                prompt: "explore",
-                environment: [BotPeerDelegation.turnContextEnvironmentKey: turnContext]
-            )
+            for: request
         )
         let instructions = try XCTUnwrap(
-            try collaborationSettings(from: response)["developer_instructions"] as? String
+            CodexAppServerClient.threadStartParams(for: request)["developerInstructions"] as? String
         )
         XCTAssertTrue(
             instructions.contains(BackgroundAwaitContinuation.awaitingMarker),
@@ -1091,12 +1093,6 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                 return XCTFail("expected typed processExited, got \(error)")
             }
         }
-    }
-
-    private func collaborationSettings(from response: [String: Any]) throws -> [String: Any] {
-        let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
-        let collaboration = try XCTUnwrap(params["collaborationMode"] as? [String: Any])
-        return try XCTUnwrap(collaboration["settings"] as? [String: Any])
     }
 
     private func makeFakeAppServerPeer() throws -> String {
