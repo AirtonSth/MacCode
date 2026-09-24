@@ -226,11 +226,11 @@ be selected by the runtime, report that limitation rather than claiming a switch
 
 | Capability | Codex | Claude Code | Grok |
 | --- | --- | --- | --- |
-| `LIGHT` | `gpt-5.6-luna` / `medium` | `sonnet` / `high` | `grok-4.5` / `medium` |
-| `STANDARD` | `gpt-5.6-luna` / `xhigh` | `sonnet` / `high` | `grok-4.5` / `medium` |
-| `DEEP` | `gpt-5.6-luna` / `max` | `opus` / `high` | `grok-4.5` / `medium` |
-| rare escalate | `gpt-5.6-luna` / `max` | `opus` / `xhigh` | `grok-4.5` / `high` |
-| `REVIEWER` | `gpt-6-astra` / `medium` | `opus` / `high` | `grok-4.5` / `high` |
+| `LIGHT` | `gpt-5.6-luna` / `medium` | `sonnet` / `high` | `grok-4.6` / `medium` |
+| `STANDARD` | `gpt-5.6-luna` / `xhigh` | `sonnet` / `high` | `grok-4.6` / `high` |
+| `DEEP` | `gpt-5.6-luna` / `max` | `opus` / `high` | `grok-4.6` / `xhigh` |
+| rare escalate | `gpt-5.6-luna` / `max` | `opus` / `xhigh` | `grok-4.6` / `high` |
+| `REVIEWER` | `gpt-6-astra` / `medium` | `opus` / `high` | `grok-4.6` / `high` |
 
 Worker prompts: [prompt-contract.md](references/prompt-contract.md) — **slice-only**,
 no full skill paste, no other workers’ conclusions into independent review.

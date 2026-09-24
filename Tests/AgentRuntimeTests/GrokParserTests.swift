@@ -338,4 +338,46 @@ final class GrokParserTests: XCTestCase {
             return false
         }, "camelCase maxTokens must normalize to max_tokens and seal as completed")
     }
+
+    /// grok-build streaming-json AcpLine::Plan must surface live plan steps.
+    func test_planLineEmitsActivePlanUpdated() {
+        let parser = GrokParser()
+        let events = parser.parseLine(#"{"type":"plan","entries":[{"content":"Scan ACP","status":"in_progress"},{"content":"Patch parser","status":"pending"}]}"#)
+        XCTAssertTrue(events.contains {
+            if case .activePlanUpdated(let plan) = $0 {
+                return plan.steps.map(\.title) == ["Scan ACP", "Patch parser"]
+                    && plan.steps.first?.status == .inProgress
+            }
+            return false
+        }, "type=plan must map entries to activePlanUpdated")
+    }
+
+    /// grok-build streaming-json AvailableCommands must not be dropped.
+    func test_availableCommandsLineEmitsProviderRuntime() {
+        let parser = GrokParser()
+        let events = parser.parseLine(#"{"type":"available_commands","tools":["bash"],"commands":["compact"]}"#)
+        XCTAssertTrue(events.contains {
+            if case .providerRuntime(let runtime) = $0 {
+                return runtime.method == "available_commands"
+                    && runtime.payloadJSON.contains("compact")
+            }
+            return false
+        }, "type=available_commands must emit providerRuntime")
+    }
+
+    /// grok-build streaming-json MaxTurnsReached seals the turn like end.
+    func test_maxTurnsReachedSealsOpenToolAndCompletesTurn() {
+        let parser = GrokParser()
+        var events: [AssistantEvent] = []
+        events += parser.parseLine(#"{"type":"tool_call","toolCallId":"tc-cap","name":"shell"}"#)
+        events += parser.parseLine(#"{"type":"max_turns_reached"}"#)
+        XCTAssertTrue(events.contains {
+            if case .itemCompleted("tc-cap", .completed) = $0 { return true }
+            return false
+        }, "max_turns_reached must seal open tools")
+        XCTAssertTrue(events.contains {
+            if case .turnCompleted = $0 { return true }
+            return false
+        }, "max_turns_reached must complete the turn")
+    }
 }
