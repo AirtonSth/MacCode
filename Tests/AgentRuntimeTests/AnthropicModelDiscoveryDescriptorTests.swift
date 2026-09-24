@@ -76,6 +76,7 @@ final class AnthropicModelDiscoveryDescriptorTests: XCTestCase {
         // hardcoded 200k misinforms the user on every 1M-context tier.
         XCTAssertEqual(descriptor(id: "claude-fable-5")?.contextWindowTokens, 1_000_000)
         XCTAssertEqual(descriptor(id: "claude-opus-5")?.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(descriptor(id: "claude-opus-5-5")?.contextWindowTokens, 1_000_000)
         XCTAssertEqual(descriptor(id: "claude-opus-4-8")?.contextWindowTokens, 1_000_000)
         XCTAssertEqual(descriptor(id: "claude-sonnet-5")?.contextWindowTokens, 1_000_000)
         XCTAssertEqual(descriptor(id: "claude-haiku-4-5")?.contextWindowTokens, 200_000)

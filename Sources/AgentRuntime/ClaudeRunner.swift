@@ -72,6 +72,8 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         let rawID = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let id = rawID.hasSuffix("[1m]") ? String(rawID.dropLast(4)) : rawID
         if id.hasPrefix("claude-opus-4-7") { return .xhigh }
+        // Claude Code 2.1.281 catalog: Opus 5.5 default_effort is medium.
+        if id.hasPrefix("claude-opus-5-5") { return .medium }
         return .high
     }
 
@@ -81,9 +83,8 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     ) -> AgentReasoningEffort? {
         let supported = supportedReasoningEfforts(for: model)
         guard !supported.isEmpty else { return nil }
-        // Claude Code defaults to high on every effort-capable model except
-        // Opus 4.7, whose documented default is xhigh. Forward that default
-        // instead of inventing medium, which under-reasons Auto/Claude turns.
+        // Claude Code defaults to high on effort-capable models except
+        // Opus 4.7 (xhigh) and Opus 5.5 (medium, live 2.1.281 catalog).
         let requested = effort ?? Self.defaultReasoningEffort(for: model)
         if requested == .minimal { return .low }
         if supported.contains(requested) { return requested }

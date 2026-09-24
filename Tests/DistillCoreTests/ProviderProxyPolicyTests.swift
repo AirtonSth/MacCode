@@ -730,7 +730,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
         }
     }
 
-    func test_nestedCLIAgentAppDelegation_rejectsAdminVersionAndResume() {
+    func test_nestedCLIAgentAppDelegation_rejectsAdminVersionAndResume() throws {
         let prompt = "/tmp/rc-nested-prompt.txt"
         XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "claude",
@@ -796,6 +796,57 @@ final class ProviderProxyPolicyTests: XCTestCase {
             providerBasename: "claude",
             arguments: ["--print", "--model", "opus", "--effort", "high"]
         ))
+        XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "claude",
+            arguments: [
+                "--print", "--model", "opus", "--effort", "high",
+                "--include-hook-events", "--replay-user-messages",
+                "--forward-subagent-text", "--add-dir", "/tmp/extra",
+                "--mcp-config", "{}", "--json-schema", "{}",
+                "--system-prompt-file", "/tmp/sys.md",
+                "--append-system-prompt-file", "/tmp/append.md",
+                "--plugin-dir", "/tmp/plugin", "--plugin-url", "https://example.invalid/p.zip",
+                "--worktree", "wt", "-w", "wt2", "--fallback-model", "sonnet",
+                "--bare", "--permission-prompts", "host", "--max-budget-usd", "1",
+                "--name", "nested", "-n", "nested2", "--agents", "{}",
+                "--agent", "reviewer", "--file", "file_abc:doc.txt",
+                "--debug-file", "/tmp/debug.log", "--betas", "context-1m",
+                "--from-pr", "1", "--remote-control", "desk",
+                "--brief", "--chrome", "--no-chrome",
+                "--dangerously-skip-permissions",
+                "--allow-dangerously-skip-permissions",
+                "--exclude-dynamic-system-prompt-sections", "--restricted",
+                "--ax-screen-reader", "--bg", "--background",
+                "--autocompact", "auto", "--max-turns", "4",
+                "--permission-mode", "default"
+            ]
+        ), "known Claude Code 2.1.281 flags Agent App emits or nested agents use must stay eligible")
+        let defaultPermission = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "claude",
+            arguments: [
+                "--print", "--model", "opus", "--effort", "high",
+                "--permission-mode", "default"
+            ],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(defaultPermission.permissionMode, .supervised,
+                       "permission-mode default remains an accepted alias of manual")
+        let manualPermission = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "claude",
+            arguments: [
+                "--print", "--model", "opus", "--effort", "high",
+                "--permission-mode", "manual"
+            ],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(manualPermission.permissionMode, .supervised)
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "claude",
+            arguments: [
+                "--print", "--model", "opus", "--effort", "high",
+                "--future-unknown-flag"
+            ]
+        ), "unknown dash flags must stay fail-closed")
     }
 
     func test_nestedEligibilityRejectsRawFallbackContractsBeforeReadingPromptInput() {

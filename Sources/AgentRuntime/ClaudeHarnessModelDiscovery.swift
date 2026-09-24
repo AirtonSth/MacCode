@@ -86,7 +86,8 @@ public enum ClaudeHarnessModelDiscovery {
                 provider: .claude,
                 supportsReasoning: supportsEffort || !efforts.isEmpty,
                 supportedReasoningEfforts: efforts,
-                supportsCustomModel: true
+                supportsCustomModel: true,
+                contextWindowTokens: AnthropicModelDiscovery.contextWindowTokens(forID: id)
             )
         }
     }

@@ -2714,6 +2714,8 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         XCTAssertEqual(normalized("claude-opus-4-6", .xhigh), .high)
         XCTAssertEqual(normalized("claude-sonnet-4-6", nil), .high)
         XCTAssertEqual(normalized("claude-opus-4-7", nil), .xhigh)
+        XCTAssertEqual(normalized("claude-opus-5-5", nil), .medium,
+                       "Opus 5.5 omitted effort must match live Claude Code default_effort medium")
         XCTAssertEqual(normalized("claude-mythos-preview", .xhigh), .high)
         XCTAssertEqual(normalized("claude-opus-4-5", .max), .high)
         XCTAssertNil(normalized("claude-haiku-4-5", .high),

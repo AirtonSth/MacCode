@@ -241,12 +241,14 @@ public enum AnthropicModelDiscovery {
         )
     }
 
-    /// Known context windows by model-id prefix (Anthropic docs, 2026-07):
-    /// Fable 5, Opus 4.6+, and Sonnet 4.6+ are 1M-context; Haiku is 200k.
-    /// First match wins, so dated/legacy ids must precede their bare alias.
+    /// Known context windows by model-id prefix (Anthropic docs / Claude Code
+    /// 2.1.281 catalog): Fable 5, Opus 5.5, Opus 4.6+, and Sonnet 4.6+ are
+    /// 1M-context; Haiku is 200k. First match wins, so dated/legacy ids must
+    /// precede their bare alias.
     private static let contextWindowsByIDPrefix: [(prefix: String, tokens: Int)] = [
         ("claude-fable", 1_000_000),
         ("fable", 1_000_000),
+        ("claude-opus-5-5", 1_000_000),
         ("claude-opus-5", 1_000_000),
         ("claude-opus-4-8", 1_000_000),
         ("claude-opus-4-7", 1_000_000),
@@ -261,7 +263,7 @@ public enum AnthropicModelDiscovery {
 
     /// Nil when the window is unknown so the picker hides the context pill
     /// instead of showing a fabricated number.
-    private static func contextWindowTokens(forID id: String) -> Int? {
+    static func contextWindowTokens(forID id: String) -> Int? {
         let lower = id.lowercased()
         return contextWindowsByIDPrefix.first { lower.hasPrefix($0.prefix) }?.tokens
     }

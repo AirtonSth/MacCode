@@ -510,6 +510,18 @@ final class ClaudeRunnerArgsTests: XCTestCase {
             "xhigh",
             "Opus 4.7 omitted effort follows Claude Code's xhigh default"
         )
+        let opus55 = AgentRunRequest(
+            threadId: AgentThreadID(), provider: .claude, model: "claude-opus-5-5",
+            cwd: "/tmp", prompt: "x", permissionMode: .supervised, reasoningEffort: nil
+        )
+        let opus55Args = ClaudeRunner.buildArgs(opus55)
+        XCTAssertEqual(
+            opus55Args[opus55Args.index(after: opus55Args.firstIndex(of: "--effort")!)],
+            "medium",
+            "Opus 5.5 omitted effort follows Claude Code 2.1.281 catalog default_effort medium"
+        )
+        XCTAssertEqual(ClaudeRunner.defaultReasoningEffort(for: "claude-opus-5-5[1m]"), .medium)
+        XCTAssertEqual(ClaudeRunner.defaultReasoningEffort(for: "claude-opus-5"), .high)
     }
 
     func test_effortIsNormalizedToTheSelectedClaudeModel() throws {
