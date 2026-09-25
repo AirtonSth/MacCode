@@ -438,12 +438,16 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     }
 
     /// Builds the stream-json user message object for CLI stdin.
-    /// Empty attachments stay a single text block. Images become base64
-    /// content blocks; other files become text path mentions — same shape as
-    /// ClaudeAgentSDKBridge.mjs attachmentBlock (CLAUDE-CLI-009).
+    /// Empty text is omitted (Claude Code 2.1.277+ rejects empty text blocks);
+    /// attach-only turns are therefore image/file blocks only. Images become
+    /// base64 content blocks; other files become text path mentions — same
+    /// shape as ClaudeAgentSDKBridge.mjs attachmentBlock (CLAUDE-CLI-009).
     nonisolated static func userPromptPayload(text: String, attachments: [AgentAttachment] = []) throws -> [String: Any] {
         try ClaudeAgentSDKBridgeAdapter.validateAttachments(attachments)
-        var content: [[String: Any]] = [["type": "text", "text": text]]
+        var content: [[String: Any]] = []
+        if !text.isEmpty {
+            content.append(["type": "text", "text": text])
+        }
         for attachment in attachments {
             content.append(try attachmentContentBlock(attachment))
         }
