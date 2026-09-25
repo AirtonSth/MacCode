@@ -2690,7 +2690,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
 
     /// Same-host DEEP binding when Auto cannot orchestrate (package/rollout/kill
     /// switch). Still never switches provider — only drops `$remote-code-orchestrate`
-    /// and uses the host-matrix DEEP row (opus / sol / grok-4.6 high).
+    /// and uses the host-matrix DEEP row (opus / sol / grok-4.7 high).
     public func routeDeepFallback(
         configuration: AgentRoutingConfiguration,
         providerSnapshots: [AgentProviderSnapshot]
@@ -3049,12 +3049,12 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             // LIGHT still requires observable reasoning; Haiku has no effort control.
             return (["sonnet", "claude-sonnet", "claude-sonnet-5", "claude-sonnet-4-6"], .high)
         case .grok:
-            return (["grok-4.6", "grok-4.5"], .medium)
+            return (["grok-4.7", "grok-4.6", "grok-4.5"], .medium)
         }
     }
 
     /// DEEP (non-orchestrated Auto fallback) binding — same host only.
-    /// Codex → sol/high, Claude → opus/high, Grok → grok-4.6/high.
+    /// Codex → sol/high, Claude → opus/high, Grok → grok-4.7/high.
     public static func deepMatrixBinding(for provider: AgentProvider) -> (preferredModelIds: [String], effort: AgentReasoningEffort) {
         switch provider {
         case .codex:
@@ -3062,7 +3062,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         case .claude:
             return (["opus", "claude-opus", "claude-4-opus", "claude-3-opus"], .high)
         case .grok:
-            return (["grok-4.6", "grok-4.5"], .high)
+            return (["grok-4.7", "grok-4.6", "grok-4.5"], .high)
         }
     }
 

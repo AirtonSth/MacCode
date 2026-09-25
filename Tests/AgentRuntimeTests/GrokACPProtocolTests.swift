@@ -127,9 +127,13 @@ final class GrokACPProtocolTests: XCTestCase {
         )
         XCTAssertTrue(GrokACPClient.admitsSamGrokWorker(model: "grok-4.6", effort: .xhigh))
         XCTAssertTrue(GrokACPClient.admitsSamGrokWorker(model: "grok-4.6-preview", effort: .xhigh))
+        XCTAssertTrue(GrokACPClient.admitsSamGrokWorker(model: "grok-4.7", effort: .xhigh))
+        XCTAssertTrue(GrokACPClient.admitsSamGrokWorker(model: "grok-4.7-preview", effort: .high))
         XCTAssertTrue(GrokACPClient.admitsSamGrokWorker(model: "grok-4.5", effort: .high))
         XCTAssertFalse(GrokACPClient.admitsSamGrokWorker(model: "grok-4.5", effort: .xhigh))
         XCTAssertFalse(GrokACPClient.admitsSamGrokWorker(model: "grok-4.6", effort: .max))
+        XCTAssertFalse(GrokACPClient.admitsSamGrokWorker(model: "grok-4.7-build-fast", effort: .high),
+                       "live grok-4.7-build-fast has no advertised reasoning contract")
         XCTAssertEqual(
             try GrokACPClient.launchArguments(for: request),
             [
@@ -1735,7 +1739,11 @@ final class GrokACPProtocolTests: XCTestCase {
     /// the process default model until a later set_model.
     func test_sessionOpenParamsEncodeModelIdAndReasoningEffort() throws {
         let omitted = GrokACPClient.sessionOpenParams(cwd: "/tmp", mcpServers: [Any]())
-        XCTAssertNil(omitted["_meta"])
+        let omittedMeta = try XCTUnwrap(omitted["_meta"] as? [String: Any])
+        XCTAssertEqual(omittedMeta["yoloMode"] as? Bool, false,
+                       "absent yoloMode inherits grok-build default_yolo_mode")
+        XCTAssertEqual(omittedMeta["autoMode"] as? Bool, false)
+        XCTAssertNil(omittedMeta["modelId"])
 
         let spawned = GrokACPClient.sessionOpenParams(
             cwd: "/tmp",
@@ -1777,8 +1785,11 @@ final class GrokACPProtocolTests: XCTestCase {
             mcpServers: [Any](),
             sessionId: "sid"
         )
-        // Default: no _meta.noReplay
-        XCTAssertNil(withReplay["_meta"])
+        // Default: no _meta.noReplay; yolo/auto polarities still stamped.
+        let replayMeta = try XCTUnwrap(withReplay["_meta"] as? [String: Any])
+        XCTAssertNil(replayMeta["noReplay"])
+        XCTAssertEqual(replayMeta["yoloMode"] as? Bool, false)
+        XCTAssertEqual(replayMeta["autoMode"] as? Bool, false)
 
         let noReplay = GrokACPClient.sessionOpenParams(
             cwd: "/tmp",
@@ -1823,12 +1834,15 @@ final class GrokACPProtocolTests: XCTestCase {
     }
 
     func test_sessionOpenParamsEncodeYoloModeWithoutAutoMode() throws {
-        // WHY: grok-build session_setup reads _meta.yoloMode on new/load as
-        // structural always-approve. Post-open set_mode still covers the parent
-        // turn path; autoMode is not RemoteCode autoAcceptEdits (GROK-ACP-010).
+        // WHY: grok-build session_setup inherits default_yolo_mode /
+        // default_auto_mode when the keys are absent. Stamp both polarities;
+        // autoMode is always false (not RemoteCode autoAcceptEdits).
         let servers: [Any] = []
         let omitted = GrokACPClient.sessionOpenParams(cwd: "/tmp", mcpServers: servers)
-        XCTAssertNil(omitted["_meta"], "supervised/autoAcceptEdits must omit yoloMode")
+        let omittedMeta = try XCTUnwrap(omitted["_meta"] as? [String: Any])
+        XCTAssertEqual(omittedMeta["yoloMode"] as? Bool, false,
+                       "supervised/autoAcceptEdits must stamp yoloMode false")
+        XCTAssertEqual(omittedMeta["autoMode"] as? Bool, false)
         XCTAssertNil(omitted["sessionId"])
         XCTAssertEqual(omitted["cwd"] as? String, "/tmp")
 
@@ -1839,7 +1853,7 @@ final class GrokACPProtocolTests: XCTestCase {
         )
         let yoloMeta = try XCTUnwrap(yolo["_meta"] as? [String: Any])
         XCTAssertEqual(yoloMeta["yoloMode"] as? Bool, true)
-        XCTAssertNil(yoloMeta["autoMode"])
+        XCTAssertEqual(yoloMeta["autoMode"] as? Bool, false)
         XCTAssertNil(yoloMeta["noReplay"])
 
         let coldLoad = GrokACPClient.sessionOpenParams(
@@ -1853,11 +1867,12 @@ final class GrokACPProtocolTests: XCTestCase {
         let loadMeta = try XCTUnwrap(coldLoad["_meta"] as? [String: Any])
         XCTAssertEqual(loadMeta["yoloMode"] as? Bool, true)
         XCTAssertEqual(loadMeta["noReplay"] as? Bool, true)
-        XCTAssertNil(loadMeta["autoMode"])
+        XCTAssertEqual(loadMeta["autoMode"] as? Bool, false)
 
         let encoded = try JSONSerialization.data(withJSONObject: yolo, options: [.sortedKeys])
         let parsed = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         XCTAssertEqual((parsed["_meta"] as? [String: Any])?["yoloMode"] as? Bool, true)
+        XCTAssertEqual((parsed["_meta"] as? [String: Any])?["autoMode"] as? Bool, false)
 
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -1875,9 +1890,11 @@ final class GrokACPProtocolTests: XCTestCase {
             contentsOf: root.appendingPathComponent("Sources/AgentRuntime/GrokACPClient.swift"),
             encoding: .utf8
         )
-        XCTAssertFalse(
-            client.contains("\"autoMode\""),
-            "ACP open params must not emit autoMode"
+        XCTAssertTrue(
+            client.contains("\"autoMode\": false")
+                || client.contains("meta[\"autoMode\"] = false")
+                || client.contains("[\"autoMode\": false]"),
+            "ACP open params must stamp autoMode false so grok-build does not inherit default_auto_mode"
         )
     }
 
