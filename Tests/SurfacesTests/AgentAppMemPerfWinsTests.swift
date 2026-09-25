@@ -1,6 +1,8 @@
 import AppKit
+import AgentRuntime
 import CoreModel
 import ImageIO
+import Persistence
 import SwiftUI
 import XCTest
 @testable import Surfaces
@@ -380,5 +382,714 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
             throw NSError(domain: "AgentAppMemPerfWinsTests", code: 4)
         }
         return url
+    }
+
+    // MARK: - Rank 1: toolInputCache keys are fingerprints, not full bodies
+
+    func test_toolInputCache_keysByFingerprintNotFullBody() throws {
+        // WHY: NSCache totalCostLimit counts value cost, not keys. `body as
+        // NSString` retained a second UTF-16 copy of every cached JSON blob
+        // (illustrative 20 × 4 KiB = 80 KiB keys; occupancy up to 128 KiB).
+        // Markdown-style `"utf8Count:hash"` keys are ~20–40 ASCII bytes.
+        let body = String(repeating: "n", count: 4_096)
+        let key = AgentMessageMarkdown.cacheKey(for: body)
+        XCTAssertEqual(key as String, "\(body.utf8.count):\(AgentMessageMarkdown.sourceFingerprint(for: body))")
+        XCTAssertLessThan(
+            (key as String).utf8.count,
+            80,
+            "fingerprint keys must stay tens of ASCII bytes, not the 4 KiB body"
+        )
+        XCTAssertEqual(body.utf8.count, 4_096)
+        let occupancyKeysBefore = 20 * body.utf8.count
+        let occupancyKeysAfter = 20 * (key as String).utf8.count
+        XCTAssertGreaterThan(occupancyKeysBefore, 80_000)
+        XCTAssertLessThan(occupancyKeysAfter, 1_024)
+
+        let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
+        let chunk = try functionChunk(
+            source,
+            start: "static func toolInputObject(for item: AssistantItem)",
+            endMarker: "static func intMillis(from value: Any?)"
+        )
+        XCTAssertTrue(
+            chunk.contains("AgentMessageMarkdown.cacheKey(for: body)"),
+            "toolInputCache must key by markdown fingerprint, not the JSON body"
+        )
+        XCTAssertFalse(
+            chunk.contains("let key = body as NSString"),
+            "full-body NSString keys duplicate every cached tool JSON in RSS"
+        )
+    }
+
+    func test_toolInputCache_sameLengthBodiesStillMissIndependently() {
+        // WHY: fingerprint = utf8 count + Hasher(text). Two 4 KiB JSON blobs
+        // with the same length must not share a cache slot (that would mix
+        // parsed objects across tools).
+        let a = #"{"command":"echo A \#(String(repeating: "a", count: 200))"}"#
+        let b = #"{"command":"echo B \#(String(repeating: "b", count: 200))"}"#
+        XCTAssertEqual(a.utf8.count, b.utf8.count)
+        XCTAssertNotEqual(
+            AgentMessageMarkdown.cacheKey(for: a),
+            AgentMessageMarkdown.cacheKey(for: b),
+            "equal-length bodies must still miss — hash is part of the key"
+        )
+        let itemA = bashItem(id: "a", command: "echo A \(String(repeating: "a", count: 200))")
+        let itemB = bashItem(id: "b", command: "echo B \(String(repeating: "b", count: 200))")
+        let before = AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting
+        XCTAssertNotNil(AgentTimelineItemPresentation.toolInputObject(for: itemA))
+        XCTAssertNotNil(AgentTimelineItemPresentation.toolInputObject(for: itemB))
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting - before,
+            2,
+            "two distinct bodies must parse twice even when utf8 counts match"
+        )
+    }
+
+    // MARK: - Rank 2: assistant normalize/compact keys are fingerprints
+
+    func test_assistantTextCaches_keysByFingerprintNotFullBody() throws {
+        // WHY: hide-set rebuilds normalize AND compact every assistant body.
+        // Two caches keyed by `text as NSString` duplicated up to 2×128 KiB
+        // of source bodies on top of the transformed values. Fingerprint keys
+        // drop that to ~10 KiB while warm hits still skip unicode walks.
+        let body = String(repeating: "word ", count: 800)
+        XCTAssertEqual(body.utf8.count, 4_000)
+        let key = AgentMessageMarkdown.cacheKey(for: body)
+        XCTAssertLessThan((key as String).utf8.count, 80)
+        let twoCachesBefore = 2 * 128 * 1_024
+        let twoCachesAfter = 2 * 128 * (key as String).utf8.count
+        XCTAssertEqual(twoCachesBefore, 262_144)
+        XCTAssertLessThan(twoCachesAfter, 20_480)
+
+        let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
+        let normalized = try functionChunk(
+            source,
+            start: "private static func normalizedAssistantText(_ text: String)",
+            endMarker: "private static func makeNormalizedAssistantText"
+        )
+        let compact = try functionChunk(
+            source,
+            start: "private static func compactAssistantText(_ text: String)",
+            endMarker: "private static func makeCompactAssistantText"
+        )
+        XCTAssertTrue(normalized.contains("AgentMessageMarkdown.cacheKey(for: text)"))
+        XCTAssertTrue(compact.contains("AgentMessageMarkdown.cacheKey(for: text)"))
+        XCTAssertFalse(normalized.contains("let key = text as NSString"))
+        XCTAssertFalse(compact.contains("let key = text as NSString"))
+    }
+
+    func test_assistantTextCaches_warmHitSkipsUnicodeWalkAndDistinctBodiesMiss() {
+        // WHY: fingerprint keys must still hit for the same body (compute
+        // stays 1) and miss for a same-length different body (compute += 1).
+        let wordA = "a\(UUID().uuidString.prefix(8))"
+        let wordB = "b\(UUID().uuidString.prefix(8))"
+        let a = String(repeating: "\(wordA) ", count: 40)
+        let b = String(repeating: "\(wordB) ", count: 40)
+        XCTAssertEqual(a.utf8.count, b.utf8.count)
+        XCTAssertNotEqual(AgentMessageMarkdown.cacheKey(for: a), AgentMessageMarkdown.cacheKey(for: b))
+
+        let beforeNorm = AgentAppView.normalizedTextCacheComputeCountForTesting
+        let beforeCompact = AgentAppView.compactTextCacheComputeCountForTesting
+        XCTAssertEqual(
+            AgentAppView.normalizedAssistantTextForTesting(a),
+            String(repeating: "\(wordA) ", count: 39) + wordA
+        )
+        XCTAssertEqual(
+            AgentAppView.compactAssistantTextForTesting(a),
+            String(repeating: wordA, count: 40)
+        )
+        XCTAssertEqual(AgentAppView.normalizedTextCacheComputeCountForTesting - beforeNorm, 1)
+        XCTAssertEqual(AgentAppView.compactTextCacheComputeCountForTesting - beforeCompact, 1)
+
+        for _ in 0..<20 {
+            _ = AgentAppView.normalizedAssistantTextForTesting(a)
+            _ = AgentAppView.compactAssistantTextForTesting(a)
+        }
+        XCTAssertEqual(
+            AgentAppView.normalizedTextCacheComputeCountForTesting - beforeNorm,
+            1,
+            "warm fingerprint hit must not re-walk unicode scalars"
+        )
+        XCTAssertEqual(AgentAppView.compactTextCacheComputeCountForTesting - beforeCompact, 1)
+
+        _ = AgentAppView.normalizedAssistantTextForTesting(b)
+        _ = AgentAppView.compactAssistantTextForTesting(b)
+        XCTAssertEqual(
+            AgentAppView.normalizedTextCacheComputeCountForTesting - beforeNorm,
+            2,
+            "a different same-length body must miss the fingerprint key"
+        )
+        XCTAssertEqual(AgentAppView.compactTextCacheComputeCountForTesting - beforeCompact, 2)
+    }
+
+    // MARK: - Rank 3: snapshot mentionableBots per contentGeneration
+
+    @MainActor
+    func test_mentionableBotsSnapshot_columnAndHeaderShareGenerationCache() throws {
+        // WHY: TranscriptReactiveScope used to call mentionableBotsProvider on
+        // every timeline @Published assign (including tool-body-only ticks).
+        // The header SubagentActivityBadge did the same on every VM chrome
+        // publish. One snapshot per contentGeneration must serve both; composer
+        // @ stays live on the provider.
+        let (vm, rootURL) = try makeVM()
+        defer {
+            vm.dispose()
+            try? FileManager.default.removeItem(at: rootURL)
+        }
+        var providerCalls = 0
+        let bots = [
+            BotDefinition(handle: "ceo", name: "Ceo", title: "CEO", description: "", avatarSymbol: "star.fill")
+        ]
+        vm.mentionableBotsProvider = {
+            providerCalls += 1
+            return bots
+        }
+        let view = AgentAppView(vm: vm)
+        let before = AgentAppView.mentionableBotsSnapshotProviderCallCountForTesting
+
+        XCTAssertEqual(view.snapshotMentionableBotsForTesting().map(\.handle), ["ceo"])
+        for _ in 0..<10 {
+            XCTAssertEqual(view.snapshotMentionableBotsForTesting().count, 1)
+        }
+        XCTAssertEqual(providerCalls, 1, "generation-stable header+column re-entry must not recopy listCached")
+        XCTAssertEqual(AgentAppView.mentionableBotsSnapshotProviderCallCountForTesting - before, 1)
+
+        let now = Date(timeIntervalSince1970: 1)
+        vm.applySubagentActivity(
+            SubagentActivitySnapshot(
+                active: [
+                    SubagentActivityItem(
+                        id: UUID(),
+                        runId: nil,
+                        threadId: AgentThreadID(),
+                        nodeId: "n1",
+                        displayName: "worker",
+                        provider: .codex,
+                        model: nil,
+                        phase: .working,
+                        lifecycleStatus: .accepted,
+                        finalRunStatus: nil,
+                        admittedAt: now,
+                        finalizedAt: nil,
+                        lifecycleUpdatedAt: now,
+                        isActive: true
+                    )
+                ],
+                done: []
+            )
+        )
+        XCTAssertEqual(
+            view.snapshotMentionableBotsForTesting().count,
+            1
+        )
+        XCTAssertEqual(
+            providerCalls,
+            1,
+            "applySubagentActivity (header chrome publish) must reuse the generation snapshot"
+        )
+
+        vm.messages = [
+            AgentMessage(threadId: AgentThreadID(), role: .user, content: "bump generation")
+        ]
+        XCTAssertEqual(view.snapshotMentionableBotsForTesting().count, 1)
+        XCTAssertEqual(providerCalls, 2, "contentGeneration bump must refresh the catalog snapshot")
+
+        let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
+        let header = try functionChunk(source, start: "private var header: some View {", endMarker: "private var fullAccessBanner")
+        XCTAssertTrue(header.contains("snapshotMentionableBots()"))
+        XCTAssertFalse(
+            header.contains("mentionableBotsProvider()"),
+            "header badge must not live-call the provider on VM chrome publishes"
+        )
+        let column = try functionChunk(
+            source,
+            start: "let flow = cachedChatFlowPaint(",
+            endMarker: "VStack(alignment: .leading, spacing: 32)"
+        )
+        XCTAssertTrue(column.contains("snapshotMentionableBots()"))
+        XCTAssertFalse(column.contains("mentionableBotsProvider()"))
+        XCTAssertTrue(
+            source.contains("mentionableBots = mentionableBotsProvider()"),
+            "composer @ must stay live on the provider"
+        )
+    }
+
+    // MARK: - Rank 4: skip signature builder on generation-stable counts
+
+    @MainActor
+    func test_cachedChatRowPaintContext_skipsSignatureBuilderOnGenerationStableCounts() throws {
+        // WHY: even after bots are snapshotted, F2 still allocated a growing
+        // signature string (every bot handle|name|symbol) on every column body.
+        // Tool-body-only ticks already know generation + row/visible counts;
+        // building that string is wasted alloc+hash (~2 KiB for 50 bots).
+        let (vm, rootURL) = try makeVM()
+        defer {
+            vm.dispose()
+            try? FileManager.default.removeItem(at: rootURL)
+        }
+        let view = AgentAppView(vm: vm)
+        let turn = AssistantTurnSnapshot(turnId: "t-stable", finalAssistantMessage: "ok", finished: true)
+        let entries: [AgentAppView.TranscriptEntry] = [.turn(turn)]
+        let rows = entries.map(AgentAppView.ChatFlowRow.entry)
+        let bots = (0..<50).map { index in
+            BotDefinition(
+                handle: "bot\(index)",
+                name: "Bot \(index)",
+                title: "",
+                description: "",
+                avatarSymbol: "person.fill"
+            )
+        }
+
+        let beforeCompute = AgentAppView.chatRowPaintContextComputeCountForTesting
+        let beforeSignature = AgentAppView.chatRowPaintContextSignatureBuilderCountForTesting
+        _ = view.cachedChatRowPaintContextForTesting(rows: rows, visibleEntries: entries, bots: bots)
+        XCTAssertEqual(AgentAppView.chatRowPaintContextComputeCountForTesting - beforeCompute, 1)
+        XCTAssertEqual(AgentAppView.chatRowPaintContextSignatureBuilderCountForTesting - beforeSignature, 1)
+
+        for _ in 0..<200 {
+            _ = view.cachedChatRowPaintContextForTesting(rows: rows, visibleEntries: entries, bots: bots)
+        }
+        XCTAssertEqual(
+            AgentAppView.chatRowPaintContextComputeCountForTesting - beforeCompute,
+            1,
+            "generation-stable re-entry must not rebuild paint context"
+        )
+        XCTAssertEqual(
+            AgentAppView.chatRowPaintContextSignatureBuilderCountForTesting - beforeSignature,
+            1,
+            "matching generation+row/visible counts must return before chatRowPaintContextSignature"
+        )
+
+        vm.messages = [
+            AgentMessage(threadId: AgentThreadID(), role: .assistant, content: "generation moves")
+        ]
+        _ = view.cachedChatRowPaintContextForTesting(rows: rows, visibleEntries: entries, bots: bots)
+        XCTAssertEqual(AgentAppView.chatRowPaintContextComputeCountForTesting - beforeCompute, 2)
+        XCTAssertEqual(AgentAppView.chatRowPaintContextSignatureBuilderCountForTesting - beforeSignature, 2)
+
+        let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
+        let chunk = try functionChunk(
+            source,
+            start: "private func cachedChatRowPaintContext(",
+            endMarker: "private func snapshotMentionableBots()"
+        )
+        let countsIdx = try XCTUnwrap(chunk.range(of: "chatRowPaintContextCache.rowCount == rows.count"))
+        let signatureIdx = try XCTUnwrap(chunk.range(of: "Self.chatRowPaintContextSignature("))
+        XCTAssertTrue(
+            countsIdx.lowerBound < signatureIdx.lowerBound,
+            "generation+counts hit must precede the signature builder"
+        )
+    }
+
+    // MARK: - Rank 5 unique: normalizedFinalsMemo cost + fingerprint key
+
+    func test_normalizedFinalsMemo_costLimitAndFingerprintKey() throws {
+        // WHY: finished-turn hide-set walks used an unbounded-cost NSCache
+        // keyed only by final utf8 length. Equal-length final swaps missed,
+        // and occupancy had no byte ceiling.
+        XCTAssertEqual(AgentChatLiveTurnChrome.normalizedFinalsMemoCountLimit, 128)
+        XCTAssertEqual(AgentChatLiveTurnChrome.normalizedFinalsMemoCostLimit, 128 * 1024)
+        let source = try repoSource("Sources/Surfaces/AgentChatLiveTurnChrome.swift")
+        let chunk = try functionChunk(
+            source,
+            start: "public static func normalizedAssistantFinals(for turn: AssistantTurnSnapshot)",
+            endMarker: "public static func paintsLiveTurnChrome"
+        )
+        XCTAssertTrue(chunk.contains("AgentMessageMarkdown.sourceFingerprint(for:"))
+        XCTAssertFalse(
+            chunk.contains("finalAssistantMessage?.utf8.count"),
+            "length-only keys miss equal-length finished finals"
+        )
+        XCTAssertTrue(source.contains("totalCostLimit = normalizedFinalsMemoCostLimit"))
+
+        let before = 512
+        let after = AgentChatLiveTurnChrome.normalizedFinalsMemoCountLimit
+        XCTAssertEqual(Double(before - after) / Double(before), 0.75, accuracy: 0.001)
+    }
+
+    func test_normalizedFinalsMemo_equalLengthFinalReplacementMisses() {
+        // WHY: fingerprint the finished final so "alpha" → "bravo" (same utf8
+        // count) does not reuse the hide-set memo.
+        func turn(final: String) -> AssistantTurnSnapshot {
+            AssistantTurnSnapshot(
+                turnId: "t-final",
+                items: [
+                    AssistantItem(
+                        id: "a1",
+                        turnId: "t-final",
+                        type: .assistantMessage,
+                        state: .completed,
+                        body: final,
+                        startedAtMs: 1,
+                        finishedAtMs: 2
+                    )
+                ],
+                finalAssistantMessage: final,
+                finished: true
+            )
+        }
+        let a = turn(final: "alpha")
+        let b = turn(final: "bravo")
+        XCTAssertEqual(a.finalAssistantMessage?.utf8.count, b.finalAssistantMessage?.utf8.count)
+        let before = AgentChatLiveTurnChrome.normalizedFinalsComputeCountForTesting
+        XCTAssertFalse(AgentChatLiveTurnChrome.normalizedAssistantFinals(for: a).isEmpty)
+        XCTAssertFalse(AgentChatLiveTurnChrome.normalizedAssistantFinals(for: b).isEmpty)
+        XCTAssertGreaterThanOrEqual(
+            AgentChatLiveTurnChrome.normalizedFinalsComputeCountForTesting - before,
+            2,
+            "equal-length finals must miss independently"
+        )
+        _ = AgentChatLiveTurnChrome.normalizedAssistantFinals(for: a)
+        let afterWarm = AgentChatLiveTurnChrome.normalizedFinalsComputeCountForTesting
+        _ = AgentChatLiveTurnChrome.normalizedAssistantFinals(for: a)
+        XCTAssertEqual(
+            AgentChatLiveTurnChrome.normalizedFinalsComputeCountForTesting,
+            afterWarm,
+            "warm fingerprint hit must not re-normalize"
+        )
+    }
+
+    // MARK: - Rank 6 unique: Edit/diff JSON reuses toolInputCache
+
+    func test_editDiffJSON_reusesToolInputCache() throws {
+        // WHY: live tool rows already JSON-decode item.body. Edit/diff
+        // extraction used to JSONSerialization-parse the same object again.
+        let source = try repoSource("Sources/Surfaces/AgentChatUXPresentation.swift")
+        let jsonChunk = try functionChunk(
+            source,
+            start: "private static func jsonObject(_ body: String)",
+            endMarker: "// MARK: - Thread rail row copy"
+        )
+        XCTAssertTrue(jsonChunk.contains("toolInputObject(forBody:"))
+        XCTAssertFalse(jsonChunk.contains("JSONSerialization.jsonObject"))
+
+        let body = #"{"file_path":"/tmp/x.swift","old_string":"a","new_string":"b"}"#
+        let item = AssistantItem(
+            id: "edit-1",
+            turnId: "t-edit",
+            type: .tool,
+            state: .completed,
+            summary: "Edit",
+            body: body,
+            startedAtMs: 1,
+            finishedAtMs: 2
+        )
+        let before = AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting
+        XCTAssertNotNil(AgentTimelineItemPresentation.toolInputObject(for: item))
+        XCTAssertEqual(AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting - before, 1)
+        XCTAssertNotNil(AgentFileEditDiffPresentation.synthesizeDiffFromEditJSON(body))
+        XCTAssertEqual(
+            AgentTimelineItemPresentation.toolInputObjectComputeCountForTesting - before,
+            1,
+            "Edit JSON must hit the warmed toolInputCache (no second parse)"
+        )
+    }
+
+    // MARK: - Unique vs 393: memoize history chatFlowRows; live tail stays fresh
+
+    @MainActor
+    func test_cachedChatFlowPaint_skipsRebuildOnChromeOnlyTicks() throws {
+        // WHY: chrome-only / paint-tick bodies split and wove ChatFlowRow on
+        // every column pass. History identity (generation + history first/last
+        // ids + count) is stable on those ticks — rebuilding the finished
+        // weave is wasted. The live suffix still weaves each pass.
+        let (vm, rootURL) = try makeVM()
+        defer {
+            vm.dispose()
+            try? FileManager.default.removeItem(at: rootURL)
+        }
+        let view = AgentAppView(vm: vm)
+        let history = AssistantTurnSnapshot(
+            turnId: "t-hist",
+            finalAssistantMessage: "done",
+            finished: true
+        )
+        let live = AssistantTurnSnapshot(turnId: "t-live", finished: false)
+        let paint: [AgentAppView.TranscriptEntry] = [.turn(history), .turn(live)]
+        let extra = AgentMessage(threadId: AgentThreadID(), role: .user, content: "tail")
+
+        let before = AgentAppView.chatFlowPaintComputeCountForTesting
+        let beforeLive = AgentAppView.chatFlowPaintLiveComputeCountForTesting
+        let first = view.cachedChatFlowPaintForTesting(
+            paintSequence: paint,
+            latestLiveTurnId: "t-live"
+        )
+        XCTAssertEqual(first.historyRows.count, 1)
+        XCTAssertEqual(first.liveRows.count, 1)
+        XCTAssertEqual(AgentAppView.chatFlowPaintComputeCountForTesting - before, 1)
+        XCTAssertEqual(AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive, 1)
+
+        for _ in 0..<200 {
+            let again = view.cachedChatFlowPaintForTesting(
+                paintSequence: paint,
+                latestLiveTurnId: "t-live"
+            )
+            XCTAssertEqual(again.allRows.map(\.id), first.allRows.map(\.id))
+        }
+        XCTAssertEqual(
+            AgentAppView.chatFlowPaintComputeCountForTesting - before,
+            1,
+            "chrome-only ticks with a live turn must skip the history weave"
+        )
+        XCTAssertEqual(
+            AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive,
+            201,
+            "live tail must reweave on every paint while a live turn exists"
+        )
+
+        let longer = paint + [.message(extra)]
+        let afterTail = view.cachedChatFlowPaintForTesting(
+            paintSequence: longer,
+            latestLiveTurnId: "t-live"
+        )
+        XCTAssertEqual(
+            AgentAppView.chatFlowPaintComputeCountForTesting - before,
+            1,
+            "appending onto the live suffix must not rebuild history"
+        )
+        XCTAssertEqual(afterTail.liveRows.count, 2)
+
+        let older = AssistantTurnSnapshot(
+            turnId: "t-older",
+            finalAssistantMessage: "earlier",
+            finished: true
+        )
+        _ = view.cachedChatFlowPaintForTesting(
+            paintSequence: [.turn(older)] + paint,
+            latestLiveTurnId: "t-live"
+        )
+        XCTAssertEqual(
+            AgentAppView.chatFlowPaintComputeCountForTesting - before,
+            2,
+            "history first/last/count change must miss"
+        )
+
+        vm.messages = [extra]
+        _ = view.cachedChatFlowPaintForTesting(
+            paintSequence: [.turn(older)] + paint,
+            latestLiveTurnId: "t-live"
+        )
+        XCTAssertEqual(
+            AgentAppView.chatFlowPaintComputeCountForTesting - before,
+            3,
+            "contentGeneration bump must miss even when paint ids match"
+        )
+
+        let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
+        let helper = try functionChunk(
+            source,
+            start: "private func cachedChatFlowPaint(",
+            endMarker: "func cachedChatRowPaintContextForTesting"
+        )
+        XCTAssertTrue(helper.contains("historyRows = Self.chatFlowRows(split.history)"))
+        XCTAssertTrue(helper.contains("Self.chatFlowRows(split.liveTail)"))
+        XCTAssertTrue(helper.contains("Self.splitTrailingLiveTurns("))
+        XCTAssertFalse(
+            helper.contains("chatFlowPaintCache.liveRows"),
+            "live ChatFlowRows must not be memoized"
+        )
+        let countsIdx = try XCTUnwrap(helper.range(of: "chatFlowPaintCache.count == count"))
+        let rowsIdx = try XCTUnwrap(helper.range(of: "Self.chatFlowRows(split.history)"))
+        XCTAssertTrue(
+            countsIdx.lowerBound < rowsIdx.lowerBound,
+            "generation+first/last/count hit must precede history chatFlowRows"
+        )
+        let column = try functionChunk(
+            source,
+            start: "let flow = cachedChatFlowPaint(",
+            endMarker: "VStack(alignment: .leading, spacing: 32)"
+        )
+        XCTAssertTrue(column.contains("flow.historyRows"))
+        XCTAssertFalse(column.contains("Self.chatFlowRows("))
+    }
+
+    @MainActor
+    func test_cachedChatFlowPaint_liveToolBodyGrowthMissesLiveTail() throws {
+        // WHY: commitStreamQuantum grows tool output / appends tools without
+        // bumping contentGeneration. Caching ChatFlowRow snapshots for the
+        // live suffix freezes that paint. History weave must still hit.
+        let (vm, rootURL) = try makeVM()
+        defer {
+            vm.dispose()
+            try? FileManager.default.removeItem(at: rootURL)
+        }
+        let view = AgentAppView(vm: vm)
+        let history = AssistantTurnSnapshot(
+            turnId: "t-hist",
+            finalAssistantMessage: "done",
+            finished: true
+        )
+        var live = AssistantTurnSnapshot(
+            turnId: "t-live",
+            items: [
+                AssistantItem(
+                    id: "tool-1",
+                    turnId: "t-live",
+                    type: .tool,
+                    body: "ls",
+                    output: "a",
+                    startedAtMs: 2
+                )
+            ],
+            finished: false
+        )
+        let paint: [AgentAppView.TranscriptEntry] = [.turn(history), .turn(live)]
+        let before = AgentAppView.chatFlowPaintComputeCountForTesting
+        let beforeLive = AgentAppView.chatFlowPaintLiveComputeCountForTesting
+        let first = view.cachedChatFlowPaintForTesting(
+            paintSequence: paint,
+            latestLiveTurnId: "t-live"
+        )
+        XCTAssertEqual(Self.chatFlowToolPayloads(first.liveRows), ["tool-1:ls:a"])
+        XCTAssertEqual(AgentAppView.chatFlowPaintComputeCountForTesting - before, 1)
+        XCTAssertEqual(AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive, 1)
+
+        live.items[0].output = String(repeating: "x", count: 8_192)
+        let grown = view.cachedChatFlowPaintForTesting(
+            paintSequence: [.turn(history), .turn(live)],
+            latestLiveTurnId: "t-live"
+        )
+        XCTAssertEqual(
+            Self.chatFlowToolPayloads(grown.liveRows),
+            ["tool-1:ls:" + String(repeating: "x", count: 8_192)],
+            "live tool-body growth must miss the live-tail cache"
+        )
+        XCTAssertEqual(
+            AgentAppView.chatFlowPaintComputeCountForTesting - before,
+            1,
+            "tool-body growth must not rebuild finished history"
+        )
+        XCTAssertEqual(AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive, 2)
+
+        live.items.append(
+            AssistantItem(id: "tool-2", turnId: "t-live", type: .tool, body: "pwd", startedAtMs: 3)
+        )
+        let extraTool = view.cachedChatFlowPaintForTesting(
+            paintSequence: [.turn(history), .turn(live)],
+            latestLiveTurnId: "t-live"
+        )
+        XCTAssertEqual(
+            Self.chatFlowToolPayloads(extraTool.liveRows),
+            [
+                "tool-1:ls:" + String(repeating: "x", count: 8_192),
+                "tool-2:pwd:"
+            ],
+            "an extra live tool must paint without a generation bump"
+        )
+        XCTAssertEqual(AgentAppView.chatFlowPaintComputeCountForTesting - before, 1)
+        XCTAssertEqual(AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive, 3)
+    }
+
+    // MARK: - Unique vs 393: header clock sentinel
+
+    func test_subagentActivityBadgeNow_skipsClockWhenEmptyAndClosed() throws {
+        // WHY: Auto routing always mounts Subagents chrome. An empty closed
+        // badge still called vm.currentTime() on every header body, churning
+        // Date identity with no elapsed UI to feed.
+        var calls = 0
+        let live = Date(timeIntervalSince1970: 99)
+        let clock: () -> Date = {
+            calls += 1
+            return live
+        }
+        XCTAssertEqual(
+            AgentAppView.subagentActivityBadgeNow(
+                snapshotEmpty: true,
+                popoverPresented: false,
+                currentTime: clock
+            ),
+            AgentAppView.subagentActivityBadgeStableNow
+        )
+        XCTAssertEqual(calls, 0, "empty closed badge must not call currentTime")
+
+        XCTAssertEqual(
+            AgentAppView.subagentActivityBadgeNow(
+                snapshotEmpty: true,
+                popoverPresented: true,
+                currentTime: clock
+            ),
+            live
+        )
+        XCTAssertEqual(calls, 1, "open popover still needs a live clock")
+
+        XCTAssertEqual(
+            AgentAppView.subagentActivityBadgeNow(
+                snapshotEmpty: false,
+                popoverPresented: false,
+                currentTime: clock
+            ),
+            live
+        )
+        XCTAssertEqual(calls, 2, "non-empty snapshot still needs a live clock")
+
+        let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
+        let header = try functionChunk(
+            source,
+            start: "private var header: some View {",
+            endMarker: "private var fullAccessBanner"
+        )
+        XCTAssertTrue(header.contains("subagentActivityBadgeNow("))
+        XCTAssertFalse(
+            header.contains("now: vm.currentTime()"),
+            "header must not unconditionally Date() the empty closed badge"
+        )
+        XCTAssertTrue(
+            source.contains("mentionableBots = mentionableBotsProvider()"),
+            "composer @ must stay live on the provider"
+        )
+    }
+
+    private static func chatFlowToolPayloads(_ rows: [AgentAppView.ChatFlowRow]) -> [String] {
+        rows.flatMap { row -> [AssistantItem] in
+            switch row {
+            case .entry(.turn(let turn)):
+                return turn.items
+            case .entry(.message):
+                return []
+            case .segment(let segment):
+                return segment.snapshot.items
+            }
+        }.filter { $0.type == .tool }.map { "\($0.id):\($0.body):\($0.output ?? "")" }
+    }
+
+    private func repoSource(_ relative: String) throws -> String {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        return try String(contentsOf: root.appendingPathComponent(relative), encoding: .utf8)
+    }
+
+    private func functionChunk(_ source: String, start: String, endMarker: String) throws -> String {
+        let startRange = try XCTUnwrap(source.range(of: start), "missing \(start)")
+        let rest = source[startRange.lowerBound...]
+        let end = rest.range(of: endMarker)?.lowerBound ?? rest.endIndex
+        return String(source[startRange.lowerBound..<end])
+    }
+
+    @MainActor
+    private func makeVM() throws -> (AgentAppViewModel, URL) {
+        let rootURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-memperf-wins-" + UUID().uuidString)
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: rootURL.path).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [:]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: WorkspaceID(),
+            cwd: rootURL.path,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            draftRepo: AgentThreadDraftRepository(db: db)
+        )
+        return (vm, rootURL)
     }
 }

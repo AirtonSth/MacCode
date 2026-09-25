@@ -11287,9 +11287,17 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
     #endif
 
     static func toolInputObject(for item: AssistantItem) -> [String: Any]? {
-        let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        toolInputObject(forBody: item.body)
+    }
+
+    /// Shared JSON object cache for live tool rows and Edit/diff extraction.
+    /// Fingerprint key (~20–40 ASCII bytes). NSCache does not count key
+    /// bytes toward totalCostLimit; a full-body NSString key retained a
+    /// second UTF-16 copy of every cached JSON blob.
+    static func toolInputObject(forBody raw: String) -> [String: Any]? {
+        let body = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return nil }
-        let key = body as NSString
+        let key = AgentMessageMarkdown.cacheKey(for: body)
         if let cached = toolInputCache.object(forKey: key) {
             return cached.object
         }
@@ -12620,14 +12628,28 @@ public struct AgentAppView: View {
         return cache
     }()
 
+    #if DEBUG
+    nonisolated(unsafe) static var normalizedTextCacheComputeCountForTesting: UInt64 = 0
+    nonisolated(unsafe) static var compactTextCacheComputeCountForTesting: UInt64 = 0
+    static func normalizedAssistantTextForTesting(_ text: String) -> String {
+        normalizedAssistantText(text)
+    }
+    static func compactAssistantTextForTesting(_ text: String) -> String {
+        compactAssistantText(text)
+    }
+    #endif
+
     private static func normalizedAssistantText(_ text: String) -> String {
         guard text.utf8.count <= dedupeCacheCharacterLimit else {
             return makeNormalizedAssistantText(text)
         }
-        let key = text as NSString
+        let key = AgentMessageMarkdown.cacheKey(for: text)
         if let cached = normalizedTextCache.object(forKey: key) {
             return cached as String
         }
+        #if DEBUG
+        normalizedTextCacheComputeCountForTesting &+= 1
+        #endif
         let out = makeNormalizedAssistantText(text)
         normalizedTextCache.setObject(out as NSString, forKey: key, cost: out.utf8.count)
         return out
@@ -12653,10 +12675,13 @@ public struct AgentAppView: View {
         guard text.utf8.count <= dedupeCacheCharacterLimit else {
             return makeCompactAssistantText(text)
         }
-        let key = text as NSString
+        let key = AgentMessageMarkdown.cacheKey(for: text)
         if let cached = compactTextCache.object(forKey: key) {
             return cached as String
         }
+        #if DEBUG
+        compactTextCacheComputeCountForTesting &+= 1
+        #endif
         let out = makeCompactAssistantText(text)
         compactTextCache.setObject(out as NSString, forKey: key, cost: out.utf8.count)
         return out
@@ -13925,17 +13950,50 @@ public struct AgentAppView: View {
     private let assistantTextsCache = AssistantTextsCache()
 
     /// F2: memoize `makeChatRowPaintContext` across chrome-only / paint-tick
-    /// body passes when `contentGeneration` and the compact row/bots signature
-    /// are unchanged. Peer-header + hide-set walks are O(visible rows).
+    /// body passes when `contentGeneration` and row/visible counts match.
+    /// Tool-body-only timeline publishes keep generation stable; skip the
+    /// bot-identity signature string on that hit path.
     private final class ChatRowPaintContextCache {
         var generation: UInt64 = 0
         var signature: String = ""
+        var rowCount: Int = -1
+        var visibleCount: Int = -1
         var context: ChatRowPaintContext?
     }
     private let chatRowPaintContextCache = ChatRowPaintContextCache()
+
+    /// Snapshot `mentionableBotsProvider` once per `contentGeneration` for
+    /// header + transcript column. Composer `@` stays live on the provider.
+    private final class MentionableBotsSnapshotCache {
+        var generation: UInt64 = 0
+        var bots: [BotDefinition] = []
+        var hasValue = false
+    }
+    private let mentionableBotsSnapshotCache = MentionableBotsSnapshotCache()
+
+    /// Memoize finished-history `chatFlowRows` across chrome-only / paint-tick
+    /// bodies. Live suffix is never cached: tool-body growth and extra tools
+    /// keep `contentGeneration` stable but must still paint.
+    private final class ChatFlowPaintCache {
+        var generation: UInt64 = 0
+        var count: Int = -1
+        var firstId: String?
+        var lastId: String?
+        var historyRows: [ChatFlowRow] = []
+        var hasValue = false
+    }
+    private let chatFlowPaintCache = ChatFlowPaintCache()
     #if DEBUG
     /// Test-only: uncached `makeChatRowPaintContext` invocations.
     static nonisolated(unsafe) var chatRowPaintContextComputeCountForTesting: UInt64 = 0
+    /// Test-only: `chatRowPaintContextSignature` allocations.
+    static nonisolated(unsafe) var chatRowPaintContextSignatureBuilderCountForTesting: UInt64 = 0
+    /// Test-only: provider calls from the generation-gated bots snapshot.
+    static nonisolated(unsafe) var mentionableBotsSnapshotProviderCallCountForTesting: UInt64 = 0
+    /// Test-only: uncached history `chatFlowRows` invocations.
+    static nonisolated(unsafe) var chatFlowPaintComputeCountForTesting: UInt64 = 0
+    /// Test-only: live-tail `chatFlowRows` invocations (always miss when live).
+    static nonisolated(unsafe) var chatFlowPaintLiveComputeCountForTesting: UInt64 = 0
     #endif
 
     /// Signature for F2 paint-context reuse. Includes every bot identity field
@@ -13963,6 +14021,17 @@ public struct AgentAppView: View {
         bots: [BotDefinition]
     ) -> ChatRowPaintContext {
         let generation = vm.transcriptState.contentGeneration
+        // Rank 4: matching generation + row/visible counts returns the cached
+        // context BEFORE `chatRowPaintContextSignature` (no bot-string alloc).
+        if chatRowPaintContextCache.generation == generation,
+           chatRowPaintContextCache.rowCount == rows.count,
+           chatRowPaintContextCache.visibleCount == visibleEntries.count,
+           let cached = chatRowPaintContextCache.context {
+            return cached
+        }
+        #if DEBUG
+        Self.chatRowPaintContextSignatureBuilderCountForTesting &+= 1
+        #endif
         let signature = Self.chatRowPaintContextSignature(
             generation: generation,
             rows: rows,
@@ -13972,6 +14041,8 @@ public struct AgentAppView: View {
         if chatRowPaintContextCache.generation == generation,
            chatRowPaintContextCache.signature == signature,
            let cached = chatRowPaintContextCache.context {
+            chatRowPaintContextCache.rowCount = rows.count
+            chatRowPaintContextCache.visibleCount = visibleEntries.count
             return cached
         }
         #if DEBUG
@@ -13984,8 +14055,75 @@ public struct AgentAppView: View {
         )
         chatRowPaintContextCache.generation = generation
         chatRowPaintContextCache.signature = signature
+        chatRowPaintContextCache.rowCount = rows.count
+        chatRowPaintContextCache.visibleCount = visibleEntries.count
         chatRowPaintContextCache.context = context
         return context
+    }
+
+    private func snapshotMentionableBots() -> [BotDefinition] {
+        let generation = vm.transcriptState.contentGeneration
+        if mentionableBotsSnapshotCache.hasValue,
+           mentionableBotsSnapshotCache.generation == generation {
+            return mentionableBotsSnapshotCache.bots
+        }
+        #if DEBUG
+        Self.mentionableBotsSnapshotProviderCallCountForTesting &+= 1
+        #endif
+        let bots = vm.mentionableBotsProvider()
+        mentionableBotsSnapshotCache.generation = generation
+        mentionableBotsSnapshotCache.bots = bots
+        mentionableBotsSnapshotCache.hasValue = true
+        return bots
+    }
+
+    private func cachedChatFlowPaint(
+        paintSequence: [TranscriptEntry],
+        latestLiveTurnId: String?
+    ) -> (historyRows: [ChatFlowRow], liveRows: [ChatFlowRow], allRows: [ChatFlowRow]) {
+        let generation = vm.transcriptState.contentGeneration
+        // Always split so `latestLiveTurnId` and trailing unfinished turns
+        // move the live boundary even when generation + paint ends are stable.
+        let split = Self.splitTrailingLiveTurns(
+            paintSequence,
+            latestLiveTurnId: latestLiveTurnId
+        )
+        // History (or the full sequence when there is no live tail) is keyed
+        // on generation + history first/last ids + count. Live snapshots
+        // embed tool bodies and must not be stored.
+        let count = split.history.count
+        let firstId = split.history.first?.id
+        let lastId = split.history.last?.id
+        let historyRows: [ChatFlowRow]
+        if chatFlowPaintCache.hasValue,
+           chatFlowPaintCache.generation == generation,
+           chatFlowPaintCache.count == count,
+           chatFlowPaintCache.firstId == firstId,
+           chatFlowPaintCache.lastId == lastId {
+            historyRows = chatFlowPaintCache.historyRows
+        } else {
+            #if DEBUG
+            Self.chatFlowPaintComputeCountForTesting &+= 1
+            #endif
+            // Chat flow: weave each turn with the bot peer rows that arrived
+            // mid-turn. The split boundary never cuts a turn from its following
+            // messages, so mapping each side independently equals the whole.
+            historyRows = Self.chatFlowRows(split.history)
+            chatFlowPaintCache.generation = generation
+            chatFlowPaintCache.count = count
+            chatFlowPaintCache.firstId = firstId
+            chatFlowPaintCache.lastId = lastId
+            chatFlowPaintCache.historyRows = historyRows
+            chatFlowPaintCache.hasValue = true
+        }
+        guard !split.liveTail.isEmpty else {
+            return (historyRows, [], historyRows)
+        }
+        #if DEBUG
+        Self.chatFlowPaintLiveComputeCountForTesting &+= 1
+        #endif
+        let liveRows = Self.chatFlowRows(split.liveTail)
+        return (historyRows, liveRows, historyRows + liveRows)
     }
 
     #if DEBUG
@@ -13996,6 +14134,17 @@ public struct AgentAppView: View {
         bots: [BotDefinition]
     ) -> ChatRowPaintContext {
         cachedChatRowPaintContext(rows: rows, visibleEntries: visibleEntries, bots: bots)
+    }
+
+    func snapshotMentionableBotsForTesting() -> [BotDefinition] {
+        snapshotMentionableBots()
+    }
+
+    func cachedChatFlowPaintForTesting(
+        paintSequence: [TranscriptEntry],
+        latestLiveTurnId: String?
+    ) -> (historyRows: [ChatFlowRow], liveRows: [ChatFlowRow], allRows: [ChatFlowRow]) {
+        cachedChatFlowPaint(paintSequence: paintSequence, latestLiveTurnId: latestLiveTurnId)
     }
     #endif
 
@@ -14517,6 +14666,22 @@ public struct AgentAppView: View {
         )
     }
 
+    /// Empty closed Subagents chrome does not read elapsed time. A fresh
+    /// `Date()` on every header body churned identity while Auto showed an
+    /// idle badge.
+    nonisolated static let subagentActivityBadgeStableNow = Date(timeIntervalSinceReferenceDate: 0)
+
+    nonisolated static func subagentActivityBadgeNow(
+        snapshotEmpty: Bool,
+        popoverPresented: Bool,
+        currentTime: () -> Date
+    ) -> Date {
+        if snapshotEmpty && !popoverPresented {
+            return subagentActivityBadgeStableNow
+        }
+        return currentTime()
+    }
+
     // Thin context header. Run-config (provider/model/permission) lives in
     // the composer footer now, Codex-style.
     private var header: some View {
@@ -14561,8 +14726,12 @@ public struct AgentAppView: View {
             if !vm.subagentActivity.isEmpty || showSubagentActivity || vm.routingMode == .auto {
                 SubagentActivityBadge(
                     snapshot: vm.subagentActivity,
-                    bots: vm.mentionableBotsProvider(),
-                    now: vm.currentTime(),
+                    bots: snapshotMentionableBots(),
+                    now: Self.subagentActivityBadgeNow(
+                        snapshotEmpty: vm.subagentActivity.isEmpty,
+                        popoverPresented: showSubagentActivity,
+                        currentTime: vm.currentTime
+                    ),
                     isPresented: $showSubagentActivity,
                     orchestrateActive: vm.routingMode == .auto
                 )
@@ -14809,19 +14978,14 @@ public struct AgentAppView: View {
                             if case .turn(let turn) = entry { return turn.turnId }
                             return nil
                         }
-                        let split = Self.splitTrailingLiveTurns(
-                            paintSequence,
+                        let flow = cachedChatFlowPaint(
+                            paintSequence: paintSequence,
                             latestLiveTurnId: latestLiveId
                         )
-                        // Chat flow: weave each turn with the bot peer rows that
-                        // arrived mid-turn so every update appends in arrival
-                        // order. The split boundary never cuts a turn from its
-                        // following messages (the live tail starts at the turn),
-                        // so mapping each side independently equals the whole.
-                        let historyRows = Self.chatFlowRows(split.history)
-                        let liveRows = Self.chatFlowRows(split.liveTail)
-                        let allRows = historyRows + liveRows
-                        let mentionBots = vm.mentionableBotsProvider()
+                        let historyRows = flow.historyRows
+                        let liveRows = flow.liveRows
+                        let allRows = flow.allRows
+                        let mentionBots = snapshotMentionableBots()
                         // F2: reuse paint context across chrome-only / paint-tick
                         // passes when contentGeneration is unchanged.
                         let rowPaintContext = cachedChatRowPaintContext(
