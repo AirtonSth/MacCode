@@ -5638,6 +5638,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public var mentionableBotsProvider: () -> [BotDefinition] = { [] }
+    public var mentionableBotsRevisionProvider: () -> UInt64 = { 0 }
 
     #if DEBUG
     /// Test-only: bots-provider invocations from `composerSuggestions`.
@@ -13955,6 +13956,7 @@ public struct AgentAppView: View {
     /// bot-identity signature string on that hit path.
     private final class ChatRowPaintContextCache {
         var generation: UInt64 = 0
+        var botsRevision: UInt64 = 0
         var signature: String = ""
         var rowCount: Int = -1
         var visibleCount: Int = -1
@@ -13962,10 +13964,11 @@ public struct AgentAppView: View {
     }
     private let chatRowPaintContextCache = ChatRowPaintContextCache()
 
-    /// Snapshot `mentionableBotsProvider` once per `contentGeneration` for
-    /// header + transcript column. Composer `@` stays live on the provider.
+    /// Snapshot `mentionableBotsProvider` once per transcript/catalog revision
+    /// for header + transcript column. Composer `@` stays live on the provider.
     private final class MentionableBotsSnapshotCache {
         var generation: UInt64 = 0
+        var botsRevision: UInt64 = 0
         var bots: [BotDefinition] = []
         var hasValue = false
     }
@@ -13976,6 +13979,7 @@ public struct AgentAppView: View {
     /// keep `contentGeneration` stable but must still paint.
     private final class ChatFlowPaintCache {
         var generation: UInt64 = 0
+        var aggregateBudgetGeneration: UInt64 = 0
         var count: Int = -1
         var firstId: String?
         var lastId: String?
@@ -14021,9 +14025,11 @@ public struct AgentAppView: View {
         bots: [BotDefinition]
     ) -> ChatRowPaintContext {
         let generation = vm.transcriptState.contentGeneration
-        // Rank 4: matching generation + row/visible counts returns the cached
-        // context BEFORE `chatRowPaintContextSignature` (no bot-string alloc).
+        let botsRevision = vm.mentionableBotsRevisionProvider()
+        // Rank 4: matching transcript/catalog revisions + row/visible counts
+        // returns before `chatRowPaintContextSignature` (no bot-string alloc).
         if chatRowPaintContextCache.generation == generation,
+           chatRowPaintContextCache.botsRevision == botsRevision,
            chatRowPaintContextCache.rowCount == rows.count,
            chatRowPaintContextCache.visibleCount == visibleEntries.count,
            let cached = chatRowPaintContextCache.context {
@@ -14039,6 +14045,7 @@ public struct AgentAppView: View {
             bots: bots
         )
         if chatRowPaintContextCache.generation == generation,
+           chatRowPaintContextCache.botsRevision == botsRevision,
            chatRowPaintContextCache.signature == signature,
            let cached = chatRowPaintContextCache.context {
             chatRowPaintContextCache.rowCount = rows.count
@@ -14054,6 +14061,7 @@ public struct AgentAppView: View {
             bots: bots
         )
         chatRowPaintContextCache.generation = generation
+        chatRowPaintContextCache.botsRevision = botsRevision
         chatRowPaintContextCache.signature = signature
         chatRowPaintContextCache.rowCount = rows.count
         chatRowPaintContextCache.visibleCount = visibleEntries.count
@@ -14063,8 +14071,10 @@ public struct AgentAppView: View {
 
     private func snapshotMentionableBots() -> [BotDefinition] {
         let generation = vm.transcriptState.contentGeneration
+        let botsRevision = vm.mentionableBotsRevisionProvider()
         if mentionableBotsSnapshotCache.hasValue,
-           mentionableBotsSnapshotCache.generation == generation {
+           mentionableBotsSnapshotCache.generation == generation,
+           mentionableBotsSnapshotCache.botsRevision == botsRevision {
             return mentionableBotsSnapshotCache.bots
         }
         #if DEBUG
@@ -14072,6 +14082,7 @@ public struct AgentAppView: View {
         #endif
         let bots = vm.mentionableBotsProvider()
         mentionableBotsSnapshotCache.generation = generation
+        mentionableBotsSnapshotCache.botsRevision = botsRevision
         mentionableBotsSnapshotCache.bots = bots
         mentionableBotsSnapshotCache.hasValue = true
         return bots
@@ -14082,6 +14093,7 @@ public struct AgentAppView: View {
         latestLiveTurnId: String?
     ) -> (historyRows: [ChatFlowRow], liveRows: [ChatFlowRow], allRows: [ChatFlowRow]) {
         let generation = vm.transcriptState.contentGeneration
+        let aggregateBudgetGeneration = vm.aggregateHotTextBudgetGeneration
         // Always split so `latestLiveTurnId` and trailing unfinished turns
         // move the live boundary even when generation + paint ends are stable.
         let split = Self.splitTrailingLiveTurns(
@@ -14097,6 +14109,7 @@ public struct AgentAppView: View {
         let historyRows: [ChatFlowRow]
         if chatFlowPaintCache.hasValue,
            chatFlowPaintCache.generation == generation,
+           chatFlowPaintCache.aggregateBudgetGeneration == aggregateBudgetGeneration,
            chatFlowPaintCache.count == count,
            chatFlowPaintCache.firstId == firstId,
            chatFlowPaintCache.lastId == lastId {
@@ -14110,6 +14123,7 @@ public struct AgentAppView: View {
             // messages, so mapping each side independently equals the whole.
             historyRows = Self.chatFlowRows(split.history)
             chatFlowPaintCache.generation = generation
+            chatFlowPaintCache.aggregateBudgetGeneration = aggregateBudgetGeneration
             chatFlowPaintCache.count = count
             chatFlowPaintCache.firstId = firstId
             chatFlowPaintCache.lastId = lastId

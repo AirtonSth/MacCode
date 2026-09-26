@@ -537,13 +537,15 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
             try? FileManager.default.removeItem(at: rootURL)
         }
         var providerCalls = 0
-        let bots = [
+        var botsRevision: UInt64 = 0
+        var bots = [
             BotDefinition(handle: "ceo", name: "Ceo", title: "CEO", description: "", avatarSymbol: "star.fill")
         ]
         vm.mentionableBotsProvider = {
             providerCalls += 1
             return bots
         }
+        vm.mentionableBotsRevisionProvider = { botsRevision }
         let view = AgentAppView(vm: vm)
         let before = AgentAppView.mentionableBotsSnapshotProviderCallCountForTesting
 
@@ -588,11 +590,18 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
             "applySubagentActivity (header chrome publish) must reuse the generation snapshot"
         )
 
+        bots = [
+            BotDefinition(handle: "ceo", name: "Chief Executive", title: "CEO", description: "", avatarSymbol: "person.fill")
+        ]
+        botsRevision &+= 1
+        XCTAssertEqual(view.snapshotMentionableBotsForTesting().map(\.name), ["Chief Executive"])
+        XCTAssertEqual(providerCalls, 2, "bot catalog revision must refresh without a transcript change")
+
         vm.messages = [
             AgentMessage(threadId: AgentThreadID(), role: .user, content: "bump generation")
         ]
         XCTAssertEqual(view.snapshotMentionableBotsForTesting().count, 1)
-        XCTAssertEqual(providerCalls, 2, "contentGeneration bump must refresh the catalog snapshot")
+        XCTAssertEqual(providerCalls, 3, "contentGeneration bump must refresh the catalog snapshot")
 
         let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
         let header = try functionChunk(source, start: "private var header: some View {", endMarker: "private var fullAccessBanner")
@@ -627,6 +636,8 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
             vm.dispose()
             try? FileManager.default.removeItem(at: rootURL)
         }
+        var botsRevision: UInt64 = 0
+        vm.mentionableBotsRevisionProvider = { botsRevision }
         let view = AgentAppView(vm: vm)
         let turn = AssistantTurnSnapshot(turnId: "t-stable", finalAssistantMessage: "ok", finished: true)
         let entries: [AgentAppView.TranscriptEntry] = [.turn(turn)]
@@ -661,12 +672,21 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
             "matching generation+row/visible counts must return before chatRowPaintContextSignature"
         )
 
+        botsRevision &+= 1
+        _ = view.cachedChatRowPaintContextForTesting(rows: rows, visibleEntries: entries, bots: bots)
+        XCTAssertEqual(
+            AgentAppView.chatRowPaintContextComputeCountForTesting - beforeCompute,
+            2,
+            "bot catalog revisions must invalidate peer context without transcript changes"
+        )
+        XCTAssertEqual(AgentAppView.chatRowPaintContextSignatureBuilderCountForTesting - beforeSignature, 2)
+
         vm.messages = [
             AgentMessage(threadId: AgentThreadID(), role: .assistant, content: "generation moves")
         ]
         _ = view.cachedChatRowPaintContextForTesting(rows: rows, visibleEntries: entries, bots: bots)
-        XCTAssertEqual(AgentAppView.chatRowPaintContextComputeCountForTesting - beforeCompute, 2)
-        XCTAssertEqual(AgentAppView.chatRowPaintContextSignatureBuilderCountForTesting - beforeSignature, 2)
+        XCTAssertEqual(AgentAppView.chatRowPaintContextComputeCountForTesting - beforeCompute, 3)
+        XCTAssertEqual(AgentAppView.chatRowPaintContextSignatureBuilderCountForTesting - beforeSignature, 3)
 
         let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
         let chunk = try functionChunk(
@@ -979,6 +999,73 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
         )
         XCTAssertEqual(AgentAppView.chatFlowPaintComputeCountForTesting - before, 1)
         XCTAssertEqual(AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive, 3)
+    }
+
+    @MainActor
+    func test_cachedChatFlowPaint_refreshesHistoricalPayloadAfterAggregateBudgetEviction() throws {
+        // WHY: aggregate text eviction can clear a historical tool output without
+        // changing transcript generation, row count, or endpoint IDs. The paint
+        // cache must release and stop displaying the evicted payload immediately.
+        let (vm, rootURL) = try makeVM()
+        defer {
+            vm.dispose()
+            try? FileManager.default.removeItem(at: rootURL)
+        }
+        vm.aggregateHotTextByteLimitForTesting = 10_000
+        var timeline = AssistantTimelineState()
+        timeline.apply(.turnStarted(turnId: "t-history"))
+        timeline.apply(.itemStarted(item: AssistantItem(
+            id: "tool-history",
+            turnId: "t-history",
+            type: .tool,
+            state: .completed,
+            body: "",
+            output: String(repeating: "payload", count: 1_000),
+            startedAtMs: 1
+        )))
+        timeline.apply(.turnCompleted(turnId: "t-history", finalMessage: nil))
+        timeline.apply(.turnStarted(turnId: "t-live"))
+        XCTAssertGreaterThan(timeline.aggregateHotTextByteCount, 7_000)
+        XCTAssertLessThan(timeline.aggregateHotTextByteCount, 10_000)
+
+        func quantum(_ value: AssistantTimelineState) -> StreamQuantumReduceResult {
+            StreamQuantumReduceResult(
+                appliedEvent: true,
+                timeline: value,
+                currentRunId: nil,
+                status: .running,
+                lastErrorRecoverable: false,
+                liveBackgroundShellCount: 0,
+                liveBackgroundTasks: [],
+                suppressStaleActivePlanUpdates: false,
+                seedRunStartedAt: false,
+                runThreadBindings: [:],
+                hasProposedPlan: false,
+                forceAggregateBudget: true,
+                appliedEventCount: 1
+            )
+        }
+        vm.commitStreamQuantum(quantum(timeline))
+        let view = AgentAppView(vm: vm)
+        let beforeEvictionGeneration = vm.transcriptState.contentGeneration
+        let paint = { vm.timeline.turns.map { AgentAppView.TranscriptEntry.turn($0) } }
+        let before = view.cachedChatFlowPaintForTesting(
+            paintSequence: paint(),
+            latestLiveTurnId: "t-live"
+        )
+        XCTAssertEqual(Self.chatFlowToolPayloads(before.historyRows), [
+            "tool-history::" + String(repeating: "payload", count: 1_000)
+        ])
+
+        vm.aggregateHotTextByteLimitForTesting = 1_000
+        vm.commitStreamQuantum(quantum(timeline))
+        XCTAssertEqual(vm.transcriptState.contentGeneration, beforeEvictionGeneration)
+        XCTAssertNil(vm.timeline.turns.first?.items.first?.output)
+        let after = view.cachedChatFlowPaintForTesting(
+            paintSequence: paint(),
+            latestLiveTurnId: "t-live"
+        )
+        XCTAssertEqual(Self.chatFlowToolPayloads(after.historyRows), ["tool-history::"])
     }
 
     // MARK: - Unique vs 393: header clock sentinel
