@@ -796,6 +796,50 @@ final class ProviderProxyPolicyTests: XCTestCase {
             providerBasename: "claude",
             arguments: ["--print", "--model", "opus", "--effort", "high"]
         ))
+        let grokBase = ["--model", "grok-4.6", "--effort", "high", "--prompt", "investigate"]
+        let unsupportedGrokOptions: [[String]] = [
+            ["--max-turns", "1"], ["--json-schema", "{\"type\":\"object\"}"],
+            ["--prompt-json", "{\"prompt\":\"do work\"}"], ["--cwd", "/other/worktree"],
+            ["--tools", "bash"], ["--allow", "read"], ["--deny", "write"],
+            ["--settings", "/tmp/grok-settings.json"],
+            ["--system-prompt-override", "restricted"], ["--system-prompt", "restricted"],
+            ["--debug-file", "/tmp/grok.log"], ["--leader-socket", "/tmp/grok.sock"],
+            ["--agents", "agent.toml"], ["--agent", "reviewer"],
+            ["--worktree-ref", "branch"], ["--ref", "branch"], ["--worktree", "/tmp/worktree"],
+            ["-w", "/tmp/worktree"], ["--restore-code"], ["--include-partial-messages"],
+            ["--verbatim"], ["--disable-web-search"], ["--no-leader"], ["--debug"]
+        ]
+        for option in unsupportedGrokOptions {
+            let arguments = grokBase + option
+            XCTAssertFalse(
+                ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                    providerBasename: "grok", arguments: arguments
+                ),
+                "Grok invocation with unsupported option \(option.first ?? "") must stay on raw CLI"
+            )
+            XCTAssertNil(
+                ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                    providerBasename: "grok", arguments: arguments,
+                    promptFile: "/tmp/rc-nested-prompt.txt"
+                ),
+                "Unsupported option \(option.first ?? "") must not be lost in Agent App promotion"
+            )
+        }
+        let promptJSONArgs = [
+            "--model", "grok-4.6", "--effort", "high",
+            "--prompt-json", "{\"prompt\":\"do work\"}"
+        ]
+        XCTAssertFalse(
+            ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "grok", arguments: promptJSONArgs
+            ),
+            "prompt-json must stay on raw CLI because promotion does not decode it"
+        )
+        XCTAssertNil(
+            ProviderProxyPolicy.nestedCLIInlinePrompt(
+                providerBasename: "grok", arguments: promptJSONArgs
+            )
+        )
     }
 
     func test_nestedEligibilityRejectsRawFallbackContractsBeforeReadingPromptInput() {
@@ -848,20 +892,16 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertEqual(yolo.permissionMode, .fullAccess,
                        "--yolo is grok-build always-approve")
 
-        let maxTurns = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
-            providerBasename: "grok",
-            arguments: [
-                "--model", "grok-4.6", "--effort", "high",
-                "--prompt", "investigate", "--max-turns", "8",
-                "--json-schema", "{\"type\":\"object\"}",
-                "--cwd", "/tmp",
-                "--verbatim",
-                "--disable-web-search"
-            ],
-            promptFile: prompt
-        ))
-        XCTAssertEqual(maxTurns.model, "grok-4.6")
-        XCTAssertEqual(maxTurns.permissionMode, .supervised)
+        XCTAssertFalse(
+            ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "grok",
+                arguments: [
+                    "--model", "grok-4.6", "--effort", "high",
+                    "--prompt", "investigate", "--max-turns", "8"
+                ]
+            ),
+            "max-turn limits must remain enforced by the raw CLI"
+        )
 
         XCTAssertEqual(
             ProviderProxyPolicy.nestedCLIInlinePrompt(
