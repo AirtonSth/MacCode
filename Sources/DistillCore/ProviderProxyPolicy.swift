@@ -1469,7 +1469,25 @@ public enum ProviderProxyPolicy {
         // openai/codex 0.154 `codex exec` subcommands (resume/fork/review/help)
         // are session or admin operations, not a new Agent App turn.
         if Self.nestedCodexExecSubcommandKeepsRawCLI(scan.positionals) { return false }
+        // `codex exec --json` is exec JSONL (`item` + `aggregated_output`).
+        // Agent App `--output-format json` is a different ABI; keep raw like resume.
+        if scan.flags.contains("--json") || nestedCodexUsesUnrepresentedOptions(scan) {
+            return false
+        }
         return true
+    }
+
+    private static func nestedCodexUsesUnrepresentedOptions(_ scan: NestedArgScan) -> Bool {
+        let unsupportedValueOptions: Set<String> = [
+            "--sandbox", "-s", "--ask-for-approval", "-a", "--image", "-i",
+            "--enable", "--disable", "--local-provider", "--add-dir",
+            "--output-schema", "--output-last-message", "-o"
+        ]
+        let unsupportedFlags: Set<String> = [
+            "--approve-for-me", "--dangerously-bypass-hook-trust", "--ignore-rules"
+        ]
+        return scan.optionValues.keys.contains(where: { unsupportedValueOptions.contains($0) })
+            || !scan.flags.isDisjoint(with: unsupportedFlags)
     }
 
     private static func nestedCodexAgentAppDelegation(
@@ -1618,7 +1636,10 @@ public enum ProviderProxyPolicy {
             flagOptions: nestedCodexExecFlagOptions
         )
         guard !scan.malformed, scan.positionals.first == "exec" else { return nil }
-        if Self.nestedCodexExecSubcommandKeepsRawCLI(scan.positionals) { return nil }
+        if Self.nestedCodexExecSubcommandKeepsRawCLI(scan.positionals)
+            || nestedCodexUsesUnrepresentedOptions(scan) {
+            return nil
+        }
         let rest = scan.positionals.dropFirst()
         let joined = rest.joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)

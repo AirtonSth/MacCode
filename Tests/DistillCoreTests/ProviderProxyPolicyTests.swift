@@ -1021,23 +1021,25 @@ final class ProviderProxyPolicyTests: XCTestCase {
             providerBasename: "codex",
             arguments: ["exec", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "work"]
         ))
-        XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
-            providerBasename: "codex",
-            arguments: [
-                "exec", "--enable", "web_search_cached",
-                "--add-dir", "/tmp/extra",
-                "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high",
-                "work"
-            ]
-        ), "openai/codex 0.154 exec flags must not mark nested promotion malformed")
-        XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
-            providerBasename: "codex",
-            arguments: [
-                "exec", "-s", "workspace-write", "-i", "/tmp/shot.png",
-                "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high",
-                "work"
-            ]
-        ), "0.154 short aliases -s/--sandbox and -i/--image must not mark nested promotion malformed")
+        let unrepresentedCodexOptions = [
+            ["exec", "--enable", "web_search_cached", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "work"],
+            ["exec", "--add-dir", "/tmp/extra", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "work"],
+            ["exec", "-s", "read-only", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "work"],
+            ["exec", "-i", "/tmp/shot.png", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "describe image"],
+            ["exec", "--output-schema", "/tmp/schema.json", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "work"],
+            ["exec", "--approve-for-me", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "work"]
+        ]
+        for arguments in unrepresentedCodexOptions {
+            XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "codex",
+                arguments: arguments
+            ), "unrepresented Codex options must keep the invocation on the raw CLI: \\(arguments)")
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "codex",
+                arguments: arguments,
+                promptFile: "/tmp/nested-prompt.txt"
+            ), "promotion must not discard Codex option semantics: \\(arguments)")
+        }
         XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
             providerBasename: "codex",
             arguments: [
