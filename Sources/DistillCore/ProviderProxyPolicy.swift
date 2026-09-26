@@ -1453,6 +1453,20 @@ public enum ProviderProxyPolicy {
         // `codex exec --json` is exec JSONL (`item` + `aggregated_output`).
         // Agent App `--output-format json` is a different ABI; keep raw like resume.
         if scan.flags.contains("--json") { return false }
+        let unsupportedValueOptions: Set<String> = [
+            "--image", "--add-dir", "--local-provider", "--output-schema",
+            "--output-last-message", "--enable", "--disable", "--thread-source"
+        ]
+        if scan.optionValues.keys.contains(where: { unsupportedValueOptions.contains($0) }) {
+            return false
+        }
+        let unsupportedFlags: Set<String> = [
+            "--worktree", "--approve-for-me", "--dangerously-bypass-hook-trust",
+            "--ignore-rules"
+        ]
+        if !scan.flags.isDisjoint(with: unsupportedFlags) {
+            return false
+        }
         return true
     }
 
