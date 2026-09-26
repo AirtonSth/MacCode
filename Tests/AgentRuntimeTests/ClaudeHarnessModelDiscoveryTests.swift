@@ -28,6 +28,39 @@ final class ClaudeHarnessModelDiscoveryTests: XCTestCase {
         XCTAssertEqual(fable.supportedReasoningEfforts, [.low, .medium, .high, .xhigh, .max, .ultracode])
         XCTAssertTrue(fable.supportsReasoning)
         XCTAssertTrue(fable.supportsCustomModel)
+        XCTAssertNil(models.first { $0.id == "default" }?.contextWindowTokens,
+                     "catalog may lead with id default; unknown windows must stay nil")
+        XCTAssertEqual(models.first { $0.id == "opus[1m]" }?.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(fable.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(models.first { $0.id == "sonnet" }?.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(models.first { $0.id == "haiku" }?.contextWindowTokens, 200_000)
+    }
+
+    func test_harnessDescriptorsCopyResolvedModelContextWindow() throws {
+        let response: [String: Any] = [
+            "type": "control_response",
+            "response": [
+                "subtype": "success",
+                "response": [
+                    "models": [
+                        ["value": "default", "displayName": "Default (recommended)",
+                         "resolvedModel": "claude-opus-5-5",
+                         "supportsEffort": true,
+                         "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"]],
+                        ["value": "claude-opus-5-5[1m]", "displayName": "Opus 5.5",
+                         "supportsEffort": true, "supportedEffortLevels": ["medium"]],
+                        ["value": "haiku", "displayName": "Haiku"]
+                    ]
+                ]
+            ]
+        ]
+        let models = try XCTUnwrap(ClaudeHarnessModelDiscovery.modelDescriptors(from: response))
+        XCTAssertEqual(models.map(\.id), ["default", "claude-opus-5-5[1m]", "haiku"])
+        XCTAssertEqual(models[0].contextWindowTokens, 1_000_000,
+                       "Claude Code 2.1.282 default alias resolves to Opus 5.5 (1M); copy resolvedModel so the ctx pill is not blank")
+        XCTAssertEqual(models[1].contextWindowTokens, 1_000_000)
+        XCTAssertEqual(models[2].contextWindowTokens, 200_000)
+        XCTAssertEqual(AnthropicModelDiscovery.contextWindowTokens(forID: "claude-opus-5-5"), 1_000_000)
     }
 
     func test_claudeRunnerUsesHarnessBeforeApiFallback() async throws {

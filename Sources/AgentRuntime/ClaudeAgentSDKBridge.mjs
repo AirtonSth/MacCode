@@ -727,7 +727,10 @@ function attachmentBlock(attachment) {
 }
 
 function pushPrompt(text, attachments = [], turnContext = undefined) {
-  const content = [{ type: 'text', text }];
+  // Claude Code 2.1.277+ rejects empty text content blocks. Attach-only
+  // turns are valid when image/file blocks remain.
+  const content = [];
+  if (text) content.push({ type: 'text', text });
   for (const attachment of attachments) {
     const block = attachmentBlock(attachment);
     if (block) content.push(block);

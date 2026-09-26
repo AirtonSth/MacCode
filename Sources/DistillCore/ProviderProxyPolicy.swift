@@ -667,7 +667,9 @@ public enum ProviderProxyPolicy {
                     "--remote-control-session-name-prefix", "--system-prompt-file",
                     "--append-system-prompt-file", "--betas", "--mcp-config",
                     "--plugin-dir", "--plugin-url", "--debug-file", "--file",
-                    "--agent", "--agents", "--from-pr", "--remote-control"
+                    "--agent", "--agents", "--from-pr", "--remote-control",
+                    "--cloud", "--environment", "--teleport",
+                    "--system-prompt-snapshot"
                 ]
             case .grok:
                 return [
@@ -694,7 +696,9 @@ public enum ProviderProxyPolicy {
                     "--setting-sources", "--settings", "--session-id",
                     "--resume", "-r", "--add-dir", "--cwd", "--worktree", "-w",
                     "--mcp-config", "--plugin-dir", "--plugin-url", "--debug-file",
-                    "--file", "--agent", "--agents", "--from-pr", "--remote-control"
+                    "--file", "--agent", "--agents", "--from-pr", "--remote-control",
+                    "--cloud", "--environment", "--teleport",
+                    "--system-prompt-snapshot"
                 ]
             case .grok:
                 return [
@@ -718,7 +722,7 @@ public enum ProviderProxyPolicy {
                     "--exclude-dynamic-system-prompt-sections", "--forward-subagent-text",
                     "--include-hook-events", "--include-partial-messages",
                     "--replay-user-messages", "--strict-mcp-config", "--safe-mode",
-                    "--ax-screen-reader", "--help", "-h", "--version", "-v"
+                    "--ax-screen-reader", "--tmux", "--help", "-h", "--version", "-v"
                 ]
             case .grok:
                 return [
@@ -1269,23 +1273,47 @@ public enum ProviderProxyPolicy {
 
     // MARK: - nested CLI parsers (private)
 
-    private static func nestedClaudeAgentAppEligible(arguments: [String]) -> Bool {
-        let scan = scanNestedArguments(
+    /// Claude Code 2.1.282 options Agent App emits or nested agents use.
+    /// Unknown dash flags stay fail-closed via scanNestedArguments.
+    private static let nestedClaudeValueOptions: Set<String> = [
+        "--model", "--effort", "--output-format", "--input-format",
+        "--permission-mode", "--tools", "--allowed-tools", "--allowedTools",
+        "--disallowed-tools", "--disallowedTools", "--append-system-prompt",
+        "--system-prompt", "--setting-sources", "--settings",
+        "--session-id", "--resume", "-r",
+        "--add-dir", "--json-schema", "--system-prompt-file",
+        "--append-system-prompt-file", "--mcp-config", "--plugin-dir",
+        "--plugin-url", "--worktree", "-w", "--fallback-model",
+        "--permission-prompts", "--max-budget-usd", "--name", "-n",
+        "--agents", "--agent", "--file", "--debug-file", "--betas",
+        "--from-pr", "--remote-control", "--autocompact", "--max-turns",
+        "--cloud", "--environment", "--teleport",
+        "--prompt-suggestions", "--remote-control-session-name-prefix",
+        "--system-prompt-snapshot"
+    ]
+
+    private static let nestedClaudeFlagOptions: Set<String> = [
+        "--continue", "-c", "--debug", "--disable-slash-commands",
+        "--fork-session", "--help", "-h", "--ide", "--include-partial-messages",
+        "--no-session-persistence", "--print", "-p", "--strict-mcp-config",
+        "--verbose", "--version", "-V",
+        "--include-hook-events", "--replay-user-messages", "--forward-subagent-text",
+        "--bare", "--brief", "--chrome", "--no-chrome",
+        "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+        "--exclude-dynamic-system-prompt-sections", "--restricted",
+        "--ax-screen-reader", "--bg", "--background", "--tmux"
+    ]
+
+    private static func scanNestedClaudeArguments(_ arguments: [String]) -> NestedArgScan {
+        scanNestedArguments(
             arguments,
-            valueOptions: [
-                "--model", "--effort", "--output-format", "--input-format",
-                "--permission-mode", "--tools", "--allowed-tools", "--allowedTools",
-                "--disallowed-tools", "--disallowedTools", "--append-system-prompt",
-                "--system-prompt", "--setting-sources", "--settings",
-                "--session-id", "--resume", "-r"
-            ],
-            flagOptions: [
-                "--continue", "-c", "--debug", "--disable-slash-commands",
-                "--fork-session", "--help", "-h", "--ide", "--include-partial-messages",
-                "--no-session-persistence", "--print", "-p", "--strict-mcp-config",
-                "--verbose", "--version", "-V"
-            ]
+            valueOptions: nestedClaudeValueOptions,
+            flagOptions: nestedClaudeFlagOptions
         )
+    }
+
+    private static func nestedClaudeAgentAppEligible(arguments: [String]) -> Bool {
+        let scan = scanNestedClaudeArguments(arguments)
         guard !scan.malformed else { return false }
         if scan.flags.contains("--version") || scan.flags.contains("-V")
             || scan.flags.contains("--help") || scan.flags.contains("-h") {
@@ -1325,22 +1353,7 @@ public enum ProviderProxyPolicy {
         promptFile: String
     ) -> ProviderAgentAppDelegation? {
         guard nestedClaudeAgentAppEligible(arguments: arguments) else { return nil }
-        let scan = scanNestedArguments(
-            arguments,
-            valueOptions: [
-                "--model", "--effort", "--output-format", "--input-format",
-                "--permission-mode", "--tools", "--allowed-tools", "--allowedTools",
-                "--disallowed-tools", "--disallowedTools", "--append-system-prompt",
-                "--system-prompt", "--setting-sources", "--settings",
-                "--session-id", "--resume", "-r"
-            ],
-            flagOptions: [
-                "--continue", "-c", "--debug", "--disable-slash-commands",
-                "--fork-session", "--help", "-h", "--ide", "--include-partial-messages",
-                "--no-session-persistence", "--print", "-p", "--strict-mcp-config",
-                "--verbose", "--version", "-V"
-            ]
-        )
+        let scan = scanNestedClaudeArguments(arguments)
         guard !scan.malformed else { return nil }
         let model = scan.optionValues["--model"]?.last ?? ""
         guard !model.isEmpty,
@@ -1374,7 +1387,7 @@ public enum ProviderProxyPolicy {
     private static func nestedClaudeModelSupportsReasoningEffort(_ model: String) -> Bool {
         let rawID = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let id = rawID.hasSuffix("[1m]") ? String(rawID.dropLast(4)) : rawID
-        if id == "best" || id == "fable" || id == "mythos" || id == "opus" || id == "sonnet"
+        if id == "best" || id == "default" || id == "fable" || id == "mythos" || id == "opus" || id == "sonnet"
             || id.hasPrefix("claude-fable") || id.hasPrefix("claude-mythos-5")
             || id.hasPrefix("claude-mythos-preview") || id.hasPrefix("claude-opus-5")
             || id.hasPrefix("claude-opus-4-5") || id.hasPrefix("claude-opus-4-6")
@@ -1387,22 +1400,7 @@ public enum ProviderProxyPolicy {
     }
 
     private static func nestedClaudeInlinePrompt(arguments: [String]) -> String? {
-        let scan = scanNestedArguments(
-            arguments,
-            valueOptions: [
-                "--model", "--effort", "--output-format", "--input-format",
-                "--permission-mode", "--tools", "--allowed-tools", "--allowedTools",
-                "--disallowed-tools", "--disallowedTools", "--append-system-prompt",
-                "--system-prompt", "--setting-sources", "--settings",
-                "--session-id", "--resume", "-r"
-            ],
-            flagOptions: [
-                "--continue", "-c", "--debug", "--disable-slash-commands",
-                "--fork-session", "--help", "-h", "--ide", "--include-partial-messages",
-                "--no-session-persistence", "--print", "-p", "--strict-mcp-config",
-                "--verbose", "--version", "-V"
-            ]
-        )
+        let scan = scanNestedClaudeArguments(arguments)
         guard !scan.malformed else { return nil }
         // Prefer explicit positionals after flags (claude --print "prompt").
         let joined = scan.positionals.joined(separator: " ")

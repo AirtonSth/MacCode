@@ -56,7 +56,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             || id.hasPrefix("claude-opus-4-6") {
             return [.low, .medium, .high, .max]
         }
-        if id == "best" || id == "fable" || id == "mythos" || id == "opus" || id == "sonnet"
+        if id == "best" || id == "default" || id == "fable" || id == "mythos" || id == "opus" || id == "sonnet"
             || id.hasPrefix("claude-fable") || id.hasPrefix("claude-mythos-5")
             || id.hasPrefix("claude-opus-5")
             || id.hasPrefix("claude-opus-4-7") || id.hasPrefix("claude-opus-4-8")
@@ -72,6 +72,11 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         let rawID = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let id = rawID.hasSuffix("[1m]") ? String(rawID.dropLast(4)) : rawID
         if id.hasPrefix("claude-opus-4-7") { return .xhigh }
+        // Claude Code 2.1.282 catalog: Opus 5.5 default_effort is medium.
+        // The live `default` and `opus` aliases resolve to claude-opus-5-5.
+        if id == "default" || id == "opus" || id.hasPrefix("claude-opus-5-5") {
+            return .medium
+        }
         return .high
     }
 
@@ -81,9 +86,8 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     ) -> AgentReasoningEffort? {
         let supported = supportedReasoningEfforts(for: model)
         guard !supported.isEmpty else { return nil }
-        // Claude Code defaults to high on every effort-capable model except
-        // Opus 4.7, whose documented default is xhigh. Forward that default
-        // instead of inventing medium, which under-reasons Auto/Claude turns.
+        // Claude Code defaults to high on effort-capable models except
+        // Opus 4.7 (xhigh) and Opus 5.5 / live opus and default aliases (medium).
         let requested = effort ?? Self.defaultReasoningEffort(for: model)
         if requested == .minimal { return .low }
         if supported.contains(requested) { return requested }
