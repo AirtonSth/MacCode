@@ -200,8 +200,28 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
                       "SDK pushPrompt must set origin.kind=human like CLI stdin")
         XCTAssertTrue(body.contains("uuid: randomUUID()"),
                       "SDK pushPrompt must stamp a uuid on host user messages")
-        XCTAssertTrue(body.contains("if (text) content.push({ type: 'text', text })"),
-                      "SDK pushPrompt must omit empty text blocks Claude Code 2.1.277+ rejects")
+        XCTAssertTrue(body.contains("typeof text === 'string' && text.trim()"),
+                      "SDK pushPrompt must omit whitespace-only text blocks Claude Code cannot use")
+    }
+
+    func test_userPromptPayload_omitsWhitespaceOnlyTextBlockWhenAttachmentsPresent() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-claude-cli-whitespace-text-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let pngData = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")!
+        let png = tmp.appendingPathComponent("dot.png")
+        try pngData.write(to: png)
+
+        let payload = try ClaudeStreamingCLIAdapter.userPromptPayload(
+            text: " \n\t",
+            attachments: [
+                AgentAttachment(path: png.path, displayName: "dot.png", kind: .image, mimeType: "image/png")
+            ]
+        )
+        let content = try XCTUnwrap((payload["message"] as? [String: Any])?["content"] as? [[String: Any]])
+        XCTAssertEqual(content.count, 1, "whitespace-only prompt text must not become an empty text block")
+        XCTAssertEqual(content[0]["type"] as? String, "image")
     }
 
     func test_userPromptPayload_includesImageAndFileBlocks() throws {
