@@ -596,7 +596,14 @@ public final class CodexAppServerClient: @unchecked Sendable {
         var resumeFellBack = false
         if let providerThreadId = request.providerThreadId, !providerThreadId.isEmpty {
             do {
-                let resumeParams: JSONObject = ["threadId": providerThreadId]
+                var resumeParams: JSONObject = ["threadId": providerThreadId]
+                let instructions = Self.developerInstructions(
+                    for: request.interactionMode,
+                    environment: request.environment
+                )
+                if !instructions.isEmpty {
+                    resumeParams["developerInstructions"] = instructions
+                }
                 response = try await requestJSONObject(method: "thread/resume", params: resumeParams)
             } catch {
                 guard Self.isRecoverableThreadResumeError(error) else { throw error }
@@ -1000,8 +1007,8 @@ public final class CodexAppServerClient: @unchecked Sendable {
         if request.serviceTier == .fast {
             params["serviceTier"] = "fast"
         }
-        // Codex 0.156 ThreadStartParams: developerInstructions is first-class.
-        // collaborationMode is not a TurnStartParams field on 0.156.1.
+        // Codex 0.157 ThreadStartParams: developerInstructions is first-class.
+        // collaborationMode is not a TurnStartParams field on 0.157.0.
         let instructions = developerInstructions(
             for: request.interactionMode,
             environment: request.environment
@@ -1043,6 +1050,8 @@ public final class CodexAppServerClient: @unchecked Sendable {
         // uniformly whether this is a primary run, a same-provider subagent, or a
         // cross-provider nested run, per AGENTS.md.
         let tokenSaverActive = request.environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
+        // Live 0.157 TurnStartParams still lists approvalPolicy; Distill/plan
+        // text belongs on thread/start developerInstructions, not collaborationMode.
         var params: JSONObject = [
             "threadId": providerThreadId,
             "input": input,

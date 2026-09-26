@@ -23,6 +23,14 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
     public static func listModels(installedVersion: String?) -> [AgentModelDescriptor] {
         [
             AgentModelDescriptor(
+                id: "grok-4.7",
+                label: "Grok 4.7",
+                provider: .grok,
+                supportsReasoning: true,
+                supportedReasoningEfforts: grok46ReasoningEfforts,
+                supportsCustomModel: true
+            ),
+            AgentModelDescriptor(
                 id: "grok-4.6",
                 label: "Grok 4.6",
                 provider: .grok,
@@ -69,7 +77,14 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
                 supportedReasoningEfforts: GrokReasoningPolicy.museSparkEfforts,
                 supportsCustomModel: true
             ),
-            // Current account default tracks Grok 4.6.
+            AgentModelDescriptor(
+                id: "grok-4.7-build-fast",
+                label: "Grok 4.7 Build Fast",
+                provider: .grok,
+                supportsReasoning: false,
+                supportsCustomModel: true
+            ),
+            // Current account default tracks Grok 4.7 (live grok 1.0.41).
             AgentModelDescriptor(
                 id: "",
                 label: "Default (account)",
