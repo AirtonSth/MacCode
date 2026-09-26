@@ -1685,6 +1685,28 @@ public enum ProviderProxyPolicy {
             || scan.optionValues["--session-id"] != nil || scan.optionValues["-s"] != nil {
             return true
         }
+        let unsupportedValueOptions: Set<String> = [
+            "--max-turns", "--json-schema", "--prompt-json", "--cwd",
+            "--tools", "--allow", "--deny", "--allowed-tools", "--disallowed-tools",
+            "--allowedTools", "--disallowedTools", "--settings", "--input-format", "--rules",
+            "--sandbox",
+            "--system-prompt-override", "--system-prompt", "--debug-file",
+            "--leader-socket", "--agents", "--agent", "--worktree-ref",
+            "--ref", "--worktree", "-w"
+        ]
+        if scan.optionValues.keys.contains(where: { unsupportedValueOptions.contains($0) }) {
+            return true
+        }
+        let unsupportedFlags: Set<String> = [
+            "--restore-code", "--include-partial-messages", "--verbatim",
+            "--disable-web-search", "--no-leader", "--debug", "--auto-update",
+            "--no-auto-update", "--memory", "--no-memory", "--plan", "--no-plan",
+            "--subagents", "--no-subagents",
+            "--fullscreen", "--minimal", "--no-alt-screen", "--oauth"
+        ]
+        if !scan.flags.isDisjoint(with: unsupportedFlags) {
+            return true
+        }
         return false
     }
 
