@@ -445,7 +445,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     nonisolated static func userPromptPayload(text: String, attachments: [AgentAttachment] = []) throws -> [String: Any] {
         try ClaudeAgentSDKBridgeAdapter.validateAttachments(attachments)
         var content: [[String: Any]] = []
-        if !text.isEmpty {
+        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             content.append(["type": "text", "text": text])
         }
         for attachment in attachments {
