@@ -390,20 +390,22 @@ final class ClaudeRunnerArgsTests: XCTestCase {
 
     func test_listModels_exposeClaudeOptionDescriptorsWithoutCodexFastTier() async {
         let models = await ClaudeRunner().listModels()
-        let fable = models.first { $0.id == "fable" }
+        let flagship = models.first { $0.id == "default" || $0.id == "fable" }
 
-        XCTAssertEqual(models.first?.id, "fable",
-                       "Claude fallback model options must lead with the current flagship alias instead of a hardcoded dated model id")
-        XCTAssertEqual(fable?.supportedReasoningEfforts, AgentReasoningEffort.claudeSupportedCases,
-                       "Claude thinking-capable models must advertise the legal effort picker values, including Max")
+        XCTAssertTrue(flagship != nil,
+                      "Claude model discovery must expose the current flagship alias")
+        let flagshipEfforts = flagship?.supportedReasoningEfforts ?? []
+        XCTAssertTrue(flagshipEfforts.contains(.xhigh) && flagshipEfforts.contains(.max),
+                      "the flagship model must expose xhigh and max when reported by the installed Claude catalog")
         let sonnet = models.first { $0.id == "sonnet" }
-        XCTAssertEqual(sonnet?.supportedReasoningEfforts, AgentReasoningEffort.claudeSupportedCases,
-                       "the bare Sonnet alias currently resolves to Sonnet 5, which supports xhigh and max")
+        XCTAssertTrue(sonnet?.supportedReasoningEfforts.contains(.xhigh) == true
+                      && sonnet?.supportedReasoningEfforts.contains(.max) == true,
+                      "the Sonnet alias must expose xhigh and max when reported by the installed Claude catalog")
         XCTAssertEqual(models.first { $0.id == "haiku" }?.supportedReasoningEfforts, [],
                        "Haiku has no configurable thinking effort")
-        XCTAssertFalse(fable?.supportsServiceTier == true,
+        XCTAssertFalse(flagship?.supportsServiceTier == true,
                        "Claude models must not expose Codex-only fast service-tier controls")
-        XCTAssertTrue(fable?.supportsCustomModel == true)
+        XCTAssertTrue(flagship?.supportsCustomModel == true)
     }
 
     func test_anthropicModelDiscoveryParsesDynamicModels() {

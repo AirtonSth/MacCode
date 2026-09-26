@@ -1333,6 +1333,26 @@ public enum ProviderProxyPolicy {
                 return false
             }
         }
+        let unsupportedValueOptions: Set<String> = [
+            "--add-dir", "--json-schema", "--system-prompt-file", "--append-system-prompt-file",
+            "--mcp-config", "--plugin-dir", "--plugin-url", "--worktree", "-w",
+            "--fallback-model", "--permission-prompts", "--max-budget-usd", "--name", "-n",
+            "--agents", "--agent", "--file", "--debug-file", "--betas", "--from-pr",
+            "--remote-control", "--autocompact", "--max-turns"
+        ]
+        if scan.optionValues.keys.contains(where: { unsupportedValueOptions.contains($0) }) {
+            return false
+        }
+        let unsupportedFlags: Set<String> = [
+            "--include-hook-events", "--replay-user-messages", "--forward-subagent-text",
+            "--bare", "--brief", "--chrome", "--no-chrome",
+            "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+            "--exclude-dynamic-system-prompt-sections", "--restricted", "--ax-screen-reader",
+            "--bg", "--background"
+        ]
+        if !scan.flags.isDisjoint(with: unsupportedFlags) {
+            return false
+        }
         return scan.flags.contains("--print") || scan.flags.contains("-p")
     }
 

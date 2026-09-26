@@ -796,31 +796,49 @@ final class ProviderProxyPolicyTests: XCTestCase {
             providerBasename: "claude",
             arguments: ["--print", "--model", "opus", "--effort", "high"]
         ))
+        let common = ["--print", "--model", "opus", "--effort", "high"]
+        let unsupportedValueOptions: [[String]] = [
+            ["--add-dir", "/tmp/extra"], ["--json-schema", "{}"],
+            ["--system-prompt-file", "/tmp/sys.md"], ["--append-system-prompt-file", "/tmp/append.md"],
+            ["--mcp-config", "{}"], ["--plugin-dir", "/tmp/plugin"],
+            ["--plugin-url", "https://example.invalid/p.zip"],
+            ["--worktree", "wt"], ["-w", "wt"], ["--fallback-model", "sonnet"],
+            ["--permission-prompts", "host"], ["--max-budget-usd", "1"],
+            ["--name", "nested"], ["-n", "nested"], ["--agents", "{}"],
+            ["--agent", "reviewer"], ["--file", "file_abc:doc.txt"],
+            ["--debug-file", "/tmp/debug.log"], ["--betas", "context-1m"],
+            ["--from-pr", "1"], ["--remote-control", "desk"],
+            ["--autocompact", "auto"], ["--max-turns", "4"]
+        ]
+        for option in unsupportedValueOptions {
+            let arguments = common + option
+            XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "claude", arguments: arguments
+            ), "unrepresented Claude value option \(option[0]) must remain on raw CLI")
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "claude", arguments: arguments, promptFile: prompt
+            ), "unrepresented Claude value option \(option[0]) must not be dropped by promotion")
+        }
+        let unsupportedFlags = [
+            "--include-hook-events", "--replay-user-messages", "--forward-subagent-text",
+            "--bare", "--brief", "--chrome", "--no-chrome",
+            "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+            "--exclude-dynamic-system-prompt-sections", "--restricted", "--ax-screen-reader",
+            "--bg", "--background"
+        ]
+        for flag in unsupportedFlags {
+            let arguments = common + [flag]
+            XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "claude", arguments: arguments
+            ), "unrepresented Claude flag \(flag) must remain on raw CLI")
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "claude", arguments: arguments, promptFile: prompt
+            ), "unrepresented Claude flag \(flag) must not be dropped by promotion")
+        }
         XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
             providerBasename: "claude",
-            arguments: [
-                "--print", "--model", "opus", "--effort", "high",
-                "--include-hook-events", "--replay-user-messages",
-                "--forward-subagent-text", "--add-dir", "/tmp/extra",
-                "--mcp-config", "{}", "--json-schema", "{}",
-                "--system-prompt-file", "/tmp/sys.md",
-                "--append-system-prompt-file", "/tmp/append.md",
-                "--plugin-dir", "/tmp/plugin", "--plugin-url", "https://example.invalid/p.zip",
-                "--worktree", "wt", "-w", "wt2", "--fallback-model", "sonnet",
-                "--bare", "--permission-prompts", "host", "--max-budget-usd", "1",
-                "--name", "nested", "-n", "nested2", "--agents", "{}",
-                "--agent", "reviewer", "--file", "file_abc:doc.txt",
-                "--debug-file", "/tmp/debug.log", "--betas", "context-1m",
-                "--from-pr", "1", "--remote-control", "desk",
-                "--brief", "--chrome", "--no-chrome",
-                "--dangerously-skip-permissions",
-                "--allow-dangerously-skip-permissions",
-                "--exclude-dynamic-system-prompt-sections", "--restricted",
-                "--ax-screen-reader", "--bg", "--background",
-                "--autocompact", "auto", "--max-turns", "4",
-                "--permission-mode", "default"
-            ]
-        ), "known Claude Code 2.1.281 flags Agent App emits or nested agents use must stay eligible")
+            arguments: common + ["--permission-mode", "default", "--output-format", "json"]
+        ), "options represented by the Agent App receipt remain promotable")
         let defaultPermission = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "claude",
             arguments: [
