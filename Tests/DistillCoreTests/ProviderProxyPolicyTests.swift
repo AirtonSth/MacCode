@@ -1341,6 +1341,14 @@ final class ProviderProxyPolicyTests: XCTestCase {
             .explicit(.autoAcceptEdits),
             "--full-auto is Codex's complete workspace-write shortcut"
         )
+        XCTAssertEqual(
+            ProviderProxyPolicy.explicitPermissionRequest(
+                providerBasename: "codex",
+                arguments: ["exec", "--approve-for-me"]
+            ),
+            .explicit(.autoAcceptEdits),
+            "--approve-for-me enables automatic review with the workspace-write sandbox"
+        )
         for profile in [
             ["--profile", "wide"],
             ["--profile=wide"]

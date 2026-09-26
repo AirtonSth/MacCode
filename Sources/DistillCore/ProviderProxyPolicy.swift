@@ -714,7 +714,7 @@ public enum ProviderProxyPolicy {
                     "--full-auto", "--strict-config", "--oss", "--skip-git-repo-check",
                     "--ephemeral", "--ignore-user-config", "--ignore-rules", "--json",
                     "--no-alt-screen", "--help", "-h", "--version", "-V",
-                    "--worktree", "--approve-for-me"
+                    "--worktree"
                 ]
             case .claude:
                 return [
@@ -813,10 +813,9 @@ public enum ProviderProxyPolicy {
                 candidates.append(.fullAccess)
                 index += 1
                 continue
-            case (.codex, "--full-auto"):
+            case (.codex, "--full-auto"), (.codex, "--approve-for-me"):
                 sawPermissionFlag = true
-                // Codex defines this as the complete workspace-write shortcut,
-                // not an approval-only dimension.
+                // Both options enable Codex's workspace-write sandbox.
                 sandbox = .autoAcceptEdits
                 sawArgumentSandbox = true
                 index += 1
