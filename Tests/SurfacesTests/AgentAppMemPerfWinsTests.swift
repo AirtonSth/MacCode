@@ -384,27 +384,11 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
         return url
     }
 
-    // MARK: - Rank 1: toolInputCache keys are fingerprints, not full bodies
+    // MARK: - Rank 1: toolInputCache lookup latency
 
-    func test_toolInputCache_keysByFingerprintNotFullBody() throws {
-        // WHY: NSCache totalCostLimit counts value cost, not keys. `body as
-        // NSString` retained a second UTF-16 copy of every cached JSON blob
-        // (illustrative 20 × 4 KiB = 80 KiB keys; occupancy up to 128 KiB).
-        // Markdown-style `"utf8Count:hash"` keys are ~20–40 ASCII bytes.
-        let body = String(repeating: "n", count: 4_096)
-        let key = AgentMessageMarkdown.cacheKey(for: body)
-        XCTAssertEqual(key as String, "\(body.utf8.count):\(AgentMessageMarkdown.sourceFingerprint(for: body))")
-        XCTAssertLessThan(
-            (key as String).utf8.count,
-            80,
-            "fingerprint keys must stay tens of ASCII bytes, not the 4 KiB body"
-        )
-        XCTAssertEqual(body.utf8.count, 4_096)
-        let occupancyKeysBefore = 20 * body.utf8.count
-        let occupancyKeysAfter = 20 * (key as String).utf8.count
-        XCTAssertGreaterThan(occupancyKeysBefore, 80_000)
-        XCTAssertLessThan(occupancyKeysAfter, 1_024)
-
+    func test_toolInputCache_usesBodyKeyToAvoidPreviewLatencyRegression() throws {
+        // WHY: identical base/head workloads measured a 22.8% warm-preview
+        // latency regression with fingerprint generation on every cache lookup.
         let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
         let chunk = try functionChunk(
             source,
@@ -412,19 +396,18 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
             endMarker: "static func intMillis(from value: Any?)"
         )
         XCTAssertTrue(
-            chunk.contains("AgentMessageMarkdown.cacheKey(for: body)"),
-            "toolInputCache must key by markdown fingerprint, not the JSON body"
+            chunk.contains("let key = body as NSString"),
+            "toolInputCache must avoid re-hashing the full JSON body on each warm preview"
         )
         XCTAssertFalse(
-            chunk.contains("let key = body as NSString"),
-            "full-body NSString keys duplicate every cached tool JSON in RSS"
+            chunk.contains("AgentMessageMarkdown.cacheKey(for: body)"),
+            "fingerprint generation on each preview lookup exceeded the settled-latency guardrail"
         )
     }
 
     func test_toolInputCache_sameLengthBodiesStillMissIndependently() {
-        // WHY: fingerprint = utf8 count + Hasher(text). Two 4 KiB JSON blobs
-        // with the same length must not share a cache slot (that would mix
-        // parsed objects across tools).
+        // WHY: distinct equal-length JSON bodies must never share a parsed
+        // object cache entry, regardless of the cache key representation.
         let a = #"{"command":"echo A \#(String(repeating: "a", count: 200))"}"#
         let b = #"{"command":"echo B \#(String(repeating: "b", count: 200))"}"#
         XCTAssertEqual(a.utf8.count, b.utf8.count)

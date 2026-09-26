@@ -14,7 +14,7 @@ No Instruments samples were taken. Do **not** read the estimates below as proces
 
 | Rank | Site | What changed | Before | After |
 | --- | --- | --- | --- | --- |
-| 1 | `toolInputObject` / `toolInputCache` | Key = `AgentMessageMarkdown.cacheKey` (`utf8Count:hash`), not `body as NSString` | Key bytes ≈ cached JSON bodies. Cost-limit occupancy up to **128 KiB of keys**. Illustrative 20 tools × 4 KiB JSON = **80 KiB keys**. Parse count already 1/unique body. | Keys ~20–40 ASCII bytes. 256 entries → **~10 KiB keys**. Parse count **unchanged** (still 1/body; warm extra_parses = 0). **~87–92% fewer key bytes** on that cache. |
+| 1 | `toolInputObject` / `toolInputCache` | Keep `body as NSString` as the key after the fingerprint-key variant regressed the comparable 20-tool preview benchmark by ~23%. | Key bytes scale with retained JSON bodies; the 128 KiB value-cost limit does not include key storage. Parse count 1/unique body after warming. | Retains the existing body-key memory cost to keep warm preview latency within the settled-latency guardrail. Parse count remains 1/body. |
 | 2 | `normalizedTextCache` + `compactTextCache` | Same fingerprint keys | 2 caches × 128 KiB cost occupancy → up to **~256 KiB of key NSStrings** on top of values. Unicode-scalar walk skipped on hit. | ~20–40 B × 128 × 2 ≈ **~10 KiB keys**. **~96% fewer key bytes**. Transform CPU on miss unchanged; warm hits still skip unicode walks. |
 | 3 | Transcript column + header `SubagentActivityBadge` | Snapshot `mentionableBots` once per `contentGeneration` and `BotStore.botsListRevision`; pass into **both** column and header. Composer `@` still calls the provider live. | Column: **1** `mentionableBotsProvider()` / `timeline` publish. Header: **1** provider call / VM chrome publish. | Revision-stable column/header re-entry: **0** provider calls (**100% fewer** on that path); bot catalog writes invalidate without a transcript edit. Composer `@` still 1 call per suggestion gather. |
 | 4 | `cachedChatRowPaintContext` | Return cached context when transcript/catalog revisions and row/visible **counts** match, **before** `chatRowPaintContextSignature`. | 1 signature `String` per column body. 50 bots × ~40 chars ≈ **~2 KiB alloc + hash** per `timeline` publish, even when F2 then returns the cached context. | Revision-stable tool-body-only ticks: signature-builder count **0** after first fill (**100% fewer** signature allocs on that path). |
@@ -23,7 +23,7 @@ No Instruments samples were taken. Do **not** read the estimates below as proces
 
 ## Conservative totals (named caches / calls only)
 
-- **Key RSS (ranks 1–2):** up to ~128 KiB + ~256 KiB = **~384 KiB extra key NSStrings** → **~20 KiB** fingerprint keys at the same count/cost ceilings (**about 95% less key RAM** on those caches). Values and parsed JSON objects are unchanged.
+- **Key RSS (ranks 1–2):** only `normalizedTextCache` and `compactTextCache` use fingerprint keys; at the stated count/cost ceilings, their estimated key storage falls from up to ~256 KiB to ~10 KiB. `toolInputCache` keeps full-body keys to avoid a measured preview latency regression. Values and parsed JSON objects are unchanged.
 - **Provider calls (rank 3):** **1 call per publish** → **0** while transcript and bot-catalog revisions are stable.
 - **Signature allocs (rank 4):** **1 String / column body** → **0** on revision-stable count matches.
 - **Finals memo (rank 5):** **75% fewer entries** at the count ceiling plus a new 128 KiB cost cap (was unbounded).

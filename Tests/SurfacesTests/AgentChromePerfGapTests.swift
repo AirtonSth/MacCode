@@ -45,17 +45,18 @@ struct AgentChromePerfGapTests {
         )
     }
 
-    @Test("toolInputCache and assistant-text caches key by fingerprint, not full body")
-    func cacheKeys_areFingerprintsNotFullBodies() throws {
-        // WHY: NSCache totalCostLimit ignores key bytes. Body-as-NSString keys
-        // retained a second UTF-16 copy of every cached JSON / assistant body.
+    @Test("toolInputCache keeps preview latency while assistant-text caches use fingerprints")
+    func cacheKeys_matchMeasuredLatencyAndMemoryTradeoffs() throws {
+        // WHY: fingerprint generation on every tool preview regressed the
+        // comparable warm-path benchmark; assistant-text caches still avoid
+        // retaining full source strings as keys.
         let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
         let toolStart = try #require(source.range(of: "static func toolInputObject(for item: AssistantItem)"))
         let toolRest = source[toolStart.lowerBound...]
         let toolEnd = toolRest.range(of: "static func intMillis(from value: Any?)")?.lowerBound ?? toolRest.endIndex
         let toolChunk = String(source[toolStart.lowerBound..<toolEnd])
-        #expect(toolChunk.contains("AgentMessageMarkdown.cacheKey(for: body)"))
-        #expect(!toolChunk.contains("let key = body as NSString"))
+        #expect(toolChunk.contains("let key = body as NSString"))
+        #expect(!toolChunk.contains("AgentMessageMarkdown.cacheKey(for: body)"))
 
         let normStart = try #require(source.range(of: "private static func normalizedAssistantText(_ text: String)"))
         let normRest = source[normStart.lowerBound...]

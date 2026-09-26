@@ -11292,13 +11292,12 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
     }
 
     /// Shared JSON object cache for live tool rows and Edit/diff extraction.
-    /// Fingerprint key (~20–40 ASCII bytes). NSCache does not count key
-    /// bytes toward totalCostLimit; a full-body NSString key retained a
-    /// second UTF-16 copy of every cached JSON blob.
+    /// Use the body as the key to avoid re-hashing large JSON strings on every
+    /// live-row paint; NSCache bounds the retained entries and values.
     static func toolInputObject(forBody raw: String) -> [String: Any]? {
         let body = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return nil }
-        let key = AgentMessageMarkdown.cacheKey(for: body)
+        let key = body as NSString
         if let cached = toolInputCache.object(forKey: key) {
             return cached.object
         }
