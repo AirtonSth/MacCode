@@ -2575,13 +2575,15 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         let grok = AgentOrchestrationRuntime.deepControllerSelection(
             provider: .grok,
             availableModels: [
+                AgentModelDescriptor(id: "grok-4.7", label: "Grok 4.7", provider: .grok, supportsReasoning: true,
+                                     supportedReasoningEfforts: [.low, .medium, .high, .xhigh]),
                 AgentModelDescriptor(id: "grok-4.6", label: "Grok 4.6", provider: .grok, supportsReasoning: true,
                                      supportedReasoningEfforts: [.medium, .high, .xhigh]),
                 AgentModelDescriptor(id: "grok-4.5", label: "Grok", provider: .grok, supportsReasoning: true,
                                      supportedReasoningEfforts: [.medium, .high])
             ]
         )
-        XCTAssertEqual(grok.modelId, "grok-4.6")
+        XCTAssertEqual(grok.modelId, "grok-4.7")
         XCTAssertEqual(grok.reasoningEffort, .high)
     }
 
@@ -2638,13 +2640,15 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         let grok = AgentOrchestrationRuntime.lightControllerSelection(
             provider: .grok,
             availableModels: [
+                AgentModelDescriptor(id: "grok-4.7", label: "Grok 4.7", provider: .grok, supportsReasoning: true,
+                                     supportedReasoningEfforts: [.low, .medium, .high, .xhigh]),
                 AgentModelDescriptor(id: "grok-4.6", label: "Grok 4.6", provider: .grok, supportsReasoning: true,
                                      supportedReasoningEfforts: [.medium, .high, .xhigh]),
                 AgentModelDescriptor(id: "grok-4.5", label: "Grok 4.5", provider: .grok, supportsReasoning: true,
                                      supportedReasoningEfforts: [.medium, .high])
             ]
         )
-        XCTAssertEqual(grok.modelId, "grok-4.6")
+        XCTAssertEqual(grok.modelId, "grok-4.7")
         XCTAssertEqual(grok.reasoningEffort, .medium)
     }
 
