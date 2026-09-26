@@ -3240,26 +3240,29 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             provider: .codex,
             model: "gpt-5.5",
             cwd: "/tmp/remotecode-app-server-adapter",
-            prompt: "notification contract"
+            prompt: "notification contract",
+            providerThreadId: "codex-thread-1"
         )) { event in
             events.record(event)
         }
 
-        client.notificationHandler?("thread.started", ["thread": ["id": "dotted-jsonl-event"]])
-        XCTAssertFalse(events.assistantEvents.contains {
-            if case .threadStarted(_, let providerThreadId) = $0 {
-                return providerThreadId == "dotted-jsonl-event"
-            }
-            return false
-        }, "the app-server adapter must not treat a JSONL event name as its notification method")
+        func matchingThreadStartedCount() -> Int {
+            events.assistantEvents.filter {
+                if case .threadStarted(_, let providerThreadId) = $0 {
+                    return providerThreadId == "codex-thread-1"
+                }
+                return false
+            }.count
+        }
+        let initialThreadStartedCount = matchingThreadStartedCount()
 
-        client.notificationHandler?("thread/started", ["thread": ["id": "app-server-event"]])
-        XCTAssertTrue(events.assistantEvents.contains {
-            if case .threadStarted(_, let providerThreadId) = $0 {
-                return providerThreadId == "app-server-event"
-            }
-            return false
-        }, "the app-server notification must still publish thread/started")
+        client.notificationHandler?("thread.started", ["thread": ["id": "codex-thread-1"]])
+        XCTAssertEqual(matchingThreadStartedCount(), initialThreadStartedCount,
+                       "the app-server adapter must not treat a JSONL event name as its notification method")
+
+        client.notificationHandler?("thread/started", ["thread": ["id": "codex-thread-1"]])
+        XCTAssertEqual(matchingThreadStartedCount(), initialThreadStartedCount + 1,
+                       "the app-server notification must still publish thread/started")
     }
 
     func test_readThreadRendersCommonStringAliasesForUncommonSnapshotItems() async throws {
