@@ -573,8 +573,8 @@ public enum ProviderProxyPolicy {
             case "acceptedits", "accept-edits", "auto_accept_edits", "workspace":
                 return .autoAcceptEdits
             case "auto":
-                // Grok auto is a classifier, not acceptEdits.
-                return provider == .grok ? .fullAccess : .autoAcceptEdits
+                // Claude/Grok auto is a model classifier, not acceptEdits.
+                return .fullAccess
             case "bypasspermissions", "bypass-permissions", "full_access":
                 return .fullAccess
             default:
@@ -669,7 +669,9 @@ public enum ProviderProxyPolicy {
                     "--plugin-dir", "--plugin-url", "--debug-file", "--file",
                     "--agent", "--agents", "--from-pr", "--remote-control",
                     "--cloud", "--environment", "--teleport",
-                    "--system-prompt-snapshot"
+                    "--system-prompt-snapshot",
+                    "--autocompact", "--max-turns",
+                    "--permission-prompts", "--permission-prompt-tool"
                 ]
             case .grok:
                 return [
@@ -698,7 +700,8 @@ public enum ProviderProxyPolicy {
                     "--mcp-config", "--plugin-dir", "--plugin-url", "--debug-file",
                     "--file", "--agent", "--agents", "--from-pr", "--remote-control",
                     "--cloud", "--environment", "--teleport",
-                    "--system-prompt-snapshot"
+                    "--system-prompt-snapshot",
+                    "--permission-prompts", "--permission-prompt-tool"
                 ]
             case .grok:
                 return [
@@ -1298,7 +1301,7 @@ public enum ProviderProxyPolicy {
         "--from-pr", "--remote-control", "--autocompact", "--max-turns",
         "--cloud", "--environment", "--teleport",
         "--prompt-suggestions", "--remote-control-session-name-prefix",
-        "--system-prompt-snapshot"
+        "--system-prompt-snapshot", "--permission-prompt-tool"
     ]
 
     private static let nestedClaudeFlagOptions: Set<String> = [
@@ -1310,7 +1313,8 @@ public enum ProviderProxyPolicy {
         "--bare", "--brief", "--chrome", "--no-chrome",
         "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
         "--exclude-dynamic-system-prompt-sections", "--restricted",
-        "--ax-screen-reader", "--bg", "--background", "--tmux"
+        "--ax-screen-reader", "--bg", "--background", "--tmux",
+        "--safe-mode"
     ]
 
     private static func scanNestedClaudeArguments(_ arguments: [String]) -> NestedArgScan {
@@ -1356,6 +1360,11 @@ public enum ProviderProxyPolicy {
         }
         if let outputFormat = scan.optionValues["--output-format"]?.last?.lowercased(),
            !["text", "json", "grok-json"].contains(outputFormat) {
+            return false
+        }
+        if scan.optionValues["--permission-mode"]?.last?.lowercased() == "auto" {
+            // Classifier auto can approve Bash/MCP/network; Agent App has no
+            // matching mode, so stay on the raw CLI like Grok.
             return false
         }
         let delegatedValueOptions: Set<String> = [
@@ -1433,9 +1442,9 @@ public enum ProviderProxyPolicy {
 
     private static func mapClaudePermission(_ raw: String?) -> AgentPermissionMode {
         switch (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "acceptedits", "accept-edits", "auto", "workspace":
+        case "acceptedits", "accept-edits", "workspace":
             return .autoAcceptEdits
-        case "bypasspermissions", "bypass-permissions", "dontask", "full_access", "full-access":
+        case "bypasspermissions", "bypass-permissions", "dontask", "full_access", "full-access", "auto":
             return .fullAccess
         default:
             return .supervised

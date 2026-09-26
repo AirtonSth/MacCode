@@ -834,7 +834,8 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ["--system-prompt-file", "/tmp/sys.md"], ["--append-system-prompt-file", "/tmp/append.md"],
             ["--plugin-dir", "/tmp/plugin"], ["--plugin-url", "https://example.invalid/p.zip"],
             ["--worktree", "wt"], ["-w", "wt2"], ["--fallback-model", "sonnet"],
-            ["--bare"], ["--permission-prompts", "host"], ["--max-budget-usd", "1"],
+            ["--bare"], ["--permission-prompts", "host"], ["--permission-prompt-tool", "mcp__x"],
+            ["--max-budget-usd", "1"],
             ["--name", "nested"], ["-n", "nested2"], ["--agents", "{}"],
             ["--agent", "reviewer"], ["--file", "file_abc:doc.txt"],
             ["--debug-file", "/tmp/debug.log"], ["--betas", "context-1m"],
@@ -842,7 +843,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ["--chrome"], ["--no-chrome"], ["--dangerously-skip-permissions"],
             ["--allow-dangerously-skip-permissions"], ["--exclude-dynamic-system-prompt-sections"],
             ["--restricted"], ["--ax-screen-reader"], ["--bg"], ["--background"],
-            ["--autocompact", "auto"], ["--max-turns", "4"],
+            ["--autocompact", "auto"], ["--max-turns", "4"], ["--safe-mode"],
             ["--cloud", "desk"], ["--environment", "env_1"], ["--teleport", "sess"],
             ["--tmux"], ["--prompt-suggestions", "off"],
             ["--remote-control-session-name-prefix", "rc"],
@@ -884,6 +885,19 @@ final class ProviderProxyPolicyTests: XCTestCase {
             promptFile: prompt
         ))
         XCTAssertEqual(manualPermission.permissionMode, .supervised)
+        let claudeAutoArguments = [
+            "--print", "--model", "opus", "--effort", "high",
+            "--permission-mode", "auto"
+        ]
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "claude",
+            arguments: claudeAutoArguments
+        ), "Claude auto is a classifier, not acceptEdits; nested Agent App must stay raw like Grok")
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "claude",
+            arguments: claudeAutoArguments,
+            promptFile: prompt
+        ), "promoting classifier auto as workspace edits would let Bash/MCP/network bypass an edits-level parent")
         XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
             providerBasename: "claude",
             arguments: [
@@ -1375,6 +1389,14 @@ final class ProviderProxyPolicyTests: XCTestCase {
         )
         XCTAssertEqual(
             ProviderProxyPolicy.explicitPermissionRequest(
+                providerBasename: "claude",
+                arguments: ["--permission-mode", "auto"]
+            ),
+            .explicit(.fullAccess),
+            "Claude auto is a model classifier that can approve Bash/MCP/network, not workspace-only acceptEdits"
+        )
+        XCTAssertEqual(
+            ProviderProxyPolicy.explicitPermissionRequest(
                 providerBasename: "codex",
                 arguments: ["exec", "--sandbox=workspace-write", "-a=on-request"]
             ),
@@ -1585,6 +1607,56 @@ final class ProviderProxyPolicyTests: XCTestCase {
                 ]
             ),
             .explicit(.supervised)
+        )
+    }
+
+    func test_permissionParsing_claudeValueOptionsConsumeWithoutFalseFullAccess() {
+        // WHY: unknown dash tokens require fullAccess and do not consume the
+        // following value. Live Claude --autocompact/--max-turns must consume
+        // without widening; permission ABI flags must be classified, not guessed.
+        XCTAssertEqual(
+            ProviderProxyPolicy.explicitPermissionRequest(
+                providerBasename: "claude",
+                arguments: [
+                    "--print", "--permission-mode", "plan",
+                    "--autocompact", "auto"
+                ]
+            ),
+            .explicit(.supervised),
+            "autocompact auto is compaction, not permission-mode auto"
+        )
+        XCTAssertEqual(
+            ProviderProxyPolicy.explicitPermissionRequest(
+                providerBasename: "claude",
+                arguments: [
+                    "--print", "--permission-mode", "plan",
+                    "--max-turns", "4"
+                ]
+            ),
+            .explicit(.supervised),
+            "max-turns is a turn budget and must not be treated as an unknown authority flag"
+        )
+        XCTAssertEqual(
+            ProviderProxyPolicy.explicitPermissionRequest(
+                providerBasename: "claude",
+                arguments: [
+                    "--print", "--permission-mode", "plan",
+                    "--permission-prompts", "none"
+                ]
+            ),
+            .explicit(.fullAccess),
+            "permission-prompts is permission ABI even when the value is deny-prompts"
+        )
+        XCTAssertEqual(
+            ProviderProxyPolicy.explicitPermissionRequest(
+                providerBasename: "claude",
+                arguments: [
+                    "--print", "--permission-mode", "plan",
+                    "--permission-prompt-tool", "mcp__x"
+                ]
+            ),
+            .explicit(.fullAccess),
+            "permission-prompt-tool changes who answers --print prompts"
         )
     }
 
