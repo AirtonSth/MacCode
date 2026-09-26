@@ -3227,6 +3227,41 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }, "aggregated_output must become command stdout")
     }
 
+    func test_appServerThreadStartedUsesSlashNotificationOnly() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let localThreadId = AgentThreadID()
+        let events = OrderedEventLog()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: localThreadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "notification contract"
+        )) { event in
+            events.record(event)
+        }
+
+        client.notificationHandler?("thread.started", ["thread": ["id": "dotted-jsonl-event"]])
+        XCTAssertFalse(events.assistantEvents.contains {
+            if case .threadStarted(_, let providerThreadId) = $0 {
+                return providerThreadId == "dotted-jsonl-event"
+            }
+            return false
+        }, "the app-server adapter must not treat a JSONL event name as its notification method")
+
+        client.notificationHandler?("thread/started", ["thread": ["id": "app-server-event"]])
+        XCTAssertTrue(events.assistantEvents.contains {
+            if case .threadStarted(_, let providerThreadId) = $0 {
+                return providerThreadId == "app-server-event"
+            }
+            return false
+        }, "the app-server notification must still publish thread/started")
+    }
+
     func test_readThreadRendersCommonStringAliasesForUncommonSnapshotItems() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         client.readResponse = [
