@@ -219,16 +219,6 @@ public final class GrokParser {
                 )))
             }
 
-        case "available_commands":
-            let data = (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])) ?? Data()
-            out.append(.providerRuntime(ProviderRuntimeEvent(
-                provider: .grok,
-                source: "grok.streaming-json",
-                method: "available_commands",
-                payloadJSON: String(data: data, encoding: .utf8) ?? "{}",
-                receivedAtMs: now
-            )))
-
         case "max_turns_reached":
             ensureTurn(&out)
             closeOpenItems(&out, toolFinalState: .completed)
