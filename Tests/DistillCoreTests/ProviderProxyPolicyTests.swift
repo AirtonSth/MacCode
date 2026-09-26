@@ -509,8 +509,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
             providerBasename: "claude",
             arguments: [
                 "--print", "--model", "opus", "--effort", "max",
-                "--permission-mode", "plan", "--output-format", "json",
-                "--no-session-persistence"
+                "--permission-mode", "plan", "--output-format", "json"
             ],
             promptFile: prompt
         ))
@@ -796,35 +795,39 @@ final class ProviderProxyPolicyTests: XCTestCase {
             providerBasename: "claude",
             arguments: ["--print", "--model", "opus", "--effort", "high"]
         ))
+        let unforwardedClaudeOptions: [[String]] = [
+            ["--include-hook-events"], ["--replay-user-messages"], ["--forward-subagent-text"],
+            ["--add-dir", "/tmp/extra"], ["--mcp-config", "{}"], ["--json-schema", "{}"],
+            ["--system-prompt-file", "/tmp/sys.md"], ["--append-system-prompt-file", "/tmp/append.md"],
+            ["--plugin-dir", "/tmp/plugin"], ["--plugin-url", "https://example.invalid/p.zip"],
+            ["--worktree", "wt"], ["-w", "wt2"], ["--fallback-model", "sonnet"],
+            ["--bare"], ["--permission-prompts", "host"], ["--max-budget-usd", "1"],
+            ["--name", "nested"], ["-n", "nested2"], ["--agents", "{}"],
+            ["--agent", "reviewer"], ["--file", "file_abc:doc.txt"],
+            ["--debug-file", "/tmp/debug.log"], ["--betas", "context-1m"],
+            ["--from-pr", "1"], ["--remote-control", "desk"], ["--brief"],
+            ["--chrome"], ["--no-chrome"], ["--dangerously-skip-permissions"],
+            ["--allow-dangerously-skip-permissions"], ["--exclude-dynamic-system-prompt-sections"],
+            ["--restricted"], ["--ax-screen-reader"], ["--bg"], ["--background"],
+            ["--autocompact", "auto"], ["--max-turns", "4"],
+            ["--cloud", "desk"], ["--environment", "env_1"], ["--teleport", "sess"],
+            ["--tmux"], ["--prompt-suggestions", "off"],
+            ["--remote-control-session-name-prefix", "rc"],
+            ["--system-prompt-snapshot", "/tmp/snap.md"], ["--no-session-persistence"]
+        ]
+        for option in unforwardedClaudeOptions {
+            let arguments = ["--print", "--model", "opus", "--effort", "high"] + option
+            XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "claude", arguments: arguments
+            ), "unforwarded Claude option \(option[0]) must remain on raw CLI")
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "claude", arguments: arguments, promptFile: prompt
+            ), "unforwarded Claude option \(option[0]) must not be dropped by promotion")
+        }
         XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
             providerBasename: "claude",
-            arguments: [
-                "--print", "--model", "opus", "--effort", "high",
-                "--include-hook-events", "--replay-user-messages",
-                "--forward-subagent-text", "--add-dir", "/tmp/extra",
-                "--mcp-config", "{}", "--json-schema", "{}",
-                "--system-prompt-file", "/tmp/sys.md",
-                "--append-system-prompt-file", "/tmp/append.md",
-                "--plugin-dir", "/tmp/plugin", "--plugin-url", "https://example.invalid/p.zip",
-                "--worktree", "wt", "-w", "wt2", "--fallback-model", "sonnet",
-                "--bare", "--permission-prompts", "host", "--max-budget-usd", "1",
-                "--name", "nested", "-n", "nested2", "--agents", "{}",
-                "--agent", "reviewer", "--file", "file_abc:doc.txt",
-                "--debug-file", "/tmp/debug.log", "--betas", "context-1m",
-                "--from-pr", "1", "--remote-control", "desk",
-                "--brief", "--chrome", "--no-chrome",
-                "--dangerously-skip-permissions",
-                "--allow-dangerously-skip-permissions",
-                "--exclude-dynamic-system-prompt-sections", "--restricted",
-                "--ax-screen-reader", "--bg", "--background",
-                "--autocompact", "auto", "--max-turns", "4",
-                "--cloud", "desk", "--environment", "env_1", "--teleport", "sess",
-                "--tmux", "--prompt-suggestions", "off",
-                "--remote-control-session-name-prefix", "rc",
-                "--system-prompt-snapshot", "/tmp/snap.md",
-                "--permission-mode", "default"
-            ]
-        ), "known Claude Code 2.1.282 flags Agent App emits or nested agents use must stay eligible")
+            arguments: ["--print", "--model", "default", "--effort", "medium", "--permission-mode", "default", "--output-format", "json"]
+        ), "Agent App's represented provider, effort, permission, and output fields remain promotable")
         XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
             providerBasename: "claude",
             arguments: ["--print", "--model", "default", "--effort", "medium"]

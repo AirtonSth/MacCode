@@ -1351,7 +1351,7 @@ public enum ProviderProxyPolicy {
         if scan.optionValues.keys.contains(where: { !delegatedValueOptions.contains($0) }) {
             return false
         }
-        let delegatedFlags: Set<String> = ["--print", "-p"]
+        let delegatedFlags = delegatedValueOptions.union(["--print", "-p"])
         if !scan.flags.isSubset(of: delegatedFlags) {
             return false
         }
