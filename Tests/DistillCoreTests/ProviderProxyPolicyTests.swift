@@ -1021,6 +1021,32 @@ final class ProviderProxyPolicyTests: XCTestCase {
             providerBasename: "codex",
             arguments: ["exec", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "work"]
         ))
+        let unrepresentedCodexOptions = [
+            ["exec", "--enable", "web_search_cached", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "work"],
+            ["exec", "--add-dir", "/tmp/extra", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "work"],
+            ["exec", "-s", "read-only", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "work"],
+            ["exec", "-i", "/tmp/shot.png", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "describe image"],
+            ["exec", "--output-schema", "/tmp/schema.json", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "work"],
+            ["exec", "--approve-for-me", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=high", "work"]
+        ]
+        for arguments in unrepresentedCodexOptions {
+            XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "codex",
+                arguments: arguments
+            ), "unrepresented Codex options must keep the invocation on the raw CLI: \\(arguments)")
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "codex",
+                arguments: arguments,
+                promptFile: "/tmp/nested-prompt.txt"
+            ), "promotion must not discard Codex option semantics: \\(arguments)")
+        }
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "codex",
+            arguments: [
+                "exec", "--not-a-real-flag", "--model", "gpt-5.6-sol",
+                "-c", "model_reasoning_effort=high", "work"
+            ]
+        ), "unknown dash flags still fail closed to the raw CLI")
         XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
             providerBasename: "codex",
             arguments: ["exec", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=ultra", "work"]

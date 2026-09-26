@@ -271,10 +271,12 @@ public final class CodexParser {
 
     private static func itemText(from item: [String: Any]) -> String {
         let kind = item["type"] as? String ?? ""
-        if kind == "command_execution" {
-            // aggregated_output is stdout and may be "" / omitted. Never treat
-            // the command line as output.
-            if let aggregated = item["aggregated_output"] as? String {
+        let kindKey = kind.replacingOccurrences(of: "_", with: "").lowercased()
+        if kindKey == "commandexecution" {
+            // aggregated_output / aggregatedOutput is stdout and may be "" /
+            // omitted. Never treat the command line as output.
+            if let aggregated = item["aggregated_output"] as? String
+                ?? item["aggregatedOutput"] as? String {
                 return aggregated
             }
             if let text = item["text"] as? String, !text.isEmpty { return text }
@@ -346,21 +348,23 @@ public final class CodexParser {
     }
 
     private func mapItemType(_ s: String) -> AssistantItemType {
-        switch s.lowercased() {
+        // openai/codex emits both camelCase app-server kinds (commandExecution)
+        // and snake_case exec JSONL kinds (command_execution).
+        switch s.replacingOccurrences(of: "_", with: "").lowercased() {
         case "reasoning": return .reasoning
-        case "plan", "todo_list", "plan_update": return .plan
-        case "command", "command_execution": return .commandExecution
-        case "file_change", "patch", "apply_patch": return .fileChange
-        case "mcp", "mcp_tool_call": return .mcpToolCall
-        case "dynamic", "dynamic_tool_call": return .dynamicToolCall
-        case "collab", "collab_tool_call": return .collabToolCall
-        case "web_search": return .webSearch
-        case "image_view": return .imageView
-        case "review": return .review
-        case "context_compaction": return .contextCompaction
+        case "plan", "todolist", "planupdate": return .plan
+        case "command", "commandexecution": return .commandExecution
+        case "filechange", "patch", "applypatch": return .fileChange
+        case "mcp", "mcptoolcall": return .mcpToolCall
+        case "dynamic", "dynamictoolcall": return .dynamicToolCall
+        case "collab", "collabtoolcall", "collabagenttoolcall": return .collabToolCall
+        case "websearch": return .webSearch
+        case "imageview": return .imageView
+        case "review", "enteredreviewmode", "exitedreviewmode": return .review
+        case "contextcompaction": return .contextCompaction
         case "error": return .error
-        case "tool", "tool_call": return .tool
-        case "agent_message", "assistantmessage", "assistant", "message", "text":
+        case "tool", "toolcall": return .tool
+        case "agentmessage", "assistantmessage", "assistant", "message", "text":
             return .assistantMessage
         default: return .assistantMessage
         }

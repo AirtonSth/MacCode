@@ -593,9 +593,12 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(input.count, 3, "app-server turns must send image attachments and file mentions through native protocol input items")
         XCTAssertEqual(input[0]["type"] as? String, "text")
         XCTAssertEqual(input[0]["text"] as? String, "draft a plan")
-        let textElements = try XCTUnwrap(input[0]["text_elements"] as? [Any],
-                                         "Codex 0.146 UserInput text requires text_elements")
+        let textElements = try XCTUnwrap(input[0]["textElements"] as? [Any],
+                                         "later openai/codex UserInput.Text serializes textElements")
         XCTAssertTrue(textElements.isEmpty, "unused text spans must still be sent as an empty array")
+        let legacyTextElements = try XCTUnwrap(input[0]["text_elements"] as? [Any],
+                                               "Codex 0.154 UserInput.Text JSON schema uses text_elements")
+        XCTAssertTrue(legacyTextElements.isEmpty)
         XCTAssertEqual(input[1]["type"] as? String, "localImage")
         XCTAssertEqual(input[1]["path"] as? String, "/tmp/screenshot.png")
         XCTAssertNil(input[1]["url"], "local images must use the app-server localImage/path contract, never a file:// remote-image URL")
@@ -953,7 +956,8 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
     }
 
     func test_turnStartParams_textInputIncludesEmptyTextElements() throws {
-        // WHY: Codex 0.146 UserInput text requires text_elements (empty when unused).
+        // WHY: Codex 0.154 UserInput.Text JSON schema uses text_elements;
+        // later camelCase peers read textElements. Send both empty arrays.
         let params = CodexAppServerClient.turnStartParams(
             providerThreadId: "thread-app-server-1",
             for: AgentRunRequest(
@@ -967,8 +971,10 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         let input = try XCTUnwrap(params["input"] as? [[String: Any]])
         XCTAssertEqual(input.first?["type"] as? String, "text")
         XCTAssertEqual(input.first?["text"] as? String, "hello text elements")
-        let textElements = try XCTUnwrap(input.first?["text_elements"] as? [Any])
+        let textElements = try XCTUnwrap(input.first?["textElements"] as? [Any])
         XCTAssertTrue(textElements.isEmpty)
+        let legacyTextElements = try XCTUnwrap(input.first?["text_elements"] as? [Any])
+        XCTAssertTrue(legacyTextElements.isEmpty)
     }
 
     func test_initializeCapabilities_includesRequestAttestationFalse() throws {
