@@ -312,7 +312,12 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             prompt: "continue",
             providerThreadId: "stale-thread",
             permissionMode: .fullAccess,
-            serviceTier: .fast
+            serviceTier: .fast,
+            interactionMode: .plan,
+            environment: [
+                "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+                BotPeerDelegation.turnContextEnvironmentKey: "REMOTE CODE RESOLVED IDENTITY ONLY: @fallback is Fallback"
+            ]
         ))
 
         XCTAssertEqual(opened.providerThreadId, "fresh-thread",
@@ -324,9 +329,16 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(params["serviceTier"] as? String, "fast")
         XCTAssertEqual(params["approvalPolicy"] as? String, "never")
         XCTAssertEqual(params["sandbox"] as? String, "danger-full-access")
+        let instructions = try XCTUnwrap(params["developerInstructions"] as? String)
+        XCTAssertTrue(instructions.contains("| distill"),
+                      "fallback thread/start must preserve current Token Saver admission")
+        XCTAssertTrue(instructions.contains("Plan only"),
+                      "fallback thread/start must preserve the current interaction mode")
+        XCTAssertTrue(instructions.contains("@fallback is Fallback"),
+                      "fallback thread/start must preserve current delegation context")
     }
 
-    func test_openThreadResumeSendsOnlyThreadId() async throws {
+    func test_openThreadResumeUpdatesInstructionsForCurrentTurn() async throws {
         let script = try makeFakeAppServerPeer()
         let client = try CodexAppServerClient(
             binary: script,
@@ -336,7 +348,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         defer { client.stop() }
 
         _ = try await client.initialize()
-        let opened = try await client.openThread(for: AgentRunRequest(
+        let tokenSaverRequest = AgentRunRequest(
             threadId: AgentThreadID(),
             provider: .codex,
             model: "gpt-5.3-codex",
@@ -344,16 +356,50 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             prompt: "continue",
             providerThreadId: "live-thread",
             permissionMode: .fullAccess,
-            serviceTier: .fast
-        ))
+            serviceTier: .fast,
+            interactionMode: .plan,
+            environment: [
+                "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+                BotPeerDelegation.turnContextEnvironmentKey: "REMOTE CODE RESOLVED IDENTITY ONLY: @before is Before"
+            ]
+        )
+        let enabled = try await client.openThread(for: tokenSaverRequest)
+        XCTAssertEqual(enabled.providerThreadId, "live-thread")
+        XCTAssertEqual(enabled.response["lastMethod"] as? String, "thread/resume")
+        XCTAssertFalse(enabled.resumeFellBackToStart)
+        let enabledParams = try XCTUnwrap(enabled.response["lastParams"] as? [String: Any])
+        let enabledInstructions = try XCTUnwrap(enabledParams["developerInstructions"] as? String)
+        XCTAssertTrue(enabledInstructions.contains("| distill"),
+                      "Token Saver admission must reach an already-open Codex thread")
+        XCTAssertTrue(enabledInstructions.contains("Plan only"),
+                      "interaction mode changes must update an already-open Codex thread")
+        XCTAssertTrue(enabledInstructions.contains("@before is Before"),
+                      "current delegation context must reach thread/resume")
 
-        XCTAssertEqual(opened.providerThreadId, "live-thread")
-        XCTAssertEqual(opened.response["lastMethod"] as? String, "thread/resume")
-        XCTAssertFalse(opened.resumeFellBackToStart)
-        let params = try XCTUnwrap(opened.response["lastParams"] as? [String: Any])
-        XCTAssertEqual(Set(params.keys), ["threadId"],
-                       "thread/resume must send only threadId; start params stay on thread/start fallback")
-        XCTAssertEqual(params["threadId"] as? String, "live-thread")
+        let disabledRequest = AgentRunRequest(
+            threadId: tokenSaverRequest.threadId,
+            provider: .codex,
+            model: tokenSaverRequest.model,
+            cwd: tokenSaverRequest.cwd,
+            prompt: "continue",
+            providerThreadId: "live-thread",
+            permissionMode: .fullAccess,
+            interactionMode: .default,
+            environment: [BotPeerDelegation.turnContextEnvironmentKey: "REMOTE CODE RESOLVED IDENTITY ONLY: @after is After"]
+        )
+        let disabled = try await client.openThread(for: disabledRequest)
+        let disabledParams = try XCTUnwrap(disabled.response["lastParams"] as? [String: Any])
+        XCTAssertEqual(Set(disabledParams.keys), ["threadId", "developerInstructions"])
+        let disabledInstructions = try XCTUnwrap(disabledParams["developerInstructions"] as? String)
+        XCTAssertFalse(disabledInstructions.contains("| distill"),
+                       "Token Saver off must replace previously admitted paid guidance")
+        XCTAssertFalse(disabledInstructions.contains("Plan only"),
+                       "the current interaction mode must replace the previous mode")
+        XCTAssertTrue(disabledInstructions.contains("@after is After"),
+                      "the current turn must replace stale delegation context")
+        XCTAssertFalse(disabledInstructions.contains("@before is Before"),
+                       "prior-turn delegation context must not leak through resume")
+        XCTAssertEqual(disabledParams["threadId"] as? String, "live-thread")
     }
 
     func test_timedOutThreadResumeRequiresFreshClientRecovery() {

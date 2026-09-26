@@ -902,39 +902,30 @@ final class ProviderProxyPolicyTests: XCTestCase {
         ))
     }
 
-    func test_nestedCodexAgentAppEligible_acceptsCodex157ExecFlags() {
-        // WHY: openai/codex 0.157.0 advertises -s/-i/--enable/--disable/--add-dir/
-        // --worktree/--thread-source/--output-schema/--approve-for-me/--ignore-rules
-        // plus 0.157-only --local-provider/--dangerously-bypass-hook-trust/
-        // --output-last-message. The nested scanner used to fail-close those
-        // as malformed and skip Agent App.
-        let arguments = [
-            "exec", "-s", "workspace-write", "-i", "/tmp/shot.png",
-            "--add-dir", "/tmp/extra", "--enable", "web_search_tool",
-            "--disable", "view_image_tool", "--worktree",
-            "--thread-source", "api", "--output-schema", "/tmp/schema.json",
-            "--output-last-message", "/tmp/last.txt",
-            "--local-provider", "ollama",
-            "--approve-for-me", "--ignore-rules",
-            "--dangerously-bypass-hook-trust", "--strict-config",
-            "--model", "gpt-6-sol",
-            "-c", "model_reasoning_effort=high",
-            "work"
+    func test_nestedCodexAgentAppEligibilityKeepsUnrepresentedExecOptionsRaw() {
+        // WHY: These Codex 0.157 CLI options alter prompt inputs, tools, sandbox,
+        // workspace, configuration, or output; nested Agent App does not forward them.
+        let common = ["exec", "--model", "gpt-6-sol", "-c", "model_reasoning_effort=high", "work"]
+        let unsupportedOptions: [[String]] = [
+            ["-i", "/tmp/shot.png"], ["--add-dir", "/tmp/extra"],
+            ["--enable", "web_search_tool"], ["--disable", "view_image_tool"],
+            ["--worktree"], ["--thread-source", "api"],
+            ["--output-schema", "/tmp/schema.json"],
+            ["--output-last-message", "/tmp/last.txt"], ["-o", "/tmp/last.txt"],
+            ["--local-provider", "ollama"], ["--approve-for-me"],
+            ["--ignore-rules"], ["--dangerously-bypass-hook-trust"],
+            ["--strict-config"]
         ]
-        XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
-            providerBasename: "codex",
-            arguments: arguments
-        ))
-        XCTAssertNotNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
-            providerBasename: "codex",
-            arguments: arguments,
-            promptFile: "/tmp/rc-nested-prompt.txt"
-        ))
-        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
-            providerBasename: "codex",
-            arguments: arguments + ["--unknown-dash-flag"],
-            promptFile: "/tmp/rc-nested-prompt.txt"
-        ), "unknown remaining dash flags must still fail closed")
+        for option in unsupportedOptions {
+            let arguments = common + option
+            XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "codex", arguments: arguments
+            ), "Codex option \(option.first ?? "") must remain on raw CLI")
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "codex", arguments: arguments,
+                promptFile: "/tmp/rc-nested-prompt.txt"
+            ), "Codex option \(option.first ?? "") must not be dropped by promotion")
+        }
     }
 
     func test_nestedEligibilityRejectsRawFallbackContractsBeforeReadingPromptInput() {

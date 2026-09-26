@@ -596,7 +596,14 @@ public final class CodexAppServerClient: @unchecked Sendable {
         var resumeFellBack = false
         if let providerThreadId = request.providerThreadId, !providerThreadId.isEmpty {
             do {
-                let resumeParams: JSONObject = ["threadId": providerThreadId]
+                var resumeParams: JSONObject = ["threadId": providerThreadId]
+                let instructions = Self.developerInstructions(
+                    for: request.interactionMode,
+                    environment: request.environment
+                )
+                if !instructions.isEmpty {
+                    resumeParams["developerInstructions"] = instructions
+                }
                 response = try await requestJSONObject(method: "thread/resume", params: resumeParams)
             } catch {
                 guard Self.isRecoverableThreadResumeError(error) else { throw error }
