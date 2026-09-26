@@ -3311,6 +3311,23 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                             ]
                         ],
                         [
+                            "id": "fn-out-1",
+                            "type": "functionCallOutput",
+                            "name": "shell",
+                            "output": "tool stdout"
+                        ],
+                        [
+                            "id": "sub-1",
+                            "type": "subAgentActivity",
+                            "kind": "started",
+                            "agentThreadId": "child-thread-1"
+                        ],
+                        [
+                            "id": "sleep-1",
+                            "type": "sleep",
+                            "durationMs": 1500
+                        ],
+                        [
                             "id": "future-1",
                             "type": "futureProviderItem",
                             "message": "Provider-specific text"
@@ -3365,6 +3382,12 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "hook-1" && item.summary == "Hook prompt" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "hook-1" && output == "Hook prompt fragment" } else { return false } },
                       "hookPrompt snapshots should render fragment text instead of raw JSON")
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "fn-out-1" && item.type == .commandExecution && item.summary == "shell" } else { return false } },
+                      "0.157 functionCallOutput is a tool result, not assistant text")
+        XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "fn-out-1" && output == "tool stdout" } else { return false } })
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "sub-1" && item.type == .collabToolCall && item.summary == "started" } else { return false } },
+                      "0.157 subAgentActivity must not render as a generic unknown tool row")
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "sleep-1" && item.type == .tool && item.summary == "Sleep" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "future-1" && output == "Provider-specific text" } else { return false } },
                       "future provider-specific snapshot items should render common message/text fields while raw providerRuntime still preserves the full JSON")
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0, let output { return itemId == "future-content-1" && output.contains("Future content array text") && output.contains("image_url") && output.contains("file:") && output.contains("future.png") && output.contains("Second content part") } else { return false } },

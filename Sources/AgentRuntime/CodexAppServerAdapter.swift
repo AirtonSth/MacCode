@@ -3711,11 +3711,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case "agentMessage", "assistantMessage", "agent_message", "assistant_message", "message": return .assistantMessage
         case "plan": return .plan
         case "reasoning", "reasoning_text", "summary_text": return .reasoning
-        case "commandExecution", "command_execution", "local_shell_call", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output": return .commandExecution
+        case "commandExecution", "command_execution", "local_shell_call", "function_call", "function_call_output", "functionCallOutput", "custom_tool_call", "custom_tool_call_output": return .commandExecution
         case "fileChange", "file_change": return .fileChange
         case "mcpToolCall", "mcp_call": return .mcpToolCall
         case "dynamicToolCall", "imageGeneration": return .dynamicToolCall
-        case "collabAgentToolCall": return .collabToolCall
+        case "collabAgentToolCall", "subAgentActivity", "sub_agent_activity": return .collabToolCall
+        case "hookPrompt", "hook_prompt", "sleep": return .tool
         case "webSearch", "web_search_call", "tool_search_call", "tool_search_output", "search", "open_page", "find_in_page": return .webSearch
         case "imageView", "image_generation_call", "input_image": return .imageView
         case "enteredReviewMode", "exitedReviewMode": return .review
@@ -3835,8 +3836,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         switch type {
         case "userMessage":
             return "User message"
-        case "hookPrompt":
+        case "hookPrompt", "hook_prompt":
             return "Hook prompt"
+        case "sleep":
+            return "Sleep"
+        case "subAgentActivity", "sub_agent_activity":
+            return string(item, "kind") ?? string(item, "agentThreadId") ?? "Sub-agent"
         case "agentMessage", "assistantMessage", "agent_message", "assistant_message", "message":
             return "Assistant message"
         case "plan":
@@ -3847,8 +3852,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             return string(item, "command") ?? string(item, "status")
         case "function_call", "custom_tool_call":
             return string(item, "name") ?? string(item, "call_id") ?? "Tool call"
-        case "function_call_output", "custom_tool_call_output":
-            return string(item, "call_id") ?? "Tool output"
+        case "function_call_output", "functionCallOutput", "custom_tool_call_output":
+            return string(item, "name") ?? string(item, "call_id") ?? "Tool output"
         case "fileChange", "file_change":
             if let changes = item["changes"] as? [[String: Any]] {
                 return "\(changes.count) file change\(changes.count == 1 ? "" : "s")"
@@ -3877,8 +3882,18 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         switch type {
         case "userMessage":
             return joinedStrings(item["content"]) ?? stringBodyFallback(for: item)
-        case "hookPrompt":
+        case "hookPrompt", "hook_prompt":
             return joinedStrings(item["fragments"]) ?? stringBodyFallback(for: item)
+        case "sleep":
+            if let duration = item["durationMs"] ?? item["duration_ms"] {
+                return "durationMs=\(duration)"
+            }
+            return stringBodyFallback(for: item)
+        case "subAgentActivity", "sub_agent_activity":
+            return string(item, "agentThreadId")
+                ?? string(item, "agentPath")
+                ?? string(item, "kind")
+                ?? stringBodyFallback(for: item)
         case "agentMessage", "assistantMessage", "agent_message", "assistant_message", "message", "plan":
             return string(item, "text")
                 ?? joinedStrings(item["content"])
@@ -3920,7 +3935,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             return jsonString(item["result"]) ?? (item["error"] as? [String: Any]).flatMap { string($0, "message") } ?? stringBodyFallback(for: item)
         case "function_call", "custom_tool_call":
             return jsonString(item["arguments"]) ?? string(item, "arguments") ?? stringBodyFallback(for: item)
-        case "function_call_output", "custom_tool_call_output":
+        case "function_call_output", "functionCallOutput", "custom_tool_call_output":
             return joinedStrings(item["output"]) ?? stringBodyFallback(for: item)
         case "dynamicToolCall":
             return jsonString(item["contentItems"]) ?? stringBodyFallback(for: item)

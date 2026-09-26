@@ -668,7 +668,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ), "Agent App must not invent a receipt for an unknown Codex model contract")
         }
 
-        for catalogModel in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.3-codex", "gpt-5.2"] {
+        for catalogModel in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.3-codex", "gpt-5.2"] {
             let delegation = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
                 providerBasename: "codex",
                 arguments: [
@@ -950,7 +950,9 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ["--output-last-message", "/tmp/last.txt"], ["-o", "/tmp/last.txt"],
             ["--local-provider", "ollama"], ["--approve-for-me"],
             ["--ignore-rules"], ["--dangerously-bypass-hook-trust"],
-            ["--strict-config"]
+            ["--strict-config"], ["--ephemeral"], ["--skip-git-repo-check"],
+            ["--ignore-user-config"], ["--cd", "/tmp/other"], ["--color", "never"],
+            ["--oss"], ["--profile", "custom"]
         ]
         for option in unsupportedOptions {
             let arguments = common + option

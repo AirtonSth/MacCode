@@ -354,16 +354,19 @@ public final class CodexParser {
         case "reasoning": return .reasoning
         case "plan", "todolist", "planupdate": return .plan
         case "command", "commandexecution": return .commandExecution
+        case "functioncalloutput", "customtoolcall", "customtoolcalloutput":
+            return .commandExecution
         case "filechange", "patch", "applypatch": return .fileChange
         case "mcp", "mcptoolcall": return .mcpToolCall
-        case "dynamic", "dynamictoolcall": return .dynamicToolCall
-        case "collab", "collabtoolcall", "collabagenttoolcall": return .collabToolCall
+        case "dynamic", "dynamictoolcall", "imagegeneration": return .dynamicToolCall
+        case "collab", "collabtoolcall", "collabagenttoolcall", "subagentactivity":
+            return .collabToolCall
         case "websearch": return .webSearch
         case "imageview": return .imageView
         case "review", "enteredreviewmode", "exitedreviewmode": return .review
         case "contextcompaction": return .contextCompaction
         case "error": return .error
-        case "tool", "toolcall": return .tool
+        case "tool", "toolcall", "hookprompt", "sleep": return .tool
         case "agentmessage", "assistantmessage", "assistant", "message", "text":
             return .assistantMessage
         default: return .assistantMessage

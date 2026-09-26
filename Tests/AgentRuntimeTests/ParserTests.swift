@@ -144,6 +144,34 @@ final class CodexParserTests: XCTestCase {
         XCTAssertEqual(item?.output, "README.md")
     }
 
+    func test_realExecSchema_live0157ThreadItemKindsAreNotAssistantText() {
+        // WHY: openai/codex 0.157 ThreadItem uses camelCase kinds such as
+        // functionCallOutput, subAgentActivity, sleep, hookPrompt, and
+        // imageGeneration. Mapping those to assistantMessage dumps tool JSON
+        // into the transcript as if the model said it.
+        let p = CodexParser()
+        var state = AssistantTimelineState()
+        for l in [
+            #"{"type":"thread.started","thread_id":"t-0157-kinds"}"#,
+            #"{"type":"turn.started"}"#,
+            #"{"type":"item.completed","item":{"id":"out-1","type":"functionCallOutput","name":"shell","output":"ok"}}"#,
+            #"{"type":"item.completed","item":{"id":"sub-1","type":"subAgentActivity","kind":"started","agentThreadId":"child-1"}}"#,
+            #"{"type":"item.completed","item":{"id":"sleep-1","type":"sleep","durationMs":1500}}"#,
+            #"{"type":"item.completed","item":{"id":"hook-1","type":"hookPrompt","fragments":[{"hookRunId":"h1","text":"hook text"}]}}"#,
+            #"{"type":"item.completed","item":{"id":"img-1","type":"imageGeneration","status":"completed","result":"done"}}"#,
+            #"{"type":"item.completed","item":{"id":"msg-1","type":"agent_message","text":"Final reply"}}"#,
+            #"{"type":"turn.completed"}"#
+        ] { for ev in p.parseLine(l) { state.apply(ev) } }
+
+        XCTAssertEqual(state.turns[0].items.first { $0.id == "out-1" }?.type, .commandExecution)
+        XCTAssertEqual(state.turns[0].items.first { $0.id == "sub-1" }?.type, .collabToolCall)
+        XCTAssertEqual(state.turns[0].items.first { $0.id == "sleep-1" }?.type, .tool)
+        XCTAssertEqual(state.turns[0].items.first { $0.id == "hook-1" }?.type, .tool)
+        XCTAssertEqual(state.turns[0].items.first { $0.id == "img-1" }?.type, .dynamicToolCall)
+        XCTAssertEqual(state.turns[0].finalAssistantMessage, "Final reply",
+                       "0.157 non-message ThreadItem kinds must not become the assistant reply")
+    }
+
     func test_realExecSchema_itemUpdatedTodoList() {
         let p = CodexParser()
         var state = AssistantTimelineState()

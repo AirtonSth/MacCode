@@ -1481,10 +1481,13 @@ public enum ProviderProxyPolicy {
         let unsupportedValueOptions: Set<String> = [
             "--sandbox", "-s", "--ask-for-approval", "-a", "--image", "-i",
             "--enable", "--disable", "--local-provider", "--add-dir",
-            "--output-schema", "--output-last-message", "-o"
+            "--output-schema", "--output-last-message", "-o",
+            "--thread-source", "--profile", "-p", "--cd", "-C", "--color"
         ]
         let unsupportedFlags: Set<String> = [
-            "--approve-for-me", "--dangerously-bypass-hook-trust", "--ignore-rules"
+            "--approve-for-me", "--dangerously-bypass-hook-trust", "--ignore-rules",
+            "--worktree", "--strict-config", "--ephemeral", "--skip-git-repo-check",
+            "--ignore-user-config", "--oss", "--dangerously-bypass-approvals-and-sandbox"
         ]
         return scan.optionValues.keys.contains(where: { unsupportedValueOptions.contains($0) })
             || !scan.flags.isDisjoint(with: unsupportedFlags)
