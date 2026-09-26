@@ -3227,6 +3227,44 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         }, "aggregated_output must become command stdout")
     }
 
+    func test_appServerThreadStartedUsesSlashNotificationOnly() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let localThreadId = AgentThreadID()
+        let events = OrderedEventLog()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: localThreadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "notification contract",
+            providerThreadId: "codex-thread-1"
+        )) { event in
+            events.record(event)
+        }
+
+        func matchingThreadStartedCount() -> Int {
+            events.assistantEvents.filter {
+                if case .threadStarted(_, let providerThreadId) = $0 {
+                    return providerThreadId == "codex-thread-1"
+                }
+                return false
+            }.count
+        }
+        let initialThreadStartedCount = matchingThreadStartedCount()
+
+        client.notificationHandler?("thread.started", ["thread": ["id": "codex-thread-1"]])
+        XCTAssertEqual(matchingThreadStartedCount(), initialThreadStartedCount,
+                       "the app-server adapter must not treat a JSONL event name as its notification method")
+
+        client.notificationHandler?("thread/started", ["thread": ["id": "codex-thread-1"]])
+        XCTAssertEqual(matchingThreadStartedCount(), initialThreadStartedCount + 1,
+                       "the app-server notification must still publish thread/started")
+    }
+
     func test_readThreadRendersCommonStringAliasesForUncommonSnapshotItems() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         client.readResponse = [
