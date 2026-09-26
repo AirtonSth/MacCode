@@ -1000,6 +1000,15 @@ public final class CodexAppServerClient: @unchecked Sendable {
         if request.serviceTier == .fast {
             params["serviceTier"] = "fast"
         }
+        // Codex 0.157 ThreadStartParams: developerInstructions is first-class.
+        // collaborationMode is not a TurnStartParams field on 0.157.0.
+        let instructions = developerInstructions(
+            for: request.interactionMode,
+            environment: request.environment
+        )
+        if !instructions.isEmpty {
+            params["developerInstructions"] = instructions
+        }
         return params
     }
 
@@ -1034,12 +1043,13 @@ public final class CodexAppServerClient: @unchecked Sendable {
         // uniformly whether this is a primary run, a same-provider subagent, or a
         // cross-provider nested run, per AGENTS.md.
         let tokenSaverActive = request.environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
+        // Live 0.157 TurnStartParams still lists approvalPolicy; Distill/plan
+        // text belongs on thread/start developerInstructions, not collaborationMode.
         var params: JSONObject = [
             "threadId": providerThreadId,
             "input": input,
             "approvalPolicy": approvalPolicy(for: request.permissionMode),
-            "sandboxPolicy": sandboxPolicy(for: request.permissionMode, tokenSaverActive: tokenSaverActive),
-            "collaborationMode": collaborationMode(for: request, normalizedModel: model)
+            "sandboxPolicy": sandboxPolicy(for: request.permissionMode, tokenSaverActive: tokenSaverActive)
         ]
         if let model { params["model"] = model }
         if request.serviceTier == .fast { params["serviceTier"] = "fast" }
@@ -1221,24 +1231,6 @@ public final class CodexAppServerClient: @unchecked Sendable {
         case .fullAccess:
             return ["type": "dangerFullAccess"]
         }
-    }
-
-    private static func collaborationMode(for request: AgentRunRequest, normalizedModel model: String?) -> JSONObject {
-        // Upstream Settings.model is required. Empty/default request model means
-        // "account default" at the top-level turn/start field, but collaborationMode
-        // still needs a concrete model — use the same built-in default as the rest
-        // of the Agent App (not a stale gpt-5.5 hardcode).
-        return [
-            "mode": request.interactionMode.rawValue,
-            "settings": [
-                "model": model ?? AgentDefaultModelSelection.codexBuiltInDefault,
-                "reasoning_effort": appServerReasoningEffort(for: request.reasoningEffort).rawValue,
-                "developer_instructions": developerInstructions(
-                    for: request.interactionMode,
-                    environment: request.environment
-                )
-            ]
-        ]
     }
 
     private static func appServerReasoningEffort(for effort: AgentReasoningEffort?) -> AgentReasoningEffort {
