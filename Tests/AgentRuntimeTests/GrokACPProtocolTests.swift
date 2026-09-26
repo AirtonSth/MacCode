@@ -127,9 +127,13 @@ final class GrokACPProtocolTests: XCTestCase {
         )
         XCTAssertTrue(GrokACPClient.admitsSamGrokWorker(model: "grok-4.6", effort: .xhigh))
         XCTAssertTrue(GrokACPClient.admitsSamGrokWorker(model: "grok-4.6-preview", effort: .xhigh))
+        XCTAssertTrue(GrokACPClient.admitsSamGrokWorker(model: "grok-4.7", effort: .xhigh))
+        XCTAssertTrue(GrokACPClient.admitsSamGrokWorker(model: "grok-4.7-preview", effort: .high))
         XCTAssertTrue(GrokACPClient.admitsSamGrokWorker(model: "grok-4.5", effort: .high))
         XCTAssertFalse(GrokACPClient.admitsSamGrokWorker(model: "grok-4.5", effort: .xhigh))
         XCTAssertFalse(GrokACPClient.admitsSamGrokWorker(model: "grok-4.6", effort: .max))
+        XCTAssertFalse(GrokACPClient.admitsSamGrokWorker(model: "grok-4.7-build-fast", effort: .high),
+                       "live grok-4.7-build-fast has no advertised reasoning contract")
         XCTAssertEqual(
             try GrokACPClient.launchArguments(for: request),
             [

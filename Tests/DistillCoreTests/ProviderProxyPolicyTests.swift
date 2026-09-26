@@ -509,8 +509,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
             providerBasename: "claude",
             arguments: [
                 "--print", "--model", "opus", "--effort", "max",
-                "--permission-mode", "plan", "--output-format", "json",
-                "--no-session-persistence"
+                "--permission-mode", "plan", "--output-format", "json"
             ],
             promptFile: prompt
         ))
@@ -669,7 +668,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ), "Agent App must not invent a receipt for an unknown Codex model contract")
         }
 
-        for catalogModel in ["gpt-6-astra", "gpt-5.3-codex", "gpt-5.2"] {
+        for catalogModel in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.3-codex", "gpt-5.2"] {
             let delegation = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
                 providerBasename: "codex",
                 arguments: [
@@ -730,7 +729,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
         }
     }
 
-    func test_nestedCLIAgentAppDelegation_rejectsAdminVersionAndResume() {
+    func test_nestedCLIAgentAppDelegation_rejectsAdminVersionAndResume() throws {
         let prompt = "/tmp/rc-nested-prompt.txt"
         XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "claude",
@@ -796,6 +795,152 @@ final class ProviderProxyPolicyTests: XCTestCase {
             providerBasename: "claude",
             arguments: ["--print", "--model", "opus", "--effort", "high"]
         ))
+        for outputFormat in ["stream-json", "yaml"] {
+            let arguments = [
+                "--print", "--model", "opus", "--effort", "high",
+                "--output-format", outputFormat
+            ]
+            XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "claude", arguments: arguments
+            ), "unrepresented output format \(outputFormat) must stay on raw CLI")
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "claude", arguments: arguments, promptFile: prompt
+            ), "unrepresented output format \(outputFormat) must not become text delegation")
+        }
+        let unforwardedClaudeOptions: [[String]] = [
+            ["--include-hook-events"], ["--replay-user-messages"], ["--forward-subagent-text"],
+            ["--add-dir", "/tmp/extra"], ["--mcp-config", "{}"], ["--json-schema", "{}"],
+            ["--system-prompt-file", "/tmp/sys.md"], ["--append-system-prompt-file", "/tmp/append.md"],
+            ["--plugin-dir", "/tmp/plugin"], ["--plugin-url", "https://example.invalid/p.zip"],
+            ["--worktree", "wt"], ["-w", "wt2"], ["--fallback-model", "sonnet"],
+            ["--bare"], ["--permission-prompts", "host"], ["--max-budget-usd", "1"],
+            ["--name", "nested"], ["-n", "nested2"], ["--agents", "{}"],
+            ["--agent", "reviewer"], ["--file", "file_abc:doc.txt"],
+            ["--debug-file", "/tmp/debug.log"], ["--betas", "context-1m"],
+            ["--from-pr", "1"], ["--remote-control", "desk"], ["--brief"],
+            ["--chrome"], ["--no-chrome"], ["--dangerously-skip-permissions"],
+            ["--allow-dangerously-skip-permissions"], ["--exclude-dynamic-system-prompt-sections"],
+            ["--restricted"], ["--ax-screen-reader"], ["--bg"], ["--background"],
+            ["--autocompact", "auto"], ["--max-turns", "4"],
+            ["--cloud", "desk"], ["--environment", "env_1"], ["--teleport", "sess"],
+            ["--tmux"], ["--prompt-suggestions", "off"],
+            ["--remote-control-session-name-prefix", "rc"],
+            ["--system-prompt-snapshot", "/tmp/snap.md"], ["--no-session-persistence"]
+        ]
+        for option in unforwardedClaudeOptions {
+            let arguments = ["--print", "--model", "opus", "--effort", "high"] + option
+            XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "claude", arguments: arguments
+            ), "unforwarded Claude option \(option[0]) must remain on raw CLI")
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "claude", arguments: arguments, promptFile: prompt
+            ), "unforwarded Claude option \(option[0]) must not be dropped by promotion")
+        }
+        XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "claude",
+            arguments: ["--print", "--model", "default", "--effort", "medium", "--permission-mode", "default", "--output-format", "json"]
+        ), "Agent App's represented provider, effort, permission, and output fields remain promotable")
+        XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "claude",
+            arguments: ["--print", "--model", "default", "--effort", "medium"]
+        ), "live 2.1.282 catalog leads with id default (Opus 5.5)")
+        let defaultPermission = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "claude",
+            arguments: [
+                "--print", "--model", "opus", "--effort", "high",
+                "--permission-mode", "default"
+            ],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(defaultPermission.permissionMode, .supervised,
+                       "permission-mode default remains an accepted alias of manual")
+        let manualPermission = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "claude",
+            arguments: [
+                "--print", "--model", "opus", "--effort", "high",
+                "--permission-mode", "manual"
+            ],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(manualPermission.permissionMode, .supervised)
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "claude",
+            arguments: [
+                "--print", "--model", "opus", "--effort", "high",
+                "--future-unknown-flag"
+            ]
+        ), "unknown dash flags must stay fail-closed")
+        let grokBase = ["--model", "grok-4.7", "--effort", "high", "--prompt", "investigate"]
+        let unsupportedGrokOptions: [[String]] = [
+            ["--max-turns", "1"], ["--json-schema", "{\"type\":\"object\"}"],
+            ["--prompt-json", "{\"prompt\":\"do work\"}"], ["--cwd", "/other/worktree"],
+            ["--tools", "bash"], ["--allow", "read"], ["--deny", "write"],
+            ["--allowed-tools", "read"], ["--disallowed-tools", "write"],
+            ["--allowedTools", "read"], ["--disallowedTools", "write"],
+            ["--settings", "/tmp/grok-settings.json"], ["--input-format", "stream-json"],
+            ["--rules", "rules.md"], ["--sandbox", "strict"],
+            ["--system-prompt-override", "restricted"], ["--system-prompt", "restricted"],
+            ["--debug-file", "/tmp/grok.log"], ["--leader-socket", "/tmp/grok.sock"],
+            ["--agents", "agent.toml"], ["--agent", "reviewer"],
+            ["--worktree-ref", "branch"], ["--ref", "branch"], ["--worktree", "/tmp/worktree"],
+            ["-w", "/tmp/worktree"], ["--restore-code"], ["--include-partial-messages"],
+            ["--verbatim"], ["--disable-web-search"], ["--no-leader"], ["--debug"],
+            ["--auto-update"], ["--no-auto-update"], ["--memory"], ["--no-memory"],
+            ["--plan"], ["--no-plan"], ["--subagents"], ["--no-subagents"],
+            ["--fullscreen"], ["--minimal"], ["--no-alt-screen"], ["--oauth"]
+        ]
+        for option in unsupportedGrokOptions {
+            let arguments = grokBase + option
+            XCTAssertFalse(
+                ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                    providerBasename: "grok", arguments: arguments
+                ),
+                "Grok option \(option.first ?? "") must remain on raw CLI"
+            )
+            XCTAssertNil(
+                ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                    providerBasename: "grok", arguments: arguments,
+                    promptFile: "/tmp/rc-nested-prompt.txt"
+                ),
+                "Grok option \(option.first ?? "") must not be dropped by promotion"
+            )
+        }
+        let promptJSONArgs = [
+            "--model", "grok-4.7", "--effort", "high",
+            "--prompt-json", "{\"prompt\":\"do work\"}"
+        ]
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "grok", arguments: promptJSONArgs
+        ), "prompt-json is not decoded and must remain raw")
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIInlinePrompt(
+            providerBasename: "grok", arguments: promptJSONArgs
+        ))
+    }
+
+    func test_nestedCodexAgentAppEligibilityKeepsUnrepresentedExecOptionsRaw() {
+        // WHY: These Codex 0.157 CLI options alter prompt inputs, tools, sandbox,
+        // workspace, configuration, or output; nested Agent App does not forward them.
+        let common = ["exec", "--model", "gpt-6-sol", "-c", "model_reasoning_effort=high", "work"]
+        let unsupportedOptions: [[String]] = [
+            ["-i", "/tmp/shot.png"], ["--add-dir", "/tmp/extra"],
+            ["--enable", "web_search_tool"], ["--disable", "view_image_tool"],
+            ["--worktree"], ["--thread-source", "api"],
+            ["--output-schema", "/tmp/schema.json"],
+            ["--output-last-message", "/tmp/last.txt"], ["-o", "/tmp/last.txt"],
+            ["--local-provider", "ollama"], ["--approve-for-me"],
+            ["--ignore-rules"], ["--dangerously-bypass-hook-trust"],
+            ["--strict-config"]
+        ]
+        for option in unsupportedOptions {
+            let arguments = common + option
+            XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "codex", arguments: arguments
+            ), "Codex option \(option.first ?? "") must remain on raw CLI")
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "codex", arguments: arguments,
+                promptFile: "/tmp/rc-nested-prompt.txt"
+            ), "Codex option \(option.first ?? "") must not be dropped by promotion")
+        }
     }
 
     func test_nestedEligibilityRejectsRawFallbackContractsBeforeReadingPromptInput() {
@@ -848,56 +993,35 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertEqual(yolo.permissionMode, .fullAccess,
                        "--yolo is grok-build always-approve")
 
-        for option in ["--max-turns", "--json-schema", "--cwd", "--deny", "--verbatim"] {
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.7", "--effort", "high",
+                "--prompt", "investigate", "--max-turns", "8"
+            ]
+        ), "max-turn limits must remain enforced by the raw CLI")
+
+        XCTAssertEqual(
+            ProviderProxyPolicy.nestedCLIInlinePrompt(
+                providerBasename: "grok",
+                arguments: [
+                    "--prompt", "inline work",
+                    "--max-turns", "3",
+                    "--verbatim",
+                    "--debug-file", "/tmp/grok.debug"
+                ]
+            ),
+            "inline work"
+        )
+        for option in ["--cwd", "--json-schema", "--deny", "--prompt-json"] {
             XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
                 providerBasename: "grok",
                 arguments: [
-                    "--model", "grok-4.6", "--effort", "high",
+                    "--model", "grok-4.7", "--effort", "high",
                     "--prompt", "investigate", option, "value"
                 ]
             ), "unforwarded \(option) must remain on the raw Grok CLI path")
         }
-        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
-            providerBasename: "grok",
-            arguments: [
-                "--model", "grok-4.6", "--effort", "high",
-                "--prompt-json", "{\\\"prompt\\\":\\\"investigate\\\"}"
-            ]
-        ), "--prompt-json is not materialized as the Agent App prompt")
-        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
-            providerBasename: "grok",
-            arguments: [
-                "--model", "grok-4.6", "--effort", "high",
-                "--prompt", "investigate", "--permission-mode", "auto"
-            ]
-        ), "classifier-based auto mode cannot be represented by the Agent App permission modes")
-        XCTAssertEqual(
-            ProviderProxyPolicy.nestedCLIInlinePrompt(
-                providerBasename: "grok",
-                arguments: ["--prompt", "inline work"]
-            ),
-            "inline work"
-        )
-        let maxTurns = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
-            providerBasename: "grok",
-            arguments: [
-                "--model", "grok-4.6", "--effort", "high",
-                "--prompt", "investigate"
-            ],
-            promptFile: prompt
-        ))
-        XCTAssertEqual(maxTurns.model, "grok-4.6")
-        XCTAssertEqual(maxTurns.permissionMode, .supervised)
-
-        XCTAssertNil(ProviderProxyPolicy.nestedCLIInlinePrompt(
-            providerBasename: "grok",
-            arguments: [
-                "--prompt", "inline work",
-                "--max-turns", "3",
-                "--verbatim",
-                "--debug-file", "/tmp/grok.debug"
-            ]
-        ), "the raw CLI prompt parser must not erase unforwarded options")
 
         XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "grok",
@@ -920,15 +1044,19 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertEqual(dontAsk.permissionMode, .fullAccess,
                        "dontAsk suppresses prompts and requires a full-access parent mapping")
 
+        let autoArguments = [
+            "--model", "grok-4.7", "--effort", "high",
+            "--prompt", "investigate", "--permission-mode", "auto"
+        ]
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "grok",
+            arguments: autoArguments
+        ), "classifier-based auto mode must stay on the raw CLI path before stdin reads")
         XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "grok",
-            arguments: [
-                "--model", "grok-4.6", "--effort", "high",
-                "--prompt", "investigate",
-                "--permission-mode", "auto"
-            ],
+            arguments: autoArguments,
             promptFile: prompt
-        ), "classifier-based auto mode must stay on the raw Grok CLI path")
+        ), "classifier-based auto mode cannot be represented by Agent App")
 
         XCTAssertEqual(
             ProviderProxyPolicy.explicitPermissionRequest(
@@ -952,6 +1080,67 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ),
             .explicit(.fullAccess)
         )
+
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.6", "--effort", "high",
+                "--prompt", "investigate",
+                "--resume", "sid-keep-raw"
+            ],
+            promptFile: prompt
+        ), "grok --resume is a value option and must stay on the raw CLI")
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.6", "--effort", "high",
+                "--prompt", "investigate",
+                "-s", "sid-keep-raw"
+            ],
+            promptFile: prompt
+        ), "grok -s/--session-id must stay on the raw CLI")
+        XCTAssertFalse(
+            ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "grok",
+                arguments: ["-v"]
+            ),
+            "grok -v is --version and must stay on the raw CLI"
+        )
+        XCTAssertFalse(
+            ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "grok",
+                arguments: ["-c"]
+            ),
+            "grok -c is --continue and must stay on the raw CLI"
+        )
+
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.7", "--effort", "high",
+                "--prompt", "investigate",
+                "--fullscreen", "--minimal", "--no-alt-screen", "--oauth"
+            ]
+        ), "Grok 4.7 CLI mode and authentication options must remain on raw CLI")
+        let grok47 = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.7", "--effort", "high",
+                "--prompt", "investigate"
+            ],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(grok47.model, "grok-4.7")
+        XCTAssertEqual(grok47.reasoningEffort, .high)
+
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.7-build-fast", "--effort", "high",
+                "--prompt", "investigate"
+            ],
+            promptFile: prompt
+        ), "grok-4.7-build-fast has no reasoning contract so nested Agent App stays fail-closed")
     }
 
     func test_nestedCLIAgentAppDelegation_samGrokWorkerKeepsRuntimeProfile() throws {

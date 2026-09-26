@@ -100,7 +100,13 @@ public enum GrokReasoningPolicy {
 
     public static func supportedEfforts(for model: String) -> [AgentReasoningEffort] {
         let id = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if id.isEmpty || id.hasPrefix("grok-4.6") { return grok46Efforts }
+        // Live grok 1.0.41 default is grok-4.7; grok-build lists the same
+        // low|medium|high|xhigh menu as grok-4.6. The build-fast sibling is a
+        // non-reasoning lane and must fail closed instead of inheriting xhigh.
+        if id.hasPrefix("grok-4.7-build-fast") { return [] }
+        if id.isEmpty || id.hasPrefix("grok-4.7") || id.hasPrefix("grok-4.6") {
+            return grok46Efforts
+        }
         if id.hasPrefix("grok-4.5") { return grok45Efforts }
         if id == "glm-5.3" || id.hasPrefix("glm-5.3-") { return glm53Efforts }
         if id.hasPrefix("muse-spark") { return museSparkEfforts }

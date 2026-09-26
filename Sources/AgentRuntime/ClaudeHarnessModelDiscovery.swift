@@ -80,13 +80,20 @@ public enum ClaudeHarnessModelDiscovery {
                     if !result.contains(effort) { result.append(effort) }
                 }
             let supportsEffort = raw["supportsEffort"] as? Bool ?? !efforts.isEmpty
+            let resolved = (raw["resolvedModel"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let window = AnthropicModelDiscovery.contextWindowTokens(forID: id)
+                ?? resolved.flatMap { resolvedID in
+                    resolvedID.isEmpty ? nil : AnthropicModelDiscovery.contextWindowTokens(forID: resolvedID)
+                }
             return AgentModelDescriptor(
                 id: id,
                 label: label,
                 provider: .claude,
                 supportsReasoning: supportsEffort || !efforts.isEmpty,
                 supportedReasoningEfforts: efforts,
-                supportsCustomModel: true
+                supportsCustomModel: true,
+                contextWindowTokens: window
             )
         }
     }

@@ -711,11 +711,13 @@ public final class GrokACPClient: @unchecked Sendable {
         return home
     }
 
-    /// Prefix-aware sam-grok-worker admission: grok-4.5 and grok-4.6 only,
+    /// Prefix-aware sam-grok-worker admission: grok-4.5, grok-4.6, and grok-4.7,
     /// with effort taken from `GrokReasoningPolicy.supportedEfforts(for:)`.
     public static func admitsSamGrokWorker(model: String, effort: AgentReasoningEffort) -> Bool {
         let id = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard id.hasPrefix("grok-4.5") || id.hasPrefix("grok-4.6") else { return false }
+        guard id.hasPrefix("grok-4.5") || id.hasPrefix("grok-4.6") || id.hasPrefix("grok-4.7") else {
+            return false
+        }
         return GrokReasoningPolicy.supportedEfforts(for: model).contains(effort)
     }
 
