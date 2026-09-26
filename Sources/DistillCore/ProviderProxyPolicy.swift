@@ -1621,26 +1621,15 @@ public enum ProviderProxyPolicy {
 
     /// grok 1.0.41 value-taking flags. Unknown dash flags stay fail-closed.
     private static let nestedGrokValueOptions: Set<String> = [
-        "--prompt-file", "--prompt", "-p", "--rules",
-        "--permission-mode", "--sandbox", "--model", "-m",
-        "--effort", "--reasoning-effort", "--output-format",
-        "--input-format", "--disallowed-tools", "--allowed-tools",
-        "--settings", "--resume", "-r", "--session-id",
-        "--max-turns", "--json-schema", "--prompt-json", "--cwd",
-        "--tools", "--allow", "--deny", "--system-prompt-override",
-        "--system-prompt", "--debug-file", "--leader-socket",
-        "--agents", "--agent", "--worktree-ref", "--ref",
-        "--worktree", "-w"
+        "--prompt-file", "--prompt", "-p",
+        "--permission-mode", "--model", "-m",
+        "--effort", "--reasoning-effort", "--output-format"
     ]
 
     /// grok 1.0.41 boolean flags. `--yolo` is `--always-approve`.
     private static let nestedGrokFlagOptions: Set<String> = [
-        "--always-approve", "--yolo", "--auto-update", "--continue",
-        "--help", "-h", "--list-models", "--memory", "--no-auto-update",
-        "--no-memory", "--no-plan", "--no-subagents", "--plan",
-        "--subagents", "--version", "-V",
-        "--fork-session", "--include-partial-messages", "--restore-code",
-        "--verbatim", "--disable-web-search", "--no-leader", "--debug"
+        "--always-approve", "--yolo",
+        "--help", "-h", "--list-models", "--version", "-V"
     ]
 
     private static func nestedGrokAgentAppEligible(arguments: [String]) -> Bool {
@@ -1656,6 +1645,9 @@ public enum ProviderProxyPolicy {
             flagOptions: nestedGrokFlagOptions
         )
         guard !scan.malformed else { return false }
+        if scan.optionValues["--permission-mode"]?.last?.lowercased() == "auto" {
+            return false
+        }
         if scan.flags.contains("--version") || scan.flags.contains("-V")
             || scan.flags.contains("--help") || scan.flags.contains("-h")
             || scan.flags.contains("--list-models") {

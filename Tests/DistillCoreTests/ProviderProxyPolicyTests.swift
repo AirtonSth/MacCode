@@ -848,33 +848,56 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertEqual(yolo.permissionMode, .fullAccess,
                        "--yolo is grok-build always-approve")
 
+        for option in ["--max-turns", "--json-schema", "--cwd", "--deny", "--verbatim"] {
+            XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "grok",
+                arguments: [
+                    "--model", "grok-4.6", "--effort", "high",
+                    "--prompt", "investigate", option, "value"
+                ]
+            ), "unforwarded \(option) must remain on the raw Grok CLI path")
+        }
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.6", "--effort", "high",
+                "--prompt-json", "{\\\"prompt\\\":\\\"investigate\\\"}"
+            ]
+        ), "--prompt-json is not materialized as the Agent App prompt")
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.6", "--effort", "high",
+                "--prompt", "investigate", "--permission-mode", "auto"
+            ]
+        ), "classifier-based auto mode cannot be represented by the Agent App permission modes")
+        XCTAssertEqual(
+            ProviderProxyPolicy.nestedCLIInlinePrompt(
+                providerBasename: "grok",
+                arguments: ["--prompt", "inline work"]
+            ),
+            "inline work"
+        )
         let maxTurns = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "grok",
             arguments: [
                 "--model", "grok-4.6", "--effort", "high",
-                "--prompt", "investigate", "--max-turns", "8",
-                "--json-schema", "{\"type\":\"object\"}",
-                "--cwd", "/tmp",
-                "--verbatim",
-                "--disable-web-search"
+                "--prompt", "investigate"
             ],
             promptFile: prompt
         ))
         XCTAssertEqual(maxTurns.model, "grok-4.6")
         XCTAssertEqual(maxTurns.permissionMode, .supervised)
 
-        XCTAssertEqual(
-            ProviderProxyPolicy.nestedCLIInlinePrompt(
-                providerBasename: "grok",
-                arguments: [
-                    "--prompt", "inline work",
-                    "--max-turns", "3",
-                    "--verbatim",
-                    "--debug-file", "/tmp/grok.debug"
-                ]
-            ),
-            "inline work"
-        )
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIInlinePrompt(
+            providerBasename: "grok",
+            arguments: [
+                "--prompt", "inline work",
+                "--max-turns", "3",
+                "--verbatim",
+                "--debug-file", "/tmp/grok.debug"
+            ]
+        ), "the raw CLI prompt parser must not erase unforwarded options")
 
         XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "grok",
@@ -897,7 +920,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertEqual(dontAsk.permissionMode, .fullAccess,
                        "dontAsk suppresses prompts and requires a full-access parent mapping")
 
-        let grokAuto = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "grok",
             arguments: [
                 "--model", "grok-4.6", "--effort", "high",
@@ -905,9 +928,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
                 "--permission-mode", "auto"
             ],
             promptFile: prompt
-        ))
-        XCTAssertNotEqual(grokAuto.permissionMode, .autoAcceptEdits,
-                          "grok auto is a classifier, not acceptEdits")
+        ), "classifier-based auto mode must stay on the raw Grok CLI path")
 
         XCTAssertEqual(
             ProviderProxyPolicy.explicitPermissionRequest(
