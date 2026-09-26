@@ -1346,8 +1346,8 @@ final class ProviderProxyPolicyTests: XCTestCase {
                 providerBasename: "codex",
                 arguments: ["exec", "--approve-for-me"]
             ),
-            .explicit(.autoAcceptEdits),
-            "--approve-for-me enables automatic review with the workspace-write sandbox"
+            .explicit(.fullAccess),
+            "--approve-for-me routes approval requests through an automatic reviewer"
         )
         for profile in [
             ["--profile", "wide"],

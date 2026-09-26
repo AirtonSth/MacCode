@@ -813,11 +813,19 @@ public enum ProviderProxyPolicy {
                 candidates.append(.fullAccess)
                 index += 1
                 continue
-            case (.codex, "--full-auto"), (.codex, "--approve-for-me"):
+            case (.codex, "--full-auto"):
                 sawPermissionFlag = true
-                // Both options enable Codex's workspace-write sandbox.
+                // Codex defines this as the complete workspace-write shortcut,
+                // not an approval-only dimension.
                 sandbox = .autoAcceptEdits
                 sawArgumentSandbox = true
+                index += 1
+                continue
+            case (.codex, "--approve-for-me"):
+                // Codex routes approval requests through an automatic reviewer;
+                // the current policy model cannot represent that authority separately.
+                sawPermissionFlag = true
+                candidates.append(.fullAccess)
                 index += 1
                 continue
             case (.claude, "--dangerously-skip-permissions"),
