@@ -1688,7 +1688,8 @@ public enum ProviderProxyPolicy {
         let unsupportedValueOptions: Set<String> = [
             "--max-turns", "--json-schema", "--prompt-json", "--cwd",
             "--tools", "--allow", "--deny", "--allowed-tools", "--disallowed-tools",
-            "--allowedTools", "--disallowedTools", "--settings",
+            "--allowedTools", "--disallowedTools", "--settings", "--input-format", "--rules",
+            "--sandbox",
             "--system-prompt-override", "--system-prompt", "--debug-file",
             "--leader-socket", "--agents", "--agent", "--worktree-ref",
             "--ref", "--worktree", "-w"
@@ -1698,7 +1699,9 @@ public enum ProviderProxyPolicy {
         }
         let unsupportedFlags: Set<String> = [
             "--restore-code", "--include-partial-messages", "--verbatim",
-            "--disable-web-search", "--no-leader", "--debug",
+            "--disable-web-search", "--no-leader", "--debug", "--auto-update",
+            "--no-auto-update", "--memory", "--no-memory", "--plan", "--no-plan",
+            "--subagents", "--no-subagents",
             "--fullscreen", "--minimal", "--no-alt-screen", "--oauth"
         ]
         if !scan.flags.isDisjoint(with: unsupportedFlags) {

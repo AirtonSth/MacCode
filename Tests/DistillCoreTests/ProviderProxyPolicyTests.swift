@@ -862,13 +862,16 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ["--tools", "bash"], ["--allow", "read"], ["--deny", "write"],
             ["--allowed-tools", "read"], ["--disallowed-tools", "write"],
             ["--allowedTools", "read"], ["--disallowedTools", "write"],
-            ["--settings", "/tmp/grok-settings.json"],
+            ["--settings", "/tmp/grok-settings.json"], ["--input-format", "stream-json"],
+            ["--rules", "rules.md"], ["--sandbox", "strict"],
             ["--system-prompt-override", "restricted"], ["--system-prompt", "restricted"],
             ["--debug-file", "/tmp/grok.log"], ["--leader-socket", "/tmp/grok.sock"],
             ["--agents", "agent.toml"], ["--agent", "reviewer"],
             ["--worktree-ref", "branch"], ["--ref", "branch"], ["--worktree", "/tmp/worktree"],
             ["-w", "/tmp/worktree"], ["--restore-code"], ["--include-partial-messages"],
             ["--verbatim"], ["--disable-web-search"], ["--no-leader"], ["--debug"],
+            ["--auto-update"], ["--no-auto-update"], ["--memory"], ["--no-memory"],
+            ["--plan"], ["--no-plan"], ["--subagents"], ["--no-subagents"],
             ["--fullscreen"], ["--minimal"], ["--no-alt-screen"], ["--oauth"]
         ]
         for option in unsupportedGrokOptions {
