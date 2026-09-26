@@ -462,6 +462,42 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
                       "file attachments must reach the SDK prompt as a structured content block")
     }
 
+    func test_realBridgeOmitsEmptyTextBlockOnAttachOnlyTurn() throws {
+        // WHY: 2.1.277 rejects empty text content blocks. Agent App send is
+        // enabled with files and empty text; pushPrompt must omit {type:text,text:""}.
+        guard let node = ProcessLocator.resolve("node") else { throw XCTSkip("node not available") }
+        let harness = try RealBridgeHarness(node: node, fakeSDKIndexJS: """
+        export function createSdkMcpServer() { return { instance: { server: {} } }; }
+        export function tool(name, description, schema, handler) { return { name, description, schema, handler }; }
+        export function query({ prompt }) {
+          return (async function*() {
+            const message = await prompt[Symbol.asyncIterator]().next();
+            yield { type: 'result', subtype: 'success', is_error: false, result: 'ATTACH_ONLY:' + JSON.stringify(message.value?.message?.content || []), session_id: 'attach-only' };
+          })();
+        }
+        """)
+        defer { _ = harness.finish() }
+
+        try harness.send([
+            "type": "rc_configure",
+            "bridge_protocol_version": ClaudeAgentSDKBridgeAdapter.bridgeProtocolVersion,
+            "expected_sdk_version": "0.3.157",
+            "session_id": "attach-only"
+        ])
+        try harness.send([
+            "type": "rc_turn",
+            "prompt": "",
+            "attachments": [["path": "/tmp/note.txt", "display_name": "note.txt", "kind": "file", "mime_type": "text/plain"]]
+        ])
+
+        XCTAssertTrue(harness.waitFor("ATTACH_ONLY:"), "the real bridge must invoke the SDK query")
+        XCTAssertFalse(harness.output.contains(#"{"type":"text","text":""}"#)
+            || harness.output.contains(#"{\"type\":\"text\",\"text\":\"\"}"#),
+                       "attach-only turns must not emit an empty text content block")
+        XCTAssertTrue(harness.output.contains(#"[Attachment: note.txt]\\n/tmp/note.txt"#),
+                      "file attachments must still reach the SDK prompt")
+    }
+
     // MARK: - Adapter: effort change is a runtime switch (F7)
 
     // WHY: the SDK query has no live effort control (unlike rc_set_model /
