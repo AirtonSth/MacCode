@@ -561,6 +561,7 @@ public enum ProviderProxyPolicy {
         var bypassApproval = false
         var sawPermissionFlag = false
         var sawArgumentSandbox = false
+        var grokSilentDeny = false
         var invalidReason: String?
 
         func parsePermissionMode(_ raw: String) -> AgentPermissionMode? {
@@ -569,11 +570,15 @@ public enum ProviderProxyPolicy {
                  "supervised", "ask", "askbeforeedits":
                 return .supervised
             case "dontask", "dont-ask":
-                return .fullAccess
+                // grok-build DontAsk silently denies non-pre-approved tools.
+                // That is stricter than ask, not bypassPermissions/always-approve.
+                // Claude dontAsk remains the skip-permissions alias.
+                return provider == .grok ? .supervised : .fullAccess
             case "acceptedits", "accept-edits", "auto_accept_edits", "workspace":
                 return .autoAcceptEdits
             case "auto":
-                // Grok auto is a classifier, not acceptEdits.
+                // Grok auto is a classifier, not acceptEdits. Require a full-access
+                // parent ceiling so Distill does not treat it as workspace-only.
                 return provider == .grok ? .fullAccess : .autoAcceptEdits
             case "bypasspermissions", "bypass-permissions", "full_access":
                 return .fullAccess
@@ -865,6 +870,10 @@ public enum ProviderProxyPolicy {
                     guard let parsed = parsePermissionMode(value) else {
                         return .invalid("unknown permission mode")
                     }
+                    if provider == .grok {
+                        let mode = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                        grokSilentDeny = mode == "dontask" || mode == "dont-ask"
+                    }
                     candidates.append(parsed)
                 case "--sandbox", "-s":
                     sawPermissionFlag = true
@@ -923,6 +932,10 @@ public enum ProviderProxyPolicy {
                         sawPermissionFlag = true
                         guard let parsed = parsePermissionMode(value) else {
                             return .invalid("unknown permission mode")
+                        }
+                        if provider == .grok {
+                            let mode = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                            grokSilentDeny = mode == "dontask" || mode == "dont-ask"
                         }
                         candidates.append(parsed)
                     case "--sandbox", "-s":
@@ -1004,7 +1017,11 @@ public enum ProviderProxyPolicy {
             // environment. Claude's permission-mode is its complete authority
             // ABI, while its separate settings/root-extending flags above
             // already require full access.
-            candidates.append(.fullAccess)
+            // grok-build dontAsk is silent deny: do not invent a yolo parent
+            // ceiling just because `--sandbox` was omitted.
+            if !grokSilentDeny {
+                candidates.append(.fullAccess)
+            }
         }
         guard sawPermissionFlag || !candidates.isEmpty else { return .inherited }
         return .explicit(candidates.reduce(.supervised) {
@@ -1647,29 +1664,34 @@ public enum ProviderProxyPolicy {
     }
 
     /// grok 1.0.41 value-taking flags. Unknown dash flags stay fail-closed.
+    /// `--single`/`--print` are clap aliases of `-p`; `--load` is `--resume`;
+    /// `--append-system-prompt` is `--rules`.
     private static let nestedGrokValueOptions: Set<String> = [
-        "--prompt-file", "--prompt", "-p", "--rules",
+        "--prompt-file", "--prompt", "-p", "--single", "--print", "--rules",
         "--permission-mode", "--sandbox", "--model", "-m",
         "--effort", "--reasoning-effort", "--output-format",
         "--input-format", "--disallowed-tools", "--allowed-tools",
-        "--settings", "--resume", "-r", "--session-id", "-s",
+        "--settings", "--resume", "-r", "--load", "--session-id", "-s",
         "--max-turns", "--json-schema", "--prompt-json", "--cwd",
         "--tools", "--allow", "--deny", "--allowedTools", "--disallowedTools",
         "--system-prompt-override",
-        "--system-prompt", "--debug-file", "--leader-socket",
+        "--system-prompt", "--append-system-prompt", "--debug-file", "--leader-socket",
         "--agents", "--agent", "--worktree-ref", "--ref",
         "--worktree", "-w"
     ]
 
-    /// grok 1.0.41 boolean flags. `--yolo` is `--always-approve`.
+    /// grok 1.0.41 boolean flags. `--yolo` and `--dangerously-skip-permissions`
+    /// are clap aliases of `--always-approve`.
     private static let nestedGrokFlagOptions: Set<String> = [
-        "--always-approve", "--yolo", "--auto-update", "--continue", "-c",
+        "--always-approve", "--yolo", "--dangerously-skip-permissions",
+        "--auto-update", "--continue", "-c",
         "--help", "-h", "--list-models", "--memory", "--no-auto-update",
         "--no-memory", "--no-plan", "--no-subagents", "--plan",
         "--subagents", "--version", "-V", "-v",
         "--fork-session", "--include-partial-messages", "--restore-code",
         "--verbatim", "--disable-web-search", "--no-leader", "--debug",
-        "--fullscreen", "--minimal", "--no-alt-screen", "--oauth"
+        "--fullscreen", "--minimal", "--no-alt-screen", "--oauth",
+        "--trust", "--trust-folder"
     ]
 
     private static func nestedGrokAgentAppEligible(arguments: [String]) -> Bool {
@@ -1693,6 +1715,8 @@ public enum ProviderProxyPolicy {
             scan.optionValues["--prompt-file"]?.contains(where: { !$0.isEmpty }) == true
             || scan.optionValues["--prompt"]?.contains(where: { !$0.isEmpty }) == true
             || scan.optionValues["-p"]?.contains(where: { !$0.isEmpty }) == true
+            || scan.optionValues["--single"]?.contains(where: { !$0.isEmpty }) == true
+            || scan.optionValues["--print"]?.contains(where: { !$0.isEmpty }) == true
             || scan.optionValues["--prompt-json"]?.contains(where: { !$0.isEmpty }) == true
             || !scan.positionals.isEmpty
         // Empty positionals + no prompt flags still eligible if stdin will supply prompt
@@ -1708,7 +1732,10 @@ public enum ProviderProxyPolicy {
     /// Resume/load/version/help stay on the raw CLI. `--resume` and `--session-id`
     /// are value options on grok 1.0.41, so a flags-only gate misses them.
     private static func nestedGrokKeepsRawCLI(_ scan: NestedArgScan) -> Bool {
-        if scan.optionValues["--permission-mode"]?.last?.lowercased() == "auto" {
+        let permissionMode = scan.optionValues["--permission-mode"]?.last?.lowercased()
+        // auto is a background classifier; dontAsk silently denies. Neither is
+        // Agent App fullAccess / acceptEdits.
+        if permissionMode == "auto" || permissionMode == "dontask" || permissionMode == "dont-ask" {
             return true
         }
         if scan.flags.contains("--version") || scan.flags.contains("-V") || scan.flags.contains("-v")
@@ -1720,6 +1747,7 @@ public enum ProviderProxyPolicy {
             return true
         }
         if scan.optionValues["--resume"] != nil || scan.optionValues["-r"] != nil
+            || scan.optionValues["--load"] != nil
             || scan.optionValues["--session-id"] != nil || scan.optionValues["-s"] != nil {
             return true
         }
@@ -1728,7 +1756,8 @@ public enum ProviderProxyPolicy {
             "--tools", "--allow", "--deny", "--allowed-tools", "--disallowed-tools",
             "--allowedTools", "--disallowedTools", "--settings", "--input-format", "--rules",
             "--sandbox",
-            "--system-prompt-override", "--system-prompt", "--debug-file",
+            "--system-prompt-override", "--system-prompt", "--append-system-prompt",
+            "--debug-file",
             "--leader-socket", "--agents", "--agent", "--worktree-ref",
             "--ref", "--worktree", "-w"
         ]
@@ -1740,7 +1769,8 @@ public enum ProviderProxyPolicy {
             "--disable-web-search", "--no-leader", "--debug", "--auto-update",
             "--no-auto-update", "--memory", "--no-memory", "--plan", "--no-plan",
             "--subagents", "--no-subagents",
-            "--fullscreen", "--minimal", "--no-alt-screen", "--oauth"
+            "--fullscreen", "--minimal", "--no-alt-screen", "--oauth",
+            "--trust", "--trust-folder"
         ]
         if !scan.flags.isDisjoint(with: unsupportedFlags) {
             return true
@@ -1775,15 +1805,15 @@ public enum ProviderProxyPolicy {
               requestedEffort != .ultracode else { return nil }
         let effort = GrokReasoningPolicy.normalizedEffort(requestedEffort, model: model)
         let permission: AgentPermissionMode = {
-            if scan.flags.contains("--always-approve") || scan.flags.contains("--yolo") {
+            if scan.flags.contains("--always-approve")
+                || scan.flags.contains("--yolo")
+                || scan.flags.contains("--dangerously-skip-permissions") {
                 return .fullAccess
             }
             switch (scan.optionValues["--permission-mode"]?.last ?? "").lowercased() {
             case "acceptedits", "accept-edits", "workspace":
                 return .autoAcceptEdits
-            case "dontask", "dont-ask", "full_access", "full-access", "bypasspermissions":
-                return .fullAccess
-            case "auto":
+            case "full_access", "full-access", "bypasspermissions", "bypass-permissions":
                 return .fullAccess
             default:
                 return .supervised
@@ -1815,7 +1845,9 @@ public enum ProviderProxyPolicy {
         )
         guard !scan.malformed else { return nil }
         if let prompt = scan.optionValues["--prompt"]?.last
-            ?? scan.optionValues["-p"]?.last {
+            ?? scan.optionValues["-p"]?.last
+            ?? scan.optionValues["--single"]?.last
+            ?? scan.optionValues["--print"]?.last {
             let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { return trimmed }
         }

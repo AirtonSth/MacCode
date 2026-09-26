@@ -104,6 +104,25 @@ final class GrokRunnerArgsTests: XCTestCase {
             source: "grok.streaming-json"
         )
         XCTAssertEqual(err?.method, "error")
+        for type in [
+            "available_commands",
+            "auto_compact_started",
+            "auto_compact_completed",
+            "auto_compact_failed",
+            "auto_compact_cancelled",
+            "auto_continue_completed",
+            "memory_flush_started",
+            "memory_flush_completed",
+            "memory_capture_activity",
+            "image_compressed"
+        ] {
+            let event = GrokRunner.providerRuntimeEventIfNeeded(
+                line: #"{"type":"\#(type)"}"#,
+                source: "grok.streaming-json"
+            )
+            XCTAssertEqual(event?.method, type,
+                           "grok-build streaming-json \(type) must stay on the Work log")
+        }
     }
 
     func test_modelAndPermissionMapping() {
