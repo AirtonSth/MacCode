@@ -225,6 +225,8 @@ final class GrokRunnerArgsTests: XCTestCase {
 
     func test_listModelsReasoningParityWithGrokCLICache() {
         let models = GrokRunner.listModels(installedVersion: nil)
+        let fourSeven = try! XCTUnwrap(models.first { $0.id == "grok-4.7" })
+        XCTAssertEqual(fourSeven.supportedReasoningEfforts, [.low, .medium, .high, .xhigh])
         let fourSix = try! XCTUnwrap(models.first { $0.id == "grok-4.6" })
         XCTAssertEqual(fourSix.supportedReasoningEfforts, [.low, .medium, .high, .xhigh])
         let fourFive = try! XCTUnwrap(models.first { $0.id == "grok-4.5" })
@@ -234,6 +236,9 @@ final class GrokRunnerArgsTests: XCTestCase {
 
         XCTAssertNil(models.first { $0.id == "grok-composer-2.5-fast" },
                      "live grok 1.0.30 no longer lists composer-fast")
+        let buildFast = try! XCTUnwrap(models.first { $0.id == "grok-4.7-build-fast" })
+        XCTAssertFalse(buildFast.supportsReasoning)
+        XCTAssertTrue(buildFast.supportedReasoningEfforts.isEmpty)
         let glm = try! XCTUnwrap(models.first { $0.id == "glm-5.3" })
         XCTAssertEqual(glm.supportedReasoningEfforts, [.low, .medium, .high, .xhigh, .max])
         let muse = try! XCTUnwrap(models.first { $0.id == "muse-spark-1.3-contributor" })
@@ -247,7 +252,8 @@ final class GrokRunnerArgsTests: XCTestCase {
 
     func test_listModelsIncludesGrokDefaults() {
         let models = GrokRunner.listModels(installedVersion: nil)
-        XCTAssertEqual(models.first?.id, "grok-4.6")
+        XCTAssertEqual(models.first?.id, "grok-4.7")
+        XCTAssertTrue(models.contains { $0.id == "grok-4.6" && $0.provider == .grok })
         XCTAssertTrue(models.contains { $0.id == "grok-4.5" && $0.provider == .grok })
         XCTAssertTrue(models.contains { $0.provider == .grok && $0.supportsCustomModel })
     }

@@ -177,7 +177,7 @@ final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
         XCTAssertTrue(body.contains("uuid: randomUUID()"),
                       "SDK pushPrompt must stamp a uuid on host user messages")
         XCTAssertTrue(body.contains("if (text) content.push({ type: 'text', text })"),
-                      "SDK pushPrompt must omit empty text blocks so attach-only turns survive 2.1.277+")
+                      "SDK pushPrompt must omit empty text blocks Claude Code 2.1.277+ rejects")
     }
 
     func test_userPromptPayload_includesImageAndFileBlocks() throws {

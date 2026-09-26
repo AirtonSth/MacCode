@@ -2609,6 +2609,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         agent.viewModel.mentionableBotsProvider = { [weak self] in
             (try? self?.context?.botStore.listCached()) ?? []
         }
+        agent.viewModel.mentionableBotsRevisionProvider = { [weak self] in
+            self?.context?.botStore.botsListRevision ?? 0
+        }
     }
 
     private var hostCatalogCreatedBots: [AgentRunID: Set<BotID>] = [:]

@@ -36,14 +36,17 @@ final class ClaudeHarnessModelDiscoveryTests: XCTestCase {
         XCTAssertEqual(models.first { $0.id == "haiku" }?.contextWindowTokens, 200_000)
     }
 
-    func test_harnessDescriptorsCopyOpus55OneMillionContextWindow() throws {
+    func test_harnessDescriptorsCopyResolvedModelContextWindow() throws {
         let response: [String: Any] = [
             "type": "control_response",
             "response": [
                 "subtype": "success",
                 "response": [
                     "models": [
-                        ["value": "default", "displayName": "Default"],
+                        ["value": "default", "displayName": "Default (recommended)",
+                         "resolvedModel": "claude-opus-5-5",
+                         "supportsEffort": true,
+                         "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"]],
                         ["value": "claude-opus-5-5[1m]", "displayName": "Opus 5.5",
                          "supportsEffort": true, "supportedEffortLevels": ["medium"]],
                         ["value": "haiku", "displayName": "Haiku"]
@@ -53,7 +56,8 @@ final class ClaudeHarnessModelDiscoveryTests: XCTestCase {
         ]
         let models = try XCTUnwrap(ClaudeHarnessModelDiscovery.modelDescriptors(from: response))
         XCTAssertEqual(models.map(\.id), ["default", "claude-opus-5-5[1m]", "haiku"])
-        XCTAssertNil(models[0].contextWindowTokens)
+        XCTAssertEqual(models[0].contextWindowTokens, 1_000_000,
+                       "Claude Code 2.1.282 default alias resolves to Opus 5.5 (1M); copy resolvedModel so the ctx pill is not blank")
         XCTAssertEqual(models[1].contextWindowTokens, 1_000_000)
         XCTAssertEqual(models[2].contextWindowTokens, 200_000)
         XCTAssertEqual(AnthropicModelDiscovery.contextWindowTokens(forID: "claude-opus-5-5"), 1_000_000)

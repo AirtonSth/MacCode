@@ -242,7 +242,7 @@ public enum AnthropicModelDiscovery {
     }
 
     /// Known context windows by model-id prefix (Anthropic docs / Claude Code
-    /// 2.1.281 catalog): Fable 5, Opus 5.5, Opus 4.6+, and Sonnet 4.6+ are
+    /// 2.1.282 catalog): Fable 5.1/5, Opus 5.5, Opus 4.6+, and Sonnet 4.6+ are
     /// 1M-context; Haiku is 200k. First match wins, so dated/legacy ids must
     /// precede their bare alias.
     private static let contextWindowsByIDPrefix: [(prefix: String, tokens: Int)] = [

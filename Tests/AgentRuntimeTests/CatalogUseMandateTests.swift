@@ -57,15 +57,12 @@ final class CatalogUseMandateTests: XCTestCase {
             provider: "Claude SDK bridge"
         )
 
-        // Codex: `developer_instructions` on the app-server thread start.
-        let params = CodexAppServerClient.turnStartParams(
-            providerThreadId: "thread-catalog-mandate",
+        // Codex: `developerInstructions` on the app-server thread start (0.157).
+        let params = CodexAppServerClient.threadStartParams(
             for: request(.codex, environment: environment)
         )
-        let collaboration = try XCTUnwrap(params["collaborationMode"] as? [String: Any])
-        let settings = try XCTUnwrap(collaboration["settings"] as? [String: Any])
-        let codexInstructions = try XCTUnwrap(settings["developer_instructions"] as? String)
-        assertMandate(codexInstructions, provider: "Codex developer_instructions")
+        let codexInstructions = try XCTUnwrap(params["developerInstructions"] as? String)
+        assertMandate(codexInstructions, provider: "Codex developerInstructions")
 
         // Grok Build: the ACP session/prompt text.
         let blocks = try GrokACPClient.promptBlocks(
@@ -96,13 +93,10 @@ final class CatalogUseMandateTests: XCTestCase {
         ).isEmpty,
                       "Token Saver off must not admit the librarian into Codex argv")
 
-        let params = CodexAppServerClient.turnStartParams(
-            providerThreadId: "thread-catalog-off",
+        let params = CodexAppServerClient.threadStartParams(
             for: request(.codex, environment: environment)
         )
-        let collaboration = try XCTUnwrap(params["collaborationMode"] as? [String: Any])
-        let settings = try XCTUnwrap(collaboration["settings"] as? [String: Any])
-        let codexInstructions = try XCTUnwrap(settings["developer_instructions"] as? String)
+        let codexInstructions = try XCTUnwrap(params["developerInstructions"] as? String)
         XCTAssertFalse(codexInstructions.contains("Distill MCP catalog tools"),
                        "Token Saver off must not deliver the catalog mandate to Codex")
 

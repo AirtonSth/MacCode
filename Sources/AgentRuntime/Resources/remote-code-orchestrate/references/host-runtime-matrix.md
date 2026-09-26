@@ -98,17 +98,17 @@ escalation. Do not default the whole graph to Opus.
 
 ## Grok
 
-Fixed model family: `grok-4.5` only. Allowed efforts under this skill: `medium`
-and `high` (no `low` / `xhigh` / `max` for orchestration workers).
+Fixed model family: `grok-4.7` only. Allowed efforts under this skill: `medium`,
+`high`, and `xhigh` (no `low` / `max` for orchestration workers).
 
 | Capability / role | Model | Effort | Sandbox / notes |
 | --- | --- | --- | --- |
-| `LIGHT` / `fast_scan` | `grok-4.5` | `medium` | prefer read-only discovery |
-| `STANDARD` / `routine_worker` | `grok-4.5` | `medium` | bounded implementation and validation |
-| `DEEP` / `deep_worker` | `grok-4.5` | `medium` | hard debug, architecture, high risk |
-| `genius_worker` (rare) | `grok-4.5` | `high` | escalate scope/proof; high only for rare genius |
-| `REVIEWER` | `grok-4.5` | `high` | independent review; no subagent fan-out |
-| advisor (optional) | `grok-4.5` | `high` | focused advisory only |
+| `LIGHT` / `fast_scan` | `grok-4.7` | `medium` | prefer read-only discovery |
+| `STANDARD` / `routine_worker` | `grok-4.7` | `high` | bounded implementation and validation |
+| `DEEP` / `deep_worker` | `grok-4.7` | `xhigh` | hard debug, architecture, high risk |
+| `genius_worker` (rare) | `grok-4.7` | `high` | escalate scope/proof; high only for rare genius |
+| `REVIEWER` | `grok-4.7` | `high` | independent review; no subagent fan-out |
+| advisor (optional) | `grok-4.7` | `high` | focused advisory only |
 
 Invoke Grok workers headless with workspace sandbox and always-approve only when
 the node is writable and the parent already authorized those writes.

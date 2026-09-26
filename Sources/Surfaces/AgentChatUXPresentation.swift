@@ -1336,8 +1336,16 @@ public enum AgentFileEditDiffPresentation {
     }
 
     private static func diffFromJSONChanges(_ body: String) -> String? {
-        guard let data = body.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        let json: Any
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("{"),
+           let obj = AgentTimelineItemPresentation.toolInputObject(forBody: trimmed) {
+            json = obj
+        } else {
+            guard let data = body.data(using: .utf8),
+                  let parsed = try? JSONSerialization.jsonObject(with: data) else { return nil }
+            json = parsed
+        }
         // { "changes": [ ... ] } or bare array
         let changes: [[String: Any]]
         if let dict = json as? [String: Any] {
@@ -1477,12 +1485,10 @@ public enum AgentFileEditDiffPresentation {
 
     private static func jsonObject(_ body: String) -> [String: Any]? {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("{"),
-              let data = trimmed.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        return obj
+        guard trimmed.hasPrefix("{") else { return nil }
+        // Reuse the live-tool JSON cache so Edit/diff extraction does not
+        // JSONSerialization-parse a body already decoded for tool rows.
+        return AgentTimelineItemPresentation.toolInputObject(forBody: trimmed)
     }
 }
 

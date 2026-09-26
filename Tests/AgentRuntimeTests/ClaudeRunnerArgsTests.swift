@@ -390,22 +390,22 @@ final class ClaudeRunnerArgsTests: XCTestCase {
 
     func test_listModels_exposeClaudeOptionDescriptorsWithoutCodexFastTier() async {
         let models = await ClaudeRunner().listModels()
-        let flagship = models.first { $0.id == "default" || $0.id == "fable" }
-
-        XCTAssertTrue(flagship != nil,
-                      "Claude model discovery must expose the current flagship alias")
-        let flagshipEfforts = flagship?.supportedReasoningEfforts ?? []
-        XCTAssertTrue(flagshipEfforts.contains(.xhigh) && flagshipEfforts.contains(.max),
-                      "the flagship model must expose xhigh and max when reported by the installed Claude catalog")
-        let sonnet = models.first { $0.id == "sonnet" }
-        XCTAssertTrue(sonnet?.supportedReasoningEfforts.contains(.xhigh) == true
-                      && sonnet?.supportedReasoningEfforts.contains(.max) == true,
-                      "the Sonnet alias must expose xhigh and max when reported by the installed Claude catalog")
-        XCTAssertEqual(models.first { $0.id == "haiku" }?.supportedReasoningEfforts, [],
+        let firstID = models.first?.id
+        XCTAssertTrue(firstID == "fable" || firstID == "default",
+                       "fallback leads with fable; live Claude Code 2.1.282 catalog leads with default (Opus 5.5 recommended)")
+        let fable = models.first { $0.id == "fable" || $0.id.hasPrefix("claude-fable") }
+        let fableEfforts = fable?.supportedReasoningEfforts ?? []
+        XCTAssertTrue(fableEfforts.contains(.xhigh) && fableEfforts.contains(.max),
+                       "Claude thinking-capable models must advertise xhigh and max; live 2.1.282 omits ultracode from supportedEffortLevels")
+        let sonnet = models.first { $0.id == "sonnet" || $0.id.hasPrefix("claude-sonnet-5") }
+        let sonnetEfforts = sonnet?.supportedReasoningEfforts ?? []
+        XCTAssertTrue(sonnetEfforts.contains(.xhigh) && sonnetEfforts.contains(.max),
+                       "the Sonnet 5 alias supports xhigh and max")
+        XCTAssertEqual(models.first { $0.id == "haiku" || $0.id.contains("haiku") }?.supportedReasoningEfforts, [],
                        "Haiku has no configurable thinking effort")
-        XCTAssertFalse(flagship?.supportsServiceTier == true,
+        XCTAssertFalse(models.contains { $0.supportsServiceTier == true },
                        "Claude models must not expose Codex-only fast service-tier controls")
-        XCTAssertTrue(flagship?.supportsCustomModel == true)
+        XCTAssertEqual(fable?.supportsCustomModel, true)
     }
 
     func test_anthropicModelDiscoveryParsesDynamicModels() {
@@ -501,7 +501,8 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         XCTAssertEqual(eff(.max), "max", "Max must use Claude's native max effort flag")
         XCTAssertEqual(eff(.ultracode), "ultracode",
                        "Claude Code 2.1.203+ accepts ultracode as a native effort value")
-        XCTAssertEqual(eff(nil), "high", "omitted effort follows Claude Code's default high")
+        XCTAssertEqual(eff(nil), "medium",
+                       "live Claude Code 2.1.282 opus alias resolves to Opus 5.5 (default_effort medium)")
         let opus47 = AgentRunRequest(
             threadId: AgentThreadID(), provider: .claude, model: "claude-opus-4-7",
             cwd: "/tmp", prompt: "x", permissionMode: .supervised, reasoningEffort: nil
@@ -520,10 +521,13 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         XCTAssertEqual(
             opus55Args[opus55Args.index(after: opus55Args.firstIndex(of: "--effort")!)],
             "medium",
-            "Opus 5.5 omitted effort follows Claude Code 2.1.281 catalog default_effort medium"
+            "Opus 5.5 omitted effort follows Claude Code 2.1.282 catalog default_effort medium"
         )
         XCTAssertEqual(ClaudeRunner.defaultReasoningEffort(for: "claude-opus-5-5[1m]"), .medium)
+        XCTAssertEqual(ClaudeRunner.defaultReasoningEffort(for: "opus[1m]"), .medium)
+        XCTAssertEqual(ClaudeRunner.defaultReasoningEffort(for: "default"), .medium)
         XCTAssertEqual(ClaudeRunner.defaultReasoningEffort(for: "claude-opus-5"), .high)
+        XCTAssertEqual(ClaudeRunner.supportedReasoningEfforts(for: "default"), AgentReasoningEffort.claudeSupportedCases)
     }
 
     func test_effortIsNormalizedToTheSelectedClaudeModel() throws {
