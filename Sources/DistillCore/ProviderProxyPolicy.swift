@@ -1701,6 +1701,9 @@ public enum ProviderProxyPolicy {
     /// Resume/load/version/help stay on the raw CLI. `--resume` and `--session-id`
     /// are value options on grok 1.0.41, so a flags-only gate misses them.
     private static func nestedGrokKeepsRawCLI(_ scan: NestedArgScan) -> Bool {
+        if scan.optionValues["--permission-mode"]?.last?.lowercased() == "auto" {
+            return true
+        }
         if scan.flags.contains("--version") || scan.flags.contains("-V") || scan.flags.contains("-v")
             || scan.flags.contains("--help") || scan.flags.contains("-h")
             || scan.flags.contains("--list-models") {

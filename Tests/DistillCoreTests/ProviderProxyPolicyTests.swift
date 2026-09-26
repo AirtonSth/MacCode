@@ -1013,6 +1013,15 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ),
             "inline work"
         )
+        for option in ["--cwd", "--json-schema", "--deny", "--prompt-json"] {
+            XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "grok",
+                arguments: [
+                    "--model", "grok-4.7", "--effort", "high",
+                    "--prompt", "investigate", option, "value"
+                ]
+            ), "unforwarded \(option) must remain on the raw Grok CLI path")
+        }
 
         XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "grok",
@@ -1035,17 +1044,19 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertEqual(dontAsk.permissionMode, .fullAccess,
                        "dontAsk suppresses prompts and requires a full-access parent mapping")
 
-        let grokAuto = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+        let autoArguments = [
+            "--model", "grok-4.7", "--effort", "high",
+            "--prompt", "investigate", "--permission-mode", "auto"
+        ]
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
             providerBasename: "grok",
-            arguments: [
-                "--model", "grok-4.6", "--effort", "high",
-                "--prompt", "investigate",
-                "--permission-mode", "auto"
-            ],
+            arguments: autoArguments
+        ), "classifier-based auto mode must stay on the raw CLI path before stdin reads")
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: autoArguments,
             promptFile: prompt
-        ))
-        XCTAssertNotEqual(grokAuto.permissionMode, .autoAcceptEdits,
-                          "grok auto is a classifier, not acceptEdits")
+        ), "classifier-based auto mode cannot be represented by Agent App")
 
         XCTAssertEqual(
             ProviderProxyPolicy.explicitPermissionRequest(
