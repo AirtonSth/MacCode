@@ -795,6 +795,18 @@ final class ProviderProxyPolicyTests: XCTestCase {
             providerBasename: "claude",
             arguments: ["--print", "--model", "opus", "--effort", "high"]
         ))
+        for outputFormat in ["stream-json", "yaml"] {
+            let arguments = [
+                "--print", "--model", "opus", "--effort", "high",
+                "--output-format", outputFormat
+            ]
+            XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "claude", arguments: arguments
+            ), "unrepresented output format \(outputFormat) must stay on raw CLI")
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "claude", arguments: arguments, promptFile: prompt
+            ), "unrepresented output format \(outputFormat) must not become text delegation")
+        }
         let unforwardedClaudeOptions: [[String]] = [
             ["--include-hook-events"], ["--replay-user-messages"], ["--forward-subagent-text"],
             ["--add-dir", "/tmp/extra"], ["--mcp-config", "{}"], ["--json-schema", "{}"],
