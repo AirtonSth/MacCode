@@ -1007,8 +1007,8 @@ public final class CodexAppServerClient: @unchecked Sendable {
         if request.serviceTier == .fast {
             params["serviceTier"] = "fast"
         }
-        // Codex 0.157 ThreadStartParams: developerInstructions is first-class.
-        // collaborationMode is not a TurnStartParams field on 0.157.0.
+        // Set instructions on thread/start and every turn: reused/resumed threads
+        // do not receive new thread-start params.
         let instructions = developerInstructions(
             for: request.interactionMode,
             environment: request.environment
@@ -1061,6 +1061,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
         if let model { params["model"] = model }
         if request.serviceTier == .fast { params["serviceTier"] = "fast" }
         params["effort"] = appServerReasoningEffort(for: request.reasoningEffort).rawValue
+        params["collaborationMode"] = collaborationMode(for: request, normalizedModel: model)
         return params
     }
 
@@ -1238,6 +1239,20 @@ public final class CodexAppServerClient: @unchecked Sendable {
         case .fullAccess:
             return ["type": "dangerFullAccess"]
         }
+    }
+
+    private static func collaborationMode(for request: AgentRunRequest, normalizedModel model: String?) -> JSONObject {
+        [
+            "mode": request.interactionMode.rawValue,
+            "settings": [
+                "model": model ?? AgentDefaultModelSelection.codexBuiltInDefault,
+                "reasoning_effort": appServerReasoningEffort(for: request.reasoningEffort).rawValue,
+                "developer_instructions": developerInstructions(
+                    for: request.interactionMode,
+                    environment: request.environment
+                )
+            ]
+        ]
     }
 
     private static func appServerReasoningEffort(for effort: AgentReasoningEffort?) -> AgentReasoningEffort {

@@ -943,6 +943,39 @@ final class ProviderProxyPolicyTests: XCTestCase {
         }
     }
 
+    func test_nestedCodexAgentAppEligibility_failsClosedForUnrepresentedExecOptions() {
+        // WHY: Agent App delegation preserves only model and reasoning effort;
+        // consuming any other option would silently drop CLI behavior.
+        let unrepresentedOptions = [
+            ["-s", "read-only"], ["-i", "/tmp/shot.png"],
+            ["--add-dir", "/tmp/extra"], ["--enable", "web_search_tool"],
+            ["--disable", "view_image_tool"], ["--worktree"],
+            ["--thread-source", "api"], ["--output-schema", "/tmp/schema.json"],
+            ["--approve-for-me"], ["-o", "/tmp/result.txt"],
+            ["--ask-for-approval", "never"], ["--profile", "custom"]
+        ]
+        for option in unrepresentedOptions {
+            let arguments = ["exec", "--model", "gpt-6-astra"] + option + ["-c", "model_reasoning_effort=high", "work"]
+            XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+                providerBasename: "codex",
+                arguments: arguments
+            ), "unrepresented option must stay on the raw Codex CLI: \(option)")
+            XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+                providerBasename: "codex",
+                arguments: arguments,
+                promptFile: "/tmp/rc-nested-prompt.txt"
+            ))
+        }
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "codex",
+            arguments: ["exec", "--model", "gpt-6-astra", "-c", "sandbox_mode=read-only", "work"]
+        ), "arbitrary config overrides must not be discarded during promotion")
+        XCTAssertTrue(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "codex",
+            arguments: ["exec", "--model", "gpt-6-astra", "-c", "model_reasoning_effort=high", "work"]
+        ))
+    }
+
     func test_nestedEligibilityRejectsRawFallbackContractsBeforeReadingPromptInput() {
         // WHY: ProviderProxyRunner reads stdin only after this preflight. A
         // mapping that later returns nil would otherwise consume stdin and fail
@@ -1307,6 +1340,14 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ),
             .explicit(.autoAcceptEdits),
             "--full-auto is Codex's complete workspace-write shortcut"
+        )
+        XCTAssertEqual(
+            ProviderProxyPolicy.explicitPermissionRequest(
+                providerBasename: "codex",
+                arguments: ["exec", "--approve-for-me"]
+            ),
+            .explicit(.fullAccess),
+            "--approve-for-me routes approval requests through an automatic reviewer"
         )
         for profile in [
             ["--profile", "wide"],

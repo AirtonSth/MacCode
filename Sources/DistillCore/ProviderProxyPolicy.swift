@@ -713,7 +713,8 @@ public enum ProviderProxyPolicy {
                 return [
                     "--full-auto", "--strict-config", "--oss", "--skip-git-repo-check",
                     "--ephemeral", "--ignore-user-config", "--ignore-rules", "--json",
-                    "--no-alt-screen", "--help", "-h", "--version", "-V"
+                    "--no-alt-screen", "--help", "-h", "--version", "-V",
+                    "--worktree"
                 ]
             case .claude:
                 return [
@@ -818,6 +819,13 @@ public enum ProviderProxyPolicy {
                 // not an approval-only dimension.
                 sandbox = .autoAcceptEdits
                 sawArgumentSandbox = true
+                index += 1
+                continue
+            case (.codex, "--approve-for-me"):
+                // Codex routes approval requests through an automatic reviewer;
+                // the current policy model cannot represent that authority separately.
+                sawPermissionFlag = true
+                candidates.append(.fullAccess)
                 index += 1
                 continue
             case (.claude, "--dangerously-skip-permissions"),
@@ -1433,23 +1441,13 @@ public enum ProviderProxyPolicy {
         }
     }
 
-    /// openai/codex 0.157 `codex exec` value flags. Unknown remaining dash
-    /// flags stay fail-closed so nested Agent App promotion does not invent a receipt.
+    /// Only model and reasoning options are represented by Agent App delegation.
+    /// Other Codex exec options fail closed and stay on the raw CLI.
     private static let nestedCodexExecValueOptions: Set<String> = [
-        "--sandbox", "-s", "--ask-for-approval", "-a", "--config", "-c",
-        "--model", "-m", "--image", "-i", "--color", "--cd", "-C",
-        "--profile", "-p", "--add-dir", "--local-provider",
-        "--output-schema", "--output-last-message", "-o",
-        "--enable", "--disable", "--thread-source"
+        "--config", "-c", "--model", "-m"
     ]
 
-    private static let nestedCodexExecFlagOptions: Set<String> = [
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--dangerously-bypass-hook-trust", "--approve-for-me",
-        "--ephemeral", "--full-auto", "--help", "-h", "--ignore-user-config",
-        "--ignore-rules", "--json", "--oss", "--search", "--skip-git-repo-check",
-        "--strict-config", "--version", "-V", "--worktree"
-    ]
+    private static let nestedCodexExecFlagOptions: Set<String> = []
 
     private static func nestedCodexAgentAppEligible(arguments: [String]) -> Bool {
         let scan = scanNestedArguments(
@@ -1458,31 +1456,18 @@ public enum ProviderProxyPolicy {
             flagOptions: nestedCodexExecFlagOptions
         )
         guard !scan.malformed else { return false }
-        if scan.flags.contains("--version") || scan.flags.contains("-V")
-            || scan.flags.contains("--help") || scan.flags.contains("-h") {
-            return false
-        }
+        let configValues = (scan.optionValues["--config"] ?? []) + (scan.optionValues["-c"] ?? [])
+        guard configValues.allSatisfy({ value in
+            guard let separator = value.firstIndex(of: "=") else { return false }
+            return value[..<separator]
+                .trimmingCharacters(in: .whitespacesAndNewlines) == "model_reasoning_effort"
+        }) else { return false }
         guard scan.positionals.first == "exec" else { return false }
+        let model = scan.optionValues["--model"]?.last ?? scan.optionValues["-m"]?.last ?? ""
+        guard nestedCodexReasoningEffort(arguments: arguments, model: model) != nil else { return false }
         // openai/codex 0.154 `codex exec` subcommands (resume/fork/review/help)
         // are session or admin operations, not a new Agent App turn.
         if Self.nestedCodexExecSubcommandKeepsRawCLI(scan.positionals) { return false }
-        // `codex exec --json` is exec JSONL (`item` + `aggregated_output`).
-        // Agent App `--output-format json` is a different ABI; keep raw like resume.
-        if scan.flags.contains("--json") { return false }
-        let unsupportedValueOptions: Set<String> = [
-            "--image", "-i", "--add-dir", "--local-provider", "--output-schema",
-            "--output-last-message", "-o", "--enable", "--disable", "--thread-source"
-        ]
-        if scan.optionValues.keys.contains(where: { unsupportedValueOptions.contains($0) }) {
-            return false
-        }
-        let unsupportedFlags: Set<String> = [
-            "--worktree", "--approve-for-me", "--dangerously-bypass-hook-trust",
-            "--ignore-rules", "--strict-config"
-        ]
-        if !scan.flags.isDisjoint(with: unsupportedFlags) {
-            return false
-        }
         return true
     }
 
@@ -1937,7 +1922,8 @@ public enum ProviderProxyPolicy {
                 "--config", "-c", "--image", "-i", "--model", "-m",
                 "--profile", "-p", "--sandbox", "-s", "--cd", "-C",
                 "--add-dir", "--local-provider", "--output-schema",
-                "--color", "--output-last-message", "-o"
+                "--color", "--output-last-message", "-o",
+                "--enable", "--disable", "--thread-source"
             ]
             var sawJSON = false
             var firstPositional: String?

@@ -93,8 +93,7 @@ final class CodexRunnerArgsTests: XCTestCase {
                       "auto-accept-edits must match the app-server mapping: on-request plus workspace-write")
         XCTAssertTrue(CodexRunner.buildArgs(req(mode: .fullAccess)).contains(#"approval_policy="never""#),
                       "full-access mode must not prompt for approvals after the user selects danger-full-access")
-        let appServer = CodexAppServerClient.turnStartParams(
-            providerThreadId: "thread-parity",
+        let appServer = CodexAppServerClient.threadStartParams(
             for: req(mode: .autoAcceptEdits)
         )
         XCTAssertEqual(appServer["approvalPolicy"] as? String, "on-request")
