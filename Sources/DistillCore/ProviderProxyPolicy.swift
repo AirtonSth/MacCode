@@ -1345,6 +1345,10 @@ public enum ProviderProxyPolicy {
                 return false
             }
         }
+        if let outputFormat = scan.optionValues["--output-format"]?.last?.lowercased(),
+           !["text", "json", "grok-json"].contains(outputFormat) {
+            return false
+        }
         let delegatedValueOptions: Set<String> = [
             "--model", "--effort", "--permission-mode", "--output-format"
         ]
