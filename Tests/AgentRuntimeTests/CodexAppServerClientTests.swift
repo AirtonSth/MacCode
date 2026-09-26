@@ -568,7 +568,8 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                 permissionMode: .autoAcceptEdits,
                 reasoningEffort: .high,
                 serviceTier: .fast,
-                interactionMode: .plan
+                interactionMode: .plan,
+                environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
             )
         )
 
@@ -576,7 +577,14 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
         XCTAssertEqual(params["threadId"] as? String, "thread-app-server-1")
         XCTAssertEqual(params["approvalPolicy"] as? String, "on-request")
-        XCTAssertNil(params["collaborationMode"], "turn/start instructions are provided by the current supported thread protocol")
+        let collaboration = try XCTUnwrap(params["collaborationMode"] as? [String: Any])
+        XCTAssertEqual(collaboration["mode"] as? String, "plan")
+        let settings = try XCTUnwrap(collaboration["settings"] as? [String: Any])
+        XCTAssertEqual(settings["model"] as? String, "gpt-5.5")
+        XCTAssertEqual(settings["reasoning_effort"] as? String, "high")
+        let planInstructions = try XCTUnwrap(settings["developer_instructions"] as? String)
+        XCTAssertTrue(planInstructions.contains("Plan only"))
+        XCTAssertTrue(planInstructions.contains("| distill"), "Token Saver instructions must reach the real turn/start payload")
         XCTAssertEqual(params["serviceTier"] as? String, "fast")
         XCTAssertEqual(params["effort"] as? String, "high")
         XCTAssertEqual((params["sandboxPolicy"] as? [String: Any])?["type"] as? String, "workspaceWrite")
@@ -612,6 +620,28 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             (start["developerInstructions"] as? String)?.contains("Plan only") == true,
             "New threads receive the selected mode in thread/start developerInstructions"
         )
+
+        let followUp = try await client.startTurn(
+            providerThreadId: "thread-app-server-1",
+            for: AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-test",
+                prompt: "continue normally",
+                interactionMode: .default
+            )
+        )
+        let followUpParams = try XCTUnwrap(followUp["lastParams"] as? [String: Any])
+        let followUpCollaboration = try XCTUnwrap(followUpParams["collaborationMode"] as? [String: Any])
+        XCTAssertEqual(followUpCollaboration["mode"] as? String, "default")
+        let followUpSettings = try XCTUnwrap(followUpCollaboration["settings"] as? [String: Any])
+        let followUpInstructions = try XCTUnwrap(followUpSettings["developer_instructions"] as? String)
+        XCTAssertFalse(followUpInstructions.contains("Plan only"))
+        XCTAssertFalse(
+            followUpInstructions.contains("| distill"),
+            "A reused thread must stop receiving Token Saver instructions after the feature is disabled"
+        )
     }
 
     func test_turnStartParams_preservesUltraReasoningEffort() throws {
@@ -629,12 +659,12 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             )
         )
         XCTAssertEqual(params["effort"] as? String, "ultra")
-        XCTAssertNil(params["collaborationMode"])
+        XCTAssertNotNil(params["collaborationMode"])
     }
 
     func test_turnStartParams_emptyModelUsesBuiltInDefaultInCollaborationMode() throws {
-        // WHY: top-level model is omitted for account-default. turn/start must
-        // not invent collaborationMode.settings.model.
+        // WHY: top-level model is omitted for account-default, but collaborationMode
+        // still requires the built-in default model.
         for empty in ["", "  ", "default", "Default"] {
             let params = CodexAppServerClient.turnStartParams(
                 providerThreadId: "thread-default-model",
@@ -647,7 +677,13 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                 )
             )
             XCTAssertNil(params["model"], "empty/default must omit top-level model (\(empty))")
-            XCTAssertNil(params["collaborationMode"], "turn/start must not send collaborationMode (\(empty))")
+            let collaboration = try XCTUnwrap(params["collaborationMode"] as? [String: Any])
+            let settings = try XCTUnwrap(collaboration["settings"] as? [String: Any])
+            XCTAssertEqual(
+                settings["model"] as? String,
+                AgentDefaultModelSelection.codexBuiltInDefault,
+                "collaborationMode.settings.model preserves account-default selection (\(empty))"
+            )
         }
     }
 
@@ -676,7 +712,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
         XCTAssertEqual(params["effort"] as? String, "low",
                        "Codex app-server enables provider tools such as image_gen/web_search; minimal effort makes native compaction fail.")
-        XCTAssertNil(params["collaborationMode"])
+        XCTAssertNotNil(params["collaborationMode"])
     }
 
     func test_threadReadRollbackAndInterruptUseNativeCodexAppServerMethods() async throws {
