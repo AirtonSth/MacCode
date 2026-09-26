@@ -1345,6 +1345,16 @@ public enum ProviderProxyPolicy {
                 return false
             }
         }
+        let delegatedValueOptions: Set<String> = [
+            "--model", "--effort", "--permission-mode", "--output-format"
+        ]
+        if scan.optionValues.keys.contains(where: { !delegatedValueOptions.contains($0) }) {
+            return false
+        }
+        let delegatedFlags = delegatedValueOptions.union(["--print", "-p"])
+        if !scan.flags.isSubset(of: delegatedFlags) {
+            return false
+        }
         return scan.flags.contains("--print") || scan.flags.contains("-p")
     }
 
