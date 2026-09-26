@@ -129,6 +129,8 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         [
             AgentModelDescriptor(id: "", label: "Default (account)", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
             Self.astraModel,
+            AgentModelDescriptor(id: "gpt-6-sol", label: "GPT-6-Sol", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
+            AgentModelDescriptor(id: "gpt-6-luna", label: "GPT-6-Luna", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
             AgentModelDescriptor(id: "gpt-5.6-sol", label: "GPT-5.6-Sol", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
             AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
             AgentModelDescriptor(id: "gpt-5.4", label: "GPT-5.4", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
