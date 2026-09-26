@@ -709,13 +709,22 @@ final class ProviderProxyPolicyTests: XCTestCase {
             providerBasename: "grok",
             arguments: [
                 "--model", "grok-4.5", "--effort", "high",
-                "--prompt", "investigate", "--yolo", "--max-turns", "8"
+                "--prompt", "investigate", "--yolo"
             ],
             promptFile: prompt
         ))
         XCTAssertEqual(grokYolo.permissionMode, .fullAccess,
                        "grok-build clap aliases --yolo to --always-approve")
         XCTAssertEqual(grokYolo.reasoningEffort, .high)
+
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.5", "--effort", "high",
+                "--prompt", "investigate", "--yolo", "--max-turns", "8"
+            ],
+            promptFile: prompt
+        ), "promotion must not discard the caller's max-turns limit")
 
         XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "grok",

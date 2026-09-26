@@ -1632,7 +1632,7 @@ public enum ProviderProxyPolicy {
         "--effort", "--reasoning-effort", "--output-format",
         "--input-format", "--disallowed-tools", "--allowed-tools",
         "--settings", "--resume", "-r", "--session-id", "-s",
-        "--json-schema", "--prompt-json", "--cwd",
+        "--max-turns", "--json-schema", "--prompt-json", "--cwd",
         "--tools", "--allow", "--deny", "--allowedTools", "--disallowedTools",
         "--system-prompt-override",
         "--system-prompt", "--debug-file", "--leader-socket",

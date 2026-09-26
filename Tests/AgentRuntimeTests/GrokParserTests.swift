@@ -352,17 +352,21 @@ final class GrokParserTests: XCTestCase {
         }, "type=plan must map entries to activePlanUpdated")
     }
 
-    /// grok-build streaming-json AvailableCommands must not be dropped.
-    func test_availableCommandsLineEmitsProviderRuntime() {
-        let parser = GrokParser()
-        let events = parser.parseLine(#"{"type":"available_commands","tools":["bash"],"commands":["compact"]}"#)
-        XCTAssertTrue(events.contains {
-            if case .providerRuntime(let runtime) = $0 {
-                return runtime.method == "available_commands"
-                    && runtime.payloadJSON.contains("compact")
-            }
+    /// Runner-level runtime handling owns this line, so parsing it must not duplicate the event.
+    func test_availableCommandsLineIsHandledOnlyByRunnerRuntimePath() throws {
+        let object: [String: Any] = ["type": "available_commands", "tools": ["bash"], "commands": ["compact"]]
+        let parserEvents = GrokParser().parseLine(#"{"type":"available_commands","tools":["bash"],"commands":["compact"]}"#)
+        XCTAssertFalse(parserEvents.contains {
+            if case .providerRuntime = $0 { return true }
             return false
-        }, "type=available_commands must emit providerRuntime")
+        })
+
+        let runtime = try XCTUnwrap(GrokRunner.providerRuntimeEventIfNeeded(
+            object: object,
+            source: "grok.streaming-json"
+        ))
+        XCTAssertEqual(runtime.method, "available_commands")
+        XCTAssertTrue(runtime.payloadJSON.contains("compact"))
     }
 
     /// grok-build streaming-json MaxTurnsReached seals the turn like end.
