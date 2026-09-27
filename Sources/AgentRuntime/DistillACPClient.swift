@@ -774,7 +774,8 @@ public final class DistillACPClient: @unchecked Sendable {
         yoloMode: Bool = false,
         modelId: String? = nil,
         reasoningEffort: AgentReasoningEffort? = nil,
-        reasoningModel: String? = nil
+        reasoningModel: String? = nil,
+        reasoningModelSelectionSupported: Bool = true
     ) async throws -> DistillACPSessionOpenResult {
         let result = try await requestJSONObject(
             method: "session/new",
@@ -788,7 +789,9 @@ public final class DistillACPClient: @unchecked Sendable {
             timeout: 20
         )
         let opened = try Self.openResult(result, fallbackSessionId: nil)
-        try await setReasoningModel(sessionId: opened.sessionId, modelId: reasoningModel)
+        if reasoningModelSelectionSupported {
+            try await setReasoningModel(sessionId: opened.sessionId, modelId: reasoningModel)
+        }
         return opened
     }
 
@@ -804,7 +807,8 @@ public final class DistillACPClient: @unchecked Sendable {
         yoloMode: Bool = false,
         modelId: String? = nil,
         reasoningEffort: AgentReasoningEffort? = nil,
-        reasoningModel: String? = nil
+        reasoningModel: String? = nil,
+        reasoningModelSelectionSupported: Bool = true
     ) async throws -> DistillACPSessionOpenResult {
         let params = Self.sessionOpenParams(
             cwd: Self.resolvedSessionCwd(cwd),
@@ -821,7 +825,9 @@ public final class DistillACPClient: @unchecked Sendable {
             timeout: 60
         )
         let opened = try Self.openResult(result, fallbackSessionId: sessionId)
-        try await setReasoningModel(sessionId: opened.sessionId, modelId: reasoningModel)
+        if reasoningModelSelectionSupported {
+            try await setReasoningModel(sessionId: opened.sessionId, modelId: reasoningModel)
+        }
         return opened
     }
 

@@ -129,7 +129,7 @@ final class AgentSourceCapsulePresentationTests: XCTestCase {
                 providerLocked: false,
                 unavailableReason: nil
             ),
-            "Choose which ChatGPT / Claude / Grok account runs this thread"
+            "Choose the provider or account that runs this thread"
         )
         XCTAssertEqual(
             AgentSourceCapsulePresentation.helpText(

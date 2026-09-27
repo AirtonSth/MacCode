@@ -19603,7 +19603,7 @@ public enum AgentSourceCapsulePresentation {
         }
         if let unavailableReason, !unavailableReason.isEmpty { return unavailableReason }
         if !canSwitch { return "Account / source for this agent run" }
-        return "Choose which ChatGPT / Claude / Grok account runs this thread"
+        return "Choose the provider or account that runs this thread"
     }
 
     public static func switchHint(canSwitch: Bool, helpText: String) -> String {

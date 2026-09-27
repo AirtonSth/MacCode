@@ -761,9 +761,9 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         }
         do {
             let capabilities = try await client.initialize()
-            guard capabilities.sessionReasoningModel else {
+            guard capabilities.sessionReasoningModel || request.reasoningModel == nil else {
                 throw AgentProviderAdapterError.unsupported(
-                    "Distill ACP does not support per-conversation Reasoning model selection"
+                    "This Distill ACP version does not support the selected per-conversation Reasoning model"
                 )
             }
             let opened: DistillACPSessionOpenResult
@@ -780,7 +780,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     yoloMode: request.permissionMode == .fullAccess,
                     modelId: request.model,
                     reasoningEffort: request.reasoningEffort,
-                    reasoningModel: request.reasoningModel
+                    reasoningModel: request.reasoningModel,
+                    reasoningModelSelectionSupported: capabilities.sessionReasoningModel
                 )
             } else {
                 opened = try await client.newSession(
@@ -788,7 +789,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     yoloMode: request.permissionMode == .fullAccess,
                     modelId: request.model,
                     reasoningEffort: request.reasoningEffort,
-                    reasoningModel: request.reasoningModel
+                    reasoningModel: request.reasoningModel,
+                    reasoningModelSelectionSupported: capabilities.sessionReasoningModel
                 )
             }
             let mapper = DistillACPEventMapper(sessionId: opened.sessionId)
@@ -816,7 +818,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 mapper: mapper,
                 model: opened.currentModelId ?? request.model,
                 reasoningEffort: seededEffort,
-                reasoningModel: request.reasoningModel,
+                reasoningModel: capabilities.sessionReasoningModel ? request.reasoningModel : nil,
                 advertisesReasoningEffortConfig: opened.advertisesReasoningEffortConfig,
                 advertisedEfforts: advertisedEfforts,
                 availableModeIDs: availableModeIDs,
@@ -937,7 +939,13 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             }
             let currentModel = synchronized { session.model }
             let currentReasoningModel = synchronized { session.reasoningModel }
-            let reasoningModelChanged = currentReasoningModel != normalizedReasoningModel
+            guard session.capabilities.sessionReasoningModel || normalizedReasoningModel == nil else {
+                throw AgentProviderAdapterError.unsupported(
+                    "This Distill ACP version does not support the selected per-conversation Reasoning model"
+                )
+            }
+            let reasoningModelChanged = session.capabilities.sessionReasoningModel
+                && currentReasoningModel != normalizedReasoningModel
             let mainModelChanged = !model.isEmpty && model != currentModel
             let crossedSwap = reasoningModelChanged
                 && mainModelChanged
