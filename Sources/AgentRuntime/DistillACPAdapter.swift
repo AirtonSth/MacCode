@@ -308,7 +308,10 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             )
             defer { client.stop() }
             let initialized = try await client.initialize()
-            let opened = try await client.newSession(cwd: discoveryCwd)
+            let opened = try await client.newSession(
+                cwd: discoveryCwd,
+                reasoningModelSelectionSupported: initialized.sessionReasoningModel
+            )
             let discovered = Self.mergeModelCatalogs(initialized.models, opened.models)
             let modeIDs = Set(opened.availableModes.map(\.id))
             // Live distill builds often omit `modes.availableModes` from session/new

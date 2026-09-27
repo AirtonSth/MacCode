@@ -4,6 +4,51 @@ import CoreModel
 @testable import AgentRuntime
 
 final class DistillACPAdapterTests: ProviderProcessTestCase {
+    func test_discoverySkipsReasoningExtensionWhenOlderPeerOmitsCapability() async throws {
+        // WHY: model discovery must preserve a valid catalog from older Distill ACP peers that do not implement the optional Reasoning selector.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("distill-acp-old-discovery-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let requestsURL = root.appendingPathComponent("requests.jsonl")
+        let harnessURL = root.appendingPathComponent("distill-agent")
+        let harness = """
+        #!/usr/bin/env python3
+        import json, pathlib, sys
+        requests = pathlib.Path(\(String(reflecting: requestsURL.path)))
+        def record(value):
+            with requests.open("a") as output:
+                output.write(json.dumps(value) + "\\n")
+        def send(value): print(json.dumps(value), flush=True)
+        for line in sys.stdin:
+            message = json.loads(line)
+            method = message.get("method")
+            params = message.get("params", {})
+            record({"method":method})
+            if method == "initialize":
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":True,"sessionCapabilities":{"resume":True},"promptCapabilities":{}}}})
+            elif method == "session/new":
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"sessionId":"old-distill-session","models":{"availableModels":[{"modelId":"live-distill-model","name":"Live Distill Model"}],"currentModelId":"live-distill-model"}}})
+            elif method == "x.ai/session/reasoning_model/set":
+                send({"jsonrpc":"2.0", "id":message["id"], "error":{"code":-32601,"message":"method not found"}})
+        """
+        try harness.write(to: harnessURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: harnessURL.path)
+        let result = await DistillACPAdapter(
+            binaryNameOverride: harnessURL.path,
+            discoveryCwd: root.path
+        ).discoveryResult()
+
+        XCTAssertFalse(result.isFallback, "an old peer's live model catalog must survive optional-extension absence")
+        XCTAssertEqual(result.models.map(\.id), ["live-distill-model"])
+        let methods = try String(contentsOf: requestsURL, encoding: .utf8)
+            .split(whereSeparator: \.isNewline)
+            .compactMap { try JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: String] }
+            .compactMap { $0["method"] }
+        XCTAssertFalse(methods.contains("x.ai/session/reasoning_model/set"),
+                       "discovery must not call an extension the peer did not advertise")
+    }
+
     func test_selectedModelRunsTurnsAndResumesOnTheSameACPThread() async throws {
         // WHY: provider selection must reach the harness, and follow-up turns must
         // reuse its session rather than starting a disconnected conversation.
