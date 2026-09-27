@@ -634,6 +634,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     public let providerThreadId: String?
     public let permissionMode: AgentPermissionMode
     public let reasoningEffort: AgentReasoningEffort?
+    /// Resolved per-conversation selection. Nil explicitly disables Reasoning.
+    public let reasoningModel: String?
     public let serviceTier: AgentServiceTier
     public let interactionMode: AgentInteractionMode
     public let providerBinary: String?
@@ -661,6 +663,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         providerThreadId: String? = nil,
         permissionMode: AgentPermissionMode = .supervised,
         reasoningEffort: AgentReasoningEffort? = nil,
+        reasoningModel: String? = nil,
         serviceTier: AgentServiceTier = .auto,
         interactionMode: AgentInteractionMode = .default,
         providerBinary: String? = nil,
@@ -683,6 +686,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         self.providerThreadId = providerThreadId
         self.permissionMode = permissionMode
         self.reasoningEffort = reasoningEffort
+        self.reasoningModel = reasoningModel
         self.serviceTier = serviceTier
         self.interactionMode = interactionMode
         self.providerBinary = providerBinary
@@ -695,7 +699,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case runId, threadId, provider, providerInstanceId, model, cwd, prompt, userMessageContent, attachments, providerThreadId, permissionMode, reasoningEffort, serviceTier, interactionMode, providerBinary, environment, extraArgs, runAsUser
+        case runId, threadId, provider, providerInstanceId, model, cwd, prompt, userMessageContent, attachments, providerThreadId, permissionMode, reasoningEffort, reasoningModel, serviceTier, interactionMode, providerBinary, environment, extraArgs, runAsUser
     }
 
     public init(from decoder: Decoder) throws {
@@ -712,6 +716,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         providerThreadId = try c.decodeIfPresent(String.self, forKey: .providerThreadId)
         permissionMode = try c.decodeIfPresent(AgentPermissionMode.self, forKey: .permissionMode) ?? .supervised
         reasoningEffort = try c.decodeIfPresent(AgentReasoningEffort.self, forKey: .reasoningEffort)
+        reasoningModel = try c.decodeIfPresent(String.self, forKey: .reasoningModel)
         serviceTier = try c.decodeIfPresent(AgentServiceTier.self, forKey: .serviceTier) ?? .auto
         interactionMode = try c.decodeIfPresent(AgentInteractionMode.self, forKey: .interactionMode) ?? .default
         providerBinary = try c.decodeIfPresent(String.self, forKey: .providerBinary)
@@ -734,6 +739,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
             && lhs.providerThreadId == rhs.providerThreadId
             && lhs.permissionMode == rhs.permissionMode
             && lhs.reasoningEffort == rhs.reasoningEffort
+            && lhs.reasoningModel == rhs.reasoningModel
             && lhs.serviceTier == rhs.serviceTier
             && lhs.interactionMode == rhs.interactionMode
             && lhs.providerBinary == rhs.providerBinary
@@ -854,6 +860,7 @@ public enum AgentProviderDriverKind: String, Codable, Sendable {
     case codexCLI = "codex_cli"
     case claudeCLI = "claude_cli"
     case grokCLI = "grok_cli"
+    case distillACP = "distill_acp"
 }
 
 public enum AgentProviderSnapshotStatus: String, Codable, Sendable {
@@ -1055,7 +1062,7 @@ public enum AgentDefaultModelSelection {
     public static func builtInDefault(for provider: AgentProvider) -> String {
         switch provider {
         case .codex: return codexBuiltInDefault
-        case .claude, .grok: return ""
+        case .claude, .grok, .distill: return ""
         }
     }
 
@@ -1298,12 +1305,13 @@ public enum AgentProviderSnapshotFactory {
                 modelDiscoverySource: modelDiscoverySource,
                 modelDiscoveryCacheKey: modelDiscoveryCacheKey
             )
-        case .grok:
+        case .grok, .distill:
+            let providerName = provider == .distill ? "Distill" : "Grok"
             let status: AgentProviderSnapshotStatus = enabled
                 ? (!installed || models.isEmpty ? .unavailable : (authenticated == false || updateState == "update_available" ? .warning : .available))
                 : .disabled
             let statusDetail = Self.statusDetail(
-                providerName: "Grok",
+                providerName: providerName,
                 installed: installed,
                 hasModels: !models.isEmpty,
                 authenticated: authenticated,
@@ -1312,16 +1320,13 @@ public enum AgentProviderSnapshotFactory {
                 enabled: enabled
             )
             return AgentProviderSnapshot(
-                id: id ?? "grok-cli",
-                provider: .grok,
-                driverKind: .grokCLI,
-                displayName: displayName ?? "Grok",
-                accentColor: accentColor ?? "#1DA1F2",
-                continuationGroup: "xai-grok",
+                id: id ?? (provider == .distill ? "distill-acp" : "grok-cli"),
+                provider: provider,
+                driverKind: provider == .distill ? .distillACP : .grokCLI,
+                displayName: displayName ?? providerName,
+                accentColor: accentColor ?? (provider == .distill ? "#6E56CF" : "#1DA1F2"),
+                continuationGroup: provider == .distill ? "distill" : "xai-grok",
                 interactionModes: interactionModesOverride ?? [.default],
-                // Grok CLI accepts default / acceptEdits / bypassPermissions even when
-                // ACP session/new omits modes.advertisement. Default open so Full access
-                // is selectable before discovery; discovery may still narrow the set.
                 permissionModes: permissionModesOverride ?? AgentPermissionMode.allCases,
                 enabled: enabled,
                 installed: installed,
@@ -1336,8 +1341,6 @@ public enum AgentProviderSnapshotFactory {
                 environmentKeys: environmentKeys,
                 models: models,
                 slashCommands: uniqueSlashCommands(
-                    // `/goal` offered on every provider so composer autocomplete and
-                    // `$goal` → `/goal` normalization work for Codex, Claude, and Grok.
                     defaults: (interactionModesOverride ?? [.default]).contains(.plan)
                         ? ["/clear", "/default", "/model", "/plan", "/status", "/goal"]
                         : ["/clear", "/default", "/model", "/status", "/goal"],
@@ -1388,6 +1391,8 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
     public var model: String
     public var permissionMode: AgentPermissionMode
     public var reasoningEffort: AgentReasoningEffort
+    /// Independent per-conversation Reasoning model; nil disables Reasoning.
+    public var reasoningModel: String?
     public var providerThreadId: String?
     public var status: AgentRunStatus
     public var createdAt: Date
@@ -1444,6 +1449,7 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         sortOrder: Int = 0,
         permissionMode: AgentPermissionMode = .supervised,
         reasoningEffort: AgentReasoningEffort = .medium,
+        reasoningModel: String? = nil,
         executionMode: AgentExecutionMode = .local,
         baseBranch: String? = nil,
         worktreePath: String? = nil,
@@ -1462,6 +1468,7 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         self.model = model
         self.permissionMode = permissionMode
         self.reasoningEffort = reasoningEffort
+        self.reasoningModel = reasoningModel
         self.providerThreadId = providerThreadId
         self.status = status
         self.createdAt = createdAt

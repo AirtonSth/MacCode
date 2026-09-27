@@ -57,6 +57,87 @@ public enum ProcessLocator {
         return nil
     }
 
+    public static func resolveDistillAgent(_ name: String) -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return resolveDistillAgent(
+            name,
+            environmentPath: ProcessInfo.processInfo.environment["PATH"],
+            homeDirectory: home,
+            managedHomes: [home]
+        )
+    }
+
+    static func resolveDistillAgent(
+        _ name: String,
+        environmentPath: String?,
+        homeDirectory: String,
+        managedHomes: [String]
+    ) -> String? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.contains("/") {
+            let path = (trimmed as NSString).expandingTildeInPath
+            guard FileManager.default.isExecutableFile(atPath: path),
+                  !managedHomes.contains(where: { isManagedDistillShim(path, homeDirectory: $0) })
+            else { return nil }
+            return path
+        }
+        for directory in searchPath(environmentPath: environmentPath, homeDirectory: homeDirectory) {
+            if Self.normalizedDirectory(directory) == Self.normalizedDirectory("\(homeDirectory)/.remote-code/bin") {
+                continue
+            }
+            let path = directory + "/" + trimmed
+            if FileManager.default.isExecutableFile(atPath: path),
+               !managedHomes.contains(where: { isManagedDistillShim(path, homeDirectory: $0) }) {
+                return path
+            }
+        }
+        return nil
+    }
+
+    public static func resolveDistillAgentForRunAsUser(
+        _ name: String,
+        runAsUser: AgentRunAsUser?,
+        currentUID: uid_t = getuid()
+    ) -> String? {
+        let currentHome = FileManager.default.homeDirectoryForCurrentUser.path
+        let homes = [currentHome, runAsUser?.homePath].compactMap { $0 }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.contains("/") {
+            let path = (trimmed as NSString).expandingTildeInPath
+            guard FileManager.default.isExecutableFile(atPath: path),
+                  !homes.contains(where: { isManagedDistillShim(path, homeDirectory: $0) })
+            else { return nil }
+            return path
+        }
+        if let runAsUser, runAsUser.uid != currentUID,
+           let path = resolveDistillAgent(
+                trimmed,
+                environmentPath: nil,
+                homeDirectory: runAsUser.homePath,
+                managedHomes: homes
+           ) {
+            return path
+        }
+        return resolveDistillAgent(
+            trimmed,
+            environmentPath: ProcessInfo.processInfo.environment["PATH"],
+            homeDirectory: currentHome,
+            managedHomes: homes
+        )
+    }
+
+    private static func isManagedDistillShim(_ path: String, homeDirectory: String) -> Bool {
+        let managedURL = URL(fileURLWithPath: "\(homeDirectory)/.remote-code/bin/distill")
+        let managedPath = managedURL.standardizedFileURL.path
+        let managedTarget = managedURL.resolvingSymlinksInPath().standardizedFileURL.path
+        let candidateURL = URL(fileURLWithPath: path)
+        let candidatePath = candidateURL.standardizedFileURL.path
+        let candidateTarget = candidateURL.resolvingSymlinksInPath().standardizedFileURL.path
+        return candidatePath == managedPath || candidateTarget == managedTarget
+    }
+
     private static func normalizedDirectory(_ path: String) -> String {
         var p = path
         while p.count > 1 && p.hasSuffix("/") { p.removeLast() }

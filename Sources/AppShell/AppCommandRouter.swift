@@ -1548,6 +1548,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             return "claude auth login\n"
         case .grok:
             return "grok login\n"
+        case .distill:
+            return "distill login\n"
         }
     }
 
@@ -5149,6 +5151,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             providerThreadId: t.providerThreadId,
             permissionMode: t.permissionMode,
             reasoningEffort: t.reasoningEffort,
+            reasoningModel: t.reasoningModel,
             serviceTier: t.serviceTier,
             interactionMode: interactionMode ?? .default,
             providerBinary: autoRoutingActive ? nil : providerBinary(provider: prov, instanceId: t.providerInstanceId),
@@ -6323,6 +6326,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 discoveryEnvironment: environment,
                 discoveryRunAsUser: runAsUser
             ).listModels()
+        case .distill:
+            return await DistillACPAdapter(
+                binaryNameOverride: binaryPath.isEmpty ? binary : binaryPath,
+                discoveryCwd: cwd,
+                discoveryEnvironment: environment,
+                discoveryRunAsUser: runAsUser
+            ).listModels()
         }
     }
 
@@ -6360,7 +6370,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             break
         case .codex:
             env["CODEX_HOME"] = env["CODEX_HOME"] ?? "\(runAsUser.homePath)/.codex"
-        case .grok:
+        case .grok, .distill:
             env["GROK_HOME"] = env["GROK_HOME"] ?? "\(runAsUser.homePath)/.grok"
         }
         return env
@@ -6427,11 +6437,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         discoveryRunAsUser: runAsUser
                     ).discoveryResult()
                     : nil
+                let distillDiscovery = instance.provider == .distill
+                    ? await DistillACPAdapter(
+                        binaryNameOverride: binaryPath.isEmpty ? binary : binaryPath,
+                        discoveryCwd: FileManager.default.currentDirectoryPath,
+                        discoveryEnvironment: env,
+                        discoveryRunAsUser: runAsUser
+                    ).discoveryResult()
+                    : nil
                 let models: [AgentModelDescriptor]
                 let liveCatalogVerified: Bool
                 if let grokDiscovery {
                     models = grokDiscovery.models
                     liveCatalogVerified = !grokDiscovery.isFallback && !grokDiscovery.models.isEmpty
+                } else if let distillDiscovery {
+                    models = distillDiscovery.models
+                    liveCatalogVerified = !distillDiscovery.isFallback && !distillDiscovery.models.isEmpty
                 } else if instance.provider == .claude {
                     let discovery = await ClaudeRunner(binaryNameOverride: binaryPath.isEmpty ? binary : binaryPath)
                         .listModelsResult(
@@ -6477,7 +6498,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     binaryPath: binaryPath,
                     environment: env,
                     claudePresentation: claudeRuntime,
-                    grokCapabilities: grokDiscovery?.capabilities
+                    acpCapabilities: grokDiscovery?.capabilities ?? distillDiscovery?.capabilities
                 )
                 let runtimeSlashCommands = capabilities.slashCommands
                     + (runtimeCapabilities?.supportsFork == true ? ["/fork"] : [])
@@ -6489,6 +6510,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         : .builtInFallback
                 case .grok:
                     modelDiscoverySource = grokDiscovery.map { $0.isFallback ? .builtInFallback : .live }
+                case .distill:
+                    modelDiscoverySource = distillDiscovery.map { $0.isFallback ? .builtInFallback : .live }
                 }
                 snapshots.append(AgentProviderSnapshotFactory.snapshot(
                     provider: instance.provider,
@@ -6512,11 +6535,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     // tag (same for every instance of a provider), not isolation — exclude it
                     // from the snapshot while it remains in the actual run environment.
                     environmentKeys: env.keys.filter { $0 != "REMOTE_CODE_AGENT_PROVIDER" }.sorted(),
-                    interactionModesOverride: grokDiscovery?.interactionModes ?? claudeRuntime?.interactionModes,
-                    permissionModesOverride: grokDiscovery?.permissionModes ?? claudeRuntime?.permissionModes,
+                    interactionModesOverride: grokDiscovery?.interactionModes ?? distillDiscovery?.interactionModes ?? claudeRuntime?.interactionModes,
+                    permissionModesOverride: grokDiscovery?.permissionModes ?? distillDiscovery?.permissionModes ?? claudeRuntime?.permissionModes,
                     capabilitiesOverride: runtimeCapabilities,
                     modelDiscoverySource: modelDiscoverySource,
-                    modelDiscoveryCacheKey: grokDiscovery?.discoveryCacheKey
+                    modelDiscoveryCacheKey: grokDiscovery?.discoveryCacheKey ?? distillDiscovery?.discoveryCacheKey
                 ))
             }
             rememberProviderSnapshotsForSend(snapshots)
@@ -6546,11 +6569,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     discoveryRunAsUser: runAsUser
                 ).discoveryResult()
                 : nil
+            let distillDiscovery = provider == .distill
+                ? await DistillACPAdapter(
+                    binaryNameOverride: binaryPath.isEmpty ? binary : binaryPath,
+                    discoveryCwd: FileManager.default.currentDirectoryPath,
+                    discoveryEnvironment: env,
+                    discoveryRunAsUser: runAsUser
+                ).discoveryResult()
+                : nil
             let models: [AgentModelDescriptor]
             let liveCatalogVerified: Bool
             if let grokDiscovery {
                 models = grokDiscovery.models
                 liveCatalogVerified = !grokDiscovery.isFallback && !grokDiscovery.models.isEmpty
+            } else if let distillDiscovery {
+                models = distillDiscovery.models
+                liveCatalogVerified = !distillDiscovery.isFallback && !distillDiscovery.models.isEmpty
             } else if provider == .claude {
                 let discovery = await ClaudeRunner(binaryNameOverride: binaryPath.isEmpty ? binary : binaryPath)
                     .listModelsResult(
@@ -6596,7 +6630,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 binaryPath: binaryPath,
                 environment: env,
                 claudePresentation: claudeRuntime,
-                grokCapabilities: grokDiscovery?.capabilities
+                acpCapabilities: grokDiscovery?.capabilities ?? distillDiscovery?.capabilities
             )
             let runtimeSlashCommands = capabilities.slashCommands
                 + (runtimeCapabilities?.supportsFork == true ? ["/fork"] : [])
@@ -6608,6 +6642,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     : .builtInFallback
             case .grok:
                 modelDiscoverySource = grokDiscovery.map { $0.isFallback ? .builtInFallback : .live }
+            case .distill:
+                modelDiscoverySource = distillDiscovery.map { $0.isFallback ? .builtInFallback : .live }
             }
             snapshots.append(AgentProviderSnapshotFactory.snapshot(
                 provider: provider,
@@ -6621,11 +6657,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 advisory: claudeRuntime?.advisory ?? capabilities.advisory,
                 slashCommands: runtimeSlashCommands,
                 skills: capabilities.skills,
-                interactionModesOverride: grokDiscovery?.interactionModes ?? claudeRuntime?.interactionModes,
-                permissionModesOverride: grokDiscovery?.permissionModes ?? claudeRuntime?.permissionModes,
+                interactionModesOverride: grokDiscovery?.interactionModes ?? distillDiscovery?.interactionModes ?? claudeRuntime?.interactionModes,
+                permissionModesOverride: grokDiscovery?.permissionModes ?? distillDiscovery?.permissionModes ?? claudeRuntime?.permissionModes,
                 capabilitiesOverride: runtimeCapabilities,
                 modelDiscoverySource: modelDiscoverySource,
-                modelDiscoveryCacheKey: grokDiscovery?.discoveryCacheKey
+                modelDiscoveryCacheKey: grokDiscovery?.discoveryCacheKey ?? distillDiscovery?.discoveryCacheKey
             ))
         }
         rememberProviderSnapshotsForSend(snapshots)
@@ -6637,7 +6673,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         binaryPath: String,
         environment: [String: String],
         claudePresentation: ClaudeProviderRuntimePresentation?,
-        grokCapabilities: AgentProviderCapabilities?
+        acpCapabilities: AgentProviderCapabilities?
     ) -> AgentProviderCapabilities? {
         switch provider {
         case .codex:
@@ -6655,8 +6691,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 supportsRollback: false,
                 supportsPlanReview: true
             )
-        case .grok:
-            return grokCapabilities
+        case .grok, .distill:
+            return acpCapabilities
         }
     }
 
@@ -6708,6 +6744,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 ).models
         case .grok:
             return GrokRunner.listModels(installedVersion: installedVersion)
+        case .distill:
+            return await DistillACPAdapter(
+                binaryNameOverride: binaryPath.isEmpty ? nil : binaryPath,
+                discoveryEnvironment: environment,
+                discoveryRunAsUser: runAsUser
+            ).listModels()
         }
     }
 
@@ -6815,7 +6857,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         case .claude:
             let home = environment["HOME"] ?? defaultHome
             return URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(".claude/skills", isDirectory: true)
-        case .grok:
+        case .grok, .distill:
             if let root = environment["GROK_HOME"], !root.isEmpty {
                 return URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent("skills", isDirectory: true)
             }
@@ -6842,7 +6884,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func updateAgentProvider(provider: AgentProvider, providerInstanceId: String?) async throws -> JSONValue {
         let binary = providerBinary(provider: provider, instanceId: providerInstanceId) ?? provider.rawValue
-        let binaryPath = ProcessLocator.resolve(binary) ?? ""
+        let binaryPath = (provider == .distill
+            ? ProcessLocator.resolveDistillAgent(binary)
+            : ProcessLocator.resolve(binary)) ?? ""
         guard !binaryPath.isEmpty else {
             throw JSONRPCError(code: -32040, message: "\(provider.rawValue) CLI binary is unavailable.")
         }
@@ -6940,7 +6984,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 env["CODEX_HOME"] = env["CODEX_HOME"] ?? home
             case .claude:
                 env["HOME"] = env["HOME"] ?? home
-            case .grok:
+            case .grok, .distill:
                 env["GROK_HOME"] = env["GROK_HOME"] ?? home
             }
         }
@@ -7055,6 +7099,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         case .codex: key = "cli.codex.path"
         case .claude: key = "cli.claude.path"
         case .grok: key = "cli.grok.path"
+        case .distill: key = "cli.distill.path"
         }
         guard let value = try? context?.settingsRepo.get(key)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !value.isEmpty else { return nil }

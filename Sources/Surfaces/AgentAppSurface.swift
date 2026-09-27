@@ -393,6 +393,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var providerSnapshots: [AgentProviderSnapshot] = []
     @Published public var permissionMode: AgentPermissionMode = .supervised
     @Published public var reasoningEffort: AgentReasoningEffort = .medium
+    @Published public var reasoningModel: String?
     @Published public var serviceTier: AgentServiceTier = .auto
     @Published public private(set) var routingMode: AgentRoutingMode = .manual
     @Published public var executionMode: AgentExecutionMode = .local
@@ -2342,6 +2343,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         model = manual.effectiveModel
         permissionMode = selectedThread.permissionMode
         reasoningEffort = manual.reasoningEffort
+        reasoningModel = selectedThread.reasoningModel
         serviceTier = manual.serviceTier
         executionMode = selectedThread.executionMode
         baseBranch = selectedThread.baseBranch ?? gitBranch ?? "main"
@@ -3961,6 +3963,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if Self.shouldAssignIfChanged(current: reasoningEffort, next: manual.reasoningEffort) {
             reasoningEffort = manual.reasoningEffort
         }
+        if Self.shouldAssignIfChanged(current: reasoningModel, next: selectedThread.reasoningModel) {
+            reasoningModel = selectedThread.reasoningModel
+        }
         if Self.shouldAssignIfChanged(current: serviceTier, next: manual.serviceTier) {
             serviceTier = manual.serviceTier
         }
@@ -5274,11 +5279,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 models = ClaudeRunner.listModels(installedVersion: nil)
             case .grok:
                 models = GrokRunner.listModels(installedVersion: nil)
+            case .distill:
+                models = await DistillACPAdapter().listModels()
             }
             rows.append(AgentProviderSnapshotFactory.snapshot(
                 provider: provider,
                 models: models,
-                binaryPath: ProcessLocator.resolve(provider.rawValue) ?? "",
+                binaryPath: (provider == .distill
+                    ? ProcessLocator.resolveDistillAgent(provider.rawValue)
+                    : ProcessLocator.resolve(provider.rawValue)) ?? "",
                 modelDiscoverySource: .builtInFallback
             ))
         }
@@ -5346,7 +5355,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                             runAsUser: runAsUser
                         )
                         liveModels = result.isFallback ? [] : result.models
-                    case .grok:
+                    case .grok, .distill:
                         liveModels = []
                     }
                 }
@@ -5775,6 +5784,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             command = "npm install -g @anthropic-ai/claude-code"
         case .grok:
             command = "curl -fsSL https://x.ai/cli/install.sh | bash"
+        case .distill:
+            providerRecoveryStatusMessage = "Install Distill separately, then set its executable path in Settings."
+            return
         }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(command, forType: .string)
@@ -6237,7 +6249,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 reasoningEffort: reasoningEffort,
                 serviceTier: serviceTier,
                 modelSelection: currentModelSelection,
-                interactionMode: interactionMode
+                interactionMode: interactionMode,
+                reasoningModel: reasoningModel
            ) {
             persistComposerDraft(for: id)
             return true
@@ -6280,6 +6293,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 serviceTier: serviceTier,
                 modelSelection: currentModelSelection,
                 interactionMode: interactionMode,
+                reasoningModel: reasoningModel,
                 at: now
             ) else {
                 statusMessage = "Could not save thread configuration: thread not found."
@@ -6297,6 +6311,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 threads[i].model = model
                 threads[i].permissionMode = permissionMode
                 threads[i].reasoningEffort = reasoningEffort
+                threads[i].reasoningModel = reasoningModel
                 threads[i].serviceTier = serviceTier
                 threads[i].modelSelection = currentModelSelection
                 threads[i].interactionMode = interactionMode
@@ -6327,7 +6342,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reasoningEffort: AgentReasoningEffort,
         serviceTier: AgentServiceTier,
         modelSelection: AgentModelSelection,
-        interactionMode: AgentInteractionMode
+        interactionMode: AgentInteractionMode,
+        reasoningModel: String? = nil
     ) -> Bool {
         let routing = painted.effectiveRoutingConfiguration
         return painted.provider == provider
@@ -6336,6 +6352,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             && painted.model == model
             && painted.permissionMode == permissionMode
             && painted.reasoningEffort == reasoningEffort
+            && painted.reasoningModel == reasoningModel
             && painted.serviceTier == serviceTier
             && painted.modelSelection == modelSelection
             && painted.effectiveInteractionMode == interactionMode
@@ -6436,6 +6453,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         model = routing.manualSelection.effectiveModel
         permissionMode = thread.permissionMode
         reasoningEffort = routing.manualSelection.reasoningEffort
+        reasoningModel = thread.reasoningModel
         serviceTier = routing.manualSelection.serviceTier
         interactionMode = thread.effectiveInteractionMode
         normalizeInteractionModeForSelectedProvider()
@@ -6587,6 +6605,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         persistThreadConfig()
     }
 
+    public func setReasoningModel(_ model: String?) {
+        let trimmed = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        reasoningModel = trimmed.isEmpty ? nil : trimmed
+        persistThreadConfig()
+    }
+
     public func setCustomModel(_ raw: String) {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard supportsCustomModelForSelectedProvider else { return }
@@ -6626,6 +6650,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                             providerInstanceId: providerInstanceId,
                             model: model,
                             permissionMode: permissionMode, reasoningEffort: reasoningEffort,
+                            reasoningModel: reasoningModel,
                             serviceTier: serviceTier, modelSelection: currentModelSelection,
                             runAsUser: runAsUser, routingConfiguration: routingConfiguration)
         let prunedThreadIDs: [AgentThreadID]
@@ -8231,6 +8256,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let runProviderInstanceId = providerInstanceId
         let runModel = model
         let runReasoningEffort = reasoningEffort
+        let runReasoningModel = reasoningModel
         let runServiceTier = serviceTier
         let runSnapshot = selectedProviderSnapshot
         let routingSnapshot: AgentOrchestrationRoutingSnapshot?
@@ -8467,6 +8493,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             providerThreadId: resumeInterrupted ? nil : providerThreadId,
             permissionMode: permissionMode,
             reasoningEffort: runReasoningEffort,
+            reasoningModel: runReasoningModel,
             serviceTier: runServiceTier,
             interactionMode: interactionMode,
             providerBinary: launchConfig?.binary,
@@ -18385,6 +18412,18 @@ public struct AgentAppView: View {
             }
             if vm.supportsReasoningForSelectedModel || vm.supportsServiceTierForSelectedModel {
                 compactMenuDivider
+            }
+            if vm.provider == .distill && vm.routingMode == .manual {
+                compactMenuSection("Reasoning model")
+                compactMenuRow("Off", selected: vm.reasoningModel == nil) {
+                    vm.setReasoningModel(nil)
+                }
+                ForEach(vm.modelOptionsForSelectedProvider, id: \.id) { candidate in
+                    compactMenuRow(candidate.label, selected: candidate.id == vm.reasoningModel) {
+                        vm.setReasoningModel(candidate.id)
+                    }
+                    .disabled(configurationLocked)
+                }
             }
             if vm.routingMode == .manual && vm.supportsReasoningForSelectedModel {
                 compactMenuSection("Reasoning effort")

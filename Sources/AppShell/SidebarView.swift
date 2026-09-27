@@ -3897,6 +3897,8 @@ public struct SidebarRootView: View {
         case .grok:
             // Grok: PostToolUse is passive; PATH wrappers + | distill only.
             return "Compresses shell tool output via wrappers and | distill"
+        case .distill:
+            return "Distill optimization follows its runtime configuration"
         }
     }
 
@@ -3904,6 +3906,8 @@ public struct SidebarRootView: View {
         switch provider {
         case .claude, .codex, .grok:
             return 1_000_000
+        case .distill:
+            return 0
         }
     }
 
@@ -4195,6 +4199,8 @@ public struct SidebarRootView: View {
         case .grok:
             // Product request: purple Grok ring (distinct from Claude orange / Codex blue).
             return Color(nsColor: .systemPurple)
+        case .distill:
+            return Color(hex: 0x6E56CF)
         }
     }
 
@@ -4203,6 +4209,7 @@ public struct SidebarRootView: View {
         case .claude: return "Claude"
         case .codex: return "Codex"
         case .grok: return "Grok"
+        case .distill: return "Distill"
         }
     }
 
@@ -4695,6 +4702,7 @@ public struct SidebarRootView: View {
             case .claude: title = "Claude"
             case .codex: title = "Codex"
             case .grok: title = "Grok"
+            case .distill: title = "Distill"
             }
             return "\(title) +\(formatTokenCountPublic(delta))"
         }
@@ -4817,6 +4825,7 @@ public struct SidebarRootView: View {
                 case .claude: return claudeUsedProgress
                 case .codex: return codexUsedProgress
                 case .grok: return grokUsedProgress
+                case .distill: return 0
                 }
             }
         }
@@ -4879,6 +4888,7 @@ public struct SidebarRootView: View {
             case .claude: return Color(nsColor: .systemOrange)
             case .codex: return Color(nsColor: .systemBlue)
             case .grok: return Color(nsColor: .systemPurple)
+            case .distill: return Color(hex: 0x6E56CF)
             }
         }
     }

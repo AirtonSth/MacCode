@@ -94,6 +94,7 @@ enum ProviderStderrClassifier {
         case .claude: return "Claude"
         case .codex: return "Codex"
         case .grok: return "Grok"
+        case .distill: return "Distill"
         }
     }
 
@@ -112,7 +113,7 @@ enum ProviderStderrClassifier {
             if lower.contains("codex") && lower.contains("warning") { return false }
         case .claude:
             if lower.contains("claude") && lower.contains("warning") { return false }
-        case .grok:
+        case .grok, .distill:
             if lower.contains("grok") && lower.contains("warning") { return false }
         }
         return true

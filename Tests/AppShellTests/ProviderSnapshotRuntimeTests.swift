@@ -293,6 +293,38 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                         "the snapshot must retain the opaque binary/account discovery identity")
     }
 
+    func test_distillSnapshotKeepsFallbackCatalogMarkedAsFallbackWhenACPLaunchFails() async throws {
+        // WHY: a useful static model list after ACP failure is not verified live account discovery.
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fakeDistill = dir.appendingPathComponent("fake-distill")
+        try #"""
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then
+          printf 'distill 0.2.101\n'
+          exit 0
+        fi
+        exit 1
+        """#.write(to: fakeDistill, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeDistill.path)
+
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        try ctx.settingsRepo.set("agent.provider.instances", """
+        [{"id":"distill-team","provider":"distill","binaryPath":"\(fakeDistill.path)","enabled":true}]
+        """)
+
+        let snapshots = await router.listAgentProviderSnapshots()
+        XCTAssertTrue(snapshots.contains { $0.id == "distill-team" }, "configured Distill account must survive snapshot discovery; got ids: \(snapshots.map(\.id))")
+        let distill = try XCTUnwrap(snapshots.first { $0.id == "distill-team" })
+        XCTAssertFalse(distill.models.isEmpty, "fallback models should remain selectable while the harness is unavailable")
+        XCTAssertEqual(distill.modelDiscoverySource, .builtInFallback,
+                       "a nonempty fallback catalog must not be mislabeled as live discovery")
+        XCTAssertTrue(distill.modelListIsFallback)
+    }
+
     func test_providerSnapshotsUseConfiguredBinaryAndExposeVersion() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -4260,6 +4292,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 concrete = ClaudeStreamingCLIAdapter(binaryNameOverride: peer.path)
             case .grok:
                 concrete = GrokACPAdapter(binaryNameOverride: peer.path)
+            case .distill:
+                concrete = DistillACPAdapter(binaryNameOverride: peer.path)
             }
             let revoking = RevokingAcceptanceAdapter(inner: concrete)
             let ctx = try AppContext(
@@ -4337,6 +4371,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                     concrete = ClaudeStreamingCLIAdapter(binaryNameOverride: peer.path)
                 case .grok:
                     concrete = GrokACPAdapter(binaryNameOverride: peer.path)
+                case .distill:
+                    concrete = DistillACPAdapter(binaryNameOverride: peer.path)
                 }
                 let ctx = try AppContext(
                     channel: .debug,
@@ -7294,7 +7330,7 @@ private final class ProviderAcceptanceProbePeer {
                 if line.strip():
                     marker.write_text("x")
             """
-        case .grok:
+        case .grok, .distill:
             source = """
             #!/usr/bin/env python3
             import json, pathlib, sys

@@ -118,6 +118,7 @@ enum BotsDeskFollowThrough {
         case .claude: route = "Claude"
         case .codex: route = "Codex"
         case .grok: route = "Grok"
+        case .distill: route = "Distill"
         }
         let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return route }

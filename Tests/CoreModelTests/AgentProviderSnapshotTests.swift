@@ -25,6 +25,18 @@ final class AgentProviderSnapshotTests: XCTestCase {
         XCTAssertTrue(snapshot.slashCommands.contains("/plan"))
     }
 
+    func test_distillSnapshotPreservesConfiguredAccentColor() {
+        let snapshot = AgentProviderSnapshotFactory.snapshot(
+            provider: .distill,
+            models: [AgentModelDescriptor(id: "main", label: "Main", provider: .distill)],
+            binaryPath: "/tmp/distill",
+            accentColor: "#123456"
+        )
+
+        XCTAssertEqual(snapshot.accentColor, "#123456",
+                       "configured provider-instance styling must override Distill's default accent")
+    }
+
     func test_grokSnapshotDefaultsExposeFullAccessWithoutDiscoveryOverride() {
         let snapshot = AgentProviderSnapshotFactory.snapshot(
             provider: .grok,

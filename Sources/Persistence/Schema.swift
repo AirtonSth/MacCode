@@ -1143,6 +1143,9 @@ public enum Schema {
                OR state = 'compensated'
                OR state = 'abandoned';
         """),
+        SchemaStep(84, """
+        ALTER TABLE agent_threads ADD COLUMN reasoning_model TEXT;
+        """),
         // Durable human -> RCW1 disclosure belongs to the retained user message,
         // not the evictable provider stream. The FK keeps storage bounded by the
         // existing 100-message transcript window and removes rows on prune/delete.

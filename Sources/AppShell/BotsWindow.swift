@@ -48,6 +48,7 @@ public struct BotDeskRouting: Equatable, Codable {
     public var routingMode: AgentRoutingMode
     public var permissionMode: AgentPermissionMode
     public var reasoningEffort: AgentReasoningEffort
+    public var reasoningModel: String?
     public var serviceTier: AgentServiceTier
     public var runAsUser: AgentRunAsUser
 
@@ -58,6 +59,7 @@ public struct BotDeskRouting: Equatable, Codable {
         routingMode: AgentRoutingMode = .auto,
         permissionMode: AgentPermissionMode = .supervised,
         reasoningEffort: AgentReasoningEffort = .medium,
+        reasoningModel: String? = nil,
         serviceTier: AgentServiceTier = .auto,
         runAsUser: AgentRunAsUser? = nil
     ) {
@@ -67,6 +69,7 @@ public struct BotDeskRouting: Equatable, Codable {
         self.routingMode = routingMode
         self.permissionMode = permissionMode
         self.reasoningEffort = reasoningEffort
+        self.reasoningModel = reasoningModel
         self.serviceTier = serviceTier
         self.runAsUser = runAsUser ?? AgentRunAsUser.current()
     }
@@ -79,6 +82,7 @@ public struct BotDeskRouting: Equatable, Codable {
         routingMode = try container.decode(AgentRoutingMode.self, forKey: .routingMode)
         permissionMode = try container.decode(AgentPermissionMode.self, forKey: .permissionMode)
         reasoningEffort = try container.decodeIfPresent(AgentReasoningEffort.self, forKey: .reasoningEffort) ?? .medium
+        reasoningModel = try container.decodeIfPresent(String.self, forKey: .reasoningModel)
         serviceTier = try container.decodeIfPresent(AgentServiceTier.self, forKey: .serviceTier) ?? .auto
         runAsUser = try container.decodeIfPresent(AgentRunAsUser.self, forKey: .runAsUser)
             ?? AgentRunAsUser.current()
@@ -112,6 +116,7 @@ public struct BotDeskRouting: Equatable, Codable {
             routingMode: run == nil ? thread.effectiveRoutingConfiguration.mode : .manual,
             permissionMode: thread.permissionMode,
             reasoningEffort: thread.reasoningEffort,
+            reasoningModel: thread.reasoningModel,
             serviceTier: thread.serviceTier,
             runAsUser: thread.runAsUser
         )
@@ -6887,6 +6892,7 @@ public final class BotsViewModel: ObservableObject {
         case .claude: return "opus"
         case .codex: return AgentDefaultModelSelection.codexBuiltInDefault
         case .grok: return "grok-4.6"
+        case .distill: return ""
         }
     }
 
@@ -7298,6 +7304,7 @@ public final class BotsViewModel: ObservableObject {
         case .claude: return "Claude"
         case .codex: return "Codex"
         case .grok: return "Grok"
+        case .distill: return "Distill"
         }
     }
 
@@ -7851,6 +7858,16 @@ public final class BotsViewModel: ObservableObject {
         deskRouting.model = model
         deskRouting.routingMode = .manual
         normalizeDeskReasoning()
+    }
+
+    public func setDeskReasoningModel(_ model: String?) {
+        let trimmed = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        deskRouting.reasoningModel = trimmed.isEmpty ? nil : trimmed
+        if let threadID = selectedConversation?.linkedAgentThreadID,
+           var thread = try? context.threadRepo.get(id: threadID) {
+            thread.reasoningModel = deskRouting.reasoningModel
+            try? context.threadRepo.upsert(thread)
+        }
     }
 
     public func setDeskRoutingMode(_ mode: AgentRoutingMode) {
@@ -9681,14 +9698,17 @@ public final class BotsViewModel: ObservableObject {
             guard let existing = try context.threadRepo.get(id: linked),
                   !threadBelongsToAnotherBot(linked, botID: bot.id),
                   existing.provider == routing.provider,
-                  existing.providerInstanceId == routing.providerInstanceID,
-                  (existing.runAsUser ?? AgentRunAsUser.current()).id == routing.runAsUser.id else { return nil }
+                  existing.providerInstanceId == routing.providerInstanceID else { return nil }
+            let existingRunAsUser = existing.runAsUser ?? AgentRunAsUser.current()
+            guard existingRunAsUser.uid == routing.runAsUser.uid,
+                  existingRunAsUser.shortName == routing.runAsUser.shortName else { return nil }
             // 1.3: model/reasoning/permission drift updates the existing thread
             // in place instead of forking a new thread and losing history.
             var updated = existing
             var didUpdate = false
             if updated.model != model { updated.model = model; didUpdate = true }
             if updated.reasoningEffort != routing.reasoningEffort { updated.reasoningEffort = routing.reasoningEffort; didUpdate = true }
+            if updated.reasoningModel != routing.reasoningModel { updated.reasoningModel = routing.reasoningModel; didUpdate = true }
             if updated.permissionMode != routing.permissionMode { updated.permissionMode = routing.permissionMode; didUpdate = true }
             if updated.serviceTier != routing.serviceTier { updated.serviceTier = routing.serviceTier; didUpdate = true }
             if didUpdate {
@@ -9700,7 +9720,7 @@ public final class BotsViewModel: ObservableObject {
         if let reusableThread {
             thread = reusableThread
         } else {
-            thread = try router.createAgentThread(
+            var createdThread = try router.createAgentThread(
                 workspace: nil,
                 title: conversation.title,
                 provider: routing.provider,
@@ -9720,6 +9740,9 @@ public final class BotsViewModel: ObservableObject {
                 routingConfiguration: nil,
                 quiet: true
             )
+            createdThread.reasoningModel = routing.reasoningModel
+            try context.threadRepo.upsert(createdThread)
+            thread = createdThread
             liveConversation.linkedAgentThreadID = thread.id
             try botStore.upsertConversation(liveConversation)
             lastStartedConversationByBot[liveConversation.botID] = liveConversation
@@ -13117,6 +13140,19 @@ public struct BotsRootView: View {
                     showDeskModelOptions = false
                 }
                 .disabled(deskRoutingLocked)
+            }
+            if vm.deskRouting.provider == .distill && vm.deskRouting.routingMode == .manual {
+                AgentCompactMenuDivider()
+                AgentCompactMenuSection("Reasoning model")
+                AgentCompactMenuRow("Off", selected: vm.deskRouting.reasoningModel == nil) {
+                    vm.setDeskReasoningModel(nil)
+                }
+                ForEach(models, id: \.id) { candidate in
+                    AgentCompactMenuRow(candidate.label, selected: candidate.id == vm.deskRouting.reasoningModel) {
+                        vm.setDeskReasoningModel(candidate.id)
+                    }
+                    .disabled(deskRoutingLocked)
+                }
             }
             if vm.deskSupportsReasoning {
                 AgentCompactMenuDivider()

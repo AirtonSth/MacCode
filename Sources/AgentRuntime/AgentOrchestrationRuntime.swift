@@ -2743,6 +2743,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         case .codex: return "codex"
         case .claude: return "claude-code"
         case .grok: return "grok"
+        case .distill: return "distill"
         }
     }
 
@@ -3050,6 +3051,8 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             return (["sonnet", "claude-sonnet", "claude-sonnet-5", "claude-sonnet-4-6"], .high)
         case .grok:
             return (["grok-4.7", "grok-4.6", "grok-4.5"], .medium)
+        case .distill:
+            return ([], .medium)
         }
     }
 
@@ -3063,6 +3066,8 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             return (["opus", "claude-opus", "claude-4-opus", "claude-3-opus"], .high)
         case .grok:
             return (["grok-4.7", "grok-4.6", "grok-4.5"], .high)
+        case .distill:
+            return ([], .high)
         }
     }
 

@@ -23,6 +23,7 @@ public enum SubagentProviderKind: String, Sendable, Equatable, CaseIterable {
     case codex
     case claude
     case grok
+    case distill
     case unknown
 }
 
@@ -97,6 +98,7 @@ public struct SubagentActivityItem: Identifiable, Sendable, Equatable {
         case .codex: providerName = "Codex"
         case .claude: providerName = "Claude"
         case .grok: providerName = "Grok"
+        case .distill: providerName = "Distill"
         case .unknown: providerName = "Unknown"
         }
         var parts = [providerName]
@@ -412,6 +414,7 @@ public enum SubagentActivityProjection {
         case .codex: return .codex
         case .claude: return .claude
         case .grok: return .grok
+        case .distill: return .distill
         }
     }
 
@@ -569,6 +572,7 @@ public enum SubagentActivityProjection {
         case .codex: return "Codex"
         case .claude: return "Claude"
         case .grok: return "Grok"
+        case .distill: return "Distill"
         case .unknown:
             // Fall back to a provider token embedded in the nodeId when known.
             guard let nodeId else { return "Unknown" }
@@ -746,6 +750,7 @@ public enum SubagentActivityStyle {
         case .codex: return Color(hex: 0x3DD6C6)
         case .claude: return Color(hex: 0xE8A838)
         case .grok: return Color(hex: 0xF472B6)
+        case .distill: return Color(hex: 0x6E56CF)
         case .unknown: return DS.Palette.textTertiary
         }
     }

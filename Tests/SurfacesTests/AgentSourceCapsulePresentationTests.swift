@@ -180,10 +180,10 @@ final class AgentSourceCapsulePresentationTests: XCTestCase {
         let ids = entries.map(\.id)
         XCTAssertTrue(ids.contains("codex-personal") && ids.contains("codex-work"),
                       "a thread bound to a now-disabled instance must still show that account so it is not silently rewritten")
-        // Claude/Grok are appended when discovery only returned Codex instances
-        // so the pre-thread switcher never collapses to a single dead row.
-        XCTAssertTrue(ids.contains("claude") && ids.contains("grok"),
-                      "missing providers are still offered alongside codex instances")
+        // Providers absent from discovery remain selectable alongside Codex instances.
+        XCTAssertTrue(ids.contains("claude") && ids.contains("grok") && ids.contains("distill"),
+                      "missing providers, including Distill, remain available in the account picker")
+        XCTAssertEqual(entries.first(where: { $0.id == "distill" })?.title, "Distill")
         XCTAssertEqual(entries.first(where: { $0.id == "codex-work" })?.isSelected, true)
         XCTAssertEqual(entries.first(where: { $0.id == "codex-personal" })?.isSelected, false)
     }
@@ -239,6 +239,7 @@ final class AgentSourceCapsulePresentationTests: XCTestCase {
                 case .codex: return .codexCLI
                 case .claude: return .claudeCLI
                 case .grok: return .grokCLI
+                case .distill: return .distillACP
                 }
             }(),
             displayName: displayName,

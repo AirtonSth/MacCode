@@ -397,6 +397,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
                 provider: provider,
                 arguments: rewritten
             )
+        case .distill:
+            return rewritten
         case .claude:
             return mergingProviderPrompt(
                 prompt,
@@ -903,6 +905,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             sessionContinuationFlags = [
                 "--resume", "-r", "--continue", "--session-id", "--fork-session"
             ]
+        case .distill:
+            return false
         }
         if !scan.flags.isDisjoint(with: sessionContinuationFlags) {
             return false
@@ -927,6 +931,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         case .codex:
             return scan.positionals.first == "exec"
                 && scan.positionals.dropFirst().first != "resume"
+        case .distill:
+            return false
         }
     }
 
@@ -1009,6 +1015,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
                 "--system-prompt", "--setting-sources", "--settings",
                 "--session-id", "--resume", "-r", "--mcp-config"
             ]
+        case .distill:
+            return []
         case .codex:
             return [
                 "--sandbox", "--ask-for-approval", "-a", "--config", "-c",
@@ -1034,6 +1042,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
                 "--no-session-persistence", "--print", "-p", "--strict-mcp-config",
                 "--verbose", "--version", "-V"
             ]
+        case .distill:
+            return []
         case .codex:
             return [
                 "--dangerously-bypass-approvals-and-sandbox", "--ephemeral",
@@ -3052,7 +3062,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         switch provider {
         case .claude: return claudeInstructionsURL
         case .codex: return codexInstructionsURL
-        case .grok:
+        case .grok, .distill:
             return homeDirectoryURL().appendingPathComponent(".grok/AGENTS.md")
         }
     }
@@ -3182,7 +3192,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         switch provider {
         case .claude: return claudeSkillsRoot
         case .codex: return codexSkillsRoot
-        case .grok:
+        case .grok, .distill:
             return homeDirectoryURL().appendingPathComponent(".grok/skills", isDirectory: true)
         }
     }

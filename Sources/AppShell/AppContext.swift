@@ -1118,7 +1118,7 @@ public final class AppContext {
             providerSnapshotSupplier: {
                 await contextReference.value?.router?.listAgentProviderSnapshots() ?? []
             },
-            providerAdapters: [.codex: codex, .claude: claude, .grok: grok]
+            providerAdapters: [.codex: codex, .claude: claude, .grok: grok, .distill: DistillACPAdapter(binaryNameOverride: try? settingsRepo.get("cli.distill.path"))]
         )
         self.coordinator.onRecoveredForkPrunedThreadIDs = { [weak contextReference] ids in
             await MainActor.run {

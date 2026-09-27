@@ -49,10 +49,15 @@ final class AgentAppViewModelTests: XCTestCase {
         let threadRepo = AgentThreadRepository(db: db)
         let messageRepo = AgentMessageRepository(db: db)
         let runRepo = AgentRunRepository(db: db)
+        var providers: [AgentProvider: AgentProviderRunner] = [
+            .codex: FakeProviderRunner(provider: .codex),
+            .claude: FakeProviderRunner(provider: .claude),
+            .distill: FakeProviderRunner(provider: .distill)
+        ]
+        if let provider { providers[provider.provider] = provider }
         let coord = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
                                         threadRepo: threadRepo,
-                                        providers: [.codex: provider ?? FakeProviderRunner(provider: .codex),
-                                                    .claude: FakeProviderRunner(provider: .claude)])
+                                        providers: providers)
         let workspaceID = WorkspaceID()
         let vm = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp,
                                    coordinator: coord, threadRepo: threadRepo,
@@ -1286,6 +1291,82 @@ final class AgentAppViewModelTests: XCTestCase {
                        "macOS Agent App must route the actual run by selected provider instance, not just provider type")
         XCTAssertEqual(capture.providerBinaries.last, "/usr/bin/env")
         XCTAssertEqual(capture.environments.last?["CODEX_HOME"], "/tmp/codex-work")
+    }
+
+    func test_distillProviderRunsAndResumesWithPersistedSessionInAgentApp() async throws {
+        // WHY: the Agent App must send through the selected provider and restore its provider session after reopening.
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-distill-restart-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let workspaceID = WorkspaceID()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let history = PromptHistoryStore(db: db)
+        let capture = CapturingProviderRunner(provider: .distill, completionDelayNanoseconds: 20_000_000, finalMessage: "Distill reply")
+        let snapshot = AgentProviderSnapshotFactory.snapshot(
+            provider: .distill,
+            models: [AgentModelDescriptor(id: "gpt-6-luna", label: "GPT-6 Luna", provider: .distill)],
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            id: "distill"
+        )
+
+        let firstCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.distill: capture]
+        )
+        let firstVM = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: firstCoordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            promptHistoryStore: history,
+            initialThreadId: nil
+        )
+        firstVM.providerSnapshots = [snapshot]
+        firstVM.setProvider(.distill)
+        firstVM.createThread(title: "Distill session")
+        let threadID = try XCTUnwrap(firstVM.selectedThreadId)
+        firstVM.setModel("gpt-6-luna")
+        firstVM.prompt = "first Distill turn"
+        await firstVM.send()
+        await waitAsync("Distill response and provider cursor persist") {
+            (try? messageRepo.list(threadId: threadID))?.contains { $0.role == .assistant && $0.content == "Distill reply" } == true
+                && (try? threadRepo.get(id: threadID)?.providerThreadId)?.isEmpty == false
+        }
+        let savedProviderThreadID = try XCTUnwrap(try threadRepo.get(id: threadID)?.providerThreadId)
+        XCTAssertEqual(try XCTUnwrap(threadRepo.get(id: threadID)).provider, .distill)
+        XCTAssertEqual(try XCTUnwrap(threadRepo.get(id: threadID)).model, "gpt-6-luna")
+
+        let secondCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.distill: capture]
+        )
+        let reopenedVM = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: secondCoordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            promptHistoryStore: history,
+            initialThreadId: threadID
+        )
+        reopenedVM.providerSnapshots = [snapshot]
+        XCTAssertEqual(reopenedVM.provider, .distill)
+        XCTAssertEqual(reopenedVM.model, "gpt-6-luna")
+        reopenedVM.prompt = "follow-up Distill turn"
+        await reopenedVM.send()
+        await waitAsync("Distill follow-up reaches the restored provider session") {
+            capture.prompts.count == 2
+        }
+        XCTAssertEqual(capture.providerInstanceIds, ["distill", "distill"])
+        XCTAssertEqual(capture.requestProviderThreadIds.first ?? nil, nil)
+        XCTAssertEqual(capture.requestProviderThreadIds.dropFirst().first ?? nil, savedProviderThreadID)
     }
 
     func test_restartedAgentAppSendsFollowupWithPersistedProviderThreadId() async throws {
@@ -10179,6 +10260,7 @@ private final class CapturingProviderAdapter: AgentProviderAdapter, @unchecked S
 private final class CapturingProviderRunner: AgentProviderRunner, @unchecked Sendable {
     let provider: AgentProvider
     private let completionDelayNanoseconds: UInt64
+    private let finalMessage: String?
     private let lock = NSLock()
     private var _prompts: [String] = []
     private var _interactionModes: [AgentInteractionMode] = []
@@ -10216,9 +10298,10 @@ private final class CapturingProviderRunner: AgentProviderRunner, @unchecked Sen
         lock.lock(); defer { lock.unlock() }
         return _requestProviderThreadIds
     }
-    init(provider: AgentProvider, completionDelayNanoseconds: UInt64 = 0) {
+    init(provider: AgentProvider, completionDelayNanoseconds: UInt64 = 0, finalMessage: String? = nil) {
         self.provider = provider
         self.completionDelayNanoseconds = completionDelayNanoseconds
+        self.finalMessage = finalMessage
     }
 
     func listModels() async -> [AgentModelDescriptor] {
@@ -10242,7 +10325,7 @@ private final class CapturingProviderRunner: AgentProviderRunner, @unchecked Sen
             }
             let providerThreadId = request.providerThreadId ?? UUID().uuidString
             onEvent(.status(.completed))
-            onEvent(.finished(.completed, finalMessage: nil, providerThreadId: providerThreadId))
+            onEvent(.finished(.completed, finalMessage: self.finalMessage, providerThreadId: providerThreadId))
         }
         return AgentRunHandle(runId: request.runId, process: nil) {}
     }

@@ -1418,6 +1418,11 @@ public final class SettingsViewModel: ObservableObject {
                 .grok,
                 adapter: GrokACPAdapter(binaryNameOverride: trimmed.isEmpty ? nil : trimmed)
             )
+        case .distill:
+            context.coordinator.replaceProviderAdapter(
+                .distill,
+                adapter: DistillACPAdapter(binaryNameOverride: trimmed.isEmpty ? nil : trimmed)
+            )
         }
     }
 

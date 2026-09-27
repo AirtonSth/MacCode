@@ -286,6 +286,7 @@ public enum PetActiveThreadProjector {
         case .codex: return "Codex"
         case .claude: return "Claude"
         case .grok: return "Grok"
+        case .distill: return "Distill"
         }
     }
 }

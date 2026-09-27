@@ -30,6 +30,7 @@ public enum AgentProvider: String, Codable, Sendable, CaseIterable {
     case codex
     case claude
     case grok
+    case distill
 }
 
 public struct SurfaceDescriptor: Codable, Sendable, Hashable {

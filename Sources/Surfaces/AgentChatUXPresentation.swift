@@ -1501,6 +1501,7 @@ public enum AgentThreadRailRowCopy {
         case .codex: return "X"
         case .claude: return "C"
         case .grok: return "G"
+        case .distill: return "D"
         }
     }
 

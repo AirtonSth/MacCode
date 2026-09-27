@@ -6930,6 +6930,12 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.previewBrainAssembleCountForTesting, afterCodex + 1)
         XCTAssertEqual(grok.provider, .grok)
         XCTAssertEqual(grok.model, BotsViewModel.defaultModel(for: .grok))
+
+        vm.setDeskProvider(.distill)
+        let distill = try XCTUnwrap(vm.previewBrain())
+        XCTAssertEqual(distill.provider, .distill)
+        XCTAssertEqual(distill.model, BotsViewModel.defaultModel(for: .distill))
+        XCTAssertEqual(vm.deskRouting.provider, .distill)
     }
 
     func test_reloadKeepsDesk_becauseRemountMustNotNavigateHome() throws {
@@ -7712,6 +7718,20 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(decoded.runAsUser.id, AgentRunAsUser.current().id)
     }
 
+    func test_deskRoutingRoundTripsIndependentReasoningModels() throws {
+        // WHY: Desk stores routing per conversation; changing one Reasoning model must not replace another conversation's selection.
+        let first = BotDeskRouting(provider: .distill, providerInstanceID: "distill", model: "grok-4.6", routingMode: .manual, reasoningModel: "grok-4.5")
+        let second = BotDeskRouting(provider: .distill, providerInstanceID: "distill", model: "grok-4.6", routingMode: .manual, reasoningModel: nil)
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+
+        let restoredFirst = try decoder.decode(BotDeskRouting.self, from: encoder.encode(first))
+        let restoredSecond = try decoder.decode(BotDeskRouting.self, from: encoder.encode(second))
+
+        XCTAssertEqual(restoredFirst.reasoningModel, "grok-4.5")
+        XCTAssertNil(restoredSecond.reasoningModel)
+    }
+
     func test_newDeskThreadDoesNotSeedFromBotRevision_becauseProviderBelongsToTheThread() throws {
         // WHY: saving a Bot with a legacy Claude revision must never make
         // Claude that Bot's provider. The user chooses the execution route
@@ -7726,6 +7746,165 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertNil(vm.resolvedProvider(for: bot))
     }
 
+    func test_distillACPBotDeskSendAndReopenUsesPersistedSessionWithTokenSaverOff() async throws {
+        // WHY: Bot Desk must run through Distill ACP, preserve the conversation on reopen, and keep compression off.
+        let root = URL(fileURLWithPath: directory, isDirectory: true)
+            .appendingPathComponent("distill-bot-acp-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        ProviderProcessOwnership.shared.configure(fileURL: root.appendingPathComponent("provider-processes.json"))
+        let harnessURL = root.appendingPathComponent("distill-agent")
+        let requestsURL = root.appendingPathComponent("requests.jsonl")
+        let launchesURL = root.appendingPathComponent("launches.jsonl")
+        let counterURL = root.appendingPathComponent("prompt-count")
+        let harness = """
+        #!/usr/bin/env python3
+        import json, os, pathlib, sys
+        requests = pathlib.Path(\(String(reflecting: requestsURL.path)))
+        launches = pathlib.Path(\(String(reflecting: launchesURL.path)))
+        counter = pathlib.Path(\(String(reflecting: counterURL.path)))
+        launch = {}
+        hint = os.environ.get("RC_TOKEN_SAVER_DISTILL_HINT")
+        if hint is not None:
+            launch["tokenSaverHint"] = hint
+        with launches.open("a") as output:
+            output.write(json.dumps(launch) + "\\n")
+        def record(value):
+            with requests.open("a") as output:
+                output.write(json.dumps(value) + "\\n")
+        def prompt_text(blocks):
+            if isinstance(blocks, str): return blocks
+            if isinstance(blocks, dict): return blocks.get("text", "")
+            if isinstance(blocks, list): return " ".join(prompt_text(block) for block in blocks)
+            return ""
+        def send(value):
+            print(json.dumps(value), flush=True)
+        for line in sys.stdin:
+            message = json.loads(line)
+            method = message.get("method")
+            params = message.get("params", {})
+            if method == "initialize":
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":True,"sessionCapabilities":{"resume":True},"promptCapabilities":{}}}})
+            elif method in ("session/new", "session/load"):
+                meta = params.get("_meta", {})
+                record({"method":method,"sessionId":params.get("sessionId"),"modelId":meta.get("modelId")})
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"sessionId":params.get("sessionId", "bot-distill-session"),"models":{"availableModels":[{"modelId":"gpt-6-luna","name":"GPT-6 Luna"}],"currentModelId":"gpt-6-luna"}}})
+            elif method in ("session/set_mode", "session/set_model", "session/set_config_option"):
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{}})
+            elif method == "session/prompt":
+                count = int(counter.read_text()) if counter.exists() else 0
+                count += 1
+                counter.write_text(str(count))
+                text = prompt_text(params.get("prompt", []))
+                record({"method":method,"sessionId":params.get("sessionId"),"firstRequestPresent":"First Distill bot turn" in text,"followUpPresent":"Follow-up Distill bot turn" in text})
+                send({"jsonrpc":"2.0", "method":"session/update", "params":{"sessionId":params["sessionId"],"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Bot Distill reply " + str(count)}}}})
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"stopReason":"end_turn"}})
+        """
+        try harness.write(to: harnessURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: harnessURL.path)
+
+        let context = try makeContext()
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = false }
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let adapter = DistillACPAdapter(binaryNameOverride: harnessURL.path)
+        context.coordinator.replaceProviderAdapter(.distill, adapter: adapter)
+        var reopenedAdapter: DistillACPAdapter?
+        defer { adapter.stopAll(); reopenedAdapter?.stopAll() }
+        let snapshot = AgentProviderSnapshotFactory.snapshot(
+            provider: .distill,
+            models: [AgentModelDescriptor(id: "gpt-6-luna", label: "GPT-6 Luna", provider: .distill)],
+            binaryPath: harnessURL.path,
+            authenticated: true,
+            id: "distill"
+        )
+        router.rememberProviderSnapshotsForSend([snapshot])
+
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .codex, model: "legacy-only")
+        vm.openDesk(bot)
+        vm.createDeskThread()
+        vm.setDeskProvider(.distill)
+        vm.setDeskRoutingMode(.manual)
+        vm.setDeskModel("gpt-6-luna")
+        let conversation = try XCTUnwrap(vm.selectedConversation)
+        vm.composerText = "First Distill bot turn"
+        XCTAssertTrue(vm.send())
+        let firstReplyArrived = await waitUntil(timeout: 8) {
+            vm.deskMessages.contains { $0.role == .assistant && $0.text == "Bot Distill reply 1" }
+        }
+        guard firstReplyArrived else {
+            let messageSummary = vm.deskMessages.map(\.text).joined(separator: " | ")
+            let failure = "the selected Distill ACP provider must return a visible Bot Desk response; error="
+                + (vm.errorMessage ?? "nil") + "; provider=" + vm.deskRunProvider.rawValue + "; messages=" + messageSummary
+            XCTFail(failure)
+            return
+        }
+        let linkedThreadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID)
+        let providerThreadID = try XCTUnwrap(try context.threadRepo.get(id: linkedThreadID)?.providerThreadId)
+        XCTAssertEqual(try context.threadRepo.get(id: linkedThreadID)?.provider, .distill)
+        XCTAssertEqual(try context.threadRepo.get(id: linkedThreadID)?.model, "gpt-6-luna")
+        adapter.stopAll()
+
+        let reopenedContext = try makeContext()
+        let reopenedRouter = AppCommandRouter(context: reopenedContext)
+        reopenedContext.router = reopenedRouter
+        reopenedAdapter = DistillACPAdapter(binaryNameOverride: harnessURL.path)
+        reopenedContext.coordinator.replaceProviderAdapter(.distill, adapter: try XCTUnwrap(reopenedAdapter))
+        reopenedRouter.rememberProviderSnapshotsForSend([snapshot])
+        let reopenedVM = BotsViewModel(context: reopenedContext, router: reopenedRouter)
+        reopenedVM.openDesk(bot)
+        reopenedVM.selectDeskThread(conversation.id)
+        XCTAssertEqual(reopenedVM.selectedConversation?.linkedAgentThreadID, linkedThreadID)
+        let reopenedThread = try XCTUnwrap(reopenedContext.threadRepo.get(id: linkedThreadID))
+        XCTAssertEqual(reopenedThread.providerThreadId, providerThreadID,
+                       "the Distill provider session id must survive constructing a fresh AppContext")
+        XCTAssertEqual(reopenedThread.provider, reopenedVM.deskRouting.provider)
+        XCTAssertEqual(reopenedThread.providerInstanceId, reopenedVM.deskRouting.providerInstanceID)
+        XCTAssertEqual((reopenedThread.runAsUser ?? AgentRunAsUser.current()).uid, reopenedVM.deskRouting.runAsUser.uid)
+        XCTAssertEqual((reopenedThread.runAsUser ?? AgentRunAsUser.current()).shortName, reopenedVM.deskRouting.runAsUser.shortName)
+        XCTAssertEqual(reopenedVM.deskRunProvider, .distill)
+        XCTAssertEqual(reopenedVM.deskRunModel, "gpt-6-luna")
+        reopenedVM.composerText = "Follow-up Distill bot turn"
+        XCTAssertTrue(reopenedVM.send())
+        let followUpReplyArrived = await waitUntil(timeout: 8) {
+            reopenedVM.deskMessages.contains { $0.role == .assistant && $0.text == "Bot Distill reply 2" }
+        }
+        guard followUpReplyArrived else {
+            let messageSummary = reopenedVM.deskMessages.map { $0.text }.joined(separator: " | ")
+            XCTFail("Distill follow-up missing; error=" + (reopenedVM.errorMessage ?? "nil")
+                + "; messages=" + messageSummary)
+            return
+        }
+
+        let requests = try String(contentsOf: requestsURL, encoding: .utf8)
+            .split(whereSeparator: \.isNewline)
+            .compactMap { try JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+        let open = try XCTUnwrap(
+            requests.first { $0["method"] as? String == "session/new" },
+            "ACP should start exactly one new Distill session"
+        )
+        XCTAssertEqual(open["modelId"] as? String, "gpt-6-luna",
+                       "the selected Distill main model must be used at session creation")
+        let methods = requests.compactMap { $0["method"] as? String }
+        let load = try XCTUnwrap(
+            requests.first { $0["method"] as? String == "session/load" },
+            "a fresh Bot Desk context must recover the persisted provider session; methods=" + methods.joined(separator: ",")
+        )
+        XCTAssertEqual(load["sessionId"] as? String, providerThreadID)
+        let prompts = requests.filter { $0["method"] as? String == "session/prompt" }
+        XCTAssertEqual(prompts.count, 2)
+        XCTAssertEqual(prompts.map { $0["firstRequestPresent"] as? Bool }, [true, false])
+        XCTAssertEqual(prompts.map { $0["followUpPresent"] as? Bool }, [false, true])
+        let launches = try String(contentsOf: launchesURL, encoding: .utf8)
+            .split(whereSeparator: \.isNewline)
+            .compactMap { try JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+        XCTAssertEqual(launches.count, 2, "both Bot Desk provider processes must be observed")
+        XCTAssertTrue(launches.allSatisfy { $0["tokenSaverHint"] == nil },
+                      "Token Saver off must not admit compression into either Distill ACP process")
+    }
+
     func test_deskProviderChoicePersistsPerThread_notPerBot() throws {
         // WHY: one Bot can be called from Grok in one thread and Claude in
         // another. Reopening either thread must restore that user's choice
@@ -7734,6 +7913,7 @@ final class BotsWindowTests: XCTestCase {
         let bot: BotDefinition
         let grokThread: BotConversation
         let claudeThread: BotConversation
+        let distillThread: BotConversation
         do {
             let vm = BotsViewModel(context: context)
             bot = try vm.create(
@@ -7753,6 +7933,12 @@ final class BotsWindowTests: XCTestCase {
             vm.setDeskModel("opus")
             claudeThread = try XCTUnwrap(vm.selectedConversation)
 
+            vm.createDeskThread()
+            vm.setDeskProvider(.distill)
+            vm.setDeskRoutingMode(.manual)
+            vm.setDeskModel("gpt-6-luna")
+            distillThread = try XCTUnwrap(vm.selectedConversation)
+
             vm.selectDeskThread(grokThread.id)
             XCTAssertEqual(vm.deskRunProvider, .grok)
             XCTAssertEqual(vm.deskRunModel, "grok-4.6")
@@ -7767,6 +7953,9 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(restored.deskRunProvider, .grok)
         restored.selectDeskThread(claudeThread.id)
         XCTAssertEqual(restored.deskRunProvider, .claude)
+        restored.selectDeskThread(distillThread.id)
+        XCTAssertEqual(restored.deskRunProvider, .distill)
+        XCTAssertEqual(restored.deskRunModel, "gpt-6-luna")
     }
 
     func test_deskSendUsesComposerProvider_notPublishedRoute() throws {
@@ -10452,17 +10641,19 @@ final class BotsWindowTests: XCTestCase {
 
     func test_agentAppAndBotHandoffsInheritEachCallerProvider_acrossAllProviders() async throws {
         // WHY: the callee Bot is identity/brain only. Whether the caller is an
-        // Agent App thread or another Bot, Claude/Codex/Grok must be inherited
-        // from the authenticated caller run, never from the callee revision.
+        // Agent App thread or another Bot, the provider must be inherited from
+        // the authenticated caller run, never from the callee revision.
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
         let claude = ControlledBotHandoffRunner(provider: .claude)
         let codex = ControlledBotHandoffRunner(provider: .codex)
         let grok = ControlledBotHandoffRunner(provider: .grok)
+        let distill = ControlledBotHandoffRunner(provider: .distill)
         context.coordinator.replaceProvider(.claude, runner: claude)
         context.coordinator.replaceProvider(.codex, runner: codex)
         context.coordinator.replaceProvider(.grok, runner: grok)
+        context.coordinator.replaceProvider(.distill, runner: distill)
         let vm = BotsViewModel(context: context, router: router)
         let peer = try vm.create(
             name: "Oliver",
@@ -10476,6 +10667,7 @@ final class BotsWindowTests: XCTestCase {
             case .claude: return claude
             case .codex: return codex
             case .grok: return grok
+            case .distill: return distill
             }
         }
 

@@ -191,6 +191,8 @@ public enum ProviderCLIProbe {
             // Grok has no dedicated auth-status subcommand; `models` prints
             // "You are logged in with …" when authenticated.
             arguments = ["models"]
+        case .distill:
+            return AuthStatus(authenticated: nil, accountLabel: nil, accountAuthMethod: nil)
         }
         guard let result = run(
             binaryPath: binaryPath,
@@ -240,7 +242,7 @@ public enum ProviderCLIProbe {
     public static func update(provider: AgentProvider, binaryPath: String, environment: [String: String] = [:], timeoutSeconds: TimeInterval = 120.0) -> UpdateResult {
         let arguments: [String]
         switch provider {
-        case .codex, .claude, .grok:
+        case .codex, .claude, .grok, .distill:
             arguments = ["update"]
         }
         guard let result = run(binaryPath: binaryPath, arguments: arguments, environment: environment, timeoutSeconds: timeoutSeconds, retention: .suffix) else {

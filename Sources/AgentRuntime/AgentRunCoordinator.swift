@@ -580,7 +580,7 @@ public enum TokenSaverExecutionReceiptSeam {
             switch provider {
             case .claude:
                 return sidecarAvailable
-            case .codex, .grok:
+            case .codex, .grok, .distill:
                 return nil
             }
         }()
@@ -1020,6 +1020,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return ClaudeRunner.normalizedReasoningEffort(requested, model: model)
         case .grok:
             return requested.flatMap { GrokRunner.normalizedReasoningEffort($0, model: model) }
+        case .distill:
+            return requested
         case .codex:
             return requested
         }
@@ -2217,6 +2219,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             providerThreadId: resumeCursor,
             permissionMode: recoveryContext?.runtimeMode ?? request.permissionMode,
             reasoningEffort: effectiveReasoningEffort,
+            reasoningModel: request.reasoningModel,
             serviceTier: recoveryContext?.serviceTier ?? request.serviceTier,
             interactionMode: recoveryContext?.interactionMode ?? request.interactionMode,
             providerBinary: request.providerBinary,
@@ -2720,6 +2723,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 providerThreadId: request.providerThreadId,
                 permissionMode: request.permissionMode,
                 reasoningEffort: admission.route.selection.reasoningEffort,
+                reasoningModel: request.reasoningModel,
                 serviceTier: admission.route.selection.serviceTier,
                 interactionMode: request.interactionMode,
                 providerBinary: launch?.binary ?? request.providerBinary,
@@ -2808,6 +2812,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             providerThreadId: request.providerThreadId,
             permissionMode: request.permissionMode,
             reasoningEffort: route.selection.reasoningEffort,
+            reasoningModel: request.reasoningModel,
             serviceTier: route.selection.serviceTier,
             interactionMode: request.interactionMode,
             providerBinary: launch?.binary ?? request.providerBinary,
@@ -4792,6 +4797,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             userMessageContent: prompt,
             providerThreadId: resumeCursor,
             permissionMode: runMetadata.runtimeMode,
+            reasoningModel: (try? threadRepo.get(id: threadId))?.reasoningModel,
             serviceTier: runMetadata.serviceTier,
             interactionMode: runMetadata.interactionMode,
             runAsUser: runAsUser
@@ -5779,6 +5785,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             providerThreadId: resumeCursor,
             permissionMode: session.runtimeMode,
             reasoningEffort: thread.reasoningEffort,
+            reasoningModel: thread.reasoningModel,
             serviceTier: session.serviceTier,
             interactionMode: .default,
             environment: environment,
@@ -5851,7 +5858,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private func providerBinaryIdentity(_ provider: AgentProvider, adapter: AgentProviderAdapter) -> String? {
         guard adapter is OneShotProviderAdapter else { return providerAdapterKey(adapter) }
         let binaryName = provider.rawValue
-        if let path = ProcessLocator.resolve(binaryName) {
+        let resolvedBinary = provider == .distill
+            ? ProcessLocator.resolveDistillAgent(binaryName)
+            : ProcessLocator.resolve(binaryName)
+        if let path = resolvedBinary {
             return "\(binaryName):\(path)"
         }
         return "\(binaryName):unresolved"

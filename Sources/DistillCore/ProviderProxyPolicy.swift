@@ -535,7 +535,7 @@ public enum ProviderProxyPolicy {
         switch targetProvider {
         case .claude:
             return distillAvailable
-        case .codex, .grok:
+        case .codex, .grok, .distill:
             return nil
         }
     }
@@ -671,6 +671,8 @@ public enum ProviderProxyPolicy {
                     "--cloud", "--environment", "--teleport",
                     "--system-prompt-snapshot"
                 ]
+            case .distill:
+                return []
             case .grok:
                 return [
                     "--permission-mode", "--sandbox", "--prompt-file", "-p",
@@ -700,6 +702,8 @@ public enum ProviderProxyPolicy {
                     "--cloud", "--environment", "--teleport",
                     "--system-prompt-snapshot"
                 ]
+            case .distill:
+                return []
             case .grok:
                 return [
                     "--cwd", "--worktree", "-w", "--worktree-ref", "--debug-file",
@@ -725,6 +729,8 @@ public enum ProviderProxyPolicy {
                     "--replay-user-messages", "--strict-mcp-config", "--safe-mode",
                     "--ax-screen-reader", "--tmux", "--help", "-h", "--version", "-v"
                 ]
+            case .distill:
+                return []
             case .grok:
                 return [
                     "--always-approve", "--yolo", "--no-memory", "--no-subagents", "--no-auto-update",
@@ -746,6 +752,8 @@ public enum ProviderProxyPolicy {
                     "--allow-dangerously-skip-permissions", "--chrome", "--ide",
                     "--bg", "--background", "--tmux"
                 ]
+            case .distill:
+                return []
             case .grok:
                 return [
                     "--dangerously-skip-permissions", "--experimental-memory",
@@ -769,6 +777,8 @@ public enum ProviderProxyPolicy {
                     "plugin", "plugins", "project", "setup-token", "ultrareview",
                     "update", "upgrade"
                 ]
+            case .distill:
+                return []
             case .grok:
                 return [
                     "dashboard", "export", "leader", "login", "logout", "mcp",
@@ -1224,6 +1234,8 @@ public enum ProviderProxyPolicy {
             return nestedCodexAgentAppDelegation(arguments: arguments, promptFile: absolutePrompt)
         case .grok:
             return nestedGrokAgentAppDelegation(arguments: arguments, promptFile: absolutePrompt)
+        case .distill:
+            return nil
         }
     }
 
@@ -1277,6 +1289,8 @@ public enum ProviderProxyPolicy {
             return nestedCodexInlinePrompt(arguments: arguments)
         case .grok:
             return nestedGrokInlinePrompt(arguments: arguments)
+        case .distill:
+            return nil
         }
     }
 
@@ -2157,6 +2171,8 @@ public enum ProviderProxyPolicy {
                 return nil
             }
             return providerJSONTokenUsage(object: object, provider: .claude)
+        case .distill:
+            return nil
         case .grok:
             guard object["usage"] != nil
                     || object["token_usage"] != nil

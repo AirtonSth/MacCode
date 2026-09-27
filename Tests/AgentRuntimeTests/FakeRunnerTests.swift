@@ -55,6 +55,68 @@ final class FakeRunnerTests: XCTestCase {
         XCTAssertTrue(events.contains { if case .turnCompleted = $0 { return true } else { return false } })
     }
 
+    func test_coordinatorPreservesExplicitReasoningOffInsteadOfFallingBackToStoredModel() async throws {
+        let tmp = try mkTmpRepo(prefix: "rc2-reasoning-off-")
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp + "/support").run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(
+            title: "Reasoning off",
+            provider: .distill,
+            model: "grok-4.6",
+            reasoningModel: "grok-4.5"
+        )
+        try threadRepo.upsert(thread)
+        let capture = CapturedAgentRunRequest()
+        let runner = CapturingFakeProviderRunner(capture: capture)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.distill: runner]
+        )
+
+        let runID = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .distill,
+            model: "grok-4.6",
+            cwd: tmp,
+            prompt: "Run without Reasoning",
+            reasoningModel: nil
+        ))
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline,
+              capture.request == nil || (try? runRepo.get(id: runID)?.status) != .completed {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let capturedRequest = try XCTUnwrap(capture.request, "the coordinator must send a provider request")
+        XCTAssertNil(capturedRequest.reasoningModel,
+                     "the resolved request's explicit Off must take precedence over a persisted conversation model")
+        XCTAssertEqual(try runRepo.get(id: runID)?.status, .completed,
+                       "the fake provider must finish before the temporary database is removed")
+
+        let secondRunID = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .distill,
+            model: "grok-4.6",
+            cwd: tmp,
+            prompt: "Use the selected Reasoning model",
+            reasoningModel: "grok-4.6"
+        ))
+        let secondDeadline = Date().addingTimeInterval(3)
+        while Date() < secondDeadline,
+              capture.request?.prompt != "Use the selected Reasoning model"
+                || (try? runRepo.get(id: secondRunID)?.status) != .completed {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(capture.request?.reasoningModel, "grok-4.6",
+                       "an explicit request selection must also take precedence over the stored conversation value")
+        XCTAssertEqual(try runRepo.get(id: secondRunID)?.status, .completed)
+    }
+
     func test_coordinator_persistsAssistantOnTurnCompleted() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-coordinator-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
@@ -1621,7 +1683,7 @@ final class FakeRunnerTests: XCTestCase {
     }
 
     func test_stopRunInterruptsActiveProviderAdapterForCodexAndClaude() async throws {
-        for provider in [AgentProvider.codex, .claude, .grok] {
+        for provider in [AgentProvider.codex, .claude, .grok, .distill] {
             let tmp = NSTemporaryDirectory() + "rc2-active-stop-\(provider.rawValue)-" + UUID().uuidString
             let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
             let threadRepo = AgentThreadRepository(db: db)
@@ -1632,6 +1694,7 @@ final class FakeRunnerTests: XCTestCase {
             case .codex: model = "gpt-5.5"
             case .claude: model = "claude-opus-4-7"
             case .grok: model = "grok-4.5"
+            case .distill: model = ""
             }
             let thread = AgentThread(title: "stop \(provider.rawValue)",
                                      provider: provider,
@@ -2907,4 +2970,41 @@ private final class ClaudeSessionSnapshotAdapter: AgentProviderAdapter, @uncheck
     func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {}
     func stopAll() {}
     func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+}
+
+private final class CapturedAgentRunRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedRequest: AgentRunRequest?
+
+    var request: AgentRunRequest? {
+        lock.lock(); defer { lock.unlock() }
+        return storedRequest
+    }
+
+    func store(_ request: AgentRunRequest) {
+        lock.lock(); defer { lock.unlock() }
+        storedRequest = request
+    }
+}
+
+private final class CapturingFakeProviderRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .distill
+    private let capture: CapturedAgentRunRequest
+    private let runner = FakeProviderRunner(provider: .distill, scenario: .simpleAssistant(reply: "OK"))
+
+    init(capture: CapturedAgentRunRequest) {
+        self.capture = capture
+    }
+
+    func listModels() async -> [AgentModelDescriptor] {
+        await runner.listModels()
+    }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        capture.store(request)
+        return try await runner.startRun(request, onEvent: onEvent)
+    }
 }
