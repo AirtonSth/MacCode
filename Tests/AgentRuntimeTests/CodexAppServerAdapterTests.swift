@@ -3390,7 +3390,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "hook-1" && output == "Hook prompt fragment" } else { return false } },
                       "hookPrompt snapshots should render fragment text instead of raw JSON")
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "fn-camel-1" && item.type == .commandExecution && item.summary == "lookup" } else { return false } },
-                      "camelCase functionCallOutput is a 0.157 ThreadItem, not an unknown tool row")
+                      "app-server thread/read uses camelCase functionCallOutput; exec JSONL does not emit this kind")
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "fn-camel-1" && output == "row-1" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "sub-1" && item.type == .collabToolCall && item.summary == "completed" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "sub-1" && output == "completed reviewer" } else { return false } })
