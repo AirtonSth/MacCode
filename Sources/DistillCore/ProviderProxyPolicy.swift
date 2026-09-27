@@ -573,8 +573,8 @@ public enum ProviderProxyPolicy {
             case "acceptedits", "accept-edits", "auto_accept_edits", "workspace":
                 return .autoAcceptEdits
             case "auto":
-                // Grok auto is a classifier, not acceptEdits.
-                return provider == .grok ? .fullAccess : .autoAcceptEdits
+                // Claude Code and Grok `auto` are classifiers, not acceptEdits.
+                return (provider == .grok || provider == .claude) ? .fullAccess : .autoAcceptEdits
             case "bypasspermissions", "bypass-permissions", "full_access":
                 return .fullAccess
             default:
@@ -669,7 +669,9 @@ public enum ProviderProxyPolicy {
                     "--plugin-dir", "--plugin-url", "--debug-file", "--file",
                     "--agent", "--agents", "--from-pr", "--remote-control",
                     "--cloud", "--environment", "--teleport",
-                    "--system-prompt-snapshot"
+                    "--system-prompt-snapshot",
+                    "--autocompact", "--max-turns",
+                    "--permission-prompts", "--permission-prompt-tool"
                 ]
             case .distill:
                 return []
@@ -700,7 +702,8 @@ public enum ProviderProxyPolicy {
                     "--mcp-config", "--plugin-dir", "--plugin-url", "--debug-file",
                     "--file", "--agent", "--agents", "--from-pr", "--remote-control",
                     "--cloud", "--environment", "--teleport",
-                    "--system-prompt-snapshot"
+                    "--system-prompt-snapshot",
+                    "--permission-prompts", "--permission-prompt-tool"
                 ]
             case .distill:
                 return []
@@ -1307,7 +1310,7 @@ public enum ProviderProxyPolicy {
         "--add-dir", "--json-schema", "--system-prompt-file",
         "--append-system-prompt-file", "--mcp-config", "--plugin-dir",
         "--plugin-url", "--worktree", "-w", "--fallback-model",
-        "--permission-prompts", "--max-budget-usd", "--name", "-n",
+        "--permission-prompts", "--permission-prompt-tool", "--max-budget-usd", "--name", "-n",
         "--agents", "--agent", "--file", "--debug-file", "--betas",
         "--from-pr", "--remote-control", "--autocompact", "--max-turns",
         "--cloud", "--environment", "--teleport",
@@ -1323,7 +1326,7 @@ public enum ProviderProxyPolicy {
         "--include-hook-events", "--replay-user-messages", "--forward-subagent-text",
         "--bare", "--brief", "--chrome", "--no-chrome",
         "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
-        "--exclude-dynamic-system-prompt-sections", "--restricted",
+        "--exclude-dynamic-system-prompt-sections", "--restricted", "--safe-mode",
         "--ax-screen-reader", "--bg", "--background", "--tmux"
     ]
 
@@ -1351,6 +1354,10 @@ public enum ProviderProxyPolicy {
         }
         // Session continuation is host-owned on Agent App; keep raw for resume.
         if !scan.flags.isDisjoint(with: ["--resume", "-r", "--continue", "-c", "--session-id", "--fork-session"]) {
+            return false
+        }
+        // Claude `auto` is a classifier. Agent App has no equivalent mode.
+        if scan.optionValues["--permission-mode"]?.last?.lowercased() == "auto" {
             return false
         }
         // Agent App cannot honor a restricted tool allowlist (`--tools Read,Glob,Grep`
@@ -1447,9 +1454,9 @@ public enum ProviderProxyPolicy {
 
     private static func mapClaudePermission(_ raw: String?) -> AgentPermissionMode {
         switch (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "acceptedits", "accept-edits", "auto", "workspace":
+        case "acceptedits", "accept-edits", "workspace":
             return .autoAcceptEdits
-        case "bypasspermissions", "bypass-permissions", "dontask", "full_access", "full-access":
+        case "auto", "bypasspermissions", "bypass-permissions", "dontask", "full_access", "full-access":
             return .fullAccess
         default:
             return .supervised

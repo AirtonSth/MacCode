@@ -846,7 +846,9 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ["--cloud", "desk"], ["--environment", "env_1"], ["--teleport", "sess"],
             ["--tmux"], ["--prompt-suggestions", "off"],
             ["--remote-control-session-name-prefix", "rc"],
-            ["--system-prompt-snapshot", "/tmp/snap.md"], ["--no-session-persistence"]
+            ["--system-prompt-snapshot", "off"], ["--no-session-persistence"],
+            ["--safe-mode"], ["--permission-prompt-tool", "AskUser"],
+            ["--permission-mode", "auto"]
         ]
         for option in unforwardedClaudeOptions {
             let arguments = ["--print", "--model", "opus", "--effort", "high"] + option
@@ -884,6 +886,13 @@ final class ProviderProxyPolicyTests: XCTestCase {
             promptFile: prompt
         ))
         XCTAssertEqual(manualPermission.permissionMode, .supervised)
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "claude",
+            arguments: [
+                "--print", "--model", "opus", "--effort", "high",
+                "--permission-mode", "auto"
+            ]
+        ), "Claude auto is a classifier and must stay on the raw CLI")
         XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
             providerBasename: "claude",
             arguments: [
@@ -1558,6 +1567,52 @@ final class ProviderProxyPolicyTests: XCTestCase {
                 ]
             ),
             .explicit(.supervised)
+        )
+        XCTAssertEqual(
+            ProviderProxyPolicy.explicitPermissionRequest(
+                providerBasename: "claude",
+                arguments: ["--print", "--permission-mode", "auto"]
+            ),
+            .explicit(.fullAccess),
+            "Claude auto is a classifier, not acceptEdits"
+        )
+        XCTAssertEqual(
+            ProviderProxyPolicy.explicitPermissionRequest(
+                providerBasename: "claude",
+                arguments: ["--print", "--permission-mode", "acceptEdits"]
+            ),
+            .explicit(.autoAcceptEdits)
+        )
+        XCTAssertEqual(
+            ProviderProxyPolicy.explicitPermissionRequest(
+                providerBasename: "claude",
+                arguments: [
+                    "--print", "--permission-mode", "plan",
+                    "--autocompact", "auto", "--max-turns", "4"
+                ]
+            ),
+            .explicit(.supervised),
+            "compact and turn budget are not authority and must consume their values"
+        )
+        XCTAssertEqual(
+            ProviderProxyPolicy.explicitPermissionRequest(
+                providerBasename: "claude",
+                arguments: [
+                    "--print", "--permission-mode", "plan",
+                    "--permission-prompts", "none"
+                ]
+            ),
+            .explicit(.fullAccess)
+        )
+        XCTAssertEqual(
+            ProviderProxyPolicy.explicitPermissionRequest(
+                providerBasename: "claude",
+                arguments: [
+                    "--print", "--permission-mode", "plan",
+                    "--permission-prompt-tool", "AskUser"
+                ]
+            ),
+            .explicit(.fullAccess)
         )
         XCTAssertEqual(
             ProviderProxyPolicy.explicitPermissionRequest(
