@@ -144,6 +144,45 @@ final class CodexParserTests: XCTestCase {
         XCTAssertEqual(item?.output, "README.md")
     }
 
+    func test_realExecSchema_threadItemKindsAreNotAssistantText() {
+        // WHY: openai/codex 0.157 ThreadItem adds functionCallOutput, hookPrompt,
+        // subAgentActivity, sleep, and imageGeneration. The parser default used to
+        // paint those as assistant text and fold them into the turn's final answer.
+        let p = CodexParser()
+        var state = AssistantTimelineState()
+        let lines = [
+            #"{"type":"thread.started","thread_id":"t-items"}"#,
+            #"{"type":"turn.started","turn_id":"turn-items"}"#,
+            #"{"type":"item.completed","item":{"id":"fn","type":"functionCallOutput","name":"lookup","output":"row-1"}}"#,
+            #"{"type":"item.completed","item":{"id":"hook","type":"hookPrompt","fragments":[{"hookRunId":"h1","text":"do not leak"}]}}"#,
+            #"{"type":"item.completed","item":{"id":"sub","type":"subAgentActivity","agentPath":"reviewer","agentThreadId":"thr","kind":"completed"}}"#,
+            #"{"type":"item.completed","item":{"id":"nap","type":"sleep","durationMs":1500}}"#,
+            #"{"type":"item.completed","item":{"id":"img","type":"imageGeneration","result":"saved.png","status":"completed"}}"#,
+            #"{"type":"item.completed","item":{"id":"ans","type":"agent_message","text":"done"}}"#,
+            #"{"type":"turn.completed","turn_id":"turn-items"}"#
+        ]
+        for line in lines {
+            for event in p.parseLine(line) { state.apply(event) }
+        }
+        func item(_ id: String) -> AssistantItem? {
+            state.turns[0].items.first { $0.id == id }
+        }
+        XCTAssertEqual(item("fn")?.type, .commandExecution)
+        XCTAssertEqual(item("fn")?.summary, "lookup")
+        XCTAssertEqual(item("fn")?.output, "row-1")
+        XCTAssertEqual(item("hook")?.type, .tool)
+        XCTAssertEqual(item("hook")?.output, "do not leak")
+        XCTAssertEqual(item("sub")?.type, .collabToolCall)
+        XCTAssertEqual(item("sub")?.summary, "completed")
+        XCTAssertEqual(item("nap")?.type, .tool)
+        XCTAssertEqual(item("nap")?.summary, "Sleep 1500ms")
+        XCTAssertEqual(item("img")?.type, .dynamicToolCall)
+        XCTAssertEqual(item("img")?.output, "saved.png")
+        XCTAssertEqual(state.turns[0].items.first { $0.id == "ans" }?.type, .assistantMessage)
+        XCTAssertEqual(state.turns[0].finalAssistantMessage, "done",
+                       "tool-shaped ThreadItems must not be concatenated into the user-visible final answer")
+    }
+
     func test_realExecSchema_itemUpdatedTodoList() {
         let p = CodexParser()
         var state = AssistantTimelineState()

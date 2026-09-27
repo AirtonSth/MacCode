@@ -3301,6 +3301,30 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                             ]
                         ],
                         [
+                            "id": "fn-camel-1",
+                            "type": "functionCallOutput",
+                            "name": "lookup",
+                            "output": "row-1"
+                        ],
+                        [
+                            "id": "sub-1",
+                            "type": "subAgentActivity",
+                            "agentPath": "reviewer",
+                            "agentThreadId": "thr-1",
+                            "kind": "completed"
+                        ],
+                        [
+                            "id": "sleep-1",
+                            "type": "sleep",
+                            "durationMs": 1500
+                        ],
+                        [
+                            "id": "img-1",
+                            "type": "imageGeneration",
+                            "result": "saved.png",
+                            "status": "completed"
+                        ],
+                        [
                             "id": "hook-1",
                             "type": "hookPrompt",
                             "fragments": [
@@ -3365,6 +3389,14 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "hook-1" && item.summary == "Hook prompt" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "hook-1" && output == "Hook prompt fragment" } else { return false } },
                       "hookPrompt snapshots should render fragment text instead of raw JSON")
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "fn-camel-1" && item.type == .commandExecution && item.summary == "lookup" } else { return false } },
+                      "camelCase functionCallOutput is a 0.157 ThreadItem, not an unknown tool row")
+        XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "fn-camel-1" && output == "row-1" } else { return false } })
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "sub-1" && item.type == .collabToolCall && item.summary == "completed" } else { return false } })
+        XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "sub-1" && output == "completed reviewer" } else { return false } })
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "sleep-1" && item.type == .tool && item.summary == "Sleep 1500ms" } else { return false } })
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "img-1" && item.type == .dynamicToolCall } else { return false } })
+        XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "img-1" && output == "saved.png" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "future-1" && output == "Provider-specific text" } else { return false } },
                       "future provider-specific snapshot items should render common message/text fields while raw providerRuntime still preserves the full JSON")
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0, let output { return itemId == "future-content-1" && output.contains("Future content array text") && output.contains("image_url") && output.contains("file:") && output.contains("future.png") && output.contains("Second content part") } else { return false } },

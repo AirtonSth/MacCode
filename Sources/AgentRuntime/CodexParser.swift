@@ -236,10 +236,18 @@ public final class CodexParser {
                 out.append(.itemCompleted(itemId: iid, finalState: finalState))
             }
         case .commandExecution, .tool, .mcpToolCall, .dynamicToolCall, .collabToolCall:
-            let summary = item["command"] as? String
-                ?? item["name"] as? String
-                ?? item["tool"] as? String
-                ?? kind
+            let kindKey = kind.replacingOccurrences(of: "_", with: "").lowercased()
+            let summary: String
+            if kindKey == "sleep" {
+                summary = Self.sleepSummary(item)
+            } else if kindKey == "subagentactivity" {
+                summary = (item["kind"] as? String) ?? "subAgentActivity"
+            } else {
+                summary = item["command"] as? String
+                    ?? item["name"] as? String
+                    ?? item["tool"] as? String
+                    ?? kind
+            }
             out.append(.itemStarted(item: AssistantItem(
                 id: iid, turnId: turnId, type: tt,
                 state: finalState,
@@ -272,6 +280,23 @@ public final class CodexParser {
     private static func itemText(from item: [String: Any]) -> String {
         let kind = item["type"] as? String ?? ""
         let kindKey = kind.replacingOccurrences(of: "_", with: "").lowercased()
+        if kindKey == "functioncalloutput" || kindKey == "customtoolcalloutput" {
+            return Self.functionOutputText(item["output"])
+        }
+        if kindKey == "hookprompt" {
+            return Self.hookFragmentText(item["fragments"])
+        }
+        if kindKey == "imagegeneration" {
+            return (item["result"] as? String) ?? ""
+        }
+        if kindKey == "sleep" {
+            return Self.sleepSummary(item)
+        }
+        if kindKey == "subagentactivity" {
+            let activity = item["kind"] as? String ?? ""
+            let path = item["agentPath"] as? String ?? item["agent_path"] as? String ?? ""
+            return [activity, path].filter { !$0.isEmpty }.joined(separator: " ")
+        }
         if kindKey == "commandexecution" {
             // aggregated_output / aggregatedOutput is stdout and may be "" /
             // omitted. Never treat the command line as output.
@@ -301,6 +326,31 @@ public final class CodexParser {
             }
         }
         return ""
+    }
+
+    private static func functionOutputText(_ output: Any?) -> String {
+        if let text = output as? String { return text }
+        if let parts = output as? [String] { return parts.joined(separator: "\n") }
+        if let parts = output as? [[String: Any]] {
+            let texts = parts.compactMap { $0["text"] as? String }.filter { !$0.isEmpty }
+            if !texts.isEmpty { return texts.joined(separator: "\n") }
+        }
+        guard let output,
+              JSONSerialization.isValidJSONObject(output),
+              let data = try? JSONSerialization.data(withJSONObject: output),
+              let text = String(data: data, encoding: .utf8) else { return "" }
+        return text
+    }
+
+    private static func hookFragmentText(_ fragments: Any?) -> String {
+        guard let fragments = fragments as? [[String: Any]] else { return "" }
+        return fragments.compactMap { $0["text"] as? String }.filter { !$0.isEmpty }.joined(separator: "\n")
+    }
+
+    private static func sleepSummary(_ item: [String: Any]) -> String {
+        let ms = item["durationMs"] as? Int ?? item["duration_ms"] as? Int
+        if let ms { return "Sleep \(ms)ms" }
+        return "Sleep"
     }
 
     /// Mirror CodexAppServerAdapter.itemState for exec JSONL status strings.
@@ -357,7 +407,11 @@ public final class CodexParser {
         case "filechange", "patch", "applypatch": return .fileChange
         case "mcp", "mcptoolcall": return .mcpToolCall
         case "dynamic", "dynamictoolcall": return .dynamicToolCall
-        case "collab", "collabtoolcall", "collabagenttoolcall": return .collabToolCall
+        case "collab", "collabtoolcall", "collabagenttoolcall", "subagentactivity": return .collabToolCall
+        case "functioncall", "functioncalloutput", "customtoolcall", "customtoolcalloutput":
+            return .commandExecution
+        case "hookprompt", "sleep": return .tool
+        case "imagegeneration": return .dynamicToolCall
         case "websearch": return .webSearch
         case "imageview": return .imageView
         case "review", "enteredreviewmode", "exitedreviewmode": return .review
