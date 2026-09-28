@@ -781,6 +781,9 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
     func test_agentAndBotsShareTheSameAutoPopoverChrome() throws {
         // WHY: Desk Auto used to be a header-only fork. Auto-on must paint
         // the same orchestration card from one component, not a second copy.
+        // Distill likewise mounts shared sections: Agent App splits them
+        // across Main/Reasoning pills while Desk/schedulers mount the combined
+        // view — all three must compose the same section components.
         let repo = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -800,13 +803,20 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
 
         XCTAssertTrue(chrome.contains("struct AgentModelPopoverChrome"))
         XCTAssertTrue(chrome.contains("struct AgentDistillModelSelectors"))
+        XCTAssertTrue(chrome.contains("struct AgentDistillMainModelSection"))
+        XCTAssertTrue(chrome.contains("struct AgentDistillReasoningModelSection"))
         XCTAssertTrue(chrome.contains("struct AgentModelAutoRoutingCard"))
         XCTAssertTrue(chrome.contains("agent.model.auto.card"))
         XCTAssertTrue(chrome.contains(AgentModelPopoverPresentation.autoDisclaimer))
         XCTAssertTrue(chrome.contains(AgentModelPopoverPresentation.autoStatus))
 
         XCTAssertTrue(agent.contains("AgentModelPopoverChrome("))
-        XCTAssertTrue(agent.contains("AgentDistillModelSelectors("))
+        XCTAssertTrue(agent.contains("AgentDistillMainModelSection("))
+        XCTAssertTrue(agent.contains("AgentDistillReasoningModelSection("))
+        XCTAssertFalse(
+            agent.contains("struct AgentDistill"),
+            "Agent App must mount the shared Distill sections, not define its own fork"
+        )
         XCTAssertFalse(
             agent.contains("private func autoRoutingCard"),
             "Agent App must not keep a private Auto card after the shared chrome exists"

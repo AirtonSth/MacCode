@@ -123,17 +123,20 @@ public struct AgentCompactMenuSection: View {
 
 public struct AgentCompactMenuRow: View {
     public let title: String
+    public let detail: String?
     public let selected: Bool
     public let width: CGFloat?
     public let action: () -> Void
 
     public init(
         _ title: String,
+        detail: String? = nil,
         selected: Bool,
         width: CGFloat? = nil,
         action: @escaping () -> Void
     ) {
         self.title = title
+        self.detail = detail
         self.selected = selected
         self.width = width
         self.action = action
@@ -151,6 +154,12 @@ public struct AgentCompactMenuRow: View {
                     .foregroundColor(DS.Palette.text)
                     .lineLimit(1)
                 Spacer(minLength: 0)
+                if let detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(DS.Font.caption2.monospacedDigit())
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .lineLimit(1)
+                }
             }
             .padding(.horizontal, DS.Space.xs)
             .padding(.vertical, DS.Space.xs)
@@ -175,6 +184,73 @@ public struct AgentCompactMenuDivider: View {
             .frame(height: DS.Border.hairline)
             .padding(.vertical, DS.Space.xs)
             .frame(width: width)
+    }
+}
+
+/// Pure width estimator for compact model menus. Distill labels are long
+/// ("Muse Spark 1.3 Contributor") and numerous, so Distill callers pass the
+/// full label set with a wider cap instead of the 3-row default.
+public enum AgentModelMenuWidth {
+    public static let defaultMin: CGFloat = 112
+    public static let defaultMax: CGFloat = 260
+    public static let distillMin: CGFloat = 224
+    public static let distillMax: CGFloat = 360
+
+    public static func estimatedWidth(
+        titles: [String],
+        min minWidth: CGFloat = defaultMin,
+        max maxWidth: CGFloat = defaultMax
+    ) -> CGFloat {
+        let estimated = titles.map { CGFloat($0.count * 7 + 34) }.max() ?? minWidth
+        return min(max(estimated, minWidth), maxWidth)
+    }
+}
+
+/// Inline filter field for long Distill model lists.
+public struct AgentModelSearchField: View {
+    @Binding public var query: String
+    public let width: CGFloat?
+    public let accessibilityIdentifier: String
+
+    public init(query: Binding<String>, width: CGFloat? = nil, accessibilityIdentifier: String) {
+        self._query = query
+        self.width = width
+        self.accessibilityIdentifier = accessibilityIdentifier
+    }
+
+    public var body: some View {
+        HStack(spacing: DS.Space.xs) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityHidden(true)
+            TextField("Filter models", text: $query)
+                .textFieldStyle(.plain)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.text)
+                .accessibilityIdentifier(accessibilityIdentifier)
+            if !query.isEmpty {
+                Button {
+                    query = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear filter")
+            }
+        }
+        .padding(.horizontal, DS.Space.sm)
+        .padding(.vertical, DS.Space.xs)
+        .frame(width: width, alignment: .leading)
+        .background(DS.Palette.surfaceRaised)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        )
+        .padding(.bottom, DS.Space.xs)
     }
 }
 
@@ -475,19 +551,27 @@ public struct AgentModelPillPresentation: Equatable {
     public let effort: String?
     public let serviceTier: String?
     public let contextWindow: String?
+    /// Leading qualifier so adjacent pills stay unambiguous ("Main", "Reasoning").
+    public let prefix: String?
+    /// True when the selected model is missing from the current list.
+    public let warning: Bool
 
     public init(
         title: String,
         loading: Bool = false,
         effort: String? = nil,
         serviceTier: String? = nil,
-        contextWindow: String? = nil
+        contextWindow: String? = nil,
+        prefix: String? = nil,
+        warning: Bool = false
     ) {
         self.title = title
         self.loading = loading
         self.effort = effort
         self.serviceTier = serviceTier
         self.contextWindow = contextWindow
+        self.prefix = prefix
+        self.warning = warning
     }
 
     public var isAuto: Bool {
@@ -498,9 +582,11 @@ public struct AgentModelPillPresentation: Equatable {
         if isAuto {
             return loading ? "Auto model routing, loading" : "Auto model routing"
         }
-        var parts = ["Model \(title)"]
+        let subject = prefix.map { "\($0) model \(title)" } ?? "Model \(title)"
+        var parts = [subject]
         if let effort { parts.append("effort \(effort)") }
         if let serviceTier { parts.append("tier \(serviceTier)") }
+        if warning { parts.append("unavailable") }
         return parts.joined(separator: ", ")
     }
 }
@@ -520,6 +606,18 @@ public struct AgentModelPillLabel: View {
                 ProgressView()
                     .controlSize(.mini)
                     .accessibilityHidden(true)
+            }
+            if presentation.warning {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(DS.Palette.warning)
+                    .accessibilityHidden(true)
+            }
+            if let prefix = presentation.prefix {
+                Text(prefix)
+                    .font(DS.Font.caption2.weight(.semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
             }
             Text(presentation.title)
                 .font(DS.Font.caption.weight(.medium))

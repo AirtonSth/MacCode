@@ -417,6 +417,9 @@ public struct AgentEffortSelection: Codable, Sendable, Equatable, Hashable {
     }
 
     public var isAutomatic: Bool { effort == nil }
+
+    /// Pill/menu label: the pinned effort name, or Auto when unset.
+    public var pickerDisplayName: String { effort?.displayName ?? "Auto" }
 }
 
 public struct AgentModelSelection: Codable, Sendable, Equatable, Hashable {
@@ -897,6 +900,14 @@ public struct AgentModelDescriptor: Codable, Sendable, Equatable, Hashable {
         supportsServiceTier = try c.decodeIfPresent(Bool.self, forKey: .supportsServiceTier) ?? false
         supportsCustomModel = try c.decodeIfPresent(Bool.self, forKey: .supportsCustomModel) ?? false
         contextWindowTokens = try c.decodeIfPresent(Int.self, forKey: .contextWindowTokens)
+    }
+
+    /// Compact context label for pills and picker rows ("128k ctx"). Nil when unknown.
+    public var contextWindowLabel: String? {
+        guard let tokens = contextWindowTokens, tokens > 0 else { return nil }
+        if tokens >= 1_000_000, tokens % 1_000_000 == 0 { return "\(tokens / 1_000_000)M ctx" }
+        if tokens >= 1_000, tokens % 1_000 == 0 { return "\(tokens / 1_000)k ctx" }
+        return "\(tokens) ctx"
     }
 }
 

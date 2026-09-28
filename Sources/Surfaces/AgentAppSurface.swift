@@ -5618,10 +5618,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public var selectedModelContextWindowLabel: String? {
-        guard let tokens = selectedModelDescriptor?.contextWindowTokens, tokens > 0 else { return nil }
-        if tokens >= 1_000_000, tokens % 1_000_000 == 0 { return "\(tokens / 1_000_000)M ctx" }
-        if tokens >= 1_000, tokens % 1_000 == 0 { return "\(tokens / 1_000)k ctx" }
-        return "\(tokens) ctx"
+        selectedModelDescriptor?.contextWindowLabel
     }
 
     private func modelSelectionIsValid(_ model: String, in models: [AgentModelDescriptor]) -> Bool {
@@ -12130,6 +12127,7 @@ public struct AgentAppView: View {
     // P3: user-message "show more" — message ids the user has expanded past 28 lines.
 
     @State private var showModelOptions = false
+    @State private var showReasoningModelOptions = false
     @State private var showAllModelOptions = false
     /// Source/account capsule popover (Codex / Claude / Grok). Always openable so
     /// locked/single-source states fail loud instead of a dead click.
@@ -15001,10 +14999,29 @@ public struct AgentAppView: View {
 
     private var modelLabel: String {
         if vm.routingMode == .auto, vm.provider != .distill { return "Auto" }
-        if vm.provider == .distill, vm.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return "Select Main model"
+        if vm.provider == .distill {
+            return distillMainModelTitle
         }
         return vm.modelOptionsForSelectedProvider.first(where: { $0.id == vm.model })?.label ?? vm.model
+    }
+
+    /// Distill Main pill title. The pill already carries a "Main" prefix, so
+    /// the empty state drops the qualifier ("Select model", not "Main Select
+    /// Main model"). Desk/schedulers keep their own "Select Main model" copy.
+    private var distillMainModelTitle: String {
+        if vm.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Select model" }
+        return vm.modelOptionsForSelectedProvider.first(where: { $0.id == vm.model })?.label ?? vm.model
+    }
+
+    private var distillReasoningModelTitle: String {
+        guard let reasoning = vm.reasoningModel, !reasoning.isEmpty else { return "Off" }
+        return vm.modelOptionsForSelectedProvider.first(where: { $0.id == reasoning })?.label ?? reasoning
+    }
+
+    private var distillReasoningModelUnavailable: Bool {
+        guard let reasoning = vm.reasoningModel, !reasoning.isEmpty else { return false }
+        if reasoning == vm.model { return true }
+        return !vm.modelOptionsForSelectedProvider.contains(where: { $0.id == reasoning })
     }
     private var autoRoutingPrerequisitesLoading: Bool {
         vm.selectedThreadId != nil && (
@@ -15019,12 +15036,34 @@ public struct AgentAppView: View {
     /// P3: VoiceOver label for the model picker pill that reads as structured
     /// text rather than the raw concatenated visual tokens.
     private var modelPillPresentation: AgentModelPillPresentation {
-        AgentModelPillPresentation(
+        if vm.provider == .distill {
+            // Distill runs Main + Reasoning as separate pills. The Main pill
+            // shows the Distill Main effort selection (Auto or pinned) — not
+            // the legacy `reasoningEffort`, which goes stale under Auto — and
+            // flags a pin missing from the live list. Context moves to the
+            // picker rows so the two pills stay compact.
+            return AgentModelPillPresentation(
+                title: modelLabel,
+                effort: vm.supportsReasoningForSelectedModel ? vm.distillMainEffortSelection.pickerDisplayName : nil,
+                serviceTier: vm.serviceTier == .fast ? serviceTierLabel : nil,
+                prefix: "Main",
+                warning: vm.selectedModelUnavailableNotice != nil
+            )
+        }
+        return AgentModelPillPresentation(
             title: modelLabel,
             loading: autoRoutingPillLoading,
             effort: (vm.routingMode == .manual && vm.supportsReasoningForSelectedModel) ? effortLabel : nil,
             serviceTier: (vm.routingMode == .manual && vm.serviceTier == .fast) ? serviceTierLabel : nil,
             contextWindow: vm.routingMode == .manual ? vm.selectedModelContextWindowLabel : nil
+        )
+    }
+
+    private var reasoningPillPresentation: AgentModelPillPresentation {
+        AgentModelPillPresentation(
+            title: distillReasoningModelTitle,
+            prefix: "Reasoning",
+            warning: distillReasoningModelUnavailable
         )
     }
 
@@ -18045,6 +18084,9 @@ public struct AgentAppView: View {
             }
             if AgentComposerChromePresentation.shows(.model, mode: composerChromeMode) {
                 modelMenu
+                if vm.provider == .distill {
+                    reasoningModelMenu
+                }
             }
             if AgentComposerChromePresentation.shows(.permission, mode: composerChromeMode) {
                 permissionMenu
@@ -18436,39 +18478,67 @@ public struct AgentAppView: View {
         }
         // Source/account selection lives on the dedicated left capsule so the
         // model popover stays model/effort/tier only.
-        .help("Model · reasoning effort · service tier")
+        .help(vm.provider == .distill ? "Main model · main effort" : "Model · reasoning effort · service tier")
     }
 
-    private var modelOptionsPopover: some View {
-        // P2: "Retry loading models" must remain tappable even mid-run so a
-        // failed model-list fetch can be retried without stopping the run.
-        // Only mutation rows (set provider/model/effort/tier) are disabled
-        // while running; the retry and recovery rows are excluded.
+    /// Distill-only second pill: the optional separate reasoning model.
+    private var reasoningModelMenu: some View {
+        Button {
+            showReasoningModelOptions.toggle()
+        } label: {
+            AgentModelPillLabel(presentation: reasoningPillPresentation, width: reasoningModelMenuLabelWidth)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(reasoningPillPresentation.accessibilityLabel)
+        .accessibilityIdentifier("agent.reasoningModel.menu")
+        .popover(isPresented: $showReasoningModelOptions, arrowEdge: .bottom) {
+            reasoningModelOptionsPopover
+        }
+        .help("Reasoning model · reasoning effort")
+    }
+
+    private var reasoningModelOptionsPopover: some View {
         let running = vm.selectedThreadRunIsStartingOrRunning
         let configurationLocked = running || !vm.selectedProviderCanRun
-        let showsAutoRouting = vm.provider != .distill
-        let presentation = AgentModelPopoverPresentation.current(
-            mode: showsAutoRouting ? vm.routingMode : .manual,
-            autoRoutingLoading: autoRoutingPrerequisitesLoading
-        )
         return AgentModelPopoverChrome(
-            presentation: presentation,
-            autoEnabled: Binding(
-                get: { vm.routingMode == .auto },
-                set: { _ = vm.setAutoModelRoutingEnabled($0) }
-            ),
-            toggleDisabled: running || !presentation.autoToggleEnabled,
-            showsAutoRouting: showsAutoRouting
+            presentation: .current(mode: .manual),
+            autoEnabled: .constant(false),
+            toggleDisabled: true,
+            showsAutoRouting: false,
+            title: "Reasoning model"
         ) {
-            // UX-MAC_AGENT-016: readable while running; mutation rows disable below.
             if running {
                 Text("Read-only while running")
                     .font(DS.Font.caption2)
                     .foregroundColor(DS.Palette.textTertiary)
                     .fixedSize(horizontal: true, vertical: false)
             }
-            let modelOptions = vm.modelOptionsForSelectedProvider
-            let customModels = vm.customModelsForSelectedProvider
+            modelListStatusHeader
+            AgentDistillReasoningModelSection(
+                mainModel: vm.model,
+                reasoningModel: vm.reasoningModel,
+                reasoningModels: vm.modelOptionsForSelectedProvider,
+                reasoningEffortSelection: vm.distillReasoningEffortSelection,
+                reasoningEfforts: vm.distillReasoningEfforts,
+                supportsReasoningModelEffort: vm.selectedProviderCapabilities.supportsDistillReasoningModelEffort,
+                width: compactModelMenuWidth,
+                isDisabled: configurationLocked,
+                emptyListTitle: vm.modelListLoading ? "Loading models..." : "No models available",
+                onSelectReasoningModel: { model in
+                    vm.setReasoningModel(model)
+                },
+                onSelectReasoningEffort: { selection in
+                    vm.setDistillReasoningEffortSelection(selection)
+                }
+            )
+        }
+        .accessibilityIdentifier("agent.reasoningModel.popover")
+    }
+
+    /// Loading / retry / fallback header shared by the Main and Reasoning
+    /// popovers so both Distill pills report list health identically.
+    private var modelListStatusHeader: some View {
+        VStack(alignment: .leading, spacing: 0) {
             if vm.modelListLoading {
                 Text("Loading models...")
                     .font(DS.Font.caption)
@@ -18501,74 +18571,103 @@ public struct AgentAppView: View {
                     dismiss: { vm.dismissProviderSnapshotStatusMessage() }
                 )
             }
-            if vm.provider == .distill || !modelOptions.isEmpty || !customModels.isEmpty {
-                // F33: no provider gate — codex's baked-in list must surface
-                // the same fallback notice + refresh affordance as claude.
-                if vm.displayedModelListIsFallback {
-                    Text("Live model list unavailable. Refresh to check available models.")
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textSecondary)
-                    compactMenuRow("Refresh model list", selected: false) {
-                        // F11: reloads snapshots (the rows the picker shows)
-                        // and bypasses the discovery TTL, not just loadModels.
-                        Task { await vm.refreshModelList() }
-                    }
-                    .disabled(vm.modelListLoading)
+            // F33: no provider gate — codex's baked-in list must surface
+            // the same fallback notice + refresh affordance as claude.
+            if vm.displayedModelListIsFallback {
+                Text("Live model list unavailable. Refresh to check available models.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                compactMenuRow("Refresh model list", selected: false) {
+                    // F11: reloads snapshots (the rows the picker shows)
+                    // and bypasses the discovery TTL, not just loadModels.
+                    Task { await vm.refreshModelList() }
                 }
-                // F9: a pinned model missing from the displayed list is kept —
-                // explain why no row is checked instead of silently swapping.
-                if let unavailableNotice = vm.selectedModelUnavailableNotice {
-                    Text(unavailableNotice)
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.warning)
-                }
-                if vm.provider == .distill {
-                    AgentDistillModelSelectors(
-                        mainModel: vm.model,
-                        mainModels: modelOptions,
-                        customMainModels: customModels,
-                        reasoningModel: vm.reasoningModel,
-                        reasoningModels: modelOptions,
-                        mainEffortSelection: vm.distillMainEffortSelection,
-                        mainEfforts: vm.supportedReasoningEffortsForSelectedModel,
-                        reasoningEffortSelection: vm.distillReasoningEffortSelection,
-                        reasoningEfforts: vm.distillReasoningEfforts,
-                        supportsMainEffortAuto: vm.selectedProviderCapabilities.supportsDistillMainEffortAuto,
-                        supportsReasoningModelEffort: vm.selectedProviderCapabilities.supportsDistillReasoningModelEffort,
-                        width: compactModelMenuWidth,
-                        isDisabled: configurationLocked,
-                        onSelectMainModel: { model in
-                            vm.setModel(model)
-                            showModelOptions = false
-                        },
-                        onSelectCustomMainModel: { model in
-                            vm.setCustomModel(model)
-                            showModelOptions = false
-                        },
-                        onSelectReasoningModel: { model in
-                            vm.setReasoningModel(model)
-                        },
-                        onSelectMainEffort: { selection in
-                            vm.setDistillMainEffortSelection(selection)
-                        },
-                        onSelectReasoningEffort: { selection in
-                            vm.setDistillReasoningEffortSelection(selection)
-                        },
-                        mainFooter: {
-                            if vm.supportsCustomModelForSelectedProvider {
-                                if showCustomModelField {
-                                    customModelInlineField
-                                } else {
-                                    compactMenuRow("Custom...", selected: false) {
-                                        customModelDraft = vm.modelOptionsForSelectedProvider.contains(where: { $0.id == vm.model }) ? "" : vm.model
-                                        showCustomModelField = true
-                                    }
-                                    .disabled(configurationLocked)
+                .disabled(vm.modelListLoading)
+            }
+        }
+    }
+
+    private var modelOptionsPopover: some View {
+        // P2: "Retry loading models" must remain tappable even mid-run so a
+        // failed model-list fetch can be retried without stopping the run.
+        // Only mutation rows (set provider/model/effort/tier) are disabled
+        // while running; the retry and recovery rows are excluded.
+        let running = vm.selectedThreadRunIsStartingOrRunning
+        let configurationLocked = running || !vm.selectedProviderCanRun
+        let showsAutoRouting = vm.provider != .distill
+        let presentation = AgentModelPopoverPresentation.current(
+            mode: showsAutoRouting ? vm.routingMode : .manual,
+            autoRoutingLoading: autoRoutingPrerequisitesLoading
+        )
+        return AgentModelPopoverChrome(
+            presentation: presentation,
+            autoEnabled: Binding(
+                get: { vm.routingMode == .auto },
+                set: { _ = vm.setAutoModelRoutingEnabled($0) }
+            ),
+            toggleDisabled: running || !presentation.autoToggleEnabled,
+            showsAutoRouting: showsAutoRouting,
+            title: vm.provider == .distill ? "Main model" : "Model"
+        ) {
+            // UX-MAC_AGENT-016: readable while running; mutation rows disable below.
+            if running {
+                Text("Read-only while running")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+            let modelOptions = vm.modelOptionsForSelectedProvider
+            let customModels = vm.customModelsForSelectedProvider
+            modelListStatusHeader
+            if vm.provider == .distill {
+                // The section owns the unavailable warning inline (single
+                // notice next to the rows); the outer F9 notice below is
+                // non-Distill only to avoid painting the same fact twice.
+                AgentDistillMainModelSection(
+                    mainModel: vm.model,
+                    mainModels: modelOptions,
+                    customMainModels: customModels,
+                    reasoningModel: vm.reasoningModel,
+                    mainEffortSelection: vm.distillMainEffortSelection,
+                    mainEfforts: vm.supportedReasoningEffortsForSelectedModel,
+                    supportsMainEffortAuto: vm.selectedProviderCapabilities.supportsDistillMainEffortAuto,
+                    width: compactModelMenuWidth,
+                    isDisabled: configurationLocked,
+                    emptyListTitle: vm.modelListLoading ? "Loading models..." : "No models available",
+                    onSelectMainModel: { model in
+                        vm.setModel(model)
+                        showModelOptions = false
+                    },
+                    onSelectCustomMainModel: { model in
+                        vm.setCustomModel(model)
+                        showModelOptions = false
+                    },
+                    onSelectMainEffort: { selection in
+                        vm.setDistillMainEffortSelection(selection)
+                    },
+                    footer: {
+                        if vm.supportsCustomModelForSelectedProvider {
+                            if showCustomModelField {
+                                customModelInlineField
+                            } else {
+                                compactMenuRow("Custom...", selected: false) {
+                                    customModelDraft = vm.modelOptionsForSelectedProvider.contains(where: { $0.id == vm.model }) ? "" : vm.model
+                                    showCustomModelField = true
                                 }
+                                .disabled(configurationLocked)
                             }
                         }
-                    )
-                } else {
+                    }
+                )
+            } else {
+                if !modelOptions.isEmpty || !customModels.isEmpty {
+                    // F9: a pinned model missing from the displayed list is kept —
+                    // explain why no row is checked instead of silently swapping.
+                    if let unavailableNotice = vm.selectedModelUnavailableNotice {
+                        Text(unavailableNotice)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.warning)
+                    }
                     compactMenuSection("Model")
                     let visibleModelCount = showAllModelOptions ? modelOptions.count : min(3, modelOptions.count)
                     let visibleCustomModelCount = showAllModelOptions ? customModels.count : max(0, 3 - visibleModelCount)
@@ -18594,7 +18693,7 @@ public struct AgentAppView: View {
                         }
                     }
                 }
-                if vm.provider != .distill && vm.supportsCustomModelForSelectedProvider {
+                if vm.supportsCustomModelForSelectedProvider {
                     if showCustomModelField {
                         customModelInlineField
                     } else {
@@ -18725,6 +18824,9 @@ public struct AgentAppView: View {
     private let modelMenuWidthCache = ModelMenuWidthCache()
 
     private var compactModelMenuWidth: CGFloat {
+        if vm.provider == .distill {
+            return distillModelMenuWidth
+        }
         // Source/account titles moved to the dedicated capsule; this width is
         // only for model/effort/tier rows inside the model popover.
         var titles: [String] = []
@@ -18753,8 +18855,30 @@ public struct AgentAppView: View {
         if modelMenuWidthCache.signature == signature {
             return modelMenuWidthCache.width
         }
-        let estimated = titles.map { CGFloat($0.count * 7 + 34) }.max() ?? 112
-        let width = min(max(estimated, 112), 260)
+        let width = AgentModelMenuWidth.estimatedWidth(titles: titles)
+        modelMenuWidthCache.signature = signature
+        modelMenuWidthCache.width = width
+        return width
+    }
+
+    /// Distill popovers measure the FULL label set (both pills share it) with
+    /// a wider cap — the 3-row estimate truncated live labels like
+    /// "Muse Spark 1.3 Contributor" to "Muse Spark 1.3...".
+    private var distillModelMenuWidth: CGFloat {
+        let modelOptions = vm.modelOptionsForSelectedProvider
+        var titles = modelOptions.map(\.label)
+        titles.append(contentsOf: vm.customModelsForSelectedProvider)
+        titles.append(contentsOf: vm.supportedReasoningEffortsForSelectedModel.map(\.displayName))
+        titles.append(contentsOf: ["Auto", "Custom...", "Show all \(modelOptions.count) models", "Filter models"])
+        let signature = "distill|" + titles.joined(separator: "|")
+        if modelMenuWidthCache.signature == signature {
+            return modelMenuWidthCache.width
+        }
+        let width = AgentModelMenuWidth.estimatedWidth(
+            titles: titles,
+            min: AgentModelMenuWidth.distillMin,
+            max: AgentModelMenuWidth.distillMax
+        )
         modelMenuWidthCache.signature = signature
         modelMenuWidthCache.width = width
         return width
@@ -18767,11 +18891,32 @@ public struct AgentAppView: View {
         let loadingWidth: CGFloat = autoRoutingPillLoading ? 14 + DS.Space.xs : 0
         let separatorCount = max(0, currentModelMenuLabelParts.count - 1)
         let spacing = CGFloat(separatorCount + 1) * DS.Space.xs
-        return min(max(ceil(measured + chevronWidth + loadingWidth + spacing), 44), 260)
+        // Distill renders two pills side by side; cap the Main pill so the
+        // Reasoning pill keeps room in the composer row.
+        let cap: CGFloat = vm.provider == .distill ? 220 : 260
+        return min(max(ceil(measured + chevronWidth + loadingWidth + spacing), 44), cap)
+    }
+
+    private var reasoningModelMenuLabelWidth: CGFloat {
+        let label = "Reasoning · \(distillReasoningModelTitle)"
+        let measured = Self.measureCurrentModelMenuLabel(label)
+        let chevronWidth: CGFloat = 8
+        let spacing = CGFloat(2) * DS.Space.xs
+        return min(max(ceil(measured + chevronWidth + spacing), 44), 200)
     }
 
     private var currentModelMenuLabelParts: [String] {
         if vm.routingMode == .auto { return ["Auto"] }
+        if vm.provider == .distill {
+            var parts = ["Main", modelLabel]
+            if vm.supportsReasoningForSelectedModel {
+                parts.append(vm.distillMainEffortSelection.pickerDisplayName)
+            }
+            if vm.serviceTier == .fast {
+                parts.append(serviceTierLabel)
+            }
+            return parts
+        }
         var parts = [modelLabel]
         if vm.supportsReasoningForSelectedModel {
             parts.append(effortLabel)
