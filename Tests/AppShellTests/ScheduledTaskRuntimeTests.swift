@@ -123,6 +123,70 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertEqual(asError.localizedDescription, "Scheduler version mismatch. Retry.")
     }
 
+    @MainActor
+    func test_distillScheduleValidationRejectsDuplicateModelsAndUnsupportedEffortBeforeExecution() throws {
+        // WHY: unattended jobs must not create a thread with ambiguous models or an unsupported effort.
+        let snapshot = AgentProviderSnapshot(
+            id: "distill",
+            provider: .distill,
+            driverKind: .distillACP,
+            displayName: "Distill",
+            accentColor: "#6E56CF",
+            continuationGroup: "distill",
+            interactionModes: [.default],
+            permissionModes: [.fullAccess],
+            enabled: true,
+            installed: true,
+            status: .available,
+            authenticated: true,
+            models: [
+                AgentModelDescriptor(id: "main", label: "Main", provider: .distill, supportsReasoning: true, supportedReasoningEfforts: [.high]),
+                AgentModelDescriptor(id: "reason", label: "Reason", provider: .distill, supportsReasoning: true, supportedReasoningEfforts: [.high]),
+            ],
+            slashCommands: [],
+            capabilities: AgentProviderCapabilities(
+                supportsDistillMainEffortAuto: true,
+                supportsDistillReasoningModelEffort: true
+            )
+        )
+        var task = makeHourly(nextRunAt: nil)
+        task.provider = .distill
+        task.model = "main"
+        task.distillMainEffortSelection = .fixed(.low)
+        task.reasoningModel = "reason"
+        task.distillReasoningEffortSelection = .fixed(.high)
+        let selection = ScheduledTaskExecutor.modelSelection(for: task)
+        XCTAssertEqual(selection.distillMainEffortSelection, .fixed(.low))
+        XCTAssertEqual(selection.distillReasoningEffortSelection, .fixed(.high))
+        XCTAssertThrowsError(try ScheduledTaskExecutor.validateDistillConfiguration(task, snapshot: snapshot)) {
+            XCTAssertEqual(($0 as? ScheduledTaskPreflightError)?.description,
+                           ScheduledTaskPreflightError.unsupportedReasoning("Low").description)
+        }
+
+        task.distillMainEffortSelection = .fixed(.high)
+        task.distillReasoningEffortSelection = .fixed(.low)
+        XCTAssertThrowsError(try ScheduledTaskExecutor.validateDistillConfiguration(task, snapshot: snapshot)) {
+            XCTAssertEqual(($0 as? ScheduledTaskPreflightError)?.description,
+                           ScheduledTaskPreflightError.unsupportedReasoning("Low").description)
+        }
+
+        task.model = "  "
+        task.reasoningModel = nil
+        XCTAssertThrowsError(try ScheduledTaskExecutor.validateDistillConfiguration(task, snapshot: snapshot)) {
+            XCTAssertEqual(
+                ($0 as? ScheduledTaskPreflightError)?.description,
+                ScheduledTaskPreflightError.invalidTask("Select an explicit Distill Main model.").description
+            )
+        }
+
+        task.model = "reason"
+        task.reasoningModel = "reason"
+        XCTAssertThrowsError(try ScheduledTaskExecutor.validateDistillConfiguration(task, snapshot: snapshot)) {
+            XCTAssertEqual(($0 as? ScheduledTaskPreflightError)?.description,
+                           ScheduledTaskPreflightError.invalidTask("Main and Reasoning Distill models must differ.").description)
+        }
+    }
+
     func test_autoRoutingConfigurationCarriesScheduledFallbackAndEligibleProviders() {
         var task = makeHourly(nextRunAt: nil)
         task.routingMode = .auto

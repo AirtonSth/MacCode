@@ -25,6 +25,40 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertEqual(task.nextRunAt, Date(timeIntervalSince1970: 200))
     }
 
+    func test_distillScheduleRestoresAndRunsManually_becauseItCannotAutoRouteModels() throws {
+        let now = Date(timeIntervalSince1970: 100)
+        var draft = ScheduledTaskEditorDraft(now: now)
+        draft.title = "Distill task"
+        draft.prompt = "Inspect"
+        draft.workspaceID = WorkspaceID()
+        draft.workspacePathSnapshot = "/tmp"
+        draft.runAsUser = NSUserName()
+        draft.runAsUID = ScheduledSystemUserCatalog.user(named: NSUserName())?.uid ?? 501
+        draft.provider = .distill
+        draft.providerInstanceID = "distill"
+        draft.model = "grok-4.6"
+        draft.reasoningModel = "chatgpt/gpt-6-sol"
+        draft.distillMainEffortSelection = .fixed(.high)
+        draft.distillReasoningEffortSelection = .automatic
+        draft.routingMode = .auto
+
+        let task = try draft.makeTask(now: now)
+        XCTAssertEqual(task.routingMode, .manual)
+        XCTAssertEqual(task.effectiveRoutingMode, .manual)
+        XCTAssertEqual(task.reasoningModel, "chatgpt/gpt-6-sol")
+        XCTAssertEqual(task.distillMainEffortSelection, .fixed(.high))
+        XCTAssertEqual(task.distillReasoningEffortSelection, .automatic)
+        let restoredDraft = ScheduledTaskEditorDraft(task: task, now: now)
+        XCTAssertEqual(restoredDraft.reasoningModel, "chatgpt/gpt-6-sol")
+        XCTAssertEqual(restoredDraft.distillMainEffortSelection, .fixed(.high))
+        XCTAssertEqual(restoredDraft.distillReasoningEffortSelection, .automatic)
+
+        var persistedTask = task
+        persistedTask.routingMode = .auto
+        XCTAssertEqual(persistedTask.effectiveRoutingMode, .manual)
+        XCTAssertEqual(ScheduledTaskEditorDraft(task: persistedTask, now: now).routingMode, .manual)
+    }
+
     func test_sidebarPlacesScheduleTasksAfterActiveThreads_becauseNavigationOrderIsContractual() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
         let newWorkspace = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.newWorkspace\")"))

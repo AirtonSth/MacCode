@@ -52,7 +52,7 @@ final class ScheduledTaskStoreTests: XCTestCase {
                 provider, provider_instance_id, model, reasoning_effort, recurrence_json, timezone_id,
                 enabled, created_at, updated_at
             ) VALUES(
-                'legacy', 'Legacy', 'Run', 'workspace', '/tmp', 'sam', 501,
+                '00000000-0000-4000-8000-000000000001', 'Legacy', 'Run', '00000000-0000-4000-8000-000000000002', '/tmp', 'sam', 501,
                 'codex', 'codex', 'gpt-5', 'high', '{"kind":"daily","hour":9,"minute":0}',
                 'UTC', 1, '2026-07-22T00:00:00Z', '2026-07-22T00:00:00Z'
             );
@@ -60,9 +60,15 @@ final class ScheduledTaskStoreTests: XCTestCase {
 
         try Schema.migrate(legacyDB)
 
-        let statement = try legacyDB.prepare("SELECT routing_mode FROM scheduled_tasks WHERE id = 'legacy';")
+        let statement = try legacyDB.prepare("SELECT routing_mode FROM scheduled_tasks WHERE id = '00000000-0000-4000-8000-000000000001';")
         XCTAssertTrue(try statement.step())
         XCTAssertEqual(statement.columnText(0), "manual")
+        let legacy = try XCTUnwrap(ScheduledTaskStore(db: legacyDB).get(
+            id: UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
+        ))
+        XCTAssertNil(legacy.reasoningModel, "old tasks remain without an independent Reasoning model")
+        XCTAssertNil(legacy.distillMainEffortSelection, "old tasks keep the legacy shared-effort representation")
+        XCTAssertNil(legacy.distillReasoningEffortSelection, "old tasks must not acquire an invented Reasoning pin")
     }
 
     func test_saveAndListRoundTripEveryExecutionField_becauseAgentRunsMustBeExact() throws {
@@ -72,6 +78,21 @@ final class ScheduledTaskStoreTests: XCTestCase {
 
         XCTAssertEqual(try store.list(), [task])
         XCTAssertEqual(try store.get(id: task.id)?.effectiveRoutingMode, .auto)
+    }
+
+    func test_distillRoleModelsAndEffortsRoundTrip_becauseScheduledRunsMustRetainIndependentSettings() throws {
+        var task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
+        task.provider = .distill
+        task.providerInstanceID = "distill-primary"
+        task.model = "main-model"
+        task.reasoningModel = "reasoning-model"
+        task.distillMainEffortSelection = .fixed(.high)
+        task.distillReasoningEffortSelection = .automatic
+
+        try store.save(task)
+
+        XCTAssertEqual(try store.get(id: task.id), task)
+        XCTAssertEqual(try store.list(), [task])
     }
 
     func test_claimDueDeduplicatesOccurrenceAndBlocksSameTaskOverlap_becauseCrashesMustNotDoubleRun() throws {

@@ -394,6 +394,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var permissionMode: AgentPermissionMode = .supervised
     @Published public var reasoningEffort: AgentReasoningEffort = .medium
     @Published public var reasoningModel: String?
+    @Published public var distillMainEffortSelection: AgentEffortSelection = .automatic
+    @Published public var distillReasoningEffortSelection: AgentEffortSelection = .automatic
     @Published public var serviceTier: AgentServiceTier = .auto
     @Published public private(set) var routingMode: AgentRoutingMode = .manual
     @Published public var executionMode: AgentExecutionMode = .local
@@ -1078,7 +1080,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 provider: routing.manualSelection.provider,
                 providerInstanceId: routing.manualProviderInstanceId ?? routing.manualSelection.provider.rawValue,
                 model: routing.manualSelection.effectiveModel,
-                reasoningEffort: routing.manualSelection.reasoningEffort
+                reasoningEffort: routing.manualSelection.reasoningEffort,
+                distillMainEffortSelection: routing.manualSelection.distillMainEffortSelection,
+                distillReasoningEffortSelection: routing.manualSelection.distillReasoningEffortSelection
             ))
             rememberNewThreadDefaults()
         }
@@ -2335,8 +2339,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // (perf AA-04).
         applyQueuedStatusForSelectedThread()
         let routing = selectedThread.effectiveRoutingConfiguration
-        routingMode = routing.mode
         let manual = routing.manualSelection
+        routingMode = routing.mode == .auto && manual.provider == .distill ? .manual : routing.mode
         provider = manual.provider
         providerInstanceId = routing.manualProviderInstanceId ?? manual.provider.rawValue
         runAsUser = selectedThread.runAsUser ?? AgentRunAsUser.current()
@@ -2344,6 +2348,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         permissionMode = selectedThread.permissionMode
         reasoningEffort = manual.reasoningEffort
         reasoningModel = selectedThread.reasoningModel
+        distillMainEffortSelection = manual.distillMainEffortSelection
+            ?? .fixed(manual.reasoningEffort)
+        distillReasoningEffortSelection = manual.distillReasoningEffortSelection ?? .automatic
         serviceTier = manual.serviceTier
         executionMode = selectedThread.executionMode
         baseBranch = selectedThread.baseBranch ?? gitBranch ?? "main"
@@ -2459,6 +2466,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     self.statusMessage = "Could not open thread: \(error)"
                     return
                 }
+            }
+            if thread.effectiveRoutingConfiguration.mode == .auto,
+               thread.effectiveRoutingConfiguration.manualSelection.provider == .distill {
+                self.persistDistillManualRoutingIfNeeded(threadId: id)
             }
             await self.hydrateOpenedThread(
                 thread,
@@ -2915,6 +2926,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                       self.softReselectDurableGeneration == generation,
                       self.selectThreadOpenGeneration == openGeneration,
                       self.selectedThreadId == threadId else { return }
+                if self.provider == .distill && self.routingMode == .manual {
+                    self.persistDistillManualRoutingIfNeeded(threadId: threadId)
+                }
                 self.applyQueuedMessagesReload(queued, for: threadId)
                 let nextStarted = AgentAppViewModel.resolvedRunStartedAt(
                     current: self.runStartedAt,
@@ -3929,6 +3943,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Same-thread re-select: sync chrome/status without wiping the transcript.
     /// Host `refreshAgentSurfaces(reloadTranscriptIfSelected:)` and rail clicks
     /// re-enter here; full open was causing 2–4 full reloads of the same thread.
+    private func persistDistillManualRoutingIfNeeded(threadId: AgentThreadID) {
+        guard selectedThreadId == threadId,
+              provider == .distill,
+              routingMode == .manual else { return }
+        do {
+            guard let durableWorkspace = try threadRepo.workspaceId(of: threadId),
+                  durableWorkspace == workspaceID,
+                  let storedRouting = try threadRepo.routingConfiguration(of: threadId),
+                  storedRouting.mode == .auto,
+                  storedRouting.manualSelection.provider == .distill else { return }
+            _ = persistThreadConfig()
+        } catch {
+            if statusMessage.isEmpty {
+                statusMessage = "Could not repair Distill thread routing: \(error)"
+            }
+        }
+    }
+
     private func softReselectOpenThread(_ selectedThread: AgentThread, markRead: Bool) {
         let id = selectedThread.id
         Self.agentOpenTrace(
@@ -3938,10 +3970,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         scheduleSoftReselectDurableRefresh(threadId: id)
         let routing = selectedThread.effectiveRoutingConfiguration
         let manual = routing.manualSelection
+        let effectiveRoutingMode = routing.mode == .auto && manual.provider == .distill ? .manual : routing.mode
         // Assign-if-changed: soft reselect re-entered on every host refresh / rail
         // re-click and re-published identical chrome (multipass SwiftUI body churn).
-        if Self.shouldAssignIfChanged(current: routingMode, next: routing.mode) {
-            routingMode = routing.mode
+        if Self.shouldAssignIfChanged(current: routingMode, next: effectiveRoutingMode) {
+            routingMode = effectiveRoutingMode
         }
         if Self.shouldAssignIfChanged(current: provider, next: manual.provider) {
             provider = manual.provider
@@ -3965,6 +3998,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         if Self.shouldAssignIfChanged(current: reasoningModel, next: selectedThread.reasoningModel) {
             reasoningModel = selectedThread.reasoningModel
+        }
+        let nextMainEffortSelection = manual.distillMainEffortSelection ?? .fixed(manual.reasoningEffort)
+        if Self.shouldAssignIfChanged(current: distillMainEffortSelection, next: nextMainEffortSelection) {
+            distillMainEffortSelection = nextMainEffortSelection
+        }
+        let nextReasoningEffortSelection = manual.distillReasoningEffortSelection ?? .automatic
+        if Self.shouldAssignIfChanged(current: distillReasoningEffortSelection, next: nextReasoningEffortSelection) {
+            distillReasoningEffortSelection = nextReasoningEffortSelection
         }
         if Self.shouldAssignIfChanged(current: serviceTier, next: manual.serviceTier) {
             serviceTier = manual.serviceTier
@@ -5610,8 +5651,38 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             modelId: isCustom ? (descriptor?.id ?? "") : model,
             customModelId: isCustom ? model : nil,
             reasoningEffort: reasoningEffort,
-            serviceTier: serviceTier
+            serviceTier: serviceTier,
+            distillMainEffortSelection: provider == .distill ? distillMainEffortSelection : nil,
+            distillReasoningEffortSelection: provider == .distill ? distillReasoningEffortSelection : nil
         )
+    }
+
+    public var distillReasoningEfforts: [AgentReasoningEffort] {
+        guard provider == .distill, let reasoningModel else { return [] }
+        return modelOptionsForSelectedProvider.first(where: { $0.id == reasoningModel })?.supportedReasoningEfforts
+            ?? DistillReasoningPolicy.supportedEfforts(for: reasoningModel)
+    }
+
+    public var selectedDistillEffortValidationMessage: String? {
+        guard provider == .distill else { return nil }
+        if let effort = distillMainEffortSelection.effort,
+           !supportedReasoningEffortsForSelectedModel.isEmpty,
+           !supportedReasoningEffortsForSelectedModel.contains(effort) {
+            return "Main effort \(effort.displayName) is unavailable for the selected Distill model. Choose Auto or a supported effort."
+        }
+        if distillMainEffortSelection.isAutomatic,
+           !selectedProviderCapabilities.supportsDistillMainEffortAuto {
+            return "Update the Distill ACP harness to apply Auto Main effort."
+        }
+        if let reasoningModel, let effort = distillReasoningEffortSelection.effort {
+            if !distillReasoningEfforts.isEmpty, !distillReasoningEfforts.contains(effort) {
+                return "Reasoning effort \(effort.displayName) is unavailable for \(reasoningModel). Choose Auto or a supported effort."
+            }
+            if !selectedProviderCapabilities.supportsDistillReasoningModelEffort {
+                return "Update the Distill ACP harness to apply a separate Reasoning-model effort."
+            }
+        }
+        return nil
     }
 
     public func normalizeSelectedModelOptions() {
@@ -5619,9 +5690,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if efforts.isEmpty {
             reasoningEffort = .medium
         } else if !efforts.contains(reasoningEffort) {
-            // Prefer the model default when clamping (Grok 4.5 default is high;
-            // otherwise keep the first advertised level).
             reasoningEffort = efforts.contains(.high) ? .high : (efforts.first ?? .medium)
+        }
+        if provider == .distill, reasoningModel == nil {
+            distillReasoningEffortSelection = .automatic
         }
         if !supportsServiceTierForSelectedModel {
             serviceTier = .auto
@@ -6180,6 +6252,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         sourceSelectionUserPinned = true
         providerInstanceId = snapshot.id
         provider = snapshot.provider
+        if provider == .distill {
+            routingMode = .manual
+        }
         // F10/F33: same flag coherence as applyProviderSnapshots — snapshot
         // rows replace the VM's own fetch, so a stale fallback flag must not
         // put a false "built-in defaults" warning on the new instance's list.
@@ -6196,8 +6271,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func setProvider(_ newProvider: AgentProvider) {
         guard !executionLocked else { return }
         if let selectedThreadId { persistComposerDraft(for: selectedThreadId) }
+        let previousProvider = provider
         sourceSelectionUserPinned = true
         provider = newProvider
+        if newProvider == .distill {
+            routingMode = .manual
+        }
         // Prefer a real snapshot id when snapshots are loaded so Source stays
         // checkmarked after a Source switch (ids are "codex-cli", not "codex").
         if let snap = providerSnapshots.first(where: { $0.provider == newProvider && $0.enabled })
@@ -6223,6 +6302,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             )
         }
         normalizeSelectedModelOptions()
+        if newProvider == .distill, previousProvider != .distill {
+            let efforts = supportedReasoningEffortsForSelectedModel
+            distillMainEffortSelection = efforts.isEmpty
+                ? .automatic
+                : .fixed(efforts.contains(.medium) ? .medium : (efforts.contains(.high) ? .high : efforts[0]))
+            distillReasoningEffortSelection = .automatic
+        }
         normalizeInteractionModeForSelectedProvider()
         persistThreadConfig()
     }
@@ -6239,6 +6325,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // and bumps routing revision even when picker/permission/run-as-user
         // did not change.
         if let painted = threads.first(where: { $0.id == id }),
+           (provider != .distill || painted.effectiveRoutingConfiguration.mode == .manual),
            Self.paintedThreadMatchesPersistedConfig(
                 painted,
                 provider: provider,
@@ -6272,7 +6359,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             let nextRouting = try routingBase.replacing(
                 expectedRevision: routingBase.revision,
-                mode: routingBase.mode,
+                mode: provider == .distill ? .manual : routingBase.mode,
                 manualSelection: currentModelSelection,
                 manualProviderInstanceId: providerInstanceId,
                 eligibleProviders: routingBase.eligibleProviders,
@@ -6365,6 +6452,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// exact provider/model/effort/tier captured when Auto was enabled.
     @discardableResult
     public func setAutoModelRoutingEnabled(_ enabled: Bool) -> Bool {
+        guard provider != .distill || !enabled else { return false }
         guard let id = selectedThreadId else {
             routingMode = enabled ? .auto : .manual
             rememberNewThreadDefaults()
@@ -6446,7 +6534,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private func restoreThreadConfiguration(from thread: AgentThread) {
         let routing = thread.effectiveRoutingConfiguration
-        routingMode = routing.mode
+        let forceManualForDistill = routing.mode == .auto && routing.manualSelection.provider == .distill
+        routingMode = forceManualForDistill ? .manual : routing.mode
         provider = routing.manualSelection.provider
         providerInstanceId = routing.manualProviderInstanceId ?? routing.manualSelection.provider.rawValue
         runAsUser = thread.runAsUser ?? AgentRunAsUser.current()
@@ -6526,6 +6615,36 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func setReasoningEffort(_ effort: AgentReasoningEffort) {
         let efforts = supportedReasoningEffortsForSelectedModel
         reasoningEffort = efforts.isEmpty ? .medium : (efforts.contains(effort) ? effort : (efforts.first ?? .medium))
+        if provider == .distill {
+            distillMainEffortSelection = .fixed(reasoningEffort)
+        }
+        persistThreadConfig()
+    }
+
+    public func setDistillMainEffortSelection(_ selection: AgentEffortSelection) {
+        guard provider == .distill else { return }
+        if selection.isAutomatic,
+           !selectedProviderCapabilities.supportsDistillMainEffortAuto {
+            statusMessage = "Update the Distill ACP session to enable Auto Main effort."
+            return
+        }
+        if let effort = selection.effort {
+            let supported = supportedReasoningEffortsForSelectedModel
+            guard supported.isEmpty || supported.contains(effort) else { return }
+            reasoningEffort = effort
+        }
+        distillMainEffortSelection = selection
+        persistThreadConfig()
+    }
+
+    public func setDistillReasoningEffortSelection(_ selection: AgentEffortSelection) {
+        guard provider == .distill,
+              selectedProviderCapabilities.supportsDistillReasoningModelEffort,
+              reasoningModel != nil else { return }
+        if let effort = selection.effort,
+           !distillReasoningEfforts.isEmpty,
+           !distillReasoningEfforts.contains(effort) { return }
+        distillReasoningEffortSelection = selection
         persistThreadConfig()
     }
 
@@ -6607,7 +6726,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func setReasoningModel(_ model: String?) {
         let trimmed = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        reasoningModel = trimmed.isEmpty ? nil : trimmed
+        let nextModel = trimmed.isEmpty ? nil : trimmed
+        guard nextModel == nil || nextModel != self.model else { return }
+        if nextModel == nil {
+            distillReasoningEffortSelection = .automatic
+        }
+        reasoningModel = nextModel
         persistThreadConfig()
     }
 
@@ -6684,13 +6808,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     private func restoreNewThreadDefaults(_ saved: AgentNewThreadDefaults) {
-        routingMode = saved.routingMode
+        routingMode = saved.provider == .distill ? .manual : saved.routingMode
         runAsUser = saved.runAsUser ?? AgentRunAsUser.current()
         provider = saved.provider
         providerInstanceId = saved.providerInstanceId
         model = saved.model
         lastModelStore.remember(model: saved.model, for: saved.provider)
         reasoningEffort = saved.reasoningEffort
+        distillMainEffortSelection = saved.distillMainEffortSelection
+            ?? (saved.provider == .distill ? .fixed(saved.reasoningEffort) : .automatic)
+        distillReasoningEffortSelection = saved.distillReasoningEffortSelection ?? .automatic
+        if saved.provider == .distill, saved.routingMode == .auto {
+            rememberNewThreadDefaults()
+        }
     }
 
     private func rememberNewThreadDefaults() {
@@ -6700,7 +6830,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             provider: provider,
             providerInstanceId: providerInstanceId,
             model: model,
-            reasoningEffort: reasoningEffort
+            reasoningEffort: reasoningEffort,
+            distillMainEffortSelection: provider == .distill ? distillMainEffortSelection : nil,
+            distillReasoningEffortSelection: provider == .distill ? distillReasoningEffortSelection : nil
         ))
     }
 
@@ -7758,6 +7890,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let sendThreadId = selectedThreadId
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
+        if let message = selectedDistillEffortValidationMessage {
+            statusMessage = message
+            return
+        }
         // S5: refuse concurrent preparation only (active runs may still queue).
         // The preparation latch outlives the "Loading…" chrome: it is held until
         // the provider start returns, while a tracked run already renders
@@ -8255,7 +8391,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let runProvider = provider
         let runProviderInstanceId = providerInstanceId
         let runModel = model
-        let runReasoningEffort = reasoningEffort
+        let runModelSelection = currentModelSelection
+        let runReasoningEffort = provider == .distill
+            ? runModelSelection.distillMainEffortSelection?.effort
+            : reasoningEffort
         let runReasoningModel = reasoningModel
         let runServiceTier = serviceTier
         let runSnapshot = selectedProviderSnapshot
@@ -8494,6 +8633,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             permissionMode: permissionMode,
             reasoningEffort: runReasoningEffort,
             reasoningModel: runReasoningModel,
+            distillMainEffortSelection: runProvider == .distill
+                ? runModelSelection.distillMainEffortSelection : nil,
+            distillReasoningEffortSelection: runProvider == .distill
+                ? runModelSelection.distillReasoningEffortSelection : nil,
             serviceTier: runServiceTier,
             interactionMode: interactionMode,
             providerBinary: launchConfig?.binary,
@@ -14857,7 +15000,10 @@ public struct AgentAppView: View {
     }
 
     private var modelLabel: String {
-        if vm.routingMode == .auto { return "Auto" }
+        if vm.routingMode == .auto, vm.provider != .distill { return "Auto" }
+        if vm.provider == .distill, vm.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Select Main model"
+        }
         return vm.modelOptionsForSelectedProvider.first(where: { $0.id == vm.model })?.label ?? vm.model
     }
     private var autoRoutingPrerequisitesLoading: Bool {
@@ -18300,8 +18446,9 @@ public struct AgentAppView: View {
         // while running; the retry and recovery rows are excluded.
         let running = vm.selectedThreadRunIsStartingOrRunning
         let configurationLocked = running || !vm.selectedProviderCanRun
+        let showsAutoRouting = vm.provider != .distill
         let presentation = AgentModelPopoverPresentation.current(
-            mode: vm.routingMode,
+            mode: showsAutoRouting ? vm.routingMode : .manual,
             autoRoutingLoading: autoRoutingPrerequisitesLoading
         )
         return AgentModelPopoverChrome(
@@ -18310,7 +18457,8 @@ public struct AgentAppView: View {
                 get: { vm.routingMode == .auto },
                 set: { _ = vm.setAutoModelRoutingEnabled($0) }
             ),
-            toggleDisabled: running || !presentation.autoToggleEnabled
+            toggleDisabled: running || !presentation.autoToggleEnabled,
+            showsAutoRouting: showsAutoRouting
         ) {
             // UX-MAC_AGENT-016: readable while running; mutation rows disable below.
             if running {
@@ -18353,8 +18501,7 @@ public struct AgentAppView: View {
                     dismiss: { vm.dismissProviderSnapshotStatusMessage() }
                 )
             }
-            if !modelOptions.isEmpty || !customModels.isEmpty {
-                compactMenuSection("Model")
+            if vm.provider == .distill || !modelOptions.isEmpty || !customModels.isEmpty {
                 // F33: no provider gate — codex's baked-in list must surface
                 // the same fallback notice + refresh affordance as claude.
                 if vm.displayedModelListIsFallback {
@@ -18375,30 +18522,79 @@ public struct AgentAppView: View {
                         .font(DS.Font.caption)
                         .foregroundColor(DS.Palette.warning)
                 }
-                let visibleModelCount = showAllModelOptions ? modelOptions.count : min(3, modelOptions.count)
-                let visibleCustomModelCount = showAllModelOptions ? customModels.count : max(0, 3 - visibleModelCount)
-                let visibleModels = Array(modelOptions.prefix(visibleModelCount))
-                let visibleCustomModels = Array(customModels.prefix(visibleCustomModelCount))
-                ForEach(visibleModels, id: \.id) { model in
-                    compactMenuRow(model.label, selected: model.id == vm.model) {
-                        vm.setModel(model.id)
-                        showModelOptions = false
+                if vm.provider == .distill {
+                    AgentDistillModelSelectors(
+                        mainModel: vm.model,
+                        mainModels: modelOptions,
+                        customMainModels: customModels,
+                        reasoningModel: vm.reasoningModel,
+                        reasoningModels: modelOptions,
+                        mainEffortSelection: vm.distillMainEffortSelection,
+                        mainEfforts: vm.supportedReasoningEffortsForSelectedModel,
+                        reasoningEffortSelection: vm.distillReasoningEffortSelection,
+                        reasoningEfforts: vm.distillReasoningEfforts,
+                        supportsMainEffortAuto: vm.selectedProviderCapabilities.supportsDistillMainEffortAuto,
+                        supportsReasoningModelEffort: vm.selectedProviderCapabilities.supportsDistillReasoningModelEffort,
+                        width: compactModelMenuWidth,
+                        isDisabled: configurationLocked,
+                        onSelectMainModel: { model in
+                            vm.setModel(model)
+                            showModelOptions = false
+                        },
+                        onSelectCustomMainModel: { model in
+                            vm.setCustomModel(model)
+                            showModelOptions = false
+                        },
+                        onSelectReasoningModel: { model in
+                            vm.setReasoningModel(model)
+                        },
+                        onSelectMainEffort: { selection in
+                            vm.setDistillMainEffortSelection(selection)
+                        },
+                        onSelectReasoningEffort: { selection in
+                            vm.setDistillReasoningEffortSelection(selection)
+                        },
+                        mainFooter: {
+                            if vm.supportsCustomModelForSelectedProvider {
+                                if showCustomModelField {
+                                    customModelInlineField
+                                } else {
+                                    compactMenuRow("Custom...", selected: false) {
+                                        customModelDraft = vm.modelOptionsForSelectedProvider.contains(where: { $0.id == vm.model }) ? "" : vm.model
+                                        showCustomModelField = true
+                                    }
+                                    .disabled(configurationLocked)
+                                }
+                            }
+                        }
+                    )
+                } else {
+                    compactMenuSection("Model")
+                    let visibleModelCount = showAllModelOptions ? modelOptions.count : min(3, modelOptions.count)
+                    let visibleCustomModelCount = showAllModelOptions ? customModels.count : max(0, 3 - visibleModelCount)
+                    let visibleModels = Array(modelOptions.prefix(visibleModelCount))
+                    let visibleCustomModels = Array(customModels.prefix(visibleCustomModelCount))
+                    ForEach(visibleModels, id: \.id) { model in
+                        compactMenuRow(model.label, selected: model.id == vm.model) {
+                            vm.setModel(model.id)
+                            showModelOptions = false
+                        }
+                        .disabled(configurationLocked)
                     }
-                    .disabled(configurationLocked)
-                }
-                ForEach(visibleCustomModels, id: \.self) { customModel in
-                    compactMenuRow(customModel, selected: customModel == vm.model) {
-                        vm.setCustomModel(customModel)
-                        showModelOptions = false
+                    ForEach(visibleCustomModels, id: \.self) { customModel in
+                        compactMenuRow(customModel, selected: customModel == vm.model) {
+                            vm.setCustomModel(customModel)
+                            showModelOptions = false
+                        }
+                        .disabled(configurationLocked)
                     }
-                    .disabled(configurationLocked)
-                }
-                if modelOptions.count + customModels.count > 3, !showAllModelOptions {
-                    compactMenuRow("More...", selected: false) {
-                        showAllModelOptions = true
+                    if modelOptions.count + customModels.count > 3, !showAllModelOptions {
+                        compactMenuRow("More...", selected: false) {
+                            showAllModelOptions = true
+                        }
                     }
                 }
-                if vm.supportsCustomModelForSelectedProvider {
+                if vm.provider != .distill && vm.supportsCustomModelForSelectedProvider {
                     if showCustomModelField {
                         customModelInlineField
                     } else {
@@ -18410,23 +18606,12 @@ public struct AgentAppView: View {
                     }
                 }
             }
-            if vm.supportsReasoningForSelectedModel || vm.supportsServiceTierForSelectedModel {
+            if (vm.provider != .distill && vm.supportsReasoningForSelectedModel)
+                || vm.supportsServiceTierForSelectedModel {
                 compactMenuDivider
             }
-            if vm.provider == .distill && vm.routingMode == .manual {
-                compactMenuSection("Reasoning model")
-                compactMenuRow("Off", selected: vm.reasoningModel == nil) {
-                    vm.setReasoningModel(nil)
-                }
-                ForEach(vm.modelOptionsForSelectedProvider, id: \.id) { candidate in
-                    compactMenuRow(candidate.label, selected: candidate.id == vm.reasoningModel) {
-                        vm.setReasoningModel(candidate.id)
-                    }
-                    .disabled(configurationLocked)
-                }
-            }
-            if vm.routingMode == .manual && vm.supportsReasoningForSelectedModel {
-                compactMenuSection("Reasoning effort")
+            if vm.provider != .distill && vm.routingMode == .manual && vm.supportsReasoningForSelectedModel {
+                compactMenuSection(vm.provider == .distill ? "Main effort" : "Reasoning effort")
                 ForEach(vm.supportedReasoningEffortsForSelectedModel, id: \.self) { effort in
                     compactMenuRow(effort.displayName, selected: effort == vm.reasoningEffort) {
                         vm.setReasoningEffort(effort)
@@ -18516,11 +18701,14 @@ public struct AgentAppView: View {
         }
         .padding(.horizontal, DS.Space.xs)
         .padding(.vertical, DS.Space.xs)
+        .disabled(vm.selectedThreadRunIsStartingOrRunning || !vm.selectedProviderCanRun)
     }
 
     private func commitCustomModelDraft() {
         let trimmed = customModelDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !vm.selectedThreadRunIsStartingOrRunning,
+              vm.selectedProviderCanRun,
+              !trimmed.isEmpty else { return }
         vm.setCustomModel(trimmed)
         showCustomModelField = false
         customModelDraft = ""

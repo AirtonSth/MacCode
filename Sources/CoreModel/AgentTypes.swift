@@ -165,6 +165,8 @@ public struct AgentProviderCapabilities: Codable, Sendable, Equatable {
     public let supportsFork: Bool
     public let supportsRollback: Bool
     public let supportsPlanReview: Bool
+    public let supportsDistillMainEffortAuto: Bool
+    public let supportsDistillReasoningModelEffort: Bool
 
     public init(
         supportsAttachments: Bool = false,
@@ -175,7 +177,9 @@ public struct AgentProviderCapabilities: Codable, Sendable, Equatable {
         supportsStreaming: Bool = false,
         supportsFork: Bool = false,
         supportsRollback: Bool = false,
-        supportsPlanReview: Bool = false
+        supportsPlanReview: Bool = false,
+        supportsDistillMainEffortAuto: Bool = false,
+        supportsDistillReasoningModelEffort: Bool = false
     ) {
         self.supportsAttachments = supportsAttachments
         self.supportedAttachmentKinds = supportedAttachmentKinds
@@ -186,6 +190,8 @@ public struct AgentProviderCapabilities: Codable, Sendable, Equatable {
         self.supportsFork = supportsFork
         self.supportsRollback = supportsRollback
         self.supportsPlanReview = supportsPlanReview
+        self.supportsDistillMainEffortAuto = supportsDistillMainEffortAuto
+        self.supportsDistillReasoningModelEffort = supportsDistillReasoningModelEffort
     }
 
     public static let conservative = AgentProviderCapabilities()
@@ -194,6 +200,7 @@ public struct AgentProviderCapabilities: Codable, Sendable, Equatable {
         case supportsAttachments, supportedAttachmentKinds, supportedAttachmentMediaTypes
         case supportsApprovals, supportsUserInput, supportsStreaming
         case supportsFork, supportsRollback, supportsPlanReview
+        case supportsDistillMainEffortAuto, supportsDistillReasoningModelEffort
     }
 
     public init(from decoder: Decoder) throws {
@@ -207,6 +214,8 @@ public struct AgentProviderCapabilities: Codable, Sendable, Equatable {
         supportsFork = try container.decodeIfPresent(Bool.self, forKey: .supportsFork) ?? false
         supportsRollback = try container.decodeIfPresent(Bool.self, forKey: .supportsRollback) ?? false
         supportsPlanReview = try container.decodeIfPresent(Bool.self, forKey: .supportsPlanReview) ?? false
+        supportsDistillMainEffortAuto = try container.decodeIfPresent(Bool.self, forKey: .supportsDistillMainEffortAuto) ?? false
+        supportsDistillReasoningModelEffort = try container.decodeIfPresent(Bool.self, forKey: .supportsDistillReasoningModelEffort) ?? false
     }
 }
 
@@ -394,12 +403,32 @@ public enum AgentAttachmentResolver {
     }
 }
 
+public struct AgentEffortSelection: Codable, Sendable, Equatable, Hashable {
+    /// Nil means Auto; a value pins an advertised effort level.
+    public var effort: AgentReasoningEffort?
+
+    public init(effort: AgentReasoningEffort? = nil) {
+        self.effort = effort
+    }
+
+    public static let automatic = AgentEffortSelection()
+    public static func fixed(_ effort: AgentReasoningEffort) -> AgentEffortSelection {
+        AgentEffortSelection(effort: effort)
+    }
+
+    public var isAutomatic: Bool { effort == nil }
+}
+
 public struct AgentModelSelection: Codable, Sendable, Equatable, Hashable {
     public var provider: AgentProvider
     public var modelId: String
     public var customModelId: String?
     public var reasoningEffort: AgentReasoningEffort
     public var serviceTier: AgentServiceTier
+    /// Nil preserves legacy Distill threads, which used `reasoningEffort` as Main effort.
+    public var distillMainEffortSelection: AgentEffortSelection?
+    /// Nil means Auto for a selected Reasoning model and Off when no model is selected.
+    public var distillReasoningEffortSelection: AgentEffortSelection?
 
     public var effectiveModel: String {
         let custom = customModelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -411,13 +440,17 @@ public struct AgentModelSelection: Codable, Sendable, Equatable, Hashable {
         modelId: String,
         customModelId: String? = nil,
         reasoningEffort: AgentReasoningEffort = .medium,
-        serviceTier: AgentServiceTier = .auto
+        serviceTier: AgentServiceTier = .auto,
+        distillMainEffortSelection: AgentEffortSelection? = nil,
+        distillReasoningEffortSelection: AgentEffortSelection? = nil
     ) {
         self.provider = provider
         self.modelId = modelId
         self.customModelId = customModelId?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.reasoningEffort = reasoningEffort
         self.serviceTier = serviceTier
+        self.distillMainEffortSelection = distillMainEffortSelection
+        self.distillReasoningEffortSelection = distillReasoningEffortSelection
     }
 }
 
@@ -636,6 +669,9 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     public let reasoningEffort: AgentReasoningEffort?
     /// Resolved per-conversation selection. Nil explicitly disables Reasoning.
     public let reasoningModel: String?
+    /// Distill role-specific effort choices. Nil preserves legacy request behavior.
+    public let distillMainEffortSelection: AgentEffortSelection?
+    public let distillReasoningEffortSelection: AgentEffortSelection?
     public let serviceTier: AgentServiceTier
     public let interactionMode: AgentInteractionMode
     public let providerBinary: String?
@@ -664,6 +700,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         permissionMode: AgentPermissionMode = .supervised,
         reasoningEffort: AgentReasoningEffort? = nil,
         reasoningModel: String? = nil,
+        distillMainEffortSelection: AgentEffortSelection? = nil,
+        distillReasoningEffortSelection: AgentEffortSelection? = nil,
         serviceTier: AgentServiceTier = .auto,
         interactionMode: AgentInteractionMode = .default,
         providerBinary: String? = nil,
@@ -687,6 +725,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         self.permissionMode = permissionMode
         self.reasoningEffort = reasoningEffort
         self.reasoningModel = reasoningModel
+        self.distillMainEffortSelection = distillMainEffortSelection
+        self.distillReasoningEffortSelection = distillReasoningEffortSelection
         self.serviceTier = serviceTier
         self.interactionMode = interactionMode
         self.providerBinary = providerBinary
@@ -699,7 +739,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case runId, threadId, provider, providerInstanceId, model, cwd, prompt, userMessageContent, attachments, providerThreadId, permissionMode, reasoningEffort, reasoningModel, serviceTier, interactionMode, providerBinary, environment, extraArgs, runAsUser
+        case runId, threadId, provider, providerInstanceId, model, cwd, prompt, userMessageContent, attachments, providerThreadId, permissionMode, reasoningEffort, reasoningModel, distillMainEffortSelection, distillReasoningEffortSelection, serviceTier, interactionMode, providerBinary, environment, extraArgs, runAsUser
     }
 
     public init(from decoder: Decoder) throws {
@@ -717,6 +757,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         permissionMode = try c.decodeIfPresent(AgentPermissionMode.self, forKey: .permissionMode) ?? .supervised
         reasoningEffort = try c.decodeIfPresent(AgentReasoningEffort.self, forKey: .reasoningEffort)
         reasoningModel = try c.decodeIfPresent(String.self, forKey: .reasoningModel)
+        distillMainEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillMainEffortSelection)
+        distillReasoningEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillReasoningEffortSelection)
         serviceTier = try c.decodeIfPresent(AgentServiceTier.self, forKey: .serviceTier) ?? .auto
         interactionMode = try c.decodeIfPresent(AgentInteractionMode.self, forKey: .interactionMode) ?? .default
         providerBinary = try c.decodeIfPresent(String.self, forKey: .providerBinary)
@@ -740,6 +782,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
             && lhs.permissionMode == rhs.permissionMode
             && lhs.reasoningEffort == rhs.reasoningEffort
             && lhs.reasoningModel == rhs.reasoningModel
+            && lhs.distillMainEffortSelection == rhs.distillMainEffortSelection
+            && lhs.distillReasoningEffortSelection == rhs.distillReasoningEffortSelection
             && lhs.serviceTier == rhs.serviceTier
             && lhs.interactionMode == rhs.interactionMode
             && lhs.providerBinary == rhs.providerBinary

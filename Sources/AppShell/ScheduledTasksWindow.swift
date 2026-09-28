@@ -26,6 +26,9 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
     public var providerInstanceID: String
     public var model: String
     public var reasoningEffort: AgentReasoningEffort
+    public var reasoningModel: String?
+    public var distillMainEffortSelection: AgentEffortSelection?
+    public var distillReasoningEffortSelection: AgentEffortSelection?
     public var routingMode: AgentRoutingMode
     public var frequency: ScheduledTaskFrequency
     public var scheduledDate: Date
@@ -49,7 +52,10 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
         providerInstanceID = task?.providerInstanceID ?? "codex"
         model = task?.model ?? ""
         reasoningEffort = task?.reasoningEffort ?? .high
-        routingMode = task?.effectiveRoutingMode ?? .auto
+        reasoningModel = task?.reasoningModel
+        distillMainEffortSelection = task?.distillMainEffortSelection
+        distillReasoningEffortSelection = task?.distillReasoningEffortSelection
+        routingMode = provider == .distill ? .manual : (task?.effectiveRoutingMode ?? .auto)
         timeZoneIdentifier = task?.timeZoneIdentifier ?? TimeZone.current.identifier
         isEnabled = task?.isEnabled ?? true
         scheduledDate = now.addingTimeInterval(60 * 60)
@@ -134,7 +140,12 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
             providerInstanceID: providerInstanceID,
             model: model,
             reasoningEffort: reasoningEffort,
-            routingMode: routingMode,
+            reasoningModel: provider == .distill ? reasoningModel : nil,
+            distillMainEffortSelection: provider == .distill
+                ? (distillMainEffortSelection ?? .fixed(reasoningEffort)) : nil,
+            distillReasoningEffortSelection: provider == .distill
+                ? (distillReasoningEffortSelection ?? .automatic) : nil,
+            routingMode: provider == .distill ? .manual : routingMode,
             recurrence: recurrence,
             timeZoneIdentifier: timeZoneIdentifier,
             isEnabled: isEnabled,
@@ -1447,20 +1458,22 @@ private struct ScheduledTaskEditorView: View {
                             editorSourceCapsule
                                 .accessibilityIdentifier("scheduledTasks.editor.provider")
                         }
-                        formRow("Model routing") {
-                            HStack(spacing: DS.Space.sm) {
-                                if vm.providersLoading {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                        .accessibilityLabel("Loading providers")
+                        if draft.provider != .distill {
+                            formRow("Model routing") {
+                                HStack(spacing: DS.Space.sm) {
+                                    if vm.providersLoading {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                            .accessibilityLabel("Loading providers")
+                                    }
+                                    Toggle("Auto", isOn: Binding(
+                                        get: { draft.routingMode == .auto },
+                                        set: { setAutoRoutingEnabled($0) }
+                                    ))
+                                    .toggleStyle(.switch)
+                                    .tint(DS.Palette.success)
+                                    .accessibilityIdentifier("scheduledTasks.editor.autoRouting")
                                 }
-                                Toggle("Auto", isOn: Binding(
-                                    get: { draft.routingMode == .auto },
-                                    set: { setAutoRoutingEnabled($0) }
-                                ))
-                                .toggleStyle(.switch)
-                                .tint(DS.Palette.success)
-                                .accessibilityIdentifier("scheduledTasks.editor.autoRouting")
                             }
                         }
                         // Parity with Agent App: Auto never picks the provider/Source —
@@ -1710,66 +1723,139 @@ private struct ScheduledTaskEditorView: View {
 
     private var editorModelPillPresentation: AgentModelPillPresentation {
         let models = vm.models(provider: draft.provider, instanceID: draft.providerInstanceID)
-        let title = models.first(where: { $0.id == draft.model })?.label
-            ?? (draft.model.isEmpty ? "Model" : draft.model)
-        return AgentModelPillPresentation(
-            title: title,
-            effort: draft.reasoningEffort.displayName
-        )
+        let selectableModels = draft.provider == .distill
+            ? AgentDistillModelCatalog.selectableModels(models)
+            : models
+        let title = selectableModels.first(where: { $0.id == draft.model })?.label
+            ?? (draft.model.isEmpty ? (draft.provider == .distill ? "Select Main model" : "Model") : draft.model)
+        let effort = draft.provider == .distill
+            ? (draft.distillMainEffortSelection ?? .fixed(draft.reasoningEffort)).effort?.displayName ?? "Auto"
+            : draft.reasoningEffort.displayName
+        return AgentModelPillPresentation(title: title, effort: effort)
     }
 
     private var editorModelPopover: some View {
         let models = vm.models(provider: draft.provider, instanceID: draft.providerInstanceID)
+        let showsAutoRouting = draft.provider != .distill
+        let selectedSnapshot = vm.providers.first {
+            $0.provider == draft.provider && $0.id == draft.providerInstanceID
+        }
+        let mainEffortSelection = draft.distillMainEffortSelection ?? .fixed(draft.reasoningEffort)
+        let reasoningEffortSelection = draft.distillReasoningEffortSelection ?? .automatic
         return AgentModelPopoverChrome(
-            presentation: AgentModelPopoverPresentation.current(mode: draft.routingMode),
+            presentation: AgentModelPopoverPresentation.current(
+                mode: showsAutoRouting ? draft.routingMode : .manual
+            ),
             autoEnabled: Binding(
                 get: { draft.routingMode == .auto },
                 set: { setAutoRoutingEnabled($0) }
             ),
-            toggleDisabled: false
+            toggleDisabled: false,
+            showsAutoRouting: showsAutoRouting
         ) {
-            AgentCompactMenuSection("Model")
-            ForEach(models, id: \.id) { model in
-                AgentCompactMenuRow(model.label, selected: model.id == draft.model) {
-                    draft.model = model.id
-                    if let effort = model.supportedReasoningEfforts.first {
-                        draft.reasoningEffort = effort
+            if draft.provider == .distill {
+                AgentDistillModelSelectors(
+                    mainModel: draft.model,
+                    mainModels: AgentDistillModelCatalog.selectableModels(models),
+                    reasoningModel: draft.reasoningModel,
+                    reasoningModels: AgentDistillModelCatalog.selectableModels(models),
+                    mainEffortSelection: mainEffortSelection,
+                    mainEfforts: selectedModelEfforts,
+                    reasoningEffortSelection: reasoningEffortSelection,
+                    reasoningEfforts: selectedReasoningEfforts,
+                    supportsMainEffortAuto: selectedSnapshot?.effectiveCapabilities.supportsDistillMainEffortAuto == true,
+                    supportsReasoningModelEffort: selectedSnapshot?.effectiveCapabilities.supportsDistillReasoningModelEffort == true,
+                    isDisabled: false,
+                    onSelectMainModel: { draft.model = $0 },
+                    onSelectCustomMainModel: { draft.model = $0 },
+                    onSelectReasoningModel: { model in
+                        draft.reasoningModel = model
+                        if model == nil { draft.distillReasoningEffortSelection = .automatic }
+                    },
+                    onSelectMainEffort: { selection in
+                        draft.distillMainEffortSelection = selection
+                        if let effort = selection.effort { draft.reasoningEffort = effort }
+                    },
+                    onSelectReasoningEffort: { draft.distillReasoningEffortSelection = $0 },
+                    mainFooter: { EmptyView() }
+                )
+            } else {
+                AgentCompactMenuSection("Model")
+                ForEach(AgentDistillModelCatalog.selectableModels(models), id: \.id) { model in
+                    AgentCompactMenuRow(model.label, selected: model.id == draft.model) {
+                        draft.model = model.id
+                        if let effort = model.supportedReasoningEfforts.first {
+                            draft.reasoningEffort = effort
+                        }
+                        showModelOptions = false
                     }
-                    showModelOptions = false
                 }
-            }
-            if !draft.model.isEmpty, !models.contains(where: { $0.id == draft.model }) {
-                AgentCompactMenuRow(draft.model, selected: true) {
-                    showModelOptions = false
-                }
-            }
-            AgentCompactMenuDivider()
-            AgentCompactMenuSection("Reasoning")
-            ForEach(AgentReasoningEffort.allCases, id: \.self) { effort in
-                AgentCompactMenuRow(effort.displayName, selected: effort == draft.reasoningEffort) {
-                    draft.reasoningEffort = effort
-                    showModelOptions = false
+                AgentCompactMenuDivider()
+                AgentCompactMenuSection("Reasoning")
+                ForEach(AgentReasoningEffort.allCases, id: \.self) { effort in
+                    AgentCompactMenuRow(effort.displayName, selected: effort == draft.reasoningEffort) {
+                        draft.reasoningEffort = effort
+                        showModelOptions = false
+                    }
                 }
             }
         }
         .accessibilityIdentifier("scheduledTasks.editor.reasoning")
     }
 
+    private var selectedModelEfforts: [AgentReasoningEffort] {
+        modelsForSchedule.first(where: { $0.id == draft.model })?.supportedReasoningEfforts ?? []
+    }
+
+    private var selectedReasoningEfforts: [AgentReasoningEffort] {
+        guard let reasoningModel = draft.reasoningModel else { return [] }
+        return modelsForSchedule.first(where: { $0.id == reasoningModel })?.supportedReasoningEfforts ?? []
+    }
+
+    private var modelsForSchedule: [AgentModelDescriptor] {
+        AgentDistillModelCatalog.selectableModels(
+            vm.models(provider: draft.provider, instanceID: draft.providerInstanceID)
+        )
+    }
+
     private func selectScheduledSource(_ entry: AgentSourceCapsulePresentation.MenuEntry) {
         if let snapshot = vm.providers.first(where: { $0.id == entry.id }) {
             draft.provider = snapshot.provider
             draft.providerInstanceID = snapshot.id
-            draft.model = snapshot.models.first?.id ?? ""
-            draft.reasoningEffort = snapshot.models.first?.supportedReasoningEfforts.first ?? .high
+            let models = snapshot.provider == .distill
+                ? AgentDistillModelCatalog.selectableModels(snapshot.models)
+                : snapshot.models
+            draft.model = models.first?.id ?? ""
+            draft.reasoningEffort = models.first?.supportedReasoningEfforts.first ?? .high
+            if snapshot.provider == .distill {
+                draft.routingMode = .manual
+                draft.reasoningModel = nil
+                draft.distillMainEffortSelection = .automatic
+                draft.distillReasoningEffortSelection = .automatic
+            } else {
+                draft.reasoningModel = nil
+                draft.distillMainEffortSelection = nil
+                draft.distillReasoningEffortSelection = nil
+            }
             return
         }
         guard let provider = AgentProvider(rawValue: entry.id) else { return }
         draft.provider = provider
         if let snapshot = vm.providerSnapshots(for: provider).first {
             draft.providerInstanceID = snapshot.id
-            draft.model = snapshot.models.first?.id ?? ""
-            draft.reasoningEffort = snapshot.models.first?.supportedReasoningEfforts.first ?? .high
+            let models = snapshot.provider == .distill
+                ? AgentDistillModelCatalog.selectableModels(snapshot.models)
+                : snapshot.models
+            draft.model = models.first?.id ?? ""
+            draft.reasoningEffort = models.first?.supportedReasoningEfforts.first ?? .high
+        } else {
+            draft.providerInstanceID = provider.rawValue
+            draft.model = ""
         }
+        draft.reasoningModel = nil
+        draft.distillMainEffortSelection = provider == .distill ? .automatic : nil
+        draft.distillReasoningEffortSelection = provider == .distill ? .automatic : nil
+        if provider == .distill { draft.routingMode = .manual }
     }
 
     private func confirmAndSave() {
@@ -1783,6 +1869,7 @@ private struct ScheduledTaskEditorView: View {
     }
 
     private func setAutoRoutingEnabled(_ enabled: Bool) {
+        guard draft.provider != .distill || !enabled else { return }
         draft.routingMode = enabled ? .auto : .manual
         // Turning Auto off must keep the chosen provider.
         // Only fill a missing model from that provider's snapshot — never

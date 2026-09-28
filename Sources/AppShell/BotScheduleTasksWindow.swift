@@ -64,7 +64,9 @@ public struct BotScheduleTaskDraft: Identifiable, Equatable {
         self.name = item.name
         self.prompt = item.prompt
         self.scheduleNote = item.scheduleNote
-        self.spec = BotScheduleSpec.resolved(json: item.scheduleSpecJSON, note: item.scheduleNote)
+        var resolvedSpec = BotScheduleSpec.resolved(json: item.scheduleSpecJSON, note: item.scheduleNote)
+        if resolvedSpec.provider == .distill { resolvedSpec.routingMode = .manual }
+        self.spec = resolvedSpec
         self.isEnabled = item.isEnabled
         self.isNew = false
     }
@@ -417,23 +419,27 @@ struct BotScheduleSpecEditor: View {
                     specSourceCapsule
                         .accessibilityIdentifier("bots.scheduleTasks.editor.provider")
                 }
-                formRow("Model routing") {
-                    HStack(spacing: DS.Space.sm) {
-                        if providersLoading {
-                            ProgressView()
-                                .controlSize(.small)
-                                .accessibilityLabel("Loading providers")
+                if spec.provider != .distill {
+                    formRow("Model routing") {
+                        HStack(spacing: DS.Space.sm) {
+                            if providersLoading {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .accessibilityLabel("Loading providers")
+                            }
+                            Toggle("Auto", isOn: Binding(
+                                get: { spec.routingMode == .auto },
+                                set: { enabled in
+                                    spec.routingMode = spec.provider == .distill ? .manual : (enabled ? .auto : .manual)
+                                }
+                            ))
+                            .toggleStyle(.switch)
+                            .tint(DS.Palette.success)
+                            .accessibilityIdentifier("bots.scheduleTasks.editor.autoRouting")
                         }
-                        Toggle("Auto", isOn: Binding(
-                            get: { spec.routingMode == .auto },
-                            set: { spec.routingMode = $0 ? .auto : .manual }
-                        ))
-                        .toggleStyle(.switch)
-                        .tint(DS.Palette.success)
-                        .accessibilityIdentifier("bots.scheduleTasks.editor.autoRouting")
                     }
                 }
-                if spec.routingMode == .auto {
+                if spec.provider != .distill && spec.routingMode == .auto {
                     formRow("Model") {
                         Text("Auto selects the best model for the selected provider at run time.")
                             .font(DS.Font.caption)
@@ -519,67 +525,133 @@ struct BotScheduleSpecEditor: View {
     }
 
     private var specModelPillPresentation: AgentModelPillPresentation {
-        let title = models.first(where: { $0.id == spec.model })?.label
-            ?? (spec.model.isEmpty ? "Model" : spec.model)
-        return AgentModelPillPresentation(
-            title: title,
-            effort: spec.reasoningEffort.displayName
-        )
+        let selectableModels = spec.provider == .distill
+            ? AgentDistillModelCatalog.selectableModels(models)
+            : models
+        let title = selectableModels.first(where: { $0.id == spec.model })?.label
+            ?? (spec.model.isEmpty ? (spec.provider == .distill ? "Select Main model" : "Model") : spec.model)
+        let effort = spec.provider == .distill
+            ? (spec.distillMainEffortSelection ?? .fixed(spec.reasoningEffort)).effort?.displayName ?? "Auto"
+            : spec.reasoningEffort.displayName
+        return AgentModelPillPresentation(title: title, effort: effort)
     }
 
     private var specModelPopover: some View {
-        AgentModelPopoverChrome(
-            presentation: AgentModelPopoverPresentation.current(mode: spec.routingMode),
+        let showsAutoRouting = spec.provider != .distill
+        let snapshot = providers.first {
+            $0.provider == spec.provider && $0.id == spec.providerInstanceID
+        } ?? snapshots(for: spec.provider).first
+        let mainEffortSelection = spec.distillMainEffortSelection ?? .fixed(spec.reasoningEffort)
+        let reasoningEffortSelection = spec.distillReasoningEffortSelection ?? .automatic
+        return AgentModelPopoverChrome(
+            presentation: AgentModelPopoverPresentation.current(
+                mode: showsAutoRouting ? spec.routingMode : .manual
+            ),
             autoEnabled: Binding(
                 get: { spec.routingMode == .auto },
-                set: { spec.routingMode = $0 ? .auto : .manual }
+                set: { enabled in
+                    spec.routingMode = spec.provider == .distill ? .manual : (enabled ? .auto : .manual)
+                }
             ),
-            toggleDisabled: false
+            toggleDisabled: false,
+            showsAutoRouting: showsAutoRouting
         ) {
-            AgentCompactMenuSection("Model")
-            ForEach(models, id: \.id) { model in
-                AgentCompactMenuRow(model.label, selected: model.id == spec.model) {
-                    spec.model = model.id
-                    if let effort = model.supportedReasoningEfforts.first {
-                        spec.reasoningEffort = effort
+            if spec.provider == .distill {
+                AgentDistillModelSelectors(
+                    mainModel: spec.model,
+                    mainModels: AgentDistillModelCatalog.selectableModels(models),
+                    reasoningModel: spec.reasoningModel,
+                    reasoningModels: AgentDistillModelCatalog.selectableModels(models),
+                    mainEffortSelection: mainEffortSelection,
+                    mainEfforts: selectedMainEfforts,
+                    reasoningEffortSelection: reasoningEffortSelection,
+                    reasoningEfforts: selectedReasoningEfforts,
+                    supportsMainEffortAuto: snapshot?.effectiveCapabilities.supportsDistillMainEffortAuto == true,
+                    supportsReasoningModelEffort: snapshot?.effectiveCapabilities.supportsDistillReasoningModelEffort == true,
+                    isDisabled: false,
+                    onSelectMainModel: { model in
+                        spec.model = model
+                        if spec.reasoningModel == model { spec.reasoningModel = nil }
+                    },
+                    onSelectCustomMainModel: { model in spec.model = model },
+                    onSelectReasoningModel: { spec.reasoningModel = $0 },
+                    onSelectMainEffort: { selection in
+                        spec.distillMainEffortSelection = selection
+                        if let effort = selection.effort { spec.reasoningEffort = effort }
+                    },
+                    onSelectReasoningEffort: { spec.distillReasoningEffortSelection = $0 },
+                    mainFooter: { EmptyView() }
+                )
+            } else {
+                AgentCompactMenuSection("Model")
+                ForEach(AgentDistillModelCatalog.selectableModels(models), id: \.id) { model in
+                    AgentCompactMenuRow(model.label, selected: model.id == spec.model) {
+                        spec.model = model.id
+                        if let effort = model.supportedReasoningEfforts.first {
+                            spec.reasoningEffort = effort
+                        }
+                        showModelOptions = false
                     }
-                    showModelOptions = false
                 }
-            }
-            if !spec.model.isEmpty, !models.contains(where: { $0.id == spec.model }) {
-                AgentCompactMenuRow(spec.model, selected: true) {
-                    showModelOptions = false
-                }
-            }
-            AgentCompactMenuDivider()
-            AgentCompactMenuSection("Reasoning")
-            ForEach(AgentReasoningEffort.allCases, id: \.self) { effort in
-                AgentCompactMenuRow(effort.displayName, selected: effort == spec.reasoningEffort) {
-                    spec.reasoningEffort = effort
-                    showModelOptions = false
+                AgentCompactMenuDivider()
+                AgentCompactMenuSection("Reasoning")
+                ForEach(AgentReasoningEffort.allCases, id: \.self) { effort in
+                    AgentCompactMenuRow(effort.displayName, selected: effort == spec.reasoningEffort) {
+                        spec.reasoningEffort = effort
+                        showModelOptions = false
+                    }
                 }
             }
         }
         .accessibilityIdentifier("bots.scheduleTasks.editor.reasoning")
     }
 
+    private var selectedMainEfforts: [AgentReasoningEffort] {
+        models.first(where: { $0.id == spec.model })?.supportedReasoningEfforts ?? []
+    }
+
+    private var selectedReasoningEfforts: [AgentReasoningEffort] {
+        guard let reasoningModel = spec.reasoningModel else { return [] }
+        return models.first(where: { $0.id == reasoningModel })?.supportedReasoningEfforts ?? []
+    }
+
     private func selectSpecSource(_ entry: AgentSourceCapsulePresentation.MenuEntry) {
         if let snapshot = providers.first(where: { $0.id == entry.id }) {
             spec.provider = snapshot.provider
             spec.providerInstanceID = snapshot.id
-            spec.model = snapshot.models.first?.id ?? ""
-            spec.reasoningEffort = snapshot.models.first?.supportedReasoningEfforts.first ?? .medium
+            let models = snapshot.provider == .distill
+                ? AgentDistillModelCatalog.selectableModels(snapshot.models)
+                : snapshot.models
+            spec.model = models.first?.id ?? ""
+            spec.reasoningEffort = models.first?.supportedReasoningEfforts.first ?? .medium
+            if snapshot.provider == .distill {
+                spec.routingMode = .manual
+                spec.distillMainEffortSelection = .automatic
+                spec.distillReasoningEffortSelection = .automatic
+            } else {
+                spec.distillMainEffortSelection = nil
+                spec.distillReasoningEffortSelection = nil
+            }
+            spec.reasoningModel = nil
             return
         }
         guard let provider = AgentProvider(rawValue: entry.id) else { return }
         spec.provider = provider
         if let snapshot = snapshots(for: provider).first {
             spec.providerInstanceID = snapshot.id
-            spec.model = snapshot.models.first?.id ?? ""
-            spec.reasoningEffort = snapshot.models.first?.supportedReasoningEfforts.first ?? .medium
+            let models = snapshot.provider == .distill
+                ? AgentDistillModelCatalog.selectableModels(snapshot.models)
+                : snapshot.models
+            spec.model = models.first?.id ?? ""
+            spec.reasoningEffort = models.first?.supportedReasoningEfforts.first ?? .medium
         } else {
             spec.providerInstanceID = provider.rawValue
+            spec.model = ""
         }
+        spec.reasoningModel = nil
+        spec.distillMainEffortSelection = provider == .distill ? .automatic : nil
+        spec.distillReasoningEffortSelection = provider == .distill ? .automatic : nil
+        if provider == .distill { spec.routingMode = .manual }
     }
 
     @ViewBuilder

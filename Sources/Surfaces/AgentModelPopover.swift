@@ -113,30 +113,265 @@ public struct AgentModelAutoRoutingCard: View {
     }
 }
 
+public enum AgentDistillModelCatalog {
+    public static func selectableModels(_ models: [AgentModelDescriptor]) -> [AgentModelDescriptor] {
+        models.filter { !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+}
+
+public struct AgentDistillModelSelectors<MainFooter: View>: View {
+    public let mainModel: String
+    public let mainModels: [AgentModelDescriptor]
+    public let customMainModels: [String]
+    public let reasoningModel: String?
+    public let reasoningModels: [AgentModelDescriptor]
+    public let mainEffortSelection: AgentEffortSelection
+    public let mainEfforts: [AgentReasoningEffort]
+    public let reasoningEffortSelection: AgentEffortSelection
+    public let reasoningEfforts: [AgentReasoningEffort]
+    public let supportsMainEffortAuto: Bool
+    public let supportsReasoningModelEffort: Bool
+    public let width: CGFloat?
+    public let isDisabled: Bool
+    public let onSelectMainModel: (String) -> Void
+    public let onSelectReasoningModel: (String?) -> Void
+    public let onSelectMainEffort: (AgentEffortSelection) -> Void
+    public let onSelectReasoningEffort: (AgentEffortSelection) -> Void
+    private let mainFooter: MainFooter
+    @State private var showsAllMainModels = false
+
+    public init(
+        mainModel: String,
+        mainModels: [AgentModelDescriptor],
+        customMainModels: [String] = [],
+        reasoningModel: String?,
+        reasoningModels: [AgentModelDescriptor],
+        mainEffortSelection: AgentEffortSelection = .automatic,
+        mainEfforts: [AgentReasoningEffort] = [],
+        reasoningEffortSelection: AgentEffortSelection = .automatic,
+        reasoningEfforts: [AgentReasoningEffort] = [],
+        supportsMainEffortAuto: Bool = false,
+        supportsReasoningModelEffort: Bool = false,
+        width: CGFloat? = nil,
+        isDisabled: Bool,
+        onSelectMainModel: @escaping (String) -> Void,
+        onSelectCustomMainModel: @escaping (String) -> Void,
+        onSelectReasoningModel: @escaping (String?) -> Void,
+        onSelectMainEffort: @escaping (AgentEffortSelection) -> Void = { _ in },
+        onSelectReasoningEffort: @escaping (AgentEffortSelection) -> Void = { _ in },
+        @ViewBuilder mainFooter: () -> MainFooter
+    ) {
+        self.mainModel = mainModel
+        self.mainModels = mainModels
+        self.customMainModels = customMainModels
+        self.reasoningModel = reasoningModel
+        self.reasoningModels = reasoningModels
+        self.mainEffortSelection = mainEffortSelection
+        self.mainEfforts = mainEfforts
+        self.reasoningEffortSelection = reasoningEffortSelection
+        self.reasoningEfforts = reasoningEfforts
+        self.supportsMainEffortAuto = supportsMainEffortAuto
+        self.supportsReasoningModelEffort = supportsReasoningModelEffort
+        self.onSelectMainEffort = onSelectMainEffort
+        self.onSelectReasoningEffort = onSelectReasoningEffort
+        self.width = width
+        self.isDisabled = isDisabled
+        self.onSelectMainModel = onSelectMainModel
+        self.onSelectReasoningModel = onSelectReasoningModel
+        self.mainFooter = mainFooter()
+        self.onSelectCustomMainModel = onSelectCustomMainModel
+    }
+
+    private let onSelectCustomMainModel: (String) -> Void
+
+    public var body: some View {
+        let selectableMainModels = AgentDistillModelCatalog.selectableModels(mainModels)
+        let selectableReasoningModels = AgentDistillModelCatalog.selectableModels(reasoningModels)
+        return VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 0) {
+                AgentCompactMenuSection("Main model")
+                    .accessibilityIdentifier("agent.distill.mainModel.section")
+                ForEach(visibleMainModels, id: \.id) { model in
+                    AgentCompactMenuRow(model.label, selected: model.id == mainModel, width: width) {
+                        onSelectMainModel(model.id)
+                    }
+                    .disabled(isDisabled || reasoningModel == model.id)
+                }
+                ForEach(customMainModels, id: \.self) { model in
+                    AgentCompactMenuRow(model, selected: model == mainModel, width: width) {
+                        onSelectCustomMainModel(model)
+                    }
+                    .disabled(isDisabled || reasoningModel == model)
+                }
+                if selectableMainModels.count > 3, !showsAllMainModels {
+                    AgentCompactMenuRow("More...", selected: false, width: width) {
+                        showsAllMainModels = true
+                    }
+                }
+                AgentCompactMenuDivider(width: width)
+                AgentCompactMenuSection("Main effort")
+                    .accessibilityIdentifier("agent.distill.mainEffort.section")
+                AgentCompactMenuRow(
+                    "Auto",
+                    selected: mainEffortSelection.isAutomatic,
+                    width: width
+                ) {
+                    onSelectMainEffort(.automatic)
+                }
+                .disabled(isDisabled || !supportsMainEffortAuto)
+                ForEach(mainEfforts, id: \.self) { effort in
+                    AgentCompactMenuRow(
+                        effort.displayName,
+                        selected: mainEffortSelection.effort == effort,
+                        width: width
+                    ) {
+                        onSelectMainEffort(.fixed(effort))
+                    }
+                    .disabled(isDisabled)
+                    .help(effort.pickerHelpText)
+                }
+                if let effort = mainEffortSelection.effort,
+                   !mainEfforts.isEmpty,
+                   !mainEfforts.contains(effort) {
+                    Text("Selected Main effort \(effort.displayName) is unavailable for this model. Choose Auto or a supported level.")
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !supportsMainEffortAuto {
+                    Text("Auto Main effort requires an updated Distill ACP session.")
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !mainModel.isEmpty,
+                   !selectableMainModels.contains(where: { $0.id == mainModel }),
+                   !customMainModels.contains(mainModel) {
+                    Text("Selected Main model unavailable: \(mainModel)")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                mainFooter
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Main model selection")
+            .accessibilityIdentifier("agent.distill.mainModel")
+            AgentCompactMenuDivider(width: width)
+            VStack(alignment: .leading, spacing: 0) {
+                AgentCompactMenuSection("Reasoning model")
+                    .accessibilityIdentifier("agent.distill.reasoningModel.section")
+                AgentCompactMenuRow("Off", selected: reasoningModel == nil, width: width) {
+                    onSelectReasoningModel(nil)
+                }
+                .disabled(isDisabled)
+                ForEach(selectableReasoningModels.filter { $0.id != mainModel }, id: \.id) { model in
+                    AgentCompactMenuRow(model.label, selected: model.id == reasoningModel, width: width) {
+                        onSelectReasoningModel(model.id)
+                    }
+                    .disabled(isDisabled)
+                }
+                if reasoningModel != nil {
+                    AgentCompactMenuDivider(width: width)
+                    AgentCompactMenuSection("Reasoning effort")
+                        .accessibilityIdentifier("agent.distill.reasoningEffort.section")
+                    if supportsReasoningModelEffort {
+                        AgentCompactMenuRow(
+                            "Auto",
+                            selected: reasoningEffortSelection.isAutomatic,
+                            width: width
+                        ) {
+                            onSelectReasoningEffort(.automatic)
+                        }
+                        .disabled(isDisabled)
+                        ForEach(reasoningEfforts, id: \.self) { effort in
+                            AgentCompactMenuRow(
+                                effort.displayName,
+                                selected: reasoningEffortSelection.effort == effort,
+                                width: width
+                            ) {
+                                onSelectReasoningEffort(.fixed(effort))
+                            }
+                            .disabled(isDisabled)
+                            .help(effort.pickerHelpText)
+                        }
+                        if let effort = reasoningEffortSelection.effort,
+                           !reasoningEfforts.isEmpty,
+                           !reasoningEfforts.contains(effort) {
+                            Text("Selected Reasoning effort \(effort.displayName) is unavailable for this model. Choose Auto or a supported level.")
+                                .font(DS.Font.caption2)
+                                .foregroundColor(DS.Palette.warning)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    } else {
+                        Text("Reasoning effort follows the model default in this Distill version.")
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                if let reasoningModel, reasoningModel == mainModel {
+                    Text("Main and Reasoning models must differ. Select Off or choose a different Reasoning model.")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if let reasoningModel,
+                          !selectableReasoningModels.contains(where: { $0.id == reasoningModel }) {
+                    Text("Selected Reasoning model unavailable: \(reasoningModel)")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Reasoning model selection")
+            .accessibilityIdentifier("agent.distill.reasoningModel")
+        }
+    }
+
+    private var visibleMainModels: [AgentModelDescriptor] {
+        let selectable = AgentDistillModelCatalog.selectableModels(mainModels)
+        guard !showsAllMainModels else { return selectable }
+        let visible = Array(selectable.prefix(3))
+        guard let selected = selectable.first(where: { $0.id == mainModel }),
+              !visible.contains(where: { $0.id == selected.id }) else { return visible }
+        return visible + [selected]
+    }
+}
+
 public struct AgentModelPopoverChrome<ManualContent: View>: View {
     let presentation: AgentModelPopoverPresentation
     let autoEnabled: Binding<Bool>
     let toggleDisabled: Bool
+    let showsAutoRouting: Bool
     let manualContent: ManualContent
 
     public init(
         presentation: AgentModelPopoverPresentation,
         autoEnabled: Binding<Bool>,
         toggleDisabled: Bool,
+        showsAutoRouting: Bool = true,
         @ViewBuilder manualContent: () -> ManualContent
     ) {
         self.presentation = presentation
         self.autoEnabled = autoEnabled
         self.toggleDisabled = toggleDisabled
+        self.showsAutoRouting = showsAutoRouting
         self.manualContent = manualContent()
     }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            header
-            Divider()
-                .accessibilityIdentifier("agent.model.auto.divider")
-            if presentation.showsDisclaimer {
+            if showsAutoRouting {
+                header
+                Divider()
+                    .accessibilityIdentifier("agent.model.auto.divider")
+            } else {
+                Text("Model")
+                    .font(DS.Font.caption.weight(.medium))
+                    .foregroundColor(DS.Palette.text)
+            }
+            if showsAutoRouting && presentation.showsDisclaimer {
                 AgentModelAutoRoutingCard(presentation: presentation)
                     .transition(presentation.transition == .fadeAndSlide
                         ? .opacity.combined(with: .move(edge: .top))

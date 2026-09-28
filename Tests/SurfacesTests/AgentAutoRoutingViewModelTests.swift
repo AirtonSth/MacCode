@@ -73,8 +73,14 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
             vm.setProvider(provider)
             vm.createThread(title: "auto-\(provider.rawValue)")
             let thread = try XCTUnwrap(try threads.get(id: try XCTUnwrap(vm.selectedThreadId)))
+            if provider == .distill {
+                XCTAssertEqual(thread.effectiveRoutingConfiguration.mode, .manual,
+                               "Distill requires a specific Main model and cannot use model-auto.")
+                XCTAssertEqual(thread.effectiveRoutingConfiguration.manualSelection.provider, .distill)
+                continue
+            }
             XCTAssertEqual(thread.effectiveRoutingConfiguration.mode, .auto,
-                           "Auto must be available and selected for \(provider.rawValue).")
+                           "Auto must remain available for \(provider.rawValue).")
             XCTAssertEqual(thread.effectiveRoutingConfiguration.eligibleProviders, AgentProvider.allCases)
             XCTAssertGreaterThan(thread.effectiveRoutingConfiguration.revision, 0,
                                  "Auto threads must be admit-ready (revision > 0); revision 0 fails with invalidPolicy.")
@@ -89,6 +95,94 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
                 "Auto threads must store the current orchestration policy digest."
             )
         }
+    }
+
+    func testRestoringLegacyDistillModelAutoThreadPersistsManualMode() async throws {
+        // WHY: old Distill threads may have been saved while Auto routing was
+        // available; restoring one must select its pinned Main model instead.
+        let (vm, threads, root) = try fixture()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        vm.setProvider(.distill)
+        vm.createThread(title: "legacy Distill route")
+        let distillID = try XCTUnwrap(vm.selectedThreadId)
+        let distillThread = try XCTUnwrap(try threads.get(id: distillID))
+        vm.createThread(title: "other thread")
+
+        let manual = distillThread.effectiveRoutingConfiguration
+        let runtime = AgentOrchestrationRuntime(
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false }
+        )
+        let legacyAuto = try runtime.autoConfiguration(
+            replacing: manual,
+            expectedRevision: manual.revision,
+            manualSelection: manual.manualSelection,
+            manualProviderInstanceId: manual.manualProviderInstanceId,
+            providerSnapshots: vm.providerSnapshots
+        )
+        try threads.setRoutingConfiguration(
+            legacyAuto,
+            threadId: distillID,
+            expectedRevision: manual.revision
+        )
+        vm.reloadThreads()
+        if let index = vm.threads.firstIndex(where: { $0.id == distillID }) {
+            vm.threads[index].routingConfiguration = legacyAuto
+        }
+        vm.selectThread(distillID)
+        await vm.waitForSelectThreadHydrationForTesting()
+
+        XCTAssertEqual(vm.provider, .distill)
+        XCTAssertEqual(vm.routingMode, .manual)
+        XCTAssertEqual(
+            try threads.routingConfiguration(of: distillID)?.mode,
+            .manual,
+            "restoring Distill must persist the repair so a later reopen cannot restore model-auto"
+        )
+
+        let repaired = try XCTUnwrap(try threads.routingConfiguration(of: distillID))
+        let softLegacyAuto = try runtime.autoConfiguration(
+            replacing: repaired,
+            expectedRevision: repaired.revision,
+            manualSelection: repaired.manualSelection,
+            manualProviderInstanceId: repaired.manualProviderInstanceId,
+            providerSnapshots: vm.providerSnapshots
+        )
+        try threads.setRoutingConfiguration(
+            softLegacyAuto,
+            threadId: distillID,
+            expectedRevision: repaired.revision
+        )
+        if let index = vm.threads.firstIndex(where: { $0.id == distillID }) {
+            vm.threads[index].routingConfiguration = softLegacyAuto
+        }
+        vm.selectThread(distillID)
+        await vm.waitForSoftReselectDurableRefreshForTesting()
+
+        XCTAssertEqual(vm.routingMode, .manual)
+        XCTAssertEqual(
+            try threads.routingConfiguration(of: distillID)?.mode,
+            .manual,
+            "same-thread refresh must keep Distill model-auto hidden and repair the saved route"
+        )
+    }
+
+    func testSwitchingExistingAutoThreadToDistillPersistsManualRouting() throws {
+        // WHY: provider changes are allowed on unsent Auto threads, but Distill
+        // must replace model-auto with its pinned Main model immediately.
+        let (vm, threads, root) = try fixture()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        vm.createThread(title: "switch to Distill")
+        let threadID = try XCTUnwrap(vm.selectedThreadId)
+        XCTAssertEqual(try threads.routingConfiguration(of: threadID)?.mode, .auto)
+
+        vm.setProvider(.distill)
+
+        let repaired = try XCTUnwrap(try threads.get(id: threadID))
+        XCTAssertEqual(vm.routingMode, .manual)
+        XCTAssertEqual(repaired.effectiveRoutingConfiguration.mode, .manual)
+        XCTAssertEqual(repaired.effectiveRoutingConfiguration.manualSelection.provider, .distill)
     }
 
     func testCreateThreadAutoConfigurationIsAdmitReady() throws {
@@ -655,6 +749,35 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         XCTAssertFalse(current.autoToggleEnabled)
     }
 
+    func test_distillNewThreadDefaultsMigrateAwayFromAutomaticRouting_becauseNoAutoModelMayBeRestored() {
+        let suiteName = "rc-distill-defaults-" + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = AgentNewThreadDefaultsStore(defaults: defaults)
+        store.save(AgentNewThreadDefaults(
+            routingMode: .auto,
+            runAsUser: nil,
+            provider: .distill,
+            providerInstanceId: "distill",
+            model: "grok-4.6",
+            reasoningEffort: .high
+        ))
+
+        XCTAssertEqual(store.load()?.routingMode, .manual)
+        XCTAssertEqual(store.load()?.routingMode, .manual, "the normalized route must persist")
+    }
+
+    func test_distillModelSelectorsNeverOfferTheEmptyAccountDefaultID() {
+        // WHY: the empty ID means "use whichever account default is active";
+        // it is not a concrete Main or Reasoning model the user can pin.
+        let catalog = DistillRunner.listModels(installedVersion: nil)
+        let selectable = AgentDistillModelCatalog.selectableModels(catalog)
+
+        XCTAssertFalse(selectable.contains(where: { $0.id.isEmpty }))
+        XCTAssertTrue(selectable.contains(where: { $0.id == "grok-4.6" }))
+        XCTAssertEqual(selectable.count, catalog.count - catalog.filter { $0.id.isEmpty }.count)
+    }
+
     func test_agentAndBotsShareTheSameAutoPopoverChrome() throws {
         // WHY: Desk Auto used to be a header-only fork. Auto-on must paint
         // the same orchestration card from one component, not a second copy.
@@ -676,17 +799,20 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         )
 
         XCTAssertTrue(chrome.contains("struct AgentModelPopoverChrome"))
+        XCTAssertTrue(chrome.contains("struct AgentDistillModelSelectors"))
         XCTAssertTrue(chrome.contains("struct AgentModelAutoRoutingCard"))
         XCTAssertTrue(chrome.contains("agent.model.auto.card"))
         XCTAssertTrue(chrome.contains(AgentModelPopoverPresentation.autoDisclaimer))
         XCTAssertTrue(chrome.contains(AgentModelPopoverPresentation.autoStatus))
 
         XCTAssertTrue(agent.contains("AgentModelPopoverChrome("))
+        XCTAssertTrue(agent.contains("AgentDistillModelSelectors("))
         XCTAssertFalse(
             agent.contains("private func autoRoutingCard"),
             "Agent App must not keep a private Auto card after the shared chrome exists"
         )
         XCTAssertTrue(bots.contains("AgentModelPopoverChrome("))
+        XCTAssertTrue(bots.contains("AgentDistillModelSelectors("))
         XCTAssertFalse(
             bots.contains(AgentModelPopoverPresentation.autoDisclaimer),
             "Bots Desk must not recopy the Auto card; use AgentModelPopoverChrome"

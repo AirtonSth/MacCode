@@ -271,6 +271,8 @@ public struct DistillACPInitializeResult: Sendable, Equatable {
     public let audio: Bool
     public let resumeSession: Bool
     public let sessionReasoningModel: Bool
+    public let sessionMainEffortAuto: Bool
+    public let sessionReasoningModelEffort: Bool
     public let agentVersion: String?
     public let models: [AgentModelDescriptor]
     public let currentModelId: String?
@@ -283,6 +285,8 @@ public struct DistillACPInitializeResult: Sendable, Equatable {
         audio: Bool = false,
         resumeSession: Bool = false,
         sessionReasoningModel: Bool = false,
+        sessionMainEffortAuto: Bool = false,
+        sessionReasoningModelEffort: Bool = false,
         agentVersion: String? = nil,
         models: [AgentModelDescriptor] = [],
         currentModelId: String? = nil
@@ -294,6 +298,8 @@ public struct DistillACPInitializeResult: Sendable, Equatable {
         self.audio = audio
         self.resumeSession = resumeSession
         self.sessionReasoningModel = sessionReasoningModel
+        self.sessionMainEffortAuto = sessionMainEffortAuto
+        self.sessionReasoningModelEffort = sessionReasoningModelEffort
         self.agentVersion = agentVersion
         self.models = models
         self.currentModelId = currentModelId
@@ -318,6 +324,8 @@ public struct DistillACPInitializeResult: Sendable, Equatable {
             audio: prompt["audio"] as? Bool ?? false,
             resumeSession: sessions["resume"] != nil,
             sessionReasoningModel: xaiCapabilities["sessionReasoningModel"] as? Bool ?? false,
+            sessionMainEffortAuto: xaiCapabilities["sessionMainEffortAuto"] as? Bool ?? false,
+            sessionReasoningModelEffort: xaiCapabilities["sessionReasoningModelEffort"] as? Bool ?? false,
             agentVersion: metadata["agentVersion"] as? String,
             models: DistillACPClient.modelDescriptors(from: modelState),
             currentModelId: modelState?["currentModelId"] as? String
@@ -395,7 +403,7 @@ struct DistillACPSessionMode: Equatable {
 struct DistillACPSessionOpenResult {
     let sessionId: String
     let models: [AgentModelDescriptor]
-    let currentModelId: String?
+    var currentModelId: String?
     /// Live current effort: `configOptions.reasoning_effort.currentValue` when
     /// present, else model `_meta.reasoningEffort` (may differ from option default).
     let currentReasoningEffortRaw: String?
@@ -403,6 +411,11 @@ struct DistillACPSessionOpenResult {
     let currentModeId: String?
     /// Typed ACP `configOptions` from session/new|load (model + reasoning_effort).
     let configOptions: [[String: Any]]
+    /// Set only after the session explicitly acknowledges a role-effort bind.
+    var appliedMainEffortSelection: AgentEffortSelection? = nil
+    var appliedMainModelId: String? = nil
+    /// Set only after the session actor confirms the Reasoning model and its effort policy.
+    var appliedReasoningModelEffortSelection: AgentEffortSelection? = nil
 
     /// True when session/new|load advertised a selectable `reasoning_effort` option.
     var advertisesReasoningEffortConfig: Bool {
@@ -774,8 +787,12 @@ public final class DistillACPClient: @unchecked Sendable {
         yoloMode: Bool = false,
         modelId: String? = nil,
         reasoningEffort: AgentReasoningEffort? = nil,
+        mainEffortSelection: AgentEffortSelection? = nil,
         reasoningModel: String? = nil,
-        reasoningModelSelectionSupported: Bool = true
+        reasoningModelEffortSelection: AgentEffortSelection? = nil,
+        reasoningModelSelectionSupported: Bool = true,
+        mainEffortAutoSupported: Bool = false,
+        reasoningModelEffortSupported: Bool = false
     ) async throws -> DistillACPSessionOpenResult {
         let result = try await requestJSONObject(
             method: "session/new",
@@ -788,9 +805,43 @@ public final class DistillACPClient: @unchecked Sendable {
             ),
             timeout: 20
         )
-        let opened = try Self.openResult(result, fallbackSessionId: nil)
+        var opened = try Self.openResult(result, fallbackSessionId: nil)
+        if let mainEffortSelection {
+            guard !mainEffortSelection.isAutomatic || mainEffortAutoSupported else {
+                throw DistillACPError.unsupported("This Distill ACP version cannot apply Auto Main effort changes")
+            }
+            let requestedModel = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let mainModelId = requestedModel.isEmpty ? (opened.currentModelId ?? "") : requestedModel
+            let applied = try await setModel(
+                sessionId: opened.sessionId,
+                modelId: mainModelId,
+                reasoningEffort: mainEffortSelection.effort,
+                reasoningEffortAuto: mainEffortSelection.isAutomatic
+            )
+            guard applied.isAutomatic == mainEffortSelection.isAutomatic,
+                  mainEffortSelection.effort == nil || applied.effort == mainEffortSelection.effort else {
+                throw DistillACPError.unsupported("Distill did not confirm the requested Main-model effort")
+            }
+            opened.currentModelId = applied.activeModelId
+            opened.appliedMainModelId = applied.canonicalModelId
+            if applied.canonicalModelId != nil {
+                opened.appliedMainEffortSelection = mainEffortSelection
+            }
+        }
         if reasoningModelSelectionSupported {
-            try await setReasoningModel(sessionId: opened.sessionId, modelId: reasoningModel)
+            let applied = try await setReasoningModel(
+                sessionId: opened.sessionId,
+                modelId: reasoningModel,
+                effortSelection: reasoningModelEffortSelection,
+                supportsIndependentEffort: reasoningModelEffortSupported
+            )
+            if applied.modelId == nil || applied.isAutomatic {
+                opened.appliedReasoningModelEffortSelection = .automatic
+            } else if let effort = applied.effort {
+                opened.appliedReasoningModelEffortSelection = .fixed(effort)
+            } else {
+                throw DistillACPError.responseTypeMismatch("Reasoning model effort acknowledgement")
+            }
         }
         return opened
     }
@@ -807,8 +858,12 @@ public final class DistillACPClient: @unchecked Sendable {
         yoloMode: Bool = false,
         modelId: String? = nil,
         reasoningEffort: AgentReasoningEffort? = nil,
+        mainEffortSelection: AgentEffortSelection? = nil,
         reasoningModel: String? = nil,
-        reasoningModelSelectionSupported: Bool = true
+        reasoningModelEffortSelection: AgentEffortSelection? = nil,
+        reasoningModelSelectionSupported: Bool = true,
+        mainEffortAutoSupported: Bool = false,
+        reasoningModelEffortSupported: Bool = false
     ) async throws -> DistillACPSessionOpenResult {
         let params = Self.sessionOpenParams(
             cwd: Self.resolvedSessionCwd(cwd),
@@ -824,9 +879,43 @@ public final class DistillACPClient: @unchecked Sendable {
             params: params,
             timeout: 60
         )
-        let opened = try Self.openResult(result, fallbackSessionId: sessionId)
+        var opened = try Self.openResult(result, fallbackSessionId: sessionId)
+        if let mainEffortSelection {
+            guard !mainEffortSelection.isAutomatic || mainEffortAutoSupported else {
+                throw DistillACPError.unsupported("This Distill ACP version cannot apply Auto Main effort changes")
+            }
+            let requestedModel = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let mainModelId = requestedModel.isEmpty ? (opened.currentModelId ?? "") : requestedModel
+            let applied = try await setModel(
+                sessionId: opened.sessionId,
+                modelId: mainModelId,
+                reasoningEffort: mainEffortSelection.effort,
+                reasoningEffortAuto: mainEffortSelection.isAutomatic
+            )
+            guard applied.isAutomatic == mainEffortSelection.isAutomatic,
+                  mainEffortSelection.effort == nil || applied.effort == mainEffortSelection.effort else {
+                throw DistillACPError.unsupported("Distill did not confirm the requested Main-model effort")
+            }
+            opened.currentModelId = applied.activeModelId
+            opened.appliedMainModelId = applied.canonicalModelId
+            if applied.canonicalModelId != nil {
+                opened.appliedMainEffortSelection = mainEffortSelection
+            }
+        }
         if reasoningModelSelectionSupported {
-            try await setReasoningModel(sessionId: opened.sessionId, modelId: reasoningModel)
+            let applied = try await setReasoningModel(
+                sessionId: opened.sessionId,
+                modelId: reasoningModel,
+                effortSelection: reasoningModelEffortSelection,
+                supportsIndependentEffort: reasoningModelEffortSupported
+            )
+            if applied.modelId == nil || applied.isAutomatic {
+                opened.appliedReasoningModelEffortSelection = .automatic
+            } else if let effort = applied.effort {
+                opened.appliedReasoningModelEffortSelection = .fixed(effort)
+            } else {
+                throw DistillACPError.responseTypeMismatch("Reasoning model effort acknowledgement")
+            }
         }
         return opened
     }
@@ -844,29 +933,119 @@ public final class DistillACPClient: @unchecked Sendable {
         return DistillRunner.normalizedReasoningEffort(effort, model: modelId)?.rawValue
     }
 
-    /// Selects or explicitly disables this conversation's separate Reasoning model.
-    func setReasoningModel(sessionId: String, modelId: String?) async throws {
-        _ = try await requestJSONObject(
-            method: "x.ai/session/reasoning_model/set",
-            params: ["sessionId": sessionId, "modelId": modelId ?? ""],
-            timeout: 15
-        )
+    /// The result is the selection actually applied by the Distill session actor.
+    struct ReasoningModelSelectionResult: Equatable {
+        let modelId: String?
+        let effort: AgentReasoningEffort?
+        let isAutomatic: Bool
     }
 
-    /// `reasoningEffort` is the ACP `_meta.reasoningEffort` wire value (harness
-    /// `REASONING_EFFORT_META_KEY`). Omit when the host has nothing to bind.
-    /// Values are mapped via `wireReasoningEffort` before the wire call.
+    /// Selects or explicitly disables this conversation's separate Reasoning model.
+    func setReasoningModel(
+        sessionId: String,
+        modelId: String?,
+        effortSelection: AgentEffortSelection? = nil,
+        supportsIndependentEffort: Bool = false
+    ) async throws -> ReasoningModelSelectionResult {
+        let trimmedModel = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let effortValue: Any?
+        if let effortSelection, supportsIndependentEffort {
+            if let effort = effortSelection.effort {
+                guard let wire = Self.wireReasoningEffort(effort, modelId: trimmedModel) else {
+                    throw DistillACPError.unsupported("Selected Reasoning model does not advertise that effort")
+                }
+                effortValue = wire
+            } else {
+                effortValue = NSNull()
+            }
+        } else {
+            if effortSelection?.effort != nil {
+                throw DistillACPError.unsupported("This Distill ACP version cannot apply a separate Reasoning-model effort")
+            }
+            effortValue = nil
+        }
+        var params: JSONObject = ["sessionId": sessionId, "modelId": trimmedModel]
+        if let effortValue { params["reasoningEffort"] = effortValue }
+        let response = try await requestJSONObject(
+            method: "x.ai/session/reasoning_model/set",
+            params: params,
+            timeout: 15
+        )
+        let appliedModel = (response["reasoningModelId"] as? String).flatMap {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
+        }
+        let appliedEffort = (response["reasoningEffort"] as? String).flatMap(AgentReasoningEffort.init(rawValue:))
+        let acknowledgedAuto = response["reasoningEffortAuto"] as? Bool
+        let isAutomatic = acknowledgedAuto ?? true
+        guard appliedModel == (trimmedModel.isEmpty ? nil : trimmedModel) else {
+            throw DistillACPError.unsupported("Distill did not confirm the requested Reasoning model")
+        }
+        if let effortSelection, supportsIndependentEffort, !trimmedModel.isEmpty {
+            guard let acknowledgedAuto,
+                  acknowledgedAuto == effortSelection.isAutomatic,
+                  effortSelection.effort == nil || appliedEffort == effortSelection.effort else {
+                throw DistillACPError.unsupported("Distill did not confirm the requested Reasoning-model effort")
+            }
+        }
+        return ReasoningModelSelectionResult(modelId: appliedModel, effort: appliedEffort, isAutomatic: isAutomatic)
+    }
+
+    struct MainModelSelectionResult: Equatable {
+        let canonicalModelId: String?
+        let activeModelId: String
+        let effort: AgentReasoningEffort?
+        let isAutomatic: Bool
+    }
+
+    /// Binds a Main model and its concrete or automatic effort policy atomically.
     func setModel(
         sessionId: String,
         modelId: String,
-        reasoningEffort: AgentReasoningEffort? = nil
-    ) async throws {
+        reasoningEffort: AgentReasoningEffort? = nil,
+        reasoningEffortAuto: Bool? = nil
+    ) async throws -> MainModelSelectionResult {
         var params: JSONObject = ["sessionId": sessionId, "modelId": modelId]
-        if let reasoningEffort,
-           let wireEffort = Self.wireReasoningEffort(reasoningEffort, modelId: modelId) {
-            params["_meta"] = ["reasoningEffort": wireEffort]
+        var meta: JSONObject = [:]
+        if let reasoningEffortAuto {
+            meta["reasoningEffortAuto"] = reasoningEffortAuto
         }
-        _ = try await requestJSONObject(method: "session/set_model", params: params, timeout: 15)
+        if let reasoningEffort {
+            guard let wireEffort = Self.wireReasoningEffort(reasoningEffort, modelId: modelId) else {
+                throw DistillACPError.unsupported("Selected Main model does not advertise that effort")
+            }
+            meta["reasoningEffort"] = wireEffort
+        }
+        if !meta.isEmpty { params["_meta"] = meta }
+        let response = try await requestJSONObject(method: "session/set_model", params: params, timeout: 15)
+        let resultMeta = response["meta"] as? JSONObject ?? response
+        let activeModelId = (resultMeta["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let activeModelId, !activeModelId.isEmpty else {
+            throw DistillACPError.responseTypeMismatch("session/set_model model acknowledgement")
+        }
+        let serverCanonicalModelId = (resultMeta["canonicalModelId"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let serverCanonicalModelId, serverCanonicalModelId != modelId {
+            throw DistillACPError.unsupported("Distill confirmed Main model \(serverCanonicalModelId), not requested \(modelId)")
+        }
+        if reasoningEffortAuto != nil, serverCanonicalModelId == nil {
+            throw DistillACPError.unsupported("Distill did not confirm the canonical Main model for the selected effort mode")
+        }
+        let canonicalModelId = serverCanonicalModelId ?? (activeModelId == modelId ? modelId : nil)
+        let acknowledgedAuto = resultMeta["reasoningEffortAuto"] as? Bool
+        if let reasoningEffortAuto, acknowledgedAuto != reasoningEffortAuto {
+            throw DistillACPError.unsupported("Distill did not confirm the requested Main effort mode")
+        }
+        let acknowledgedEffort = (resultMeta["reasoningEffort"] as? String)
+            .flatMap(AgentReasoningEffort.init(rawValue:))
+        if let reasoningEffort, acknowledgedEffort != reasoningEffort {
+            throw DistillACPError.unsupported("Distill did not confirm the requested Main-model effort")
+        }
+        return MainModelSelectionResult(
+            canonicalModelId: canonicalModelId,
+            activeModelId: activeModelId,
+            effort: acknowledgedEffort,
+            isAutomatic: acknowledgedAuto ?? (reasoningEffortAuto ?? false)
+        )
     }
 
     /// Flat-string `session/set_config_option` (live grok 1.0.25+). Nested

@@ -27,6 +27,9 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
     public var providerInstanceID: String
     public var model: String
     public var reasoningEffort: AgentReasoningEffort
+    public var reasoningModel: String?
+    public var distillMainEffortSelection: AgentEffortSelection?
+    public var distillReasoningEffortSelection: AgentEffortSelection?
     /// Optional for backward-compatible Codable decoding of tasks serialized
     /// before scheduled Auto routing existed. Missing values mean Manual.
     public var routingMode: AgentRoutingMode?
@@ -50,6 +53,9 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         providerInstanceID: String,
         model: String,
         reasoningEffort: AgentReasoningEffort,
+        reasoningModel: String? = nil,
+        distillMainEffortSelection: AgentEffortSelection? = nil,
+        distillReasoningEffortSelection: AgentEffortSelection? = nil,
         routingMode: AgentRoutingMode = .manual,
         recurrence: ScheduledTaskRecurrence,
         timeZoneIdentifier: String,
@@ -70,6 +76,9 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         self.providerInstanceID = providerInstanceID
         self.model = model
         self.reasoningEffort = reasoningEffort
+        self.reasoningModel = reasoningModel
+        self.distillMainEffortSelection = distillMainEffortSelection
+        self.distillReasoningEffortSelection = distillReasoningEffortSelection
         self.routingMode = routingMode
         self.recurrence = recurrence
         self.timeZoneIdentifier = timeZoneIdentifier
@@ -80,7 +89,9 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         self.updatedAt = updatedAt
     }
 
-    public var effectiveRoutingMode: AgentRoutingMode { routingMode ?? .manual }
+    public var effectiveRoutingMode: AgentRoutingMode {
+        provider == .distill ? .manual : (routingMode ?? .manual)
+    }
 
     public func validationErrors() -> [String] {
         var errors: [String] = []
@@ -101,6 +112,11 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         if effectiveRoutingMode == .manual,
            model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             errors.append("Model is required.")
+        }
+        if provider == .distill,
+           let reasoningModel,
+           reasoningModel.trimmingCharacters(in: .whitespacesAndNewlines) == model.trimmingCharacters(in: .whitespacesAndNewlines) {
+            errors.append("Main and Reasoning models must differ.")
         }
         if TimeZone(identifier: timeZoneIdentifier) == nil { errors.append("Time zone must be a valid IANA identifier.") }
         switch recurrence {

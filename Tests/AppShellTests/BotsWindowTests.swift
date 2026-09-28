@@ -1424,6 +1424,20 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.studio"))
     }
 
+    func test_distillRoutineEditorNeverRendersAutoModelState_becauseDistillRequiresExplicitRoles() throws {
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotScheduleTasksWindow.swift"), encoding: .utf8)
+        guard let start = source.range(of: "struct BotScheduleSpecEditor: View") else {
+            return XCTFail("Bot routine editor must exist")
+        }
+        let editor = source[start.lowerBound...]
+
+        XCTAssertTrue(editor.contains("if spec.provider != .distill && spec.routingMode == .auto"))
+        XCTAssertTrue(editor.contains("if spec.provider != .distill {\n                    formRow(\"Model routing\")"))
+        XCTAssertTrue(editor.contains("AgentDistillModelSelectors("))
+        XCTAssertTrue(editor.contains("mainEffortSelection: mainEffortSelection"))
+        XCTAssertTrue(editor.contains("reasoningEffortSelection: reasoningEffortSelection"))
+    }
+
     func test_deskIdentityOpensStudio() throws {
         // WHY: The labeled Studio button competed with Chat. Identity and a
         // cog must dest to Studio; the inspector toggle stays last on the right.
@@ -5681,6 +5695,77 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.screen, .studio)
     }
 
+    func test_distillRoutineTestRunPersistsAndSendsRoleSpecificModelsAndEfforts() async throws {
+        // WHY: a Bot routine test run must carry its stored Distill routing into the provider request and the new conversation.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .distill)
+        context.coordinator.replaceProvider(.distill, runner: runner)
+        let efforts: [AgentReasoningEffort] = [.low, .high]
+        let models = [
+            AgentModelDescriptor(id: "main", label: "Main", provider: .distill, supportsReasoning: true, supportedReasoningEfforts: efforts),
+            AgentModelDescriptor(id: "reason", label: "Reason", provider: .distill, supportsReasoning: true, supportedReasoningEfforts: efforts),
+        ]
+        let snapshot = AgentProviderSnapshot(
+            id: "distill",
+            provider: .distill,
+            driverKind: .distillACP,
+            displayName: "Distill",
+            accentColor: "#6E56CF",
+            continuationGroup: "distill",
+            interactionModes: [.default],
+            permissionModes: [.supervised],
+            enabled: true,
+            installed: true,
+            status: .available,
+            authenticated: true,
+            models: models,
+            slashCommands: [],
+            capabilities: AgentProviderCapabilities(
+                supportsDistillMainEffortAuto: true,
+                supportsDistillReasoningModelEffort: true
+            )
+        )
+        router.rememberProviderSnapshotsForSend([snapshot])
+        let vm = BotsViewModel(context: context, router: router)
+        vm.replaceProvidersForTests([snapshot])
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        vm.routineName = "Distill routine"
+        vm.routinePrompt = "Inspect the scheduled change"
+        vm.routineScheduleNote = "Weekdays 9:00"
+        vm.routineSpec = BotScheduleSpec(
+            provider: .distill,
+            providerInstanceID: "distill",
+            model: "main",
+            reasoningEffort: .high,
+            reasoningModel: "reason",
+            distillMainEffortSelection: .fixed(.high),
+            distillReasoningEffortSelection: .fixed(.low),
+            routingMode: .manual
+        )
+        vm.saveRoutine()
+        let routine = try XCTUnwrap(vm.routines.first)
+
+        vm.requestRoutineTestRun(id: routine.definition.id)
+        let started = await waitUntil(timeout: 5) { !runner.requests.isEmpty }
+        XCTAssertTrue(started, "the routine test must reach the Distill provider adapter")
+        let request = try XCTUnwrap(runner.requests.first)
+        XCTAssertEqual(request.provider, .distill)
+        XCTAssertEqual(request.model, "main")
+        XCTAssertEqual(request.reasoningModel, "reason")
+        XCTAssertEqual(request.distillMainEffortSelection, .fixed(.high))
+        XCTAssertEqual(request.distillReasoningEffortSelection, .fixed(.low))
+        let conversation = try XCTUnwrap(vm.selectedConversation)
+
+        XCTAssertTrue(vm.createDeskThread())
+        vm.selectDeskThread(conversation.id)
+        XCTAssertEqual(vm.deskRouting.reasoningModel, "reason")
+        XCTAssertEqual(vm.deskRouting.distillMainEffortSelection, .fixed(.high))
+        XCTAssertEqual(vm.deskRouting.distillReasoningEffortSelection, .fixed(.low))
+    }
+
     func test_routineTestRunSendsTheInstruction_becauseTestRunsAreRealWork() throws {
         // WHY: Test run is a live supervised turn, not a fake schedule fire.
         // Enabling Active still must not imply the app runs while closed.
@@ -7718,10 +7803,81 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(decoded.runAsUser.id, AgentRunAsUser.current().id)
     }
 
+    func test_distillDeskSelectionRejectsAutomaticModelRouting() throws {
+        // WHY: a previously automatic Desk route must become an explicit
+        // Distill model choice, while other providers retain model-auto.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.setDeskProvider(.grok)
+        vm.setDeskRoutingMode(.auto)
+        XCTAssertEqual(vm.deskRouting.routingMode, .auto)
+
+        vm.setDeskProvider(.distill)
+
+        XCTAssertEqual(vm.deskRouting.routingMode, .manual)
+        vm.setDeskRoutingMode(.auto)
+        XCTAssertEqual(vm.deskRouting.routingMode, .manual)
+        XCTAssertNotEqual(vm.deskModelDisplayLabel, "Auto")
+
+        vm.setDeskProvider(.grok)
+        vm.setDeskRoutingMode(.auto)
+        XCTAssertEqual(vm.deskRouting.routingMode, .auto,
+                       "other providers keep the existing automatic-routing behavior")
+    }
+
+    func test_savedDeskDistillAutoRouteRestoresItsPinnedModelsManually() throws {
+        // WHY: old per-conversation Desk preferences may contain Distill Auto;
+        // restoring them must retain both model choices without model-auto.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.createDeskThread()
+        let conversation = try XCTUnwrap(vm.selectedConversation)
+        let route: [String: Any] = [
+            "provider": "distill",
+            "providerInstanceID": "distill",
+            "model": "gpt-6-luna",
+            "routingMode": "auto",
+            "permissionMode": "supervised",
+            "reasoningModel": "gpt-6-sol",
+        ]
+        let key = conversation.id.value.uuidString.lowercased()
+        UserDefaults.standard.set(
+            try JSONSerialization.data(withJSONObject: [key: route]),
+            forKey: "bots.deskThreadRouting"
+        )
+
+        let restored = BotsViewModel(context: context)
+        restored.openDesk(bot)
+        restored.selectDeskThread(conversation.id)
+
+        XCTAssertEqual(restored.deskRouting.routingMode, .manual)
+        XCTAssertEqual(restored.deskRunModel, "gpt-6-luna")
+        XCTAssertEqual(restored.deskRouting.reasoningModel, "gpt-6-sol")
+    }
+
     func test_deskRoutingRoundTripsIndependentReasoningModels() throws {
         // WHY: Desk stores routing per conversation; changing one Reasoning model must not replace another conversation's selection.
-        let first = BotDeskRouting(provider: .distill, providerInstanceID: "distill", model: "grok-4.6", routingMode: .manual, reasoningModel: "grok-4.5")
-        let second = BotDeskRouting(provider: .distill, providerInstanceID: "distill", model: "grok-4.6", routingMode: .manual, reasoningModel: nil)
+        let first = BotDeskRouting(
+            provider: .distill,
+            providerInstanceID: "distill",
+            model: "grok-4.6",
+            routingMode: .manual,
+            reasoningModel: "grok-4.5",
+            distillMainEffortSelection: .fixed(.high),
+            distillReasoningEffortSelection: .automatic
+        )
+        let second = BotDeskRouting(
+            provider: .distill,
+            providerInstanceID: "distill",
+            model: "grok-4.6",
+            routingMode: .manual,
+            reasoningModel: nil,
+            distillMainEffortSelection: .automatic
+        )
         let encoder = JSONEncoder()
         let decoder = JSONDecoder()
 
@@ -7729,7 +7885,11 @@ final class BotsWindowTests: XCTestCase {
         let restoredSecond = try decoder.decode(BotDeskRouting.self, from: encoder.encode(second))
 
         XCTAssertEqual(restoredFirst.reasoningModel, "grok-4.5")
+        XCTAssertEqual(restoredFirst.distillMainEffortSelection, .fixed(.high))
+        XCTAssertEqual(restoredFirst.distillReasoningEffortSelection, .automatic)
         XCTAssertNil(restoredSecond.reasoningModel)
+        XCTAssertEqual(restoredSecond.distillMainEffortSelection, .automatic)
+        XCTAssertNil(restoredSecond.distillReasoningEffortSelection)
     }
 
     func test_newDeskThreadDoesNotSeedFromBotRevision_becauseProviderBelongsToTheThread() throws {

@@ -78,16 +78,19 @@ public final class ScheduledTaskStore: @unchecked Sendable {
                 INSERT INTO scheduled_tasks(
                     id, title, prompt, workspace_id, workspace_path_snapshot, run_as_user, run_as_uid,
                     provider, provider_instance_id,
-                    model, reasoning_effort, routing_mode, recurrence_json, timezone_id, enabled, next_run_at,
+                    model, reasoning_effort, reasoning_model, distill_main_effort_json, distill_reasoning_effort_json,
+                    routing_mode, recurrence_json, timezone_id, enabled, next_run_at,
                     last_run_at, lease_owner, lease_expires_at, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title=excluded.title, prompt=excluded.prompt, workspace_id=excluded.workspace_id,
                     workspace_path_snapshot=excluded.workspace_path_snapshot,
                     run_as_user=excluded.run_as_user, run_as_uid=excluded.run_as_uid, provider=excluded.provider,
                     provider_instance_id=excluded.provider_instance_id, model=excluded.model,
-                    reasoning_effort=excluded.reasoning_effort, routing_mode=excluded.routing_mode,
-                    recurrence_json=excluded.recurrence_json,
+                    reasoning_effort=excluded.reasoning_effort, reasoning_model=excluded.reasoning_model,
+                    distill_main_effort_json=excluded.distill_main_effort_json,
+                    distill_reasoning_effort_json=excluded.distill_reasoning_effort_json,
+                    routing_mode=excluded.routing_mode, recurrence_json=excluded.recurrence_json,
                     timezone_id=excluded.timezone_id, enabled=excluded.enabled,
                     next_run_at=excluded.next_run_at, last_run_at=excluded.last_run_at,
                     updated_at=excluded.updated_at;
@@ -546,17 +549,26 @@ public final class ScheduledTaskStore: @unchecked Sendable {
         try statement.bind(9, task.providerInstanceID)
         try statement.bind(10, task.model)
         try statement.bind(11, task.reasoningEffort.rawValue)
-        try statement.bind(12, task.effectiveRoutingMode.rawValue)
-        try statement.bind(13, recurrenceJSON)
-        try statement.bind(14, task.timeZoneIdentifier)
-        try statement.bind(15, task.isEnabled)
-        try statement.bind(16, string(task.nextRunAt))
-        try statement.bind(17, string(task.lastRunAt))
-        try statement.bind(18, string(task.createdAt))
-        try statement.bind(19, string(task.updatedAt))
+        try statement.bind(12, task.reasoningModel)
+        try statement.bind(13, encodeEffortSelection(task.distillMainEffortSelection))
+        try statement.bind(14, encodeEffortSelection(task.distillReasoningEffortSelection))
+        try statement.bind(15, task.effectiveRoutingMode.rawValue)
+        try statement.bind(16, recurrenceJSON)
+        try statement.bind(17, task.timeZoneIdentifier)
+        try statement.bind(18, task.isEnabled)
+        try statement.bind(19, string(task.nextRunAt))
+        try statement.bind(20, string(task.lastRunAt))
+        try statement.bind(21, string(task.createdAt))
+        try statement.bind(22, string(task.updatedAt))
     }
 
     private func decodeTask(_ statement: SQLiteStatement) throws -> ScheduledTask {
+        let mainEffortSelection = try decodeEffortSelection(statement.columnText(12))
+        let reasoningEffortSelection = try decodeEffortSelection(statement.columnText(13))
+        guard let recurrenceRaw = statement.columnText(15) else {
+            throw ScheduledTaskStoreError.invalidRow("missing scheduled_tasks recurrence_json")
+        }
+        let recurrence = try decodeRecurrence(recurrenceRaw)
         guard
             let idRaw = statement.columnText(0), let id = UUID(uuidString: idRaw),
             let title = statement.columnText(1), let prompt = statement.columnText(2),
@@ -566,19 +578,21 @@ public final class ScheduledTaskStore: @unchecked Sendable {
             let providerRaw = statement.columnText(7), let provider = AgentProvider(rawValue: providerRaw),
             let instance = statement.columnText(8), let model = statement.columnText(9),
             let reasoningRaw = statement.columnText(10), let reasoning = AgentReasoningEffort(rawValue: reasoningRaw),
-            let routingRaw = statement.columnText(11), let routingMode = AgentRoutingMode(rawValue: routingRaw),
-            let recurrenceRaw = statement.columnText(12),
-            let recurrence = try? decodeRecurrence(recurrenceRaw),
-            let timeZone = statement.columnText(13),
-            let created = date(statement.columnText(19)), let updated = date(statement.columnText(20))
+            let routingRaw = statement.columnText(14), let routingMode = AgentRoutingMode(rawValue: routingRaw),
+            let timeZone = statement.columnText(16),
+            let created = date(statement.columnText(22)), let updated = date(statement.columnText(23))
         else { throw ScheduledTaskStoreError.invalidRow("missing or invalid scheduled_tasks column") }
         return ScheduledTask(
             id: id, title: title, prompt: prompt, workspaceID: WorkspaceID(workspaceUUID), workspacePathSnapshot: workspacePath,
             runAsUser: runAs, runAsUID: UInt32(statement.columnInt64(6)), provider: provider, providerInstanceID: instance, model: model,
-            reasoningEffort: reasoning, routingMode: routingMode,
+            reasoningEffort: reasoning,
+            reasoningModel: statement.columnText(11),
+            distillMainEffortSelection: mainEffortSelection,
+            distillReasoningEffortSelection: reasoningEffortSelection,
+            routingMode: routingMode,
             recurrence: recurrence, timeZoneIdentifier: timeZone,
-            isEnabled: statement.columnInt64(14) != 0,
-            nextRunAt: date(statement.columnText(15)), lastRunAt: date(statement.columnText(16)),
+            isEnabled: statement.columnInt64(17) != 0,
+            nextRunAt: date(statement.columnText(18)), lastRunAt: date(statement.columnText(19)),
             createdAt: created, updatedAt: updated
         )
     }
@@ -612,6 +626,22 @@ public final class ScheduledTaskStore: @unchecked Sendable {
     private func decodeRecurrence(_ string: String) throws -> ScheduledTaskRecurrence {
         guard let data = string.data(using: .utf8) else { throw ScheduledTaskStoreError.invalidRow("recurrence is not UTF-8") }
         return try decoder.decode(ScheduledTaskRecurrence.self, from: data)
+    }
+
+    private func encodeEffortSelection(_ selection: AgentEffortSelection?) throws -> String? {
+        guard let selection else { return nil }
+        guard let value = String(data: try JSONEncoder().encode(selection), encoding: .utf8) else {
+            throw ScheduledTaskStoreError.invalidRow("Distill effort selection is not UTF-8")
+        }
+        return value
+    }
+
+    private func decodeEffortSelection(_ value: String?) throws -> AgentEffortSelection? {
+        guard let value else { return nil }
+        guard let data = value.data(using: .utf8) else {
+            throw ScheduledTaskStoreError.invalidRow("Distill effort selection is not UTF-8")
+        }
+        return try JSONDecoder().decode(AgentEffortSelection.self, from: data)
     }
 
     private func string(_ date: Date?) -> String? {
@@ -677,7 +707,9 @@ public final class ScheduledTaskStore: @unchecked Sendable {
 
     private static let taskSelect = """
         SELECT id, title, prompt, workspace_id, workspace_path_snapshot, run_as_user, run_as_uid,
-               provider, provider_instance_id, model, reasoning_effort, routing_mode, recurrence_json, timezone_id, enabled, next_run_at,
+               provider, provider_instance_id, model, reasoning_effort, reasoning_model,
+               distill_main_effort_json, distill_reasoning_effort_json,
+               routing_mode, recurrence_json, timezone_id, enabled, next_run_at,
                last_run_at, lease_owner, lease_expires_at, created_at, updated_at
         FROM scheduled_tasks
         """

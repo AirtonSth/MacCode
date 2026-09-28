@@ -3853,7 +3853,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// - Parameter quiet: when true (scheduled headless fires), skip rail select and
     ///   `refreshFromState` so automatic work does not rebuild workspace UI or steal focus.
     ///   Still persists the thread and publishes `agent.thread.created`.
-    public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, runAsUser: AgentRunAsUser? = nil, surfaceID: SurfaceID? = nil, routingConfiguration: AgentRoutingConfiguration?, quiet: Bool = false, inheriting parentThread: AgentThread? = nil) throws -> AgentThread {
+    public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, reasoningModel: String? = nil, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, runAsUser: AgentRunAsUser? = nil, surfaceID: SurfaceID? = nil, routingConfiguration: AgentRoutingConfiguration?, quiet: Bool = false, inheriting parentThread: AgentThread? = nil) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let resolvedWorkspace = parentThread?.workspaceId ?? workspace
         let resolvedRunAs: AgentRunAsUser?
@@ -3869,6 +3869,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             providerInstanceId: normalizedProviderInstanceId(provider: provider, requested: providerInstanceId),
                             model: model,
                             permissionMode: permissionMode, reasoningEffort: reasoningEffort,
+                            reasoningModel: reasoningModel ?? parentThread?.reasoningModel,
                             executionMode: parentThread?.executionMode ?? .local,
                             baseBranch: parentThread?.baseBranch,
                             worktreePath: parentThread?.worktreePath,
@@ -5152,6 +5153,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             permissionMode: t.permissionMode,
             reasoningEffort: t.reasoningEffort,
             reasoningModel: t.reasoningModel,
+            distillMainEffortSelection: prov == .distill
+                ? (modelSelection?.distillMainEffortSelection ?? t.modelSelection.distillMainEffortSelection) : nil,
+            distillReasoningEffortSelection: prov == .distill
+                ? (modelSelection?.distillReasoningEffortSelection ?? t.modelSelection.distillReasoningEffortSelection) : nil,
             serviceTier: t.serviceTier,
             interactionMode: interactionMode ?? .default,
             providerBinary: autoRoutingActive ? nil : providerBinary(provider: prov, instanceId: t.providerInstanceId),

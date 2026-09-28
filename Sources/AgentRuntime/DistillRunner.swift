@@ -18,8 +18,7 @@ public final class DistillRunner: AgentProviderRunner, @unchecked Sendable {
     public static let grok46ReasoningEfforts = DistillReasoningPolicy.grok46Efforts
     public static let grok45ReasoningEfforts = DistillReasoningPolicy.grok45Efforts
 
-    /// Static catalog of the harness's available models and their efforts.
-    /// Empty model id means account default (omit `-m`).
+    /// Static fallback catalog of explicitly named models and their efforts.
     public static func listModels(installedVersion: String?) -> [AgentModelDescriptor] {
         [
             AgentModelDescriptor(
@@ -70,14 +69,6 @@ public final class DistillRunner: AgentProviderRunner, @unchecked Sendable {
                 supportsCustomModel: true
             ),
             // The account default tracks the current reasoning model.
-            AgentModelDescriptor(
-                id: "",
-                label: "Default (account)",
-                provider: .distill,
-                supportsReasoning: true,
-                supportedReasoningEfforts: grok46ReasoningEfforts,
-                supportsCustomModel: true
-            )
         ]
     }
 
@@ -159,6 +150,12 @@ public final class DistillRunner: AgentProviderRunner, @unchecked Sendable {
     }
 
     public func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        guard !request.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let message = "Select an explicit Distill Main model before running."
+            onEvent(.error(message))
+            onEvent(.finished(.failed, finalMessage: nil, providerThreadId: nil))
+            throw AgentRunError.spawnFailed(message)
+        }
         let binary = request.providerBinary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
             ? request.providerBinary!
             : (binaryNameOverride ?? DistillProvisioner.binaryName)

@@ -438,6 +438,8 @@ public struct AgentNewThreadDefaults: Codable, Sendable, Equatable {
     public var providerInstanceId: String
     public var model: String
     public var reasoningEffort: AgentReasoningEffort
+    public var distillMainEffortSelection: AgentEffortSelection?
+    public var distillReasoningEffortSelection: AgentEffortSelection?
 
     public init(
         routingMode: AgentRoutingMode,
@@ -445,7 +447,9 @@ public struct AgentNewThreadDefaults: Codable, Sendable, Equatable {
         provider: AgentProvider,
         providerInstanceId: String,
         model: String,
-        reasoningEffort: AgentReasoningEffort
+        reasoningEffort: AgentReasoningEffort,
+        distillMainEffortSelection: AgentEffortSelection? = nil,
+        distillReasoningEffortSelection: AgentEffortSelection? = nil
     ) {
         self.routingMode = routingMode
         self.runAsUser = runAsUser
@@ -453,6 +457,8 @@ public struct AgentNewThreadDefaults: Codable, Sendable, Equatable {
         self.providerInstanceId = providerInstanceId
         self.model = model
         self.reasoningEffort = reasoningEffort
+        self.distillMainEffortSelection = distillMainEffortSelection
+        self.distillReasoningEffortSelection = distillReasoningEffortSelection
     }
 }
 
@@ -477,8 +483,12 @@ public final class AgentNewThreadDefaultsStore: @unchecked Sendable {
     public func load() -> AgentNewThreadDefaults? {
         guard let data = defaults.data(forKey: key) else { return nil }
         codecLock.lock()
-        let value = try? decoder.decode(AgentNewThreadDefaults.self, from: data)
+        var value = try? decoder.decode(AgentNewThreadDefaults.self, from: data)
         codecLock.unlock()
+        if value?.provider == .distill, value?.routingMode == .auto {
+            value?.routingMode = .manual
+            if let value { save(value) }
+        }
         return value
     }
 

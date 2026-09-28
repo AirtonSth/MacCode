@@ -7,6 +7,9 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
     public var providerInstanceID: String
     public var model: String
     public var reasoningEffort: AgentReasoningEffort
+    public var reasoningModel: String?
+    public var distillMainEffortSelection: AgentEffortSelection?
+    public var distillReasoningEffortSelection: AgentEffortSelection?
     public var routingMode: AgentRoutingMode
     public var frequency: ScheduledTaskFrequency
     public var scheduledDate: Date
@@ -22,6 +25,9 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
         providerInstanceID: String = AgentProvider.grok.rawValue,
         model: String = "",
         reasoningEffort: AgentReasoningEffort = .medium,
+        reasoningModel: String? = nil,
+        distillMainEffortSelection: AgentEffortSelection? = nil,
+        distillReasoningEffortSelection: AgentEffortSelection? = nil,
         routingMode: AgentRoutingMode = .auto,
         frequency: ScheduledTaskFrequency = .daily,
         scheduledDate: Date = Date().addingTimeInterval(60 * 60),
@@ -35,7 +41,10 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
         self.providerInstanceID = providerInstanceID
         self.model = model
         self.reasoningEffort = reasoningEffort
-        self.routingMode = routingMode
+        self.reasoningModel = reasoningModel
+        self.distillMainEffortSelection = distillMainEffortSelection
+        self.distillReasoningEffortSelection = distillReasoningEffortSelection
+        self.routingMode = provider == .distill ? .manual : routingMode
         self.frequency = frequency
         self.scheduledDate = scheduledDate
         self.intervalHours = intervalHours
@@ -136,8 +145,10 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
     }()
 
     public func encodedJSON() -> String {
+        var normalized = self
+        if normalized.provider == .distill { normalized.routingMode = .manual }
         Self.codecLock.lock()
-        let data = try? Self.sharedEncoder.encode(self)
+        let data = try? Self.sharedEncoder.encode(normalized)
         Self.codecLock.unlock()
         guard let data, let text = String(data: data, encoding: .utf8) else { return "" }
         return text
@@ -147,8 +158,9 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { return nil }
         Self.codecLock.lock()
-        let decoded = try? Self.sharedDecoder.decode(BotScheduleSpec.self, from: data)
+        var decoded = try? Self.sharedDecoder.decode(BotScheduleSpec.self, from: data)
         Self.codecLock.unlock()
+        if decoded?.provider == .distill { decoded?.routingMode = .manual }
         return decoded
     }
 

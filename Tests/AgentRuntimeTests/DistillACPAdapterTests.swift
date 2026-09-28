@@ -4,6 +4,28 @@ import CoreModel
 @testable import AgentRuntime
 
 final class DistillACPAdapterTests: ProviderProcessTestCase {
+    func test_emptyMainModelIsRejectedBeforeACPStarts_becauseDistillMustNotUseAccountDefault() async throws {
+        let adapter = DistillACPAdapter(binaryNameOverride: "/missing/distill-agent")
+        do {
+            _ = try await adapter.startSession(
+                AgentRunRequest(
+                    threadId: AgentThreadID(),
+                    provider: .distill,
+                    model: "  ",
+                    cwd: "/tmp",
+                    prompt: "Do work"
+                ),
+                onEvent: { _ in }
+            )
+            XCTFail("An empty Main model must not fall back to the account default")
+        } catch let error as AgentProviderAdapterError {
+            guard case .unsupported(let message) = error else {
+                return XCTFail("expected an explicit model-selection refusal, got \(error)")
+            }
+            XCTAssertEqual(message, "Select an explicit Distill Main model before running.")
+        }
+    }
+
     func test_discoverySkipsReasoningExtensionWhenOlderPeerOmitsCapability() async throws {
         // WHY: model discovery must preserve a valid catalog from older Distill ACP peers that do not implement the optional Reasoning selector.
         let root = FileManager.default.temporaryDirectory
@@ -47,6 +69,71 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             .compactMap { $0["method"] }
         XCTAssertFalse(methods.contains("x.ai/session/reasoning_model/set"),
                        "discovery must not call an extension the peer did not advertise")
+    }
+
+    func test_reasoningAutoRequiresExplicitACPConfirmationBeforeSessionUse() async throws {
+        // WHY: a peer that omits the advertised Auto acknowledgement must not make an unconfirmed selection look applied.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("distill-acp-reasoning-ack-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let requestsURL = root.appendingPathComponent("requests.jsonl")
+        let harnessURL = root.appendingPathComponent("distill-agent")
+        let harness = """
+        #!/usr/bin/env python3
+        import json, pathlib, sys
+        requests = pathlib.Path(\(String(reflecting: requestsURL.path)))
+        def send(value): print(json.dumps(value), flush=True)
+        for line in sys.stdin:
+            message = json.loads(line)
+            method = message.get("method")
+            params = message.get("params", {})
+            with requests.open("a") as output: output.write(json.dumps({"method":method}) + "\\n")
+            if method == "initialize":
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"x.ai/capabilities":{"sessionReasoningModel":True,"sessionMainEffortAuto":True,"sessionReasoningModelEffort":True}}}}})
+            elif method == "session/new":
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"sessionId":"reasoning-ack-session","models":{"currentModelId":"main"}}})
+            elif method == "session/set_model":
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"meta":{"model":params.get("modelId"),"reasoningEffort":"high","reasoningEffortAuto":False}}})
+            elif method == "x.ai/session/reasoning_model/set":
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"reasoningModelId":params.get("modelId")}})
+        """
+        try harness.write(to: harnessURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: harnessURL.path)
+        let client = try DistillACPClient(binary: harnessURL.path, cwd: root.path, tagProcess: false)
+        defer { client.stop() }
+        let initialized = try await client.initialize()
+        XCTAssertTrue(initialized.sessionMainEffortAuto)
+        XCTAssertTrue(initialized.sessionReasoningModelEffort)
+        do {
+            _ = try await client.newSession(
+                cwd: root.path,
+                modelId: "main",
+                mainEffortSelection: .automatic,
+                mainEffortAutoSupported: true
+            )
+            XCTFail("A missing canonical Main model acknowledgement must reject the selection")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("did not confirm the canonical Main model"))
+        }
+        do {
+            _ = try await client.newSession(
+                cwd: root.path,
+                modelId: "main",
+                reasoningModel: "reasoner",
+                reasoningModelEffortSelection: .automatic,
+                reasoningModelSelectionSupported: true,
+                reasoningModelEffortSupported: true
+            )
+            XCTFail("An omitted Reasoning Auto acknowledgement must reject the unconfirmed selection")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("did not confirm the requested Reasoning-model effort"))
+        }
+        let methods = try String(contentsOf: requestsURL, encoding: .utf8)
+            .split(whereSeparator: \.isNewline)
+            .compactMap { try JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: String] }
+            .compactMap { $0["method"] }
+        XCTAssertFalse(methods.contains("session/prompt"), "the prompt must wait for a confirmed model and effort")
     }
 
     func test_selectedModelRunsTurnsAndResumesOnTheSameACPThread() async throws {
@@ -100,7 +187,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                     send({"jsonrpc":"2.0", "id":message["id"], "error":{"code":-32602,"message":"Reasoning model must differ from the Main model"}})
                 else:
                     state["reasoning"] = reasoning_model
-                    send({"jsonrpc":"2.0", "id":message["id"], "result":{}})
+                    send({"jsonrpc":"2.0", "id":message["id"], "result":{"reasoningModelId":reasoning_model or ""}})
             elif method == "session/set_model":
                 params = message.get("params", {})
                 next_main = params.get("modelId")
@@ -109,7 +196,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                     send({"jsonrpc":"2.0", "id":message["id"], "error":{"code":-32602,"message":"Main model must differ from the Reasoning model"}})
                 else:
                     state["main"] = next_main
-                    send({"jsonrpc":"2.0", "id":message["id"], "result":{}})
+                    send({"jsonrpc":"2.0", "id":message["id"], "result":{"meta":{"model":next_main,"canonicalModelId":next_main}}})
             elif method in ("session/set_mode", "session/set_config_option"):
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{}})
             elif method == "session/prompt":

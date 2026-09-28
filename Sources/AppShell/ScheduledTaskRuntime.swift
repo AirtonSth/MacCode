@@ -132,11 +132,7 @@ public final class ScheduledTaskExecutor {
         )
 
         let runAs = Self.resolveRunAsUser(task: task)
-        let modelSelection = AgentModelSelection(
-            provider: task.provider,
-            modelId: task.model,
-            reasoningEffort: task.reasoningEffort
-        )
+        let modelSelection = Self.modelSelection(for: task)
         let routingConfiguration: AgentRoutingConfiguration?
         if task.effectiveRoutingMode == .auto {
             routingConfiguration = prepared.routingSnapshot?.configuration
@@ -158,6 +154,7 @@ public final class ScheduledTaskExecutor {
             model: task.model.isEmpty ? modelSelection.effectiveModel : task.model,
             permissionMode: .fullAccess,
             reasoningEffort: task.reasoningEffort,
+            reasoningModel: task.provider == .distill ? task.reasoningModel : nil,
             modelSelection: modelSelection,
             providerInstanceId: task.providerInstanceID,
             runAsUser: runAs,
@@ -359,6 +356,7 @@ public final class ScheduledTaskExecutor {
            !descriptor.supportedReasoningEfforts.contains(task.reasoningEffort) {
             throw ScheduledTaskPreflightError.unsupportedReasoning(task.reasoningEffort.displayName)
         }
+        try Self.validateDistillConfiguration(task, snapshot: snapshot)
         let binary = snapshot.binaryPath?.trimmingCharacters(in: .whitespacesAndNewlines)
         let baseBinary = binary?.isEmpty == false ? binary! : task.provider.rawValue
         let probeEnvironment = user.name == NSUserName()
@@ -388,6 +386,60 @@ public final class ScheduledTaskExecutor {
         )
     }
 
+    nonisolated static func modelSelection(for task: ScheduledTask) -> AgentModelSelection {
+        AgentModelSelection(
+            provider: task.provider,
+            modelId: task.model,
+            reasoningEffort: task.reasoningEffort,
+            distillMainEffortSelection: task.provider == .distill
+                ? (task.distillMainEffortSelection ?? .fixed(task.reasoningEffort)) : nil,
+            distillReasoningEffortSelection: task.provider == .distill
+                ? (task.distillReasoningEffortSelection ?? .automatic) : nil
+        )
+    }
+
+    static func validateDistillConfiguration(
+        _ task: ScheduledTask,
+        snapshot: AgentProviderSnapshot
+    ) throws {
+        guard task.provider == .distill else { return }
+        let mainModel = task.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let reasoningModel = task.reasoningModel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !mainModel.isEmpty else {
+            throw ScheduledTaskPreflightError.invalidTask("Select an explicit Distill Main model.")
+        }
+        guard reasoningModel == nil || reasoningModel != mainModel else {
+            throw ScheduledTaskPreflightError.invalidTask("Main and Reasoning Distill models must differ.")
+        }
+        let mainEffortSelection = task.distillMainEffortSelection ?? .fixed(task.reasoningEffort)
+        if mainEffortSelection.isAutomatic && !snapshot.effectiveCapabilities.supportsDistillMainEffortAuto {
+            throw ScheduledTaskPreflightError.invalidTask("Update the Distill ACP session to apply Auto Main effort.")
+        }
+        let mainDescriptor = snapshot.models.first(where: { $0.id == mainModel })
+        if let effort = mainEffortSelection.effort,
+           let supported = mainDescriptor?.supportedReasoningEfforts,
+           !supported.isEmpty,
+           !supported.contains(effort) {
+            throw ScheduledTaskPreflightError.unsupportedReasoning(effort.displayName)
+        }
+        guard let reasoningModel, !reasoningModel.isEmpty else { return }
+        let reasoningDescriptor = snapshot.models.first(where: { $0.id == reasoningModel })
+        if reasoningDescriptor == nil, !snapshot.models.isEmpty {
+            throw ScheduledTaskPreflightError.unsupportedModel(reasoningModel)
+        }
+        if let selection = task.distillReasoningEffortSelection {
+            guard snapshot.effectiveCapabilities.supportsDistillReasoningModelEffort else {
+                throw ScheduledTaskPreflightError.invalidTask("Update the Distill ACP session to select Reasoning-model effort.")
+            }
+            if let effort = selection.effort,
+               let supported = reasoningDescriptor?.supportedReasoningEfforts,
+               !supported.isEmpty,
+               !supported.contains(effort) {
+                throw ScheduledTaskPreflightError.unsupportedReasoning(effort.displayName)
+            }
+        }
+    }
+
     nonisolated static func routingConfiguration(
         for task: ScheduledTask,
         policyDigest: String,
@@ -395,11 +447,7 @@ public final class ScheduledTaskExecutor {
     ) -> AgentRoutingConfiguration {
         AgentRoutingConfiguration(
             mode: task.effectiveRoutingMode,
-            manualSelection: AgentModelSelection(
-                provider: task.provider,
-                modelId: task.model,
-                reasoningEffort: task.reasoningEffort
-            ),
+            manualSelection: modelSelection(for: task),
             manualProviderInstanceId: task.providerInstanceID,
             eligibleProviders: eligibleProviders,
             policyDigest: task.effectiveRoutingMode == .auto ? policyDigest : "",

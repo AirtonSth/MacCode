@@ -781,6 +781,25 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.providerLocked, "once it has a message the source is fixed")
     }
 
+    func test_distillSelectionRejectsAutomaticModelRouting() throws {
+        // WHY: Distill ACP requires an explicit Main model; switching from
+        // orchestration must not leave the UI in model-auto.
+        let (vm, _) = try makeVM()
+        XCTAssertTrue(vm.setAutoModelRoutingEnabled(true))
+        XCTAssertEqual(vm.routingMode, .auto)
+
+        vm.setProvider(.distill)
+
+        XCTAssertEqual(vm.routingMode, .manual)
+        XCTAssertFalse(vm.setAutoModelRoutingEnabled(true))
+        XCTAssertEqual(vm.routingMode, .manual)
+        XCTAssertEqual(vm.provider, .distill)
+
+        vm.setProvider(.grok)
+        XCTAssertTrue(vm.setAutoModelRoutingEnabled(true),
+                      "other providers keep the existing automatic-routing behavior")
+    }
+
     func test_providerChangeIsIgnoredAfterConversationStarts() throws {
         let (vm, repo) = try makeVM()
         vm.providerSnapshots = [
@@ -2618,6 +2637,144 @@ final class AgentAppViewModelTests: XCTestCase {
                        "reopening an existing thread must restore its saved permission mode")
         XCTAssertEqual(vm.reasoningEffort, .high,
                        "reopening an existing thread must restore its saved reasoning effort")
+    }
+
+    func test_distillEffortsRestorePerThreadAcrossSoftReselectionAndReachRunRequest() async throws {
+        // WHY: switching conversations must restore both Distill effort choices before constructing the next provider request.
+        let runner = CapturingProviderRunner(provider: .distill)
+        let (vm, repo) = try makeVM(provider: runner)
+        let efforts: [AgentReasoningEffort] = [.low, .high]
+        let models = [
+            AgentModelDescriptor(id: "main-a", label: "Main A", provider: .distill, supportsReasoning: true, supportedReasoningEfforts: efforts),
+            AgentModelDescriptor(id: "reason-a", label: "Reason A", provider: .distill, supportsReasoning: true, supportedReasoningEfforts: efforts),
+            AgentModelDescriptor(id: "main-b", label: "Main B", provider: .distill, supportsReasoning: true, supportedReasoningEfforts: efforts),
+            AgentModelDescriptor(id: "reason-b", label: "Reason B", provider: .distill, supportsReasoning: true, supportedReasoningEfforts: efforts),
+        ]
+        vm.availableModels = models
+        vm.providerSnapshots = [AgentProviderSnapshot(
+            id: AgentProvider.distill.rawValue,
+            provider: .distill,
+            driverKind: .distillACP,
+            displayName: "Distill",
+            accentColor: "#6E56CF",
+            continuationGroup: "distill",
+            interactionModes: [.default],
+            permissionModes: [.supervised],
+            enabled: true,
+            installed: true,
+            status: .available,
+            authenticated: true,
+            models: models,
+            slashCommands: [],
+            capabilities: AgentProviderCapabilities(
+                supportsDistillMainEffortAuto: true,
+                supportsDistillReasoningModelEffort: true
+            )
+        )]
+        vm.provider = .distill
+        vm.providerInstanceId = AgentProvider.distill.rawValue
+
+        func makeDistillThread(
+            title: String,
+            mainModel: String,
+            reasoningModel: String,
+            mainEffort: AgentReasoningEffort,
+            reasoningEffort: AgentReasoningEffort
+        ) -> AgentThread {
+            let selection = AgentModelSelection(
+                provider: .distill,
+                modelId: mainModel,
+                reasoningEffort: mainEffort,
+                distillMainEffortSelection: .fixed(mainEffort),
+                distillReasoningEffortSelection: .fixed(reasoningEffort)
+            )
+            return AgentThread(
+                workspaceId: vm.workspaceID,
+                title: title,
+                provider: .distill,
+                model: mainModel,
+                reasoningEffort: mainEffort,
+                reasoningModel: reasoningModel,
+                modelSelection: selection,
+                routingConfiguration: AgentRoutingConfiguration(
+                    mode: .manual,
+                    manualSelection: selection,
+                    manualProviderInstanceId: AgentProvider.distill.rawValue
+                )
+            )
+        }
+
+        let threadA = makeDistillThread(
+            title: "A",
+            mainModel: "main-a",
+            reasoningModel: "reason-a",
+            mainEffort: .high,
+            reasoningEffort: .low
+        )
+        let threadB = makeDistillThread(
+            title: "B",
+            mainModel: "main-b",
+            reasoningModel: "reason-b",
+            mainEffort: .low,
+            reasoningEffort: .high
+        )
+        let legacyThread = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "Legacy",
+            provider: .distill,
+            model: "main-a",
+            reasoningEffort: .high,
+            reasoningModel: "reason-a"
+        )
+        try repo.upsert(threadA)
+        try repo.upsert(threadB)
+        try repo.upsert(legacyThread)
+        vm.reloadThreads()
+
+        vm.selectThread(threadA.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        XCTAssertEqual(vm.distillMainEffortSelection, .fixed(.high))
+        XCTAssertEqual(vm.distillReasoningEffortSelection, .fixed(.low))
+        XCTAssertEqual(vm.currentModelSelection.distillMainEffortSelection, .fixed(.high))
+        XCTAssertEqual(vm.currentModelSelection.distillReasoningEffortSelection, .fixed(.low))
+
+        vm.selectThread(threadB.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        XCTAssertEqual(vm.distillMainEffortSelection, .fixed(.low))
+        XCTAssertEqual(vm.distillReasoningEffortSelection, .fixed(.high))
+
+        vm.selectThread(threadA.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        XCTAssertEqual(vm.distillMainEffortSelection, .fixed(.high))
+        XCTAssertEqual(vm.distillReasoningEffortSelection, .fixed(.low))
+        XCTAssertEqual(vm.currentModelSelection.distillMainEffortSelection, .fixed(.high))
+        XCTAssertEqual(vm.currentModelSelection.distillReasoningEffortSelection, .fixed(.low))
+
+        vm.prompt = "Use thread A's Distill routing"
+        await vm.send()
+        await waitAsync("thread A request captured") { runner.requests.count == 1 }
+        let request = try XCTUnwrap(runner.requests.first)
+        XCTAssertEqual(request.threadId, threadA.id)
+        XCTAssertEqual(request.model, "main-a")
+        XCTAssertEqual(request.reasoningModel, "reason-a")
+        XCTAssertEqual(request.distillMainEffortSelection, .fixed(.high))
+        XCTAssertEqual(request.distillReasoningEffortSelection, .fixed(.low))
+
+        vm.selectThread(legacyThread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        XCTAssertEqual(vm.distillMainEffortSelection, .fixed(.high),
+                       "legacy threads continue to derive Main effort from their stored reasoningEffort")
+        XCTAssertEqual(vm.distillReasoningEffortSelection, .automatic,
+                       "legacy threads without a Reasoning effort pin restore Auto")
+
+        vm.selectThread(threadB.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        XCTAssertEqual(vm.distillMainEffortSelection, .fixed(.low))
+        XCTAssertEqual(vm.distillReasoningEffortSelection, .fixed(.high))
+        XCTAssertEqual(try repo.get(id: threadA.id)?.modelSelection.distillMainEffortSelection, .fixed(.high))
+        XCTAssertEqual(try repo.get(id: threadA.id)?.modelSelection.distillReasoningEffortSelection, .fixed(.low))
+        XCTAssertEqual(try repo.get(id: threadB.id)?.modelSelection.distillMainEffortSelection, .fixed(.low))
+        XCTAssertEqual(try repo.get(id: threadB.id)?.modelSelection.distillReasoningEffortSelection, .fixed(.high))
     }
 
     func test_settingPermissionPersistsImmediatelyBeforeAnyMessageIsSent() throws {
@@ -10269,6 +10426,12 @@ private final class CapturingProviderRunner: AgentProviderRunner, @unchecked Sen
     private var _providerBinaries: [String?] = []
     private var _environments: [[String: String]] = []
     private var _requestProviderThreadIds: [String?] = []
+    private var _requests: [AgentRunRequest] = []
+
+    var requests: [AgentRunRequest] {
+        lock.lock(); defer { lock.unlock() }
+        return _requests
+    }
 
     var prompts: [String] {
         lock.lock(); defer { lock.unlock() }
@@ -10310,6 +10473,7 @@ private final class CapturingProviderRunner: AgentProviderRunner, @unchecked Sen
 
     func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
         lock.lock()
+        _requests.append(request)
         _prompts.append(request.prompt)
         _interactionModes.append(request.interactionMode)
         _attachments.append(request.attachments)

@@ -40,7 +40,7 @@ public enum Schema {
     /// v82 indexes audit_log(action, id) so the orchestration receipt poll
     /// can read its append signature without a table scan, and v83 indexes
     /// agent_threads(workspace_id, updated_at DESC, id DESC) for the rail list.
-    public static let currentVersion: Int = 83
+    public static let currentVersion: Int = 84
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1770,6 +1770,11 @@ public enum Schema {
         SchemaStep(83, """
         CREATE INDEX IF NOT EXISTS idx_agent_threads_workspace_updated
             ON agent_threads(workspace_id, updated_at DESC, id DESC);
+        """),
+        SchemaStep(84, """
+        ALTER TABLE scheduled_tasks ADD COLUMN reasoning_model TEXT;
+        ALTER TABLE scheduled_tasks ADD COLUMN distill_main_effort_json TEXT;
+        ALTER TABLE scheduled_tasks ADD COLUMN distill_reasoning_effort_json TEXT;
         """),
     ]
 

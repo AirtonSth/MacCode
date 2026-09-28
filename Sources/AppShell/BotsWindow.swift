@@ -49,6 +49,8 @@ public struct BotDeskRouting: Equatable, Codable {
     public var permissionMode: AgentPermissionMode
     public var reasoningEffort: AgentReasoningEffort
     public var reasoningModel: String?
+    public var distillMainEffortSelection: AgentEffortSelection?
+    public var distillReasoningEffortSelection: AgentEffortSelection?
     public var serviceTier: AgentServiceTier
     public var runAsUser: AgentRunAsUser
 
@@ -60,16 +62,20 @@ public struct BotDeskRouting: Equatable, Codable {
         permissionMode: AgentPermissionMode = .supervised,
         reasoningEffort: AgentReasoningEffort = .medium,
         reasoningModel: String? = nil,
+        distillMainEffortSelection: AgentEffortSelection? = nil,
+        distillReasoningEffortSelection: AgentEffortSelection? = nil,
         serviceTier: AgentServiceTier = .auto,
         runAsUser: AgentRunAsUser? = nil
     ) {
         self.provider = provider
         self.providerInstanceID = providerInstanceID
         self.model = model
-        self.routingMode = routingMode
+        self.routingMode = provider == .distill ? .manual : routingMode
         self.permissionMode = permissionMode
         self.reasoningEffort = reasoningEffort
         self.reasoningModel = reasoningModel
+        self.distillMainEffortSelection = distillMainEffortSelection
+        self.distillReasoningEffortSelection = distillReasoningEffortSelection
         self.serviceTier = serviceTier
         self.runAsUser = runAsUser ?? AgentRunAsUser.current()
     }
@@ -79,10 +85,13 @@ public struct BotDeskRouting: Equatable, Codable {
         provider = try container.decode(AgentProvider.self, forKey: .provider)
         providerInstanceID = try container.decode(String.self, forKey: .providerInstanceID)
         model = try container.decode(String.self, forKey: .model)
-        routingMode = try container.decode(AgentRoutingMode.self, forKey: .routingMode)
+        let restoredRoutingMode = try container.decode(AgentRoutingMode.self, forKey: .routingMode)
+        routingMode = provider == .distill ? .manual : restoredRoutingMode
         permissionMode = try container.decode(AgentPermissionMode.self, forKey: .permissionMode)
         reasoningEffort = try container.decodeIfPresent(AgentReasoningEffort.self, forKey: .reasoningEffort) ?? .medium
         reasoningModel = try container.decodeIfPresent(String.self, forKey: .reasoningModel)
+        distillMainEffortSelection = try container.decodeIfPresent(AgentEffortSelection.self, forKey: .distillMainEffortSelection)
+        distillReasoningEffortSelection = try container.decodeIfPresent(AgentEffortSelection.self, forKey: .distillReasoningEffortSelection)
         serviceTier = try container.decodeIfPresent(AgentServiceTier.self, forKey: .serviceTier) ?? .auto
         runAsUser = try container.decodeIfPresent(AgentRunAsUser.self, forKey: .runAsUser)
             ?? AgentRunAsUser.current()
@@ -117,6 +126,8 @@ public struct BotDeskRouting: Equatable, Codable {
             permissionMode: thread.permissionMode,
             reasoningEffort: thread.reasoningEffort,
             reasoningModel: thread.reasoningModel,
+            distillMainEffortSelection: thread.modelSelection.distillMainEffortSelection,
+            distillReasoningEffortSelection: thread.modelSelection.distillReasoningEffortSelection,
             serviceTier: thread.serviceTier,
             runAsUser: thread.runAsUser
         )
@@ -143,6 +154,19 @@ public struct BotDeskRouting: Equatable, Codable {
     /// the wire value would break persisted routing; keep `auto` but make the
     /// contract explicit in code and UI.
     public var isAutoRouting: Bool { routingMode == .auto }
+
+    public var modelSelection: AgentModelSelection {
+        AgentModelSelection(
+            provider: provider,
+            modelId: model,
+            reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier,
+            distillMainEffortSelection: provider == .distill
+                ? (distillMainEffortSelection ?? .fixed(reasoningEffort)) : nil,
+            distillReasoningEffortSelection: provider == .distill
+                ? (distillReasoningEffortSelection ?? .automatic) : nil
+        )
+    }
 
     public func resolvedModel(defaultModel: (AgentProvider) -> String) -> String {
         if isAutoRouting || model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1083,7 +1107,11 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                         provider: routing.provider,
                         modelId: routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:)),
                         reasoningEffort: routing.reasoningEffort,
-                        serviceTier: routing.serviceTier
+                        serviceTier: routing.serviceTier,
+                        distillMainEffortSelection: routing.provider == .distill
+                            ? (routing.distillMainEffortSelection ?? .fixed(routing.reasoningEffort)) : nil,
+                        distillReasoningEffortSelection: routing.provider == .distill
+                            ? (routing.distillReasoningEffortSelection ?? .automatic) : nil
                     ),
                     providerInstanceId: routing.providerInstanceID,
                     runAsUser: routing.runAsUser,
@@ -1870,7 +1898,11 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                                     defaultModel: BotsViewModel.defaultModel(for:)
                                 ),
                                 reasoningEffort: routing.reasoningEffort,
-                                serviceTier: routing.serviceTier
+                                serviceTier: routing.serviceTier,
+                                distillMainEffortSelection: routing.provider == .distill
+                                    ? (routing.distillMainEffortSelection ?? .fixed(routing.reasoningEffort)) : nil,
+                                distillReasoningEffortSelection: routing.provider == .distill
+                                    ? (routing.distillReasoningEffortSelection ?? .automatic) : nil
                             ),
                             providerInstanceId: routing.providerInstanceID,
                             attachments: plan.attachments,
@@ -1918,7 +1950,11 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 provider: routing.provider,
                 modelId: model,
                 reasoningEffort: routing.reasoningEffort,
-                serviceTier: routing.serviceTier
+                serviceTier: routing.serviceTier,
+                distillMainEffortSelection: routing.provider == .distill
+                    ? (routing.distillMainEffortSelection ?? .fixed(routing.reasoningEffort)) : nil,
+                distillReasoningEffortSelection: routing.provider == .distill
+                    ? (routing.distillReasoningEffortSelection ?? .automatic) : nil
             ),
             manualProviderInstanceId: routing.providerInstanceID,
             eligibleProviders: [routing.provider],
@@ -6132,6 +6168,10 @@ public final class BotsViewModel: ObservableObject {
         let message = (text ?? composerText).trimmingCharacters(in: .whitespacesAndNewlines)
         guard AgentChatTranscriptChrome.admitsSend(text: message, attachmentCount: attached.count) else { return false }
         guard let bot = selectedBot else { return false }
+        if let message = deskDistillEffortValidationMessage {
+            errorMessage = message
+            return false
+        }
         do {
             try admitDesktopSend(bot: bot)
         } catch {
@@ -6878,8 +6918,13 @@ public final class BotsViewModel: ObservableObject {
                 deskRouting.provider = spec.provider
                 deskRouting.providerInstanceID = spec.providerInstanceID
                 deskRouting.model = spec.model
-                deskRouting.routingMode = spec.routingMode
+                deskRouting.routingMode = spec.provider == .distill ? .manual : spec.routingMode
                 deskRouting.reasoningEffort = spec.reasoningEffort
+                deskRouting.reasoningModel = spec.reasoningModel
+                deskRouting.distillMainEffortSelection = spec.provider == .distill
+                    ? (spec.distillMainEffortSelection ?? .fixed(spec.reasoningEffort)) : nil
+                deskRouting.distillReasoningEffortSelection = spec.provider == .distill
+                    ? (spec.distillReasoningEffortSelection ?? .automatic) : nil
             }
             _ = send(instruction)
         } catch {
@@ -7846,6 +7891,9 @@ public final class BotsViewModel: ObservableObject {
             ?? provider.rawValue
         deskRouting.provider = provider
         deskRouting.providerInstanceID = instance
+        if provider == .distill {
+            deskRouting.routingMode = .manual
+        }
         if deskRouting.routingMode == .auto {
             deskRouting.model = ""
         } else if !deskModels.contains(where: { $0.id == deskRouting.model }) {
@@ -7862,17 +7910,21 @@ public final class BotsViewModel: ObservableObject {
 
     public func setDeskReasoningModel(_ model: String?) {
         let trimmed = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        deskRouting.reasoningModel = trimmed.isEmpty ? nil : trimmed
-        if let threadID = selectedConversation?.linkedAgentThreadID,
-           var thread = try? context.threadRepo.get(id: threadID) {
-            thread.reasoningModel = deskRouting.reasoningModel
-            try? context.threadRepo.upsert(thread)
+        let selectedModel = trimmed.isEmpty ? nil : trimmed
+        guard selectedModel == nil || selectedModel != deskRouting.model else { return }
+        var updated = deskRouting
+        if selectedModel == nil {
+            updated.distillReasoningEffortSelection = .automatic
         }
+        updated.reasoningModel = selectedModel
+        guard persistDeskThreadModelSelection(updated) else { return }
+        deskRouting = updated
     }
 
     public func setDeskRoutingMode(_ mode: AgentRoutingMode) {
-        deskRouting.routingMode = mode
-        if mode == .auto {
+        let resolvedMode: AgentRoutingMode = deskRouting.provider == .distill ? .manual : mode
+        deskRouting.routingMode = resolvedMode
+        if resolvedMode == .auto {
             deskRouting.model = ""
         } else if deskRouting.model.isEmpty {
             deskRouting.model = Self.defaultModel(for: deskRouting.provider)
@@ -7892,10 +7944,112 @@ public final class BotsViewModel: ObservableObject {
         availableRunAsUsers = MacOSLocalUserCatalog.listEligibleUsers()
     }
 
+    public var deskDistillMainEffortSelection: AgentEffortSelection {
+        if let selection = deskRouting.distillMainEffortSelection { return selection }
+        return deskSupportedReasoning.isEmpty ? .automatic : .fixed(deskRunReasoning)
+    }
+
+    public var deskDistillReasoningEffortSelection: AgentEffortSelection {
+        deskRouting.distillReasoningEffortSelection ?? .automatic
+    }
+
+    public var deskDistillReasoningEfforts: [AgentReasoningEffort] {
+        guard let reasoningModel = deskRouting.reasoningModel else { return [] }
+        return deskModels.first(where: { $0.id == reasoningModel })?.supportedReasoningEfforts
+            ?? DistillReasoningPolicy.supportedEfforts(for: reasoningModel)
+    }
+
+    public var deskDistillEffortValidationMessage: String? {
+        guard deskRouting.provider == .distill else { return nil }
+        let mainSelection = deskDistillMainEffortSelection
+        if let effort = mainSelection.effort,
+           !deskSupportedReasoning.isEmpty,
+           !deskSupportedReasoning.contains(effort) {
+            return "Main effort \(effort.displayName) is unavailable for the selected Distill model. Choose Auto or a supported effort."
+        }
+        if mainSelection.isAutomatic, !deskSupportsDistillMainEffortAuto {
+            return "Update the Distill ACP harness to apply Auto Main effort."
+        }
+        if let reasoningModel = deskRouting.reasoningModel,
+           let effort = deskDistillReasoningEffortSelection.effort {
+            if !deskDistillReasoningEfforts.isEmpty, !deskDistillReasoningEfforts.contains(effort) {
+                return "Reasoning effort \(effort.displayName) is unavailable for \(reasoningModel). Choose Auto or a supported effort."
+            }
+            if !deskSupportsDistillReasoningModelEffort {
+                return "Update the Distill ACP harness to apply a separate Reasoning-model effort."
+            }
+        }
+        return nil
+    }
+
+    public var deskSupportsDistillMainEffortAuto: Bool {
+        let snapshot = providers.first(where: {
+            $0.provider == deskRouting.provider && $0.id == deskRouting.providerInstanceID
+        }) ?? providers.first { $0.provider == deskRouting.provider }
+        return snapshot?.effectiveCapabilities.supportsDistillMainEffortAuto == true
+    }
+
+    public var deskSupportsDistillReasoningModelEffort: Bool {
+        let snapshot = providers.first(where: {
+            $0.provider == deskRouting.provider && $0.id == deskRouting.providerInstanceID
+        }) ?? providers.first { $0.provider == deskRouting.provider }
+        return snapshot?.effectiveCapabilities.supportsDistillReasoningModelEffort == true
+    }
+
+    public func setDeskDistillMainEffortSelection(_ selection: AgentEffortSelection) {
+        guard deskRouting.provider == .distill else { return }
+        if selection.isAutomatic, !deskSupportsDistillMainEffortAuto {
+            errorMessage = "Update the Distill ACP session to enable Auto Main effort."
+            return
+        }
+        if let effort = selection.effort,
+           !deskSupportedReasoning.isEmpty,
+           !deskSupportedReasoning.contains(effort) { return }
+        var updated = deskRouting
+        if let effort = selection.effort { updated.reasoningEffort = effort }
+        updated.distillMainEffortSelection = selection
+        updated.routingMode = .manual
+        guard persistDeskThreadModelSelection(updated) else { return }
+        deskRouting = updated
+    }
+
+    public func setDeskDistillReasoningEffortSelection(_ selection: AgentEffortSelection) {
+        guard deskRouting.provider == .distill,
+              deskSupportsDistillReasoningModelEffort,
+              deskRouting.reasoningModel != nil else { return }
+        if let effort = selection.effort,
+           !deskDistillReasoningEfforts.isEmpty,
+           !deskDistillReasoningEfforts.contains(effort) { return }
+        var updated = deskRouting
+        updated.distillReasoningEffortSelection = selection
+        guard persistDeskThreadModelSelection(updated) else { return }
+        deskRouting = updated
+    }
+
     public func setDeskReasoningEffort(_ effort: AgentReasoningEffort) {
+        if deskRouting.provider == .distill {
+            setDeskDistillMainEffortSelection(.fixed(effort))
+            return
+        }
         let supported = deskSupportedReasoning
         deskRouting.reasoningEffort = supported.contains(effort) ? effort : (supported.first ?? .medium)
         deskRouting.routingMode = .manual
+    }
+
+    @discardableResult
+    private func persistDeskThreadModelSelection(_ routing: BotDeskRouting) -> Bool {
+        guard let threadID = selectedConversation?.linkedAgentThreadID else { return true }
+        do {
+            guard var thread = try context.threadRepo.get(id: threadID) else { return false }
+            thread.reasoningModel = routing.reasoningModel
+            thread.reasoningEffort = routing.reasoningEffort
+            thread.modelSelection = routing.modelSelection
+            try context.threadRepo.upsert(thread)
+            return true
+        } catch {
+            errorMessage = "Could not save Distill model settings: \(error)"
+            return false
+        }
     }
 
     public var botMentionSuggestions: [BotDefinition] {
@@ -8028,8 +8182,11 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public var deskModelDisplayLabel: String {
-        if deskRouting.routingMode == .auto { return "Auto" }
+        if deskRouting.routingMode == .auto, deskRouting.provider != .distill { return "Auto" }
         let id = deskRunModel
+        if deskRouting.provider == .distill, id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Select Main model"
+        }
         return deskModels.first(where: { $0.id == id })?.label ?? id
     }
 
@@ -8049,10 +8206,22 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func normalizeDeskReasoning() {
+        if deskRouting.provider == .distill {
+            deskRouting.routingMode = .manual
+        }
         let supported = deskSupportedReasoning
-        guard !supported.isEmpty else { return }
-        if !supported.contains(deskRouting.reasoningEffort) {
+        if !supported.isEmpty, !supported.contains(deskRouting.reasoningEffort) {
             deskRouting.reasoningEffort = supported.contains(.high) ? .high : (supported.first ?? .medium)
+        }
+        if deskRouting.provider == .distill {
+            if deskRouting.distillMainEffortSelection == nil {
+                deskRouting.distillMainEffortSelection = supported.isEmpty
+                    ? .automatic
+                    : .fixed(deskRouting.reasoningEffort)
+            }
+            if deskRouting.reasoningModel == nil {
+                deskRouting.distillReasoningEffortSelection = .automatic
+            }
         }
     }
 
@@ -8075,6 +8244,7 @@ public final class BotsViewModel: ObservableObject {
         for conversation: BotConversation?,
         allowStoreLookup: Bool = true
     ) {
+        let priorRouting = deskRouting
         isApplyingDeskRouting = true
         if let conversation, let saved = deskRoutingByConversation[conversation.id] {
             if deskRouting != saved {
@@ -8084,15 +8254,19 @@ public final class BotsViewModel: ObservableObject {
                   let threadID = conversation?.linkedAgentThreadID,
                   let thread = try? context.threadRepo.get(id: threadID) {
             deskRouting = BotDeskRouting(thread: thread)
-            normalizeDeskReasoning()
         } else {
             let fallback = BotDeskRouting()
             if deskRouting != fallback {
                 deskRouting = fallback
             }
         }
+        normalizeDeskReasoning()
+        let routingChanged = priorRouting != deskRouting
         isApplyingDeskRouting = false
         deskRoutingHydrated = true
+        if routingChanged, let conversationID = conversation?.id {
+            captureDeskRouting(for: conversationID)
+        }
     }
 
     private func persistDeskRouting() {
@@ -9712,7 +9886,16 @@ public final class BotsViewModel: ObservableObject {
             if updated.permissionMode != routing.permissionMode { updated.permissionMode = routing.permissionMode; didUpdate = true }
             if updated.serviceTier != routing.serviceTier { updated.serviceTier = routing.serviceTier; didUpdate = true }
             if didUpdate {
-                updated.modelSelection = AgentModelSelection(provider: routing.provider, modelId: model, reasoningEffort: routing.reasoningEffort, serviceTier: routing.serviceTier)
+                updated.modelSelection = AgentModelSelection(
+                    provider: routing.provider,
+                    modelId: model,
+                    reasoningEffort: routing.reasoningEffort,
+                    serviceTier: routing.serviceTier,
+                    distillMainEffortSelection: routing.provider == .distill
+                        ? (routing.distillMainEffortSelection ?? .fixed(routing.reasoningEffort)) : nil,
+                    distillReasoningEffortSelection: routing.provider == .distill
+                        ? (routing.distillReasoningEffortSelection ?? .automatic) : nil
+                )
                 try context.threadRepo.upsert(updated)
             }
             return updated
@@ -9732,7 +9915,11 @@ public final class BotsViewModel: ObservableObject {
                     provider: routing.provider,
                     modelId: model,
                     reasoningEffort: routing.reasoningEffort,
-                    serviceTier: routing.serviceTier
+                    serviceTier: routing.serviceTier,
+                    distillMainEffortSelection: routing.provider == .distill
+                        ? (routing.distillMainEffortSelection ?? .fixed(routing.reasoningEffort)) : nil,
+                    distillReasoningEffortSelection: routing.provider == .distill
+                        ? (routing.distillReasoningEffortSelection ?? .automatic) : nil
                 ),
                 providerInstanceId: routing.providerInstanceID,
                 runAsUser: routing.runAsUser,
@@ -9951,7 +10138,11 @@ public final class BotsViewModel: ObservableObject {
                     provider: routing.provider,
                     modelId: model,
                     reasoningEffort: effort,
-                    serviceTier: routing.serviceTier
+                    serviceTier: routing.serviceTier,
+                    distillMainEffortSelection: routing.provider == .distill
+                        ? (routing.distillMainEffortSelection ?? .fixed(effort)) : nil,
+                    distillReasoningEffortSelection: routing.provider == .distill
+                        ? (routing.distillReasoningEffortSelection ?? .automatic) : nil
                 ),
                 providerInstanceId: routing.providerInstanceID,
                 attachments: attachments,
@@ -13124,37 +13315,63 @@ public struct BotsRootView: View {
 
     private var deskModelPopover: some View {
         let models = vm.deskModels
-        let presentation = AgentModelPopoverPresentation.current(mode: vm.deskRouting.routingMode)
+        let showsAutoRouting = vm.deskRouting.provider != .distill
+        let presentation = AgentModelPopoverPresentation.current(
+            mode: showsAutoRouting ? vm.deskRouting.routingMode : .manual
+        )
         return AgentModelPopoverChrome(
             presentation: presentation,
             autoEnabled: Binding(
                 get: { vm.deskRouting.routingMode == .auto },
                 set: { vm.setDeskRoutingMode($0 ? .auto : .manual) }
             ),
-            toggleDisabled: deskRoutingLocked
+            toggleDisabled: deskRoutingLocked,
+            showsAutoRouting: showsAutoRouting
         ) {
-            AgentCompactMenuSection("Model")
-            ForEach(models, id: \.id) { model in
-                AgentCompactMenuRow(model.label, selected: model.id == vm.deskRunModel) {
-                    vm.setDeskModel(model.id)
-                    showDeskModelOptions = false
-                }
-                .disabled(deskRoutingLocked)
-            }
-            if vm.deskRouting.provider == .distill && vm.deskRouting.routingMode == .manual {
-                AgentCompactMenuDivider()
-                AgentCompactMenuSection("Reasoning model")
-                AgentCompactMenuRow("Off", selected: vm.deskRouting.reasoningModel == nil) {
-                    vm.setDeskReasoningModel(nil)
-                }
-                ForEach(models, id: \.id) { candidate in
-                    AgentCompactMenuRow(candidate.label, selected: candidate.id == vm.deskRouting.reasoningModel) {
-                        vm.setDeskReasoningModel(candidate.id)
+            if vm.deskRouting.provider == .distill {
+                AgentDistillModelSelectors(
+                    mainModel: vm.deskRunModel,
+                    mainModels: models,
+                    reasoningModel: vm.deskRouting.reasoningModel,
+                    reasoningModels: models,
+                    mainEffortSelection: vm.deskDistillMainEffortSelection,
+                    mainEfforts: vm.deskSupportedReasoning,
+                    reasoningEffortSelection: vm.deskDistillReasoningEffortSelection,
+                    reasoningEfforts: vm.deskDistillReasoningEfforts,
+                    supportsMainEffortAuto: vm.deskSupportsDistillMainEffortAuto,
+                    supportsReasoningModelEffort: vm.deskSupportsDistillReasoningModelEffort,
+                    width: 240,
+                    isDisabled: deskRoutingLocked,
+                    onSelectMainModel: { model in
+                        vm.setDeskModel(model)
+                        showDeskModelOptions = false
+                    },
+                    onSelectCustomMainModel: { model in
+                        vm.setDeskModel(model)
+                        showDeskModelOptions = false
+                    },
+                    onSelectReasoningModel: { model in
+                        vm.setDeskReasoningModel(model)
+                    },
+                    onSelectMainEffort: { selection in
+                        vm.setDeskDistillMainEffortSelection(selection)
+                    },
+                    onSelectReasoningEffort: { selection in
+                        vm.setDeskDistillReasoningEffortSelection(selection)
+                    },
+                    mainFooter: { EmptyView() }
+                )
+            } else {
+                AgentCompactMenuSection("Model")
+                ForEach(models, id: \.id) { model in
+                    AgentCompactMenuRow(model.label, selected: model.id == vm.deskRunModel) {
+                        vm.setDeskModel(model.id)
+                        showDeskModelOptions = false
                     }
                     .disabled(deskRoutingLocked)
                 }
             }
-            if vm.deskSupportsReasoning {
+            if vm.deskRouting.provider != .distill && vm.deskSupportsReasoning {
                 AgentCompactMenuDivider()
                 AgentCompactMenuSection("Reasoning effort")
                 ForEach(vm.deskSupportedReasoning, id: \.self) { effort in

@@ -2220,6 +2220,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             permissionMode: recoveryContext?.runtimeMode ?? request.permissionMode,
             reasoningEffort: effectiveReasoningEffort,
             reasoningModel: request.reasoningModel,
+            distillMainEffortSelection: request.distillMainEffortSelection,
+            distillReasoningEffortSelection: request.distillReasoningEffortSelection,
             serviceTier: recoveryContext?.serviceTier ?? request.serviceTier,
             interactionMode: recoveryContext?.interactionMode ?? request.interactionMode,
             providerBinary: request.providerBinary,
@@ -2724,6 +2726,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 permissionMode: request.permissionMode,
                 reasoningEffort: admission.route.selection.reasoningEffort,
                 reasoningModel: request.reasoningModel,
+                distillMainEffortSelection: admission.route.provider == .distill
+                    ? admission.route.selection.distillMainEffortSelection : nil,
+                distillReasoningEffortSelection: admission.route.provider == .distill
+                    ? admission.route.selection.distillReasoningEffortSelection : nil,
                 serviceTier: admission.route.selection.serviceTier,
                 interactionMode: request.interactionMode,
                 providerBinary: launch?.binary ?? request.providerBinary,
