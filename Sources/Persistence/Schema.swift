@@ -38,9 +38,12 @@ public enum Schema {
     /// v80 owns host-authoritative Bot queued follow-ups, v81 indexes the
     /// exact running-thread predicate used by provider-session reaping, and
     /// v82 indexes audit_log(action, id) so the orchestration receipt poll
-    /// can read its append signature without a table scan, and v83 indexes
-    /// agent_threads(workspace_id, updated_at DESC, id DESC) for the rail list.
-    public static let currentVersion: Int = 84
+    /// can read its append signature without a table scan, v83 indexes
+    /// agent_threads(workspace_id, updated_at DESC, id DESC) for the rail list,
+    /// v84 adds agent_threads.reasoning_model, and v85 adds scheduled-task
+    /// model fields, including repair for databases that already recorded v84.
+    private static let scheduledTaskModelColumnsSchemaVersion = 85
+    public static let currentVersion: Int = scheduledTaskModelColumnsSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -123,6 +126,17 @@ public enum Schema {
                 revision = agent_turn_checkpoint_catalog_meta.revision + 1;
         END;
         """
+
+    private static let scheduledTaskModelColumns: [(name: String, type: String)] = [
+        ("reasoning_model", "TEXT"),
+        ("distill_main_effort_json", "TEXT"),
+        ("distill_reasoning_effort_json", "TEXT"),
+    ]
+    private static var scheduledTaskModelColumnsMigrationSQL: String {
+        scheduledTaskModelColumns.map {
+            "ALTER TABLE scheduled_tasks ADD COLUMN \($0.name) \($0.type);"
+        }.joined(separator: "\n")
+    }
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -1771,11 +1785,7 @@ public enum Schema {
         CREATE INDEX IF NOT EXISTS idx_agent_threads_workspace_updated
             ON agent_threads(workspace_id, updated_at DESC, id DESC);
         """),
-        SchemaStep(84, """
-        ALTER TABLE scheduled_tasks ADD COLUMN reasoning_model TEXT;
-        ALTER TABLE scheduled_tasks ADD COLUMN distill_main_effort_json TEXT;
-        ALTER TABLE scheduled_tasks ADD COLUMN distill_reasoning_effort_json TEXT;
-        """),
+        SchemaStep(scheduledTaskModelColumnsSchemaVersion, scheduledTaskModelColumnsMigrationSQL),
     ]
 
     /// Tables that exist in the schema for historical reasons but have no
@@ -1796,6 +1806,22 @@ public enum Schema {
 
     public static func migrate(_ db: SQLiteDB) throws {
         try migrateSteps(db, steps)
+    }
+
+    private static func addMissingScheduledTaskModelColumns(_ db: SQLiteDB) throws {
+        let existingColumns: Set<String> = try {
+            let statement = try db.prepare("PRAGMA table_info(scheduled_tasks);")
+            defer { statement.reset() }
+            var names = Set<String>()
+            while try statement.step() {
+                if let name = statement.columnText(1) { names.insert(name) }
+            }
+            return names
+        }()
+
+        for column in scheduledTaskModelColumns where !existingColumns.contains(column.name) {
+            try db.execute("ALTER TABLE scheduled_tasks ADD COLUMN \(column.name) \(column.type);")
+        }
     }
 
     /// Applies the given steps transactionally and idempotently.
@@ -1825,7 +1851,12 @@ public enum Schema {
         let pending = steps.filter { $0.version > current }
         for step in pending.sorted(by: { $0.version < $1.version }) {
             try db.transaction {
-                try db.execute(step.sql)
+                // Some earlier v84 builds already installed these columns.
+                if step.version == Self.scheduledTaskModelColumnsSchemaVersion {
+                    try Self.addMissingScheduledTaskModelColumns(db)
+                } else {
+                    try db.execute(step.sql)
+                }
                 let ins = try db.prepare("INSERT OR IGNORE INTO schema_meta(version, applied_at) VALUES(?, ?);")
                 try ins.bind(1, Int64(step.version))
                 Self.migrationAppliedAtLock.lock()

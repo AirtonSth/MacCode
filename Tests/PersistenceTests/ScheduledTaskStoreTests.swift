@@ -71,6 +71,26 @@ final class ScheduledTaskStoreTests: XCTestCase {
         XCTAssertNil(legacy.distillReasoningEffortSelection, "old tasks must not acquire an invented Reasoning pin")
     }
 
+    func test_version84DatabaseRepairsScheduledTaskColumns_becauseScheduleTasksMustOpenAcrossUpgrade() throws {
+        for hasScheduledTaskColumns in [false, true] {
+            let legacyDB = try SQLiteDB(path: ":memory:")
+            try Schema.migrateSteps(legacyDB, Schema.steps.filter { $0.version <= 83 })
+            try legacyDB.execute("ALTER TABLE agent_threads ADD COLUMN reasoning_model TEXT;")
+            if hasScheduledTaskColumns {
+                try legacyDB.execute("""
+                    ALTER TABLE scheduled_tasks ADD COLUMN reasoning_model TEXT;
+                    ALTER TABLE scheduled_tasks ADD COLUMN distill_main_effort_json TEXT;
+                    ALTER TABLE scheduled_tasks ADD COLUMN distill_reasoning_effort_json TEXT;
+                    """)
+            }
+            try legacyDB.execute("INSERT INTO schema_meta(version, applied_at) VALUES(84, '2026-09-28T00:00:00Z');")
+
+            try Schema.migrate(legacyDB)
+
+            XCTAssertEqual(try ScheduledTaskStore(db: legacyDB).list(), [])
+        }
+    }
+
     func test_saveAndListRoundTripEveryExecutionField_becauseAgentRunsMustBeExact() throws {
         var task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
         task.routingMode = .auto
