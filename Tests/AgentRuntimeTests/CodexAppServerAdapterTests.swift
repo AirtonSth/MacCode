@@ -3378,6 +3378,12 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "fn-out-1" && output == "ran tests" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "sleep-1" && item.type == .tool && item.summary == "Sleep 1500 ms" } else { return false } },
                       "sleep snapshots must show the duration instead of the raw type name")
+        var snapshotTimeline = AssistantTimelineState()
+        for event in events { snapshotTimeline.apply(event) }
+        let snapshotFn = snapshotTimeline.turns.flatMap(\.items).first { $0.id == "fn-out-1" }
+        let snapshotSleep = snapshotTimeline.turns.flatMap(\.items).first { $0.id == "sleep-1" }
+        XCTAssertEqual(snapshotFn?.state, .completed)
+        XCTAssertEqual(snapshotSleep?.state, .completed)
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "hook-1" && item.summary == "Hook prompt" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "hook-1" && output == "Hook prompt fragment" } else { return false } },
                       "hookPrompt snapshots should render fragment text instead of raw JSON")
@@ -3496,21 +3502,31 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                 "output": "ran tests"
             ]
         ])
+        client.notificationHandler?("item/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-fn-1",
+            "item": [
+                "id": "sleep-1",
+                "type": "sleep",
+                "durationMs": 1500
+            ]
+        ])
 
         try await Task.sleep(nanoseconds: 50_000_000)
         let events = await sink.snapshot()
-        XCTAssertTrue(events.contains {
-            if case .itemStarted(let item) = $0 {
-                return item.id == "fn-live-1" && item.type == .tool && item.summary == "shell"
-            }
-            return false
-        }, "a functionCallOutput that arrives only on item/completed still needs a tool row")
-        XCTAssertTrue(events.contains {
-            if case .itemDelta(let itemId, _, let output, _) = $0 {
-                return itemId == "fn-live-1" && output == "ran tests"
-            }
-            return false
-        })
+        var timeline = AssistantTimelineState()
+        for event in events { timeline.apply(event) }
+        let fn = timeline.turns.flatMap(\.items).first { $0.id == "fn-live-1" }
+        let sleep = timeline.turns.flatMap(\.items).first { $0.id == "sleep-1" }
+        XCTAssertEqual(fn?.type, .tool)
+        XCTAssertEqual(fn?.summary, "shell")
+        XCTAssertEqual(fn?.output, "ran tests")
+        XCTAssertEqual(fn?.state, .completed,
+                       "functionCallOutput has no status field; item/completed must not leave the row streaming")
+        XCTAssertEqual(sleep?.type, .tool)
+        XCTAssertEqual(sleep?.summary, "Sleep 1500 ms")
+        XCTAssertEqual(sleep?.state, .completed,
+                       "sleep has no status field; item/completed must not leave the row streaming")
     }
 
     func test_adapterStartsStreamingAssistantItemOnlyOnceAcrossDeltas() async throws {

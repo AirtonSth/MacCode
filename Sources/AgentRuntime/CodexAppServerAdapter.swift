@@ -1635,7 +1635,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                     summary: summary
                 ))
             }
-            events.append(.itemCompleted(itemId: itemId, finalState: Self.itemState(for: string(item, "status"))))
+            events.append(.itemCompleted(itemId: itemId, finalState: Self.terminalItemState(for: item, type: rawType)))
             // Codex can complete a final_answer item without ever emitting
             // turn/completed. Arm a single thread/read reconcile loop so the run
             // only finishes when the server authoritatively reports the turn idle.
@@ -3668,7 +3668,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let type = string(item, "type") ?? "unknown"
         if isUserMessageItem(item, type: type) { return [] }
         let itemType = assistantItemType(for: type)
-        let state = itemState(for: string(item, "status"))
+        let state = terminalItemState(for: item, type: type)
         let summary = summary(for: item, type: type)
         let resourcePath: String? = {
             if itemType == .imageView { return string(item, "path") }
@@ -3804,6 +3804,22 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             "image_generation_call", "input_image",
             "context_compaction", "compaction", "compaction_trigger"
         ].contains(type)
+    }
+
+    /// `item/completed` is already terminal. `functionCallOutput` and `sleep`
+    /// have no status field in Codex 0.159, so a missing status is completed,
+    /// not still streaming.
+    private static func terminalItemState(for item: [String: Any], type: String) -> AssistantItemState {
+        let status = string(item, "status")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if status == nil || status?.isEmpty == true {
+            switch type {
+            case "functionCallOutput", "sleep":
+                return .completed
+            default:
+                break
+            }
+        }
+        return itemState(for: status)
     }
 
     private static func itemState(for status: String?) -> AssistantItemState {
