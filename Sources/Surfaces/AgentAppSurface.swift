@@ -13617,33 +13617,6 @@ public struct AgentAppView: View {
         return (Array(entries.prefix(end)), liveTail)
     }
 
-    /// Live-tail identity for chrome-only ticks. Hashes item text, not only
-    /// UTF-8 length, so a same-length rewrite still misses the cached rows.
-    nonisolated static func liveTailGrowthSignature(
-        _ entries: ArraySlice<TranscriptEntry>
-    ) -> Int {
-        var hasher = Hasher()
-        hasher.combine(entries.count)
-        for entry in entries {
-            hasher.combine(entry.id)
-            switch entry {
-            case .message(let message):
-                hasher.combine(message.content)
-            case .turn(let turn):
-                hasher.combine(turn.finished)
-                hasher.combine(turn.items.count)
-                hasher.combine(turn.finalAssistantMessage)
-                for item in turn.items {
-                    hasher.combine(item.id)
-                    hasher.combine(item.state.rawValue)
-                    hasher.combine(item.body)
-                    hasher.combine(item.output)
-                }
-            }
-        }
-        return hasher.finalize()
-    }
-
     /// User-bubble relative time only needs 1 Hz identity. Passing a fresh
     /// `Date()` into Equatable rows at ~30 Hz remounted timestamps with no
     /// visible copy change inside the same second.
@@ -14196,10 +14169,10 @@ public struct AgentAppView: View {
     private let mentionableBotsSnapshotCache = MentionableBotsSnapshotCache()
 
     /// Memoize finished-history `chatFlowRows` across chrome-only / paint-tick
-    /// bodies. Live suffix is cached only while its growth signature (ids,
-    /// item counts, body/output UTF-8 lengths, states) is unchanged — tool-body
-    /// growth still misses. Split is skipped when the paint-sequence ends and
-    /// live-turn id match the previous pass.
+    /// bodies. The live suffix is never cached: a content hash that would keep
+    /// it honest walks the tool text and measured slower than rebuilding the
+    /// rows, which share the existing strings. Split is skipped when the
+    /// paint-sequence ends and live-turn id match the previous pass.
     private final class ChatFlowPaintCache {
         var generation: UInt64 = 0
         var aggregateBudgetGeneration: UInt64 = 0
@@ -14211,13 +14184,8 @@ public struct AgentAppView: View {
         var paintLastId: String?
         var latestLiveTurnId: String?
         var splitIndex: Int = -1
-        var liveSignature: Int = 0
-        var liveGeneration: UInt64 = 0
-        var liveAggregateBudgetGeneration: UInt64 = 0
         var historyRows: [ChatFlowRow] = []
-        var liveRows: [ChatFlowRow] = []
         var hasValue = false
-        var hasLiveValue = false
     }
     private let chatFlowPaintCache = ChatFlowPaintCache()
     #if DEBUG
@@ -14229,7 +14197,7 @@ public struct AgentAppView: View {
     static nonisolated(unsafe) var mentionableBotsSnapshotProviderCallCountForTesting: UInt64 = 0
     /// Test-only: uncached history `chatFlowRows` invocations.
     static nonisolated(unsafe) var chatFlowPaintComputeCountForTesting: UInt64 = 0
-    /// Test-only: live-tail `chatFlowRows` invocations (miss on growth).
+    /// Test-only: live-tail `chatFlowRows` invocations (always, so progress stays fresh).
     static nonisolated(unsafe) var chatFlowPaintLiveComputeCountForTesting: UInt64 = 0
     /// Test-only: `splitTrailingLiveTurns` invocations from cached paint.
     static nonisolated(unsafe) var chatFlowPaintSplitCountForTesting: UInt64 = 0
@@ -14396,29 +14364,17 @@ public struct AgentAppView: View {
             chatFlowPaintCache.hasValue = true
         }
         guard splitIndex < paintCount else {
-            chatFlowPaintCache.hasLiveValue = false
-            chatFlowPaintCache.liveRows = []
             return (historyRows, [], historyRows)
-        }
-        let liveSignature = Self.liveTailGrowthSignature(liveSlice)
-        if chatFlowPaintCache.hasLiveValue,
-           chatFlowPaintCache.liveGeneration == generation,
-           chatFlowPaintCache.liveAggregateBudgetGeneration == aggregateBudgetGeneration,
-           chatFlowPaintCache.liveSignature == liveSignature {
-            let liveRows = chatFlowPaintCache.liveRows
-            return (historyRows, liveRows, historyRows + liveRows)
         }
         #if DEBUG
         Self.chatFlowPaintLiveComputeCountForTesting &+= 1
         #endif
+        // Do not memoize. Tool progress, summary, and same-length rewrites must
+        // paint on the next tick, and hashing the bodies to detect that was
+        // slower than this weave on a ~1 MB tail.
         let liveRows = Self.chatFlowRows(
             liveEntries.isEmpty ? Array(liveSlice) : liveEntries
         )
-        chatFlowPaintCache.liveSignature = liveSignature
-        chatFlowPaintCache.liveGeneration = generation
-        chatFlowPaintCache.liveAggregateBudgetGeneration = aggregateBudgetGeneration
-        chatFlowPaintCache.liveRows = liveRows
-        chatFlowPaintCache.hasLiveValue = true
         return (historyRows, liveRows, historyRows + liveRows)
     }
 

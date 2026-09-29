@@ -88,12 +88,12 @@ struct AgentChromePerfGapTests {
         #expect(source.contains("mentionableBots = mentionableBotsProvider()"))
     }
 
-    @Test("timeline memoizes history and live chatFlowRows; growth still misses")
+    @Test("timeline memoizes history chatFlowRows; live tail always weaves")
     func chatFlowPaint_shortCircuitsOnGenerationAndPaintEnds() throws {
         // WHY: chrome-only ticks rebuilt the finished history weave even when
         // generation + history first/last ids + count were unchanged. Live
-        // ChatFlowRows now hit when the growth signature is unchanged; tool-body
-        // growth still misses.
+        // ChatFlowRows stay uncached: hashing tool text to skip them measured
+        // slower than the weave, and a length-only key hid progress updates.
         let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
         let start = try #require(source.range(of: "private func cachedChatFlowPaint("))
         let rest = source[start.lowerBound...]
@@ -111,9 +111,8 @@ struct AgentChromePerfGapTests {
         #expect(chunk.contains("chatFlowPaintCache.generation == generation"))
         #expect(chunk.contains("Self.splitTrailingLiveTurns("))
         #expect(chunk.contains("latestLiveTurnId: latestLiveTurnId"))
-        #expect(chunk.contains("liveTailGrowthSignature"))
-        #expect(chunk.contains("chatFlowPaintCache.liveRows"))
-        #expect(chunk.contains("chatFlowPaintCache.liveGeneration == generation"))
+        #expect(!chunk.contains("liveTailGrowthSignature"))
+        #expect(!chunk.contains("chatFlowPaintCache.liveRows"))
         _ = live
         let columnStart = try #require(source.range(of: "let flow = cachedChatFlowPaint("))
         let columnRest = source[columnStart.lowerBound...]

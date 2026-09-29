@@ -815,8 +815,8 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
         // WHY: chrome-only / paint-tick bodies split and wove ChatFlowRow on
         // every column pass. History identity (generation + history first/last
         // ids + count) is stable on those ticks — rebuilding the finished
-        // weave is wasted. Live growth identity is also stable when tool
-        // bodies did not grow, so the live weave can hit too.
+        // weave is wasted. The live suffix still weaves every pass so progress
+        // and same-length tool text cannot go stale.
         let (vm, rootURL) = try makeVM()
         defer {
             vm.dispose()
@@ -858,8 +858,8 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
         )
         XCTAssertEqual(
             AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive,
-            1,
-            "chrome-only ticks with unchanged live bodies must skip the live weave"
+            201,
+            "live tail must reweave on every paint so progress and text stay fresh"
         )
         XCTAssertEqual(
             AgentAppView.chatFlowPaintSplitCountForTesting - beforeSplit,
@@ -912,9 +912,11 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
             endMarker: "func cachedChatRowPaintContextForTesting"
         )
         XCTAssertTrue(helper.contains("Self.splitTrailingLiveTurns("))
-        XCTAssertTrue(helper.contains("liveTailGrowthSignature"))
-        XCTAssertTrue(helper.contains("chatFlowPaintCache.liveRows"))
-        XCTAssertTrue(helper.contains("chatFlowPaintCache.liveGeneration == generation"))
+        XCTAssertFalse(helper.contains("liveTailGrowthSignature"))
+        XCTAssertFalse(
+            helper.contains("chatFlowPaintCache.liveRows"),
+            "live ChatFlowRows must not be memoized"
+        )
         let countsIdx = try XCTUnwrap(helper.range(of: "chatFlowPaintCache.count == count"))
         let rowsIdx = try XCTUnwrap(helper.range(of: "Self.chatFlowRows("))
         XCTAssertTrue(
@@ -1017,6 +1019,95 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
             "same-length tool output replacement must miss the live-tail cache"
         )
         XCTAssertEqual(AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive, 4)
+
+        live.items[0].progress = 0.4
+        let progressed = view.cachedChatFlowPaintForTesting(
+            paintSequence: [.turn(history), .turn(live)],
+            latestLiveTurnId: "t-live"
+        )
+        XCTAssertEqual(
+            Self.firstLiveTool(progressed.liveRows)?.progress,
+            0.4,
+            "progress-only updates must miss the live-tail cache"
+        )
+        XCTAssertEqual(AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive, 5)
+
+        live.items[0].summary = "compile"
+        let summarized = view.cachedChatFlowPaintForTesting(
+            paintSequence: [.turn(history), .turn(live)],
+            latestLiveTurnId: "t-live"
+        )
+        XCTAssertEqual(
+            Self.firstLiveTool(summarized.liveRows)?.summary,
+            "compile",
+            "summary-only updates must miss the live-tail cache"
+        )
+        XCTAssertEqual(AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive, 6)
+    }
+
+    func test_workingStripScan_warmedTrailingWalkBeatsFullTimeline() {
+        // WHY: header chrome scanned every finished turn. The replacement must
+        // be faster on the same 800-turn workload, five warmed samples, and
+        // inside max(25ms, 5%). A full-text live-row hash failed that bar, so
+        // live rows stay uncached.
+        let item = AssistantItem(
+            id: "old-tool",
+            turnId: "t",
+            type: .tool,
+            state: .completed,
+            body: "echo",
+            startedAtMs: 1
+        )
+        let finished = (0..<800).map { index in
+            AssistantTurnSnapshot(
+                turnId: "t-\(index)",
+                items: Array(repeating: item, count: 25),
+                finished: true
+            )
+        }
+        let turns = finished + [AssistantTurnSnapshot(turnId: "t-live", finished: false)]
+        func fullScan() -> Bool {
+            var found = false
+            for _ in 0..<40 {
+                found = turns.contains { turn in
+                    !turn.finished && turn.items.contains {
+                        $0.state == .streaming && AgentAppView.isGroupableTool($0.type)
+                    }
+                }
+            }
+            return found
+        }
+        func trailingScan() -> Bool {
+            var found = false
+            for _ in 0..<40 {
+                found = AgentAppView.hasStreamingGroupableTools(in: turns)
+            }
+            return found
+        }
+        for _ in 0..<3 {
+            _ = fullScan()
+            _ = trailingScan()
+        }
+        var beforeMs: [Double] = []
+        var afterMs: [Double] = []
+        for _ in 0..<5 {
+            let start = CFAbsoluteTimeGetCurrent()
+            XCTAssertFalse(fullScan())
+            beforeMs.append((CFAbsoluteTimeGetCurrent() - start) * 1_000)
+        }
+        for _ in 0..<5 {
+            let start = CFAbsoluteTimeGetCurrent()
+            XCTAssertFalse(trailingScan())
+            afterMs.append((CFAbsoluteTimeGetCurrent() - start) * 1_000)
+        }
+        let beforeMedian = beforeMs.sorted()[beforeMs.count / 2]
+        let afterMedian = afterMs.sorted()[afterMs.count / 2]
+        let allowance = max(25.0, beforeMedian * 0.05)
+        print(
+            "[perf-proof] working-strip before_ms=\(beforeMs) after_ms=\(afterMs) before_median=\(beforeMedian) after_median=\(afterMedian)"
+        )
+        XCTAssertLessThan(afterMedian, beforeMedian, "trailing scan must beat the full timeline walk")
+        XCTAssertLessThanOrEqual(afterMedian, beforeMedian + allowance)
     }
 
     @MainActor
@@ -1223,6 +1314,14 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
     }
 
     private static func chatFlowToolPayloads(_ rows: [AgentAppView.ChatFlowRow]) -> [String] {
+        chatFlowToolPayloadItems(rows).map { "\($0.id):\($0.body):\($0.output ?? "")" }
+    }
+
+    private static func firstLiveTool(_ rows: [AgentAppView.ChatFlowRow]) -> AssistantItem? {
+        chatFlowToolPayloadItems(rows).first
+    }
+
+    private static func chatFlowToolPayloadItems(_ rows: [AgentAppView.ChatFlowRow]) -> [AssistantItem] {
         rows.flatMap { row -> [AssistantItem] in
             switch row {
             case .entry(.turn(let turn)):
@@ -1232,7 +1331,7 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
             case .segment(let segment):
                 return segment.snapshot.items
             }
-        }.filter { $0.type == .tool }.map { "\($0.id):\($0.body):\($0.output ?? "")" }
+        }.filter { $0.type == .tool }
     }
 
     private func repoSource(_ relative: String) throws -> String {
