@@ -3467,6 +3467,52 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                       "some Codex app-server Plan Mode builds emit the plan as final assistant text; the Agent App still needs a first-class proposed-plan card")
     }
 
+    func test_functionCallOutputCompletedWithoutStartStillOpensToolRow() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "tool output"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("item/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-fn-1",
+            "item": [
+                "id": "fn-live-1",
+                "type": "functionCallOutput",
+                "name": "shell",
+                "output": "ran tests"
+            ]
+        ])
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let events = await sink.snapshot()
+        XCTAssertTrue(events.contains {
+            if case .itemStarted(let item) = $0 {
+                return item.id == "fn-live-1" && item.type == .tool && item.summary == "shell"
+            }
+            return false
+        }, "a functionCallOutput that arrives only on item/completed still needs a tool row")
+        XCTAssertTrue(events.contains {
+            if case .itemDelta(let itemId, _, let output, _) = $0 {
+                return itemId == "fn-live-1" && output == "ran tests"
+            }
+            return false
+        })
+    }
+
     func test_adapterStartsStreamingAssistantItemOnlyOnceAcrossDeltas() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in

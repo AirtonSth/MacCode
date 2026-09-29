@@ -3797,6 +3797,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             "agentMessage", "assistantMessage", "agent_message", "assistant_message",
             "message", "reasoning", "reasoning_text", "summary_text",
             "local_shell_call", "function_call", "function_call_output",
+            "functionCallOutput", "sleep",
             "custom_tool_call", "custom_tool_call_output", "mcp_call",
             "web_search_call", "tool_search_call", "tool_search_output",
             "search", "open_page", "find_in_page",
