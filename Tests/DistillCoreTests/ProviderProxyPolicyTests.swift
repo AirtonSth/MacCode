@@ -625,7 +625,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertEqual(ultraAfterMax.reasoningEffort, .ultra,
                        "a later Codex ultra override must promote instead of staying on the raw CLI")
 
-        for maxModel in ["gpt-5.6", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        for maxModel in ["gpt-5.6", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6.1-sol"] {
             let delegation = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
                 providerBasename: "codex",
                 arguments: ["exec", "--model", maxModel, "-c", "model_reasoning_effort=max", "work"],
@@ -668,7 +668,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ), "Agent App must not invent a receipt for an unknown Codex model contract")
         }
 
-        for catalogModel in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.3-codex", "gpt-5.2"] {
+        for catalogModel in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.3-codex", "gpt-5.2"] {
             let delegation = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
                 providerBasename: "codex",
                 arguments: [

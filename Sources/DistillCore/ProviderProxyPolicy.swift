@@ -1616,6 +1616,7 @@ public enum ProviderProxyPolicy {
             return true
         }
         if id.hasPrefix("gpt-5.2") || id.hasPrefix("gpt-6-astra")
+            || id.hasPrefix("gpt-6.1-sol")
             || id.hasPrefix("gpt-6-sol") || id.hasPrefix("gpt-6-luna") {
             return true
         }
@@ -1628,8 +1629,8 @@ public enum ProviderProxyPolicy {
         return ["resume", "fork", "review", "help"].contains(subcommand)
     }
 
-    /// Live Codex app-server catalogs advertise `max` and `ultra` only for the
-    /// 5.6 model families below plus gpt-6-astra/sol/luna. Unknown/omitted
+    /// Live Codex 0.159 app-server catalogs advertise `max` and `ultra` for the
+    /// 5.6 families below plus gpt-6-astra/sol/luna and gpt-6.1-sol. Unknown
     /// models stay on the raw CLI because their effort contract cannot be
     /// represented truthfully.
     private static func nestedCodexModelSupportsMax(_ model: String) -> Bool {
@@ -1639,6 +1640,7 @@ public enum ProviderProxyPolicy {
             || id.hasPrefix("gpt-5.6-terra")
             || id.hasPrefix("gpt-5.6-luna")
             || id.hasPrefix("gpt-6-astra")
+            || id.hasPrefix("gpt-6.1-sol")
             || id.hasPrefix("gpt-6-sol")
             || id.hasPrefix("gpt-6-luna")
     }

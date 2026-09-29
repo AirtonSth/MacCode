@@ -3301,6 +3301,17 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                             ]
                         ],
                         [
+                            "id": "fn-out-1",
+                            "type": "functionCallOutput",
+                            "name": "shell",
+                            "output": "ran tests"
+                        ],
+                        [
+                            "id": "sleep-1",
+                            "type": "sleep",
+                            "durationMs": 1500
+                        ],
+                        [
                             "id": "hook-1",
                             "type": "hookPrompt",
                             "fragments": [
@@ -3362,6 +3373,11 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                        "userMessage snapshots must not render as tool rows because the Agent App already shows the prompt as a user bubble")
         XCTAssertTrue(events.contains { if case .providerRuntime(let runtime) = $0 { return runtime.providerItemId == "user-content-1" && runtime.payloadJSON.contains("User content array text") } else { return false } },
                       "userMessage snapshots must stay available in raw runtime history even when hidden from the visible assistant timeline")
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "fn-out-1" && item.type == .tool && item.summary == "shell" } else { return false } },
+                      "camelCase functionCallOutput is an app-server tool result, not assistant prose and not a shell command")
+        XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "fn-out-1" && output == "ran tests" } else { return false } })
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "sleep-1" && item.type == .tool && item.summary == "Sleep 1500 ms" } else { return false } },
+                      "sleep snapshots must show the duration instead of the raw type name")
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "hook-1" && item.summary == "Hook prompt" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "hook-1" && output == "Hook prompt fragment" } else { return false } },
                       "hookPrompt snapshots should render fragment text instead of raw JSON")

@@ -3712,6 +3712,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case "plan": return .plan
         case "reasoning", "reasoning_text", "summary_text": return .reasoning
         case "commandExecution", "command_execution", "local_shell_call", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output": return .commandExecution
+        case "functionCallOutput", "sleep": return .tool
         case "fileChange", "file_change": return .fileChange
         case "mcpToolCall", "mcp_call": return .mcpToolCall
         case "dynamicToolCall", "imageGeneration": return .dynamicToolCall
@@ -3847,8 +3848,16 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             return string(item, "command") ?? string(item, "status")
         case "function_call", "custom_tool_call":
             return string(item, "name") ?? string(item, "call_id") ?? "Tool call"
-        case "function_call_output", "custom_tool_call_output":
-            return string(item, "call_id") ?? "Tool output"
+        case "function_call_output", "functionCallOutput", "custom_tool_call_output":
+            return string(item, "name") ?? string(item, "call_id") ?? "Tool output"
+        case "sleep":
+            if let duration = item["durationMs"] as? Int {
+                return "Sleep \(duration) ms"
+            }
+            if let duration = item["durationMs"] as? Double {
+                return "Sleep \(Int(duration)) ms"
+            }
+            return "Sleep"
         case "fileChange", "file_change":
             if let changes = item["changes"] as? [[String: Any]] {
                 return "\(changes.count) file change\(changes.count == 1 ? "" : "s")"
@@ -3920,8 +3929,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             return jsonString(item["result"]) ?? (item["error"] as? [String: Any]).flatMap { string($0, "message") } ?? stringBodyFallback(for: item)
         case "function_call", "custom_tool_call":
             return jsonString(item["arguments"]) ?? string(item, "arguments") ?? stringBodyFallback(for: item)
-        case "function_call_output", "custom_tool_call_output":
+        case "function_call_output", "functionCallOutput", "custom_tool_call_output":
             return joinedStrings(item["output"]) ?? stringBodyFallback(for: item)
+        case "sleep":
+            return nil
         case "dynamicToolCall":
             return jsonString(item["contentItems"]) ?? stringBodyFallback(for: item)
         case "collabAgentToolCall":

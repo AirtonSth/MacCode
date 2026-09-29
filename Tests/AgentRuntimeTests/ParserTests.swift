@@ -164,6 +164,19 @@ final class CodexParserTests: XCTestCase {
         XCTAssertEqual(m, "model blocked")
     }
 
+    func test_functionCallOutput_isToolNotAssistantText() {
+        let p = CodexParser()
+        let events = p.parseLine(#"{"type":"item.completed","item":{"id":"fn-1","type":"function_call_output","name":"shell","output":"ok"}}"#)
+        XCTAssertTrue(events.contains {
+            if case .itemStarted(let item) = $0 { return item.id == "fn-1" && item.type == .tool }
+            return false
+        }, "function_call_output must not be copied into the assistant reply")
+        XCTAssertFalse(events.contains {
+            if case .itemDelta(_, let body, _, _) = $0 { return body == "ok" }
+            return false
+        })
+    }
+
     func test_unknownEvent_ignored() {
         let p = CodexParser()
         XCTAssertEqual(p.parseLine(#"{"type":"unknown.event","payload":1}"#).count, 0)

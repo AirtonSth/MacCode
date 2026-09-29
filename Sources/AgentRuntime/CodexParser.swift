@@ -366,6 +366,12 @@ public final class CodexParser {
         case "tool", "toolcall": return .tool
         case "agentmessage", "assistantmessage", "assistant", "message", "text":
             return .assistantMessage
+        // App-server ThreadItem kinds. They are not assistant prose. Mapping
+        // them to assistantMessage copies tool output into the reply bubble.
+        case "functioncalloutput", "hookprompt", "sleep", "subagentactivity":
+            return .tool
+        case "imagegeneration":
+            return .dynamicToolCall
         default: return .assistantMessage
         }
     }
