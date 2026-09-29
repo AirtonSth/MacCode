@@ -1112,17 +1112,20 @@ final class ProviderProxyPolicyTests: XCTestCase {
             promptFile: prompt
         ), "unknown grok dash flags must stay fail-closed")
 
-        let dontAsk = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+        let dontAskArguments = [
+            "--model", "grok-4.6", "--effort", "high",
+            "--prompt", "investigate",
+            "--permission-mode", "dontAsk"
+        ]
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
             providerBasename: "grok",
-            arguments: [
-                "--model", "grok-4.6", "--effort", "high",
-                "--prompt", "investigate",
-                "--permission-mode", "dontAsk"
-            ],
+            arguments: dontAskArguments
+        ), "dontAsk is silent deny and must stay on the raw CLI")
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: dontAskArguments,
             promptFile: prompt
-        ))
-        XCTAssertEqual(dontAsk.permissionMode, .fullAccess,
-                       "dontAsk suppresses prompts and requires a full-access parent mapping")
+        ), "dontAsk must not be promoted to Agent App bypassPermissions")
 
         let autoArguments = [
             "--model", "grok-4.7", "--effort", "high",
@@ -1212,6 +1215,66 @@ final class ProviderProxyPolicyTests: XCTestCase {
         ))
         XCTAssertEqual(grok47.model, "grok-4.7")
         XCTAssertEqual(grok47.reasoningEffort, .high)
+
+        XCTAssertEqual(
+            ProviderProxyPolicy.nestedCLIInlinePrompt(
+                providerBasename: "grok",
+                arguments: ["--print", "print alias", "--model", "grok-4.7"]
+            ),
+            "print alias"
+        )
+        XCTAssertEqual(
+            ProviderProxyPolicy.nestedCLIInlinePrompt(
+                providerBasename: "grok",
+                arguments: ["--single", "single alias", "--model", "grok-4.7"]
+            ),
+            "single alias"
+        )
+        let printWorkspace = [
+            "--model", "grok-4.7", "--effort", "high",
+            "--print", "investigate",
+            "--permission-mode", "acceptEdits",
+            "--sandbox", "workspace"
+        ]
+        XCTAssertEqual(
+            ProviderProxyPolicy.explicitPermissionRequest(
+                providerBasename: "grok",
+                arguments: printWorkspace
+            ),
+            .explicit(.autoAcceptEdits),
+            "--print is the grok -p alias and must not widen a proven workspace mode"
+        )
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.7", "--effort", "high",
+                "--prompt", "investigate",
+                "--output-format", "streaming-json"
+            ],
+            promptFile: prompt
+        ), "streaming-json must stay on the raw CLI")
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.7", "--effort", "high",
+                "--prompt", "investigate",
+                "--append-system-prompt", "extra rules",
+                "--load", "sid-keep-raw",
+                "--trust"
+            ],
+            promptFile: prompt
+        ), "unrepresented grok aliases must stay on the raw CLI")
+        let skip = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "grok",
+            arguments: [
+                "--model", "grok-4.7", "--effort", "high",
+                "--prompt", "investigate",
+                "--dangerously-skip-permissions"
+            ],
+            promptFile: prompt
+        ))
+        XCTAssertEqual(skip.permissionMode, .fullAccess,
+                       "--dangerously-skip-permissions is grok --always-approve")
 
         XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "grok",

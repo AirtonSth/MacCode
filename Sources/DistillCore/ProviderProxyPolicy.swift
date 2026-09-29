@@ -676,12 +676,16 @@ public enum ProviderProxyPolicy {
             case .grok:
                 return [
                     "--permission-mode", "--sandbox", "--prompt-file", "-p",
+                    "--single", "--print",
                     "--model", "-m", "--effort", "--reasoning-effort",
                     "--output-format", "--disallowed-tools", "--allowed-tools",
-                    "--allow", "--deny", "--tools", "--rules", "--json-schema",
+                    "--allow", "--deny", "--tools", "--rules", "--append-system-prompt",
+                    "--json-schema",
                     "--max-turns", "--prompt-json", "--system-prompt-override",
+                    "--system-prompt",
                     "--cwd", "--worktree", "-w", "--worktree-ref", "--debug-file",
-                    "--leader-socket", "--agent", "--agents", "--session-id", "--resume"
+                    "--leader-socket", "--agent", "--agents", "--session-id",
+                    "--resume", "--load"
                 ]
             }
         }()
@@ -707,7 +711,8 @@ public enum ProviderProxyPolicy {
             case .grok:
                 return [
                     "--cwd", "--worktree", "-w", "--worktree-ref", "--debug-file",
-                    "--leader-socket", "--agent", "--agents", "--session-id", "--resume"
+                    "--leader-socket", "--agent", "--agents", "--session-id",
+                    "--resume", "--load"
                 ]
             }
         }()
@@ -758,7 +763,7 @@ public enum ProviderProxyPolicy {
                 return [
                     "--dangerously-skip-permissions", "--experimental-memory",
                     "--restore-code", "--oauth", "--continue", "-c",
-                    "--fork-session", "--debug"
+                    "--fork-session", "--debug", "--trust", "--trust-folder"
                 ]
             }
         }()
@@ -1670,20 +1675,23 @@ public enum ProviderProxyPolicy {
         "--max-turns", "--json-schema", "--prompt-json", "--cwd",
         "--tools", "--allow", "--deny", "--allowedTools", "--disallowedTools",
         "--system-prompt-override",
-        "--system-prompt", "--debug-file", "--leader-socket",
+        "--system-prompt", "--append-system-prompt", "--debug-file", "--leader-socket",
         "--agents", "--agent", "--worktree-ref", "--ref",
-        "--worktree", "-w"
+        "--worktree", "-w", "--single", "--print", "--load"
     ]
 
-    /// grok 1.0.41 boolean flags. `--yolo` is `--always-approve`.
+    /// grok 1.0.41 boolean flags. `--yolo` and `--dangerously-skip-permissions`
+    /// are `--always-approve`. `--trust` persists a folder decision.
     private static let nestedGrokFlagOptions: Set<String> = [
-        "--always-approve", "--yolo", "--auto-update", "--continue", "-c",
+        "--always-approve", "--yolo", "--dangerously-skip-permissions",
+        "--auto-update", "--continue", "-c",
         "--help", "-h", "--list-models", "--memory", "--no-auto-update",
         "--no-memory", "--no-plan", "--no-subagents", "--plan",
         "--subagents", "--version", "-V", "-v",
         "--fork-session", "--include-partial-messages", "--restore-code",
         "--verbatim", "--disable-web-search", "--no-leader", "--debug",
-        "--fullscreen", "--minimal", "--no-alt-screen", "--oauth"
+        "--fullscreen", "--minimal", "--no-alt-screen", "--oauth",
+        "--trust", "--trust-folder"
     ]
 
     private static func nestedGrokAgentAppEligible(arguments: [String]) -> Bool {
@@ -1707,6 +1715,8 @@ public enum ProviderProxyPolicy {
             scan.optionValues["--prompt-file"]?.contains(where: { !$0.isEmpty }) == true
             || scan.optionValues["--prompt"]?.contains(where: { !$0.isEmpty }) == true
             || scan.optionValues["-p"]?.contains(where: { !$0.isEmpty }) == true
+            || scan.optionValues["--single"]?.contains(where: { !$0.isEmpty }) == true
+            || scan.optionValues["--print"]?.contains(where: { !$0.isEmpty }) == true
             || scan.optionValues["--prompt-json"]?.contains(where: { !$0.isEmpty }) == true
             || !scan.positionals.isEmpty
         // Empty positionals + no prompt flags still eligible if stdin will supply prompt
@@ -1716,13 +1726,22 @@ public enum ProviderProxyPolicy {
         return scan.optionValues["--model"]?.isEmpty == false
             || scan.flags.contains("--always-approve")
             || scan.flags.contains("--yolo")
+            || scan.flags.contains("--dangerously-skip-permissions")
             || scan.optionValues["--sandbox"] != nil
     }
 
     /// Resume/load/version/help stay on the raw CLI. `--resume` and `--session-id`
     /// are value options on grok 1.0.41, so a flags-only gate misses them.
     private static func nestedGrokKeepsRawCLI(_ scan: NestedArgScan) -> Bool {
-        if scan.optionValues["--permission-mode"]?.last?.lowercased() == "auto" {
+        // `auto` is a classifier. `dontAsk` silently denies (PromptPolicy::Deny).
+        // Neither is Agent App fullAccess / bypassPermissions.
+        if let mode = scan.optionValues["--permission-mode"]?.last?.lowercased(),
+           mode == "auto" || mode == "dontask" || mode == "dont-ask" {
+            return true
+        }
+        // streaming-json is the CLI NDJSON ABI. Promoting it would emit text.
+        if let output = scan.optionValues["--output-format"]?.last?.lowercased(),
+           output == "streaming-json" || output == "streaming-messages-json" {
             return true
         }
         if scan.flags.contains("--version") || scan.flags.contains("-V") || scan.flags.contains("-v")
@@ -1734,6 +1753,7 @@ public enum ProviderProxyPolicy {
             return true
         }
         if scan.optionValues["--resume"] != nil || scan.optionValues["-r"] != nil
+            || scan.optionValues["--load"] != nil
             || scan.optionValues["--session-id"] != nil || scan.optionValues["-s"] != nil {
             return true
         }
@@ -1741,6 +1761,7 @@ public enum ProviderProxyPolicy {
             "--max-turns", "--json-schema", "--prompt-json", "--cwd",
             "--tools", "--allow", "--deny", "--allowed-tools", "--disallowed-tools",
             "--allowedTools", "--disallowedTools", "--settings", "--input-format", "--rules",
+            "--append-system-prompt",
             "--sandbox",
             "--system-prompt-override", "--system-prompt", "--debug-file",
             "--leader-socket", "--agents", "--agent", "--worktree-ref",
@@ -1754,7 +1775,8 @@ public enum ProviderProxyPolicy {
             "--disable-web-search", "--no-leader", "--debug", "--auto-update",
             "--no-auto-update", "--memory", "--no-memory", "--plan", "--no-plan",
             "--subagents", "--no-subagents",
-            "--fullscreen", "--minimal", "--no-alt-screen", "--oauth"
+            "--fullscreen", "--minimal", "--no-alt-screen", "--oauth",
+            "--trust", "--trust-folder"
         ]
         if !scan.flags.isDisjoint(with: unsupportedFlags) {
             return true
@@ -1789,15 +1811,14 @@ public enum ProviderProxyPolicy {
               requestedEffort != .ultracode else { return nil }
         let effort = GrokReasoningPolicy.normalizedEffort(requestedEffort, model: model)
         let permission: AgentPermissionMode = {
-            if scan.flags.contains("--always-approve") || scan.flags.contains("--yolo") {
+            if scan.flags.contains("--always-approve") || scan.flags.contains("--yolo")
+                || scan.flags.contains("--dangerously-skip-permissions") {
                 return .fullAccess
             }
             switch (scan.optionValues["--permission-mode"]?.last ?? "").lowercased() {
             case "acceptedits", "accept-edits", "workspace":
                 return .autoAcceptEdits
-            case "dontask", "dont-ask", "full_access", "full-access", "bypasspermissions":
-                return .fullAccess
-            case "auto":
+            case "full_access", "full-access", "bypasspermissions":
                 return .fullAccess
             default:
                 return .supervised
@@ -1829,7 +1850,9 @@ public enum ProviderProxyPolicy {
         )
         guard !scan.malformed else { return nil }
         if let prompt = scan.optionValues["--prompt"]?.last
-            ?? scan.optionValues["-p"]?.last {
+            ?? scan.optionValues["-p"]?.last
+            ?? scan.optionValues["--single"]?.last
+            ?? scan.optionValues["--print"]?.last {
             let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { return trimmed }
         }
