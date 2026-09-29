@@ -573,8 +573,10 @@ public enum ProviderProxyPolicy {
             case "acceptedits", "accept-edits", "auto_accept_edits", "workspace":
                 return .autoAcceptEdits
             case "auto":
-                // Grok auto is a classifier, not acceptEdits.
-                return provider == .grok ? .fullAccess : .autoAcceptEdits
+                // Grok and Claude `auto` are classifiers, not acceptEdits.
+                // Claude Code 2.1.284 starts interactive sessions in auto when
+                // no mode is configured. Parent ceiling must be fullAccess.
+                return (provider == .grok || provider == .claude) ? .fullAccess : .autoAcceptEdits
             case "bypasspermissions", "bypass-permissions", "full_access":
                 return .fullAccess
             default:
@@ -1338,6 +1340,9 @@ public enum ProviderProxyPolicy {
     private static func nestedClaudeAgentAppEligible(arguments: [String]) -> Bool {
         let scan = scanNestedClaudeArguments(arguments)
         guard !scan.malformed else { return false }
+        if scan.optionValues["--permission-mode"]?.last?.lowercased() == "auto" {
+            return false
+        }
         if scan.flags.contains("--version") || scan.flags.contains("-V")
             || scan.flags.contains("--help") || scan.flags.contains("-h") {
             return false
@@ -1447,8 +1452,10 @@ public enum ProviderProxyPolicy {
 
     private static func mapClaudePermission(_ raw: String?) -> AgentPermissionMode {
         switch (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "acceptedits", "accept-edits", "auto", "workspace":
+        case "acceptedits", "accept-edits", "workspace":
             return .autoAcceptEdits
+        case "auto":
+            return .fullAccess
         case "bypasspermissions", "bypass-permissions", "dontask", "full_access", "full-access":
             return .fullAccess
         default:

@@ -884,6 +884,34 @@ final class ProviderProxyPolicyTests: XCTestCase {
             promptFile: prompt
         ))
         XCTAssertEqual(manualPermission.permissionMode, .supervised)
+        let claudeAuto = [
+            "--print", "--model", "opus", "--effort", "high",
+            "--permission-mode", "auto"
+        ]
+        XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
+            providerBasename: "claude",
+            arguments: claudeAuto
+        ), "Claude auto is a classifier and must stay on the raw CLI")
+        XCTAssertNil(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
+            providerBasename: "claude",
+            arguments: claudeAuto,
+            promptFile: prompt
+        ), "Agent App must not rewrite Claude auto into acceptEdits")
+        XCTAssertEqual(
+            ProviderProxyPolicy.explicitPermissionRequest(
+                providerBasename: "claude",
+                arguments: ["--permission-mode", "auto"]
+            ),
+            .explicit(.fullAccess),
+            "Claude auto is not acceptEdits; parent ceiling must not treat it as workspace edits"
+        )
+        XCTAssertEqual(
+            ProviderProxyPolicy.explicitPermissionRequest(
+                providerBasename: "claude",
+                arguments: ["--permission-mode=auto"]
+            ),
+            .explicit(.fullAccess)
+        )
         XCTAssertFalse(ProviderProxyPolicy.nestedCLIAgentAppEligible(
             providerBasename: "claude",
             arguments: [
