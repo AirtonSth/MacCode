@@ -13617,6 +13617,61 @@ public struct AgentAppView: View {
         return (Array(entries.prefix(end)), liveTail)
     }
 
+    /// Cheap live-tail identity for chrome-only ticks. Counts and item
+    /// body/output lengths catch tool-body growth; equal-length in-place
+    /// replacement of an earlier item is a residual miss (streaming bodies grow).
+    nonisolated static func liveTailGrowthSignature(
+        _ entries: ArraySlice<TranscriptEntry>
+    ) -> Int {
+        var hasher = Hasher()
+        hasher.combine(entries.count)
+        for entry in entries {
+            hasher.combine(entry.id)
+            switch entry {
+            case .message(let message):
+                hasher.combine(message.content.utf8.count)
+            case .turn(let turn):
+                hasher.combine(turn.finished)
+                hasher.combine(turn.items.count)
+                hasher.combine(turn.finalAssistantMessage?.utf8.count ?? 0)
+                for item in turn.items {
+                    hasher.combine(item.id)
+                    hasher.combine(item.state.rawValue)
+                    hasher.combine(item.body.utf8.count)
+                    hasher.combine(item.output?.utf8.count ?? 0)
+                }
+            }
+        }
+        return hasher.finalize()
+    }
+
+    /// User-bubble relative time only needs 1 Hz identity. Passing a fresh
+    /// `Date()` into Equatable rows at ~30 Hz remounted timestamps with no
+    /// visible copy change inside the same second.
+    nonisolated static func relativeTimestampNowBucket(_ now: Date) -> Date {
+        Date(timeIntervalSinceReferenceDate: now.timeIntervalSinceReferenceDate.rounded(.down))
+    }
+
+    /// Header working strip only cares about the trailing unfinished turn.
+    /// Scanning every finished turn's items on ~30 Hz chrome ticks walked the
+    /// whole timeline for a bit that cannot be true on completed history.
+    nonisolated static func hasStreamingGroupableTools(
+        in turns: [AssistantTurnSnapshot]
+    ) -> Bool {
+        var index = turns.count - 1
+        while index >= 0 {
+            let turn = turns[index]
+            if turn.finished { break }
+            if turn.items.contains(where: {
+                $0.state == .streaming && isGroupableTool($0.type)
+            }) {
+                return true
+            }
+            index -= 1
+        }
+        return false
+    }
+
     /// F7: build the merged transcript in O(N) by merging two already-ordered
     /// sequences instead of re-sorting the whole thread (O(N log N)) on every
     /// structural change (turn/item/message add) during a run. `messages` are
@@ -14142,16 +14197,28 @@ public struct AgentAppView: View {
     private let mentionableBotsSnapshotCache = MentionableBotsSnapshotCache()
 
     /// Memoize finished-history `chatFlowRows` across chrome-only / paint-tick
-    /// bodies. Live suffix is never cached: tool-body growth and extra tools
-    /// keep `contentGeneration` stable but must still paint.
+    /// bodies. Live suffix is cached only while its growth signature (ids,
+    /// item counts, body/output UTF-8 lengths, states) is unchanged — tool-body
+    /// growth still misses. Split is skipped when the paint-sequence ends and
+    /// live-turn id match the previous pass.
     private final class ChatFlowPaintCache {
         var generation: UInt64 = 0
         var aggregateBudgetGeneration: UInt64 = 0
         var count: Int = -1
         var firstId: String?
         var lastId: String?
+        var paintCount: Int = -1
+        var paintFirstId: String?
+        var paintLastId: String?
+        var latestLiveTurnId: String?
+        var splitIndex: Int = -1
+        var liveSignature: Int = 0
+        var liveGeneration: UInt64 = 0
+        var liveAggregateBudgetGeneration: UInt64 = 0
         var historyRows: [ChatFlowRow] = []
+        var liveRows: [ChatFlowRow] = []
         var hasValue = false
+        var hasLiveValue = false
     }
     private let chatFlowPaintCache = ChatFlowPaintCache()
     #if DEBUG
@@ -14163,8 +14230,10 @@ public struct AgentAppView: View {
     static nonisolated(unsafe) var mentionableBotsSnapshotProviderCallCountForTesting: UInt64 = 0
     /// Test-only: uncached history `chatFlowRows` invocations.
     static nonisolated(unsafe) var chatFlowPaintComputeCountForTesting: UInt64 = 0
-    /// Test-only: live-tail `chatFlowRows` invocations (always miss when live).
+    /// Test-only: live-tail `chatFlowRows` invocations (miss on growth).
     static nonisolated(unsafe) var chatFlowPaintLiveComputeCountForTesting: UInt64 = 0
+    /// Test-only: `splitTrailingLiveTurns` invocations from cached paint.
+    static nonisolated(unsafe) var chatFlowPaintSplitCountForTesting: UInt64 = 0
     #endif
 
     /// Signature for F2 paint-context reuse. Includes every bot identity field
@@ -14261,18 +14330,46 @@ public struct AgentAppView: View {
     ) -> (historyRows: [ChatFlowRow], liveRows: [ChatFlowRow], allRows: [ChatFlowRow]) {
         let generation = vm.transcriptState.contentGeneration
         let aggregateBudgetGeneration = vm.aggregateHotTextBudgetGeneration
-        // Always split so `latestLiveTurnId` and trailing unfinished turns
-        // move the live boundary even when generation + paint ends are stable.
-        let split = Self.splitTrailingLiveTurns(
-            paintSequence,
-            latestLiveTurnId: latestLiveTurnId
-        )
-        // History (or the full sequence when there is no live tail) is keyed
-        // on generation + history first/last ids + count. Live snapshots
-        // embed tool bodies and must not be stored.
-        let count = split.history.count
-        let firstId = split.history.first?.id
-        let lastId = split.history.last?.id
+        let paintCount = paintSequence.count
+        let paintFirstId = paintSequence.first?.id
+        let paintLastId = paintSequence.last?.id
+        let splitIndex: Int
+        let historyEntries: [TranscriptEntry]
+        let liveEntries: [TranscriptEntry]
+        if chatFlowPaintCache.hasValue,
+           chatFlowPaintCache.generation == generation,
+           chatFlowPaintCache.aggregateBudgetGeneration == aggregateBudgetGeneration,
+           chatFlowPaintCache.paintCount == paintCount,
+           chatFlowPaintCache.paintFirstId == paintFirstId,
+           chatFlowPaintCache.paintLastId == paintLastId,
+           chatFlowPaintCache.latestLiveTurnId == latestLiveTurnId,
+           chatFlowPaintCache.splitIndex >= 0,
+           chatFlowPaintCache.splitIndex <= paintCount {
+            splitIndex = chatFlowPaintCache.splitIndex
+            historyEntries = []
+            liveEntries = []
+        } else {
+            #if DEBUG
+            Self.chatFlowPaintSplitCountForTesting &+= 1
+            #endif
+            let split = Self.splitTrailingLiveTurns(
+                paintSequence,
+                latestLiveTurnId: latestLiveTurnId
+            )
+            splitIndex = split.history.count
+            historyEntries = split.history
+            liveEntries = split.liveTail
+            chatFlowPaintCache.paintCount = paintCount
+            chatFlowPaintCache.paintFirstId = paintFirstId
+            chatFlowPaintCache.paintLastId = paintLastId
+            chatFlowPaintCache.latestLiveTurnId = latestLiveTurnId
+            chatFlowPaintCache.splitIndex = splitIndex
+        }
+        let historySlice = paintSequence.prefix(splitIndex)
+        let liveSlice = paintSequence.suffix(from: splitIndex)
+        let count = splitIndex
+        let firstId = historySlice.first?.id
+        let lastId = historySlice.last?.id
         let historyRows: [ChatFlowRow]
         if chatFlowPaintCache.hasValue,
            chatFlowPaintCache.generation == generation,
@@ -14288,7 +14385,9 @@ public struct AgentAppView: View {
             // Chat flow: weave each turn with the bot peer rows that arrived
             // mid-turn. The split boundary never cuts a turn from its following
             // messages, so mapping each side independently equals the whole.
-            historyRows = Self.chatFlowRows(split.history)
+            historyRows = Self.chatFlowRows(
+                historyEntries.isEmpty ? Array(historySlice) : historyEntries
+            )
             chatFlowPaintCache.generation = generation
             chatFlowPaintCache.aggregateBudgetGeneration = aggregateBudgetGeneration
             chatFlowPaintCache.count = count
@@ -14297,13 +14396,30 @@ public struct AgentAppView: View {
             chatFlowPaintCache.historyRows = historyRows
             chatFlowPaintCache.hasValue = true
         }
-        guard !split.liveTail.isEmpty else {
+        guard splitIndex < paintCount else {
+            chatFlowPaintCache.hasLiveValue = false
+            chatFlowPaintCache.liveRows = []
             return (historyRows, [], historyRows)
+        }
+        let liveSignature = Self.liveTailGrowthSignature(liveSlice)
+        if chatFlowPaintCache.hasLiveValue,
+           chatFlowPaintCache.liveGeneration == generation,
+           chatFlowPaintCache.liveAggregateBudgetGeneration == aggregateBudgetGeneration,
+           chatFlowPaintCache.liveSignature == liveSignature {
+            let liveRows = chatFlowPaintCache.liveRows
+            return (historyRows, liveRows, historyRows + liveRows)
         }
         #if DEBUG
         Self.chatFlowPaintLiveComputeCountForTesting &+= 1
         #endif
-        let liveRows = Self.chatFlowRows(split.liveTail)
+        let liveRows = Self.chatFlowRows(
+            liveEntries.isEmpty ? Array(liveSlice) : liveEntries
+        )
+        chatFlowPaintCache.liveSignature = liveSignature
+        chatFlowPaintCache.liveGeneration = generation
+        chatFlowPaintCache.liveAggregateBudgetGeneration = aggregateBudgetGeneration
+        chatFlowPaintCache.liveRows = liveRows
+        chatFlowPaintCache.hasLiveValue = true
         return (historyRows, liveRows, historyRows + liveRows)
     }
 
@@ -15211,6 +15327,7 @@ public struct AgentAppView: View {
                         let liveRows = flow.liveRows
                         let allRows = flow.allRows
                         let mentionBots = snapshotMentionableBots()
+                        let relativeNow = Self.relativeTimestampNowBucket(vm.currentTime())
                         // F2: reuse paint context across chrome-only / paint-tick
                         // passes when contentGeneration is unchanged.
                         let rowPaintContext = cachedChatRowPaintContext(
@@ -15268,7 +15385,8 @@ public struct AgentAppView: View {
                                         columnWidth: timelineColumnWidth,
                                         groupHeader: rowPaintContext.peerGroupHeader(for: row),
                                         hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row),
-                                        mentionableBots: mentionBots
+                                        mentionableBots: mentionBots,
+                                        relativeNow: relativeNow
                                     )
                                     .id(row.id)
                                 }
@@ -15280,7 +15398,8 @@ public struct AgentAppView: View {
                                     columnWidth: timelineColumnWidth,
                                     groupHeader: rowPaintContext.peerGroupHeader(for: row),
                                     hideAssistantOutput: rowPaintContext.hidesAssistantOutput(for: row),
-                                    mentionableBots: mentionBots
+                                    mentionableBots: mentionBots,
+                                    relativeNow: relativeNow
                                 )
                                 .id(row.id)
                             }
@@ -16526,7 +16645,8 @@ public struct AgentAppView: View {
     private func messageRow(
         _ msg: AgentMessage,
         columnWidth: CGFloat = 10_000,
-        mentionableBots: [BotDefinition] = []
+        mentionableBots: [BotDefinition] = [],
+        relativeNow: Date? = nil
     ) -> some View {
         switch msg.role {
         case .user:
@@ -16549,6 +16669,7 @@ public struct AgentAppView: View {
             AgentChatUserBubble(
                 text: displayText,
                 createdAt: msg.createdAt,
+                now: relativeNow,
                 columnWidth: columnWidth,
                 accessibilityIdentifier: "agent.userMessageBubble",
                 roleIdentifier: "agent.role.user",
@@ -16847,7 +16968,8 @@ public struct AgentAppView: View {
         columnWidth: CGFloat,
         groupHeader: AgentChatPeerGroupHeader? = nil,
         hideAssistantOutput: Bool = false,
-        mentionableBots: [BotDefinition] = []
+        mentionableBots: [BotDefinition] = [],
+        relativeNow: Date? = nil
     ) -> some View {
         VStack(alignment: .leading, spacing: DS.Space.sm) {
             if let groupHeader {
@@ -16855,7 +16977,12 @@ public struct AgentAppView: View {
             }
             switch entry {
             case .message(let message):
-                messageRow(message, columnWidth: columnWidth, mentionableBots: mentionableBots)
+                messageRow(
+                    message,
+                    columnWidth: columnWidth,
+                    mentionableBots: mentionableBots,
+                    relativeNow: relativeNow
+                )
             case .turn(let turn):
                 turnView(turn, hideAssistantOutput: hideAssistantOutput)
             }
@@ -16868,7 +16995,8 @@ public struct AgentAppView: View {
         columnWidth: CGFloat,
         groupHeader: AgentChatPeerGroupHeader? = nil,
         hideAssistantOutput: Bool = false,
-        mentionableBots: [BotDefinition] = []
+        mentionableBots: [BotDefinition] = [],
+        relativeNow: Date? = nil
     ) -> some View {
         switch row {
         case .entry(let entry):
@@ -16877,7 +17005,8 @@ public struct AgentAppView: View {
                 columnWidth: columnWidth,
                 groupHeader: groupHeader,
                 hideAssistantOutput: hideAssistantOutput,
-                mentionableBots: mentionableBots
+                mentionableBots: mentionableBots,
+                relativeNow: relativeNow
             )
         case .segment(let segment):
             turnSegmentView(segment, hideAssistantOutput: hideAssistantOutput)
@@ -18262,11 +18391,7 @@ public struct AgentAppView: View {
             isAwaitingBackground: vm.isAwaitingBackgroundWork,
             backgroundShellCount: vm.backgroundShellCount,
             activeSubagentCount: activeSubagents,
-            hasStreamingTools: vm.timeline.turns.contains { turn in
-                !turn.finished && turn.items.contains {
-                    $0.state == .streaming && AgentAppView.isGroupableTool($0.type)
-                }
-            }
+            hasStreamingTools: Self.hasStreamingGroupableTools(in: vm.timeline.turns)
         )
         let elapsed: Int? = {
             guard runLive || vm.isAwaitingBackgroundWork else { return nil }
