@@ -1005,6 +1005,18 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
         )
         XCTAssertEqual(AgentAppView.chatFlowPaintComputeCountForTesting - before, 1)
         XCTAssertEqual(AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive, 3)
+
+        live.items[0].output = "b"
+        let replaced = view.cachedChatFlowPaintForTesting(
+            paintSequence: [.turn(history), .turn(live)],
+            latestLiveTurnId: "t-live"
+        )
+        XCTAssertEqual(
+            Self.chatFlowToolPayloads(replaced.liveRows).first,
+            "tool-1:ls:b",
+            "same-length tool output replacement must miss the live-tail cache"
+        )
+        XCTAssertEqual(AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive, 4)
     }
 
     @MainActor

@@ -13617,9 +13617,8 @@ public struct AgentAppView: View {
         return (Array(entries.prefix(end)), liveTail)
     }
 
-    /// Cheap live-tail identity for chrome-only ticks. Counts and item
-    /// body/output lengths catch tool-body growth; equal-length in-place
-    /// replacement of an earlier item is a residual miss (streaming bodies grow).
+    /// Live-tail identity for chrome-only ticks. Hashes item text, not only
+    /// UTF-8 length, so a same-length rewrite still misses the cached rows.
     nonisolated static func liveTailGrowthSignature(
         _ entries: ArraySlice<TranscriptEntry>
     ) -> Int {
@@ -13629,16 +13628,16 @@ public struct AgentAppView: View {
             hasher.combine(entry.id)
             switch entry {
             case .message(let message):
-                hasher.combine(message.content.utf8.count)
+                hasher.combine(message.content)
             case .turn(let turn):
                 hasher.combine(turn.finished)
                 hasher.combine(turn.items.count)
-                hasher.combine(turn.finalAssistantMessage?.utf8.count ?? 0)
+                hasher.combine(turn.finalAssistantMessage)
                 for item in turn.items {
                     hasher.combine(item.id)
                     hasher.combine(item.state.rawValue)
-                    hasher.combine(item.body.utf8.count)
-                    hasher.combine(item.output?.utf8.count ?? 0)
+                    hasher.combine(item.body)
+                    hasher.combine(item.output)
                 }
             }
         }
