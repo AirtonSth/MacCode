@@ -122,6 +122,14 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertFalse(source.contains("scheduled-task-runners"))
     }
 
+    func test_manualDistillPreflightResolvesLegacyInstanceId_becauseLaunchMustUseConnectedAccount() throws {
+        let source = try String(contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("snapshots.resolvedSnapshot(provider: task.provider, instanceID: task.providerInstanceID)"))
+        XCTAssertTrue(source.contains("task.providerInstanceID = snapshot.id"))
+        XCTAssertTrue(source.contains("instanceId: snapshot.id"))
+        XCTAssertTrue(source.contains("providerInstanceId: task.providerInstanceID"))
+    }
+
     func test_runtimePreservesFrozenProviderAndReportsManualClaimFailures_becauseRunNowMustNotSilentlyChangeOrDrop() throws {
         let source = try String(contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"))
 

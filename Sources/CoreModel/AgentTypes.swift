@@ -1053,6 +1053,16 @@ public struct AgentProviderSnapshot: Codable, Sendable, Equatable, Identifiable 
     }
 }
 
+public extension Array where Element == AgentProviderSnapshot {
+    /// Exact instance first; a stale or legacy id (e.g. "distill") falls back to the
+    /// provider's enabled instance so saved tasks keep resolving after migration.
+    func resolvedSnapshot(provider: AgentProvider, instanceID: String) -> AgentProviderSnapshot? {
+        first { $0.provider == provider && $0.id == instanceID }
+            ?? first { $0.provider == provider && $0.enabled }
+            ?? first { $0.provider == provider }
+    }
+}
+
 public enum AgentProviderRunPreflightError: Error, CustomStringConvertible, Equatable {
     case missingSnapshot
     case disabled(String)

@@ -497,7 +497,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
     }
 
     public func models(provider: AgentProvider, instanceID: String) -> [AgentModelDescriptor] {
-        providers.first { $0.provider == provider && $0.id == instanceID }?.models ?? []
+        providers.resolvedSnapshot(provider: provider, instanceID: instanceID)?.models ?? []
     }
 
     private func reloadTasks() {
@@ -1565,6 +1565,8 @@ private struct ScheduledTaskEditorView: View {
             }
         }
         .background(DS.Palette.bg)
+        .onAppear { normalizeProviderInstance() }
+        .onChange(of: vm.providers.map(\.id)) { _ in normalizeProviderInstance() }
         .accessibilityIdentifier("scheduledTasks.editor")
     }
 
@@ -1577,6 +1579,12 @@ private struct ScheduledTaskEditorView: View {
             return draft.isEnabled ? "Not scheduled yet" : "Paused until enabled"
         }
         return next.formatted(.dateTime.month(.abbreviated).day().year().hour().minute())
+    }
+
+    private func normalizeProviderInstance() {
+        guard !vm.providers.contains(where: { $0.provider == draft.provider && $0.id == draft.providerInstanceID }),
+              let resolved = vm.providers.resolvedSnapshot(provider: draft.provider, instanceID: draft.providerInstanceID) else { return }
+        draft.providerInstanceID = resolved.id
     }
 
     private func editorGroup<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -1743,9 +1751,10 @@ private struct ScheduledTaskEditorView: View {
     private var editorModelPopover: some View {
         let models = vm.models(provider: draft.provider, instanceID: draft.providerInstanceID)
         let showsAutoRouting = draft.provider != .distill
-        let selectedSnapshot = vm.providers.first {
-            $0.provider == draft.provider && $0.id == draft.providerInstanceID
-        }
+        let selectedSnapshot = vm.providers.resolvedSnapshot(
+            provider: draft.provider,
+            instanceID: draft.providerInstanceID
+        )
         let mainEffortSelection = draft.distillMainEffortSelection ?? .fixed(draft.reasoningEffort)
         let reasoningEffortSelection = draft.distillReasoningEffortSelection ?? .automatic
         return AgentModelPopoverChrome(

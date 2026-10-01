@@ -15,6 +15,25 @@ final class ScheduledTasksWindowTests: XCTestCase {
         super.tearDown()
     }
 
+    func test_distillModelsResolveLegacyInstanceId_becauseSavedTasksMustKeepTheirConnectedAccount() {
+        let model = AgentModelDescriptor(id: "main", label: "Main", provider: .distill)
+        let snapshot = AgentProviderSnapshot(
+            id: "distill-acp", provider: .distill, driverKind: .distillACP,
+            displayName: "Distill", accentColor: "#6E56CF", continuationGroup: "distill",
+            interactionModes: [.default], enabled: true, installed: true, status: .available,
+            authenticated: true, models: [model], slashCommands: []
+        )
+        XCTAssertEqual([snapshot].resolvedSnapshot(provider: .distill, instanceID: "distill")?.models, [model])
+
+        let exact = AgentProviderSnapshot(
+            id: "distill", provider: .distill, driverKind: .distillACP,
+            displayName: "Exact", accentColor: "#6E56CF", continuationGroup: "distill",
+            interactionModes: [.default], enabled: false, installed: true, status: .available,
+            models: [], slashCommands: []
+        )
+        XCTAssertEqual([snapshot, exact].resolvedSnapshot(provider: .distill, instanceID: "distill")?.id, "distill")
+    }
+
     func test_editorBuildsFullTaskWithNextRun_becauseSavedSchedulesMustBeImmediatelyRunnable() throws {
         var draft = ScheduledTaskEditorDraft(now: Date(timeIntervalSince1970: 100))
         draft.title = "Audit"

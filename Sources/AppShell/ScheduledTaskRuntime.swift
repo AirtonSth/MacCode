@@ -136,8 +136,11 @@ public final class ScheduledTaskExecutor {
         _ task: ScheduledTask,
         onThreadCreated: ((AgentThreadID) throws -> Void)? = nil
     ) async throws -> (threadID: AgentThreadID, runID: AgentRunID) {
-        let task = Self.resolvingDistillDefaults(task)
+        var task = Self.resolvingDistillDefaults(task)
         let prepared = try await prepareExecution(task)
+        if task.effectiveRoutingMode != .auto, let snapshot = prepared.providerSnapshot {
+            task.providerInstanceID = snapshot.id
+        }
         try Self.rejectUIOnlySchedulePrompt(task.prompt)
         // Match AgentAppViewModel.send: $goal→/goal, /sam-work→$sam-work, /default body→body.
         let dispatchPrompt = Self.scheduleDispatchPrompt(
@@ -349,7 +352,7 @@ public final class ScheduledTaskExecutor {
             )
         }
 
-        let snapshot = snapshots.first { $0.id == task.providerInstanceID && $0.provider == task.provider }
+        let snapshot = snapshots.resolvedSnapshot(provider: task.provider, instanceID: task.providerInstanceID)
         do {
             try AgentProviderRunPreflight.validate(
                 snapshot: snapshot,
@@ -374,7 +377,7 @@ public final class ScheduledTaskExecutor {
         let binary = snapshot.binaryPath?.trimmingCharacters(in: .whitespacesAndNewlines)
         let baseBinary = binary?.isEmpty == false ? binary! : task.provider.rawValue
         let probeEnvironment = user.name == NSUserName()
-            ? router.providerEnvironment(provider: task.provider, instanceId: task.providerInstanceID)
+            ? router.providerEnvironment(provider: task.provider, instanceId: snapshot.id)
             : [:]
         let authenticated = await ProviderCLIProbe.runOffCooperativePool {
             ProviderCLIProbe.authStatus(
