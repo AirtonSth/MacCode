@@ -16377,9 +16377,6 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.hiddenLiveTurnItems")
     }
 
-    // IMP-MAC_AGENT-007: tappable starter prompts on an empty thread reduce
-    // blank-page friction and hint at what the agent can do. Copy is shared with iOS
-    // via AgentEmptyConversationStarters for parity.
     private var emptyConversation: some View {
         VStack(spacing: DS.Space.lg) {
             Image(systemName: "sparkles")
@@ -16394,45 +16391,12 @@ public struct AgentAppView: View {
                     .font(.system(size: 28, weight: .semibold))
                     .foregroundColor(DS.Palette.textSecondary)
                     .lineLimit(1)
-                Text("Start a new agent run, or pick a starter below.")
+                Text("Start a new agent run.")
                     .font(DS.Font.body)
                     .foregroundColor(DS.Palette.textTertiary)
                     .lineLimit(2)
                     .multilineTextAlignment(.center)
             }
-            VStack(spacing: DS.Space.sm) {
-                ForEach(AgentEmptyConversationStarters.all) { starter in
-                    Button {
-                        vm.prompt = starter.prompt
-                        vm.focusTick &+= 1
-                    } label: {
-                        HStack(spacing: DS.Space.sm) {
-                            Image(systemName: starter.icon)
-                                .font(.system(size: 12))
-                                .foregroundColor(DS.Palette.accent)
-                                .frame(width: 16)
-                            Text(starter.title)
-                                .font(DS.Font.body)
-                                .foregroundColor(DS.Palette.text)
-                            Spacer(minLength: 0)
-                            Image(systemName: "arrow.up.left")
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundColor(DS.Palette.textTertiary)
-                        }
-                        .padding(.horizontal, DS.Space.md)
-                        .padding(.vertical, DS.Space.sm)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(DS.Palette.surfaceRaised)
-                        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-                    }
-                    .buttonStyle(.plain)
-                    .help("Insert this starter prompt into the composer")
-                    .accessibilityIdentifier("agent.starter.\(starter.title)")
-                }
-            }
-            .frame(maxWidth: 420)
             if let accountPanel {
                 accountPanel.frame(maxWidth: 420)
             }

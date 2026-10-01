@@ -1076,11 +1076,6 @@ final class AgentChatUXPresentationTests: XCTestCase {
         XCTAssertTrue(subtitle.contains("…"), "long models truncate for rail density")
     }
 
-    func test_emptyStarters_alignedCount() {
-        XCTAssertEqual(AgentEmptyConversationStarters.all.count, 4)
-        XCTAssertFalse(AgentEmptyConversationStarters.all[0].prompt.isEmpty)
-    }
-
     func test_threadRailCopy_headerSearchAndClearAll_matchAgentAppChrome() throws {
         // WHY: dest and Agent App must share one rail chrome. Header,
         // search match, and Clear All visibility cannot drift per surface.
