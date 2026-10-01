@@ -547,7 +547,7 @@ final class PetAttentionStoreTests: XCTestCase {
         )
     }
 
-    func test_markAllRead_marksOnlyProjectedOutcomesAndNeverTouchesCallbacks() throws {
+    func test_markAllRead_clearsEveryRowExceptLivePendingCallbacks_becauseMarkAllViewedMustEmptyReadyForYou() throws {
         let fixture = try fixture()
         let workspaceID = WorkspaceID(UUID())
         let thread = thread(
@@ -596,7 +596,7 @@ final class PetAttentionStoreTests: XCTestCase {
             category: PetNotificationCategory.sshUnexpectedDisconnect.rawValue
         ))
 
-        XCTAssertEqual(try fixture.store.markAllRead(), 3)
+        XCTAssertEqual(try fixture.store.markAllRead(), 5)
         XCTAssertFalse(try XCTUnwrap(fixture.threads.get(id: thread.id)).hasUnread)
         XCTAssertEqual(
             try fixture.callbacks.get(
@@ -609,20 +609,23 @@ final class PetAttentionStoreTests: XCTestCase {
         )
         XCTAssertEqual(
             Set(try fixture.notifications.list(unreadOnly: true).map(\.id)),
-            Set(["ordinary", "file-blocker", "listener-blocker"]),
-            "Bulk viewing dismisses SSH disconnect notices and keeps live decision blockers."
+            Set(["ordinary"]),
+            "Bulk viewing dismisses every projected notification; only unprojected categories stay unread."
         )
-        XCTAssertEqual(try fixture.store.refresh().items.map(\.classification), [
-            .needsYou, .needsYou, .needsYou,
-        ])
+        let remaining = try fixture.store.refresh().items
+        XCTAssertEqual(remaining.map(\.classification), [.needsYou])
+        XCTAssertEqual(remaining.first?.source, .callback(
+            threadID: thread.id,
+            requestID: "approval-bulk",
+            kind: .approval
+        ))
     }
 
-    func test_markAllRead_clearsDestFailedRunAndSSHDisconnectWithoutResolvingQuestions() throws {
-        // WHY: Ready for you showed "Agent run failed" (Bots) and
-        // "SSH connection needs attention" as Needs you. Mark all viewed
-        // left both rows because dest blocked mapped to a callback and SSH
-        // disconnect was treated as a live blocker. Viewing must dismiss
-        // those outcomes and still leave dest questions.
+    func test_markAllRead_clearsDestFailedRunSSHDisconnectAndDestQuestions() throws {
+        // WHY: the user's Ready for you kept weeks-old bot "Input requested"
+        // rows after Mark all viewed. Bot inbox rows are only markers (the
+        // question stays answerable in Bots desk chat), so bulk read must
+        // acknowledge them along with failed runs and SSH disconnects.
         let db = try SQLiteDB(path: ":memory:")
         try Schema.migrate(db)
         let bots = BotStore(db: db)
@@ -696,14 +699,72 @@ final class PetAttentionStoreTests: XCTestCase {
             ["Agent run failed", "SSH connection needs attention", "Input requested"]
         )
 
-        XCTAssertEqual(try store.markAllRead(), 2)
+        XCTAssertEqual(try store.markAllRead(), 3)
 
-        let after = try store.refresh().items
-        XCTAssertEqual(after.map(\.title), ["Input requested"])
-        XCTAssertEqual(after.first?.classification, .needsYou)
+        XCTAssertTrue(try store.refresh().items.isEmpty)
         XCTAssertEqual(try XCTUnwrap(bots.conversation(id: conversation.id)).attentionState, .none)
         XCTAssertTrue(try notifications.list(unreadOnly: true).isEmpty)
-        XCTAssertEqual(try bots.listAttention().count, 1)
+        XCTAssertTrue(try bots.listAttention().isEmpty)
+        let attention = try bots.listAttention(includeAcknowledged: true)
+        XCTAssertEqual(attention.count, 2)
+        XCTAssertTrue(attention.allSatisfy { $0.acknowledgedAt != nil })
+    }
+
+    func test_markAllRead_acknowledgesStaleCallbacksWhilePendingStayPending() throws {
+        // WHY: an expired callback has nothing left to answer and must not
+        // pin Ready for you, but a live one still blocks a running agent.
+        let fixture = try fixture()
+        let workspaceID = WorkspaceID(UUID())
+        let staleThread = thread(
+            id: "77777777-7777-7777-7777-777777777777",
+            workspaceID: workspaceID,
+            status: .failed,
+            updatedAt: 100
+        )
+        let liveThread = thread(
+            id: "88888888-8888-8888-8888-888888888888",
+            workspaceID: workspaceID,
+            status: .failed,
+            updatedAt: 101
+        )
+        try fixture.threads.upsert(staleThread)
+        try fixture.threads.upsert(liveThread)
+        for (threadID, requestID) in [(staleThread.id, "approval-stale"), (liveThread.id, "approval-live")] {
+            try fixture.callbacks.record(
+                threadId: threadID,
+                request: AssistantPendingRequest(
+                    id: requestID,
+                    turnId: nil,
+                    kind: .fileChange,
+                    title: "Apply patch",
+                    createdAtMs: 100_000
+                )
+            )
+        }
+        try fixture.callbacks.markStale(
+            threadId: staleThread.id,
+            requestId: "approval-stale",
+            kind: .approval,
+            reason: "provider session ended"
+        )
+
+        XCTAssertGreaterThanOrEqual(try fixture.store.markAllRead(), 1)
+
+        XCTAssertEqual(
+            try fixture.callbacks.get(threadId: staleThread.id, requestId: "approval-stale", kind: .approval)?.state,
+            .acknowledged
+        )
+        XCTAssertEqual(
+            try fixture.callbacks.get(threadId: liveThread.id, requestId: "approval-live", kind: .approval)?.state,
+            .pending
+        )
+        let remaining = try fixture.store.refresh().items
+        XCTAssertEqual(remaining.count, 1)
+        XCTAssertEqual(remaining.first?.source, .callback(
+            threadID: liveThread.id,
+            requestID: "approval-live",
+            kind: .approval
+        ))
     }
 
     func test_terminalRecorder_usesDeterministicIDsFixedCopyAndIdempotentPersistence() throws {

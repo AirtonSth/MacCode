@@ -92,25 +92,14 @@ public enum PetAttentionItemKind: Sendable, Equatable {
         }
     }
 
-    /// Mark all viewed may dismiss these. Live decisions (approvals, questions,
-    /// file conflicts, listener failures, dest input) stay until resolved.
+    /// Mark all viewed dismisses every row except live provider approvals/questions,
+    /// which only an answer resolves.
     public var isBulkViewable: Bool {
         switch self {
-        case .callback:
-            return false
-        case .agentOutcome:
+        case .callback(_, let isStale):
+            return isStale
+        case .agentOutcome, .notification:
             return true
-        case .notification(let category):
-            switch category {
-            case .fileConflict, .serverListenerFailed, .notificationsDenied, .agentAttention:
-                return false
-            case .sshUnexpectedDisconnect,
-                 .gitCompleted, .gitFailed,
-                 .projectScriptCompleted, .projectScriptFailed,
-                 .sshTransferCompleted, .sshTransferFailed,
-                 .providerUpdateFailed:
-                return true
-            }
         }
     }
 }

@@ -130,8 +130,8 @@ public final class PetAttentionStore {
         }
     }
 
-    /// Marks projected viewable rows read. It deliberately never calls any
-    /// callback-repository mutation, so approvals/questions cannot be bulk-resolved.
+    /// Clears every projected row. Stale provider callbacks are acknowledged; a live
+    /// (pending) provider callback is never resolved here.
     @discardableResult
     public func markAllRead() throws -> Int {
         var marked = 0
@@ -146,17 +146,26 @@ public final class PetAttentionStore {
             marked += 1
         }
         if let dest = try destLookup?() {
-            for item in Self.projectDest(dest) where item.kind.isBulkViewable {
+            for item in Self.projectDest(dest) {
                 if case .bot(_, let conversationID, let attentionItemID) = item.source {
                     if let conversationID {
                         try markBotConversationViewed?(conversationID)
-                        marked += 1
                     }
                     if let attentionItemID {
                         try acknowledgeBotAttention?(attentionItemID)
                     }
+                    marked += 1
                 }
             }
+        }
+        for callback in try callbackRepository.list(states: [.stale]) {
+            try callbackRepository.resolve(
+                threadId: callback.threadId,
+                requestId: callback.requestId,
+                kind: callback.kind,
+                state: .acknowledged
+            )
+            marked += 1
         }
         return marked
     }
