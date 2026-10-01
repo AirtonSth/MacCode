@@ -51,6 +51,7 @@ public enum DistillProvisioner {
 
     /// The installer is a POSIX shell pipeline, so it runs through `/bin/sh -c`.
     public static let installerShellPath = "/bin/sh"
+    public static let installTimeoutSeconds: TimeInterval = 600
 
     public static func installPlan() -> DistillInstallPlan {
         let commandLine = "curl -fsSL \(installScriptURL) | sh"
@@ -161,16 +162,15 @@ public enum DistillProvisioner {
 
     /// Default runner: the real installer process.
     public static let runInstallerProcess: (DistillInstallPlan) throws -> Int32 = { plan in
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: plan.shellPath)
-        process.arguments = plan.shellArguments
-        process.standardInput = FileHandle.nullDevice
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        try process.run()
-        _ = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return process.terminationStatus
+        runInstaller(plan, timeoutSeconds: installTimeoutSeconds)
+    }
+
+    static func runInstaller(_ plan: DistillInstallPlan, timeoutSeconds: TimeInterval) -> Int32 {
+        ProviderCLIProbe.run(
+            binaryPath: plan.shellPath,
+            arguments: plan.shellArguments,
+            environment: ProcessInfo.processInfo.environment,
+            timeoutSeconds: timeoutSeconds
+        )?.status ?? -1
     }
 }

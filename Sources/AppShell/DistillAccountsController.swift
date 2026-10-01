@@ -12,8 +12,18 @@ protocol DistillAccountManaging: Sendable {
 
 extension DistillAccounts: DistillAccountManaging {}
 
+private enum DistillInstallResult: Sendable {
+    case success(String)
+    case failure(String)
+}
+
+public enum DistillInstallState: Equatable {
+    case unknown, installed, installing, failed(String)
+}
+
 @MainActor
 public final class DistillAccountsController: ObservableObject {
+    @Published public private(set) var installState: DistillInstallState = .unknown
     @Published public private(set) var statuses: [DistillAccountStatus]
     @Published public private(set) var busyProvider: DistillAccountProvider?
     @Published public private(set) var lastError: String?
@@ -21,16 +31,63 @@ public final class DistillAccountsController: ObservableObject {
 
     private let accounts: any DistillAccountManaging
     private let didChange: (DistillAccountProvider?, Bool) async -> Void
+    private let installer: () throws -> String
+    private let resolveBinary: () -> String?
     private var operation: Task<Void, Never>?
     private var generation: UInt64 = 0
+    private var installGeneration: UInt64 = 0
 
-    init(accounts: any DistillAccountManaging, didChange: @escaping (DistillAccountProvider?, Bool) async -> Void = { _, _ in }) {
+    init(
+        accounts: any DistillAccountManaging,
+        configuredDistillPathOverride: String? = nil,
+        installer: (() throws -> String)? = nil,
+        resolveBinary: (() -> String?)? = nil,
+        didChange: @escaping (DistillAccountProvider?, Bool) async -> Void = { _, _ in }
+    ) {
         self.accounts = accounts
+        self.installer = installer ?? {
+            try DistillProvisioner.ensureInstalled(override: configuredDistillPathOverride).binaryPath
+        }
+        self.resolveBinary = resolveBinary ?? {
+            DistillProvisioner.resolveInstalledBinary(override: configuredDistillPathOverride)
+        }
         self.didChange = didChange
         self.statuses = accounts.statuses()
     }
 
     public func refresh() { statuses = accounts.statuses() }
+
+    public func ensureDistillInstalled() {
+        guard installState != .installing else { return }
+        if resolveBinary() != nil {
+            installState = .installed
+            return
+        }
+        installGeneration &+= 1
+        let token = installGeneration
+        installState = .installing
+        let installer = self.installer
+        Task { [weak self] in
+            let result: DistillInstallResult = await ProviderCLIProbe.runOffCooperativePool {
+                do { return .success(try installer()) }
+                catch { return .failure(String(describing: error)) }
+            }
+            guard let self, self.installGeneration == token else { return }
+            switch result {
+            case .success:
+                installState = .installed
+                await didChange(nil, true)
+                refresh()
+            case .failure(let error):
+                installState = .failed("Could not install Distill: \(error). Run in Terminal: \(DistillProvisioner.installPlan().commandLine)")
+            }
+        }
+    }
+
+    public func retryDistillInstall() {
+        if case .failed = installState { installState = .unknown }
+        ensureDistillInstalled()
+    }
     public func dismissError() { lastError = nil }
 
     public func login(_ provider: DistillAccountProvider) {

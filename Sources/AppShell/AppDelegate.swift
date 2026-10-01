@@ -238,6 +238,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // past the first frame; see runDeferredStartup().
         router = AppCommandRouter(context: context)
         context.router = router
+        context.distillAccountsController.ensureDistillInstalled()
 
         // Wire EventBus to the persisted event log so events survive restart.
         // Encoding + SQLite run on AppContext's serial writer queue; publish

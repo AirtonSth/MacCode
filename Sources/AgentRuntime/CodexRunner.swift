@@ -178,6 +178,8 @@ public enum ProcessLocator {
             .map(String.init)
         paths.insert("\(homeDirectory)/.remote-code/bin", at: 0)
         paths.append(contentsOf: [
+            // Official Distill install.sh target; GUI apps never have it on PATH.
+            "\(homeDirectory)/.local/share/distill/bin",
             "\(homeDirectory)/.grok/bin",
             "/opt/homebrew/bin",
             "/usr/local/bin",

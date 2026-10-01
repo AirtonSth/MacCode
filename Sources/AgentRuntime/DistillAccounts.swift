@@ -186,7 +186,10 @@ public final class DistillAccounts: Sendable {
         if Task.isCancelled { throw DistillAccountError.cancelled }
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: binaryPath)
+        let executablePath = FileManager.default.isExecutableFile(atPath: binaryPath)
+            ? binaryPath
+            : DistillProvisioner.resolveInstalledBinary(override: nil, environmentPath: environment["PATH"]) ?? binaryPath
+        process.executableURL = URL(fileURLWithPath: executablePath)
         process.arguments = arguments
         var env = environment
         env["DISTILL_HOME"] = home.path

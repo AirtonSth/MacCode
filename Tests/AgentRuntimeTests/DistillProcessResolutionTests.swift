@@ -173,3 +173,34 @@ final class DistillProcessResolutionTests: ProviderProcessTestCase {
         XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "yes")
     }
 }
+
+final class DistillProvisionerBoundedInstallerTests: XCTestCase {
+    func test_officialInstallLayoutResolvesWithoutShellPath_becauseTheGUIAppMustFindAFreshAutoInstall() throws {
+        // WHY: install.sh puts the binary in ~/.local/share/distill/bin, which a GUI app's PATH never contains.
+        // After an auto-install RemoteCode must still find it, or every run keeps failing as "not installed".
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("distill-layout-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let bin = home.appendingPathComponent(".local/share/distill/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let binary = bin.appendingPathComponent("distill")
+        try "#!/bin/sh\nexit 0\n".write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+
+        XCTAssertNil(DistillProvisioner.resolveInstalledBinary(environmentPath: "/usr/bin:/bin", homeDirectory: home.path + "-missing"))
+        let resolved = try XCTUnwrap(DistillProvisioner.resolveInstalledBinary(environmentPath: "/usr/bin:/bin", homeDirectory: home.path))
+        XCTAssertEqual(URL(fileURLWithPath: resolved).resolvingSymlinksInPath().path, binary.resolvingSymlinksInPath().path)
+    }
+
+    func test_installerRunnerIsBounded_becauseAHungInstallerMustNotParkTheAppForever() {
+        let plan = DistillInstallPlan(shellPath: "/bin/sh", shellArguments: ["-c", "sleep 30"], commandLine: "sleep 30")
+        let start = Date()
+        let status = DistillProvisioner.runInstaller(plan, timeoutSeconds: 1)
+        XCTAssertNotEqual(status, 0)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 10)
+    }
+
+    func test_installerRunnerReturnsSuccessForSuccessfulInstaller() {
+        let plan = DistillInstallPlan(shellPath: "/bin/sh", shellArguments: ["-c", "exit 0"], commandLine: "exit 0")
+        XCTAssertEqual(DistillProvisioner.runInstaller(plan, timeoutSeconds: 5), 0)
+    }
+}

@@ -378,7 +378,7 @@ public final class AppContext {
             environment: environment,
             openURL: { url in NSWorkspace.shared.open(url) }
         )
-        return DistillAccountsController(accounts: accounts) { [weak self] _, succeeded in
+        return DistillAccountsController(accounts: accounts, configuredDistillPathOverride: configured ?? nil) { [weak self] _, succeeded in
             guard let self else { return }
             if succeeded { await self.router?.refreshDistillProviderCatalog() }
         }

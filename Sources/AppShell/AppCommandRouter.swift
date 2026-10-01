@@ -21,13 +21,22 @@ private struct DistillAccountsPanelHost: View {
                 statuses: controller.statuses,
                 busyProvider: controller.busyProvider,
                 signInURL: controller.signInURL,
-                lastError: controller.lastError
+                lastError: controller.lastError,
+                installState: {
+                    switch controller.installState {
+                    case .unknown: return .unknown
+                    case .installed: return .installed
+                    case .installing: return .installing
+                    case .failed(let message): return .failed(message)
+                    }
+                }()
             ),
             login: controller.login,
             logout: controller.logout,
             cancel: controller.cancel,
             openAgain: { NSWorkspace.shared.open($0) },
-            dismissError: controller.dismissError
+            dismissError: controller.dismissError,
+            retryInstall: controller.retryDistillInstall
         )
         .onAppear { controller.refresh() }
     }
