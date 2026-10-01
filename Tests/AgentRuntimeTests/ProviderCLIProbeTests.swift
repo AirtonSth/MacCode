@@ -44,6 +44,23 @@ final class ProviderCLIProbeTests: XCTestCase {
                        "provider snapshots must probe Codex auth with instance-scoped CODEX_HOME so personal/work accounts do not collapse into one status")
     }
 
+    func test_distillAuthStatusReadsConnectedAccounts_becauseSchedulesMustNotRejectASignedInDistill() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let distillHome = home.appendingPathComponent(".distill", isDirectory: true)
+        try FileManager.default.createDirectory(at: distillHome, withIntermediateDirectories: true)
+        try #"{"access_token":"x","email":"a@b.c"}"#.write(
+            to: distillHome.appendingPathComponent("claude-auth.json"), atomically: true, encoding: .utf8)
+        let authenticated = ProviderCLIProbe.authStatus(
+            provider: .distill, binaryPath: "/usr/bin/true", environment: ["DISTILL_HOME": distillHome.path], runAsUser: nil)
+        XCTAssertEqual(authenticated.authenticated, true)
+        XCTAssertEqual(authenticated.accountLabel, "a@b.c")
+
+        let empty = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        XCTAssertEqual(ProviderCLIProbe.authStatus(
+            provider: .distill, binaryPath: "/usr/bin/true", environment: ["DISTILL_HOME": empty.path], runAsUser: nil).authenticated, false)
+    }
+
     func test_claudeAuthProbeReadsJsonStatus() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

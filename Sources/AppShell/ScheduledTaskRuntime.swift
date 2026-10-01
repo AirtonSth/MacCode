@@ -387,7 +387,7 @@ public final class ScheduledTaskExecutor {
                 runAsUser: runAsForProbe
             ).authenticated
         }
-        guard authenticated == true else {
+        guard authenticated == true || (task.provider == .distill && user.name != NSUserName() && authenticated == nil) else {
             throw ScheduledTaskPreflightError.providerUnavailable(
                 "The selected provider is unavailable for system user \(user.name). Sign in as that user and retry."
             )
@@ -513,7 +513,7 @@ public final class ScheduledTaskExecutor {
                     runAsUser: runAsForProbe
                 ).authenticated
             }
-            guard authenticated == true else {
+            guard authenticated == true || (snapshot.provider == .distill && user.name != NSUserName() && authenticated == nil) else {
                 throw ScheduledTaskPreflightError.providerUnavailable(
                     "The selected provider is unavailable for system user \(user.name). Sign in as that user and retry."
                 )

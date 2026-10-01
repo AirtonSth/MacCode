@@ -115,13 +115,17 @@ public final class DistillAccounts: Sendable {
     // MARK: Status
 
     public func statuses() -> [DistillAccountStatus] {
+        Self.connectedAccounts(home: home)
+    }
+
+    public static func connectedAccounts(home: URL) -> [DistillAccountStatus] {
         DistillAccountProvider.allCases.map { provider in
-            let account = accountDetails(provider)
+            let account = accountDetails(provider, home: home)
             return DistillAccountStatus(provider: provider, connected: account.connected, email: account.email)
         }
     }
 
-    private func accountDetails(_ provider: DistillAccountProvider) -> (connected: Bool, email: String?) {
+    private static func accountDetails(_ provider: DistillAccountProvider, home: URL) -> (connected: Bool, email: String?) {
         let url = home.appendingPathComponent(provider.credentialFileName)
         guard let data = try? Data(contentsOf: url),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]

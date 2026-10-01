@@ -11,6 +11,18 @@ import Surfaces
 
 @MainActor
 final class BotsWindowTests: XCTestCase {
+    func test_botScheduleLegacyDistillInstanceResolvesModelsFromDistillACPSnapshot() {
+        let snapshot = AgentProviderSnapshot(
+            id: "distill-acp", provider: .distill, driverKind: .distillACP,
+            displayName: "Distill", accentColor: "", continuationGroup: "distill",
+            interactionModes: [.default], permissionModes: nil, enabled: true, installed: true,
+            status: .available, models: [], slashCommands: [])
+        XCTAssertEqual(
+            BotScheduleSpecEditor.models(providers: [snapshot], provider: .distill, instanceID: "distill"),
+            snapshot.models,
+            "legacy bot schedules must resolve their provider's active instance instead of losing its model list")
+    }
+
     // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
     override class func setUp() {
         super.setUp()

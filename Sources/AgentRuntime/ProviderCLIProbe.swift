@@ -200,7 +200,27 @@ public enum ProviderCLIProbe {
             // "You are logged in with …" when authenticated.
             arguments = ["models"]
         case .distill:
-            return AuthStatus(authenticated: nil, accountLabel: nil, accountAuthMethod: nil)
+            let processEnvironment = ProcessInfo.processInfo.environment
+            // Foreign users use their own home; only the app owner inherits process DISTILL_HOME.
+            var distillEnvironment = environment
+            if runAsUser == nil, distillEnvironment["DISTILL_HOME"] == nil {
+                distillEnvironment["DISTILL_HOME"] = processEnvironment["DISTILL_HOME"]
+            }
+            let home = DistillProvisioner.homeURL(
+                environment: distillEnvironment,
+                userHome: runAsUser?.homePath ?? FileManager.default.homeDirectoryForCurrentUser.path
+            )
+            if let runAsUser, !runAsUser.isCurrentAccount,
+               !FileManager.default.isReadableFile(atPath: home.path) {
+                return AuthStatus(authenticated: nil, accountLabel: nil, accountAuthMethod: nil)
+            }
+            let connected = DistillAccounts.connectedAccounts(home: home).filter(\.connected)
+            let first = connected.first
+            return AuthStatus(
+                authenticated: first != nil,
+                accountLabel: first.map { $0.email ?? $0.provider.displayName },
+                accountAuthMethod: nil
+            )
         }
         guard let result = run(
             binaryPath: binaryPath,

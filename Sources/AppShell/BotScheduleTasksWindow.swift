@@ -488,13 +488,23 @@ struct BotScheduleSpecEditor: View {
                 }
             }
         }
+        .onAppear { normalizeProviderInstance() }
+        .onChange(of: providers.map(\.id)) { _ in normalizeProviderInstance() }
         .accessibilityIdentifier("bots.scheduleTasks.editor.spec")
     }
 
+    static func models(providers: [AgentProviderSnapshot], provider: AgentProvider, instanceID: String) -> [AgentModelDescriptor] {
+        providers.resolvedSnapshot(provider: provider, instanceID: instanceID)?.models ?? []
+    }
+
     private var models: [AgentModelDescriptor] {
-        providers.first { $0.provider == spec.provider && $0.id == spec.providerInstanceID }?.models
-            ?? snapshots(for: spec.provider).first?.models
-            ?? []
+        Self.models(providers: providers, provider: spec.provider, instanceID: spec.providerInstanceID)
+    }
+
+    private func normalizeProviderInstance() {
+        guard !providers.contains(where: { $0.provider == spec.provider && $0.id == spec.providerInstanceID }),
+              let resolved = providers.resolvedSnapshot(provider: spec.provider, instanceID: spec.providerInstanceID) else { return }
+        spec.providerInstanceID = resolved.id
     }
 
     private func snapshots(for provider: AgentProvider) -> [AgentProviderSnapshot] {
@@ -513,9 +523,7 @@ struct BotScheduleSpecEditor: View {
     private var specSourceCapsule: some View {
         AgentSourceCapsule(
             label: AgentSourceCapsulePresentation.capsuleLabel(
-                selected: providers.first(where: {
-                    $0.id == spec.providerInstanceID && $0.provider == spec.provider
-                }) ?? snapshots(for: spec.provider).first,
+                selected: providers.resolvedSnapshot(provider: spec.provider, instanceID: spec.providerInstanceID),
                 fallbackProvider: spec.provider,
                 fallbackInstanceId: spec.providerInstanceID,
                 snapshots: providers
@@ -544,9 +552,7 @@ struct BotScheduleSpecEditor: View {
 
     private var specModelPopover: some View {
         let showsAutoRouting = spec.provider != .distill
-        let snapshot = providers.first {
-            $0.provider == spec.provider && $0.id == spec.providerInstanceID
-        } ?? snapshots(for: spec.provider).first
+        let snapshot = providers.resolvedSnapshot(provider: spec.provider, instanceID: spec.providerInstanceID)
         let mainEffortSelection = spec.distillMainEffortSelection ?? .fixed(spec.reasoningEffort)
         let reasoningEffortSelection = spec.distillReasoningEffortSelection ?? .automatic
         return AgentModelPopoverChrome(
