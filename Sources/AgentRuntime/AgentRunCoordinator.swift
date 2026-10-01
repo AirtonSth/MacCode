@@ -2058,7 +2058,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let selectedSelector = tokenSaverOutboundSelector
         let selectedDelivery = onTokenSaverOutboundDelivery
         let attemptId = request.runId.value.uuidString
-        if let selectedSelector {
+        if request.provider == .distill {
+            // Distill receives the human prompt unchanged; keep bot directives in its client.
+            outboundPrompt = request.prompt
+        } else if let selectedSelector {
             // Typed path: Auto already bound provider/model. Stamp the scoped
             // env with this attempt before selection, then project by format.
             let scopedEnvironment = await runEnvironmentProvider?(
@@ -2708,10 +2711,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // so Auto always enters $remote-code-orchestrate with the host receipt
             // the app already admitted (provider/model) — skill must not re-guess.
             let displayPrompt = request.userMessageContent ?? request.prompt
-            let orchestratedPrompt = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(
-                userPrompt: request.prompt,
-                admittedRoute: admission.route
-            )
+            let orchestratedPrompt = admission.route.provider == .distill
+                ? request.prompt
+                : AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(
+                    userPrompt: request.prompt,
+                    admittedRoute: admission.route
+                )
             return (AgentRunRequest(
                 runId: request.runId,
                 threadId: request.threadId,

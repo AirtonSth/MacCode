@@ -1186,6 +1186,7 @@ public final class AppContext {
         try? tokenSaverSavingsRepo.prune()
         self.coordinator.promptCompressor = { [weak self] prompt, provider, threadId, runId in
             guard let self else { return prompt }
+            guard provider != .distill else { return prompt }
             // task-08: cross-user raw-only before any SessionLearn/compress work.
             let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
             guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .initial) else {
@@ -1198,6 +1199,7 @@ public final class AppContext {
         }
         self.coordinator.followUpPromptCompressor = { [weak self] prompt, provider, threadId, runId in
             guard let self else { return prompt }
+            guard provider != .distill else { return prompt }
             let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
             guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .followUp) else {
                 return prompt

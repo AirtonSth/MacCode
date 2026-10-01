@@ -48,15 +48,17 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         runtime: AgentOrchestrationRuntime,
         eligibleProviders: [AgentProvider] = [.codex]
     ) -> AgentRoutingConfiguration {
-        AgentRoutingConfiguration(
+        let manualProvider = eligibleProviders.first ?? .codex
+        let manualModel = manualProvider == .distill ? "grok-4.6" : "gpt-5.6-sol"
+        return AgentRoutingConfiguration(
             mode: .auto,
             manualSelection: AgentModelSelection(
-                provider: .codex,
-                modelId: "gpt-5.6-sol",
+                provider: manualProvider,
+                modelId: manualModel,
                 reasoningEffort: .medium,
                 serviceTier: .fast
             ),
-            manualProviderInstanceId: "codex-live",
+            manualProviderInstanceId: manualProvider == .distill ? "distill-live" : "codex-live",
             eligibleProviders: eligibleProviders,
             policyDigest: runtime.policyDigest,
             revision: 1
@@ -201,6 +203,71 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         XCTAssertEqual(receipt.threadId, thread.id)
         XCTAssertEqual(receipt.provider, .codex)
         XCTAssertEqual(receipt.model, "gpt-5.6-luna")
+    }
+
+    func testAutoRoutingToDistillKeepsOriginalPromptAndSkipsPromptTransforms() async throws {
+        // WHY: Distill must receive native mode handling plus the human request, not
+        // Token Saver compression, wire framing, or the Auto controller wrapper.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let receiptRepo = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: receiptRepo,
+            packageVerification: { true },
+            killSwitch: { false },
+            costEstimator: { _, usage in usage?.totalTokens }
+        )
+        let thread = AgentThread(
+            title: "auto distill",
+            provider: .claude,
+            model: "claude-manual",
+            routingConfiguration: autoConfiguration(runtime: runtime, eligibleProviders: [.distill])
+        )
+        try threadRepo.upsert(thread)
+        let distill = RecordingProviderRunner(provider: .distill)
+        let snapshot = liveSnapshot(
+            provider: .distill,
+            model: "grok-4.6",
+            capabilities: AgentProviderCapabilities(supportsStreaming: true, supportsPlanReview: true)
+        )
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            orchestrationRuntime: runtime,
+            providerSnapshotSupplier: { [snapshot] in [snapshot] },
+            providers: [.distill: distill]
+        )
+        let original = "Keep exact user wording; do not wrap this request."
+        coordinator.promptCompressor = { prompt, _, _, _ in
+            XCTFail("Distill must bypass prompt compression")
+            return "COMPRESSED::\(prompt)"
+        }
+        coordinator.tokenSaverOutboundSelector = { _ in
+            XCTFail("Distill must bypass outbound Token Saver selection")
+            fatalError("unreachable")
+        }
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .claude,
+            providerInstanceId: "claude-manual",
+            model: "claude-manual",
+            cwd: root,
+            prompt: original,
+            userMessageContent: original,
+            interactionMode: .default
+        ))
+
+        let dispatched = try XCTUnwrap(distill.lastRequest)
+        XCTAssertEqual(dispatched.provider, .distill)
+        XCTAssertEqual(dispatched.prompt, original)
+        XCTAssertEqual(dispatched.userMessageContent, original)
+        XCTAssertEqual(dispatched.interactionMode, .default)
+        XCTAssertFalse(AgentOrchestrationRuntime.promptAlreadyInvokesOrchestrateSkill(dispatched.prompt))
     }
 
     func testAutoRoutingExposesAdmittedProviderAndModelToTokenSaverSelector() async throws {

@@ -1201,7 +1201,8 @@ public final class DistillACPClient: @unchecked Sendable {
 
     public static func promptBlocks(for request: AgentRunRequest, capabilities: DistillACPInitializeResult) throws -> [JSONObject] {
         var blocks: [JSONObject] = []
-        let providerPrompt = request.providerPrompt
+        // Distill owns mode semantics natively; send human text without generic provider prose.
+        let providerPrompt = request.prompt
         // Additive: background-await self-declare marker so shell-detached
         // orchestration stalls reach the host's [[RC_AWAITING]] recovery path.
         // systemPromptDirective only — NOT alwaysOnClaudeDirectives (MCP rules

@@ -56,6 +56,79 @@ final class DistillACPClientSessionParamsTests: XCTestCase {
         XCTAssertNil(params["_meta"])
     }
 
+    func test_promptBlocks_keepOriginalPromptAndEssentialBotDirectives_withoutGenericModeOrTokenSaverText() throws {
+        let original = "Original user request with exact wording."
+        let botContext = "RemoteCode-resolved Bot identities for this exact turn: @quinn"
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .distill,
+            model: "grok-4.6",
+            cwd: "/tmp",
+            prompt: original,
+            interactionMode: .plan,
+            environment: [
+                BotPeerDelegation.turnContextEnvironmentKey: botContext,
+                "RC_TOKEN_SAVER_ENABLED": "1",
+                "RC_AUTO_ENABLED": "1"
+            ]
+        )
+        let capabilities = DistillACPInitializeResult(
+            protocolVersion: 1,
+            loadSession: true,
+            embeddedContext: false
+        )
+
+        let blocks = try DistillACPClient.promptBlocks(for: request, capabilities: capabilities)
+        let text = try XCTUnwrap(blocks.first?["text"] as? String)
+
+        XCTAssertTrue(text.contains(original))
+        XCTAssertTrue(text.contains(botContext))
+        XCTAssertTrue(text.contains(BackgroundAwaitContinuation.awaitingMarker))
+        XCTAssertTrue(text.contains(BotPeerDelegation.providerDirective))
+        XCTAssertFalse(text.contains("Default mode."))
+        XCTAssertFalse(text.contains("Plan mode."))
+        XCTAssertFalse(text.contains("Auto is on."))
+        XCTAssertFalse(text.contains("Token Saver"))
+    }
+
+    func test_otherProviderStillUsesGenericModePrompt() {
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .claude,
+            model: "claude",
+            cwd: "/tmp",
+            prompt: "Original"
+        )
+
+        XCTAssertTrue(request.providerPrompt.contains("Default mode."))
+        XCTAssertTrue(request.providerPrompt.contains("User request:\nOriginal"))
+    }
+
+    func test_distillPromptBlocks_preserveAttachmentBlocks() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("distill-prompt-\(UUID().uuidString).txt")
+        try Data("attachment body".utf8).write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .distill,
+            model: "grok-4.6",
+            cwd: "/tmp",
+            prompt: "Keep this prompt",
+            attachments: [AgentAttachment(path: fileURL.path, kind: .file)]
+        )
+        let capabilities = DistillACPInitializeResult(
+            protocolVersion: 1,
+            loadSession: true,
+            embeddedContext: true
+        )
+
+        let blocks = try DistillACPClient.promptBlocks(for: request, capabilities: capabilities)
+
+        XCTAssertEqual(blocks.count, 2)
+        XCTAssertEqual(blocks[1]["type"] as? String, "resource")
+    }
+
     func test_distillHomePrecedence_instanceThenEnvThenDotDistill() {
         // WHY: an explicit instance home must win over the app env, and ~/.grok must never be adopted.
         XCTAssertEqual(
