@@ -1447,6 +1447,38 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertFalse(vm.isLegacyProviderThread)
     }
 
+    func test_newThreadFromLegacyThreadWithHistoryCreatesDistillThread_becausePlusMustWorkOnReadOnlyThreads() throws {
+        AgentProvider.selectableForTesting = nil
+        defer { AgentProvider.selectableForTesting = AgentProvider.allCases }
+        let tmp = NSTemporaryDirectory() + "rc2-vm-legacy-provider-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let workspaceID = WorkspaceID()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo, providers: [:])
+        let legacy = AgentThread(workspaceId: workspaceID, title: "old grok chat", provider: .grok, model: "grok-4")
+        try threadRepo.upsert(legacy)
+        try messageRepo.append(AgentMessage(threadId: legacy.id, role: .user, content: "old message"))
+        let vm = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp, coordinator: coordinator,
+                                   threadRepo: threadRepo, messageRepo: messageRepo,
+                                   promptHistoryStore: PromptHistoryStore(db: db), initialThreadId: legacy.id)
+
+        XCTAssertEqual(vm.selectedThreadId, legacy.id)
+        vm.selectThread(legacy.id)
+        vm.messages = try messageRepo.list(threadId: legacy.id)
+        XCTAssertTrue(vm.providerLocked, "legacy history locks provider switching")
+        let countBefore = try threadRepo.list(workspaceId: workspaceID).count
+        // The "+" and "New Distill conversation" buttons call createThread while a read-only thread is selected.
+        vm.createThread(title: "New thread")
+
+        XCTAssertEqual(try threadRepo.list(workspaceId: workspaceID).count, countBefore + 1)
+        let newThreadId = try XCTUnwrap(vm.selectedThreadId)
+        XCTAssertNotEqual(newThreadId, legacy.id)
+        XCTAssertEqual(try threadRepo.get(id: newThreadId)?.provider, .distill)
+        XCTAssertEqual(try threadRepo.get(id: legacy.id)?.provider, .grok)
+    }
+
     func test_restartedAgentAppSendsFollowupWithPersistedProviderThreadId() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-restart-continuity-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()

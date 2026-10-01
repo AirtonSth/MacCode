@@ -6294,6 +6294,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func setProvider(_ newProvider: AgentProvider) {
         guard !executionLocked else { return }
+        applyProvider(newProvider)
+    }
+
+    /// `persistToSelectedThread: false` switches only the composer, for a new thread
+    /// started while a read-only legacy thread is selected.
+    private func applyProvider(_ newProvider: AgentProvider, persistToSelectedThread: Bool = true) {
         if let selectedThreadId { persistComposerDraft(for: selectedThreadId) }
         let previousProvider = provider
         sourceSelectionUserPinned = true
@@ -6334,7 +6340,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             distillReasoningEffortSelection = .automatic
         }
         normalizeInteractionModeForSelectedProvider()
-        persistThreadConfig()
+        if persistToSelectedThread { persistThreadConfig() }
     }
 
     /// Persist the chosen run configuration onto the selected thread so a
@@ -6780,7 +6786,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func createThread(title: String) {
         // A legacy (read-only) thread leaves its provider on the VM; new threads are Distill.
         if !provider.isSelectable {
-            setProvider(.distill)
+            applyProvider(.distill, persistToSelectedThread: false)
             guard provider.isSelectable else { return }
         }
         // New threads always reopen on the last model the user used for this
