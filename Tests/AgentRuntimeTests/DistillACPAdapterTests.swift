@@ -71,7 +71,12 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                        "discovery must not call an extension the peer did not advertise")
     }
 
-    private func writeWorkerHarness(root: URL, initializeCapabilities: String, workerResult: String) throws -> (harness: URL, requests: URL) {
+    private func writeWorkerHarness(
+        root: URL,
+        initializeCapabilities: String,
+        workerResult: String,
+        sessionModels: String = #"{"currentModelId":"main"}"#
+    ) throws -> (harness: URL, requests: URL) {
         let requestsURL = root.appendingPathComponent("requests.jsonl")
         let harnessURL = root.appendingPathComponent("distill-agent")
         let harness = """
@@ -87,7 +92,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             if method == "initialize":
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{"protocolVersion":1,"agentCapabilities":\(initializeCapabilities)}})
             elif method == "session/new":
-                send({"jsonrpc":"2.0", "id":message["id"], "result":{"sessionId":"worker-session","models":{"currentModelId":"main"}}})
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"sessionId":"worker-session","models":\(sessionModels)}})
             elif method == "session/set_model":
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{"_meta":{"model":params.get("modelId"),"contextWindow":1000}}})
             elif method == "_x.ai/session/worker_model/set":
@@ -218,6 +223,55 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         let setModels = try recordedRequests(requestsURL).filter { $0["method"] as? String == "session/set_model" }
         let meta = try XCTUnwrap((setModels.first?["params"] as? [String: Any])?["_meta"] as? [String: Any])
         XCTAssertEqual(meta["reasoningEffortAuto"] as? Bool, true)
+    }
+
+    func test_mainEffortForCatalogModelUnknownToStaticPolicy_isSentFromLiveCatalog_becauseUIOffersCatalogEfforts() async throws {
+        // WHY: the Main effort menu lists the efforts the live Distill catalog advertises for the model.
+        // The send path must honor that same catalog; a model the built-in policy does not know
+        // (chatgpt/gpt-6-luna) failed with "Selected Main model does not advertise that effort".
+        let root = try makeTempRoot("distill-acp-catalog-effort")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(
+            root: root,
+            initializeCapabilities: "{}",
+            workerResult: "{}",
+            sessionModels: #"{"currentModelId":"chatgpt/gpt-6-luna","availableModels":[{"modelId":"chatgpt/gpt-6-luna","name":"GPT-6 Luna","_meta":{"reasoningEfforts":["low","medium","high"]}}]}"#
+        )
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let events = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .distill,
+                model: "chatgpt/gpt-6-luna",
+                cwd: root.path,
+                prompt: "Go",
+                distillMainEffortSelection: .fixed(.medium)
+            )
+        ) { events.append($0) }
+        _ = try await events.waitForFinish()
+        let setModels = try recordedRequests(requestsURL).filter { $0["method"] as? String == "session/set_model" }
+        let params = try XCTUnwrap(setModels.last?["params"] as? [String: Any])
+        XCTAssertEqual(params["modelId"] as? String, "chatgpt/gpt-6-luna")
+        XCTAssertEqual((params["_meta"] as? [String: Any])?["reasoningEffort"] as? String, "medium")
+        let methods = try recordedRequests(requestsURL).compactMap { $0["method"] as? String }
+        XCTAssertTrue(methods.contains("session/prompt"), "the prompt must be sent once the catalog effort is bound")
+    }
+
+    func test_setModelStillRefusesEffortWithoutCatalogOrPolicy_becauseUnadvertisedEffortsCannotBeAcknowledged() async throws {
+        let root = try makeTempRoot("distill-acp-unadvertised-effort")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, _) = try writeWorkerHarness(root: root, initializeCapabilities: "{}", workerResult: "{}")
+        let client = try DistillACPClient(binary: harness.path, cwd: root.path, tagProcess: false)
+        defer { client.stop() }
+        _ = try await client.initialize()
+        do {
+            _ = try await client.setModel(sessionId: "worker-session", modelId: "chatgpt/gpt-6-luna", reasoningEffort: .medium)
+            XCTFail("an effort neither the catalog nor the policy advertises must not be sent")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("does not advertise that effort"), "\(error)")
+        }
     }
 
     func test_adapterNeverCallsWorkerMethodOrThrowsWhenPeerDoesNotAdvertiseIt() async throws {

@@ -410,6 +410,12 @@ struct DistillACPSessionOpenResult {
     /// Set only after the session actor confirms the Worker model and its effort policy.
     var appliedReasoningModelEffortSelection: AgentEffortSelection? = nil
 
+    /// Live catalog efforts for one model; the static policy only knows a few ids.
+    func catalogEfforts(for modelId: String?) -> [AgentReasoningEffort] {
+        let id = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return models.first { $0.id == id }?.supportedReasoningEfforts ?? []
+    }
+
     /// True when session/new|load advertised a selectable `reasoning_effort` option.
     var advertisesReasoningEffortConfig: Bool {
         !advertisedReasoningEffortIds.isEmpty
@@ -804,7 +810,8 @@ public final class DistillACPClient: @unchecked Sendable {
                 sessionId: opened.sessionId,
                 modelId: mainModelId,
                 reasoningEffort: mainEffortSelection.effort,
-                reasoningEffortAuto: mainEffortSelection.isAutomatic
+                reasoningEffortAuto: mainEffortSelection.isAutomatic,
+                advertisedEfforts: opened.catalogEfforts(for: mainModelId)
             )
             guard applied.isAutomatic == mainEffortSelection.isAutomatic,
                   mainEffortSelection.effort == nil || applied.effort == mainEffortSelection.effort else {
@@ -820,7 +827,8 @@ public final class DistillACPClient: @unchecked Sendable {
             let applied = try await setReasoningModel(
                 sessionId: opened.sessionId,
                 modelId: reasoningModel,
-                effortSelection: reasoningModelEffortSelection
+                effortSelection: reasoningModelEffortSelection,
+                advertisedEfforts: opened.catalogEfforts(for: reasoningModel)
             )
             if applied.modelId == nil || applied.isAutomatic {
                 opened.appliedReasoningModelEffortSelection = .automatic
@@ -872,7 +880,8 @@ public final class DistillACPClient: @unchecked Sendable {
                 sessionId: opened.sessionId,
                 modelId: mainModelId,
                 reasoningEffort: mainEffortSelection.effort,
-                reasoningEffortAuto: mainEffortSelection.isAutomatic
+                reasoningEffortAuto: mainEffortSelection.isAutomatic,
+                advertisedEfforts: opened.catalogEfforts(for: mainModelId)
             )
             guard applied.isAutomatic == mainEffortSelection.isAutomatic,
                   mainEffortSelection.effort == nil || applied.effort == mainEffortSelection.effort else {
@@ -888,7 +897,8 @@ public final class DistillACPClient: @unchecked Sendable {
             let applied = try await setReasoningModel(
                 sessionId: opened.sessionId,
                 modelId: reasoningModel,
-                effortSelection: reasoningModelEffortSelection
+                effortSelection: reasoningModelEffortSelection,
+                advertisedEfforts: opened.catalogEfforts(for: reasoningModel)
             )
             if applied.modelId == nil || applied.isAutomatic {
                 opened.appliedReasoningModelEffortSelection = .automatic
@@ -929,13 +939,16 @@ public final class DistillACPClient: @unchecked Sendable {
     func setReasoningModel(
         sessionId: String,
         modelId: String?,
-        effortSelection: AgentEffortSelection? = nil
+        effortSelection: AgentEffortSelection? = nil,
+        advertisedEfforts: [AgentReasoningEffort] = []
     ) async throws -> ReasoningModelSelectionResult {
         let trimmedModel = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let effortValue: Any
         if let effortSelection, !trimmedModel.isEmpty {
             if let effort = effortSelection.effort {
-                guard let wire = Self.wireReasoningEffort(effort, modelId: trimmedModel) else {
+                guard let wire = Self.wireReasoningEffort(
+                    effort, modelId: trimmedModel, advertisedEfforts: advertisedEfforts
+                ) else {
                     throw DistillACPError.unsupported("Selected Worker model does not advertise that effort")
                 }
                 effortValue = wire
@@ -982,7 +995,8 @@ public final class DistillACPClient: @unchecked Sendable {
         sessionId: String,
         modelId: String,
         reasoningEffort: AgentReasoningEffort? = nil,
-        reasoningEffortAuto: Bool? = nil
+        reasoningEffortAuto: Bool? = nil,
+        advertisedEfforts: [AgentReasoningEffort] = []
     ) async throws -> MainModelSelectionResult {
         var params: JSONObject = ["sessionId": sessionId, "modelId": modelId]
         var meta: JSONObject = [:]
@@ -990,7 +1004,9 @@ public final class DistillACPClient: @unchecked Sendable {
             meta["reasoningEffortAuto"] = reasoningEffortAuto
         }
         if let reasoningEffort {
-            guard let wireEffort = Self.wireReasoningEffort(reasoningEffort, modelId: modelId) else {
+            guard let wireEffort = Self.wireReasoningEffort(
+                reasoningEffort, modelId: modelId, advertisedEfforts: advertisedEfforts
+            ) else {
                 throw DistillACPError.unsupported("Selected Main model does not advertise that effort")
             }
             meta["reasoningEffort"] = wireEffort
