@@ -101,14 +101,13 @@ public enum GraphifyGitProbe {
         p.arguments = ["git"] + args
         p.currentDirectoryURL = URL(fileURLWithPath: cwd)
         let out = Pipe()
-        let err = Pipe()
         p.standardOutput = out
-        p.standardError = err
+        // stderr was read and discarded; an undrained second pipe can deadlock the stdout read.
+        p.standardError = FileHandle.nullDevice
         do { try p.run() } catch {
             return ProcessResult(exit: -1, stdout: "")
         }
         let data = out.fileHandleForReading.readDataToEndOfFile()
-        _ = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         return ProcessResult(
             exit: p.terminationStatus,

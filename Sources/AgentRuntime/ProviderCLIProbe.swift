@@ -133,6 +133,14 @@ public enum ProviderCLIProbe {
         let renderedStderr: String
     }
 
+    /// Runs blocking probe work on a dedicated thread so a caller never parks a
+    /// Swift cooperative-pool thread on child-process I/O.
+    public static func runOffCooperativePool<T: Sendable>(_ body: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            Thread.detachNewThread { continuation.resume(returning: body()) }
+        }
+    }
+
     public static func version(binaryPath: String, environment: [String: String] = [:], timeoutSeconds: TimeInterval = 2.0) -> String? {
         versionStatus(binaryPath: binaryPath, environment: environment, timeoutSeconds: timeoutSeconds).version
     }
@@ -274,7 +282,8 @@ public enum ProviderCLIProbe {
         environment: [String: String],
         runAsUser: AgentRunAsUser?,
         timeoutSeconds: TimeInterval,
-        retention: PipeAccumulator.Retention = .prefix
+        retention: PipeAccumulator.Retention = .prefix,
+        currentDirectory: String? = nil
     ) -> CommandResult? {
         let trimmed = binaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -289,7 +298,7 @@ public enum ProviderCLIProbe {
                 executablePath: trimmed,
                 arguments: arguments,
                 environment: baseEnv,
-                currentDirectory: FileManager.default.currentDirectoryPath,
+                currentDirectory: currentDirectory ?? FileManager.default.currentDirectoryPath,
                 runAsUser: runAsUser
             )
         } catch {
@@ -326,7 +335,7 @@ public enum ProviderCLIProbe {
         var renderedStderr = ""
 
         drainDone.enter()
-        DispatchQueue.global(qos: .userInitiated).async {
+        Thread.detachNewThread {
             let drained = Self.drainCappedResult(
                 from: out.fileHandleForReading,
                 maxBytes: outputByteLimit,
@@ -338,7 +347,7 @@ public enum ProviderCLIProbe {
         }
 
         drainDone.enter()
-        DispatchQueue.global(qos: .userInitiated).async {
+        Thread.detachNewThread {
             let drained = Self.drainCappedResult(
                 from: err.fileHandleForReading,
                 maxBytes: outputByteLimit,

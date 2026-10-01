@@ -253,10 +253,15 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         ])
     }
     func sshDisconnect(surface: SurfaceID) throws {}
-    func sshTransferUpload(surface: SurfaceID, localPath: String, remotePath: String) throws -> JSONValue { .object(["ok": .bool(true)]) }
-    func sshTransferDownload(surface: SurfaceID, remotePath: String, localPath: String) throws -> JSONValue { .object(["ok": .bool(true)]) }
+    var sshBlockingCalls: [String] = []
+    var sshAsyncCalls: [String] = []
+    func sshTransferUpload(surface: SurfaceID, localPath: String, remotePath: String) throws -> JSONValue { sshBlockingCalls.append("upload"); return .object(["ok": .bool(true)]) }
+    func sshTransferDownload(surface: SurfaceID, remotePath: String, localPath: String) throws -> JSONValue { sshBlockingCalls.append("download"); return .object(["ok": .bool(true)]) }
     func sshFilesLocalList(path: String?) throws -> JSONValue { .object(["path": .string(path ?? "/tmp"), "entries": .array([])]) }
-    func sshFilesRemoteList(surface: SurfaceID, path: String?) throws -> JSONValue { .object(["path": .string(path ?? "/"), "entries": .array([])]) }
+    func sshFilesRemoteList(surface: SurfaceID, path: String?) throws -> JSONValue { sshBlockingCalls.append("remote.list"); return .object(["path": .string(path ?? "/"), "entries": .array([])]) }
+    func sshTransferUploadAsync(surface: SurfaceID, localPath: String, remotePath: String) async throws -> JSONValue { sshAsyncCalls.append("upload"); return .object(["ok": .bool(true)]) }
+    func sshTransferDownloadAsync(surface: SurfaceID, remotePath: String, localPath: String) async throws -> JSONValue { sshAsyncCalls.append("download"); return .object(["ok": .bool(true)]) }
+    func sshFilesRemoteListAsync(surface: SurfaceID, path: String?) async throws -> JSONValue { sshAsyncCalls.append("remote.list"); return .object(["path": .string(path ?? "/"), "entries": .array([])]) }
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor {
         SurfaceDescriptor(type: .agentApp, title: "Agent App")
     }
@@ -1356,6 +1361,26 @@ final class DispatcherTests: XCTestCase {
         ]))
         guard case .object(let downloadResult)? = download.result else { return XCTFail("download must return an object") }
         XCTAssertEqual(downloadResult["ok"], .bool(true), "download must be exposed as a host-owned terminal/scp RPC")
+    }
+
+    @MainActor
+    func test_remoteSSHRPCsUseOffMainProcessPath_becauseScpMustNotFreezeTheApp() async throws {
+        // WHY: the dispatcher runs on the main actor; the blocking router variants ran
+        // scp/ssh synchronously there, freezing every window for the whole transfer.
+        let router = FakeRouter()
+        let d = JSONRPCDispatcher(router: router)
+        let sid = UUID().uuidString
+        _ = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "ssh.transfer.upload", params: [
+            "surface_id": .string(sid), "local_path": .string("/tmp/a"), "remote_path": .string("/tmp/b")
+        ]))
+        _ = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "ssh.transfer.download", params: [
+            "surface_id": .string(sid), "remote_path": .string("/tmp/b"), "local_path": .string("/tmp/a")
+        ]))
+        _ = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "ssh.files.remote.list", params: [
+            "surface_id": .string(sid), "path": .string("/srv")
+        ]))
+        XCTAssertEqual(router.sshAsyncCalls, ["upload", "download", "remote.list"])
+        XCTAssertEqual(router.sshBlockingCalls, [], "remote RPCs must not call the blocking process path")
     }
 
     @MainActor

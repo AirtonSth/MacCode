@@ -435,6 +435,31 @@ final class GraphifyWorkspaceServiceTests: XCTestCase {
         wait(for: [ensureStarted], timeout: 3.0)
     }
 
+    func test_watchedCheckoutsAreBounded_becauseEveryVisitedRepoKeptAnFSEventStreamForever() throws {
+        // WHY: one FSEvents stream per checkout ever refreshed stayed alive for the
+        // app lifetime; switching repos for months accumulated streams and callbacks.
+        service.autoEnsure = true
+        let limit = GraphifyWorkspaceService.maxWatchedCheckouts
+        var checkouts: [GraphifyCheckout] = []
+        for index in 0..<(limit + 10) {
+            let root = tempRoot.appendingPathComponent("watched-\(index)", isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let checkout = GraphifyCheckout(
+                key: GraphifyRepoKey(commonDir: root.appendingPathComponent(".git").path),
+                displayRoot: root.path
+            )
+            checkouts.append(checkout)
+            XCTAssertTrue(service.watchCheckout(checkout))
+        }
+        XCTAssertEqual(service.lifecycleSnapshotForTesting.watchers, limit)
+        // Re-watching a recent checkout keeps it; re-watching an evicted one re-arms it within the bound.
+        XCTAssertTrue(service.watchCheckout(checkouts.last!))
+        XCTAssertTrue(service.watchCheckout(checkouts.first!))
+        XCTAssertEqual(service.lifecycleSnapshotForTesting.watchers, limit)
+        service.stopWatchingAll()
+        XCTAssertEqual(service.lifecycleSnapshotForTesting.watchers, 0)
+    }
+
     func test_stopWatchingAll_releasesPendingDebounces_and_rearmsOnNextRefresh() throws {
         // WHY: Token Saver OFF must release delayed work immediately, while the
         // retained schedule still forces the next active checkout refresh and

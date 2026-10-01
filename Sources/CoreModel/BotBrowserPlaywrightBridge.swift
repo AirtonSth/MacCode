@@ -340,7 +340,12 @@ public final class BotBrowserPlaywrightHost: BotBrowserBridging, @unchecked Send
     private struct Entry {
         var route: BotBrowserRoute
         var child: any BotBrowserPlaywrightChildProcessing
+        var lastUsed: Date
     }
+
+    /// Children idle this long are terminated so deleted or dormant bots do not
+    /// keep a Node/Chrome process alive for the life of the app.
+    public static let defaultIdleChildTimeout: TimeInterval = 2 * 60 * 60
 
     private let lock = NSLock()
     private let queue = DispatchQueue(label: "io.remotecode.bot-browser-playwright")
@@ -349,6 +354,9 @@ public final class BotBrowserPlaywrightHost: BotBrowserBridging, @unchecked Send
     private let makeChild: @Sendable ([String], [String: String]?) -> any BotBrowserPlaywrightChildProcessing
     private let resolveNPX: @Sendable () throws -> String
     private let resolveDocker: @Sendable () throws -> String
+    private let idleChildTimeout: TimeInterval
+    private let now: @Sendable () -> Date
+    private var idleSweepTimer: DispatchSourceTimer?
 
     public init(
         makeChild: @escaping @Sendable ([String], [String: String]?) -> any BotBrowserPlaywrightChildProcessing = { argv, environment in
@@ -359,11 +367,52 @@ public final class BotBrowserPlaywrightHost: BotBrowserBridging, @unchecked Send
         },
         resolveDocker: @escaping @Sendable () throws -> String = {
             try BotComputerDockerResolver.resolveSharedHealthyExecutable()
-        }
+        },
+        idleChildTimeout: TimeInterval = BotBrowserPlaywrightHost.defaultIdleChildTimeout,
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.makeChild = makeChild
         self.resolveNPX = resolveNPX
         self.resolveDocker = resolveDocker
+        self.idleChildTimeout = idleChildTimeout
+        self.now = now
+    }
+
+    deinit {
+        idleSweepTimer?.cancel()
+    }
+
+    /// Terminates every child idle longer than the timeout and forgets its page state.
+    public func evictIdleChildren() {
+        queue.sync { evictIdleChildrenOnQueue(keeping: nil) }
+    }
+
+    private func evictIdleChildrenOnQueue(keeping kept: BotID?) {
+        let cutoff = now().addingTimeInterval(-idleChildTimeout)
+        lock.lock()
+        let idle = children.filter { $0.key != kept && $0.value.lastUsed < cutoff }
+        for botID in idle.keys {
+            children.removeValue(forKey: botID)
+            lastKnown.removeValue(forKey: botID)
+        }
+        let stillRunning = !children.isEmpty
+        lock.unlock()
+        for entry in idle.values { entry.child.terminate() }
+        if !stillRunning {
+            idleSweepTimer?.cancel()
+            idleSweepTimer = nil
+        }
+    }
+
+    /// Runs on `queue`; a periodic sweep exists only while children are alive.
+    private func scheduleIdleSweepIfNeeded() {
+        guard idleSweepTimer == nil else { return }
+        let interval = max(1, min(idleChildTimeout / 4, 10 * 60))
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + interval, repeating: interval)
+        timer.setEventHandler { [weak self] in self?.evictIdleChildrenOnQueue(keeping: nil) }
+        idleSweepTimer = timer
+        timer.resume()
     }
 
     public static let npxMissingMessage =
@@ -463,6 +512,7 @@ public final class BotBrowserPlaywrightHost: BotBrowserBridging, @unchecked Send
             throw BotBrowserPlaywrightBridgeError.invalid(message)
         }
         return try queue.sync {
+            evictIdleChildrenOnQueue(keeping: botID)
             let child = try resolvedChild(botID: botID, route: route, appSupport: appSupport)
             let refParameterName: String
             do {
@@ -517,6 +567,7 @@ public final class BotBrowserPlaywrightHost: BotBrowserBridging, @unchecked Send
     ) throws -> any BotBrowserPlaywrightChildProcessing {
         lock.lock()
         if let entry = children[botID], entry.route == route {
+            children[botID]?.lastUsed = now()
             lock.unlock()
             return entry.child
         }
@@ -541,8 +592,9 @@ public final class BotBrowserPlaywrightHost: BotBrowserBridging, @unchecked Send
         }
         let child = makeChild(argv, environment)
         lock.lock()
-        children[botID] = Entry(route: route, child: child)
+        children[botID] = Entry(route: route, child: child, lastUsed: now())
         lock.unlock()
+        scheduleIdleSweepIfNeeded()
         return child
     }
 

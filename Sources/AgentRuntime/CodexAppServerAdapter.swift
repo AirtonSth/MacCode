@@ -723,7 +723,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         guard let snapshot = sessionSnapshot(threadId: request.sourceThreadId) else {
             throw AgentProviderAdapterError.sessionNotFound(request.sourceThreadId)
         }
-        guard forkSafety(threadId: request.sourceThreadId).supportsDurableFork else {
+        guard await ProviderCLIProbe.runOffCooperativePool({ self.forkSafety(threadId: request.sourceThreadId) }).supportsDurableFork else {
             throw AgentProviderAdapterError.unsupported("Codex fork reconciliation schema is unavailable")
         }
         if let expectedSourceId = request.sourceProviderThreadId,
@@ -1390,10 +1390,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 turnId: turnId,
                 itemId: itemId,
                 questionIds: effectiveQuestionIds,
-                questionPromptsById: Dictionary(uniqueKeysWithValues: questions.compactMap { question in
+                questionPromptsById: Dictionary(questions.compactMap { question in
                     guard let id = string(question, "id"), let prompt = string(question, "question") else { return nil }
                     return (id, prompt)
-                }),
+                }, uniquingKeysWith: { first, _ in first }),
                 multiSelectQuestionIds: Self.userInputMultiSelectQuestionIds(
                     questions: questions,
                     fallbackQuestionIds: effectiveQuestionIds,
@@ -3112,7 +3112,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
     }
 
-    private static func codexAnswers(
+    static func codexAnswers(
         questionIds: [String],
         questionPromptsById: [String: String] = [:],
         multiSelectQuestionIds: Set<String> = [],
@@ -3121,14 +3121,15 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let structured = structuredAnswers(text)
         let answersById = structured.isEmpty
             ? splitUserInputAnswers(questionIds: questionIds, text: text)
-            : Dictionary(uniqueKeysWithValues: questionIds.compactMap { id in
+            : Dictionary(questionIds.compactMap { id in
                 let answer = structured[id] ?? questionPromptsById[id].flatMap { structured[$0] }
                 return answer.map { (id, $0) }
-            })
-        return Dictionary(uniqueKeysWithValues: questionIds.map { id in
+            }, uniquingKeysWith: { first, _ in first })
+        // Provider payloads can repeat a question id; first answer wins instead of trapping.
+        return Dictionary(questionIds.map { id in
             let answer = answersById[id] ?? text
             return (id, ["answers": multiSelectQuestionIds.contains(id) ? splitMultiSelectAnswer(answer) : [answer]])
-        })
+        }, uniquingKeysWith: { first, _ in first })
     }
 
     private static func structuredAnswers(_ text: String) -> [String: String] {
@@ -3171,7 +3172,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
         if !mapped.isEmpty { return mapped }
         guard lines.count == questionIds.count else { return [:] }
-        return Dictionary(uniqueKeysWithValues: zip(questionIds, lines))
+        return Dictionary(Array(zip(questionIds, lines)), uniquingKeysWith: { first, _ in first })
     }
 
     private static func detailString(from payload: [String: Any]) -> String? {

@@ -840,8 +840,16 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             if process.isRunning { process.terminate() }
             throw AgentRunError.spawnFailed(error.localizedDescription)
         }
+        // Drain stderr concurrently: a child filling the stderr pipe before closing
+        // stdout would otherwise block both processes forever.
+        final class DrainedData: @unchecked Sendable { var data = Data() }
+        let stderrReader = stderrPipe.fileHandleForReading
+        let stderrDrain = DispatchQueue(label: "claude.sdk.session.stderr")
+        let drainedStderr = DrainedData()
+        stderrDrain.async { drainedStderr.data = stderrReader.readDataToEndOfFile() }
         let stdout = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        stderrDrain.sync {}
+        let stderr = drainedStderr.data
         process.waitUntilExit()
 
         let lines = String(decoding: stdout, as: UTF8.self).split(whereSeparator: \.isNewline)

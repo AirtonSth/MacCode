@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import CoreModel
+import AgentRuntime
 import DesignSystemKit
 import Persistence
 import SocketServer
@@ -1862,9 +1863,9 @@ extension AppCommandRouter {
     /// Returns true when the remote exit code is 0. Runs off the main run loop
     /// via Task.detached so the caller's actor is never blocked.
     func sshRemoteManageAsync(argv: [String], password: String?) async throws -> Bool {
-        let result = try await Task.detached {
-            try Self.runCommandBlocking(executable: "/usr/bin/ssh", arguments: argv, password: password)
-        }.value
+        let result = try await ProviderCLIProbe.runOffCooperativePool {
+            Result { try Self.runCommandBlocking(executable: "/usr/bin/ssh", arguments: argv, password: password) }
+        }.get()
         return result.exitCode == 0
     }
 }

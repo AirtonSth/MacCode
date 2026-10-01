@@ -31,6 +31,9 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
     private var stickyByWorkspace: [String: String] = [:]
     private var schedules: [String: RefreshSchedule] = [:]
     private var watchers: [String: GraphifyCheckoutWatcher] = [:]
+    /// Least- to most-recently watched checkout ids; bounds live FSEvents streams.
+    private var watcherOrder: [String] = []
+    static let maxWatchedCheckouts = 16
     private struct PendingDebounce {
         let token: UInt64
         let work: DispatchWorkItem
@@ -1097,6 +1100,8 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             return false
         }
         if watchers[id] != nil {
+            watcherOrder.removeAll { $0 == id }
+            watcherOrder.append(id)
             lock.unlock()
             return true
         }
@@ -1110,10 +1115,22 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             self?.markDirtyFromFilesystem(checkout: checkout)
         }
         watchers[id] = watcher
+        watcherOrder.append(id)
         // Start while holding the lifecycle lock: stopWatchingAll cannot remove
         // this entry and return before its stream has actually started.
         watcher.start()
+        // Checkouts visited long ago keep no stream; a later refresh re-watches them.
+        var evicted: [GraphifyCheckoutWatcher] = []
+        var evictedDebounces: [DispatchWorkItem] = []
+        while watcherOrder.count > Self.maxWatchedCheckouts {
+            let oldest = watcherOrder.removeFirst()
+            if let stale = watchers.removeValue(forKey: oldest) { evicted.append(stale) }
+            if let pending = debounceWork.removeValue(forKey: oldest) { evictedDebounces.append(pending.work) }
+        }
         lock.unlock()
+        // Stop outside the lock so an in-flight FSEvents callback cannot deadlock on it.
+        for work in evictedDebounces { work.cancel() }
+        for stale in evicted { stale.stop() }
         return true
     }
 
@@ -1124,6 +1141,7 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         lifecycleAdmissionOpen = false
         let all = watchers
         watchers.removeAll()
+        watcherOrder.removeAll()
         let pendingDebounces = debounceWork.values.map(\.work)
         debounceWork.removeAll()
         // Mark every in-flight schedule cancelled so completion cannot publish fresh.

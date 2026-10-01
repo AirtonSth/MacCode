@@ -404,7 +404,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     var preflightListedProviderSnapshotsForTesting = false
     private var cachedProviderSnapshots: [AgentProviderSnapshot] = []
     private var cachedProviderSnapshotsAt: Date?
-    var codexForkProtocolSupportProbe: (String, [String: String]) -> Bool = { binary, environment in
+    var codexForkProtocolSupportProbe: @Sendable (String, [String: String]) -> Bool = { binary, environment in
         CodexForkProtocolSupport.probe(binary: binary, environment: environment).isSupported
     }
     var claudeForkProtocolSupportProbe: () -> Bool = {
@@ -6604,7 +6604,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     )
                     liveCatalogVerified = false
                 }
-                let runtimeCapabilities = providerRuntimeCapabilities(
+                let runtimeCapabilities = await providerRuntimeCapabilities(
                     provider: instance.provider,
                     binaryPath: binaryPath,
                     environment: env,
@@ -6736,7 +6736,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 )
                 liveCatalogVerified = false
             }
-            let runtimeCapabilities = providerRuntimeCapabilities(
+            let runtimeCapabilities = await providerRuntimeCapabilities(
                 provider: provider,
                 binaryPath: binaryPath,
                 environment: env,
@@ -6785,10 +6785,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         environment: [String: String],
         claudePresentation: ClaudeProviderRuntimePresentation?,
         acpCapabilities: AgentProviderCapabilities?
-    ) -> AgentProviderCapabilities? {
+    ) async -> AgentProviderCapabilities? {
         switch provider {
         case .codex:
-            return codexRuntimeCapabilities(binaryPath: binaryPath, environment: environment)
+            return await codexRuntimeCapabilities(binaryPath: binaryPath, environment: environment)
         case .claude:
             if let degraded = claudePresentation?.capabilities { return degraded }
             return AgentProviderCapabilities(
@@ -6810,15 +6810,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func codexRuntimeCapabilities(
         binaryPath: String,
         environment: [String: String]
-    ) -> AgentProviderCapabilities {
-        AgentProviderCapabilities(
+    ) async -> AgentProviderCapabilities {
+        let probe = codexForkProtocolSupportProbe
+        let supportsFork = await ProviderCLIProbe.runOffCooperativePool {
+            probe(binaryPath, environment)
+        }
+        return AgentProviderCapabilities(
             supportsAttachments: true,
             supportedAttachmentKinds: [.file, .image],
             supportedAttachmentMediaTypes: ["*/*", "image/jpeg", "image/png", "image/gif", "image/webp"],
             supportsApprovals: true,
             supportsUserInput: true,
             supportsStreaming: true,
-            supportsFork: codexForkProtocolSupportProbe(binaryPath, environment),
+            supportsFork: supportsFork,
             supportsRollback: true,
             supportsPlanReview: true
         )
@@ -6895,7 +6899,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             environment: environment,
             defaultHome: FileManager.default.homeDirectoryForCurrentUser.path
         )
-        let capabilities = await Task.detached(priority: .userInitiated) {
+        let capabilities = await ProviderCLIProbe.runOffCooperativePool {
             let auth = ProviderCLIProbe.authStatus(
                 provider: provider,
                 binaryPath: binaryPath,
@@ -6918,7 +6922,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 skills: Self.discoverSkillNames(in: skillsRoot),
                 capturedAt: now
             )
-        }.value
+        }
         Self.noteProviderProbeCacheEntry(
             &providerProbeCache,
             key: key,
@@ -7014,9 +7018,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         providerUpdateLocks.insert(key)
         defer { providerUpdateLocks.remove(key) }
 
-        let result = await Task.detached(priority: .utility) {
+        let result = await ProviderCLIProbe.runOffCooperativePool {
             ProviderCLIProbe.update(provider: provider, binaryPath: binaryPath, environment: env)
-        }.value
+        }
         providerProbeCache.removeValue(forKey: key)
         let response = JSONValue.object([
             "provider": .string(provider.rawValue),
@@ -8754,11 +8758,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Async transfer: resolves actor state on the main actor, runs the scp
     /// process off the main run loop, then marshals results/output back. Used
     /// by the macOS SSH surface so transfers never freeze the UI.
-    func sshTransferUploadAsync(surface: SurfaceID, localPath: String, remotePath: String) async throws -> JSONValue {
+    public func sshTransferUploadAsync(surface: SurfaceID, localPath: String, remotePath: String) async throws -> JSONValue {
         try await runSSHTransferAsync(surface: surface, upload: true, localPath: localPath, remotePath: remotePath)
     }
 
-    func sshTransferDownloadAsync(surface: SurfaceID, remotePath: String, localPath: String) async throws -> JSONValue {
+    public func sshTransferDownloadAsync(surface: SurfaceID, remotePath: String, localPath: String) async throws -> JSONValue {
         try await runSSHTransferAsync(surface: surface, upload: false, localPath: localPath, remotePath: remotePath)
     }
 
@@ -8773,9 +8777,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             appendOutput("\n[ssh \(kind) started]\n")
             let password = profile.password
             let commandRunner = sshCommandRunner
-            let result = try await Task.detached {
-                try commandRunner("/usr/bin/scp", args, password)
-            }.value
+            let result = try await ProviderCLIProbe.runOffCooperativePool {
+                Result { try commandRunner("/usr/bin/scp", args, password) }
+            }.get()
             if !result.output.isEmpty { appendOutput(result.output) }
             let ok = result.exitCode == 0
             appendOutput("[ssh \(kind) \(ok ? "completed" : "failed")]\n")
@@ -8792,7 +8796,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     /// Async remote listing: spawns the remote shell off the main run loop.
-    func sshFilesRemoteListAsync(surface: SurfaceID, path: String?) async throws -> JSONValue {
+    public func sshFilesRemoteListAsync(surface: SurfaceID, path: String?) async throws -> JSONValue {
         let profile = try sshTransferProfile(for: surface)
         let requested = (path?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) ? path! : "."
         let script = """
@@ -8819,9 +8823,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         """
         let args = SSHCommandBuilder.sshArguments(for: profile) + ["sh", "-lc", script]
         let password = profile.password
-        let result = try await Task.detached {
-            try Self.runCommandBlocking(executable: "/usr/bin/ssh", arguments: args, password: password)
-        }.value
+        let result = try await ProviderCLIProbe.runOffCooperativePool {
+            Result { try Self.runCommandBlocking(executable: "/usr/bin/ssh", arguments: args, password: password) }
+        }.get()
         guard result.exitCode == 0 else {
             throw JSONRPCError(code: -32020, message: "remote list failed", data: .string(result.output))
         }
@@ -8884,9 +8888,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         process.standardOutput = pipe
         process.standardError = pipe
         try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         if let expectScriptURL { try? FileManager.default.removeItem(at: expectScriptURL) }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let output = String(data: data, encoding: .utf8) ?? ""
         return (process.terminationStatus, output)
     }

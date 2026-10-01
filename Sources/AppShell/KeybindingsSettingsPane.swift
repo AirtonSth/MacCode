@@ -254,8 +254,10 @@ final class KeybindingsFileWatcher {
         src.setEventHandler {
             MainActor.assumeIsolated { onChange() }
         }
+        // Close the descriptor this source owns; `self.fd` may already belong to a newer watcher.
         src.setCancelHandler { [weak self] in
-            if let self, self.fd >= 0 { close(self.fd); self.fd = -1 }
+            close(descriptor)
+            if let self, self.fd == descriptor { self.fd = -1 }
         }
         source = src
         src.resume()

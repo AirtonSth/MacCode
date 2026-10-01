@@ -7639,6 +7639,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func forkCurrentThread() async {
         guard let tid = selectedThreadId,
               let src = threads.first(where: { $0.id == tid }) else { return }
+        // Legacy-provider threads are read-only: a fork would start their old provider.
+        guard src.provider.isSelectable else {
+            systemNote("This conversation is read-only. Start a new Distill conversation instead.")
+            return
+        }
         guard selectedProviderCapabilities.supportsFork else {
             systemNote(threadForkUnavailableReason ?? "Provider-side fork is unavailable for this session.")
             return

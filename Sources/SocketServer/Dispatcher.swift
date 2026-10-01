@@ -135,8 +135,11 @@ public protocol CommandRouting: AnyObject {
     func sshDisconnect(surface: SurfaceID) throws
     func sshTransferUpload(surface: SurfaceID, localPath: String, remotePath: String) throws -> JSONValue
     func sshTransferDownload(surface: SurfaceID, remotePath: String, localPath: String) throws -> JSONValue
+    func sshTransferUploadAsync(surface: SurfaceID, localPath: String, remotePath: String) async throws -> JSONValue
+    func sshTransferDownloadAsync(surface: SurfaceID, remotePath: String, localPath: String) async throws -> JSONValue
     func sshFilesLocalList(path: String?) throws -> JSONValue
     func sshFilesRemoteList(surface: SurfaceID, path: String?) throws -> JSONValue
+    func sshFilesRemoteListAsync(surface: SurfaceID, path: String?) async throws -> JSONValue
     // agent
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
     /// Sticky glanceable Token Saver payload for deterministic iOS pull.
@@ -354,6 +357,16 @@ public protocol CommandRouting: AnyObject {
 }
 
 public extension CommandRouting {
+    func sshTransferUploadAsync(surface: SurfaceID, localPath: String, remotePath: String) async throws -> JSONValue {
+        try sshTransferUpload(surface: surface, localPath: localPath, remotePath: remotePath)
+    }
+    func sshTransferDownloadAsync(surface: SurfaceID, remotePath: String, localPath: String) async throws -> JSONValue {
+        try sshTransferDownload(surface: surface, remotePath: remotePath, localPath: localPath)
+    }
+    func sshFilesRemoteListAsync(surface: SurfaceID, path: String?) async throws -> JSONValue {
+        try sshFilesRemoteList(surface: surface, path: path)
+    }
+
     /// Test/fake hosts may omit Token Saver entirely.
     func tokenSaverDigest() -> JSONValue? { nil }
     func setAgentWorkerModel(thread: AgentThreadID, model: String?) throws -> AgentThread { throw JSONRPCError.notSupported("Worker model selection") }
@@ -2551,7 +2564,7 @@ public final class JSONRPCDispatcher {
                     "local_path": .string(local),
                     "remote_path": .string(remote)
                 ]))
-                let result = try router.sshTransferUpload(surface: sid, localPath: local, remotePath: remote)
+                let result = try await router.sshTransferUploadAsync(surface: sid, localPath: local, remotePath: remote)
                 EventBus.shared.publish(kind: .sshTransferFinished, payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "direction": .string("upload"),
@@ -2568,7 +2581,7 @@ public final class JSONRPCDispatcher {
                     "local_path": .string(local),
                     "remote_path": .string(remote)
                 ]))
-                let result = try router.sshTransferDownload(surface: sid, remotePath: remote, localPath: local)
+                let result = try await router.sshTransferDownloadAsync(surface: sid, remotePath: remote, localPath: local)
                 EventBus.shared.publish(kind: .sshTransferFinished, payload: .object([
                     "surface_id": .string(sid.value.uuidString),
                     "direction": .string("download"),
@@ -2579,7 +2592,7 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: try router.sshFilesLocalList(path: params["path"]?.stringValue))
             case "ssh.files.remote.list":
                 guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) ?? params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
-                return .init(id: id, result: try router.sshFilesRemoteList(surface: sid, path: params["path"]?.stringValue))
+                return .init(id: id, result: try await router.sshFilesRemoteListAsync(surface: sid, path: params["path"]?.stringValue))
             case "fs.roots":
                 return .init(id: id, result: .object(["roots": fsRoots()]))
             case "fs.list":

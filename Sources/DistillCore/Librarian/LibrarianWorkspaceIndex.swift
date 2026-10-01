@@ -283,21 +283,37 @@ public actor LibrarianWorkspaceIndex {
 /// analysis ops must not re-read the workspace per call.
 public actor LibrarianWorkspaceIndexCache {
     public static let shared = LibrarianWorkspaceIndexCache()
+    /// Each index can hold tens of MiB of text; keep only the most recently used roots.
+    public static let defaultMaxRoots = 4
+    private let maxRoots: Int
     private var indexes: [String: LibrarianWorkspaceIndex] = [:]
+    private var recentRoots: [String] = []
+
+    public init(maxRoots: Int = LibrarianWorkspaceIndexCache.defaultMaxRoots) {
+        self.maxRoots = max(1, maxRoots)
+    }
 
     public func index(
         for root: String,
         host: LibrarianHostIO,
         embedder: LibrarianEmbeddingProvider?
     ) -> LibrarianWorkspaceIndex {
+        recentRoots.removeAll { $0 == root }
+        recentRoots.append(root)
         if let existing = indexes[root] { return existing }
         let created = LibrarianWorkspaceIndex(root: root, host: host, embedder: embedder)
         indexes[root] = created
+        while recentRoots.count > maxRoots {
+            indexes.removeValue(forKey: recentRoots.removeFirst())
+        }
         return created
     }
 
+    public var cachedRootCount: Int { indexes.count }
+
     public func reset() {
         indexes.removeAll()
+        recentRoots.removeAll()
     }
 }
 

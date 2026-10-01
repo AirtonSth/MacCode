@@ -504,6 +504,23 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         return .object(["ok": .bool(true)])
     }
 
+    // The dispatcher routes transfers through the off-main async entry points.
+    override func sshTransferUploadAsync(
+        surface: SurfaceID,
+        localPath: String,
+        remotePath: String
+    ) async throws -> JSONValue {
+        try sshTransferUpload(surface: surface, localPath: localPath, remotePath: remotePath)
+    }
+
+    override func sshTransferDownloadAsync(
+        surface: SurfaceID,
+        remotePath: String,
+        localPath: String
+    ) async throws -> JSONValue {
+        try sshTransferDownload(surface: surface, remotePath: remotePath, localPath: localPath)
+    }
+
     override func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor {
         synchronousBatchEffectCallCount += 1
         return try super.openAgentApp(workspace: workspace)

@@ -376,14 +376,14 @@ public final class ScheduledTaskExecutor {
         let probeEnvironment = user.name == NSUserName()
             ? router.providerEnvironment(provider: task.provider, instanceId: task.providerInstanceID)
             : [:]
-        let authenticated = await Task.detached {
+        let authenticated = await ProviderCLIProbe.runOffCooperativePool {
             ProviderCLIProbe.authStatus(
                 provider: task.provider,
                 binaryPath: baseBinary,
                 environment: probeEnvironment,
                 runAsUser: runAsForProbe
             ).authenticated
-        }.value
+        }
         guard authenticated == true else {
             throw ScheduledTaskPreflightError.providerUnavailable(
                 "The selected provider is unavailable for system user \(user.name). Sign in as that user and retry."
@@ -502,14 +502,14 @@ public final class ScheduledTaskExecutor {
             let environment = user.name == NSUserName()
                 ? router.providerEnvironment(provider: snapshot.provider, instanceId: snapshot.id)
                 : [:]
-            let authenticated = await Task.detached {
+            let authenticated = await ProviderCLIProbe.runOffCooperativePool {
                 ProviderCLIProbe.authStatus(
                     provider: snapshot.provider,
                     binaryPath: baseBinary,
                     environment: environment,
                     runAsUser: runAsForProbe
                 ).authenticated
-            }.value
+            }
             guard authenticated == true else {
                 throw ScheduledTaskPreflightError.providerUnavailable(
                     "The selected provider is unavailable for system user \(user.name). Sign in as that user and retry."

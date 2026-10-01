@@ -340,6 +340,62 @@ final class BotBrowserPlaywrightBridgeTests: XCTestCase {
         func increment() { record([]) }
     }
 
+    private final class TestClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = Date(timeIntervalSince1970: 1_000)
+        var now: Date { lock.lock(); defer { lock.unlock() }; return value }
+        func advance(_ seconds: TimeInterval) { lock.lock(); value += seconds; lock.unlock() }
+    }
+
+    func test_idleChildrenAreTerminated_becauseDeletedBotsMustNotKeepBrowsersAliveForMonths() throws {
+        // WHY: the registry kept one Node/Chrome child per bot that ever browsed,
+        // including deleted bots, for the whole app lifetime.
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-pw-idle-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let clock = TestClock()
+        let spawned = SpawnedChildren()
+        let host = BotBrowserPlaywrightHost(
+            makeChild: { _, _ in spawned.make() },
+            resolveNPX: { "/fake/npx" },
+            resolveDocker: { "/fake/docker" },
+            idleChildTimeout: 60,
+            now: { clock.now }
+        )
+        func open(_ bot: BotID) throws {
+            _ = try host.perform(botID: bot, route: .playwrightLocal, kind: "bot_browser_open", action: "", ref: "",
+                                 text: "", url: "https://a.test/home", appSupport: appSupport)
+        }
+        let deleted = BotID(), active = BotID()
+        try open(deleted)
+        try open(active)
+        clock.advance(45)
+        try open(active)
+        clock.advance(30)
+
+        // `deleted` has been idle 75 s; `active` only 30 s.
+        host.evictIdleChildren()
+        XCTAssertEqual(spawned.children[0].terminateCount, 1, "idle child must be terminated")
+        XCTAssertEqual(spawned.children[1].terminateCount, 0, "recently used child stays")
+
+        clock.advance(120)
+        try open(deleted)
+        XCTAssertEqual(spawned.children[1].terminateCount, 1, "every perform sweeps other idle children")
+        XCTAssertEqual(spawned.children.count, 3, "a returning bot gets a fresh child")
+        XCTAssertEqual(spawned.children.last?.terminateCount, 0)
+    }
+
+    private final class SpawnedChildren: @unchecked Sendable {
+        private let lock = NSLock()
+        private var made: [FakeChild] = []
+        var children: [FakeChild] { lock.lock(); defer { lock.unlock() }; return made }
+        func make() -> FakeChild {
+            let child = FakeChild()
+            lock.lock(); made.append(child); lock.unlock()
+            return child
+        }
+    }
+
     func test_hostReusesOneChildPerBot_andReturnsURLTitleContent() throws {
         // WHY: respawning per call would lose the logged-in Chrome; the
         // payload shape {url,title,content} is what the router persists and

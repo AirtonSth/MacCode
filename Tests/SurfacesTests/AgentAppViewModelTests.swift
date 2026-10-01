@@ -1437,6 +1437,10 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(capture.prompts.isEmpty, "a read-only thread must never spawn a provider process")
         XCTAssertEqual(try messageRepo.list(threadId: legacy.id).count, 0)
         XCTAssertNotNil(vm.statusMessage)
+        let threadCountBeforeFork = try threadRepo.list(workspaceId: workspaceID).count
+        await vm.forkCurrentThread()
+        XCTAssertEqual(try threadRepo.list(workspaceId: workspaceID).count, threadCountBeforeFork,
+                       "forking a read-only thread would start the legacy provider")
 
         vm.createThread(title: "fresh")
         XCTAssertEqual(vm.provider, .distill, "the banner's new-conversation action starts a Distill thread")

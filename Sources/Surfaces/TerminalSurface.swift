@@ -844,6 +844,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     private var isVisible = false
     private let historyCoordinator: TerminalHistoryCoordinator
     private let outputBus: SurfaceOutputBus
+    /// How long a utility worker observes a child disposition before reporting
+    /// `process_reap_timeout`; the disposition itself keeps running and keeps ownership.
+    public static let defaultChildDispositionObserverTimeout: TimeInterval = 30
+    private let childDispositionObserverTimeout: TimeInterval
     private var isClosing = false
     private var outputPartial = false
     private var outputPartialReason: String?
@@ -1547,9 +1551,11 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         closeOnExecEnabler: ((Int32) -> Bool)? = nil,
         nonBlockingEnabler: ((Int32) -> Bool)? = nil,
         nonBlockingFailureBarrierFactory: ((pid_t) -> SurfaceTerminationBarrier)? = nil,
-        preparedRuntime: TerminalPreparedPTYRuntime? = nil
+        preparedRuntime: TerminalPreparedPTYRuntime? = nil,
+        childDispositionObserverTimeout: TimeInterval = TerminalSurface.defaultChildDispositionObserverTimeout
     ) throws {
         self.outputBus = outputBus
+        self.childDispositionObserverTimeout = childDispositionObserverTimeout
         let cwd: String
         let type: SurfaceType
         var metadata: [String: String]
@@ -1794,8 +1800,9 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
                 )
             }
             self.applicationTerminationBarrier = dispositionBarrier
+            let observerDeadline = DispatchTime.now() + childDispositionObserverTimeout
             DispatchQueue.global(qos: .utility).async { [weak self] in
-                let succeeded = dispositionBarrier.wait(until: .distantFuture)
+                let succeeded = dispositionBarrier.wait(until: observerDeadline)
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.childPID == pid else { return }
                     if succeeded {
@@ -3493,8 +3500,9 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         )
         applicationTerminationBarrier = barrier
         childReapInFlightPID = pid
+        let observerDeadline = DispatchTime.now() + childDispositionObserverTimeout
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let succeeded = barrier.wait(until: .distantFuture)
+            let succeeded = barrier.wait(until: observerDeadline)
             self?.childReapCompletionHook.fire()
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.childPID == pid else { return }

@@ -4983,7 +4983,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             throw AgentProviderAdapterError.unsupported("fork child provider identity must be assigned by the durable fork operation")
         }
         let adapter = try adapterForThread(sourceThreadId)
-        guard adapter.forkSafety(threadId: sourceThreadId).supportsDurableFork else {
+        guard (await ProviderCLIProbe.runOffCooperativePool { adapter.forkSafety(threadId: sourceThreadId) }).supportsDurableFork else {
             throw AgentProviderAdapterError.unsupported(
                 "provider fork is not crash-safe: keyed idempotency and idempotent compensation are required"
             )
@@ -4998,7 +4998,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         try beginExclusiveThreadMutation(sourceThreadId, operation: "provider fork", requiresIdleThread: true)
         defer { endExclusiveThreadMutation(sourceThreadId) }
         try await recoverAdapterSessionIfNeeded(threadId: sourceThreadId, adapter: adapter)
-        guard adapter.forkSafety(threadId: sourceThreadId).supportsDurableFork else {
+        guard (await ProviderCLIProbe.runOffCooperativePool { adapter.forkSafety(threadId: sourceThreadId) }).supportsDurableFork else {
             throw AgentProviderAdapterError.unsupported(
                 "provider fork schema changed after session recovery; keyed reconciliation is unavailable"
             )
@@ -5026,7 +5026,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         for intent in intents {
             let adapter = providerAdapterSnapshot(for: intent.provider)
-            guard let adapter, adapter.forkSafety(threadId: intent.sourceThreadId).supportsDurableFork else {
+            guard let adapter, (await ProviderCLIProbe.runOffCooperativePool { adapter.forkSafety(threadId: intent.sourceThreadId) }).supportsDurableFork else {
                 recordForkLaunchRecoveryError(
                     childThreadId: intent.childThread.id,
                     error: "Provider no longer exposes crash-safe fork recovery."
@@ -5067,7 +5067,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                try threadRepo.status(of: intent.sourceThreadId) != nil {
                 try await recoverAdapterSessionIfNeeded(threadId: intent.sourceThreadId, adapter: adapter)
             }
-            guard adapter.forkSafety(threadId: intent.sourceThreadId).supportsDurableFork else {
+            guard (await ProviderCLIProbe.runOffCooperativePool { adapter.forkSafety(threadId: intent.sourceThreadId) }).supportsDurableFork else {
                 throw AgentProviderAdapterError.unsupported(
                     "provider fork recovery schema is no longer compatible"
                 )

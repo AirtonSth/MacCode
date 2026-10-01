@@ -262,14 +262,17 @@ public final class UnixSocketServer: @unchecked Sendable {
     }
 
     private func acceptLoop(listenerFD: Int32, generation: UInt64) {
+        var retryBackoff = AcceptRetryBackoff()
         while isRunning(generation: generation) {
             var clientAddr = sockaddr()
             var clientLen = socklen_t(MemoryLayout<sockaddr>.size)
             let client = accept(listenerFD, &clientAddr, &clientLen)
             if client < 0 {
                 if !isRunning(generation: generation) { return }
+                if let delay = retryBackoff.delay(afterErrno: errno) { usleep(delay) }
                 continue
             }
+            retryBackoff.reset()
             guard Self.enableCloseOnExec(client) else {
                 close(client)
                 continue

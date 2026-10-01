@@ -342,6 +342,42 @@ final class TerminalSurfaceTeardownLeakTests: XCTestCase {
         XCTAssertFalse(surface.readerConfiguredForTesting)
     }
 
+    func test_neverCompletingDispositionReportsTimeoutInsteadOfParkingAWorker() throws {
+        // WHY: the observer waited with .distantFuture, so a child that never
+        // finishes disposition parked one GCD worker forever per terminal and
+        // health never reported the stuck reap. Ownership (childPID) must stay.
+        let neverFinishes = DispatchGroup()
+        neverFinishes.enter()
+        var spawnedPID: pid_t = -1
+        let surface = try TerminalSurface(
+            workspaceID: WorkspaceID(),
+            title: "never-finishing-disposition",
+            launch: .shell(cwd: NSTemporaryDirectory()),
+            nonBlockingEnabler: { _ in false },
+            nonBlockingFailureBarrierFactory: { pid in
+                spawnedPID = pid
+                return SurfaceTerminationBarrier(groups: [neverFinishes], completionChecks: [{ true }])
+            },
+            childDispositionObserverTimeout: 0.3
+        )
+        defer {
+            neverFinishes.leave()
+            _ = Darwin.kill(-spawnedPID, SIGKILL)
+            _ = Darwin.kill(spawnedPID, SIGKILL)
+            var status: Int32 = 0
+            _ = Darwin.waitpid(spawnedPID, &status, 0)
+        }
+
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline,
+              surface.runtimeHealth().terminalDeadReason != "process_reap_timeout" {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+
+        XCTAssertEqual(surface.runtimeHealth().terminalDeadReason, "process_reap_timeout")
+        XCTAssertEqual(surface.runtimeHealth().childPID, spawnedPID, "a timed-out observer must not drop child ownership")
+    }
+
     func test_reaperFinishesCapturedForegroundGroupAfterShellWasReaped() throws {
         let surface = try makeDeterministicReaperSurface(title: "foreground-group-reap")
         defer { surface.close() }

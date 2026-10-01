@@ -844,18 +844,21 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         // Parse with claudeUsageText (which prefers claudeUsageScreen patterns) so
         // modern "Current week (all models): N% used" headless output is accepted
         // without spawning an interactive PTY.
-        if let result = run(
-            binary: request.claudeBinary,
-            arguments: [
-                "-p",
-                "--output-format", "text",
-                "--no-session-persistence",
-                "--max-budget-usd", "0.01",
-                "/usage"
-            ],
-            cwd: request.cwd,
-            environment: request.environment
-        ), result.status == 0 || !result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        let binary = request.claudeBinary
+        let cwd = request.cwd
+        let environment = request.environment
+        let arguments = [
+            "-p",
+            "--output-format", "text",
+            "--no-session-persistence",
+            "--max-budget-usd", "0.01",
+            "/usage"
+        ]
+        let timeoutSeconds = self.timeoutSeconds
+        let result = await ProviderCLIProbe.runOffCooperativePool {
+            Self.run(binary: binary, arguments: arguments, cwd: cwd, environment: environment, timeoutSeconds: timeoutSeconds)
+        }
+        if let result, result.status == 0 || !result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            let usage = AssistantAccountUsageParser.claudeUsageText(result.stdout) {
             return usage
         }
@@ -1113,36 +1116,22 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         } catch {}
     }
 
-    private func run(
+    private static func run(
         binary: String,
         arguments: [String],
         cwd: String,
-        environment: [String: String]
+        environment: [String: String],
+        timeoutSeconds: TimeInterval
     ) -> CommandResult? {
-        guard let path = ProcessLocator.resolve(binary) else { return nil }
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: path)
-        proc.arguments = arguments
-        proc.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        proc.environment = CodexRunner.processEnvironment(overrides: environment, purpose: .supportProcess)
-        proc.standardInput = FileHandle.nullDevice
-        let out = Pipe()
-        proc.standardOutput = out
-        proc.standardError = FileHandle.nullDevice
-
-        let finished = DispatchSemaphore(value: 0)
-        proc.terminationHandler = { _ in finished.signal() }
-        do {
-            try proc.run()
-        } catch {
-            return nil
-        }
-        if finished.wait(timeout: .now() + timeoutSeconds) == .timedOut {
-            proc.terminate()
-            _ = finished.wait(timeout: .now() + 0.2)
-            return nil
-        }
-        let stdout = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        return CommandResult(status: proc.terminationStatus, stdout: stdout)
+        guard let path = ProcessLocator.resolve(binary),
+              let result = ProviderCLIProbe.run(
+                binaryPath: path,
+                arguments: arguments,
+                environment: environment,
+                runAsUser: nil,
+                timeoutSeconds: timeoutSeconds,
+                currentDirectory: cwd
+              ) else { return nil }
+        return CommandResult(status: result.status, stdout: result.stdout)
     }
 }

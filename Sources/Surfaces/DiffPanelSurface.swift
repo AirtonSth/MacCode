@@ -889,8 +889,10 @@ public final class DiffPanelViewModel: ObservableObject {
             p.standardOutput = pipe
             p.standardError = pipe
             do { try p.run() } catch { return (-1, error.localizedDescription) }
+            // Drain before waiting: hook output beyond the pipe buffer would block git forever.
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             p.waitUntilExit()
-            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let out = String(data: data, encoding: .utf8) ?? ""
             return (p.terminationStatus, out)
         }
         if !skipStage {

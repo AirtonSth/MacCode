@@ -1805,6 +1805,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     }
 
     private func acceptLoop(listenerDescriptor: Int32, acceptanceGeneration: UInt64) {
+        var retryBackoff = AcceptRetryBackoff()
         let registry = acceptedSockets
         while registry.isAccepting(generation: acceptanceGeneration) {
             var storage = sockaddr_storage()
@@ -1816,8 +1817,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
             if fd < 0 {
                 if !registry.isAccepting(generation: acceptanceGeneration) { return }
+                if let delay = retryBackoff.delay(afterErrno: errno) { usleep(delay) }
                 continue
             }
+            retryBackoff.reset()
             // Same close-on-exec rule as the listener: a child spawned while a
             // request is in flight must not hold the client connection open.
             guard Self.enableCloseOnExec(fd) else {
