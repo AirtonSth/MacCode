@@ -415,9 +415,11 @@ struct BotScheduleSpecEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.xxl) {
             editorGroup("Details") {
-                formRow("Provider") {
-                    specSourceCapsule
-                        .accessibilityIdentifier("bots.scheduleTasks.editor.provider")
+                if AgentSourceCapsulePresentation.isVisible(entryCount: specSourceEntries.count) {
+                    formRow("Provider") {
+                        specSourceCapsule
+                            .accessibilityIdentifier("bots.scheduleTasks.editor.provider")
+                    }
                 }
                 if spec.provider != .distill {
                     formRow("Model routing") {
@@ -499,6 +501,15 @@ struct BotScheduleSpecEditor: View {
         providers.filter { $0.provider == provider }
     }
 
+    private var specSourceEntries: [AgentSourceCapsulePresentation.MenuEntry] {
+        AgentSourceCapsulePresentation.menuEntries(
+            snapshots: providers,
+            selectedSnapshotId: spec.providerInstanceID,
+            selectedProvider: spec.provider,
+            providerDisplayName: { $0.rawValue.capitalized }
+        )
+    }
+
     private var specSourceCapsule: some View {
         AgentSourceCapsule(
             label: AgentSourceCapsulePresentation.capsuleLabel(
@@ -509,12 +520,7 @@ struct BotScheduleSpecEditor: View {
                 fallbackInstanceId: spec.providerInstanceID,
                 snapshots: providers
             ),
-            entries: AgentSourceCapsulePresentation.menuEntries(
-                snapshots: providers,
-                selectedSnapshotId: spec.providerInstanceID,
-                selectedProvider: spec.provider,
-                providerDisplayName: { $0.rawValue.capitalized }
-            ),
+            entries: specSourceEntries,
             runLocked: false,
             providerLocked: false,
             accessibilityIdentifier: "bots.scheduleTasks.editor.provider",
@@ -568,10 +574,11 @@ struct BotScheduleSpecEditor: View {
                     reasoningEfforts: selectedReasoningEfforts,
                     supportsMainEffortAuto: snapshot?.effectiveCapabilities.supportsDistillMainEffortAuto == true,
                     supportsReasoningModelEffort: snapshot?.effectiveCapabilities.supportsDistillReasoningModelEffort == true,
+                    configWorkerSummary: snapshot?.effectiveCapabilities.supportsDistillReasoningModelEffort == true
+                        ? nil : AgentDistillModelCatalog.configWorkerSummary(homePath: snapshot?.homePath),
                     isDisabled: false,
                     onSelectMainModel: { model in
                         spec.model = model
-                        if spec.reasoningModel == model { spec.reasoningModel = nil }
                     },
                     onSelectCustomMainModel: { model in spec.model = model },
                     onSelectReasoningModel: { spec.reasoningModel = $0 },

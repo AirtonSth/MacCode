@@ -8,6 +8,17 @@ import AgentRuntime
 /// twice per click (before CAS and after) just to flip routing.mode.
 @MainActor
 final class SetAutoModelRoutingSkipGetTests: XCTestCase {
+    // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
+    override class func setUp() {
+        super.setUp()
+        AgentProvider.selectableForTesting = AgentProvider.allCases
+    }
+
+    override class func tearDown() {
+        AgentProvider.selectableForTesting = nil
+        super.tearDown()
+    }
+
     func test_autoToggle_sourceSkipsDurableGet() throws {
         let source = try String(
             contentsOf: URL(fileURLWithPath: #filePath)

@@ -1262,7 +1262,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             manualSelection: manualSelection,
             manualProviderInstanceId: manualProviderInstanceId,
             eligibleProviders: configuration.eligibleProviders.isEmpty
-                ? AgentProvider.allCases
+                ? AgentProvider.selectable
                 : configuration.eligibleProviders,
             policyDigest: policyDigest,
             updatedAt: now()

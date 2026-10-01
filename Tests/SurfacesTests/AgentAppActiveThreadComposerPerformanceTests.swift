@@ -7,6 +7,17 @@ import AgentRuntime
 
 @MainActor
 final class AgentAppActiveThreadComposerPerformanceTests: XCTestCase {
+    // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
+    override class func setUp() {
+        super.setUp()
+        AgentProvider.selectableForTesting = AgentProvider.allCases
+    }
+
+    override class func tearDown() {
+        AgentProvider.selectableForTesting = nil
+        super.tearDown()
+    }
+
     /// WHY: the native editor reports both prompt edits and caret movement. While
     /// a thread is active, neither input event may publish the transcript-bearing
     /// view model, or SwiftUI rebuilds the long conversation for every keystroke.

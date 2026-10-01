@@ -55,8 +55,8 @@ public struct BotDeskRouting: Equatable, Codable {
     public var runAsUser: AgentRunAsUser
 
     public init(
-        provider: AgentProvider = .codex,
-        providerInstanceID: String = AgentProvider.codex.rawValue,
+        provider: AgentProvider = .defaultProvider,
+        providerInstanceID: String = AgentProvider.defaultProvider.rawValue,
         model: String = "",
         routingMode: AgentRoutingMode = .auto,
         permissionMode: AgentPermissionMode = .supervised,
@@ -78,6 +78,21 @@ public struct BotDeskRouting: Equatable, Codable {
         self.distillReasoningEffortSelection = distillReasoningEffortSelection
         self.serviceTier = serviceTier
         self.runAsUser = runAsUser ?? AgentRunAsUser.current()
+        migrateLegacyProvider()
+    }
+
+    /// RemoteCode runs Distill only: a saved Codex/Claude/Grok route becomes Distill defaults.
+    private mutating func migrateLegacyProvider() {
+        guard !provider.isSelectable else { return }
+        provider = .distill
+        providerInstanceID = AgentProvider.distill.rawValue
+        model = ""
+        routingMode = .manual
+        reasoningEffort = .medium
+        reasoningModel = nil
+        distillMainEffortSelection = nil
+        distillReasoningEffortSelection = nil
+        serviceTier = .auto
     }
 
     public init(from decoder: Decoder) throws {
@@ -95,6 +110,7 @@ public struct BotDeskRouting: Equatable, Codable {
         serviceTier = try container.decodeIfPresent(AgentServiceTier.self, forKey: .serviceTier) ?? .auto
         runAsUser = try container.decodeIfPresent(AgentRunAsUser.self, forKey: .runAsUser)
             ?? AgentRunAsUser.current()
+        migrateLegacyProvider()
     }
 
     /// A Bot has no provider of its own. Existing Desk threads restore the
@@ -236,6 +252,7 @@ public struct BotInspectorDraft: Equatable, Codable {
         routinePrompt = try container.decodeIfPresent(String.self, forKey: .routinePrompt) ?? ""
         routineScheduleNote = try container.decodeIfPresent(String.self, forKey: .routineScheduleNote) ?? ""
         routineSpec = try container.decodeIfPresent(BotScheduleSpec.self, forKey: .routineSpec)
+        routineSpec?.migrateLegacyProvider()
     }
 }
 
@@ -7911,7 +7928,6 @@ public final class BotsViewModel: ObservableObject {
     public func setDeskReasoningModel(_ model: String?) {
         let trimmed = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let selectedModel = trimmed.isEmpty ? nil : trimmed
-        guard selectedModel == nil || selectedModel != deskRouting.model else { return }
         var updated = deskRouting
         if selectedModel == nil {
             updated.distillReasoningEffortSelection = .automatic
@@ -7973,10 +7989,10 @@ public final class BotsViewModel: ObservableObject {
         if let reasoningModel = deskRouting.reasoningModel,
            let effort = deskDistillReasoningEffortSelection.effort {
             if !deskDistillReasoningEfforts.isEmpty, !deskDistillReasoningEfforts.contains(effort) {
-                return "Reasoning effort \(effort.displayName) is unavailable for \(reasoningModel). Choose Auto or a supported effort."
+                return "Worker effort \(effort.displayName) is unavailable for \(reasoningModel). Choose Auto or a supported effort."
             }
             if !deskSupportsDistillReasoningModelEffort {
-                return "Update the Distill ACP harness to apply a separate Reasoning-model effort."
+                return "Update the Distill ACP harness to apply a separate Worker-model effort."
             }
         }
         return nil
@@ -13233,7 +13249,9 @@ public struct BotsRootView: View {
     private var deskRoutingControls: some View {
         HStack(spacing: DS.Space.sm) {
             deskRunAsChip
-            deskSourceMenu
+            if AgentSourceCapsulePresentation.isVisible(entryCount: deskSourceEntries.count) {
+                deskSourceMenu
+            }
             deskModelMenu
             deskPermissionMenu
             deskExecutionChip
@@ -13257,13 +13275,17 @@ public struct BotsRootView: View {
         )
     }
 
-    private var deskSourceMenu: some View {
-        let entries = AgentSourceCapsulePresentation.menuEntries(
+    private var deskSourceEntries: [AgentSourceCapsulePresentation.MenuEntry] {
+        AgentSourceCapsulePresentation.menuEntries(
             snapshots: vm.providers,
             selectedSnapshotId: vm.deskRouting.providerInstanceID,
             selectedProvider: vm.deskRouting.provider,
             providerDisplayName: vm.providerChipTitle
         )
+    }
+
+    private var deskSourceMenu: some View {
+        let entries = deskSourceEntries
         let label = AgentSourceCapsulePresentation.capsuleLabel(
             selected: vm.selectedDeskSnapshot,
             fallbackProvider: vm.deskRouting.provider,
@@ -13340,6 +13362,8 @@ public struct BotsRootView: View {
                     reasoningEfforts: vm.deskDistillReasoningEfforts,
                     supportsMainEffortAuto: vm.deskSupportsDistillMainEffortAuto,
                     supportsReasoningModelEffort: vm.deskSupportsDistillReasoningModelEffort,
+                    configWorkerSummary: vm.deskSupportsDistillReasoningModelEffort
+                        ? nil : AgentDistillModelCatalog.configWorkerSummary(homePath: vm.selectedDeskSnapshot?.homePath),
                     width: 240,
                     isDisabled: deskRoutingLocked,
                     onSelectMainModel: { model in

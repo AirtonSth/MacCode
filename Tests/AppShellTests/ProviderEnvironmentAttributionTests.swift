@@ -280,6 +280,27 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func test_providerEnvironmentSetsDistillHomeForDistillOnly() throws {
+        // WHY: Distill 2.0.24 reads DISTILL_HOME and never adopts ~/.grok; an instance home must reach it, not GROK_HOME.
+        let appSupport = NSTemporaryDirectory() + "RC2ProvEnvDistillHome-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        try ctx.settingsRepo.set("agent.provider.instances", """
+        [
+          { "id": "distill-x", "provider": "distill", "displayName": "D", "homePath": "/tmp/distill-home-x", "enabled": true, "env": {} },
+          { "id": "grok-x", "provider": "grok", "displayName": "G", "homePath": "/tmp/grok-home-x", "enabled": true, "env": {} }
+        ]
+        """)
+        let router = AppCommandRouter(context: ctx)
+        let distill = router.providerEnvironment(provider: .distill, instanceId: "distill-x")
+        XCTAssertEqual(distill["DISTILL_HOME"], "/tmp/distill-home-x")
+        XCTAssertNil(distill["GROK_HOME"])
+        let grok = router.providerEnvironment(provider: .grok, instanceId: "grok-x")
+        XCTAssertEqual(grok["GROK_HOME"], "/tmp/grok-home-x")
+        XCTAssertNil(grok["DISTILL_HOME"])
+    }
+
     /// Token economy is paid: with Token Saver off, no distill hint / PostToolUse.
     /// With Token Saver on, every provider gets the distill hint; Claude also gets PostToolUse.
     @MainActor

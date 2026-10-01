@@ -4,6 +4,39 @@ import ServiceManagement
 @testable import AppShell
 
 final class ScheduledTaskRuntimeTests: XCTestCase {
+    // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
+    override class func setUp() {
+        super.setUp()
+        AgentProvider.selectableForTesting = AgentProvider.allCases
+    }
+
+    override class func tearDown() {
+        AgentProvider.selectableForTesting = nil
+        super.tearDown()
+    }
+
+    func test_legacyProviderTaskRunsAsDistill_becauseRunsMustNeverStartOtherProviders() {
+        AgentProvider.selectableForTesting = nil
+        defer { AgentProvider.selectableForTesting = AgentProvider.allCases }
+        var task = ScheduledTask(
+            title: "Nightly", prompt: "Run tests", workspaceID: WorkspaceID(), workspacePathSnapshot: "/tmp",
+            runAsUser: "sam", runAsUID: 501, provider: .distill, providerInstanceID: "distill",
+            model: "grok-4.6", reasoningEffort: .high,
+            recurrence: .daily(at: ScheduledLocalTime(hour: 9, minute: 0)!), timeZoneIdentifier: "UTC"
+        )
+        task.provider = .codex
+        task.providerInstanceID = "codex-cli"
+        task.model = "gpt-5.6-sol"
+
+        let resolved = ScheduledTaskExecutor.resolvingDistillDefaults(task)
+        XCTAssertEqual(resolved.provider, .distill)
+        XCTAssertEqual(resolved.providerInstanceID, "distill")
+        XCTAssertFalse(resolved.model.isEmpty, "an unset model resolves to the Distill catalog default")
+        XCTAssertNotEqual(resolved.model, "gpt-5.6-sol")
+        XCTAssertEqual(resolved.prompt, "Run tests")
+        XCTAssertTrue(resolved.validationErrors().isEmpty, "\(resolved.validationErrors())")
+    }
+
     func test_reconciledDueDateLeavesPastDueUnchanged_becauseMissedFiresAreSkippedOnlyOnLaunch() {
         // WHY: while the app is open, claimDue must still see next_run_at <= now.
         // Catch-up compression of a multi-day backlog is intentionally gone.
@@ -124,8 +157,8 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
     }
 
     @MainActor
-    func test_distillScheduleValidationRejectsDuplicateModelsAndUnsupportedEffortBeforeExecution() throws {
-        // WHY: unattended jobs must not create a thread with ambiguous models or an unsupported effort.
+    func test_distillScheduleValidationAllowsDuplicateModelsAndRejectsUnsupportedEffortBeforeExecution() throws {
+        // WHY: equal Main and Worker models are valid, but unsupported efforts must fail before execution.
         let snapshot = AgentProviderSnapshot(
             id: "distill",
             provider: .distill,
@@ -152,16 +185,13 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         var task = makeHourly(nextRunAt: nil)
         task.provider = .distill
         task.model = "main"
-        task.distillMainEffortSelection = .fixed(.low)
-        task.reasoningModel = "reason"
+        task.distillMainEffortSelection = .fixed(.high)
+        task.reasoningModel = "main"
         task.distillReasoningEffortSelection = .fixed(.high)
         let selection = ScheduledTaskExecutor.modelSelection(for: task)
-        XCTAssertEqual(selection.distillMainEffortSelection, .fixed(.low))
+        XCTAssertEqual(selection.distillMainEffortSelection, .fixed(.high))
         XCTAssertEqual(selection.distillReasoningEffortSelection, .fixed(.high))
-        XCTAssertThrowsError(try ScheduledTaskExecutor.validateDistillConfiguration(task, snapshot: snapshot)) {
-            XCTAssertEqual(($0 as? ScheduledTaskPreflightError)?.description,
-                           ScheduledTaskPreflightError.unsupportedReasoning("Low").description)
-        }
+        XCTAssertNoThrow(try ScheduledTaskExecutor.validateDistillConfiguration(task, snapshot: snapshot))
 
         task.distillMainEffortSelection = .fixed(.high)
         task.distillReasoningEffortSelection = .fixed(.low)
@@ -181,10 +211,8 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
 
         task.model = "reason"
         task.reasoningModel = "reason"
-        XCTAssertThrowsError(try ScheduledTaskExecutor.validateDistillConfiguration(task, snapshot: snapshot)) {
-            XCTAssertEqual(($0 as? ScheduledTaskPreflightError)?.description,
-                           ScheduledTaskPreflightError.invalidTask("Main and Reasoning Distill models must differ.").description)
-        }
+        task.distillReasoningEffortSelection = .fixed(.high)
+        XCTAssertNoThrow(try ScheduledTaskExecutor.validateDistillConfiguration(task, snapshot: snapshot))
     }
 
     func test_autoRoutingConfigurationCarriesScheduledFallbackAndEligibleProviders() {

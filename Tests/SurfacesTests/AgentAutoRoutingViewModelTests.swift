@@ -6,6 +6,17 @@ import CoreModel
 
 @MainActor
 final class AgentAutoRoutingViewModelTests: XCTestCase {
+    // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
+    override class func setUp() {
+        super.setUp()
+        AgentProvider.selectableForTesting = AgentProvider.allCases
+    }
+
+    override class func tearDown() {
+        AgentProvider.selectableForTesting = nil
+        super.tearDown()
+    }
+
     private func fixture(defaults suppliedDefaults: UserDefaults? = nil) throws -> (AgentAppViewModel, AgentThreadRepository, String) {
         let suiteName = "rc-auto-vm-" + UUID().uuidString
         let root = NSTemporaryDirectory() + suiteName

@@ -12,6 +12,17 @@ import CoreModel
 // delete for a short window without deferring the actual DELETE.
 @MainActor
 final class AgentThreadDeletionUndoTests: XCTestCase {
+    // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
+    override class func setUp() {
+        super.setUp()
+        AgentProvider.selectableForTesting = AgentProvider.allCases
+    }
+
+    override class func tearDown() {
+        AgentProvider.selectableForTesting = nil
+        super.tearDown()
+    }
+
 
     private struct RelationalFingerprint: Equatable {
         var messageIds: [String]

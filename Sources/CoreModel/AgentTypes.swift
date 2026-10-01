@@ -485,7 +485,7 @@ public struct AgentRoutingConfiguration: Codable, Sendable, Equatable {
         mode: AgentRoutingMode,
         manualSelection: AgentModelSelection,
         manualProviderInstanceId: String? = nil,
-        eligibleProviders: [AgentProvider] = AgentProvider.allCases,
+        eligibleProviders: [AgentProvider] = AgentProvider.selectable,
         policyDigest: String = "",
         revision: Int = 0,
         updatedAt: Date = Date()
@@ -1158,7 +1158,7 @@ public enum AgentProviderRunnableSelection {
     }
 
     /// Prefer the current selection when runnable; otherwise the first runnable
-    /// snapshot in `AgentProvider.allCases` order. If nothing is runnable,
+    /// snapshot in `AgentProvider.selectable` order. If nothing is runnable,
     /// keep the preferred row so recovery UI can still name the failure.
     public static func resolve(
         snapshots: [AgentProviderSnapshot],
@@ -1172,7 +1172,7 @@ public enum AgentProviderRunnableSelection {
         ), isRunnable(current) {
             return current
         }
-        for provider in AgentProvider.allCases {
+        for provider in AgentProvider.selectable {
             if let snap = snapshots.first(where: { $0.provider == provider && isRunnable($0) }) {
                 return snap
             }

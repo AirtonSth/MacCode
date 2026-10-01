@@ -3,6 +3,17 @@ import CoreModel
 @testable import Persistence
 
 final class ScheduledTaskStoreTests: XCTestCase {
+    // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
+    override class func setUp() {
+        super.setUp()
+        AgentProvider.selectableForTesting = AgentProvider.allCases
+    }
+
+    override class func tearDown() {
+        AgentProvider.selectableForTesting = nil
+        super.tearDown()
+    }
+
     private var db: SQLiteDB!
     private var store: ScheduledTaskStore!
 

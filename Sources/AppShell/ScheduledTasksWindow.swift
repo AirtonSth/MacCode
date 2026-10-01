@@ -48,8 +48,8 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
         workspacePathSnapshot = task?.workspacePathSnapshot ?? ""
         runAsUser = task?.runAsUser ?? NSUserName()
         runAsUID = task?.runAsUID ?? ScheduledSystemUserCatalog.user(named: NSUserName())?.uid ?? 0
-        provider = task?.provider ?? .codex
-        providerInstanceID = task?.providerInstanceID ?? "codex"
+        provider = task?.provider ?? .defaultProvider
+        providerInstanceID = task?.providerInstanceID ?? AgentProvider.defaultProvider.rawValue
         model = task?.model ?? ""
         reasoningEffort = task?.reasoningEffort ?? .high
         reasoningModel = task?.reasoningModel
@@ -1454,9 +1454,11 @@ private struct ScheduledTaskEditorView: View {
                         // Parity with Agent App: one Provider/Source capsule only
                         // (Codex / Claude / Grok). Instance id is derived from the
                         // selected provider's primary snapshot and stays in the model.
-                        formRow("Provider") {
-                            editorSourceCapsule
-                                .accessibilityIdentifier("scheduledTasks.editor.provider")
+                        if AgentSourceCapsulePresentation.isVisible(entryCount: editorSourceEntries.count) {
+                            formRow("Provider") {
+                                editorSourceCapsule
+                                    .accessibilityIdentifier("scheduledTasks.editor.provider")
+                            }
                         }
                         if draft.provider != .distill {
                             formRow("Model routing") {
@@ -1696,6 +1698,15 @@ private struct ScheduledTaskEditorView: View {
         )
     }
 
+    private var editorSourceEntries: [AgentSourceCapsulePresentation.MenuEntry] {
+        AgentSourceCapsulePresentation.menuEntries(
+            snapshots: vm.providers,
+            selectedSnapshotId: draft.providerInstanceID,
+            selectedProvider: draft.provider,
+            providerDisplayName: { $0.rawValue.capitalized }
+        )
+    }
+
     private var editorSourceCapsule: some View {
         AgentSourceCapsule(
             label: AgentSourceCapsulePresentation.capsuleLabel(
@@ -1706,12 +1717,7 @@ private struct ScheduledTaskEditorView: View {
                 fallbackInstanceId: draft.providerInstanceID,
                 snapshots: vm.providers
             ),
-            entries: AgentSourceCapsulePresentation.menuEntries(
-                snapshots: vm.providers,
-                selectedSnapshotId: draft.providerInstanceID,
-                selectedProvider: draft.provider,
-                providerDisplayName: { $0.rawValue.capitalized }
-            ),
+            entries: editorSourceEntries,
             runLocked: false,
             providerLocked: false,
             accessibilityIdentifier: "scheduledTasks.editor.provider",
@@ -1765,6 +1771,8 @@ private struct ScheduledTaskEditorView: View {
                     reasoningEfforts: selectedReasoningEfforts,
                     supportsMainEffortAuto: selectedSnapshot?.effectiveCapabilities.supportsDistillMainEffortAuto == true,
                     supportsReasoningModelEffort: selectedSnapshot?.effectiveCapabilities.supportsDistillReasoningModelEffort == true,
+                    configWorkerSummary: selectedSnapshot?.effectiveCapabilities.supportsDistillReasoningModelEffort == true
+                        ? nil : AgentDistillModelCatalog.configWorkerSummary(homePath: selectedSnapshot?.homePath),
                     isDisabled: false,
                     onSelectMainModel: { draft.model = $0 },
                     onSelectCustomMainModel: { draft.model = $0 },

@@ -65,6 +65,9 @@ public enum HostMutationContract {
     agent.attachment.upload
     agent.attachment.import
     agent.provider.update
+    distill.accounts.login
+    distill.accounts.logout
+    distill.accounts.cancel
     fs.workspace.create_file
     fs.workspace.delete
     fs.workspace.rename

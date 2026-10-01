@@ -55,28 +55,47 @@ final class AgentDistillModelPickerRedesignTests: XCTestCase {
         XCTAssertEqual(AgentDistillModelCatalog.filtered(models, query: "   ").map(\.id), ["a", "b"])
     }
 
-    // MARK: - Collapse with selection pinning
+    // MARK: - Provider grouping and display labels
 
-    func test_visibleModels_collapsesBeyondLimitAndPinsSelected() {
-        let models = (1...8).map { distillModel("model-\($0)") }
+    func test_providerGroups_orderModelsAndShortLabels() {
+        let models = [
+            distillModel("custom/vendor", label: "Vendor (OpenRouter)"),
+            distillModel("claude/sonnet", label: "Sonnet (Claude)"),
+            distillModel("chatgpt/gpt", label: "GPT (ChatGPT)"),
+            distillModel("grok-4", label: "Grok 4"),
+        ]
+        XCTAssertEqual(AgentDistillModelCatalog.providerGroups(models).map(\.0), ["Grok", "ChatGPT", "Claude", "Custom"])
+        XCTAssertEqual(AgentDistillModelCatalog.shortLabel("GPT (ChatGPT)"), "GPT")
+        XCTAssertEqual(AgentDistillModelCatalog.shortLabel("Sonnet"), "Sonnet")
+        XCTAssertEqual(AgentDistillModelCatalog.effortOptionLabels([.low, .high]), ["Auto", "Low", "High"])
+    }
 
-        let collapsed = AgentDistillModelCatalog.visibleModels(models, selectedID: "model-7", expanded: false)
-        XCTAssertEqual(collapsed.map(\.id), ["model-1", "model-2", "model-3", "model-4", "model-7"],
-                       "collapsed list shows the prefix plus the pinned selection")
-
-        let collapsedVisibleSelection = AgentDistillModelCatalog.visibleModels(models, selectedID: "model-2", expanded: false)
-        XCTAssertEqual(collapsedVisibleSelection.map(\.id), ["model-1", "model-2", "model-3", "model-4"],
-                       "an already-visible selection must not duplicate a row")
-
-        let expanded = AgentDistillModelCatalog.visibleModels(models, selectedID: "model-7", expanded: true)
-        XCTAssertEqual(expanded.map(\.id), models.map(\.id), "Show-all must list every model")
-
-        let short = Array(models.prefix(3))
-        XCTAssertEqual(
-            AgentDistillModelCatalog.visibleModels(short, selectedID: nil, expanded: false).map(\.id),
-            ["model-1", "model-2", "model-3"],
-            "short lists never collapse, so no Show-all row appears"
+    func test_configWorkerSummary_readsConfigForSharedWorkerFallback() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try """
+        [models]
+        worker = "claude/sonnet (Claude)"
+        worker_effort = "high"
+        """.write(
+            to: home.appendingPathComponent("config.toml"),
+            atomically: true,
+            encoding: .utf8
         )
+
+        let summary = AgentDistillModelCatalog.configWorkerSummary(homePath: home.path)
+        XCTAssertEqual(summary, "From Distill config: claude/sonnet · high")
+        let section = AgentDistillReasoningModelSection(
+            mainModel: "main",
+            reasoningModel: nil,
+            reasoningModels: [],
+            supportsReasoningModelEffort: false,
+            configWorkerSummary: summary,
+            isDisabled: false,
+            onSelectReasoningModel: { _ in }
+        )
+        XCTAssertTrue(section.showsConfigFallback)
     }
 
     // MARK: - Width estimator
@@ -147,8 +166,8 @@ final class AgentDistillModelPickerRedesignTests: XCTestCase {
         let missing = AgentModelPillPresentation(title: "gpt-6-astra", effort: "Auto", prefix: "Main", warning: true)
         XCTAssertEqual(missing.accessibilityLabel, "Main model gpt-6-astra, effort Auto, unavailable")
 
-        let reasoning = AgentModelPillPresentation(title: "Off", prefix: "Reasoning", warning: false)
-        XCTAssertEqual(reasoning.accessibilityLabel, "Reasoning model Off")
+        let reasoning = AgentModelPillPresentation(title: "Off", prefix: "Worker", warning: false)
+        XCTAssertEqual(reasoning.accessibilityLabel, "Worker model Off")
     }
 
     func test_pillPresentation_legacyShapeIsUnchanged() {

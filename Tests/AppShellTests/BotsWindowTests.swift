@@ -11,6 +11,17 @@ import Surfaces
 
 @MainActor
 final class BotsWindowTests: XCTestCase {
+    // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
+    override class func setUp() {
+        super.setUp()
+        AgentProvider.selectableForTesting = AgentProvider.allCases
+    }
+
+    override class func tearDown() {
+        AgentProvider.selectableForTesting = nil
+        super.tearDown()
+    }
+
     private var directory: String!
 
     override func setUpWithError() throws {
@@ -46,6 +57,30 @@ final class BotsWindowTests: XCTestCase {
             try? FileManager.default.removeItem(atPath: directory)
         }
         directory = nil
+    }
+
+    func test_botDeskRoutingWithLegacyProviderRunsAsDistill_becauseSavedBotsMustNeverStartOtherProviders() throws {
+        AgentProvider.selectableForTesting = nil
+        defer { AgentProvider.selectableForTesting = AgentProvider.allCases }
+        let legacy = BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus", routingMode: .auto)
+        XCTAssertEqual(legacy.provider, .distill)
+        XCTAssertEqual(legacy.providerInstanceID, "distill")
+        XCTAssertEqual(legacy.model, "")
+        XCTAssertEqual(legacy.routingMode, .manual)
+        XCTAssertEqual(BotDeskRouting().provider, .distill)
+
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(BotDeskRouting())) as? [String: Any]
+        )
+        object["provider"] = "codex"
+        object["providerInstanceID"] = "codex-cli"
+        object["model"] = "gpt-5.6-sol"
+        let restored = try JSONDecoder().decode(
+            BotDeskRouting.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        XCTAssertEqual(restored.provider, .distill)
+        XCTAssertEqual(restored.model, "")
     }
 
     func test_deskSendAdmitsAndClearsAttachments_becauseAnexosMustReachTheTurn() async throws {

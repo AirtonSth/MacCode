@@ -168,60 +168,44 @@ final class AgentSourceCapsulePresentationTests: XCTestCase {
         XCTAssertEqual(warning?.isWarning, true)
     }
 
-    func test_menuEntries_keepSelectedDisabledSnapshotVisible() {
-        let personal = makeSnapshot(id: "codex-personal", provider: .codex, displayName: "Codex Personal", enabled: true)
-        let work = makeSnapshot(id: "codex-work", provider: .codex, displayName: "Codex Work", enabled: false)
+    func test_menuEntries_offerOnlyDistill_becauseLegacyProvidersAreNoLongerSelectable() {
+        let codex = makeSnapshot(id: "codex-cli", provider: .codex, displayName: "Codex", enabled: true)
+        let distill = makeSnapshot(id: "distill-acp", provider: .distill, displayName: "Distill", enabled: true)
         let entries = AgentSourceCapsulePresentation.menuEntries(
-            snapshots: [personal, work],
-            selectedSnapshotId: "codex-work",
-            selectedProvider: .codex,
-            providerDisplayName: { $0.rawValue.capitalized }
-        )
-        let ids = entries.map(\.id)
-        XCTAssertTrue(ids.contains("codex-personal") && ids.contains("codex-work"),
-                      "a thread bound to a now-disabled instance must still show that account so it is not silently rewritten")
-        // Providers absent from discovery remain selectable alongside Codex instances.
-        XCTAssertTrue(ids.contains("claude") && ids.contains("grok") && ids.contains("distill"),
-                      "missing providers, including Distill, remain available in the account picker")
-        XCTAssertEqual(entries.first(where: { $0.id == "distill" })?.title, "Distill")
-        XCTAssertEqual(entries.first(where: { $0.id == "codex-work" })?.isSelected, true)
-        XCTAssertEqual(entries.first(where: { $0.id == "codex-personal" })?.isSelected, false)
-    }
-
-    func test_menuEntries_fallBackToProvidersWhenSnapshotsEmpty() {
-        let entries = AgentSourceCapsulePresentation.menuEntries(
-            snapshots: [],
-            selectedSnapshotId: nil,
-            selectedProvider: .claude,
-            providerDisplayName: { $0.rawValue.capitalized }
-        )
-        XCTAssertEqual(entries.map(\.id), AgentProvider.allCases.map(\.rawValue),
-                       "before snapshots load, the capsule must still offer the built-in provider set")
-        XCTAssertEqual(entries.first(where: { $0.id == "claude" })?.isSelected, true)
-    }
-
-    func test_menuEntries_alwaysOfferEveryProviderOnCodexOnlyDiscovery() {
-        // Regression (Airton): empty Agent App / no threads, discovery only
-        // returned Codex. The Source capsule collapsed to a non-interactive
-        // single label ("click does nothing") because enabledSourceCount == 1.
-        // Missing providers must still appear so Claude/Grok remain selectable
-        // before the first message.
-        let codexOnly = makeSnapshot(id: "codex-cli", provider: .codex, displayName: "Codex", enabled: true)
-        let entries = AgentSourceCapsulePresentation.menuEntries(
-            snapshots: [codexOnly],
+            snapshots: [codex, distill],
             selectedSnapshotId: "codex-cli",
             selectedProvider: .codex,
             providerDisplayName: { $0.rawValue.capitalized }
         )
-        let ids = Set(entries.map(\.id))
-        XCTAssertTrue(ids.contains("codex-cli"), "Codex instance row must remain")
-        XCTAssertTrue(ids.contains("claude") || entries.contains(where: { $0.title == "Claude" }),
-                      "Claude must appear even when discovery returned Codex only")
-        XCTAssertTrue(ids.contains("grok") || entries.contains(where: { $0.title == "Grok" }),
-                      "Grok must appear even when discovery returned Codex only")
-        XCTAssertGreaterThan(entries.count, 1,
-                             "more than one source is required for an interactive pre-thread switcher")
-        XCTAssertEqual(entries.first(where: { $0.id == "codex-cli" })?.isSelected, true)
+        XCTAssertEqual(entries.map(\.id), ["distill-acp"])
+        XCTAssertFalse(AgentSourceCapsulePresentation.isVisible(entryCount: entries.count),
+                       "one Distill instance means no choice, so the capsule is removed")
+        XCTAssertTrue(AgentSourceCapsulePresentation.isVisible(entryCount: 2))
+    }
+
+    func test_menuEntries_fallBackToDistillWhenSnapshotsEmpty() {
+        let entries = AgentSourceCapsulePresentation.menuEntries(
+            snapshots: [],
+            selectedSnapshotId: nil,
+            selectedProvider: .distill,
+            providerDisplayName: { $0.rawValue.capitalized }
+        )
+        XCTAssertEqual(entries.map(\.id), ["distill"])
+        XCTAssertEqual(entries.first?.isSelected, true)
+    }
+
+    func test_menuEntries_keepSecondDistillInstance_becauseAccountsRemainAChoice() {
+        let personal = makeSnapshot(id: "distill-personal", provider: .distill, displayName: "Distill Personal")
+        let work = makeSnapshot(id: "distill-work", provider: .distill, displayName: "Distill Work")
+        let entries = AgentSourceCapsulePresentation.menuEntries(
+            snapshots: [personal, work],
+            selectedSnapshotId: "distill-work",
+            selectedProvider: .distill,
+            providerDisplayName: { $0.rawValue.capitalized }
+        )
+        XCTAssertEqual(entries.map(\.id), ["distill-personal", "distill-work"])
+        XCTAssertEqual(entries.first(where: { $0.id == "distill-work" })?.isSelected, true)
+        XCTAssertTrue(AgentSourceCapsulePresentation.isVisible(entryCount: entries.count))
     }
 
     private func makeSnapshot(

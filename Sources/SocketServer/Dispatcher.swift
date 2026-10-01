@@ -141,6 +141,11 @@ public protocol CommandRouting: AnyObject {
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
     /// Sticky glanceable Token Saver payload for deterministic iOS pull.
     func tokenSaverDigest() -> JSONValue?
+    func setAgentWorkerModel(thread: AgentThreadID, model: String?) throws -> AgentThread
+    func listDistillAccounts() -> JSONValue
+    func loginDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue
+    func logoutDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue
+    func cancelDistillAccountOperation() throws -> JSONValue
     func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread]
     func listAgentThreadsOffMain(workspace: WorkspaceID?) async throws -> [AgentThread]
     func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?) throws -> AgentThread
@@ -351,6 +356,11 @@ public protocol CommandRouting: AnyObject {
 public extension CommandRouting {
     /// Test/fake hosts may omit Token Saver entirely.
     func tokenSaverDigest() -> JSONValue? { nil }
+    func setAgentWorkerModel(thread: AgentThreadID, model: String?) throws -> AgentThread { throw JSONRPCError.notSupported("Worker model selection") }
+    func listDistillAccounts() -> JSONValue { .object(["accounts": .array([]), "busy_provider": .null, "last_error": .null]) }
+    func loginDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue { throw JSONRPCError.notSupported("Distill account management") }
+    func logoutDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue { throw JSONRPCError.notSupported("Distill account management") }
+    func cancelDistillAccountOperation() throws -> JSONValue { throw JSONRPCError.notSupported("Distill account management") }
 
     func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws {}
 
@@ -901,6 +911,9 @@ public final class JSONRPCDispatcher {
         "agent.attachment.upload",
         "agent.attachment.import",
         "agent.provider.update",
+        "distill.accounts.login",
+        "distill.accounts.logout",
+        "distill.accounts.cancel",
     ]
     private nonisolated static let canonicalImmediateEventMethods: Set<String> = Set([
         "agent.message.send",
@@ -3149,7 +3162,7 @@ public final class JSONRPCDispatcher {
             case "agent.thread.create", "host.agent.thread.create":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
                 let title = params["title"]?.stringValue ?? "New thread"
-                let modelSelection = modelSelection(from: params["model_selection"])
+                let modelSelection = try modelSelection(from: params)
                 let provider = modelSelection?.provider ?? (AgentProvider(rawValue: params["provider"]?.stringValue ?? "codex") ?? .codex)
                 let model = modelSelection?.effectiveModel ?? params["model"]?.stringValue ?? "fake-model"
                 let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init) ?? .supervised
@@ -3160,12 +3173,13 @@ public final class JSONRPCDispatcher {
                 let createSurfaceID = (params["surface_id"]?.stringValue ?? params["surfaceId"]?.stringValue).flatMap(UUID.init).map(SurfaceID.init)
                 let routing = try routingRequest(from: params, requireManualSelection: true)
                 let nestedRunContext = try nestedRunContext(from: params)
-                let t = try await router.createAgentThreadRouting(workspace: wid, title: title, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, surfaceID: createSurfaceID, routing: routing, nestedRunContext: nestedRunContext)
+                var t = try await router.createAgentThreadRouting(workspace: wid, title: title, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, surfaceID: createSurfaceID, routing: routing, nestedRunContext: nestedRunContext)
+                if params["worker_model"] != nil { t = try router.setAgentWorkerModel(thread: t.id, model: workerModel(from: params)) }
                 EventBus.shared.publish(kind: .agentThreadCreated, payload: threadPayload(t))
                 return .init(id: id, result: encodeThread(t))
             case "agent.thread.configure":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
-                let modelSelection = modelSelection(from: params["model_selection"])
+                let modelSelection = try modelSelection(from: params)
                 let provider = modelSelection?.provider ?? params["provider"]?.stringValue.flatMap(AgentProvider.init)
                 let model = modelSelection?.effectiveModel ?? params["model"]?.stringValue
                 let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init)
@@ -3174,7 +3188,8 @@ public final class JSONRPCDispatcher {
                 let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
                 let runAsUser = decodeRunAsUser(from: params["run_as_user"] ?? params["runAsUser"])
                 let routing = try routingRequest(from: params, requireManualSelection: true)
-                let t = try await router.configureAgentThreadRouting(thread: tid, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, routing: routing)
+                var t = try await router.configureAgentThreadRouting(thread: tid, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, routing: routing)
+                if params["worker_model"] != nil { t = try router.setAgentWorkerModel(thread: tid, model: workerModel(from: params)) }
                 var payload: [String: JSONValue] = [
                     "thread_id": .string(t.id.value.uuidString),
                     "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
@@ -3191,6 +3206,7 @@ public final class JSONRPCDispatcher {
                 payload["runAsUser"] = encodeRunAsUser(t.runAsUser)
                 payload["provider_locked"] = .bool(providerLocked(t))
                 payload["providerLocked"] = .bool(providerLocked(t))
+                appendFlatModelSelection(t, to: &payload)
                 appendRouting(t.effectiveRoutingConfiguration, to: &payload)
                 EventBus.shared.publish(kind: .agentThreadUpdated, payload: .object(payload))
                 return .init(id: id, result: encodeThread(t))
@@ -3204,7 +3220,7 @@ public final class JSONRPCDispatcher {
             case "agent.thread.prepare_pr":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let url = params["url"]?.stringValue else { throw JSONRPCError.invalidParams }
-                let modelSelection = modelSelection(from: params["model_selection"])
+                let modelSelection = try modelSelection(from: params)
                 let provider = modelSelection?.provider ?? (AgentProvider(rawValue: params["provider"]?.stringValue ?? "codex") ?? .codex)
                 let model = modelSelection?.effectiveModel ?? params["model"]?.stringValue ?? "fake-model"
                 let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init) ?? .supervised
@@ -3255,7 +3271,7 @@ public final class JSONRPCDispatcher {
                 if let (_, cached) = commandReceipt(method: req.method, params: params) {
                     return .init(id: id, result: cached)
                 }
-                let modelSelection = modelSelection(from: params["model_selection"])
+                let modelSelection = try modelSelection(from: params)
                 let provider = modelSelection?.provider ?? params["provider"]?.stringValue.flatMap(AgentProvider.init)
                 let model = modelSelection?.effectiveModel ?? params["model"]?.stringValue
                 let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init)
@@ -3267,9 +3283,10 @@ public final class JSONRPCDispatcher {
                 let routing = try routingRequest(from: params, requireManualSelection: false)
                 let nestedRunContext = try nestedRunContext(from: params)
                 if routing?.mode == .auto,
-                   ["provider", "provider_instance_id", "providerInstanceId", "model", "reasoning_effort", "service_tier", "model_selection"].contains(where: { params[$0] != nil }) {
+                   ["provider", "provider_instance_id", "providerInstanceId", "model", "reasoning_effort", "service_tier", "model_selection", "distill_main_effort", "worker_model", "worker_effort"].contains(where: { params[$0] != nil }) {
                     throw JSONRPCError.invalidParams
                 }
+                if params["worker_model"] != nil { _ = try router.setAgentWorkerModel(thread: tid, model: workerModel(from: params)) }
                 let sendResult = try await router.sendAgentMessageRouting(
                     thread: tid,
                     text: text,
@@ -3345,7 +3362,7 @@ public final class JSONRPCDispatcher {
                 if let (_, cached) = commandReceipt(method: req.method, params: params) {
                     return .init(id: id, result: cached)
                 }
-                let modelSelection = modelSelection(from: params["model_selection"])
+                let modelSelection = try modelSelection(from: params)
                 let provider = modelSelection?.provider ?? params["provider"]?.stringValue.flatMap(AgentProvider.init)
                 let model = modelSelection?.effectiveModel ?? params["model"]?.stringValue
                 let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init)
@@ -4088,6 +4105,16 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: encode(models))
             case "agent.providers.list":
                 return .init(id: id, result: encode(await router.listAgentProviderSnapshots()))
+            case "distill.accounts.list":
+                return .init(id: id, result: router.listDistillAccounts())
+            case "distill.accounts.login":
+                guard let raw = params["provider"]?.stringValue, let provider = DistillAccountProvider(rawValue: raw) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.loginDistillAccount(provider))
+            case "distill.accounts.logout":
+                guard let raw = params["provider"]?.stringValue, let provider = DistillAccountProvider(rawValue: raw) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.logoutDistillAccount(provider))
+            case "distill.accounts.cancel":
+                return .init(id: id, result: try router.cancelDistillAccountOperation())
             case "agent.run_as_users.list":
                 return .init(id: id, result: encode(try router.listAgentRunAsUsers()))
             case "agent.provider.update":
@@ -4644,7 +4671,7 @@ public final class JSONRPCDispatcher {
         "agent.thread.read", "agent.checkpoint.list", "agent.checkpoint.diff",
         "git.status", "git.branches", "git.log", "git.diff", "git.pull_request_url", "git.delivery_plan",
         "project.scripts",
-        "agent.models.list", "agent.providers.list", "agent.run_as_users.list", "agent.state.current", "agent.prompt_history",
+        "agent.models.list", "agent.providers.list", "distill.accounts.list", "agent.run_as_users.list", "agent.state.current", "agent.prompt_history",
         "bot.list", "bot.get", "bot.settings.get", "bot.queue.list", "bot.conversation.list", "bot.attachment.list",
         "bot.routine.list", "bot.files.list", "bot.browser.state", "bot.guest.state",
         "bot.receipt.status", "bot.peer.receipt.status", "bot.attention.list",
@@ -4871,6 +4898,7 @@ public final class JSONRPCDispatcher {
         object["displayTitle"] = .string(display)
         object["display_title"] = .string(display)
         object["model_selection"] = encode(thread.modelSelection)
+        appendFlatModelSelection(thread, to: &object)
         object["provider_instance_id"] = thread.providerInstanceId.map { .string($0) } ?? .null
         object["execution_mode"] = .string(thread.executionMode.rawValue)
         object["base_branch"] = thread.baseBranch.map { .string($0) } ?? .null
@@ -4895,6 +4923,7 @@ public final class JSONRPCDispatcher {
         object["displayTitle"] = .string(display)
         object["display_title"] = .string(display)
         object["model_selection"] = encode(thread.modelSelection)
+        appendFlatModelSelection(thread, to: &object)
         object["provider_instance_id"] = thread.providerInstanceId.map { .string($0) } ?? .null
         object["execution_mode"] = .string(thread.executionMode.rawValue)
         object["base_branch"] = thread.baseBranch.map { .string($0) } ?? .null
@@ -4909,6 +4938,12 @@ public final class JSONRPCDispatcher {
         appendRouting(thread.effectiveRoutingConfiguration, to: &object)
         appendActiveRun(to: &object, thread: thread.id)
         return .object(object)
+    }
+
+    private func appendFlatModelSelection(_ thread: AgentThread, to object: inout [String: JSONValue]) {
+        object["distill_main_effort"] = .string(thread.modelSelection.distillMainEffortSelection?.effort?.rawValue ?? "auto")
+        object["worker_model"] = .string(thread.reasoningModel ?? "")
+        object["worker_effort"] = .string(thread.modelSelection.distillReasoningEffortSelection?.effort?.rawValue ?? "auto")
     }
 
     private func encodeRunAsUser(_ user: AgentRunAsUser?) -> JSONValue {
@@ -5105,6 +5140,40 @@ public final class JSONRPCDispatcher {
         return .object(object)
     }
 
+    private func modelSelection(from params: [String: JSONValue]) throws -> AgentModelSelection? {
+        let nested = modelSelection(from: params["model_selection"])
+        let hasFlat = params["distill_main_effort"] != nil || params["worker_model"] != nil || params["worker_effort"] != nil
+        guard nested != nil || hasFlat else { return nil }
+        let provider = nested?.provider ?? AgentProvider(rawValue: params["provider"]?.stringValue ?? "distill") ?? .distill
+        var selection = nested ?? AgentModelSelection(
+            provider: provider,
+            modelId: params["model"]?.stringValue ?? "",
+            reasoningEffort: params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init) ?? .medium,
+            serviceTier: params["service_tier"]?.stringValue.flatMap(AgentServiceTier.init) ?? .auto
+        )
+        if let raw = params["distill_main_effort"] {
+            guard let value = raw.stringValue else { throw JSONRPCError.invalidParams }
+            selection.distillMainEffortSelection = try effortSelection(value)
+        }
+        if let raw = params["worker_effort"] {
+            guard let value = raw.stringValue else { throw JSONRPCError.invalidParams }
+            selection.distillReasoningEffortSelection = try effortSelection(value)
+        }
+        return selection
+    }
+
+    private func effortSelection(_ raw: String) throws -> AgentEffortSelection {
+        if raw == "auto" { return .automatic }
+        guard let effort = AgentReasoningEffort(rawValue: raw) else { throw JSONRPCError.invalidParams }
+        return .fixed(effort)
+    }
+
+    private func workerModel(from params: [String: JSONValue]) throws -> String? {
+        guard let value = params["worker_model"] else { return nil }
+        guard let model = value.stringValue else { throw JSONRPCError.invalidParams }
+        return model.isEmpty ? nil : model
+    }
+
     private func modelSelection(from value: JSONValue?) -> AgentModelSelection? {
         guard case .object(let object) = value else { return nil }
         guard let providerValue = object["provider"]?.stringValue,
@@ -5296,6 +5365,9 @@ public final class JSONRPCDispatcher {
             "reasoning_effort": .string(thread.reasoningEffort.rawValue),
             "service_tier": .string(thread.serviceTier.rawValue),
             "model_selection": encode(thread.modelSelection),
+            "distill_main_effort": .string(thread.modelSelection.distillMainEffortSelection?.effort?.rawValue ?? "auto"),
+            "worker_model": .string(thread.reasoningModel ?? ""),
+            "worker_effort": .string(thread.modelSelection.distillReasoningEffortSelection?.effort?.rawValue ?? "auto"),
             "execution_mode": .string(thread.executionMode.rawValue),
             "interaction_mode": .string(thread.effectiveInteractionMode.rawValue),
             "interactionMode": .string(thread.effectiveInteractionMode.rawValue),

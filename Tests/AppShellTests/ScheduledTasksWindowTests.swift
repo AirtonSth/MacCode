@@ -4,6 +4,17 @@ import CoreModel
 @testable import Persistence
 
 final class ScheduledTasksWindowTests: XCTestCase {
+    // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
+    override class func setUp() {
+        super.setUp()
+        AgentProvider.selectableForTesting = AgentProvider.allCases
+    }
+
+    override class func tearDown() {
+        AgentProvider.selectableForTesting = nil
+        super.tearDown()
+    }
+
     func test_editorBuildsFullTaskWithNextRun_becauseSavedSchedulesMustBeImmediatelyRunnable() throws {
         var draft = ScheduledTaskEditorDraft(now: Date(timeIntervalSince1970: 100))
         draft.title = "Audit"

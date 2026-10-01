@@ -387,14 +387,17 @@ public final class SettingsViewModel: ObservableObject {
     @Published public var codexPath: String = ""
     @Published public var claudePath: String = ""
     @Published public var grokPath: String = ""
+    @Published public var distillPath: String = ""
     /// Last value that was actually persisted + wired into the coordinator.
     /// Used by CLIPathCommitPolicy to skip no-op commits.
     public var committedCodexPath: String = ""
     public var committedClaudePath: String = ""
     public var committedGrokPath: String = ""
+    public var committedDistillPath: String = ""
     @Published public var codexAvailable: Bool = false
     @Published public var claudeAvailable: Bool = false
     @Published public var grokAvailable: Bool = false
+    @Published public var distillAvailable: Bool = false
     /// Active Claude execution engine (CLI default vs SDK bridge opt-in).
     @Published public var claudeEngine: ClaudeEngine = .cli
     /// True when `RC_CLAUDE_AGENT_SDK_ENABLED` pins the engine, so the picker is
@@ -698,12 +701,15 @@ public final class SettingsViewModel: ObservableObject {
         codexPath = cliPath(key: "cli.codex.path", fallback: "codex")
         claudePath = cliPath(key: "cli.claude.path", fallback: "claude")
         grokPath = cliPath(key: "cli.grok.path", fallback: "grok")
+        distillPath = cliPath(key: "cli.distill.path", fallback: "distill")
         committedCodexPath = codexPath
         committedClaudePath = claudePath
         committedGrokPath = grokPath
+        committedDistillPath = distillPath
         codexAvailable = resolveAvailable(codexPath)
         claudeAvailable = resolveAvailable(claudePath)
         grokAvailable = resolveAvailable(grokPath)
+        distillAvailable = resolveAvailable(distillPath)
         let claudeEngineEnv = ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"]
         claudeEngine = ClaudeEnginePolicy.resolve(
             setting: (try? settingsRepo.get(ClaudeEnginePolicy.settingsKey)).flatMap { $0 },
@@ -714,7 +720,7 @@ public final class SettingsViewModel: ObservableObject {
         // notification-driven reload was erasing update results the user may
         // be reading (P2-Settings-6).  Messages are cleared only by the setters
         // that trigger a new update attempt (setCodexPath / setClaudePath).
-        customModelsByProvider = Dictionary(uniqueKeysWithValues: AgentProvider.allCases.map { provider in
+        customModelsByProvider = Dictionary(uniqueKeysWithValues: AgentProvider.selectable.map { provider in
             (provider, customModelStore.list(provider: provider))
         })
         devices = (try? trustRepo.list()) ?? []
@@ -1179,6 +1185,17 @@ public final class SettingsViewModel: ObservableObject {
         }
     }
 
+    /// Update the Distill CLI path draft. Same commit policy as the other CLI paths.
+    public func setDistillPath(_ path: String, committed: Bool = true) {
+        distillPath = path
+        distillAvailable = resolveAvailable(path)
+        if CLIPathCommitPolicy.shouldApply(old: committedDistillPath, new: path, committed: committed) {
+            committedDistillPath = path
+            providerUpdateMessages[.distill] = nil
+            saveCLIPath(key: "cli.distill.path", provider: .distill, path: path)
+        }
+    }
+
     public func setCustomModel(provider: AgentProvider, index: Int, value: String) {
         customModelStore.update(provider: provider, index: index, value: value)
         // When the value is empty the store removes the row, shrinking the array.
@@ -1561,6 +1578,7 @@ public struct SettingsView: View {
     @State private var codexPathDraft: String = ""
     @State private var claudePathDraft: String = ""
     @State private var grokPathDraft: String = ""
+    @State private var distillPathDraft: String = ""
 
     public init(vm: SettingsViewModel, onClose: (() -> Void)? = nil) {
         self.vm = vm
@@ -1681,11 +1699,13 @@ public struct SettingsView: View {
             codexPathDraft = vm.codexPath
             claudePathDraft = vm.claudePath
             grokPathDraft = vm.grokPath
+            distillPathDraft = vm.distillPath
             vm.refreshHostFileAccessState()
         }
         .onChange(of: vm.codexPath) { codexPathDraft = $0 }
         .onChange(of: vm.claudePath) { claudePathDraft = $0 }
         .onChange(of: vm.grokPath) { grokPathDraft = $0 }
+        .onChange(of: vm.distillPath) { distillPathDraft = $0 }
     }
 
     @ViewBuilder
@@ -2420,13 +2440,13 @@ public struct SettingsView: View {
     private var customModelsSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             DSSectionHeaderG("Custom Models")
-            let hasModels = AgentProvider.allCases.contains { !(vm.customModelsByProvider[$0] ?? []).isEmpty }
+            let hasModels = AgentProvider.selectable.contains { !(vm.customModelsByProvider[$0] ?? []).isEmpty }
             if !hasModels {
                 Text("No custom models saved. Add one from the Agent model menu.")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
             }
-            ForEach(AgentProvider.allCases, id: \.self) { provider in
+            ForEach(AgentProvider.selectable, id: \.self) { provider in
                 let models = vm.customModelsByProvider[provider] ?? []
                 if !models.isEmpty {
                     VStack(alignment: .leading, spacing: DS.Space.sm) {
@@ -2629,63 +2649,16 @@ public struct SettingsView: View {
         return parts.joined(separator: " \u{00B7} ")
     }
 
-    /// Claude engine picker: CLI (recommended, no Node/npm) vs SDK bridge
-    /// (advanced). Discloses what the SDK opt-in costs and adds. Read-only when
-    /// an env override pins the engine.
-    private var claudeEngineRow: some View {
-        VStack(alignment: .leading, spacing: DS.Space.xs) {
-            Text("Claude engine")
-                .font(DS.Font.caption2.weight(.semibold)).foregroundColor(DS.Palette.textTertiary)
-            Picker("", selection: Binding(
-                get: { vm.claudeEngine },
-                set: { vm.setClaudeEngine($0) }
-            )) {
-                Text("Claude CLI — Recommended").tag(ClaudeEngine.cli)
-                Text("Agent SDK Bridge — Advanced").tag(ClaudeEngine.sdk)
-            }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .disabled(vm.claudeEngineLockedByEnv)
-            .accessibilityIdentifier("settings.claude.engine")
-            Text(vm.claudeEngine == .sdk
-                 ? "Advanced: needs Node.js 18+ and installs the Agent SDK on first use. Adds session forking and live model/permission switching. Uses your installed Claude CLI — no second native download."
-                 : "Runs your installed Claude CLI directly. No Node.js, npm, or SDK download. Fork and live model/permission switching are unavailable.")
-                .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
-                .fixedSize(horizontal: false, vertical: true)
-            if vm.claudeEngineLockedByEnv {
-                Text("Pinned by RC_CLAUDE_AGENT_SDK_ENABLED.")
-                    .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
-            }
-        }
-    }
-
     private var diagnosticsSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             DSSectionHeaderG("Diagnostics")
             cliPathRow(
-                label: "Codex path",
-                draft: $codexPathDraft,
-                onDraftChange: { vm.setCodexPath($0, committed: false) },
-                onCommit: { vm.setCodexPath(codexPathDraft, committed: true) },
-                available: vm.codexAvailable,
-                provider: .codex
-            )
-            cliPathRow(
-                label: "Claude path",
-                draft: $claudePathDraft,
-                onDraftChange: { vm.setClaudePath($0, committed: false) },
-                onCommit: { vm.setClaudePath(claudePathDraft, committed: true) },
-                available: vm.claudeAvailable,
-                provider: .claude
-            )
-            claudeEngineRow
-            cliPathRow(
-                label: "Grok path",
-                draft: $grokPathDraft,
-                onDraftChange: { vm.setGrokPath($0, committed: false) },
-                onCommit: { vm.setGrokPath(grokPathDraft, committed: true) },
-                available: vm.grokAvailable,
-                provider: .grok
+                label: "Distill path",
+                draft: $distillPathDraft,
+                onDraftChange: { vm.setDistillPath($0, committed: false) },
+                onCommit: { vm.setDistillPath(distillPathDraft, committed: true) },
+                available: vm.distillAvailable,
+                provider: .distill
             )
             if vm.showsAppUpdates {
                 appUpdatesRow

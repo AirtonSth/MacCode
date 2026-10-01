@@ -8,6 +8,17 @@ import XCTest
 
 @MainActor
 final class ProviderSnapshotRuntimeTests: XCTestCase {
+    // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
+    override class func setUp() {
+        super.setUp()
+        AgentProvider.selectableForTesting = AgentProvider.allCases
+    }
+
+    override class func tearDown() {
+        AgentProvider.selectableForTesting = nil
+        super.tearDown()
+    }
+
     private static let ownershipLedger = FileManager.default.temporaryDirectory
         .appendingPathComponent("provider-snapshot-tests-\(UUID().uuidString).json")
 

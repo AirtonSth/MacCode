@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import SwiftUI
 import Security
 import os
 import CoreModel
@@ -10,6 +11,27 @@ import RemoteCodeTreaty
 import Surfaces
 
 private let appRouterLog = Logger(subsystem: "io.remotecode.appshell", category: "router")
+
+private struct DistillAccountsPanelHost: View {
+    @ObservedObject var controller: DistillAccountsController
+
+    var body: some View {
+        DistillAccountsPanel(
+            presentation: DistillAccountsPanelPresentation(
+                statuses: controller.statuses,
+                busyProvider: controller.busyProvider,
+                signInURL: controller.signInURL,
+                lastError: controller.lastError
+            ),
+            login: controller.login,
+            logout: controller.logout,
+            cancel: controller.cancel,
+            openAgain: { NSWorkspace.shared.open($0) },
+            dismissError: controller.dismissError
+        )
+        .onAppear { controller.refresh() }
+    }
+}
 
 private struct AgentProviderInstanceConfig: Decodable, Equatable {
     var id: String
@@ -347,6 +369,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private static let minimizedPaneVisibilityThreshold = 0.08
 
     public weak var context: AppContext?
+
+    private var distillAccountsPanel: AnyView? {
+        guard let controller = context?.distillAccountsController else { return nil }
+        return AnyView(DistillAccountsPanelHost(controller: controller))
+    }
     public weak var windowController: MainWindowController?
     public weak var botsViewModel: BotsViewModel?
     private let botComputerReconciliationQueue = DispatchQueue(
@@ -744,7 +771,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             }
                             return nil
                         }()
-                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: title, initialThreadId: restoredThreadId, orchestrationRuntime: ctx.orchestrationRuntime)
+                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: title, initialThreadId: restoredThreadId, orchestrationRuntime: ctx.orchestrationRuntime, accountPanel: distillAccountsPanel)
                         agent.viewModel.onSelectedThreadChanged = { [weak self, weak agent] threadID in
                             guard let self, let agent else { return }
                             self.persistAgentSelectedThread(surfaceID: agent.descriptor.id, threadID: threadID)
@@ -4136,6 +4163,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             serviceTier: t.serviceTier,
             modelSelection: t.modelSelection,
             interactionMode: t.effectiveInteractionMode,
+            reasoningModel: t.reasoningModel,
             at: now
         ) else {
             throw LayoutError.workspaceNotFound
@@ -6375,8 +6403,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             break
         case .codex:
             env["CODEX_HOME"] = env["CODEX_HOME"] ?? "\(runAsUser.homePath)/.codex"
-        case .grok, .distill:
+        case .grok:
             env["GROK_HOME"] = env["GROK_HOME"] ?? "\(runAsUser.homePath)/.grok"
+        case .distill:
+            env["DISTILL_HOME"] = env["DISTILL_HOME"] ?? "\(runAsUser.homePath)/.distill"
         }
         return env
     }
@@ -6402,6 +6432,82 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
+    public func setAgentWorkerModel(thread: AgentThreadID, model: String?) throws -> AgentThread {
+        guard let context, var threadValue = try context.threadRepo.threadWithoutRouting(of: thread) else { throw LayoutError.workspaceNotFound }
+        let normalized = model?.trimmingCharacters(in: .whitespacesAndNewlines)
+        threadValue.reasoningModel = normalized?.isEmpty == false ? normalized : nil
+        guard try context.threadRepo.setPickerConfig(
+            of: thread,
+            provider: threadValue.provider,
+            providerInstanceId: threadValue.providerInstanceId ?? threadValue.provider.rawValue,
+            runAsUser: threadValue.runAsUser,
+            model: threadValue.model,
+            permissionMode: threadValue.permissionMode,
+            reasoningEffort: threadValue.reasoningEffort,
+            serviceTier: threadValue.serviceTier,
+            modelSelection: threadValue.modelSelection,
+            interactionMode: threadValue.effectiveInteractionMode,
+            reasoningModel: threadValue.reasoningModel
+        ) else { throw LayoutError.workspaceNotFound }
+        for surface in SurfaceRegistry.shared.all() {
+            guard let agent = surface as? AgentAppSurface, agent.viewModel.selectedThreadId == thread else { continue }
+            agent.viewModel.reasoningModel = threadValue.reasoningModel
+        }
+        EventBus.shared.publish(kind: .agentThreadUpdated, payload: agentThreadPayload(threadValue))
+        return threadValue
+    }
+
+    public func listDistillAccounts() -> JSONValue {
+        guard let controller = context?.distillAccountsController else {
+            return .object(["accounts": .array([]), "busy_provider": .null, "last_error": .null])
+        }
+        controller.refresh()
+        let rows = controller.statuses.map { status -> JSONValue in
+            var row: [String: JSONValue] = [
+                "provider": .string(status.provider.rawValue),
+                "display_name": .string(status.provider.displayName),
+                "connected": .bool(status.connected)
+            ]
+            if let email = status.email { row["email"] = .string(email) }
+            return .object(row)
+        }
+        return .object([
+            "accounts": .array(rows),
+            "busy_provider": controller.busyProvider.map { .string($0.rawValue) } ?? .null,
+            "last_error": controller.lastError.map { .string($0) } ?? .null
+        ])
+    }
+
+    public func loginDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue {
+        guard let controller = context?.distillAccountsController else { throw LayoutError.workspaceNotFound }
+        guard controller.busyProvider == nil else { throw JSONRPCError(code: -32041, message: "A Distill account operation is already running.") }
+        controller.login(provider)
+        return .object(["started": .bool(true)])
+    }
+
+    public func logoutDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue {
+        guard let controller = context?.distillAccountsController else { throw LayoutError.workspaceNotFound }
+        guard controller.busyProvider == nil else { throw JSONRPCError(code: -32041, message: "A Distill account operation is already running.") }
+        controller.logout(provider)
+        return .object(["started": .bool(true)])
+    }
+
+    public func cancelDistillAccountOperation() throws -> JSONValue {
+        guard let controller = context?.distillAccountsController else { throw LayoutError.workspaceNotFound }
+        controller.cancel()
+        return .object(["cancelled": .bool(true)])
+    }
+
+    public func refreshDistillProviderCatalog() async {
+        cachedProviderSnapshotsAt = nil
+        providerProbeCache = providerProbeCache.filter { $0.key.provider != .distill }
+        for surface in SurfaceRegistry.shared.all() {
+            guard let agent = surface as? AgentAppSurface else { continue }
+            await agent.viewModel.loadProviderSnapshots(forceCatalogRefresh: true)
+        }
+        _ = await listAgentProviderSnapshots()
+    }
+
     /// Protocol/CommandRouting entry — probes as the app owner.
     public func listAgentProviderSnapshots() async -> [AgentProviderSnapshot] {
         await listAgentProviderSnapshots(runAsUser: nil)
@@ -6412,7 +6518,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func listAgentProviderSnapshots(runAsUser: AgentRunAsUser?) async -> [AgentProviderSnapshot] {
         listAgentProviderSnapshotsCallCountForTesting += 1
         var snapshots: [AgentProviderSnapshot] = []
-        let configuredInstances = providerInstanceConfigs()
+        let configuredInstances = providerInstanceConfigs().filter { $0.provider.isSelectable }
         if !configuredInstances.isEmpty {
             for instance in configuredInstances {
                 let binary = providerBinary(instance: instance) ?? instance.provider.rawValue
@@ -6550,7 +6656,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             rememberProviderSnapshotsForSend(snapshots)
             return snapshots
         }
-        for provider in AgentProvider.allCases {
+        for provider in AgentProvider.selectable {
             let binary = configuredProviderBinary(provider) ?? provider.rawValue
             let binaryPath = Self.resolveProviderBinaryPath(binary: binary, runAsUser: runAsUser)
             let env = Self.probeEnvironment(base: [:], provider: provider, runAsUser: runAsUser)
@@ -6862,12 +6968,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         case .claude:
             let home = environment["HOME"] ?? defaultHome
             return URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(".claude/skills", isDirectory: true)
-        case .grok, .distill:
+        case .grok:
             if let root = environment["GROK_HOME"], !root.isEmpty {
                 return URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent("skills", isDirectory: true)
             }
             let home = environment["HOME"] ?? defaultHome
             return URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(".grok/skills", isDirectory: true)
+        case .distill:
+            return DistillProvisioner.homeURL(
+                environment: environment,
+                userHome: environment["HOME"] ?? defaultHome
+            ).appendingPathComponent("skills", isDirectory: true)
         }
     }
 
@@ -6989,8 +7100,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 env["CODEX_HOME"] = env["CODEX_HOME"] ?? home
             case .claude:
                 env["HOME"] = env["HOME"] ?? home
-            case .grok, .distill:
+            case .grok:
                 env["GROK_HOME"] = env["GROK_HOME"] ?? home
+            case .distill:
+                env["DISTILL_HOME"] = env["DISTILL_HOME"] ?? home
             }
         }
         // VITAL for the savings report: tag the agent's environment with the provider so the
@@ -8302,7 +8415,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: restore.flatMap(restoredBrowserURL(from:)), title: baseTitle, botID: botID))
             case .agentApp:
                 guard let ctx = context else { return descriptor }
-                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, draftRepo: AgentThreadDraftRepository(db: ctx.db), attachmentStore: AgentAttachmentStore(root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)), queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId, orchestrationRuntime: ctx.orchestrationRuntime)
+                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, draftRepo: AgentThreadDraftRepository(db: ctx.db), attachmentStore: AgentAttachmentStore(root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)), queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId, orchestrationRuntime: ctx.orchestrationRuntime, accountPanel: distillAccountsPanel)
                 // Per-surface thread binding: persist this surface's selected
                 // thread into its descriptor metadata so app restart restores it.
                 agent.viewModel.onSelectedThreadChanged = { [weak self, weak agent] threadID in

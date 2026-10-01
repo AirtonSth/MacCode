@@ -351,15 +351,8 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
                 let vm = agent.viewModel
                 // UX-IMP-010: mark the row matching the live selection so the
                 // user sees what provider/model/thread is already active.
-                let currentProvider = vm.provider
                 let currentModel = vm.model
                 let currentThread = vm.selectedThreadId
-                cmds.append(PaletteCommand(id: "agent.provider.codex", title: "Agent: Use Codex", subtitle: Self.currentSubtitle("Switch provider", isCurrent: currentProvider == .codex), keywords: ["provider", "codex"], category: .agent, iconName: "cpu") {
-                    vm.provider = .codex; Task { await vm.loadModels() }
-                })
-                cmds.append(PaletteCommand(id: "agent.provider.claude", title: "Agent: Use Claude", subtitle: Self.currentSubtitle("Switch provider", isCurrent: currentProvider == .claude), keywords: ["provider", "claude"], category: .agent, iconName: "cpu") {
-                    vm.provider = .claude; Task { await vm.loadModels() }
-                })
                 cmds.append(PaletteCommand(id: "agent.thread.new", title: "Agent: New Thread", subtitle: "Start a fresh thread", keywords: ["thread", "new", "chat"], category: .agent, iconName: "plus.bubble") {
                     vm.createThread(title: "New thread")
                 })

@@ -61,6 +61,22 @@ public enum DistillProvisioner {
         )
     }
 
+    /// Distill home: instance home, else app `DISTILL_HOME`, else `<userHome>/.distill`.
+    /// `~/.grok` is never adopted.
+    public static func homeURL(
+        instanceHomePath: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        userHome: String = FileManager.default.homeDirectoryForCurrentUser.path
+    ) -> URL {
+        for candidate in [instanceHomePath, environment["DISTILL_HOME"]] {
+            if let path = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
+                return URL(fileURLWithPath: path, isDirectory: true)
+            }
+        }
+        return URL(fileURLWithPath: userHome, isDirectory: true)
+            .appendingPathComponent(".distill", isDirectory: true)
+    }
+
     /// Pure decision: a non-empty resolved path means the installer must not run.
     public static func decide(resolvedBinary: String?) -> DistillProvisioningDecision {
         guard let resolvedBinary,

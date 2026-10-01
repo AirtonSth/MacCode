@@ -51,7 +51,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":True,"sessionCapabilities":{"resume":True},"promptCapabilities":{}}}})
             elif method == "session/new":
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{"sessionId":"old-distill-session","models":{"availableModels":[{"modelId":"live-distill-model","name":"Live Distill Model"}],"currentModelId":"live-distill-model"}}})
-            elif method == "x.ai/session/reasoning_model/set":
+            elif method == "_x.ai/session/worker_model/set":
                 send({"jsonrpc":"2.0", "id":message["id"], "error":{"code":-32601,"message":"method not found"}})
         """
         try harness.write(to: harnessURL, atomically: true, encoding: .utf8)
@@ -67,16 +67,11 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             .split(whereSeparator: \.isNewline)
             .compactMap { try JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: String] }
             .compactMap { $0["method"] }
-        XCTAssertFalse(methods.contains("x.ai/session/reasoning_model/set"),
+        XCTAssertFalse(methods.contains("_x.ai/session/worker_model/set"),
                        "discovery must not call an extension the peer did not advertise")
     }
 
-    func test_reasoningAutoRequiresExplicitACPConfirmationBeforeSessionUse() async throws {
-        // WHY: a peer that omits the advertised Auto acknowledgement must not make an unconfirmed selection look applied.
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("distill-acp-reasoning-ack-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+    private func writeWorkerHarness(root: URL, initializeCapabilities: String, workerResult: String) throws -> (harness: URL, requests: URL) {
         let requestsURL = root.appendingPathComponent("requests.jsonl")
         let harnessURL = root.appendingPathComponent("distill-agent")
         let harness = """
@@ -88,52 +83,171 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             message = json.loads(line)
             method = message.get("method")
             params = message.get("params", {})
-            with requests.open("a") as output: output.write(json.dumps({"method":method}) + "\\n")
+            with requests.open("a") as output: output.write(json.dumps({"method":method,"params":params}) + "\\n")
             if method == "initialize":
-                send({"jsonrpc":"2.0", "id":message["id"], "result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"x.ai/capabilities":{"sessionReasoningModel":True,"sessionMainEffortAuto":True,"sessionReasoningModelEffort":True}}}}})
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"protocolVersion":1,"agentCapabilities":\(initializeCapabilities)}})
             elif method == "session/new":
-                send({"jsonrpc":"2.0", "id":message["id"], "result":{"sessionId":"reasoning-ack-session","models":{"currentModelId":"main"}}})
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"sessionId":"worker-session","models":{"currentModelId":"main"}}})
             elif method == "session/set_model":
-                send({"jsonrpc":"2.0", "id":message["id"], "result":{"meta":{"model":params.get("modelId"),"reasoningEffort":"high","reasoningEffortAuto":False}}})
-            elif method == "x.ai/session/reasoning_model/set":
-                send({"jsonrpc":"2.0", "id":message["id"], "result":{"reasoningModelId":params.get("modelId")}})
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"_meta":{"model":params.get("modelId"),"contextWindow":1000}}})
+            elif method == "_x.ai/session/worker_model/set":
+                send({"jsonrpc":"2.0", "id":message["id"], "result":\(workerResult)})
+            elif method in ("session/set_mode", "session/set_config_option"):
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{}})
+            elif method == "session/prompt":
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"stopReason":"end_turn"}})
         """
         try harness.write(to: harnessURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: harnessURL.path)
-        let client = try DistillACPClient(binary: harnessURL.path, cwd: root.path, tagProcess: false)
+        return (harnessURL, requestsURL)
+    }
+
+    private func recordedRequests(_ url: URL) throws -> [[String: Any]] {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        return try text.split(whereSeparator: \.isNewline)
+            .compactMap { try JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+    }
+
+    private func makeTempRoot(_ name: String) throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }
+
+    func test_initializeParsesSessionWorkerModelCapability() async throws {
+        // WHY: the Worker selector must only be used when the harness advertises per-session support.
+        for advertised in [true, false] {
+            let root = try makeTempRoot("distill-acp-worker-cap")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let flag = advertised ? "True" : "False"
+            let (harness, _) = try writeWorkerHarness(
+                root: root,
+                initializeCapabilities: "{\"_meta\":{\"x.ai/capabilities\":{\"sessionWorkerModel\":\(flag),\"sessionReasoningModel\":True}}}",
+                workerResult: "{}"
+            )
+            let client = try DistillACPClient(binary: harness.path, cwd: root.path, tagProcess: false)
+            defer { client.stop() }
+            let initialized = try await client.initialize()
+            XCTAssertEqual(initialized.sessionWorkerModel, advertised)
+        }
+    }
+
+    func test_workerSetSendsWireParamsAndValidatesResponse() async throws {
+        // WHY: the app must never claim a Worker model the harness did not confirm.
+        let root = try makeTempRoot("distill-acp-worker-wire")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(
+            root: root,
+            initializeCapabilities: "{\"_meta\":{\"x.ai/capabilities\":{\"sessionWorkerModel\":True}}}",
+            workerResult: "{\"modelId\":params.get(\"modelId\") or None,\"effort\":params.get(\"effort\") or \"auto\",\"source\":\"session\"}"
+        )
+        let client = try DistillACPClient(binary: harness.path, cwd: root.path, tagProcess: false)
         defer { client.stop() }
-        let initialized = try await client.initialize()
-        XCTAssertTrue(initialized.sessionMainEffortAuto)
-        XCTAssertTrue(initialized.sessionReasoningModelEffort)
+        _ = try await client.initialize()
+        let fixed = try await client.setReasoningModel(sessionId: "s", modelId: "grok-4.5", effortSelection: .fixed(.high))
+        XCTAssertEqual(fixed.modelId, "grok-4.5")
+        XCTAssertEqual(fixed.effort, .high)
+        XCTAssertFalse(fixed.isAutomatic)
+        let auto = try await client.setReasoningModel(sessionId: "s", modelId: "grok-4.5", effortSelection: .automatic)
+        XCTAssertTrue(auto.isAutomatic)
+        let off = try await client.setReasoningModel(sessionId: "s", modelId: nil)
+        XCTAssertNil(off.modelId)
+        let params = try recordedRequests(requestsURL)
+            .filter { $0["method"] as? String == DistillACPClient.workerModelSetMethod }
+            .compactMap { $0["params"] as? [String: Any] }
+        XCTAssertEqual(params.map { $0["modelId"] as? String }, ["grok-4.5", "grok-4.5", ""])
+        XCTAssertEqual(params[0]["effort"] as? String, "high")
+        XCTAssertEqual(params[1]["effort"] as? String, "auto")
+        XCTAssertTrue(params[2]["effort"] is NSNull, "Off inherits effort from the Distill config")
+    }
+
+    func test_workerSetRejectsMismatchedResponse() async throws {
+        let root = try makeTempRoot("distill-acp-worker-mismatch")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, _) = try writeWorkerHarness(
+            root: root,
+            initializeCapabilities: "{\"_meta\":{\"x.ai/capabilities\":{\"sessionWorkerModel\":True}}}",
+            workerResult: "{\"modelId\":\"other\",\"effort\":\"auto\",\"source\":\"config\"}"
+        )
+        let client = try DistillACPClient(binary: harness.path, cwd: root.path, tagProcess: false)
+        defer { client.stop() }
+        _ = try await client.initialize()
         do {
-            _ = try await client.newSession(
-                cwd: root.path,
-                modelId: "main",
-                mainEffortSelection: .automatic,
-                mainEffortAutoSupported: true
-            )
-            XCTFail("A missing canonical Main model acknowledgement must reject the selection")
+            _ = try await client.setReasoningModel(sessionId: "s", modelId: "grok-4.5")
+            XCTFail("A different Worker model in the response must be rejected")
         } catch {
-            XCTAssertTrue(String(describing: error).contains("did not confirm the canonical Main model"))
+            XCTAssertTrue(String(describing: error).contains("did not confirm the requested Worker model"))
         }
+        let root2 = try makeTempRoot("distill-acp-worker-mismatch-effort")
+        defer { try? FileManager.default.removeItem(at: root2) }
+        let (harness2, _) = try writeWorkerHarness(
+            root: root2,
+            initializeCapabilities: "{\"_meta\":{\"x.ai/capabilities\":{\"sessionWorkerModel\":True}}}",
+            workerResult: "{\"modelId\":params.get(\"modelId\"),\"effort\":\"low\",\"source\":\"session\"}"
+        )
+        let client2 = try DistillACPClient(binary: harness2.path, cwd: root2.path, tagProcess: false)
+        defer { client2.stop() }
+        _ = try await client2.initialize()
         do {
-            _ = try await client.newSession(
-                cwd: root.path,
-                modelId: "main",
-                reasoningModel: "reasoner",
-                reasoningModelEffortSelection: .automatic,
-                reasoningModelSelectionSupported: true,
-                reasoningModelEffortSupported: true
-            )
-            XCTFail("An omitted Reasoning Auto acknowledgement must reject the unconfirmed selection")
+            _ = try await client2.setReasoningModel(sessionId: "s", modelId: "grok-4.6", effortSelection: .fixed(.high))
+            XCTFail("A different Worker effort in the response must be rejected")
         } catch {
-            XCTAssertTrue(String(describing: error).contains("did not confirm the requested Reasoning-model effort"))
+            XCTAssertTrue(String(describing: error).contains("did not confirm the requested Worker-model effort"), "\(error)")
         }
-        let methods = try String(contentsOf: requestsURL, encoding: .utf8)
-            .split(whereSeparator: \.isNewline)
-            .compactMap { try JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: String] }
-            .compactMap { $0["method"] }
-        XCTAssertFalse(methods.contains("session/prompt"), "the prompt must wait for a confirmed model and effort")
+    }
+
+    func test_setModelAcceptsDistill2024MinimalResponseForFixedAndAutoEffort() async throws {
+        // WHY: Distill 2.0.24 answers set_model with only {model, contextWindow}; Auto main effort must not need extra acks.
+        let root = try makeTempRoot("distill-acp-setmodel-2024")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(
+            root: root,
+            initializeCapabilities: "{}",
+            workerResult: "{}"
+        )
+        let client = try DistillACPClient(binary: harness.path, cwd: root.path, tagProcess: false)
+        defer { client.stop() }
+        _ = try await client.initialize()
+        let auto = try await client.newSession(cwd: root.path, modelId: "grok-4.6", mainEffortSelection: .automatic)
+        XCTAssertEqual(auto.appliedMainModelId, "grok-4.6")
+        XCTAssertEqual(auto.appliedMainEffortSelection, .automatic)
+        let fixed = try await client.setModel(sessionId: "worker-session", modelId: "grok-4.6", reasoningEffort: .high)
+        XCTAssertEqual(fixed.canonicalModelId, "grok-4.6")
+        XCTAssertEqual(fixed.effort, .high)
+        let setModels = try recordedRequests(requestsURL).filter { $0["method"] as? String == "session/set_model" }
+        let meta = try XCTUnwrap((setModels.first?["params"] as? [String: Any])?["_meta"] as? [String: Any])
+        XCTAssertEqual(meta["reasoningEffortAuto"] as? Bool, true)
+    }
+
+    func test_adapterNeverCallsWorkerMethodOrThrowsWhenPeerDoesNotAdvertiseIt() async throws {
+        // WHY: older Distill builds inherit Worker from config; a selected Worker model must not block or fail the session.
+        let root = try makeTempRoot("distill-acp-worker-unsupported")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(
+            root: root,
+            initializeCapabilities: "{}",
+            workerResult: "{}"
+        )
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let events = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .distill,
+                model: "grok-4.6",
+                cwd: root.path,
+                prompt: "Go",
+                reasoningModel: "grok-4.5",
+                distillMainEffortSelection: .automatic,
+                distillReasoningEffortSelection: .fixed(.high)
+            )
+        ) { events.append($0) }
+        _ = try await events.waitForFinish()
+        let methods = try recordedRequests(requestsURL).compactMap { $0["method"] as? String }
+        XCTAssertFalse(methods.contains(DistillACPClient.workerModelSetMethod))
+        XCTAssertTrue(methods.contains("session/set_model"), "Auto main effort binds through set_model without a capability flag")
     }
 
     func test_selectedModelRunsTurnsAndResumesOnTheSameACPThread() async throws {
@@ -168,7 +282,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             if method == "initialize":
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{
                     "protocolVersion":1,
-                    "agentCapabilities":{"loadSession":True,"sessionCapabilities":{"resume":True},"promptCapabilities":{},"_meta":{"x.ai/capabilities":{"sessionReasoningModel":True}}}
+                    "agentCapabilities":{"loadSession":True,"sessionCapabilities":{"resume":True},"promptCapabilities":{},"_meta":{"x.ai/capabilities":{"sessionWorkerModel":True}}}
                 }})
             elif method == "session/new":
                 params = message.get("params", {})
@@ -179,15 +293,15 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                     "sessionId":"distill-session-1",
                     "models":{"availableModels":[{"modelId":"gpt-6-luna","name":"GPT-6 Luna"}],"currentModelId":"gpt-6-luna"}
                 }})
-            elif method == "x.ai/session/reasoning_model/set":
+            elif method == "_x.ai/session/worker_model/set":
                 params = message.get("params", {})
                 reasoning_model = params.get("modelId") or None
-                record({"method":method,"sessionId":params.get("sessionId"),"reasoningModelId":params.get("modelId")})
+                record({"method":method,"sessionId":params.get("sessionId"),"reasoningModelId":params.get("modelId"),"effort":params.get("effort")})
                 if reasoning_model is not None and reasoning_model == state["main"]:
                     send({"jsonrpc":"2.0", "id":message["id"], "error":{"code":-32602,"message":"Reasoning model must differ from the Main model"}})
                 else:
                     state["reasoning"] = reasoning_model
-                    send({"jsonrpc":"2.0", "id":message["id"], "result":{"reasoningModelId":reasoning_model or ""}})
+                    send({"jsonrpc":"2.0", "id":message["id"], "result":{"modelId":reasoning_model,"effort":params.get("effort") or "auto","source":"session"}})
             elif method == "session/set_model":
                 params = message.get("params", {})
                 next_main = params.get("modelId")
@@ -280,12 +394,12 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         let sessionOpen = try XCTUnwrap(requests.first { $0["method"] as? String == "session/new" })
         XCTAssertEqual(sessionOpen["modelId"] as? String, "gpt-6-luna",
                        "the selected Distill main model must reach session/new")
-        let reasoningSelections = requests.filter { $0["method"] as? String == "x.ai/session/reasoning_model/set" }
+        let reasoningSelections = requests.filter { $0["method"] as? String == "_x.ai/session/worker_model/set" }
         XCTAssertEqual(reasoningSelections.map { $0["reasoningModelId"] as? String }, ["grok-4.5", "grok-4.6", "", "gpt-6-luna", ""],
                        "a crossed swap must clear Reasoning, change Main, apply the new Reasoning model, and then support Off")
         XCTAssertEqual(reasoningSelections.map { $0["sessionId"] as? String }, Array(repeating: "distill-session-1", count: 5))
         let crossSwapMainIndex = try XCTUnwrap(requests.firstIndex { $0["method"] as? String == "session/set_model" && $0["modelId"] as? String == "grok-4.6" })
-        let crossSwapReasoningIndex = try XCTUnwrap(requests.firstIndex { $0["method"] as? String == "x.ai/session/reasoning_model/set" && $0["reasoningModelId"] as? String == "gpt-6-luna" })
+        let crossSwapReasoningIndex = try XCTUnwrap(requests.firstIndex { $0["method"] as? String == "_x.ai/session/worker_model/set" && $0["reasoningModelId"] as? String == "gpt-6-luna" })
         XCTAssertLessThan(crossSwapMainIndex, crossSwapReasoningIndex,
                           "when the new Reasoning model equals the currently active Main model, switch Main first")
         let prompts = requests.filter { $0["method"] as? String == "session/prompt" }

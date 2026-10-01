@@ -1,5 +1,6 @@
 import XCTest
 @testable import Persistence
+import CoreModel
 
 /// C8: preferences must round-trip the kv store, partial updates must not
 /// clobber siblings, and a corrupt blob must degrade to safe defaults.
@@ -9,6 +10,30 @@ final class SettingsStoreTests: XCTestCase {
         let tmp = NSTemporaryDirectory() + "rc2-settings-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         return (SettingsStore(db: db), db)
+    }
+
+    func test_newThreadDefaultsMigrateLegacyProviderToDistill_becauseNoOtherProviderIsOffered() {
+        let suite = "rc-legacy-defaults-" + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = AgentNewThreadDefaultsStore(defaults: defaults)
+        store.save(AgentNewThreadDefaults(
+            routingMode: .auto,
+            runAsUser: nil,
+            provider: .codex,
+            providerInstanceId: "codex-cli",
+            model: "gpt-5.6-sol",
+            reasoningEffort: .xhigh,
+            distillMainEffortSelection: nil
+        ))
+
+        let migrated = store.load()
+        XCTAssertEqual(migrated?.provider, .distill)
+        XCTAssertEqual(migrated?.providerInstanceId, "distill")
+        XCTAssertEqual(migrated?.model, "", "the other provider's model must not carry over")
+        XCTAssertEqual(migrated?.reasoningEffort, .medium, "the other provider's effort must not carry over")
+        XCTAssertEqual(migrated?.routingMode, .manual)
+        XCTAssertEqual(store.load(), migrated, "the migrated defaults persist")
     }
 
     func test_defaultsWhenNothingStored() throws {

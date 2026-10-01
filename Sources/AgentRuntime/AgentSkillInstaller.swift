@@ -3062,8 +3062,10 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         switch provider {
         case .claude: return claudeInstructionsURL
         case .codex: return codexInstructionsURL
-        case .grok, .distill:
+        case .grok:
             return homeDirectoryURL().appendingPathComponent(".grok/AGENTS.md")
+        case .distill:
+            return distillHomeURL().appendingPathComponent("AGENTS.md")
         }
     }
 
@@ -3192,9 +3194,15 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         switch provider {
         case .claude: return claudeSkillsRoot
         case .codex: return codexSkillsRoot
-        case .grok, .distill:
+        case .grok:
             return homeDirectoryURL().appendingPathComponent(".grok/skills", isDirectory: true)
+        case .distill:
+            return distillHomeURL().appendingPathComponent("skills", isDirectory: true)
         }
+    }
+
+    private func distillHomeURL() -> URL {
+        DistillProvisioner.homeURL(userHome: homeDirectoryURL().path)
     }
 
     private func homeDirectoryURL() -> URL {

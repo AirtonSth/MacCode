@@ -14,6 +14,17 @@ import Persistence
 ///  - Per-surface binding survives an app restart (each tab reopens its thread).
 @MainActor
 final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
+    // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
+    override class func setUp() {
+        super.setUp()
+        AgentProvider.selectableForTesting = AgentProvider.allCases
+    }
+
+    override class func tearDown() {
+        AgentProvider.selectableForTesting = nil
+        super.tearDown()
+    }
+
 
     private func closeAndUnregisterAgentSurfaces(workspace: WorkspaceID) {
         for s in SurfaceRegistry.shared.all() {

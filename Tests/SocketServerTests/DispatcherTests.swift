@@ -8,6 +8,25 @@ import AgentRuntime
 class FakeRouter: CommandRouting, TerminalCommandRouting {
     var workspaces: [Workspace] = []
     var window = AppWindow()
+    var distillLoginProvider: DistillAccountProvider?
+    var distillLogoutProvider: DistillAccountProvider?
+    var distillAccountsPayload: JSONValue = .object(["accounts": .array([]), "busy_provider": .null, "last_error": .null])
+
+    func listDistillAccounts() -> JSONValue { distillAccountsPayload }
+    func loginDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue {
+        distillLoginProvider = provider
+        return .object(["started": .bool(true)])
+    }
+    func logoutDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue {
+        distillLogoutProvider = provider
+        return .object(["started": .bool(true)])
+    }
+    func cancelDistillAccountOperation() throws -> JSONValue { .object(["cancelled": .bool(true)]) }
+    func setAgentWorkerModel(thread: AgentThreadID, model: String?) throws -> AgentThread {
+        guard let index = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
+        threadStore[index].reasoningModel = model?.isEmpty == false ? model : nil
+        return threadStore[index]
+    }
 
     func listWorkspaces() throws -> [Workspace] { workspaces }
     func listWorkspacesAuthoritative() async throws -> [Workspace] { workspaces }
@@ -1123,6 +1142,80 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(codex["driverKind"], .string("codex_cli"))
         XCTAssertEqual(codex["slashCommands"]?.arrayValue?.contains(.string("/goal")), true)
         XCTAssertEqual(codex["models"]?.arrayValue?.isEmpty, false)
+    }
+
+    @MainActor
+    func test_distillAccountsListAndMutationRPCs() async {
+        let router = FakeRouter()
+        router.distillAccountsPayload = .object(["accounts": .array([.object([
+            "provider": .string("grok"), "display_name": .string("Grok"), "connected": .bool(true), "email": .string("a@example.com")
+        ])]), "busy_provider": .string("claude"), "last_error": .null])
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let listed = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "distill.accounts.list", params: nil))
+        XCTAssertEqual(listed.result, router.distillAccountsPayload)
+        let loggedIn = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "distill.accounts.login", params: ["provider": .string("grok")]))
+        XCTAssertEqual(loggedIn.result, .object(["started": .bool(true)]))
+        XCTAssertEqual(router.distillLoginProvider, .grok)
+        let loggedOut = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "distill.accounts.logout", params: ["provider": .string("claude")]))
+        XCTAssertEqual(loggedOut.result, .object(["started": .bool(true)]))
+        XCTAssertEqual(router.distillLogoutProvider, .claude)
+        let cancelled = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(4), method: "distill.accounts.cancel", params: nil))
+        XCTAssertEqual(cancelled.result, .object(["cancelled": .bool(true)]))
+        let invalid = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(5), method: "distill.accounts.login", params: ["provider": .string("invalid")]))
+        XCTAssertNotNil(invalid.error)
+        for method in ["distill.accounts.login", "distill.accounts.logout", "distill.accounts.cancel"] {
+            XCTAssertTrue(HostMutationContract.methods.contains(method))
+        }
+        XCTAssertTrue(JSONRPCDispatcher.isReadOnlyBatchMethod("distill.accounts.list"))
+    }
+
+    @MainActor
+    func test_agentThreadCreateAcceptsFlatDistillSelectionAndEchoesIt() async {
+        let router = FakeRouter()
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let response = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.create", params: [
+            "provider": .string("distill"), "model": .string("distill-main"),
+            "distill_main_effort": .string("high"), "worker_model": .string("distill-worker"), "worker_effort": .string("medium")
+        ]))
+        guard let payload = response.result?.objectValue else { return XCTFail("expected encoded thread") }
+        XCTAssertEqual(payload["distill_main_effort"], .string("high"))
+        XCTAssertEqual(payload["worker_model"], .string("distill-worker"))
+        XCTAssertEqual(payload["worker_effort"], .string("medium"))
+        XCTAssertEqual(router.threadStore.first?.reasoningModel, "distill-worker")
+        XCTAssertEqual(router.threadStore.first?.modelSelection.distillMainEffortSelection?.effort, .high)
+        XCTAssertEqual(router.threadStore.first?.modelSelection.distillReasoningEffortSelection?.effort, .medium)
+    }
+
+    @MainActor
+    func test_agentThreadConfigureAndSendAcceptFlatWorkerSelection() async {
+        let router = FakeRouter()
+        let thread = AgentThread(title: "Thread", provider: .distill, model: "main")
+        router.threadStore = [thread]
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let configured = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.configure", params: [
+            "thread_id": .string(thread.id.value.uuidString), "distill_main_effort": .string("auto"),
+            "worker_model": .string("worker-a"), "worker_effort": .string("high")
+        ]))
+        XCTAssertNil(configured.error)
+        XCTAssertEqual(router.threadStore.first?.reasoningModel, "worker-a")
+        XCTAssertEqual(router.threadStore.first?.modelSelection.distillReasoningEffortSelection?.effort, .high)
+        let sent = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.message.send", params: [
+            "thread_id": .string(thread.id.value.uuidString), "text": .string("hello"),
+            "distill_main_effort": .string("medium"), "worker_model": .string(""), "worker_effort": .string("auto")
+        ]))
+        XCTAssertNil(sent.error)
+        XCTAssertNil(router.threadStore.first?.reasoningModel)
+        XCTAssertEqual(router.threadStore.first?.modelSelection.distillMainEffortSelection?.effort, .medium)
+        XCTAssertTrue(router.threadStore.first?.modelSelection.distillReasoningEffortSelection?.isAutomatic == true)
+    }
+
+    @MainActor
+    func test_flatDistillEffortRejectsUnknownLevel() async {
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let response = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.create", params: [
+            "provider": .string("distill"), "distill_main_effort": .string("impossible")
+        ]))
+        XCTAssertNotNil(response.error)
     }
 
     @MainActor

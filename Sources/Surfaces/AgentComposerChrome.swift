@@ -450,7 +450,7 @@ public enum AgentRunAsUserPresentation {
         if !interactive {
             return "Provider processes run as macOS user \(selected.shortName)"
         }
-        return "Choose which macOS user executes Codex/Claude/Grok (through the shared helper)"
+        return "Choose which macOS user runs Distill (through the shared helper)"
     }
 }
 

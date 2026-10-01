@@ -167,7 +167,7 @@ public struct BotKeychainSecretStore: BotSecretStore, Sendable {
     }
 
     private static let reservedNames: Set<String> = [
-        "PATH", "HOME", "CODEX_HOME", "GROK_HOME",
+        "PATH", "HOME", "CODEX_HOME", "GROK_HOME", "DISTILL_HOME",
         "RC_REMOTE_CODE_BOT_ID", "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY",
         "RC_REMOTE_CODE_SUBAGENT_THREAD_ID", "RC_REMOTE_CODE_ROOT_RUN_ID",
         "RC_REMOTE_CODE_AGENT_APP_SOCKET_PATH", "RC_REMOTE_CODE_DELEGATION_CAPABILITY",

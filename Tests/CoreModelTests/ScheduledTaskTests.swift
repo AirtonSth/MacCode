@@ -2,6 +2,17 @@ import XCTest
 @testable import CoreModel
 
 final class ScheduledTaskTests: XCTestCase {
+    // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
+    override class func setUp() {
+        super.setUp()
+        AgentProvider.selectableForTesting = AgentProvider.allCases
+    }
+
+    override class func tearDown() {
+        AgentProvider.selectableForTesting = nil
+        super.tearDown()
+    }
+
     func test_validation_requiresEveryExecutionInput_becauseBackgroundRunsCannotPrompt() {
         let task = ScheduledTask(
             title: " ", prompt: "", workspaceID: WorkspaceID(), workspacePathSnapshot: "", runAsUser: "", runAsUID: 0,

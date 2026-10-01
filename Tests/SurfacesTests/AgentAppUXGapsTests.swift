@@ -1279,7 +1279,7 @@ final class AgentAppUXGapsTests: XCTestCase {
     func test_emptyThreadCopy_namesEverySupportedProvider() {
         XCTAssertEqual(
             AgentAppView.emptyThreadSubtitle,
-            "Send a prompt to start a Codex, Claude, or Grok thread.",
+            "Send a prompt to start a Distill thread.",
             "the empty state must not hide Grok from the supported-provider set"
         )
     }

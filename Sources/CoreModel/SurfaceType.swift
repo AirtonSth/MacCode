@@ -31,6 +31,18 @@ public enum AgentProvider: String, Codable, Sendable, CaseIterable {
     case claude
     case grok
     case distill
+
+    /// RemoteCode only offers and defaults to Distill. The other cases stay
+    /// so persisted threads/settings still decode (legacy threads are read-only).
+    public static var selectable: [AgentProvider] { selectableForTesting ?? [.distill] }
+
+    /// Provider every new thread, bot and scheduled task starts on.
+    public static var defaultProvider: AgentProvider { selectable.first ?? .distill }
+
+    public var isSelectable: Bool { Self.selectable.contains(self) }
+
+    /// Test seam: suites that exercise provider-generic machinery widen this to `allCases`.
+    nonisolated(unsafe) public static var selectableForTesting: [AgentProvider]?
 }
 
 public struct SurfaceDescriptor: Codable, Sendable, Hashable {

@@ -1,6 +1,7 @@
 import AppKit
 import CoreModel
 import DesignSystemKit
+import AgentRuntime
 import SwiftUI
 
 /// Shared Model popover chrome for Agent App and Bots Desk.
@@ -118,15 +119,40 @@ public enum AgentDistillModelCatalog {
         models.filter { !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
 
-    /// Collapsed row budget per model list. The selected model always pins
-    /// into view even when it falls outside the prefix.
-    public static let collapsedRowLimit = 4
-    /// Lists longer than this get an inline filter field.
     public static let searchThreshold = 6
-    /// Expanded lists longer than this scroll instead of growing the popover.
-    public static let scrollThreshold = 10
-    /// Fixed width when the caller passes none (schedulers, Desk drafts).
     public static let defaultWidth: CGFloat = 280
+
+    public static func shortLabel(_ label: String) -> String {
+        guard let suffix = label.range(of: " (", options: .backwards), label.hasSuffix(")") else { return label }
+        return String(label[..<suffix.lowerBound])
+    }
+
+    public static func effortOptionLabels(_ efforts: [AgentReasoningEffort]) -> [String] {
+        ["Auto"] + efforts.map(\.displayName)
+    }
+
+    public static func configuredWorker(homePath: String?) -> (worker: String, effort: String) {
+        let home = DistillProvisioner.homeURL(instanceHomePath: homePath)
+        let config = DistillModelsConfig.read(home: home)
+        return (config.worker.map(shortLabel) ?? "Off", config.workerEffort ?? "Auto")
+    }
+
+    public static func configWorkerSummary(homePath: String?) -> String {
+        let config = configuredWorker(homePath: homePath)
+        return "From Distill config: \(config.worker) · \(config.effort)"
+    }
+
+    public static func providerGroups(_ models: [AgentModelDescriptor]) -> [(String, [AgentModelDescriptor])] {
+        let order = ["Grok", "ChatGPT", "Claude", "OpenRouter", "Custom"]
+        let grouped = Dictionary(grouping: models) { model in
+            if model.id.hasPrefix("chatgpt/") { return "ChatGPT" }
+            if model.id.hasPrefix("claude/") { return "Claude" }
+            if model.id.hasPrefix("openrouter/") { return "OpenRouter" }
+            if model.id.contains("/") { return "Custom" }
+            return "Grok"
+        }
+        return order.compactMap { name in grouped[name].map { (name, $0) } }
+    }
 
     public static func filtered(_ models: [AgentModelDescriptor], query: String) -> [AgentModelDescriptor] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -136,20 +162,45 @@ public enum AgentDistillModelCatalog {
         }
     }
 
-    public static func visibleModels(
-        _ models: [AgentModelDescriptor],
-        selectedID: String?,
-        expanded: Bool,
-        limit: Int = collapsedRowLimit
-    ) -> [AgentModelDescriptor] {
-        guard !expanded, models.count > limit else { return models }
-        var visible = Array(models.prefix(limit))
-        if let selectedID, !selectedID.isEmpty,
-           let selected = models.first(where: { $0.id == selectedID }),
-           !visible.contains(where: { $0.id == selected.id }) {
-            visible.append(selected)
+}
+
+public struct AgentEffortChipRow: View {
+    public let selection: AgentEffortSelection
+    public let efforts: [AgentReasoningEffort]
+    public let disabled: Bool
+    public let onSelect: (AgentEffortSelection) -> Void
+
+    public init(selection: AgentEffortSelection, efforts: [AgentReasoningEffort], disabled: Bool = false, onSelect: @escaping (AgentEffortSelection) -> Void) {
+        self.selection = selection
+        self.efforts = efforts
+        self.disabled = disabled
+        self.onSelect = onSelect
+    }
+
+    public var body: some View {
+        HStack(spacing: DS.Space.xs) {
+            chip("Auto", selected: selection.isAutomatic) { onSelect(.automatic) }
+            ForEach(Self.ordered(efforts), id: \.self) { effort in
+                chip(effort.displayName, selected: selection.effort == effort) { onSelect(.fixed(effort)) }
+            }
         }
-        return visible
+    }
+
+    /// Lightest to heaviest, whatever order the catalog advertised.
+    static func ordered(_ efforts: [AgentReasoningEffort]) -> [AgentReasoningEffort] {
+        let rank = AgentReasoningEffort.allCases
+        return efforts.sorted { (rank.firstIndex(of: $0) ?? 0) < (rank.firstIndex(of: $1) ?? 0) }
+    }
+
+    private func chip(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title).font(DS.Font.caption).padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
+                .background(selected ? DS.Palette.accent : DS.Palette.surface, in: Capsule())
+                .overlay(Capsule().strokeBorder(selected ? DS.Palette.accent : DS.Palette.line, lineWidth: DS.Border.hairline))
+                .foregroundStyle(selected ? DS.Palette.onAccent : DS.Palette.text)
+        }
+        .buttonStyle(.plain).disabled(disabled)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
@@ -168,7 +219,6 @@ public struct AgentDistillMainModelSection<Footer: View>: View {
     public let onSelectCustomMainModel: (String) -> Void
     public let onSelectMainEffort: (AgentEffortSelection) -> Void
     private let footer: Footer
-    @State private var showsAllModels = false
     @State private var filterQuery = ""
 
     public init(
@@ -181,7 +231,7 @@ public struct AgentDistillMainModelSection<Footer: View>: View {
         supportsMainEffortAuto: Bool = false,
         width: CGFloat? = nil,
         isDisabled: Bool,
-        emptyListTitle: String = "No models available",
+        emptyListTitle: String = "No models yet. Connect an account on the start screen.",
         onSelectMainModel: @escaping (String) -> Void,
         onSelectCustomMainModel: @escaping (String) -> Void,
         onSelectMainEffort: @escaping (AgentEffortSelection) -> Void = { _ in },
@@ -210,12 +260,17 @@ public struct AgentDistillMainModelSection<Footer: View>: View {
         let matches = AgentDistillModelCatalog.filtered(selectable, query: trimmedQuery)
         let displayed = isFiltering
             ? matches
-            : AgentDistillModelCatalog.visibleModels(selectable, selectedID: mainModel, expanded: showsAllModels)
+            : selectable
         let customMatches = isFiltering
             ? customMainModels.filter { $0.lowercased().contains(trimmedQuery.lowercased()) }
             : customMainModels
         return VStack(alignment: .leading, spacing: 0) {
-            AgentCompactMenuSection("Main model")
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                AgentCompactMenuSection("Main model")
+                Text("Leads the conversation: plans, reviews, answers.")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
                 .accessibilityIdentifier("agent.distill.mainModel.section")
             if isMainUnavailable(in: selectable) {
                 Text("Selected Main model unavailable: \(mainModel). Choose a model below or add it as Custom.")
@@ -246,54 +301,18 @@ public struct AgentDistillMainModelSection<Footer: View>: View {
                     AgentCompactMenuRow(model, selected: model == mainModel, width: rowWidth) {
                         onSelectCustomMainModel(model)
                     }
-                    .disabled(isDisabled || reasoningModel == model)
+                    .disabled(isDisabled)
                     .help(model)
-                }
-                if !isFiltering, selectable.count > displayed.count {
-                    AgentCompactMenuRow("Show all \(selectable.count) models", selected: false, width: rowWidth) {
-                        showsAllModels = true
-                    }
                 }
                 footer
             }
             AgentCompactMenuDivider(width: rowWidth)
             AgentCompactMenuSection("Main effort")
                 .accessibilityIdentifier("agent.distill.mainEffort.section")
-            AgentCompactMenuRow(
-                "Auto",
-                selected: mainEffortSelection.isAutomatic,
-                width: rowWidth
-            ) {
-                onSelectMainEffort(.automatic)
-            }
-            .disabled(isDisabled || !supportsMainEffortAuto)
-            .help("Let Distill pick the effort for this model")
-            ForEach(mainEfforts, id: \.self) { effort in
-                AgentCompactMenuRow(
-                    effort.displayName,
-                    selected: mainEffortSelection.effort == effort,
-                    width: rowWidth
-                ) {
-                    onSelectMainEffort(.fixed(effort))
-                }
-                .disabled(isDisabled)
-                .help(effort.pickerHelpText)
-            }
-            if let effort = mainEffortSelection.effort,
-               !mainEfforts.isEmpty,
-               !mainEfforts.contains(effort) {
+            AgentEffortChipRow(selection: mainEffortSelection, efforts: mainEfforts, disabled: isDisabled, onSelect: onSelectMainEffort)
+            if let effort = mainEffortSelection.effort, !mainEfforts.isEmpty, !mainEfforts.contains(effort) {
                 Text("Selected Main effort \(effort.displayName) is unavailable for this model. Choose Auto or a supported level.")
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.warning)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(width: rowWidth, alignment: .leading)
-            }
-            if !supportsMainEffortAuto {
-                Text("Auto Main effort requires an updated Distill ACP session.")
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(width: rowWidth, alignment: .leading)
+                    .font(DS.Font.caption2).foregroundColor(DS.Palette.warning)
             }
         }
         .accessibilityElement(children: .contain)
@@ -312,31 +331,37 @@ public struct AgentDistillMainModelSection<Footer: View>: View {
 
     @ViewBuilder
     private func modelRows(_ displayed: [AgentModelDescriptor]) -> some View {
-        if displayed.count > AgentDistillModelCatalog.scrollThreshold {
+        if !displayed.isEmpty {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(displayed, id: \.id) { modelRow($0) }
+                    ForEach(AgentDistillModelCatalog.providerGroups(displayed), id: \.0) { provider, models in
+                        Text(provider.uppercased()).font(DS.Font.caption2).foregroundColor(DS.Palette.textSecondary).padding(.horizontal, DS.Space.sm).padding(.top, DS.Space.xs)
+                        ForEach(models, id: \.id) { modelRow($0) }
+                    }
                 }
             }
             .frame(width: rowWidth)
             .frame(maxHeight: 308)
         } else {
             VStack(alignment: .leading, spacing: 0) {
-                ForEach(displayed, id: \.id) { modelRow($0) }
+                ForEach(AgentDistillModelCatalog.providerGroups(displayed), id: \.0) { provider, models in
+                        Text(provider.uppercased()).font(DS.Font.caption2).foregroundColor(DS.Palette.textSecondary).padding(.horizontal, DS.Space.sm).padding(.top, DS.Space.xs)
+                        ForEach(models, id: \.id) { modelRow($0) }
+                    }
             }
         }
     }
 
     private func modelRow(_ model: AgentModelDescriptor) -> some View {
         AgentCompactMenuRow(
-            model.label,
+            AgentDistillModelCatalog.shortLabel(model.label),
             detail: model.contextWindowLabel,
             selected: model.id == mainModel,
             width: rowWidth
         ) {
             onSelectMainModel(model.id)
         }
-        .disabled(isDisabled || reasoningModel == model.id)
+        .disabled(isDisabled)
         .help("\(model.label)\n\(model.id)")
     }
 }
@@ -348,12 +373,12 @@ public struct AgentDistillReasoningModelSection: View {
     public let reasoningEffortSelection: AgentEffortSelection
     public let reasoningEfforts: [AgentReasoningEffort]
     public let supportsReasoningModelEffort: Bool
+    public let configWorkerSummary: String?
     public let width: CGFloat?
     public let isDisabled: Bool
     public let emptyListTitle: String
     public let onSelectReasoningModel: (String?) -> Void
     public let onSelectReasoningEffort: (AgentEffortSelection) -> Void
-    @State private var showsAllModels = false
     @State private var filterQuery = ""
 
     public init(
@@ -363,9 +388,10 @@ public struct AgentDistillReasoningModelSection: View {
         reasoningEffortSelection: AgentEffortSelection = .automatic,
         reasoningEfforts: [AgentReasoningEffort] = [],
         supportsReasoningModelEffort: Bool = false,
+        configWorkerSummary: String? = nil,
         width: CGFloat? = nil,
         isDisabled: Bool,
-        emptyListTitle: String = "No models available",
+        emptyListTitle: String = "No models yet. Connect an account on the start screen.",
         onSelectReasoningModel: @escaping (String?) -> Void,
         onSelectReasoningEffort: @escaping (AgentEffortSelection) -> Void = { _ in }
     ) {
@@ -375,6 +401,7 @@ public struct AgentDistillReasoningModelSection: View {
         self.reasoningEffortSelection = reasoningEffortSelection
         self.reasoningEfforts = reasoningEfforts
         self.supportsReasoningModelEffort = supportsReasoningModelEffort
+        self.configWorkerSummary = configWorkerSummary
         self.width = width
         self.isDisabled = isDisabled
         self.emptyListTitle = emptyListTitle
@@ -382,18 +409,36 @@ public struct AgentDistillReasoningModelSection: View {
         self.onSelectReasoningEffort = onSelectReasoningEffort
     }
 
+    public var showsConfigFallback: Bool { configWorkerSummary != nil }
+
     public var body: some View {
         let selectable = AgentDistillModelCatalog.selectableModels(reasoningModels)
-        let eligible = selectable.filter { $0.id != mainModel }
+        let eligible = selectable
         let trimmedQuery = filterQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         let isFiltering = !trimmedQuery.isEmpty
         let matches = AgentDistillModelCatalog.filtered(eligible, query: trimmedQuery)
         let displayed = isFiltering
             ? matches
-            : AgentDistillModelCatalog.visibleModels(eligible, selectedID: reasoningModel, expanded: showsAllModels)
+            : eligible
         return VStack(alignment: .leading, spacing: 0) {
-            AgentCompactMenuSection("Reasoning model")
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                AgentCompactMenuSection("Worker model")
+                Text("Runs the tasks Main delegates.")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
                 .accessibilityIdentifier("agent.distill.reasoningModel.section")
+            if let configWorkerSummary {
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    Text(configWorkerSummary)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.text)
+                    Text("Update Distill to choose a Worker per conversation.")
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textSecondary)
+                }
+                .frame(width: rowWidth, alignment: .leading)
+            } else {
             if let warning = reasoningWarning(in: selectable) {
                 Text(warning)
                     .font(DS.Font.caption2)
@@ -402,7 +447,7 @@ public struct AgentDistillReasoningModelSection: View {
                     .frame(width: rowWidth, alignment: .leading)
                     .padding(.bottom, DS.Space.xs)
             }
-            AgentCompactMenuRow("Off", selected: reasoningModel == nil, width: rowWidth) {
+            AgentCompactMenuRow("Off", detail: "Main does all the work", selected: reasoningModel == nil, width: rowWidth) {
                 onSelectReasoningModel(nil)
             }
             .disabled(isDisabled)
@@ -424,57 +469,34 @@ public struct AgentDistillReasoningModelSection: View {
                         .frame(width: rowWidth, alignment: .leading)
                 }
                 modelRows(displayed)
-                if !isFiltering, eligible.count > displayed.count {
-                    AgentCompactMenuRow("Show all \(eligible.count) models", selected: false, width: rowWidth) {
-                        showsAllModels = true
-                    }
-                }
             }
             if reasoningModel != nil {
                 AgentCompactMenuDivider(width: rowWidth)
-                AgentCompactMenuSection("Reasoning effort")
+                AgentCompactMenuSection("Worker effort")
                     .accessibilityIdentifier("agent.distill.reasoningEffort.section")
                 if supportsReasoningModelEffort {
-                    AgentCompactMenuRow(
-                        "Auto",
-                        selected: reasoningEffortSelection.isAutomatic,
-                        width: rowWidth
-                    ) {
-                        onSelectReasoningEffort(.automatic)
-                    }
-                    .disabled(isDisabled)
-                    .help("Let Distill pick the effort for this model")
-                    ForEach(reasoningEfforts, id: \.self) { effort in
-                        AgentCompactMenuRow(
-                            effort.displayName,
-                            selected: reasoningEffortSelection.effort == effort,
-                            width: rowWidth
-                        ) {
-                            onSelectReasoningEffort(.fixed(effort))
-                        }
-                        .disabled(isDisabled)
-                        .help(effort.pickerHelpText)
-                    }
+                    AgentEffortChipRow(selection: reasoningEffortSelection, efforts: reasoningEfforts, disabled: isDisabled, onSelect: onSelectReasoningEffort)
                     if let effort = reasoningEffortSelection.effort,
                        !reasoningEfforts.isEmpty,
                        !reasoningEfforts.contains(effort) {
-                        Text("Selected Reasoning effort \(effort.displayName) is unavailable for this model. Choose Auto or a supported level.")
+                        Text("Selected Worker effort \(effort.displayName) is unavailable for this model. Choose Auto or a supported level.")
                             .font(DS.Font.caption2)
                             .foregroundColor(DS.Palette.warning)
                             .fixedSize(horizontal: false, vertical: true)
                             .frame(width: rowWidth, alignment: .leading)
                     }
                 } else {
-                    Text("Reasoning effort follows the model default in this Distill version.")
+                    Text("Worker effort follows the model default in this Distill version.")
                         .font(DS.Font.caption2)
                         .foregroundColor(DS.Palette.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(width: rowWidth, alignment: .leading)
                 }
             }
+            }
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Reasoning model selection")
+        .accessibilityLabel("Worker model selection")
         .accessibilityIdentifier("agent.distill.reasoningModel")
     }
 
@@ -482,35 +504,38 @@ public struct AgentDistillReasoningModelSection: View {
 
     private func reasoningWarning(in selectable: [AgentModelDescriptor]) -> String? {
         guard let reasoningModel else { return nil }
-        if reasoningModel == mainModel {
-            return "Main and Reasoning models must differ. Select Off or choose a different Reasoning model."
-        }
         if !selectable.contains(where: { $0.id == reasoningModel }) {
-            return "Selected Reasoning model unavailable: \(reasoningModel). Choose Off or a model below."
+            return "Selected Worker model unavailable: \(reasoningModel). Choose Off or a model below."
         }
         return nil
     }
 
     @ViewBuilder
     private func modelRows(_ displayed: [AgentModelDescriptor]) -> some View {
-        if displayed.count > AgentDistillModelCatalog.scrollThreshold {
+        if !displayed.isEmpty {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(displayed, id: \.id) { modelRow($0) }
+                    ForEach(AgentDistillModelCatalog.providerGroups(displayed), id: \.0) { provider, models in
+                        Text(provider.uppercased()).font(DS.Font.caption2).foregroundColor(DS.Palette.textSecondary).padding(.horizontal, DS.Space.sm).padding(.top, DS.Space.xs)
+                        ForEach(models, id: \.id) { modelRow($0) }
+                    }
                 }
             }
             .frame(width: rowWidth)
             .frame(maxHeight: 308)
         } else {
             VStack(alignment: .leading, spacing: 0) {
-                ForEach(displayed, id: \.id) { modelRow($0) }
+                ForEach(AgentDistillModelCatalog.providerGroups(displayed), id: \.0) { provider, models in
+                        Text(provider.uppercased()).font(DS.Font.caption2).foregroundColor(DS.Palette.textSecondary).padding(.horizontal, DS.Space.sm).padding(.top, DS.Space.xs)
+                        ForEach(models, id: \.id) { modelRow($0) }
+                    }
             }
         }
     }
 
     private func modelRow(_ model: AgentModelDescriptor) -> some View {
         AgentCompactMenuRow(
-            model.label,
+            AgentDistillModelCatalog.shortLabel(model.label),
             detail: model.contextWindowLabel,
             selected: model.id == reasoningModel,
             width: rowWidth
@@ -534,6 +559,7 @@ public struct AgentDistillModelSelectors<MainFooter: View>: View {
     public let reasoningEfforts: [AgentReasoningEffort]
     public let supportsMainEffortAuto: Bool
     public let supportsReasoningModelEffort: Bool
+    public let configWorkerSummary: String?
     public let width: CGFloat?
     public let isDisabled: Bool
     public let onSelectMainModel: (String) -> Void
@@ -554,6 +580,7 @@ public struct AgentDistillModelSelectors<MainFooter: View>: View {
         reasoningEfforts: [AgentReasoningEffort] = [],
         supportsMainEffortAuto: Bool = false,
         supportsReasoningModelEffort: Bool = false,
+        configWorkerSummary: String? = nil,
         width: CGFloat? = nil,
         isDisabled: Bool,
         onSelectMainModel: @escaping (String) -> Void,
@@ -574,6 +601,7 @@ public struct AgentDistillModelSelectors<MainFooter: View>: View {
         self.reasoningEfforts = reasoningEfforts
         self.supportsMainEffortAuto = supportsMainEffortAuto
         self.supportsReasoningModelEffort = supportsReasoningModelEffort
+        self.configWorkerSummary = configWorkerSummary
         self.onSelectMainEffort = onSelectMainEffort
         self.onSelectReasoningEffort = onSelectReasoningEffort
         self.width = width
@@ -611,6 +639,7 @@ public struct AgentDistillModelSelectors<MainFooter: View>: View {
                 reasoningEffortSelection: reasoningEffortSelection,
                 reasoningEfforts: reasoningEfforts,
                 supportsReasoningModelEffort: supportsReasoningModelEffort,
+                configWorkerSummary: configWorkerSummary,
                 width: width,
                 isDisabled: isDisabled,
                 onSelectReasoningModel: onSelectReasoningModel,
@@ -650,7 +679,7 @@ public struct AgentModelPopoverChrome<ManualContent: View>: View {
                 header
                 Divider()
                     .accessibilityIdentifier("agent.model.auto.divider")
-            } else {
+            } else if !title.isEmpty {
                 Text(title)
                     .font(DS.Font.caption.weight(.medium))
                     .foregroundColor(DS.Palette.text)

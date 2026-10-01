@@ -374,13 +374,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         get { composerState.cursorOffset }
         set { composerState.cursorOffset = newValue }
     }
-    @Published public var provider: AgentProvider = .codex
-    @Published public var providerInstanceId: String = AgentProvider.codex.rawValue
+    @Published public var provider: AgentProvider = .defaultProvider
+    @Published public var providerInstanceId: String = AgentProvider.defaultProvider.rawValue
     /// macOS account that will execute the next provider process through the shared helper.
     /// Nil / current-account means no privileged trampoline.
     @Published public var runAsUser: AgentRunAsUser? = AgentRunAsUser.current()
     @Published public var availableRunAsUsers: [AgentRunAsUser] = MacOSLocalUserCatalog.listEligibleUsers()
-    @Published public var model: String = AgentDefaultModelSelection.codexBuiltInDefault
+    @Published public var model: String = AgentDefaultModelSelection.builtInDefault(for: .defaultProvider)
     /// Last model the user chose per provider (new threads + provider switches).
     /// Inject a suite-backed store in tests; production uses the shared defaults.
     public var lastModelStore: AgentLastModelStore = .shared
@@ -1072,7 +1072,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let newThreadDefaultsStore else { return }
         if let saved = newThreadDefaultsStore.load() {
             restoreNewThreadDefaults(saved)
-        } else if let latest = threads.max(by: { $0.updatedAt < $1.updatedAt }) {
+        } else if let latest = threads
+            .filter({ $0.provider.isSelectable })
+            .max(by: { $0.updatedAt < $1.updatedAt }) {
             let routing = latest.effectiveRoutingConfiguration
             restoreNewThreadDefaults(AgentNewThreadDefaults(
                 routingMode: routing.mode,
@@ -5115,7 +5117,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             await MainActor.run {
                 self.availableModels = m
                 self.availableModelsAreFallback = isFallback
-                self.modelListStatusMessage = m.isEmpty ? "No models returned for \(self.providerDisplayName(self.provider)). Retry from the model menu." : nil
+                self.modelListStatusMessage = m.isEmpty
+                    ? (self.provider == .distill
+                        ? "No models yet. Connect an account on the start screen, then retry."
+                        : "No models returned for \(self.providerDisplayName(self.provider)). Retry from the model menu.")
+                    : nil
                 // B8: a provider switch must leave a model valid for that
                 // provider — never a stale id from the other provider.
                 // F8: validate against the union of this fetch and the list
@@ -5311,7 +5317,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// unavailable solely because seed used an empty path.
     nonisolated public static func localFallbackProviderSnapshots() async -> [AgentProviderSnapshot] {
         var rows: [AgentProviderSnapshot] = []
-        for provider in AgentProvider.allCases {
+        for provider in AgentProvider.selectable {
             let models: [AgentModelDescriptor]
             switch provider {
             case .codex:
@@ -5444,7 +5450,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             instanceId: String
         ) -> String {
             let environmentKeys = environment.keys.sorted().joined(separator: ",")
-            let accountSelectors = ["HOME", "CODEX_HOME", "GROK_HOME", "REMOTE_CODE_INSTANCE"]
+            let accountSelectors = ["HOME", "CODEX_HOME", "GROK_HOME", "DISTILL_HOME", "REMOTE_CODE_INSTANCE"]
                 .map { "\($0)=\(environment[$0] ?? "")" }
                 .joined(separator: "\u{1f}")
             return "\(provider.rawValue)|\(instanceId)|\(binary)|\(cwd)|\(environmentKeys)|\(accountSelectors)"
@@ -5673,10 +5679,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         if let reasoningModel, let effort = distillReasoningEffortSelection.effort {
             if !distillReasoningEfforts.isEmpty, !distillReasoningEfforts.contains(effort) {
-                return "Reasoning effort \(effort.displayName) is unavailable for \(reasoningModel). Choose Auto or a supported effort."
+                return "Worker effort \(effort.displayName) is unavailable for \(reasoningModel). Choose Auto or a supported effort."
             }
             if !selectedProviderCapabilities.supportsDistillReasoningModelEffort {
-                return "Update the Distill ACP harness to apply a separate Reasoning-model effort."
+                return "Update the Distill ACP harness to apply a separate Worker-model effort."
             }
         }
         return nil
@@ -5936,6 +5942,27 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// first /status call before any user turn.
     public var providerLocked: Bool {
         selectedThreadId != nil && messages.contains { $0.role != .system }
+    }
+
+    /// Provider of the selected thread when RemoteCode no longer runs it (Distill only).
+    /// Such threads stay viewable but can never start a provider run.
+    public var legacyProviderThreadProvider: AgentProvider? {
+        guard let id = selectedThreadId else { return nil }
+        let threadProvider = threads.first(where: { $0.id == id })?.provider ?? provider
+        return threadProvider.isSelectable ? nil : threadProvider
+    }
+
+    public var isLegacyProviderThread: Bool { legacyProviderThreadProvider != nil }
+
+    public var legacyProviderBannerText: String {
+        let name = legacyProviderThreadProvider.map(providerDisplayName) ?? ""
+        return "This conversation used \(name). RemoteCode now runs Distill only, so it is read-only."
+    }
+
+    private func refuseLegacyProviderThreadRun() -> Bool {
+        guard isLegacyProviderThread else { return false }
+        statusMessage = "This conversation is read-only. Start a new Distill conversation."
+        return true
     }
     public var selectedThreadRunIsStartingOrRunning: Bool {
         selectedThreadId.map(isThreadStartingOrRunning) ?? false
@@ -6724,7 +6751,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func setReasoningModel(_ model: String?) {
         let trimmed = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let nextModel = trimmed.isEmpty ? nil : trimmed
-        guard nextModel == nil || nextModel != self.model else { return }
         if nextModel == nil {
             distillReasoningEffortSelection = .automatic
         }
@@ -6752,6 +6778,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func createThread(title: String) {
+        // A legacy (read-only) thread leaves its provider on the VM; new threads are Distill.
+        if !provider.isSelectable {
+            setProvider(.distill)
+            guard provider.isSelectable else { return }
+        }
         // New threads always reopen on the last model the user used for this
         // provider (not whatever model an older selected thread left on the VM).
         applyPreferredModelForCurrentProvider()
@@ -6763,7 +6794,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             mode: routingMode,
             manualSelection: currentModelSelection,
             manualProviderInstanceId: providerInstanceId,
-            eligibleProviders: AgentProvider.allCases,
+            eligibleProviders: AgentProvider.selectable,
             policyDigest: routingMode == .auto ? orchestrationRuntime.policyDigest : "",
             revision: routingMode == .auto ? 1 : 0
         )
@@ -7887,6 +7918,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let sendThreadId = selectedThreadId
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
+        if refuseLegacyProviderThreadRun() { return }
         if let message = selectedDistillEffortValidationMessage {
             statusMessage = message
             return
@@ -8261,6 +8293,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         attached: [AgentAttachment],
         interactionMode: AgentInteractionMode? = nil
     ) async -> Bool {
+        guard !refuseLegacyProviderThreadRun() else { return false }
         guard let selectedThreadId, let queuedMessageRepo else { return false }
         let mode = interactionMode ?? self.interactionMode
         do {
@@ -8337,7 +8370,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             manualSelection: configuration.manualSelection,
             manualProviderInstanceId: configuration.manualProviderInstanceId,
             eligibleProviders: configuration.eligibleProviders.isEmpty
-                ? AgentProvider.allCases
+                ? AgentProvider.selectable
                 : configuration.eligibleProviders,
             policyDigest: "",
             revision: max(0, configuration.revision),
@@ -8381,6 +8414,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         /// Provider still receives `text`; omit for non-send callers.
         recoveryDisplayText: String? = nil
     ) async -> AgentRunID? {
+        guard !refuseLegacyProviderThreadRun() else { return nil }
         let baseRouting = queuedRoutingSnapshot?.configuration
             ?? routingConfiguration
             ?? selectedThreadId.map { routingConfigurationForSend(threadId: $0) }
@@ -8896,6 +8930,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// UX-MAC_AGENT-009: re-send the last prompt after a recoverable error
     /// without forcing the user to retype it.
     public func retryLastPrompt() async {
+        if refuseLegacyProviderThreadRun() { return }
         let failedMessage = selectedThreadId.flatMap { threadId in
             try? messageRepo.listRecent(
                 threadId: threadId,
@@ -12073,6 +12108,7 @@ public struct AgentAppView: View {
         return QueueStatusBannerPresentation(message: message, offersCopy: true, offersRetry: true)
     }
     @ObservedObject var vm: AgentAppViewModel
+    private let accountPanel: AnyView?
     @State private var renamingThreadId: AgentThreadID?
     @State private var renameText: String = ""
     @State private var expandedTools: Set<String> = []
@@ -12141,7 +12177,10 @@ public struct AgentAppView: View {
     /// Always full chrome — no Simple/Power collapse toggle on macOS.
     private var composerChromeMode: AgentComposerChromeMode { .power }
 
-    public init(vm: AgentAppViewModel) { self.vm = vm }
+    public init(vm: AgentAppViewModel, accountPanel: AnyView? = nil) {
+        self.vm = vm
+        self.accountPanel = accountPanel
+    }
 
     /// Pure seam for the low-chrome Token Saver disclosure.
     public static func showsTokenSaverOptimizedBadge(wasTokenSaverOptimized: Bool) -> Bool {
@@ -12270,7 +12309,7 @@ public struct AgentAppView: View {
         "Threads are deleted immediately. You can undo for 10 seconds; after that, their history is permanently deleted."
 
     static let emptyThreadSubtitle =
-        "Send a prompt to start a Codex, Claude, or Grok thread."
+        "Send a prompt to start a Distill thread."
 
     static func attachmentRemovalAccessibilityLabel(path: String) -> String {
         "Remove attachment \((path as NSString).lastPathComponent)"
@@ -14826,8 +14865,12 @@ public struct AgentAppView: View {
             // F1: render the composer inside a scope that observes only the composer
             // text, so a keystroke re-renders the composer subtree and NOT this body
             // (which builds the whole transcript).
+            if vm.isLegacyProviderThread {
+                legacyProviderBanner
+            }
             ComposerReactiveScope(composerState: vm.composerState) {
                 composer
+                    .disabled(vm.isLegacyProviderThread)
                     .onChange(of: vm.composerState.focusTick) { _ in
                         collapseTranscriptForNewTurn()
                     }
@@ -15010,17 +15053,23 @@ public struct AgentAppView: View {
     /// Main model"). Desk/schedulers keep their own "Select Main model" copy.
     private var distillMainModelTitle: String {
         if vm.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Select model" }
-        return vm.modelOptionsForSelectedProvider.first(where: { $0.id == vm.model })?.label ?? vm.model
+        return AgentDistillModelCatalog.shortLabel(vm.modelOptionsForSelectedProvider.first(where: { $0.id == vm.model })?.label ?? vm.model)
+    }
+
+    private var configuredWorker: (worker: String, effort: String) {
+        AgentDistillModelCatalog.configuredWorker(homePath: vm.selectedProviderSnapshot?.homePath)
     }
 
     private var distillReasoningModelTitle: String {
+        guard vm.selectedProviderCapabilities.supportsDistillReasoningModelEffort else {
+            return "\(configuredWorker.worker) (config)"
+        }
         guard let reasoning = vm.reasoningModel, !reasoning.isEmpty else { return "Off" }
-        return vm.modelOptionsForSelectedProvider.first(where: { $0.id == reasoning })?.label ?? reasoning
+        return AgentDistillModelCatalog.shortLabel(vm.modelOptionsForSelectedProvider.first(where: { $0.id == reasoning })?.label ?? reasoning)
     }
 
     private var distillReasoningModelUnavailable: Bool {
         guard let reasoning = vm.reasoningModel, !reasoning.isEmpty else { return false }
-        if reasoning == vm.model { return true }
         return !vm.modelOptionsForSelectedProvider.contains(where: { $0.id == reasoning })
     }
     private var autoRoutingPrerequisitesLoading: Bool {
@@ -15044,7 +15093,7 @@ public struct AgentAppView: View {
             // picker rows so the two pills stay compact.
             return AgentModelPillPresentation(
                 title: modelLabel,
-                effort: vm.supportsReasoningForSelectedModel ? vm.distillMainEffortSelection.pickerDisplayName : nil,
+                effort: vm.distillMainEffortSelection.pickerDisplayName,
                 serviceTier: vm.serviceTier == .fast ? serviceTierLabel : nil,
                 prefix: "Main",
                 warning: vm.selectedModelUnavailableNotice != nil
@@ -15062,7 +15111,9 @@ public struct AgentAppView: View {
     private var reasoningPillPresentation: AgentModelPillPresentation {
         AgentModelPillPresentation(
             title: distillReasoningModelTitle,
-            prefix: "Reasoning",
+            effort: vm.selectedProviderCapabilities.supportsDistillReasoningModelEffort && vm.reasoningModel != nil
+                ? vm.distillReasoningEffortSelection.pickerDisplayName : nil,
+            prefix: "Worker",
             warning: distillReasoningModelUnavailable
         )
     }
@@ -16371,6 +16422,9 @@ public struct AgentAppView: View {
                 }
             }
             .frame(maxWidth: 420)
+            if let accountPanel {
+                accountPanel.frame(maxWidth: 420)
+            }
         }
         .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
     }
@@ -18035,7 +18089,8 @@ public struct AgentAppView: View {
             text: Binding(get: { vm.prompt }, set: { vm.prompt = $0 }),
             attachments: vm.attachments,
             placeholder: vm.composerPlaceholder,
-            sendEnabled: !sendIdleDisabled && AgentComposerChromePresentation.shows(.sendStop, mode: composerChromeMode),
+            sendEnabled: !vm.isLegacyProviderThread && !sendIdleDisabled
+                && AgentComposerChromePresentation.shows(.sendStop, mode: composerChromeMode),
             runActive: vm.selectedThreadIsStoppableBusy,
             isStopping: vm.isStopping,
             attachEnabled: vm.selectedProviderCanRun && !(vm.selectedProviderSnapshot.map {
@@ -18079,10 +18134,12 @@ public struct AgentAppView: View {
             if AgentComposerChromePresentation.shows(.runAsUser, mode: composerChromeMode) {
                 runAsUserMenu
             }
-            if AgentComposerChromePresentation.shows(.source, mode: composerChromeMode) {
+            if AgentComposerChromePresentation.shows(.source, mode: composerChromeMode),
+               AgentSourceCapsulePresentation.isVisible(entryCount: sourceMenuEntries.count) {
                 sourceMenu
             }
-            if AgentComposerChromePresentation.shows(.model, mode: composerChromeMode) {
+            if AgentComposerChromePresentation.shows(.model, mode: composerChromeMode),
+               !vm.isLegacyProviderThread {
                 modelMenu
                 if vm.provider == .distill {
                     reasoningModelMenu
@@ -18166,6 +18223,30 @@ public struct AgentAppView: View {
             }
             .accessibilityIdentifier("agent.systemStrip")
         }
+    }
+
+    private var legacyProviderBanner: some View {
+        HStack(alignment: .center, spacing: DS.Space.sm) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(DS.Palette.textSecondary)
+                .frame(width: 14, height: 14, alignment: .center)
+            Text(vm.legacyProviderBannerText)
+                .font(.system(size: 11))
+                .foregroundColor(DS.Palette.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button("New Distill conversation") {
+                vm.createThread(title: "New thread")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityIdentifier("agent.legacyProvider.newThread")
+        }
+        .padding(.horizontal, DS.Space.lg)
+        .padding(.vertical, DS.Space.sm)
+        .background(DS.Palette.surfaceRaised)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("agent.legacyProvider.banner")
     }
 
     private func systemStripRow(_ item: AgentSystemStripItem) -> some View {
@@ -18494,7 +18575,7 @@ public struct AgentAppView: View {
         .popover(isPresented: $showReasoningModelOptions, arrowEdge: .bottom) {
             reasoningModelOptionsPopover
         }
-        .help("Reasoning model · reasoning effort")
+        .help("Worker model · Worker effort")
     }
 
     private var reasoningModelOptionsPopover: some View {
@@ -18505,7 +18586,8 @@ public struct AgentAppView: View {
             autoEnabled: .constant(false),
             toggleDisabled: true,
             showsAutoRouting: false,
-            title: "Reasoning model"
+            // The shared Worker section owns its title and subtitle.
+            title: ""
         ) {
             if running {
                 Text("Read-only while running")
@@ -18521,9 +18603,11 @@ public struct AgentAppView: View {
                 reasoningEffortSelection: vm.distillReasoningEffortSelection,
                 reasoningEfforts: vm.distillReasoningEfforts,
                 supportsReasoningModelEffort: vm.selectedProviderCapabilities.supportsDistillReasoningModelEffort,
+                configWorkerSummary: vm.selectedProviderCapabilities.supportsDistillReasoningModelEffort
+                    ? nil : AgentDistillModelCatalog.configWorkerSummary(homePath: vm.selectedProviderSnapshot?.homePath),
                 width: compactModelMenuWidth,
                 isDisabled: configurationLocked,
-                emptyListTitle: vm.modelListLoading ? "Loading models..." : "No models available",
+                emptyListTitle: vm.modelListLoading ? "Loading models..." : "No models yet. Connect an account on the start screen.",
                 onSelectReasoningModel: { model in
                     vm.setReasoningModel(model)
                 },
@@ -18607,7 +18691,8 @@ public struct AgentAppView: View {
             ),
             toggleDisabled: running || !presentation.autoToggleEnabled,
             showsAutoRouting: showsAutoRouting,
-            title: vm.provider == .distill ? "Main model" : "Model"
+            // The shared Main section owns its title and subtitle.
+            title: vm.provider == .distill ? "" : "Model"
         ) {
             // UX-MAC_AGENT-016: readable while running; mutation rows disable below.
             if running {
@@ -18710,7 +18795,7 @@ public struct AgentAppView: View {
                 compactMenuDivider
             }
             if vm.provider != .distill && vm.routingMode == .manual && vm.supportsReasoningForSelectedModel {
-                compactMenuSection(vm.provider == .distill ? "Main effort" : "Reasoning effort")
+                compactMenuSection("Reasoning effort")
                 ForEach(vm.supportedReasoningEffortsForSelectedModel, id: \.self) { effort in
                     compactMenuRow(effort.displayName, selected: effort == vm.reasoningEffort) {
                         vm.setReasoningEffort(effort)
@@ -18898,7 +18983,7 @@ public struct AgentAppView: View {
     }
 
     private var reasoningModelMenuLabelWidth: CGFloat {
-        let label = "Reasoning · \(distillReasoningModelTitle)"
+        let label = "Worker · \(distillReasoningModelTitle)"
         let measured = Self.measureCurrentModelMenuLabel(label)
         let chevronWidth: CGFloat = 8
         let spacing = CGFloat(2) * DS.Space.xs
@@ -19847,14 +19932,19 @@ public enum AgentSourceCapsulePresentation {
         return "\(providerToken) · \(base)"
     }
 
+    /// The capsule only exists when there is a real choice between Distill instances.
+    public static func isVisible(entryCount: Int) -> Bool { entryCount > 1 }
+
     public static func menuEntries(
         snapshots: [AgentProviderSnapshot],
         selectedSnapshotId: String?,
         selectedProvider: AgentProvider,
         providerDisplayName: (AgentProvider) -> String
     ) -> [MenuEntry] {
+        // Only selectable (Distill) accounts are offered; legacy-provider rows never appear.
+        let snapshots = snapshots.filter { $0.provider.isSelectable }
         if snapshots.isEmpty {
-            return AgentProvider.allCases.map { provider in
+            return AgentProvider.selectable.map { provider in
                 MenuEntry(
                     id: provider.rawValue,
                     title: providerDisplayName(provider),
@@ -19873,12 +19963,8 @@ public enum AgentSourceCapsulePresentation {
             rows.append(selected)
         }
 
-        // Pre-thread / single-instance hosts: if discovery only returned Codex,
-        // still offer Claude and Grok so the Source capsule stays a real
-        // switcher (not a dead one-item label). Prefer any known snapshot for
-        // that provider; otherwise synthesize a provider-rawValue row.
         let covered = Set(rows.map(\.provider))
-        for provider in AgentProvider.allCases where !covered.contains(provider) {
+        for provider in AgentProvider.selectable where !covered.contains(provider) {
             if let any = snapshots.first(where: { $0.provider == provider }) {
                 rows.append(any)
             }
@@ -19899,7 +19985,7 @@ public enum AgentSourceCapsulePresentation {
         }
 
         let coveredAfter = Set(rows.map(\.provider))
-        for provider in AgentProvider.allCases where !coveredAfter.contains(provider) {
+        for provider in AgentProvider.selectable where !coveredAfter.contains(provider) {
             entries.append(MenuEntry(
                 id: provider.rawValue,
                 title: providerDisplayName(provider),
@@ -19941,7 +20027,7 @@ public enum AgentSourceCapsulePresentation {
 
     public static func switchHint(canSwitch: Bool, helpText: String) -> String {
         canSwitch
-            ? "Choose which ChatGPT, Claude, or Grok account runs this thread"
+            ? "Choose which Distill instance runs this thread"
             : helpText
     }
 
@@ -20072,12 +20158,12 @@ public final class AgentAppSurface: NSObject, Surface {
     /// Set by AppCommandRouter immediately after subscribe (mirrors Feed pattern).
     public var onClose: (() -> Void)?
 
-    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, draftRepo: AgentThreadDraftRepository? = nil, attachmentStore: AgentAttachmentStore? = nil, queuedMessageRepo: AgentQueuedMessageRepository? = nil, providerSessionRepo: ProviderSessionRuntimeRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil, orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime()) {
+    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, draftRepo: AgentThreadDraftRepository? = nil, attachmentStore: AgentAttachmentStore? = nil, queuedMessageRepo: AgentQueuedMessageRepository? = nil, providerSessionRepo: ProviderSessionRuntimeRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil, orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime(), accountPanel: AnyView? = nil) {
         var metadata = ["workspace": workspaceID.value.uuidString, "cwd": cwd]
         if let initialThreadId { metadata["selected_thread"] = initialThreadId.value.uuidString }
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: metadata)
         self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, draftRepo: draftRepo, attachmentStore: attachmentStore, queuedMessageRepo: queuedMessageRepo, providerSessionRepo: providerSessionRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId, initialRoutingMode: .auto, newThreadDefaultsStore: .shared, orchestrationRuntime: orchestrationRuntime)
-        let host = NSHostingView(rootView: AgentAppView(vm: viewModel))
+        let host = NSHostingView(rootView: AgentAppView(vm: viewModel, accountPanel: accountPanel))
         host.sizingOptions = []
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()

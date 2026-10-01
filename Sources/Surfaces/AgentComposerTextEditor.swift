@@ -8,6 +8,7 @@ public struct AgentComposerTextEditor: NSViewRepresentable {
     public static let minHeight: CGFloat = 30
     public static let maxHeight: CGFloat = 132
 
+    @Environment(\.isEnabled) private var isEnabled
     @Binding var text: String
     @Binding var height: CGFloat
     let focusTick: Int
@@ -115,6 +116,7 @@ public struct AgentComposerTextEditor: NSViewRepresentable {
         if let dropScroll = scroll as? FilePathDropScrollView {
             dropScroll.onFileDrop = onFileDrop
         }
+        textView.isEditable = isEnabled
         textView.onSend = onSend
         textView.onPreviousHistory = onPreviousHistory
         textView.onNextHistory = onNextHistory

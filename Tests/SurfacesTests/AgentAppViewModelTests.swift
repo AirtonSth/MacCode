@@ -14,6 +14,17 @@ import CoreModel
 /// the selected thread never strands the UI on a dead selection.
 @MainActor
 final class AgentAppViewModelTests: XCTestCase {
+    // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
+    override class func setUp() {
+        super.setUp()
+        AgentProvider.selectableForTesting = AgentProvider.allCases
+    }
+
+    override class func tearDown() {
+        AgentProvider.selectableForTesting = nil
+        super.tearDown()
+    }
+
 
     private func distillAttestation(
         type: AssistantItemType = .tool,
@@ -1327,7 +1338,8 @@ final class AgentAppViewModelTests: XCTestCase {
             models: [AgentModelDescriptor(id: "gpt-6-luna", label: "GPT-6 Luna", provider: .distill)],
             binaryPath: "/usr/bin/true",
             authenticated: true,
-            id: "distill"
+            id: "distill",
+            capabilitiesOverride: AgentProviderCapabilities(supportsDistillMainEffortAuto: true)
         )
 
         let firstCoordinator = AgentRunCoordinator(
@@ -1386,6 +1398,49 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(capture.providerInstanceIds, ["distill", "distill"])
         XCTAssertEqual(capture.requestProviderThreadIds.first ?? nil, nil)
         XCTAssertEqual(capture.requestProviderThreadIds.dropFirst().first ?? nil, savedProviderThreadID)
+    }
+
+    func test_legacyProviderThreadIsReadOnly_becauseRemoteCodeRunsDistillOnly() async throws {
+        AgentProvider.selectableForTesting = nil
+        defer { AgentProvider.selectableForTesting = AgentProvider.allCases }
+        let tmp = NSTemporaryDirectory() + "rc2-vm-legacy-provider-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let workspaceID = WorkspaceID()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let capture = CapturingProviderRunner(provider: .codex)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+                                              providers: [.codex: capture])
+        let legacy = AgentThread(workspaceId: workspaceID, title: "old codex chat", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(legacy)
+        let vm = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp, coordinator: coordinator,
+                                   threadRepo: threadRepo, messageRepo: messageRepo,
+                                   promptHistoryStore: PromptHistoryStore(db: db), initialThreadId: legacy.id)
+        vm.providerSnapshots = [AgentProviderSnapshotFactory.snapshot(
+            provider: .codex,
+            models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            binaryPath: "/usr/bin/true",
+            authenticated: true
+        )]
+
+        XCTAssertEqual(vm.selectedThreadId, legacy.id)
+        XCTAssertTrue(vm.isLegacyProviderThread, "the banner and disabled composer key off this flag")
+        XCTAssertEqual(
+            vm.legacyProviderBannerText,
+            "This conversation used Codex. RemoteCode now runs Distill only, so it is read-only."
+        )
+
+        vm.prompt = "hello?"
+        await vm.send()
+        await vm.retryLastPrompt()
+        XCTAssertTrue(capture.prompts.isEmpty, "a read-only thread must never spawn a provider process")
+        XCTAssertEqual(try messageRepo.list(threadId: legacy.id).count, 0)
+        XCTAssertNotNil(vm.statusMessage)
+
+        vm.createThread(title: "fresh")
+        XCTAssertEqual(vm.provider, .distill, "the banner's new-conversation action starts a Distill thread")
+        XCTAssertFalse(vm.isLegacyProviderThread)
     }
 
     func test_restartedAgentAppSendsFollowupWithPersistedProviderThreadId() async throws {

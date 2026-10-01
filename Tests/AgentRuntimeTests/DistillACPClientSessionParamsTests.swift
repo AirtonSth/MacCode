@@ -55,4 +55,50 @@ final class DistillACPClientSessionParamsTests: XCTestCase {
         XCTAssertNil(params["reasoning_effort"])
         XCTAssertNil(params["_meta"])
     }
+
+    func test_distillHomePrecedence_instanceThenEnvThenDotDistill() {
+        // WHY: an explicit instance home must win over the app env, and ~/.grok must never be adopted.
+        XCTAssertEqual(
+            DistillProvisioner.homeURL(
+                instanceHomePath: " /i ", environment: ["DISTILL_HOME": "/e", "GROK_HOME": "/g"], userHome: "/u"
+            ).path,
+            "/i"
+        )
+        XCTAssertEqual(
+            DistillProvisioner.homeURL(
+                instanceHomePath: "", environment: ["DISTILL_HOME": "/e", "GROK_HOME": "/g"], userHome: "/u"
+            ).path,
+            "/e"
+        )
+        XCTAssertEqual(
+            DistillProvisioner.homeURL(instanceHomePath: nil, environment: ["GROK_HOME": "/g"], userHome: "/u").path,
+            "/u/.distill"
+        )
+    }
+
+    func test_distillModelsConfigReadsOnlyWorkerKeysFromModelsSection() {
+        // WHY: the global Worker display must ignore comments, other sections, and empty values.
+        let parsed = DistillModelsConfig.parse("""
+        worker = "top-level-ignored"
+        [other]
+        worker = "other-section"
+        [models]
+        # worker = "commented"
+        main = "gpt"
+        worker = "grok-4.5" # trailing
+        worker_effort = 'high'
+        """)
+        XCTAssertEqual(parsed.worker, "grok-4.5")
+        XCTAssertEqual(parsed.workerEffort, "high")
+        let empty = DistillModelsConfig.parse("[models]\nworker = \"\"\nworker_effort = \"\"\n")
+        XCTAssertNil(empty.worker)
+        XCTAssertNil(empty.workerEffort)
+    }
+
+    func test_distillModelsConfigReadMissingFileIsNil() {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("no-such-\(UUID().uuidString)")
+        let result = DistillModelsConfig.read(home: home)
+        XCTAssertNil(result.worker)
+        XCTAssertNil(result.workerEffort)
+    }
 }

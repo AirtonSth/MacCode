@@ -460,6 +460,19 @@ public struct AgentNewThreadDefaults: Codable, Sendable, Equatable {
         self.distillMainEffortSelection = distillMainEffortSelection
         self.distillReasoningEffortSelection = distillReasoningEffortSelection
     }
+
+    public static func distillDefaults(runAsUser: AgentRunAsUser? = nil) -> AgentNewThreadDefaults {
+        AgentNewThreadDefaults(
+            routingMode: .manual,
+            runAsUser: runAsUser,
+            provider: .distill,
+            providerInstanceId: AgentProvider.distill.rawValue,
+            model: AgentDefaultModelSelection.builtInDefault(for: .distill),
+            reasoningEffort: .medium,
+            distillMainEffortSelection: .automatic,
+            distillReasoningEffortSelection: .automatic
+        )
+    }
 }
 
 /// Persists the user's last explicit Agent picker choices so every fresh
@@ -485,6 +498,12 @@ public final class AgentNewThreadDefaultsStore: @unchecked Sendable {
         codecLock.lock()
         var value = try? decoder.decode(AgentNewThreadDefaults.self, from: data)
         codecLock.unlock()
+        if let legacy = value, !legacy.provider.isSelectable {
+            // Distill-only: never carry another provider's model/effort forward.
+            let migrated = AgentNewThreadDefaults.distillDefaults(runAsUser: legacy.runAsUser)
+            save(migrated)
+            return migrated
+        }
         if value?.provider == .distill, value?.routingMode == .auto {
             value?.routingMode = .manual
             if let value { save(value) }

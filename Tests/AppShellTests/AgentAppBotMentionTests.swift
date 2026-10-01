@@ -9,6 +9,17 @@ import CoreModel
 /// Agent App `@bot` mentions must dispatch to the shared teammate runner.
 @MainActor
 final class AgentAppBotMentionTests: XCTestCase {
+    // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
+    override class func setUp() {
+        super.setUp()
+        AgentProvider.selectableForTesting = AgentProvider.allCases
+    }
+
+    override class func tearDown() {
+        AgentProvider.selectableForTesting = nil
+        super.tearDown()
+    }
+
     override func setUp() {
         super.setUp()
         UserDefaults.standard.removeObject(forKey: "bots.peerTurns")

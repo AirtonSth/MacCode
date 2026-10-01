@@ -10,6 +10,17 @@ import XCTest
 /// bundle identifier and icon, so users can install it as an update.
 @MainActor
 final class AppIdentityNotificationTests: XCTestCase {
+    // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
+    override class func setUp() {
+        super.setUp()
+        AgentProvider.selectableForTesting = AgentProvider.allCases
+    }
+
+    override class func tearDown() {
+        AgentProvider.selectableForTesting = nil
+        super.tearDown()
+    }
+
     override func tearDown() {
         unsetenv("RC2_E2E_AUTO_APPROVE_PAIRING")
         super.tearDown()

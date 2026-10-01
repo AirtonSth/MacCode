@@ -21,8 +21,8 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
     public var timeZoneIdentifier: String
 
     public init(
-        provider: AgentProvider = .grok,
-        providerInstanceID: String = AgentProvider.grok.rawValue,
+        provider: AgentProvider = .defaultProvider,
+        providerInstanceID: String = AgentProvider.defaultProvider.rawValue,
         model: String = "",
         reasoningEffort: AgentReasoningEffort = .medium,
         reasoningModel: String? = nil,
@@ -56,6 +56,20 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
         self.weekdays = weekdays.sorted()
         self.monthlyDay = monthlyDay
         self.timeZoneIdentifier = timeZoneIdentifier
+        migrateLegacyProvider()
+    }
+
+    /// RemoteCode runs Distill only: a saved Codex/Claude/Grok route becomes Distill defaults.
+    public mutating func migrateLegacyProvider() {
+        guard !provider.isSelectable else { return }
+        provider = .distill
+        providerInstanceID = AgentProvider.distill.rawValue
+        model = ""
+        reasoningEffort = .medium
+        reasoningModel = nil
+        distillMainEffortSelection = nil
+        distillReasoningEffortSelection = nil
+        routingMode = .manual
     }
 
     public var weekdaySet: Set<ScheduledWeekday> {
@@ -146,6 +160,7 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
 
     public func encodedJSON() -> String {
         var normalized = self
+        normalized.migrateLegacyProvider()
         if normalized.provider == .distill { normalized.routingMode = .manual }
         Self.codecLock.lock()
         let data = try? Self.sharedEncoder.encode(normalized)
@@ -160,6 +175,7 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
         Self.codecLock.lock()
         var decoded = try? Self.sharedDecoder.decode(BotScheduleSpec.self, from: data)
         Self.codecLock.unlock()
+        decoded?.migrateLegacyProvider()
         if decoded?.provider == .distill { decoded?.routingMode = .manual }
         return decoded
     }

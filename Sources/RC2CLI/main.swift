@@ -45,10 +45,10 @@ func usage(_ exit: Int32 = 0) -> Never {
       browser eval --id SID --script JS
       agent open --workspace WID
       agent thread list [--workspace WID]
-      agent thread create [--workspace WID] [--title T] [--provider codex|claude] [--model M]
+      agent thread create [--workspace WID] [--title T] [--provider distill] [--model M]
       agent send --thread TID --text "..." [--provider ...] [--model ...]
       agent stop --thread TID
-      agent models --provider codex|claude
+      agent models --provider distill
       agent-app codex|claude|grok [PROMPT] [--prompt-file PATH] [--workspace WID]
                 [--model M] [--permission MODE] [--reasoning-effort LEVEL]
     """
@@ -109,7 +109,7 @@ let subcommandHelp: [String: String] = [
     "events":         "Usage: \(prog) events <subcommand> [args...]\n\n  Subcommands:\n    recent           Print recent events\n    stream [--after-seq N]  Stream events in real-time (NDJSON)",
     "notification":   "Usage: \(prog) notification <subcommand> [args...]\n\n  Subcommands: create list mark-read dismiss",
     "browser":        "Usage: \(prog) browser <subcommand> [args...]\n\n  Subcommands: navigate back forward reload url snapshot click focus hover check uncheck fill type select wait screenshot eval",
-    "agent":          "Usage: \(prog) agent <subcommand> [args...]\n\n  Subcommands:\n    open --workspace WID\n    thread list [--workspace WID]\n    thread create [--workspace WID] [--title T] [--provider codex|claude] [--model M]\n    send --thread TID --text TEXT [--provider P] [--model M]\n    stop --thread TID\n    models [--provider codex|claude]",
+    "agent":          "Usage: \(prog) agent <subcommand> [args...]\n\n  Subcommands:\n    open --workspace WID\n    thread list [--workspace WID]\n    thread create [--workspace WID] [--title T] [--provider distill] [--model M]\n    send --thread TID --text TEXT [--provider P] [--model M]\n    stop --thread TID\n    models [--provider distill]",
     "agent-app":      "Usage: \(prog) agent-app <codex|claude|grok> [PROMPT] [--prompt-file PATH] [--workspace WID] [--model M] [--permission supervised|auto_accept_edits|full_access] [--reasoning-effort LEVEL] [--turn-timeout MS] [--output-format text|json|grok-json]\n\n  Runs a persisted headless turn through the same Agent App pipeline as the UI. Runtime profiles are reserved for RemoteCode's managed provider bridge.",
 ]
 
@@ -739,7 +739,7 @@ case "agent":
         emit(rpc.call("agent.run.stop", params: ["thread_id": tid]))
     case "models":
         let (flags, _) = parseFlags(rest2)
-        let prov = flags["provider"] ?? "codex"
+        let prov = flags["provider"] ?? "distill"
         emit(rpc.call("agent.models.list", params: ["provider": prov]))
     default: diagError(RC2CLIDiagnostics.unknownSubcommand(sub, of: "agent"))
     }

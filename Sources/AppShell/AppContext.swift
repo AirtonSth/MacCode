@@ -366,6 +366,23 @@ public final class AppContext {
     public let liveActivityAcceptanceOutbox: LiveActivityAcceptanceOutbox
     public let liveActivitySyncCoordinator: LiveActivitySyncCoordinator
     public let tokenSaverDistillServiceController: TokenSaverDistillServiceController
+    public lazy var distillAccountsController: DistillAccountsController = {
+        let environment = ProcessInfo.processInfo.environment
+        let home = DistillProvisioner.homeURL(environment: environment)
+        let configured = try? settingsRepo.get("cli.distill.path")
+        let binary = DistillProvisioner.resolveInstalledBinary(override: configured ?? nil, environmentPath: environment["PATH"])
+            ?? configured ?? "distill"
+        let accounts = DistillAccounts(
+            home: home,
+            binaryPath: binary,
+            environment: environment,
+            openURL: { url in NSWorkspace.shared.open(url) }
+        )
+        return DistillAccountsController(accounts: accounts) { [weak self] _, succeeded in
+            guard let self else { return }
+            if succeeded { await self.router?.refreshDistillProviderCatalog() }
+        }
+    }()
     let projectScriptRuns = ProjectScriptRunRegistry()
     public private(set) var remoteCodeOrchestrateInstallResult: RemoteCodeOrchestrateInstallResult?
     public private(set) var remoteCodeOrchestrateStatus: RemoteCodeOrchestrateStatus?

@@ -87,6 +87,21 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         self.lastRunAt = lastRunAt
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        migrateLegacyProvider()
+    }
+
+    /// RemoteCode runs Distill only: a saved Codex/Claude/Grok route becomes Distill defaults.
+    /// Prompt and schedule are kept; the model is resolved from the Distill catalog at run start.
+    public mutating func migrateLegacyProvider() {
+        guard !provider.isSelectable else { return }
+        provider = .distill
+        providerInstanceID = AgentProvider.distill.rawValue
+        model = ""
+        reasoningEffort = .medium
+        reasoningModel = nil
+        distillMainEffortSelection = nil
+        distillReasoningEffortSelection = nil
+        routingMode = .manual
     }
 
     public var effectiveRoutingMode: AgentRoutingMode {
@@ -112,11 +127,6 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         if effectiveRoutingMode == .manual,
            model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             errors.append("Model is required.")
-        }
-        if provider == .distill,
-           let reasoningModel,
-           reasoningModel.trimmingCharacters(in: .whitespacesAndNewlines) == model.trimmingCharacters(in: .whitespacesAndNewlines) {
-            errors.append("Main and Reasoning models must differ.")
         }
         if TimeZone(identifier: timeZoneIdentifier) == nil { errors.append("Time zone must be a valid IANA identifier.") }
         switch recurrence {
