@@ -64,7 +64,9 @@ final class AgentListChromeTests: XCTestCase {
         XCTAssertTrue(agent.contains("editorGroup(\"Details\")"))
         XCTAssertTrue(agent.contains("editorGroup(\"Frequency\")"))
         XCTAssertTrue(agent.contains("Auto selects the best model for the selected provider at run time."))
-        XCTAssertTrue(dest.contains("bots.scheduleTasks.editor.frequency"))
+        // WHY: the Frequency rows and their ids live in the one shared editor.
+        XCTAssertTrue(dest.contains("ScheduledFrequencyEditor("))
+        XCTAssertTrue(dest.contains("identifierPrefix: \"bots.scheduleTasks.editor\""))
         XCTAssertTrue(dest.contains("bots.scheduleTasks.editor.provider"))
         XCTAssertTrue(dest.contains("bots.scheduleTasks.editor.autoRouting"))
         XCTAssertTrue(dest.contains("bots.scheduleTasks.editor.reasoning"))

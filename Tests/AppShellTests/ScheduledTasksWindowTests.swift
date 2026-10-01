@@ -44,9 +44,9 @@ final class ScheduledTasksWindowTests: XCTestCase {
         draft.runAsUID = ScheduledSystemUserCatalog.user(named: NSUserName())?.uid ?? 501
         draft.providerInstanceID = "codex"
         draft.model = "gpt-5"
-        draft.frequency = .hourly
-        draft.intervalHours = 2
-        draft.scheduledDate = Date(timeIntervalSince1970: 200)
+        draft.frequencyRules[0].frequency = .hourly
+        draft.frequencyRules[0].intervalHours = 2
+        draft.frequencyRules[0].scheduledDate = Date(timeIntervalSince1970: 200)
 
         let task = try draft.makeTask(now: Date(timeIntervalSince1970: 150))
 
@@ -445,4 +445,63 @@ final class ScheduledTasksWindowTests: XCTestCase {
 
 private extension ScheduledTask {
     var permissionModeForScheduledExecution: AgentPermissionMode { .fullAccess }
+}
+
+extension ScheduledTasksWindowTests {
+    func test_draftWithTwoFrequenciesBuildsMultipleAndRestores_becauseEditingMustNotDropRules() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        var draft = ScheduledTaskEditorDraft(now: now)
+        draft.title = "Audit"
+        draft.prompt = "Inspect"
+        draft.workspaceID = WorkspaceID()
+        draft.workspacePathSnapshot = "/tmp"
+        draft.runAsUser = NSUserName()
+        draft.runAsUID = ScheduledSystemUserCatalog.user(named: NSUserName())?.uid ?? 501
+        draft.providerInstanceID = "codex"
+        draft.model = "gpt-5"
+        draft.timeZoneIdentifier = "UTC"
+        let early = ScheduledFrequencyRule(frequency: .daily, localTimeHour: 10, localTimeMinute: 10)
+        let late = ScheduledFrequencyRule(frequency: .daily, localTimeHour: 13, localTimeMinute: 10)
+        draft.frequencyRules = [late, early]
+
+        let task = try draft.makeTask(now: now)
+
+        XCTAssertEqual(task.recurrence, .multiple([
+            .daily(at: ScheduledLocalTime(hour: 13, minute: 10)!),
+            .daily(at: ScheduledLocalTime(hour: 10, minute: 10)!),
+        ]))
+        let expected = try XCTUnwrap(ScheduledTaskOccurrenceCalculator.nextOccurrence(
+            after: now.addingTimeInterval(-0.001),
+            recurrence: .daily(at: ScheduledLocalTime(hour: 10, minute: 10)!),
+            timeZone: TimeZone(identifier: "UTC")!,
+            calendar: Calendar(identifier: .gregorian)
+        ))
+        let lateNext = try XCTUnwrap(ScheduledTaskOccurrenceCalculator.nextOccurrence(
+            after: now.addingTimeInterval(-0.001),
+            recurrence: .daily(at: ScheduledLocalTime(hour: 13, minute: 10)!),
+            timeZone: TimeZone(identifier: "UTC")!,
+            calendar: Calendar(identifier: .gregorian)
+        ))
+        XCTAssertEqual(task.nextRunAt, min(expected, lateNext))
+
+        let restored = ScheduledTaskEditorDraft(task: task, now: now)
+        XCTAssertEqual(restored.frequencyRules.map(\.localTimeHour), [13, 10])
+    }
+
+    func test_multipleFrequencySummaryGroupsTimesByPattern_becauseCardsTruncateRepeatedDayLists() throws {
+        // WHY: "Weekly Mon, Fri at 10:10 AM · Weekly Mon, Fri at 1:10 PM" truncated on the
+        // overview card before the second time was visible.
+        let days: [ScheduledWeekday] = [.monday, .friday]
+        let recurrence = ScheduledTaskRecurrence.multiple([
+            .weekly(on: days, at: ScheduledLocalTime(hour: 10, minute: 10)!),
+            .weekly(on: days, at: ScheduledLocalTime(hour: 13, minute: 10)!),
+            .hourly(anchor: Date(timeIntervalSince1970: 0), intervalHours: 2),
+        ])
+        let first = ScheduledTaskRecurrence.weekly(on: days, at: ScheduledLocalTime(hour: 10, minute: 10)!).detailSummary
+        let second = ScheduledTaskRecurrence.weekly(on: days, at: ScheduledLocalTime(hour: 13, minute: 10)!).detailSummary
+        let secondTime = try XCTUnwrap(second.components(separatedBy: " at ").last)
+
+        XCTAssertEqual(recurrence.detailSummary, "\(first), \(secondTime) · Every 2 hours")
+        XCTAssertEqual(recurrence.summaryLabel, "Multiple")
+    }
 }

@@ -466,26 +466,11 @@ struct BotScheduleSpecEditor: View {
             }
 
             editorGroup("Frequency") {
-                formRow("Repeat") {
-                    Picker("Frequency", selection: $spec.frequency) {
-                        ForEach(ScheduledTaskFrequency.allCases) { Text($0.displayName).tag($0) }
-                    }
-                    .labelsHidden()
-                    .accessibilityIdentifier("bots.scheduleTasks.editor.frequency")
-                }
-                scheduleControls
-                formRow("Time zone") {
-                    Picker("Time zone", selection: $spec.timeZoneIdentifier) {
-                        ForEach(Self.commonTimeZones, id: \.self) {
-                            Text($0.replacingOccurrences(of: "_", with: " ")).tag($0)
-                        }
-                        if !Self.commonTimeZones.contains(spec.timeZoneIdentifier) {
-                            Text(spec.timeZoneIdentifier).tag(spec.timeZoneIdentifier)
-                        }
-                    }
-                    .labelsHidden()
-                    .accessibilityIdentifier("bots.scheduleTasks.editor.timeZone")
-                }
+                ScheduledFrequencyEditor(
+                    rules: $spec.frequencyRules,
+                    timeZoneIdentifier: $spec.timeZoneIdentifier,
+                    identifierPrefix: "bots.scheduleTasks.editor"
+                )
             }
         }
         .onAppear { normalizeProviderInstance() }
@@ -667,67 +652,6 @@ struct BotScheduleSpecEditor: View {
         if provider == .distill { spec.routingMode = .manual }
     }
 
-    @ViewBuilder
-    private var scheduleControls: some View {
-        switch spec.frequency {
-        case .once:
-            formRow("At") {
-                DatePicker("Run at", selection: $spec.scheduledDate)
-                    .labelsHidden()
-                    .datePickerStyle(.compact)
-            }
-        case .hourly:
-            formRow("Interval") {
-                Stepper("Every \(spec.intervalHours)h", value: $spec.intervalHours, in: 1...24)
-                    .foregroundColor(DS.Palette.text)
-            }
-        case .daily, .weekdays:
-            formRow("At") {
-                DatePicker("Local time", selection: Binding(
-                    get: { spec.localTime },
-                    set: { spec.localTime = $0 }
-                ), displayedComponents: .hourAndMinute)
-                    .labelsHidden()
-            }
-        case .weekly:
-            formRow("At") {
-                DatePicker("Local time", selection: Binding(
-                    get: { spec.localTime },
-                    set: { spec.localTime = $0 }
-                ), displayedComponents: .hourAndMinute)
-                    .labelsHidden()
-            }
-            formRow("Days") {
-                HStack(spacing: DS.Space.xs) {
-                    ForEach(ScheduledWeekday.allCases, id: \.self) { day in
-                        Toggle(dayLabel(day), isOn: Binding(
-                            get: { spec.weekdaySet.contains(day) },
-                            set: { enabled in
-                                var days = spec.weekdaySet
-                                if enabled { days.insert(day) } else { days.remove(day) }
-                                spec.weekdaySet = days
-                            }
-                        ))
-                        .toggleStyle(.button)
-                        .font(DS.Font.caption.weight(.semibold))
-                    }
-                }
-            }
-        case .monthly:
-            formRow("Day") {
-                Stepper("Day \(spec.monthlyDay)", value: $spec.monthlyDay, in: 1...28)
-                    .foregroundColor(DS.Palette.text)
-            }
-            formRow("At") {
-                DatePicker("Local time", selection: Binding(
-                    get: { spec.localTime },
-                    set: { spec.localTime = $0 }
-                ), displayedComponents: .hourAndMinute)
-                    .labelsHidden()
-            }
-        }
-    }
-
     private func editorGroup<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(title)
@@ -762,27 +686,4 @@ struct BotScheduleSpecEditor: View {
             .padding(.vertical, DS.Space.md)
         }
     }
-
-    private func dayLabel(_ day: ScheduledWeekday) -> String {
-        switch day {
-        case .sunday: return "S"
-        case .monday: return "M"
-        case .tuesday: return "T"
-        case .wednesday: return "W"
-        case .thursday: return "T"
-        case .friday: return "F"
-        case .saturday: return "S"
-        }
-    }
-
-    private static let commonTimeZones: [String] = [
-        TimeZone.current.identifier,
-        "UTC",
-        "America/New_York",
-        "America/Los_Angeles",
-        "America/Sao_Paulo",
-        "Europe/London",
-        "Europe/Berlin",
-        "Asia/Tokyo",
-    ]
 }

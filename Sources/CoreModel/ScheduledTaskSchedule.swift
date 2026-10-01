@@ -52,6 +52,29 @@ public enum ScheduledTaskRecurrence: Codable, Sendable, Equatable, Hashable {
     case weekly(on: [ScheduledWeekday], at: ScheduledLocalTime)
     /// Day-of-month `1...28` at the given local wall-clock time (always exists in every month).
     case monthly(day: Int, at: ScheduledLocalTime)
+    /// Fires at the earliest next occurrence of any rule. Rules are leaves (never `.multiple`),
+    /// `2...maxRules` elements, unique.
+    case multiple([ScheduledTaskRecurrence])
+
+    public static let maxRules = 24
+
+    /// The leaf rules of this recurrence (`self` for non-`.multiple`).
+    public var rules: [ScheduledTaskRecurrence] {
+        if case .multiple(let rules) = self { return rules }
+        return [self]
+    }
+
+    /// Flattens nested `.multiple`, drops duplicates (first-seen order kept).
+    /// - Returns: `nil` when empty or more than `maxRules` unique rules remain.
+    public static func combining(_ rules: [ScheduledTaskRecurrence]) -> ScheduledTaskRecurrence? {
+        var seen = Set<ScheduledTaskRecurrence>()
+        var unique: [ScheduledTaskRecurrence] = []
+        for rule in rules.flatMap(\.rules) where seen.insert(rule).inserted {
+            unique.append(rule)
+        }
+        guard !unique.isEmpty, unique.count <= maxRules else { return nil }
+        return unique.count == 1 ? unique[0] : .multiple(unique)
+    }
 
     // MARK: Validated factories
     // Note: `.once` / `.daily` / `.weekdays` need no failable factories (no extra ranges).
@@ -100,6 +123,7 @@ public enum ScheduledTaskRecurrence: Codable, Sendable, Equatable, Hashable {
         case minute
         case days
         case day
+        case rules
     }
 
     private enum Kind: String, Codable {
@@ -109,6 +133,7 @@ public enum ScheduledTaskRecurrence: Codable, Sendable, Equatable, Hashable {
         case weekdays
         case weekly
         case monthly
+        case multiple
     }
 
     public init(from decoder: Decoder) throws {
@@ -154,6 +179,18 @@ public enum ScheduledTaskRecurrence: Codable, Sendable, Equatable, Hashable {
                 )
             }
             self = .monthly(day: day, at: try Self.decodeLocalTime(from: c))
+        case .multiple:
+            let rules = try c.decode([ScheduledTaskRecurrence].self, forKey: .rules)
+            guard (2...Self.maxRules).contains(rules.count),
+                  !rules.contains(where: { if case .multiple = $0 { return true } else { return false } }),
+                  Set(rules).count == rules.count else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .rules,
+                    in: c,
+                    debugDescription: "multiple rules must be 2...\(Self.maxRules) unique non-multiple rules"
+                )
+            }
+            self = .multiple(rules)
         }
     }
 
@@ -181,6 +218,9 @@ public enum ScheduledTaskRecurrence: Codable, Sendable, Equatable, Hashable {
             try c.encode(Kind.monthly, forKey: .kind)
             try c.encode(day, forKey: .day)
             try Self.encodeLocalTime(time, into: &c)
+        case .multiple(let rules):
+            try c.encode(Kind.multiple, forKey: .kind)
+            try c.encode(rules, forKey: .rules)
         }
     }
 
@@ -288,6 +328,11 @@ public enum ScheduledTaskOccurrenceCalculator {
                 weekday: nil,
                 day: day
             )
+
+        case .multiple(let rules):
+            return rules.compactMap {
+                nextOccurrence(after: date, recurrence: $0, timeZone: timeZone, calendar: calendar)
+            }.min()
         }
     }
 

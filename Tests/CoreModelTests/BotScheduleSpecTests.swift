@@ -85,4 +85,48 @@ final class BotScheduleSpecTests: XCTestCase {
         XCTAssertEqual(resolved.localTimeHour, 9)
         XCTAssertEqual(resolved.displayNote(), spec.displayNote())
     }
+
+    func test_legacySpecJSONWithoutAdditionalFrequenciesDecodes_becauseOldRoutinesMustKeepWorking() throws {
+        let legacy = BotScheduleSpec(frequency: .daily, timeZoneIdentifier: "UTC")
+        let data = try XCTUnwrap(legacy.encodedJSON().data(using: .utf8))
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        object.removeValue(forKey: "additionalFrequencies")
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: object), as: UTF8.self)
+
+        let restored = try XCTUnwrap(BotScheduleSpec.decodeJSON(json))
+
+        XCTAssertEqual(restored.frequencyRules.count, 1)
+        XCTAssertNil(restored.additionalFrequencies)
+    }
+
+    func test_twoFrequenciesCombineAndRoundTrip_becauseRoutinesMayRunSeveralTimesADay() throws {
+        var spec = BotScheduleSpec(timeZoneIdentifier: "America/Asuncion")
+        let weekdays: [ScheduledWeekday] = [.monday, .tuesday, .wednesday, .thursday, .friday]
+        // Whole-second date: ISO8601 JSON drops fractions.
+        let anchor = Date(timeIntervalSince1970: 1_700_000_000)
+        spec.frequencyRules = [
+            ScheduledFrequencyRule(frequency: .weekly, scheduledDate: anchor, localTimeHour: 10, localTimeMinute: 10, weekdays: weekdays),
+            ScheduledFrequencyRule(frequency: .weekly, scheduledDate: anchor, localTimeHour: 13, localTimeMinute: 10, weekdays: weekdays),
+        ]
+
+        guard case .multiple(let rules) = try spec.makeRecurrence() else { return XCTFail("expected .multiple") }
+        XCTAssertEqual(rules.count, 2)
+
+        let restored = try XCTUnwrap(BotScheduleSpec.decodeJSON(spec.encodedJSON()))
+        XCTAssertEqual(restored.frequencyRules, spec.frequencyRules)
+        XCTAssertEqual(restored.displayNote(), "Weekly 10:10, Weekly 13:10")
+    }
+
+    func test_invalidSecondFrequencyNamesItsPosition_becauseUsersMustFindTheBadRule() {
+        var spec = BotScheduleSpec(timeZoneIdentifier: "UTC")
+        spec.frequencyRules = [
+            ScheduledFrequencyRule(),
+            ScheduledFrequencyRule(frequency: .weekly, weekdays: []),
+        ]
+
+        XCTAssertThrowsError(try spec.makeRecurrence()) { error in
+            guard case BotScheduleSpecError.invalid(let message) = error else { return XCTFail("wrong error \(error)") }
+            XCTAssertEqual(message, "Frequency 2: Select at least one weekday.")
+        }
+    }
 }

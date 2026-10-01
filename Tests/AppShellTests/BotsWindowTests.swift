@@ -4754,7 +4754,14 @@ final class BotsWindowTests: XCTestCase {
             contentsOf: sourceURL("Sources/AppShell/BotScheduleTasksWindow.swift"),
             encoding: .utf8
         )
-        XCTAssertTrue(source.contains("bots.scheduleTasks.editor.frequency"))
+        // WHY: one shared Frequency editor owns the rows (and their ids) for both schedule editors.
+        XCTAssertTrue(source.contains("ScheduledFrequencyEditor("))
+        XCTAssertTrue(source.contains("identifierPrefix: \"bots.scheduleTasks.editor\""))
+        let workspaceSource = try String(
+            contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(workspaceSource.contains("ScheduledFrequencyEditor("))
         XCTAssertTrue(source.contains("bots.scheduleTasks.editor.provider"))
         XCTAssertTrue(source.contains("bots.scheduleTasks.editor.autoRouting"))
         XCTAssertTrue(source.contains("bots.scheduleTasks.editor.reasoning"))

@@ -479,4 +479,68 @@ final class ScheduledTaskScheduleTests: XCTestCase {
         XCTAssertNotEqual(k1, k2, "different scheduled instants must produce different keys")
         XCTAssertNotEqual(k1, k3, "different task IDs must produce different keys")
     }
+
+    // MARK: Multiple frequencies
+
+    private var asuncion: TimeZone { TimeZone(identifier: "America/Asuncion")! }
+
+    private func weeklyWeekdays(_ hour: Int, _ minute: Int) -> ScheduledTaskRecurrence {
+        .weekly(
+            on: [.monday, .tuesday, .wednesday, .thursday, .friday],
+            at: ScheduledLocalTime(hour: hour, minute: minute)!
+        )
+    }
+
+    func test_multipleFiresAtEarliestRuleAndAdvancesPastSpentSlot_becauseTwoDailyWindowsMustBothRun() {
+        // 2026-06-01 is a Monday.
+        let recurrence = ScheduledTaskRecurrence.multiple([weeklyWeekdays(10, 10), weeklyWeekdays(13, 10)])
+        let mon9 = localDate(2026, 6, 1, 9, 0, timeZone: asuncion)
+        let mon1010 = localDate(2026, 6, 1, 10, 10, timeZone: asuncion)
+        let mon1310 = localDate(2026, 6, 1, 13, 10, timeZone: asuncion)
+
+        XCTAssertEqual(next(after: mon9, recurrence, timeZone: asuncion), mon1010)
+        XCTAssertEqual(
+            ScheduledTaskOccurrenceCalculator.nextOccurrenceAfterSpent(
+                scheduledAt: mon1010, recurrence: recurrence, timeZone: asuncion
+            ),
+            mon1310
+        )
+        XCTAssertEqual(
+            ScheduledTaskOccurrenceCalculator.nextOccurrenceAfterSpent(
+                scheduledAt: mon1310, recurrence: recurrence, timeZone: asuncion
+            ),
+            localDate(2026, 6, 2, 10, 10, timeZone: asuncion)
+        )
+    }
+
+    func test_multipleRoundTripsAndSingleRuleJSONIsUnchanged_becauseStoredSchedulesMustStayReadable() throws {
+        let multiple = ScheduledTaskRecurrence.multiple([weeklyWeekdays(10, 10), weeklyWeekdays(13, 10)])
+        let decoded = try JSONDecoder().decode(ScheduledTaskRecurrence.self, from: JSONEncoder().encode(multiple))
+        XCTAssertEqual(decoded, multiple)
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let single = try encoder.encode(ScheduledTaskRecurrence.daily(at: ScheduledLocalTime(hour: 9, minute: 5)!))
+        XCTAssertEqual(String(decoding: single, as: UTF8.self), #"{"hour":9,"kind":"daily","minute":5}"#)
+    }
+
+    func test_multipleDecodeRejectsSingleAndNestedRules_becauseInvariantsProtectTheCalculator() {
+        let daily = #"{"kind":"daily","hour":9,"minute":0}"#
+        let weekdays = #"{"kind":"weekdays","hour":9,"minute":0}"#
+        let one = #"{"kind":"multiple","rules":[\#(daily)]}"#
+        let nested = #"{"kind":"multiple","rules":[\#(daily),{"kind":"multiple","rules":[\#(daily),\#(weekdays)]}]}"#
+        let duplicate = #"{"kind":"multiple","rules":[\#(daily),\#(daily)]}"#
+        for json in [one, nested, duplicate] {
+            XCTAssertThrowsError(try JSONDecoder().decode(ScheduledTaskRecurrence.self, from: Data(json.utf8)), json)
+        }
+    }
+
+    func test_combiningDedupesAndCollapsesSingleRule_becauseOneFrequencyMustStayALeaf() {
+        let a = weeklyWeekdays(10, 10)
+        let b = weeklyWeekdays(13, 10)
+        XCTAssertEqual(ScheduledTaskRecurrence.combining([a]), a)
+        XCTAssertEqual(ScheduledTaskRecurrence.combining([a, a]), a)
+        XCTAssertEqual(ScheduledTaskRecurrence.combining([a, .multiple([b, a])]), .multiple([a, b]))
+        XCTAssertNil(ScheduledTaskRecurrence.combining([]))
+    }
 }

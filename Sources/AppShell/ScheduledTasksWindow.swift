@@ -30,12 +30,7 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
     public var distillMainEffortSelection: AgentEffortSelection?
     public var distillReasoningEffortSelection: AgentEffortSelection?
     public var routingMode: AgentRoutingMode
-    public var frequency: ScheduledTaskFrequency
-    public var scheduledDate: Date
-    public var intervalHours: Int
-    public var localTime: Date
-    public var weekdays: Set<ScheduledWeekday>
-    public var monthlyDay: Int
+    public var frequencyRules: [ScheduledFrequencyRule]
     public var timeZoneIdentifier: String
     public var isEnabled: Bool
 
@@ -58,38 +53,18 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
         routingMode = provider == .distill ? .manual : (task?.effectiveRoutingMode ?? .auto)
         timeZoneIdentifier = task?.timeZoneIdentifier ?? TimeZone.current.identifier
         isEnabled = task?.isEnabled ?? true
-        scheduledDate = now.addingTimeInterval(60 * 60)
-        intervalHours = 1
-        localTime = now
-        weekdays = [.monday]
-        monthlyDay = 1
-        frequency = .daily
-
-        guard let recurrence = task?.recurrence else { return }
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: timeZoneIdentifier) ?? .current
-        switch recurrence {
-        case .once(let at):
-            frequency = .once
-            scheduledDate = at
-        case .hourly(let anchor, let interval):
-            frequency = .hourly
-            scheduledDate = anchor
-            intervalHours = interval
-        case .daily(let time):
-            frequency = .daily
-            localTime = Self.date(for: time, calendar: calendar, now: now)
-        case .weekdays(let time):
-            frequency = .weekdays
-            localTime = Self.date(for: time, calendar: calendar, now: now)
-        case .weekly(let days, let time):
-            frequency = .weekly
-            weekdays = Set(days)
-            localTime = Self.date(for: time, calendar: calendar, now: now)
-        case .monthly(let day, let time):
-            frequency = .monthly
-            monthlyDay = day
-            localTime = Self.date(for: time, calendar: calendar, now: now)
+        if let recurrence = task?.recurrence {
+            frequencyRules = recurrence.rules.map(ScheduledFrequencyRule.init(recurrence:))
+        } else {
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = TimeZone(identifier: timeZoneIdentifier) ?? .current
+            let parts = calendar.dateComponents([.hour, .minute], from: now)
+            frequencyRules = [ScheduledFrequencyRule(
+                frequency: .daily,
+                scheduledDate: now.addingTimeInterval(60 * 60),
+                localTimeHour: parts.hour ?? 9,
+                localTimeMinute: parts.minute ?? 0
+            )]
         }
     }
 
@@ -98,35 +73,11 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
         guard TimeZone(identifier: timeZoneIdentifier) != nil else {
             throw ScheduledTaskPreflightError.invalidTask("Select a valid IANA time zone.")
         }
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: timeZoneIdentifier) ?? .current
-        let components = calendar.dateComponents([.hour, .minute], from: localTime)
-        guard let time = ScheduledLocalTime(hour: components.hour ?? -1, minute: components.minute ?? -1) else {
-            throw ScheduledTaskPreflightError.invalidTask("Select a valid local time.")
-        }
         let recurrence: ScheduledTaskRecurrence
-        switch frequency {
-        case .once:
-            recurrence = .once(at: ScheduledTaskOccurrenceCalculator.canonicalInstant(scheduledDate))
-        case .hourly:
-            guard let value = ScheduledTaskRecurrence.makeHourly(anchor: scheduledDate, intervalHours: intervalHours) else {
-                throw ScheduledTaskPreflightError.invalidTask("Hourly interval must be between 1 and 24.")
-            }
-            recurrence = value
-        case .daily:
-            recurrence = .daily(at: time)
-        case .weekdays:
-            recurrence = .weekdays(at: time)
-        case .weekly:
-            guard let value = ScheduledTaskRecurrence.makeWeekly(on: weekdays.sorted(), at: time) else {
-                throw ScheduledTaskPreflightError.invalidTask("Select at least one weekday.")
-            }
-            recurrence = value
-        case .monthly:
-            guard let value = ScheduledTaskRecurrence.makeMonthly(day: monthlyDay, at: time) else {
-                throw ScheduledTaskPreflightError.invalidTask("Monthly day must be between 1 and 28.")
-            }
-            recurrence = value
+        do {
+            recurrence = try ScheduledFrequencyRule.combinedRecurrence(frequencyRules)
+        } catch let error as ScheduledFrequencyRuleError {
+            throw ScheduledTaskPreflightError.invalidTask(error.message)
         }
         var task = ScheduledTask(
             id: id,
@@ -156,10 +107,6 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
         let errors = task.validationErrors()
         guard errors.isEmpty else { throw ScheduledTaskPreflightError.invalidTask(errors.joined(separator: " ")) }
         return task
-    }
-
-    private static func date(for time: ScheduledLocalTime, calendar: Calendar, now: Date) -> Date {
-        calendar.date(bySettingHour: time.hour, minute: time.minute, second: 0, of: now) ?? now
     }
 }
 
@@ -1505,24 +1452,11 @@ private struct ScheduledTaskEditorView: View {
                     }
 
                     editorGroup("Frequency") {
-                        formRow("Repeat") {
-                            Picker("Frequency", selection: $draft.frequency) {
-                                ForEach(ScheduledTaskFrequency.allCases) { Text($0.displayName).tag($0) }
-                            }
-                            .labelsHidden()
-                        }
-                        scheduleControls
-                        formRow("Time zone") {
-                            Picker("Time zone", selection: $draft.timeZoneIdentifier) {
-                                ForEach(Self.commonTimeZones, id: \.self) {
-                                    Text($0.replacingOccurrences(of: "_", with: " ")).tag($0)
-                                }
-                                if !Self.commonTimeZones.contains(draft.timeZoneIdentifier) {
-                                    Text(draft.timeZoneIdentifier).tag(draft.timeZoneIdentifier)
-                                }
-                            }
-                            .labelsHidden()
-                        }
+                        ScheduledFrequencyEditor(
+                            rules: $draft.frequencyRules,
+                            timeZoneIdentifier: $draft.timeZoneIdentifier,
+                            identifierPrefix: "scheduledTasks.editor"
+                        )
                     }
 
                     HStack(alignment: .center, spacing: DS.Space.md) {
@@ -1630,56 +1564,6 @@ private struct ScheduledTaskEditorView: View {
                 .font(DS.Font.caption.weight(.medium))
                 .foregroundColor(DS.Palette.textSecondary)
             content()
-        }
-    }
-
-    @ViewBuilder
-    private var scheduleControls: some View {
-        switch draft.frequency {
-        case .once:
-            formRow("At") {
-                DatePicker("Run at", selection: $draft.scheduledDate)
-                    .labelsHidden()
-                    .datePickerStyle(.compact)
-            }
-        case .hourly:
-            formRow("Interval") {
-                Stepper("Every \(draft.intervalHours)h", value: $draft.intervalHours, in: 1...24)
-                    .foregroundColor(DS.Palette.text)
-            }
-        case .daily, .weekdays:
-            formRow("At") {
-                DatePicker("Local time", selection: $draft.localTime, displayedComponents: .hourAndMinute)
-                    .labelsHidden()
-            }
-        case .weekly:
-            formRow("At") {
-                DatePicker("Local time", selection: $draft.localTime, displayedComponents: .hourAndMinute)
-                    .labelsHidden()
-            }
-            formRow("Days") {
-                HStack(spacing: DS.Space.xs) {
-                    ForEach(ScheduledWeekday.allCases, id: \.self) { day in
-                        Toggle(dayLabel(day), isOn: Binding(
-                            get: { draft.weekdays.contains(day) },
-                            set: { enabled in
-                                if enabled { draft.weekdays.insert(day) } else { draft.weekdays.remove(day) }
-                            }
-                        ))
-                        .toggleStyle(.button)
-                        .font(DS.Font.caption.weight(.semibold))
-                    }
-                }
-            }
-        case .monthly:
-            formRow("Day") {
-                Stepper("Day \(draft.monthlyDay)", value: $draft.monthlyDay, in: 1...28)
-                    .foregroundColor(DS.Palette.text)
-            }
-            formRow("At") {
-                DatePicker("Local time", selection: $draft.localTime, displayedComponents: .hourAndMinute)
-                    .labelsHidden()
-            }
         }
     }
 
@@ -1903,34 +1787,6 @@ private struct ScheduledTaskEditorView: View {
         draft.model = snapshot.models.first?.id ?? ""
         draft.reasoningEffort = snapshot.models.first?.supportedReasoningEfforts.first ?? .high
     }
-
-    private func dayLabel(_ day: ScheduledWeekday) -> String {
-        switch day {
-        case .sunday: return "S"
-        case .monday: return "M"
-        case .tuesday: return "T"
-        case .wednesday: return "W"
-        case .thursday: return "T"
-        case .friday: return "F"
-        case .saturday: return "S"
-        }
-    }
-
-    private static let commonTimeZones: [String] = {
-        let preferred = [
-            TimeZone.current.identifier,
-            "UTC",
-            "America/Asuncion",
-            "America/New_York",
-            "America/Los_Angeles",
-            "America/Sao_Paulo",
-            "Europe/London",
-            "Europe/Berlin",
-            "Asia/Tokyo"
-        ]
-        var seen = Set<String>()
-        return preferred.filter { TimeZone(identifier: $0) != nil && seen.insert($0).inserted }
-    }()
 }
 
 
@@ -1965,7 +1821,7 @@ public final class ScheduledTasksWindowController: NSWindowController, NSWindowD
 }
 
 
-private extension ScheduledTaskRecurrence {
+extension ScheduledTaskRecurrence {
     var summaryLabel: String {
         switch self {
         case .once: return "Once"
@@ -1974,25 +1830,55 @@ private extension ScheduledTaskRecurrence {
         case .weekdays: return "Weekdays"
         case .weekly: return "Weekly"
         case .monthly: return "Monthly"
+        case .multiple(let rules):
+            let labels = Set(rules.map(\.summaryLabel))
+            return labels.count == 1 ? labels.first! : "Multiple"
         }
     }
 
     /// Plan-style schedule column: "Daily at 9:00 AM", "Weekdays at 8:30 AM", …
+    /// Multiple rules sharing a pattern list their times once:
+    /// "Weekly Mon, Fri at 10:10 AM, 1:10 PM".
     var detailSummary: String {
         switch self {
         case .once(let at):
             return "Once · " + at.formatted(.dateTime.month(.abbreviated).day().hour().minute())
         case .hourly(_, let hours):
             return hours == 1 ? "Every hour" : "Every \(hours) hours"
+        case .multiple(let rules):
+            var groups: [(pattern: String?, parts: [String])] = []
+            for rule in rules {
+                guard let timed = rule.timedPattern else {
+                    groups.append((nil, [rule.detailSummary]))
+                    continue
+                }
+                if let index = groups.firstIndex(where: { $0.pattern == timed.pattern }) {
+                    groups[index].parts.append(timed.time)
+                } else {
+                    groups.append((timed.pattern, [timed.time]))
+                }
+            }
+            return groups.map { group in
+                group.pattern.map { "\($0) at \(group.parts.joined(separator: ", "))" } ?? group.parts[0]
+            }.joined(separator: " · ")
+        default:
+            guard let timed = timedPattern else { return "" }
+            return "\(timed.pattern) at \(timed.time)"
+        }
+    }
+
+    private var timedPattern: (pattern: String, time: String)? {
+        switch self {
         case .daily(let time):
-            return "Daily at \(time.displayString)"
+            return ("Daily", time.displayString)
         case .weekdays(let time):
-            return "Weekdays at \(time.displayString)"
+            return ("Weekdays", time.displayString)
         case .weekly(let days, let time):
-            let names = days.sorted().map(\.shortName).joined(separator: ", ")
-            return "Weekly \(names) at \(time.displayString)"
+            return ("Weekly " + days.sorted().map(\.shortName).joined(separator: ", "), time.displayString)
         case .monthly(let day, let time):
-            return "Monthly on day \(day) at \(time.displayString)"
+            return ("Monthly on day \(day)", time.displayString)
+        case .once, .hourly, .multiple:
+            return nil
         }
     }
 }

@@ -129,15 +129,22 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
             errors.append("Model is required.")
         }
         if TimeZone(identifier: timeZoneIdentifier) == nil { errors.append("Time zone must be a valid IANA identifier.") }
-        switch recurrence {
-        case .hourly(_, let interval) where !ScheduledTaskRecurrence.isValidHourlyInterval(interval):
-            errors.append("Hourly interval must be between 1 and 24.")
-        case .weekly(let days, _) where !ScheduledTaskRecurrence.isValidWeeklyDays(days):
-            errors.append("Weekly schedules require unique weekdays.")
-        case .monthly(let day, _) where !ScheduledTaskRecurrence.isValidMonthlyDay(day):
-            errors.append("Monthly day must be between 1 and 28.")
-        default:
-            break
+        if case .multiple(let rules) = recurrence {
+            if rules.count > ScheduledTaskRecurrence.maxRules { errors.append("At most 24 frequencies.") }
+            let hasNested = rules.contains { if case .multiple = $0 { return true } else { return false } }
+            if hasNested || Set(rules).count != rules.count { errors.append("Frequencies must be unique.") }
+        }
+        for rule in recurrence.rules {
+            switch rule {
+            case .hourly(_, let interval) where !ScheduledTaskRecurrence.isValidHourlyInterval(interval):
+                errors.append("Hourly interval must be between 1 and 24.")
+            case .weekly(let days, _) where !ScheduledTaskRecurrence.isValidWeeklyDays(days):
+                errors.append("Weekly schedules require unique weekdays.")
+            case .monthly(let day, _) where !ScheduledTaskRecurrence.isValidMonthlyDay(day):
+                errors.append("Monthly day must be between 1 and 28.")
+            default:
+                break
+            }
         }
         return errors
     }

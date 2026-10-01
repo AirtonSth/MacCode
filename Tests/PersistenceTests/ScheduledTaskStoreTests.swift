@@ -470,4 +470,16 @@ final class ScheduledTaskStoreTests: XCTestCase {
             nextRunAt: nextRunAt, createdAt: created, updatedAt: created
         )
     }
+
+    func test_multipleRecurrenceSurvivesSaveAndReload_becauseSchedulesMustNotCollapseToOneRule() throws {
+        var task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
+        let morning = ScheduledTaskRecurrence.weekly(on: [.monday, .friday], at: ScheduledLocalTime(hour: 10, minute: 10)!)
+        let afternoon = ScheduledTaskRecurrence.weekly(on: [.monday, .friday], at: ScheduledLocalTime(hour: 13, minute: 10)!)
+        task.recurrence = .multiple([morning, afternoon])
+        try store.save(task)
+
+        let reloaded = try XCTUnwrap(store.get(id: task.id))
+
+        XCTAssertEqual(reloaded.recurrence, .multiple([morning, afternoon]))
+    }
 }

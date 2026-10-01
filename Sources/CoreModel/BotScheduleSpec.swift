@@ -19,6 +19,8 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
     public var weekdays: [ScheduledWeekday]
     public var monthlyDay: Int
     public var timeZoneIdentifier: String
+    /// Frequencies after the first; the flat fields above are rule 1 (JSON back-compat).
+    public var additionalFrequencies: [ScheduledFrequencyRule]?
 
     public init(
         provider: AgentProvider = .defaultProvider,
@@ -92,57 +94,47 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
         }
     }
 
+    /// All frequencies; rule 1 is stored in the flat fields.
+    public var frequencyRules: [ScheduledFrequencyRule] {
+        get {
+            let first = ScheduledFrequencyRule(
+                frequency: frequency,
+                scheduledDate: scheduledDate,
+                intervalHours: intervalHours,
+                localTimeHour: localTimeHour,
+                localTimeMinute: localTimeMinute,
+                weekdays: weekdays,
+                monthlyDay: monthlyDay
+            )
+            return [first] + (additionalFrequencies ?? [])
+        }
+        set {
+            guard let first = newValue.first else { return }
+            frequency = first.frequency
+            scheduledDate = first.scheduledDate
+            intervalHours = first.intervalHours
+            localTimeHour = first.localTimeHour
+            localTimeMinute = first.localTimeMinute
+            weekdays = first.weekdays
+            monthlyDay = first.monthlyDay
+            let rest = Array(newValue.dropFirst())
+            additionalFrequencies = rest.isEmpty ? nil : rest
+        }
+    }
+
     public func makeRecurrence() throws -> ScheduledTaskRecurrence {
         guard TimeZone(identifier: timeZoneIdentifier) != nil else {
             throw BotScheduleSpecError.invalid("Select a valid IANA time zone.")
         }
-        guard let time = ScheduledLocalTime(hour: localTimeHour, minute: localTimeMinute) else {
-            throw BotScheduleSpecError.invalid("Select a valid local time.")
-        }
-        switch frequency {
-        case .once:
-            return .once(at: ScheduledTaskOccurrenceCalculator.canonicalInstant(scheduledDate))
-        case .hourly:
-            guard let value = ScheduledTaskRecurrence.makeHourly(anchor: scheduledDate, intervalHours: intervalHours) else {
-                throw BotScheduleSpecError.invalid("Hourly interval must be between 1 and 24.")
-            }
-            return value
-        case .daily:
-            return .daily(at: time)
-        case .weekdays:
-            return .weekdays(at: time)
-        case .weekly:
-            guard let value = ScheduledTaskRecurrence.makeWeekly(on: weekdays, at: time) else {
-                throw BotScheduleSpecError.invalid("Select at least one weekday.")
-            }
-            return value
-        case .monthly:
-            guard let value = ScheduledTaskRecurrence.makeMonthly(day: monthlyDay, at: time) else {
-                throw BotScheduleSpecError.invalid("Monthly day must be between 1 and 28.")
-            }
-            return value
+        do {
+            return try ScheduledFrequencyRule.combinedRecurrence(frequencyRules)
+        } catch let error as ScheduledFrequencyRuleError {
+            throw BotScheduleSpecError.invalid(error.message)
         }
     }
 
     public func displayNote() -> String {
-        // PERF: manual two-digit decimal avoids String(format:) ICU per schedule display.
-        let hh = localTimeHour < 10 ? "0\(localTimeHour)" : "\(localTimeHour)"
-        let mm = localTimeMinute < 10 ? "0\(localTimeMinute)" : "\(localTimeMinute)"
-        let time = "\(hh):\(mm)"
-        switch frequency {
-        case .once:
-            return "Once"
-        case .hourly:
-            return "Every \(intervalHours)h"
-        case .daily:
-            return "Daily \(time)"
-        case .weekdays:
-            return "Weekdays \(time)"
-        case .weekly:
-            return "Weekly \(time)"
-        case .monthly:
-            return "Monthly day \(monthlyDay) \(time)"
-        }
+        frequencyRules.map { $0.displayNote() }.joined(separator: ", ")
     }
 
     // PERF: JSONEncoder/Decoder with iso8601 strategy are expensive. Share one pair behind lock.
