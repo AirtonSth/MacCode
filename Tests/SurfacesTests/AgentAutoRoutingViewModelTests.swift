@@ -814,6 +814,8 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
 
         XCTAssertTrue(chrome.contains("struct AgentModelPopoverChrome"))
         XCTAssertTrue(chrome.contains("struct AgentDistillModelSelectors"))
+        XCTAssertTrue(chrome.contains("struct AgentDistillModelPills"))
+        XCTAssertTrue(chrome.contains("AgentDistillMainModelSection("))
         XCTAssertTrue(chrome.contains("struct AgentDistillMainModelSection"))
         XCTAssertTrue(chrome.contains("struct AgentDistillReasoningModelSection"))
         XCTAssertTrue(chrome.contains("struct AgentModelAutoRoutingCard"))
@@ -822,8 +824,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         XCTAssertTrue(chrome.contains(AgentModelPopoverPresentation.autoStatus))
 
         XCTAssertTrue(agent.contains("AgentModelPopoverChrome("))
-        XCTAssertTrue(agent.contains("AgentDistillMainModelSection("))
-        XCTAssertTrue(agent.contains("AgentDistillReasoningModelSection("))
+        XCTAssertTrue(agent.contains("AgentDistillModelPills("))
         XCTAssertFalse(
             agent.contains("struct AgentDistill"),
             "Agent App must mount the shared Distill sections, not define its own fork"
@@ -833,7 +834,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
             "Agent App must not keep a private Auto card after the shared chrome exists"
         )
         XCTAssertTrue(bots.contains("AgentModelPopoverChrome("))
-        XCTAssertTrue(bots.contains("AgentDistillModelSelectors("))
+        XCTAssertTrue(bots.contains("AgentDistillModelPills("))
         XCTAssertFalse(
             bots.contains(AgentModelPopoverPresentation.autoDisclaimer),
             "Bots Desk must not recopy the Auto card; use AgentModelPopoverChrome"

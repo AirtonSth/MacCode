@@ -1128,6 +1128,25 @@ final class AgentChatUXPresentationTests: XCTestCase {
         )
     }
 
+    func test_distillModelPillCopyUsesCatalogLabelsAndHonestFallbacks() {
+        let model = AgentModelDescriptor(id: "grok/test", label: "Test Model (provider)", provider: .grok)
+        XCTAssertEqual(AgentDistillModelCatalog.mainPillTitle(model: "", models: []), "Select model")
+        XCTAssertEqual(AgentDistillModelCatalog.mainPillTitle(model: model.id, models: [model]), "Test Model")
+        XCTAssertEqual(AgentDistillModelCatalog.workerPillTitle(reasoningModel: nil, models: [], supportsSessionWorker: true, homePath: nil), "Off")
+        XCTAssertTrue(AgentDistillModelCatalog.workerPillTitle(reasoningModel: nil, models: [], supportsSessionWorker: false, homePath: nil).contains("(config)"))
+        XCTAssertTrue(AgentDistillModelCatalog.workerUnavailable(reasoningModel: "missing", models: []))
+        XCTAssertFalse(AgentDistillModelCatalog.workerUnavailable(reasoningModel: nil, models: []))
+    }
+
+    func test_agentAndDeskMountSameDistillModelPills() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let agent = try String(contentsOf: root.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"), encoding: .utf8)
+        let bots = try String(contentsOf: root.appendingPathComponent("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(agent.contains("AgentDistillModelPills("))
+        XCTAssertTrue(bots.contains("AgentDistillModelPills("))
+        XCTAssertFalse(bots.contains("AgentDistillModelSelectors("), "WHY: Desk must use the same independently presented Main and Worker controls as Agent App.")
+    }
+
     func test_threadRowStopChromeOnlyWhenRunningWithHandler() {
         // WHY: the shared row owns the stop.circle; idle rows must not
         // paint it, and a running row without a handler is not stoppable.

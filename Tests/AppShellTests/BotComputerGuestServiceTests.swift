@@ -6,6 +6,7 @@ import Persistence
 
 private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable {
     var infoText = "ok"
+    var infoFails = false
     var images: Set<String> = [BotComputerGuestSpec.imageTag]
     var containers: [String: BotComputerContainerInspect] = [:]
     var png = BotComputerGuestObserve.pngSignature + Data(repeating: 1, count: 16)
@@ -28,7 +29,10 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
         BotComputerGuestSpec.imageTag: BotComputerGuestSpec.recipeRevision
     ]
 
-    func info() throws -> String { infoText }
+    func info() throws -> String {
+        if infoFails { throw BotComputerGuestError.dockerUnavailable }
+        return infoText
+    }
     func imageExists(tag: String) throws -> Bool { images.contains(tag) }
     func imageLabel(tag: String, key: String) throws -> String {
         guard key == BotComputerGuestSpec.recipeLabelKey else { return "" }
@@ -279,6 +283,37 @@ final class BotComputerGuestServiceTests: XCTestCase {
 
         XCTAssertThrowsError(try service.remoteFrame(botID: secondBot, ready: firstReady))
         XCTAssertEqual(fake.execCalls, 2, "rejecting cross-Bot evidence must not capture or replay")
+    }
+
+    func test_concurrentProveReadyDoesNotRaceOnLastReady_becauseStudioOpensCanOverlapProbes() throws {
+        // WHY: Studio opens can overlap probes while other code reads their published status.
+        let support = makeSupport("rc-guest-concurrent-probes")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.infoFails = true
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let readerDone = DispatchSemaphore(value: 0)
+        let stop = NSLock()
+        var stopped = false
+        DispatchQueue.global().async {
+            while !stop.withLock({ stopped }) {
+                _ = service.lastReady
+                _ = service.lastReason
+            }
+            readerDone.signal()
+        }
+        DispatchQueue.concurrentPerform(iterations: 64) { _ in
+            _ = service.proveReady()
+        }
+        stop.withLock { stopped = true }
+        XCTAssertEqual(readerDone.wait(timeout: .now() + 5), .success)
+        XCTAssertNil(service.lastReady)
+        XCTAssertEqual(service.lastReason, String(describing: BotComputerGuestError.dockerUnavailable))
     }
 
     func test_proveReadyRequiresPNGAndLoopback() throws {

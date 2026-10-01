@@ -119,6 +119,29 @@ public enum AgentDistillModelCatalog {
         models.filter { !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
 
+    public static func mainPillTitle(model: String, models: [AgentModelDescriptor]) -> String {
+        guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "Select model" }
+        return shortLabel(models.first(where: { $0.id == model })?.label ?? model)
+    }
+
+    public static func workerPillTitle(reasoningModel: String?, models: [AgentModelDescriptor], supportsSessionWorker: Bool, homePath: String?) -> String {
+        guard supportsSessionWorker else { return "\(configuredWorker(homePath: homePath).worker) (config)" }
+        guard let reasoningModel, !reasoningModel.isEmpty else { return "Off" }
+        return shortLabel(models.first(where: { $0.id == reasoningModel })?.label ?? reasoningModel)
+    }
+
+    public static func workerUnavailable(reasoningModel: String?, models: [AgentModelDescriptor]) -> Bool {
+        guard let reasoningModel, !reasoningModel.isEmpty else { return false }
+        return !models.contains(where: { $0.id == reasoningModel })
+    }
+
+    public static func pillWidth(_ label: String, cap: CGFloat) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+        let measured = (label as NSString).size(withAttributes: [.font: font]).width
+        let spacing = CGFloat(label.components(separatedBy: " · ").count) * DS.Space.xs
+        return min(cap, max(44, ceil(measured + 8 + spacing)))
+    }
+
     public static let searchThreshold = 6
     public static let defaultWidth: CGFloat = 280
 
@@ -544,6 +567,259 @@ public struct AgentDistillReasoningModelSection: View {
         }
         .disabled(isDisabled)
         .help("\(model.label)\n\(model.id)")
+    }
+}
+
+public struct AgentDistillModelPills<StatusHeader: View, MainFooter: View>: View {
+    public let mainModel: String
+    public let mainModels: [AgentModelDescriptor]
+    public let customMainModels: [String]
+    public let reasoningModel: String?
+    public let reasoningModels: [AgentModelDescriptor]
+    public let mainEffortSelection: AgentEffortSelection
+    public let mainEfforts: [AgentReasoningEffort]
+    public let supportsMainEffortAuto: Bool
+    public let reasoningEffortSelection: AgentEffortSelection
+    public let reasoningEfforts: [AgentReasoningEffort]
+    public let supportsReasoningModelEffort: Bool
+    public let homePath: String?
+    public let mainUnavailable: Bool
+    public let serviceTierLabel: String?
+    public let isRunning: Bool
+    public let isDisabled: Bool
+    public let emptyListTitle: String
+    public let workerEmptyListTitle: String
+    public let menuWidth: CGFloat
+    public let mainIdentifier: String
+    public let mainPopoverIdentifier: String
+    public let workerIdentifier: String
+    public let workerPopoverIdentifier: String
+    public let onSelectMainModel: (String) -> Void
+    public let onSelectCustomMainModel: (String) -> Void
+    public let onSelectMainEffort: (AgentEffortSelection) -> Void
+    public let onSelectWorkerModel: (String?) -> Void
+    public let onSelectWorkerEffort: (AgentEffortSelection) -> Void
+    public let onMainPopoverClosed: (() -> Void)?
+    /// Lets a caller close the Main popover from its footer (e.g. after saving a custom model).
+    private let mainIsPresented: Binding<Bool>?
+    private let statusHeader: StatusHeader
+    private let mainFooter: MainFooter
+    @State private var showingMain = false
+    @State private var showingWorker = false
+
+    public init(
+        mainModel: String,
+        mainModels: [AgentModelDescriptor],
+        customMainModels: [String] = [],
+        reasoningModel: String?,
+        reasoningModels: [AgentModelDescriptor],
+        mainEffortSelection: AgentEffortSelection,
+        mainEfforts: [AgentReasoningEffort],
+        supportsMainEffortAuto: Bool,
+        reasoningEffortSelection: AgentEffortSelection,
+        reasoningEfforts: [AgentReasoningEffort],
+        supportsReasoningModelEffort: Bool,
+        homePath: String?,
+        mainUnavailable: Bool,
+        serviceTierLabel: String? = nil,
+        isRunning: Bool,
+        isDisabled: Bool,
+        emptyListTitle: String,
+        workerEmptyListTitle: String,
+        menuWidth: CGFloat,
+        mainIdentifier: String,
+        mainPopoverIdentifier: String,
+        workerIdentifier: String,
+        workerPopoverIdentifier: String,
+        onSelectMainModel: @escaping (String) -> Void,
+        onSelectCustomMainModel: @escaping (String) -> Void,
+        onSelectMainEffort: @escaping (AgentEffortSelection) -> Void,
+        onSelectWorkerModel: @escaping (String?) -> Void,
+        onSelectWorkerEffort: @escaping (AgentEffortSelection) -> Void,
+        onMainPopoverClosed: (() -> Void)? = nil,
+        mainIsPresented: Binding<Bool>? = nil,
+        @ViewBuilder statusHeader: () -> StatusHeader,
+        @ViewBuilder mainFooter: () -> MainFooter
+    ) {
+        self.mainModel = mainModel
+        self.mainModels = mainModels
+        self.customMainModels = customMainModels
+        self.reasoningModel = reasoningModel
+        self.reasoningModels = reasoningModels
+        self.mainEffortSelection = mainEffortSelection
+        self.mainEfforts = mainEfforts
+        self.supportsMainEffortAuto = supportsMainEffortAuto
+        self.reasoningEffortSelection = reasoningEffortSelection
+        self.reasoningEfforts = reasoningEfforts
+        self.supportsReasoningModelEffort = supportsReasoningModelEffort
+        self.homePath = homePath
+        self.mainUnavailable = mainUnavailable
+        self.serviceTierLabel = serviceTierLabel
+        self.isRunning = isRunning
+        self.isDisabled = isDisabled
+        self.emptyListTitle = emptyListTitle
+        self.workerEmptyListTitle = workerEmptyListTitle
+        self.menuWidth = menuWidth
+        self.mainIdentifier = mainIdentifier
+        self.mainPopoverIdentifier = mainPopoverIdentifier
+        self.workerIdentifier = workerIdentifier
+        self.workerPopoverIdentifier = workerPopoverIdentifier
+        self.onSelectMainModel = onSelectMainModel
+        self.onSelectCustomMainModel = onSelectCustomMainModel
+        self.onSelectMainEffort = onSelectMainEffort
+        self.onSelectWorkerModel = onSelectWorkerModel
+        self.onSelectWorkerEffort = onSelectWorkerEffort
+        self.onMainPopoverClosed = onMainPopoverClosed
+        self.mainIsPresented = mainIsPresented
+        self.statusHeader = statusHeader()
+        self.mainFooter = mainFooter()
+    }
+
+    public var body: some View {
+        HStack(spacing: DS.Space.sm) {
+            mainPill
+            workerPill
+        }
+    }
+
+    private var mainPresentedBinding: Binding<Bool> { mainIsPresented ?? $showingMain }
+
+    private var mainTitle: String {
+        AgentDistillModelCatalog.mainPillTitle(model: mainModel, models: mainModels)
+    }
+
+    private var workerTitle: String {
+        AgentDistillModelCatalog.workerPillTitle(
+            reasoningModel: reasoningModel,
+            models: reasoningModels,
+            supportsSessionWorker: supportsReasoningModelEffort,
+            homePath: homePath
+        )
+    }
+
+    private var mainPresentation: AgentModelPillPresentation {
+        AgentModelPillPresentation(
+            title: mainTitle,
+            effort: mainEffortSelection.pickerDisplayName,
+            serviceTier: serviceTierLabel,
+            prefix: "Main",
+            warning: mainUnavailable
+        )
+    }
+
+    private var workerPresentation: AgentModelPillPresentation {
+        AgentModelPillPresentation(
+            title: workerTitle,
+            effort: supportsReasoningModelEffort && reasoningModel != nil
+                ? reasoningEffortSelection.pickerDisplayName : nil,
+            prefix: "Worker",
+            warning: AgentDistillModelCatalog.workerUnavailable(reasoningModel: reasoningModel, models: reasoningModels)
+        )
+    }
+
+    private var readOnlyNote: some View {
+        Text("Read-only while running")
+            .font(DS.Font.caption2)
+            .foregroundColor(DS.Palette.textTertiary)
+            .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var mainPill: some View {
+        let label = (["Main", mainTitle, mainEffortSelection.pickerDisplayName] + [serviceTierLabel].compactMap { $0 })
+            .joined(separator: " · ")
+        return Button {
+            mainPresentedBinding.wrappedValue.toggle()
+        } label: {
+            AgentModelPillLabel(presentation: mainPresentation, width: AgentDistillModelCatalog.pillWidth(label, cap: 220))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(mainPresentation.accessibilityLabel)
+        .accessibilityIdentifier(mainIdentifier)
+        .help("Main model · main effort")
+        .popover(isPresented: mainPresentedBinding, arrowEdge: .bottom) {
+            // The shared Main section owns its title and subtitle.
+            AgentModelPopoverChrome(
+                presentation: .current(mode: .manual),
+                autoEnabled: .constant(false),
+                toggleDisabled: true,
+                showsAutoRouting: false,
+                title: ""
+            ) {
+                if isRunning { readOnlyNote }
+                statusHeader
+                AgentDistillMainModelSection(
+                    mainModel: mainModel,
+                    mainModels: mainModels,
+                    customMainModels: customMainModels,
+                    reasoningModel: reasoningModel,
+                    mainEffortSelection: mainEffortSelection,
+                    mainEfforts: mainEfforts,
+                    supportsMainEffortAuto: supportsMainEffortAuto,
+                    width: menuWidth,
+                    isDisabled: isDisabled,
+                    emptyListTitle: emptyListTitle,
+                    onSelectMainModel: { model in
+                        onSelectMainModel(model)
+                        mainPresentedBinding.wrappedValue = false
+                    },
+                    onSelectCustomMainModel: { model in
+                        onSelectCustomMainModel(model)
+                        mainPresentedBinding.wrappedValue = false
+                    },
+                    onSelectMainEffort: onSelectMainEffort
+                ) {
+                    mainFooter
+                }
+            }
+            .accessibilityIdentifier(mainPopoverIdentifier)
+        }
+        .onChange(of: mainPresentedBinding.wrappedValue) { isShowing in
+            if !isShowing { onMainPopoverClosed?() }
+        }
+    }
+
+    private var workerPill: some View {
+        Button {
+            showingWorker.toggle()
+        } label: {
+            AgentModelPillLabel(
+                presentation: workerPresentation,
+                width: AgentDistillModelCatalog.pillWidth("Worker · \(workerTitle)", cap: 200)
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(workerPresentation.accessibilityLabel)
+        .accessibilityIdentifier(workerIdentifier)
+        .help("Worker model · Worker effort")
+        .popover(isPresented: $showingWorker, arrowEdge: .bottom) {
+            // The shared Worker section owns its title and subtitle.
+            AgentModelPopoverChrome(
+                presentation: .current(mode: .manual),
+                autoEnabled: .constant(false),
+                toggleDisabled: true,
+                showsAutoRouting: false,
+                title: ""
+            ) {
+                if isRunning { readOnlyNote }
+                statusHeader
+                AgentDistillReasoningModelSection(
+                    mainModel: mainModel,
+                    reasoningModel: reasoningModel,
+                    reasoningModels: reasoningModels,
+                    reasoningEffortSelection: reasoningEffortSelection,
+                    reasoningEfforts: reasoningEfforts,
+                    supportsReasoningModelEffort: supportsReasoningModelEffort,
+                    configWorkerSummary: supportsReasoningModelEffort
+                        ? nil : AgentDistillModelCatalog.configWorkerSummary(homePath: homePath),
+                    width: menuWidth,
+                    isDisabled: isDisabled,
+                    emptyListTitle: workerEmptyListTitle,
+                    onSelectReasoningModel: onSelectWorkerModel,
+                    onSelectReasoningEffort: onSelectWorkerEffort
+                )
+            }
+            .accessibilityIdentifier(workerPopoverIdentifier)
+        }
     }
 }
 

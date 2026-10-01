@@ -3241,6 +3241,66 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_refreshDockerGuestProbeIsSingleFlight_becauseEachProbeStartsADockerContainer() async throws {
+        // WHY: every Studio open asks for a probe. Overlapping probes each create a
+        // Docker container and raced on the service's published state (SIGSEGV).
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let docker = GatedInfoDocker()
+        defer { docker.gate.signal(); docker.gate.signal() }
+        vm.dockerGuestReadyOverrideForTesting = nil
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: docker,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+
+        vm.refreshDockerGuestProbe()
+        vm.refreshDockerGuestProbe()
+        vm.refreshDockerGuestProbe()
+        XCTAssertEqual(docker.infoStarted.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(docker.infoStarted.wait(timeout: .now() + 0.3), .timedOut, "a running probe must not start another")
+        XCTAssertEqual(docker.infoCalls, 1)
+
+        docker.gate.signal()
+        for _ in 0..<200 where vm.dockerGuestProbeReason == nil { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertNotNil(vm.dockerGuestProbeReason, "the finished probe publishes its result")
+        vm.refreshDockerGuestProbe()
+        XCTAssertEqual(docker.infoStarted.wait(timeout: .now() + 2), .success, "a new probe may start once the last one finished")
+        XCTAssertEqual(docker.infoCalls, 2)
+    }
+
+    private final class GatedInfoDocker: BotComputerDockerClienting, @unchecked Sendable {
+        let gate = DispatchSemaphore(value: 0)
+        let infoStarted = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var _infoCalls = 0
+        var infoCalls: Int { lock.withLock { _infoCalls } }
+
+        func info() throws -> String {
+            lock.withLock { _infoCalls += 1 }
+            infoStarted.signal()
+            _ = gate.wait(timeout: .now() + 5)
+            throw BotComputerGuestError.dockerUnavailable
+        }
+        func imageExists(tag: String) throws -> Bool { true }
+        func imageLabel(tag: String, key: String) throws -> String { "" }
+        func imageID(tag: String) throws -> String { "img" }
+        func build(context: URL, tag: String) throws {}
+        func create(options: BotComputerContainerCreateOptions) throws -> String { options.name }
+        func start(name: String) throws {}
+        func stop(name: String) throws {}
+        func inspect(name: String) throws -> BotComputerContainerInspect {
+            BotComputerContainerInspect(running: false, imageID: "img", hostPort: 49152)
+        }
+        func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data { Data() }
+        func rename(from: String, to: String) throws {}
+        func ensureNetwork(name: String) throws {}
+        func remove(name: String) throws {}
+        func removeMatching(namePrefix: String) throws {}
+    }
+
     func test_deleteRunsDockerTeardownOffMain_becauseAStuckDaemonMustNotFreezeTheRoster() async throws {
         // WHY: deleting a teammate is immediate durable UI work, while Docker
         // rm may consume resolver and command timeouts. The event loop must keep
@@ -8172,9 +8232,9 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.deskRunReasoning, .high)
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("\"bots.desk.source\""))
-        XCTAssertTrue(source.contains("accessibilityIdentifier(\"bots.desk.model\")"))
+        XCTAssertTrue(source.contains("mainIdentifier: \"bots.desk.model\""))
         XCTAssertTrue(source.contains("\"bots.desk.permission\""))
-        XCTAssertTrue(source.contains("accessibilityIdentifier(\"bots.desk.model.popover\")"))
+        XCTAssertTrue(source.contains("mainPopoverIdentifier: \"bots.desk.model.popover\""))
         XCTAssertTrue(
             source.contains("AgentModelPopoverChrome("),
             "Desk Auto must use the Agent App Model popover chrome, not a header-only fork"

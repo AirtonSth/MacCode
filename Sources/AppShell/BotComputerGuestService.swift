@@ -54,8 +54,11 @@ public final class BotComputerGuestService: @unchecked Sendable {
     private let observeAttempts: Int
     private let observeDelay: TimeInterval
     private let sleep: @Sendable (TimeInterval) -> Void
-    public private(set) var lastReady: BotComputerGuestReady?
-    public private(set) var lastReason: String = "Guest is proving the screen…"
+    private let stateLock = NSLock()
+    private var _lastReady: BotComputerGuestReady?
+    private var _lastReason = "Guest is proving the screen…"
+    public var lastReady: BotComputerGuestReady? { stateLock.withLock { _lastReady } }
+    public var lastReason: String { stateLock.withLock { _lastReason } }
     public var recipeContextURL: URL? { recipeContext }
 
     public init(
@@ -110,21 +113,25 @@ public final class BotComputerGuestService: @unchecked Sendable {
             let inspect = try docker.inspect(name: name)
             let url = try BotComputerGuestSpec.screenURL(hostPort: inspect.hostPort, token: viewerToken)
             try BotComputerGuestSpec.validateScreenURL(url)
-            lastReady = BotComputerGuestReady(
-                screenURL: url,
-                pngHash: hash,
-                pngMagic: Self.pngMagic(png),
-                resumed: false,
-                containerID: name,
-                imageReference: inspect.imageID,
-                capturedPNG: png
-            )
-            lastReason = ""
+            stateLock.withLock {
+                _lastReady = BotComputerGuestReady(
+                    screenURL: url,
+                    pngHash: hash,
+                    pngMagic: Self.pngMagic(png),
+                    resumed: false,
+                    containerID: name,
+                    imageReference: inspect.imageID,
+                    capturedPNG: png
+                )
+                _lastReason = ""
+            }
             return true
         } catch {
-            lastReady = nil
-            if lastReason == "Guest is proving the screen…" {
-                lastReason = String(describing: error)
+            stateLock.withLock {
+                _lastReady = nil
+                if _lastReason == "Guest is proving the screen…" {
+                    _lastReason = String(describing: error)
+                }
             }
             return false
         }
@@ -224,7 +231,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
             try? docker.remove(name: canonical)
             try docker.rename(from: next, to: canonical)
             let renamed = try readyState(name: canonical, botID: botID, resumed: false)
-            lastReady = renamed
+            stateLock.withLock { _lastReady = renamed }
             return renamed
         } catch {
             try? docker.remove(name: next)
@@ -337,8 +344,10 @@ public final class BotComputerGuestService: @unchecked Sendable {
             imageReference: inspect.imageID,
             capturedPNG: png
         )
-        lastReady = ready
-        lastReason = ""
+        stateLock.withLock {
+            _lastReady = ready
+            _lastReason = ""
+        }
         return ready
     }
 
@@ -366,7 +375,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
         }
         guard let recipeContext else {
             if try docker.imageExists(tag: tag) { return }
-            lastReason = "Docker image missing"
+            stateLock.withLock { _lastReason = "Docker image missing" }
             throw BotComputerGuestError.dockerUnavailable
         }
         try docker.build(context: recipeContext, tag: tag)

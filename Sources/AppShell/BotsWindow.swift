@@ -10651,14 +10651,22 @@ public final class BotsViewModel: ObservableObject {
         _ = try BotDesktopAdmission.requireSend(kind: kind, guestReady: ready)
     }
 
+    private var dockerGuestProbeTask: Task<Void, Never>?
+    private var dockerGuestProbeGeneration = 0
+
     public func refreshDockerGuestProbe() {
         guard dockerGuestReadyOverrideForTesting == nil else { return }
         guard let service = computerGuestService else { return }
-        Task.detached {
+        guard dockerGuestProbeTask == nil else { return }
+        dockerGuestProbeGeneration += 1
+        let generation = dockerGuestProbeGeneration
+        dockerGuestProbeTask = Task.detached { [weak self] in
             let ready = service.proveReady()
             await MainActor.run {
+                guard let self, self.dockerGuestProbeGeneration == generation else { return }
                 self.dockerGuestProbeReason = ready ? nil : service.lastReason
                 self.objectWillChange.send()
+                self.dockerGuestProbeTask = nil
             }
         }
     }
@@ -13252,7 +13260,30 @@ public struct BotsRootView: View {
             if AgentSourceCapsulePresentation.isVisible(entryCount: deskSourceEntries.count) {
                 deskSourceMenu
             }
-            deskModelMenu
+            if vm.deskRouting.provider == .distill {
+                AgentDistillModelPills(
+                    mainModel: vm.deskRunModel, mainModels: vm.deskModels, customMainModels: [],
+                    reasoningModel: vm.deskRouting.reasoningModel, reasoningModels: vm.deskModels,
+                    mainEffortSelection: vm.deskDistillMainEffortSelection, mainEfforts: vm.deskSupportedReasoning,
+                    supportsMainEffortAuto: vm.deskSupportsDistillMainEffortAuto,
+                    reasoningEffortSelection: vm.deskDistillReasoningEffortSelection,
+                    reasoningEfforts: vm.deskDistillReasoningEfforts,
+                    supportsReasoningModelEffort: vm.deskSupportsDistillReasoningModelEffort,
+                    homePath: vm.selectedDeskSnapshot?.homePath,
+                    mainUnavailable: !vm.deskRunModel.isEmpty && !vm.deskModels.contains(where: { $0.id == vm.deskRunModel }),
+                    isRunning: deskRoutingLocked, isDisabled: deskRoutingLocked,
+                    emptyListTitle: "No models yet. Connect an account on the start screen.",
+                    workerEmptyListTitle: "No models yet. Connect an account on the start screen.",
+                    menuWidth: AgentModelMenuWidth.estimatedWidth(titles: vm.deskModels.map(\.label) + AgentDistillModelCatalog.effortOptionLabels(vm.deskSupportedReasoning) + AgentDistillModelCatalog.effortOptionLabels(vm.deskDistillReasoningEfforts), min: AgentModelMenuWidth.distillMin, max: AgentModelMenuWidth.distillMax),
+                    mainIdentifier: "bots.desk.model", mainPopoverIdentifier: "bots.desk.model.popover",
+                    workerIdentifier: "bots.desk.workerModel", workerPopoverIdentifier: "bots.desk.workerModel.popover",
+                    onSelectMainModel: vm.setDeskModel, onSelectCustomMainModel: vm.setDeskModel,
+                    onSelectMainEffort: vm.setDeskDistillMainEffortSelection,
+                    onSelectWorkerModel: vm.setDeskReasoningModel,
+                    onSelectWorkerEffort: vm.setDeskDistillReasoningEffortSelection,
+                    statusHeader: { EmptyView() }, mainFooter: { EmptyView() }
+                )
+            } else { deskModelMenu }
             deskPermissionMenu
             deskExecutionChip
         }
@@ -13350,52 +13381,15 @@ public struct BotsRootView: View {
             toggleDisabled: deskRoutingLocked,
             showsAutoRouting: showsAutoRouting
         ) {
-            if vm.deskRouting.provider == .distill {
-                AgentDistillModelSelectors(
-                    mainModel: vm.deskRunModel,
-                    mainModels: models,
-                    reasoningModel: vm.deskRouting.reasoningModel,
-                    reasoningModels: models,
-                    mainEffortSelection: vm.deskDistillMainEffortSelection,
-                    mainEfforts: vm.deskSupportedReasoning,
-                    reasoningEffortSelection: vm.deskDistillReasoningEffortSelection,
-                    reasoningEfforts: vm.deskDistillReasoningEfforts,
-                    supportsMainEffortAuto: vm.deskSupportsDistillMainEffortAuto,
-                    supportsReasoningModelEffort: vm.deskSupportsDistillReasoningModelEffort,
-                    configWorkerSummary: vm.deskSupportsDistillReasoningModelEffort
-                        ? nil : AgentDistillModelCatalog.configWorkerSummary(homePath: vm.selectedDeskSnapshot?.homePath),
-                    width: 240,
-                    isDisabled: deskRoutingLocked,
-                    onSelectMainModel: { model in
-                        vm.setDeskModel(model)
-                        showDeskModelOptions = false
-                    },
-                    onSelectCustomMainModel: { model in
-                        vm.setDeskModel(model)
-                        showDeskModelOptions = false
-                    },
-                    onSelectReasoningModel: { model in
-                        vm.setDeskReasoningModel(model)
-                    },
-                    onSelectMainEffort: { selection in
-                        vm.setDeskDistillMainEffortSelection(selection)
-                    },
-                    onSelectReasoningEffort: { selection in
-                        vm.setDeskDistillReasoningEffortSelection(selection)
-                    },
-                    mainFooter: { EmptyView() }
-                )
-            } else {
-                AgentCompactMenuSection("Model")
-                ForEach(models, id: \.id) { model in
-                    AgentCompactMenuRow(model.label, selected: model.id == vm.deskRunModel) {
-                        vm.setDeskModel(model.id)
-                        showDeskModelOptions = false
-                    }
-                    .disabled(deskRoutingLocked)
+            AgentCompactMenuSection("Model")
+            ForEach(models, id: \.id) { model in
+                AgentCompactMenuRow(model.label, selected: model.id == vm.deskRunModel) {
+                    vm.setDeskModel(model.id)
+                    showDeskModelOptions = false
                 }
+                .disabled(deskRoutingLocked)
             }
-            if vm.deskRouting.provider != .distill && vm.deskSupportsReasoning {
+            if vm.deskSupportsReasoning {
                 AgentCompactMenuDivider()
                 AgentCompactMenuSection("Reasoning effort")
                 ForEach(vm.deskSupportedReasoning, id: \.self) { effort in
