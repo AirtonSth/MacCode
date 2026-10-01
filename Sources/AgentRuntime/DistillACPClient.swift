@@ -1014,7 +1014,13 @@ public final class DistillACPClient: @unchecked Sendable {
         if !meta.isEmpty { params["_meta"] = meta }
         let response = try await requestJSONObject(method: "session/set_model", params: params, timeout: 15)
         let resultMeta = response["_meta"] as? JSONObject ?? response["meta"] as? JSONObject ?? response
-        let activeModelId = (resultMeta["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Distill 2.0.25 serializes the switch result as `{"Ok": "<model>"}` / `{"Err": "<reason>"}`.
+        let rawModel = resultMeta["model"]
+        if let failure = (rawModel as? JSONObject)?["Err"] {
+            throw DistillACPError.unsupported("Distill rejected Main model \(modelId): \(failure)")
+        }
+        let activeModelId = ((rawModel as? String) ?? ((rawModel as? JSONObject)?["Ok"] as? String))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard let activeModelId, !activeModelId.isEmpty else {
             throw DistillACPError.responseTypeMismatch("session/set_model model acknowledgement")
         }

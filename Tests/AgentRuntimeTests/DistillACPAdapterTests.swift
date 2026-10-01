@@ -75,7 +75,8 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         root: URL,
         initializeCapabilities: String,
         workerResult: String,
-        sessionModels: String = #"{"currentModelId":"main"}"#
+        sessionModels: String = #"{"currentModelId":"main"}"#,
+        setModelResult: String? = nil
     ) throws -> (harness: URL, requests: URL) {
         let requestsURL = root.appendingPathComponent("requests.jsonl")
         let harnessURL = root.appendingPathComponent("distill-agent")
@@ -94,7 +95,9 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             elif method == "session/new":
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{"sessionId":"worker-session","models":\(sessionModels)}})
             elif method == "session/set_model":
-                send({"jsonrpc":"2.0", "id":message["id"], "result":{"_meta":{"model":params.get("modelId"),"contextWindow":1000}}})
+                fixed = \(String(reflecting: setModelResult ?? ""))
+                result = json.loads(fixed) if fixed else {"_meta":{"model":params.get("modelId"),"contextWindow":1000}}
+                send({"jsonrpc":"2.0", "id":message["id"], "result":result})
             elif method == "_x.ai/session/worker_model/set":
                 send({"jsonrpc":"2.0", "id":message["id"], "result":\(workerResult)})
             elif method in ("session/set_mode", "session/set_config_option"):
@@ -257,6 +260,51 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual((params["_meta"] as? [String: Any])?["reasoningEffort"] as? String, "medium")
         let methods = try recordedRequests(requestsURL).compactMap { $0["method"] as? String }
         XCTAssertTrue(methods.contains("session/prompt"), "the prompt must be sent once the catalog effort is bound")
+    }
+
+    func test_setModelAcceptsDistill2025ResultWrappedModelAck_becauseLatestDistillAnswersOkObject() async throws {
+        // WHY: Distill 2.0.25 answers set_model with `"model": {"Ok": "<model>"}` (captured from the real binary).
+        // Rejecting that shape failed every send with "model acknowledgement response had an unexpected shape".
+        let root = try makeTempRoot("distill-acp-setmodel-2025")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, _) = try writeWorkerHarness(
+            root: root,
+            initializeCapabilities: "{}",
+            workerResult: "{}",
+            setModelResult: #"{"_meta":{"model":{"Ok":"gpt-6-luna"},"contextWindow":872000,"canonicalModelId":"chatgpt/gpt-6-luna","reasoningEffort":"medium","reasoningEffortAuto":false}}"#
+        )
+        let client = try DistillACPClient(binary: harness.path, cwd: root.path, tagProcess: false)
+        defer { client.stop() }
+        _ = try await client.initialize()
+        let applied = try await client.setModel(
+            sessionId: "worker-session",
+            modelId: "chatgpt/gpt-6-luna",
+            reasoningEffort: .medium,
+            advertisedEfforts: [.low, .medium, .high]
+        )
+        XCTAssertEqual(applied.activeModelId, "gpt-6-luna")
+        XCTAssertEqual(applied.canonicalModelId, "chatgpt/gpt-6-luna")
+        XCTAssertEqual(applied.effort, .medium)
+    }
+
+    func test_setModelSurfacesDistillErrResult_becauseARejectedSwitchMustNotLookLikeAShapeBug() async throws {
+        let root = try makeTempRoot("distill-acp-setmodel-err")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, _) = try writeWorkerHarness(
+            root: root,
+            initializeCapabilities: "{}",
+            workerResult: "{}",
+            setModelResult: #"{"_meta":{"model":{"Err":"model unavailable"},"canonicalModelId":"chatgpt/gpt-6-luna"}}"#
+        )
+        let client = try DistillACPClient(binary: harness.path, cwd: root.path, tagProcess: false)
+        defer { client.stop() }
+        _ = try await client.initialize()
+        do {
+            _ = try await client.setModel(sessionId: "worker-session", modelId: "chatgpt/gpt-6-luna")
+            XCTFail("an Err switch result must fail")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("model unavailable"), "\(error)")
+        }
     }
 
     func test_setModelStillRefusesEffortWithoutCatalogOrPolicy_becauseUnadvertisedEffortsCannotBeAcknowledged() async throws {
