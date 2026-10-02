@@ -77,6 +77,12 @@ extension TerminalSurface: TerminalRuntimeRoutingSurface {
 protocol SSHTransferSurface: Surface {
     var sshTransferProfile: SSHHostProfile? { get }
     func appendSystemText(_ raw: String)
+    /// Terminal that owns this surface's system-output stream, if any.
+    var transferTerminal: TerminalSurface? { get }
+}
+
+extension SSHTransferSurface {
+    var transferTerminal: TerminalSurface? { nil }
 }
 
 @MainActor
@@ -1313,6 +1319,8 @@ final class SSHSurface: NSObject, SSHTransferSurface, TerminalRuntimeRoutingSurf
     func appendSystemText(_ raw: String) {
         terminal?.appendSystemText(raw)
     }
+
+    var transferTerminal: TerminalSurface? { terminal }
 
     func focus() {
         terminal?.focus()

@@ -46,11 +46,16 @@ final class TerminalHistoryGhosttyIntegrationTests: XCTestCase {
             view.hasLiveSurfaceForTesting
         }
 
+        // An idle parser frees at once; a reset during a running feed recreates
+        // when that feed ends (covered by GhosttyOutputPumpTests).
+        try waitUntil("the seed feed must leave the parser idle") {
+            view.outputBytesOwned == 0
+        }
         view.resetSurfaceOutput(Data("\(canonicalMarker)\r\n".utf8))
 
         XCTAssertTrue(
             view.hasLiveSurfaceForTesting,
-            "mounted reset must recreate the C surface synchronously before any read or explicit refresh can mask the bug"
+            "mounted reset of an idle parser must recreate the C surface synchronously before any read or explicit refresh can mask the bug"
         )
         try waitUntil("canonical reset bytes must become visible without forceRefresh") {
             view.readViewportText()?.contains(canonicalMarker) == true
@@ -128,6 +133,9 @@ final class TerminalHistoryGhosttyIntegrationTests: XCTestCase {
             view.hasLiveSurfaceForTesting
         }
 
+        try waitUntil("the seed feed must leave the parser idle") {
+            view.outputBytesOwned == 0
+        }
         var replay = Data(repeating: UInt8(ascii: "h"), count: 256 * 1024)
         replay.append(Data("\u{001B}[2J\u{001B}[H\(normalMarker)".utf8))
         // Set representative parser/session modes before entering the TUI. They
@@ -296,6 +304,9 @@ final class TerminalHistoryGhosttyIntegrationTests: XCTestCase {
         surface.replayResetSurfaceOutputForTesting(replay)
         XCTAssertTrue(surface.ghosttyReplayInProgressForTesting)
         XCTAssertTrue(surface.readerPausedForHistoryReplayForTesting)
+        try waitUntil("the reset must recreate the parser once its last feed ends") {
+            surface.ghosttyHasLiveSurfaceForTesting
+        }
         let creationCountAfterReset = surface.ghosttySurfaceCreationCountForTesting
 
         var pendingBytesAtHide: Int?

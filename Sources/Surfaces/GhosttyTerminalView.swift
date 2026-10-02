@@ -8,6 +8,9 @@ import QuartzCore
 
 private final class RemoteCodeGhosttyIOContext {
     weak var view: GhosttyTerminalView?
+    /// Slot generation of the native surface that owns this userdata. Written
+    /// only while no native surface exists, so native threads read a stable value.
+    var generation: UInt64 = 0
 }
 
 final class GhosttySurfaceSlot {
@@ -22,6 +25,16 @@ final class GhosttySurfaceSlot {
     private(set) var state: State = .empty
     private(set) var generation: UInt64 = 0
     private var surface: ghostty_surface_t?
+    private var feedInFlight = false
+    /// Test doubles are fed and freed through the driver but must never reach
+    /// the other C entry points (`liveSurface()` hides them).
+    private var isSynthetic = false
+    /// Surface removed by close while a native feed was running. Only the feed's
+    /// completion may free it, so the free never races the C parser.
+    private var deferredFree: ghostty_surface_t?
+
+    var isFeedInFlight: Bool { feedInFlight }
+    var isClosingWithDeferredFree: Bool { deferredFree != nil }
 
     var isLive: Bool {
         guard case .live = state else { return false }
@@ -40,10 +53,15 @@ final class GhosttySurfaceSlot {
         }
     }
 
-    func install(_ newSurface: ghostty_surface_t, generation expectedGeneration: UInt64) -> Bool {
+    func install(
+        _ newSurface: ghostty_surface_t,
+        generation expectedGeneration: UInt64,
+        synthetic: Bool = false
+    ) -> Bool {
         guard case .creating(let activeGeneration) = state,
               activeGeneration == expectedGeneration else { return false }
         surface = newSurface
+        isSynthetic = synthetic
         state = .live(expectedGeneration)
         return true
     }
@@ -55,21 +73,49 @@ final class GhosttySurfaceSlot {
     }
 
     func liveSurface() -> ghostty_surface_t? {
+        guard case .live = state, !isSynthetic else { return nil }
+        return surface
+    }
+
+    /// Live pointer including test doubles; only close uses it to stop rendering.
+    var rawLiveSurface: ghostty_surface_t? {
         guard case .live = state else { return nil }
         return surface
     }
 
+    /// Starts the single native feed allowed per slot. Only a live surface can be fed.
+    func beginFeed() -> ghostty_surface_t? {
+        guard !feedInFlight, case .live = state, let surface else { return nil }
+        feedInFlight = true
+        return surface
+    }
+
+    /// Ends the in-flight feed. Returns the surface whose free close deferred, if any.
+    func endFeed() -> ghostty_surface_t? {
+        feedInFlight = false
+        defer { deferredFree = nil }
+        return deferredFree
+    }
+
+    /// Makes the surface unavailable immediately. Returns it for freeing now, or
+    /// nil when a feed is running and `endFeed()` will hand it back instead.
     func removeForClose() -> ghostty_surface_t? {
+        guard deferredFree == nil else { return nil }
         guard let current = surface else {
             state = .closed(generation)
             return nil
         }
         surface = nil
         state = .closing(generation)
+        if feedInFlight {
+            deferredFree = current
+            return nil
+        }
         return current
     }
 
     func markClosed() {
+        guard deferredFree == nil else { return }
         state = .closed(generation)
     }
 }
@@ -81,9 +127,10 @@ private func ghosttyTerminalIOWriteCallback(
 ) {
     guard let userdata, let bytes, length > 0 else { return }
     let context = Unmanaged<RemoteCodeGhosttyIOContext>.fromOpaque(userdata).takeUnretainedValue()
+    let generation = context.generation
     let data = Data(bytes: bytes, count: Int(length))
     DispatchQueue.main.async { [weak context] in
-        context?.view?.writeInputData(data)
+        context?.view?.writeInputData(data, fromNativeGeneration: generation)
     }
 }
 
@@ -431,16 +478,18 @@ private final class RemoteCodeGhosttyRuntime {
             RemoteCodeGhosttyRuntime.shared.scheduleTick()
         }
         runtimeConfig.action_cb = { _, target, action in
-            // Resolve the view from the surface's userdata. The view is retained
-            // by the window hierarchy for its lifetime; the unretained cast is safe
-            // because surfaceClosed prevents action delivery after free.
+            // The surface userdata is the pinned IO context, which outlives the
+            // native surface. The generation tag drops effects that outlive
+            // their surface (closed view, or a recreated surface on the same view).
             guard target.tag == GHOSTTY_TARGET_SURFACE,
                   let ud = ghostty_surface_userdata(target.target.surface),
                   let effect = GhosttyActionMapper.map(action) else {
                 return true
             }
-            let view = Unmanaged<GhosttyTerminalView>.fromOpaque(ud).takeUnretainedValue()
-            DispatchQueue.main.async {
+            let context = Unmanaged<RemoteCodeGhosttyIOContext>.fromOpaque(ud).takeUnretainedValue()
+            let generation = context.generation
+            DispatchQueue.main.async { [weak context] in
+                guard let view = context?.view, view.isCurrentNativeGeneration(generation) else { return }
                 view.applyActionEffect(effect)
             }
             return true
@@ -698,6 +747,9 @@ final class GhosttyTerminalView: NSView {
     /// pump after the current buffer drains. This keeps one parser stream while
     /// allowing the owner to hold the bounded in-flight PTY handoff separately.
     var nextHistoryReplayContinuation: (() -> Data?)?
+    /// Fires on the main actor whenever queued bytes shrink (a native chunk
+    /// finished or the surface closed), so a paused PTY owner can resume.
+    var onOutputCapacityAvailable: (() -> Void)?
 
     private let surfaceSlot = GhosttySurfaceSlot()
     private let ioContext = RemoteCodeGhosttyIOContext()
@@ -711,16 +763,46 @@ final class GhosttyTerminalView: NSView {
     private var pendingOutput = Data()
     private var pendingOutputHead = 0
     private var pendingOutputCompactions = 0
-    private var scheduledOutputFlushGeneration: Int?
+    /// Bytes of the single chunk currently inside the C parser on `feedQueue`.
+    private var feedInFlightBytes = 0
+    /// In-flight chunk of a surface that close/reset already retired. Counted in
+    /// memory accounting but not against the next generation's queue cap.
+    private var retiredFeedBytes = 0
+    /// One-shot actions waiting for the parser to absorb all queued output.
+    private var drainActions: [String: () -> Void] = [:]
+    private var lastViewportText: String?
+    private var findCountPlaceholder: String?
+    /// Destination of "Copy All"; tests replace it so the user's pasteboard stays untouched.
+    var clipboardWriter: (String) -> Void = { text in
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+    /// Latched by renderable callers; consumed when the queue drains.
+    private var refreshWhenOutputDrains = false
+    /// Serial executor for every `ghostty_surface_process_output`. The C call can
+    /// block on Ghostty's 64-slot app mailbox until `ghostty_app_tick` runs on the
+    /// main thread, so it must never run on main or on the cooperative pool.
+    private let feedQueue = DispatchQueue(
+        label: "rc2.terminal.ghostty-feed.\(UUID().uuidString)",
+        qos: .userInitiated
+    )
+    /// Replaces the C surface lifecycle so pump/close/reset can be tested without Ghostty.
+    struct NativeDriverForTesting {
+        var create: () -> ghostty_surface_t?
+        var feed: @Sendable (ghostty_surface_t, Data) -> Void
+        var free: (ghostty_surface_t) -> Void
+        var setOcclusion: ((ghostty_surface_t, Bool) -> Void)?
+        /// Native text read (`true` = scrollback, `false` = viewport).
+        var read: ((Bool) -> String?)?
+    }
+    var nativeDriverForTesting: NativeDriverForTesting?
     private var historyReplayDrainInProgress = false
-    private var scheduledHistoryReplayDrainGeneration: Int?
     private var surfaceCreationCount = 0
     private var maximumPendingOutputBytesObserved = 0
     private var nativeScrollbackBytesEstimate = 0
     private var releasedForTerminalMemoryBudget = false
     private var lastPixelSize = NSSize(width: 0, height: 0)
     private var lastScale = NSSize(width: 0, height: 0)
-    private var renderGeneration = 0
     private var visibleInUI = false
     /// Accumulated font zoom step delta for this surface (1 step = 1 pt).
     /// Persisted to and restored from the KV settings store keyed by workspace.
@@ -757,10 +839,21 @@ final class GhosttyTerminalView: NSView {
         pendingOutputByteCount > 0
     }
 
-    /// Runtime-test diagnostics for the detach race. These expose state only;
-    /// production behavior remains driven by `scheduleOutputFlush()`.
-    var outputFlushGenerationForTesting: (scheduled: Int?, current: Int) {
-        (scheduledOutputFlushGeneration, renderGeneration)
+    /// Bytes queued for or inside the C parser. This is the figure the PTY owner
+    /// paces against; it never counts owner-held handoffs.
+    var outputBytesOwned: Int { pendingOutputByteCount + feedInFlightBytes }
+    var feedInFlightForTesting: Bool { surfaceSlot.isFeedInFlight }
+    var nativeSurfaceGenerationForTesting: UInt64 { surfaceSlot.generation }
+    var nativeSurfaceStateForTesting: GhosttySurfaceSlot.State { surfaceSlot.state }
+
+    /// True while the C parser drains this view's queue, so a full queue means the
+    /// producer must wait. Without a live surface (pre-attach) the bounded
+    /// drop-oldest contract applies instead and pausing would never resume.
+    var drainsOutputNatively: Bool { surfaceSlot.isLive }
+
+    /// Whether one more whole handoff of `bytes` fits below the queue cap.
+    func hasOutputCapacity(forHandoffBytes bytes: Int) -> Bool {
+        outputBytesOwned + bytes <= Self.maxPendingOutputBytes
     }
 
     var isRenderableForTesting: Bool { isRenderable }
@@ -769,7 +862,7 @@ final class GhosttyTerminalView: NSView {
     var surfaceCreationCountForTesting: Int { surfaceCreationCount }
     var maximumPendingOutputBytesObservedForTesting: Int { maximumPendingOutputBytesObserved }
     var retainedTerminalBytesEstimate: Int {
-        pendingOutput.count + nativeScrollbackBytesEstimate
+        pendingOutput.count + feedInFlightBytes + retiredFeedBytes + nativeScrollbackBytesEstimate
     }
     var wasReleasedForTerminalMemoryBudgetForTesting: Bool {
         releasedForTerminalMemoryBudget
@@ -784,7 +877,9 @@ final class GhosttyTerminalView: NSView {
             surfaceClosed = false
         }
         ensureSurface()
-        return surfaceSlot.isLive
+        // A surface waiting for its last feed to finish is recreated by that feed's
+        // completion, so the host is still available.
+        return surfaceSlot.isLive || (surfaceSlot.isClosingWithDeferredFree && !surfaceClosed)
     }
 
     /// Find-in-scrollback (Cmd+F) overlay state. The bar is lazily built on first
@@ -819,23 +914,12 @@ final class GhosttyTerminalView: NSView {
     /// Minimum interval between VoiceOver `valueChanged` notifications (seconds).
     private static let voValueChangedInterval: TimeInterval = 0.5
 
-    private static let immediateOutputFlushBytes = 64 * 1024
     static let maxPendingOutputBytes = 4 * 1024 * 1024
     /// Matches the enforced Ghostty config below. This is an accounting ceiling,
     /// not an additional allocation: Ghostty owns the native scrollback bytes.
     static let maxNativeScrollbackBytesEstimate = 2_000_000
-    private static let outputFlushDelay: TimeInterval = 0.02
-    /// Feed restored scrollback in small main-run-loop slices. Ghostty can apply
-    /// backpressure while rebuilding its terminal state, so one large synchronous
-    /// feed here can otherwise make AppKit report the whole application as hung.
+    /// Largest chunk inside the C parser at once, for live output and replay alike.
     static let historyReplayChunkBytes = 8 * 1024
-
-    nonisolated static func hasCurrentOutputFlush(
-        scheduledGeneration: Int?,
-        currentGeneration: Int
-    ) -> Bool {
-        scheduledGeneration == currentGeneration
-    }
 
     // MARK: - Theme palette seam
 
@@ -869,6 +953,10 @@ final class GhosttyTerminalView: NSView {
         // Pull the raw C pointer out of the slot now (while self is still valid).
         // removeForClose() zeroes surfaceSlot.surface, so the pointer can only
         // come out of here once -- no double-free is possible.
+        if let live = surfaceSlot.rawLiveSurface {
+            if let occlusion = nativeDriverForTesting?.setOcclusion { occlusion(live, false) }
+            else if nativeDriverForTesting == nil { ghostty_surface_set_occlusion(live, false) }
+        }
         let surfaceToFree: ghostty_surface_t? = surfaceSlot.removeForClose()
         surfaceSlot.markClosed()
         // Capture ioContextRetain for release after ghostty_surface_free returns.
@@ -878,15 +966,17 @@ final class GhosttyTerminalView: NSView {
         let pinnedContext = ioContextRetain
         // ghostty_surface_free must be called on the main thread.
         // Capture only the value-type pointer; never capture self in a deinit closure.
+        // A running feed pins the view (see pumpOutput), so deinit never races one.
+        let freeNative = nativeDriverForTesting?.free ?? { ghostty_surface_free($0) }
         if let ptr = surfaceToFree {
             if Thread.isMainThread {
-                ghostty_surface_free(ptr)
+                freeNative(ptr)
                 // Safe to release now: ghostty_surface_free has returned, so
                 // Ghostty will not dereference io_write_userdata again.
                 pinnedContext?.release()
             } else {
                 DispatchQueue.main.async {
-                    ghostty_surface_free(ptr)
+                    freeNative(ptr)
                     // Same guarantee: release only after free completes.
                     pinnedContext?.release()
                 }
@@ -904,7 +994,8 @@ final class GhosttyTerminalView: NSView {
     // Expose the live viewport text as the accessibility value so XCUITest /
     // VoiceOver can read what the terminal currently shows (QA-001).
     override func accessibilityRole() -> NSAccessibility.Role? { .textArea }
-    override func accessibilityValue() -> Any? { readViewportText() }
+    /// The last valid viewport stands in while the parser is still absorbing output.
+    override func accessibilityValue() -> Any? { readViewportText() ?? lastViewportText }
     /// "Terminal — <title>" when an OSC title is set, otherwise "Terminal".
     /// VoiceOver reads this on focus so users know which tab they landed on.
     override func accessibilityLabel() -> String? {
@@ -957,9 +1048,6 @@ final class GhosttyTerminalView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window == nil {
-            renderGeneration &+= 1
-        }
         observeWindowOcclusion(window)
         ensureSurface()
         updateGhosttySize(force: true)
@@ -968,12 +1056,10 @@ final class GhosttyTerminalView: NSView {
         // reattach to an on-screen window this resumes the renderer; on detach it
         // keeps it suspended (complements viewWillMove).
         syncOcclusion()
-        // Hiding/reparenting invalidates callbacks from the previous render
-        // generation. Replay is parser work, not visible rendering, so always
-        // schedule it again on the current generation even on a hidden parking
-        // window. Otherwise the PTY reader can remain suspended indefinitely.
+        // Parser work is independent of the window: a hidden parking host keeps
+        // draining, otherwise the PTY reader could remain suspended indefinitely.
         if ownerIsClosing?() != true {
-            scheduleHistoryReplayDrain()
+            pumpOutput()
         }
     }
 
@@ -1046,18 +1132,33 @@ final class GhosttyTerminalView: NSView {
         if !silent, window != nil, superview != nil, ownerIsClosing?() != true {
             NSLog("RemoteCode terminal closeSurface() on a still-mounted view (window+superview present, owner not closing) — audit #4 watch")
         }
-        renderGeneration &+= 1
-        scheduledOutputFlushGeneration = nil
-        scheduledHistoryReplayDrainGeneration = nil
         historyReplayDrainInProgress = false
         surfaceClosed = true
+        // Stop the native renderer before anything else: the owner may unmount the
+        // NSView/CAMetalLayer right after this, and a deferred free keeps the
+        // renderer alive until the in-flight feed ends, after viewWillMove can no
+        // longer find the pointer.
+        if let live = surfaceSlot.rawLiveSurface { setNativeOcclusion(live, false) }
+        if surfaceSlot.isFeedInFlight {
+            retiredFeedBytes += feedInFlightBytes
+            feedInFlightBytes = 0
+        }
+        drainActions.removeAll()
+        findCountPlaceholder = nil
+        lastViewportText = nil
+        // The surface is unavailable from here on. While a feed is inside the C
+        // parser the free moves to that feed's main-thread completion; the main
+        // thread must never wait for it.
         if let surface = surfaceSlot.removeForClose() {
-            ghostty_surface_free(surface)
+            freeNative(surface)
         }
         surfaceSlot.markClosed()
         nativeScrollbackBytesEstimate = 0
         pendingOutput.removeAll(keepingCapacity: false)
         pendingOutputHead = 0
+        refreshWhenOutputDrains = false
+        // Queued bytes are gone: let a paused owner resume.
+        DispatchQueue.main.async { [weak self] in self?.onOutputCapacityAvailable?() }
         // Drop host-side holds that otherwise survive until late view deinit
         // (owner callbacks, Metal drawable presentation state). Ghostty scrollback
         // is freed above; this path only clears Swift/AppKit residual state.
@@ -1082,6 +1183,7 @@ final class GhosttyTerminalView: NSView {
         onCmdClickFilePath = nil
         onHistoryReplayDrainCompleted = nil
         nextHistoryReplayContinuation = nil
+        onOutputCapacityAvailable = nil
         ownerIsClosing = { true }
         clearDrawablePresentationState()
     }
@@ -1089,7 +1191,6 @@ final class GhosttyTerminalView: NSView {
     private func clearDrawablePresentationState() {
         pendingOutput.removeAll(keepingCapacity: false)
         pendingOutputHead = 0
-        scheduledOutputFlushGeneration = nil
         layer?.contents = nil
         if let metalLayer = layer as? CAMetalLayer {
             metalLayer.removeAllAnimations()
@@ -1113,15 +1214,45 @@ final class GhosttyTerminalView: NSView {
         // Intentional re-creation: allow ensureSurface() to build a fresh surface.
         surfaceClosed = false
         historyReplayDrainInProgress = !data.isEmpty
-        _ = appendPendingOutput(data)
+        refreshWhenOutputDrains = !data.isEmpty
+        guard appendPendingOutput(data) else {
+            // The retired feed no longer counts, so this cannot happen for an
+            // admitted seed; if it ever does, end the replay instead of hanging it.
+            historyReplayDrainInProgress = false
+            refreshWhenOutputDrains = false
+            droppedOutputBytes += data.count
+            return false
+        }
         // `processOutput` intentionally buffers when no live C surface exists.
         // A mounted view cannot wait for a later read/refresh to recreate it:
         // restored idle tabs would remain blank indefinitely. Recreate now when
         // AppKit already provides a valid host; pre-attach views keep buffering.
+        // While a feed still runs in the old surface the slot stays `closing`;
+        // that feed's completion recreates the surface and seeds this buffer.
         if window != nil, bounds.width > 0, bounds.height > 0 {
             ensureSurface()
         }
+        if findBar?.isHidden == false {
+            recomputeFindMatches(forward: true, advance: false)
+        }
         return true
+    }
+
+    /// Test seams for find: open the bar with `query` and report its result.
+    func searchForTesting(_ query: String) {
+        openFindBar()
+        findField?.stringValue = query
+        recomputeFindMatches(forward: true, advance: false)
+    }
+    var findStateForTesting: (matches: Int, label: String) {
+        (findMatchCount, findCountLabel?.stringValue ?? "")
+    }
+    func closeFindForTesting() { closeFindBar() }
+    var accessibilityValueForTesting: String? { accessibilityValue() as? String }
+    var pendingDrainActionCountForTesting: Int { drainActions.count }
+    func sendTextToSurfaceForTesting(_ text: String) {
+        guard let surface = surfaceForInput() else { return }
+        sendText(text, to: surface)
     }
 
     /// Test seam: whether the owner still receives Ghostty→PTY input writes.
@@ -1138,51 +1269,35 @@ final class GhosttyTerminalView: NSView {
             return true
         }
         guard appendPendingOutput(data) else { return false }
-        guard let surface = surfaceSlot.liveSurface() else {
-            return true
-        }
-        if historyReplayDrainInProgress {
-            scheduleHistoryReplayDrain()
-            return true
-        }
-        guard render, isRenderable else {
-            flushPendingOutput(to: surface, render: false)
-            return true
-        }
-        if pendingOutputByteCount >= Self.immediateOutputFlushBytes {
-            flushPendingOutput(to: surface, render: true)
-        } else {
-            scheduleOutputFlush()
-        }
+        if render { refreshWhenOutputDrains = true }
+        pumpOutput()
         return true
     }
 
     private func appendPendingOutput(_ data: Data) -> Bool {
-        if historyReplayDrainInProgress,
-           data.count > Self.maxPendingOutputBytes - pendingOutputByteCount {
-            // Reject this complete producer handoff. Production has already
-            // paused its PTY reader and reserved one full handoff below the cap;
-            // the Boolean lets any unexpected caller retain/retry the whole
-            // chunk. No raw byte is cut and the parser/session remains intact.
+        if data.count > Self.maxPendingOutputBytes - outputBytesOwned,
+           historyReplayDrainInProgress || surfaceSlot.isLive {
+            // Reject this complete producer handoff, whatever its size. Production
+            // has already paused its PTY reader and reserved one full handoff below
+            // the cap; the Boolean lets the owner retain and retry the whole chunk
+            // in order, and callers stream anything larger in bounded batches. No
+            // raw byte is cut, nothing above the cap is allocated, and the
+            // parser/session remains intact.
             return false
         }
         pendingOutput.append(data)
         maximumPendingOutputBytesObserved = max(
             maximumPendingOutputBytesObserved,
-            pendingOutputByteCount
+            outputBytesOwned
         )
-        guard pendingOutputByteCount > Self.maxPendingOutputBytes else { return true }
         // Never drop from the front while a live surface exists: that splits ANSI
-        // escape sequences mid-stream and garbles rendering (PERF-009). Flush the
-        // backlog synchronously to the live surface (Ghostty owns scrollback)
-        // instead of discarding bytes.
-        if let surface = surfaceSlot.liveSurface() {
-            flushPendingOutput(to: surface, render: isRenderable)
-            return true
-        }
-        // No surface to flush to yet (truly unrenderable): bound memory as a last
+        // escape sequences mid-stream and garbles rendering (PERF-009). The pump
+        // hands every byte to Ghostty, which owns the scrollback.
+        guard !surfaceSlot.isLive else { return true }
+        // No surface to feed yet (truly unrenderable): bound memory as a last
         // resort by discarding the oldest bytes.
-        let dropped = pendingOutputByteCount - Self.maxPendingOutputBytes
+        guard outputBytesOwned > Self.maxPendingOutputBytes else { return true }
+        let dropped = outputBytesOwned - Self.maxPendingOutputBytes
         droppedOutputBytes += dropped
         pendingOutputHead += dropped
         compactPendingOutputIfNeeded()
@@ -1200,107 +1315,39 @@ final class GhosttyTerminalView: NSView {
         pendingOutputCompactions += 1
     }
 
-    private func scheduleOutputFlush() {
-        let generation = renderGeneration
-        guard !Self.hasCurrentOutputFlush(
-            scheduledGeneration: scheduledOutputFlushGeneration,
-            currentGeneration: generation
-        ) else { return }
-        scheduledOutputFlushGeneration = generation
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.outputFlushDelay) { [weak self] in
-            guard let self, self.scheduledOutputFlushGeneration == generation else { return }
-            self.scheduledOutputFlushGeneration = nil
-            guard generation == self.renderGeneration else {
-                if self.hasPendingOutput { self.scheduleOutputFlush() }
-                return
-            }
-            self.flushPendingOutput()
+    /// Single-flight pump shared by live output and history replay: at most one
+    /// `historyReplayChunkBytes` slice is inside the C parser, executed on
+    /// `feedQueue`. The main thread keeps running Ghostty's app ticks, which is
+    /// what lets a feed blocked on a full mailbox finish. The in-flight closures
+    /// retain the view so it cannot deinit under a running feed.
+    private func pumpOutput() {
+        guard hasPendingOutput, let surface = surfaceSlot.beginFeed() else { return }
+        let byteCount = min(Self.historyReplayChunkBytes, pendingOutputByteCount)
+        let start = pendingOutputHead
+        let chunk = Data(pendingOutput[start..<(start + byteCount)])
+        pendingOutputHead = start + byteCount
+        if hasPendingOutput {
+            compactPendingOutputIfNeeded()
+        } else {
+            // Keep capacity only for small bursts so one large handoff cannot pin
+            // megabytes of idle storage for the life of the terminal.
+            pendingOutput.removeAll(keepingCapacity: pendingOutput.count <= 256 * 1024)
+            pendingOutputHead = 0
         }
-    }
-
-    private func flushPendingOutput() {
-        scheduledOutputFlushGeneration = nil
-        ensureSurface()
-        guard let surface = surfaceSlot.liveSurface() else { return }
-        flushPendingOutput(to: surface, render: isRenderable)
-    }
-
-    private func flushPendingOutput(to surface: ghostty_surface_t, render: Bool) {
-        guard hasPendingOutput else { return }
-        if historyReplayDrainInProgress {
-            scheduleHistoryReplayDrain()
-            return
-        }
-        let output = pendingOutputHead == 0
-            ? pendingOutput
-            : Data(pendingOutput[pendingOutputHead...])
-        pendingOutput.removeAll(keepingCapacity: true)
-        pendingOutputHead = 0
-        processOutputImmediately(output, to: surface, render: render)
-    }
-
-    private func scheduleHistoryReplayDrain() {
-        guard historyReplayDrainInProgress,
-              hasPendingOutput,
-              surfaceSlot.isLive else { return }
-        let generation = renderGeneration
-        guard scheduledHistoryReplayDrainGeneration != generation else { return }
-        scheduledHistoryReplayDrainGeneration = generation
-        DispatchQueue.main.async { [weak self] in
-            guard let self,
-                  self.scheduledHistoryReplayDrainGeneration == generation else { return }
-            self.scheduledHistoryReplayDrainGeneration = nil
-            guard generation == self.renderGeneration,
-                  let surface = self.surfaceSlot.liveSurface() else { return }
-
-            let byteCount = min(
-                Self.historyReplayChunkBytes,
-                self.pendingOutputByteCount
-            )
-            guard byteCount > 0 else {
-                self.historyReplayDrainInProgress = false
-                return
-            }
-            let start = self.pendingOutputHead
-            let end = start + byteCount
-            let output = Data(self.pendingOutput[start..<end])
-            self.pendingOutputHead = end
-            self.compactPendingOutputIfNeeded()
-            let isFinalChunk = !self.hasPendingOutput
-            self.processOutputImmediately(
-                output,
-                to: surface,
-                render: isFinalChunk && self.isRenderable
-            )
-            if isFinalChunk {
-                self.pendingOutput.removeAll(keepingCapacity: true)
-                self.pendingOutputHead = 0
-                if let continuation = self.nextHistoryReplayContinuation?(),
-                   !continuation.isEmpty {
-                    // Ownership moves as one complete handoff. Feed it through
-                    // the same bounded 8 KiB pump and the same C parser.
-                    self.pendingOutput = continuation
-                    self.maximumPendingOutputBytesObserved = max(
-                        self.maximumPendingOutputBytesObserved,
-                        continuation.count
-                    )
-                    self.scheduleHistoryReplayDrain()
-                } else {
-                    self.historyReplayDrainInProgress = false
-                    self.onHistoryReplayDrainCompleted?()
-                }
-            } else {
-                self.scheduleHistoryReplayDrain()
-            }
-        }
-    }
-
-    private func processOutputImmediately(_ output: Data, to surface: ghostty_surface_t, render: Bool) {
+        feedInFlightBytes = byteCount
         nativeScrollbackBytesEstimate = min(
             Self.maxNativeScrollbackBytesEstimate,
-            nativeScrollbackBytesEstimate + output.count
+            nativeScrollbackBytesEstimate + byteCount
         )
-        output.withUnsafeBytes { raw in
+        let feed = nativeDriverForTesting?.feed ?? Self.feedNative
+        feedQueue.async {
+            feed(surface, chunk)
+            DispatchQueue.main.async { self.feedDidComplete() }
+        }
+    }
+
+    private static let feedNative: @Sendable (ghostty_surface_t, Data) -> Void = { surface, chunk in
+        chunk.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             ghostty_surface_process_output(
                 surface,
@@ -1308,7 +1355,88 @@ final class GhosttyTerminalView: NSView {
                 UInt(raw.count)
             )
         }
-        guard render, isRenderable else { return }
+    }
+
+    private func freeNative(_ surface: ghostty_surface_t) {
+        if let free = nativeDriverForTesting?.free {
+            free(surface)
+        } else {
+            ghostty_surface_free(surface)
+        }
+    }
+
+    private func feedDidComplete() {
+        feedInFlightBytes = 0
+        retiredFeedBytes = 0
+        if let doomed = surfaceSlot.endFeed() {
+            // Close/reset arrived while this feed was in the parser. Free exactly
+            // once now that no C call can touch the surface, then recreate for a
+            // pending reset (the slot stayed `closing`, so no second renderer
+            // could have been bound to this view meanwhile).
+            freeNative(doomed)
+            surfaceSlot.markClosed()
+            if !surfaceClosed {
+                ensureSurface()
+            }
+            runDrainActionsIfQuiescent()
+            onOutputCapacityAvailable?()
+            return
+        }
+        guard surfaceSlot.isLive else {
+            onOutputCapacityAvailable?()
+            return
+        }
+        if hasPendingOutput {
+            pumpOutput()
+        } else if historyReplayDrainInProgress {
+            // Ownership moves as one complete handoff. Feed it through the same
+            // bounded pump and the same C parser.
+            if let continuation = nextHistoryReplayContinuation?(), !continuation.isEmpty {
+                pendingOutput = continuation
+                pendingOutputHead = 0
+                maximumPendingOutputBytesObserved = max(
+                    maximumPendingOutputBytesObserved,
+                    continuation.count
+                )
+                pumpOutput()
+            } else {
+                historyReplayDrainInProgress = false
+                refreshAfterDrain()
+                onHistoryReplayDrainCompleted?()
+            }
+        } else {
+            refreshAfterDrain()
+        }
+        runDrainActionsIfQuiescent()
+        onOutputCapacityAvailable?()
+    }
+
+    /// Runs requests that arrived while a read had to return nil. This is the only
+    /// place they run, on main, so no read ever waits for the feed.
+    private func runDrainActionsIfQuiescent() {
+        guard outputBytesOwned == 0, !historyReplayDrainInProgress, !drainActions.isEmpty else { return }
+        let actions = drainActions
+        drainActions.removeAll()
+        for action in actions.values { action() }
+    }
+
+    private func onOutputDrained(key: String, _ action: @escaping () -> Void) {
+        drainActions[key] = action
+        pumpOutput()
+    }
+
+    private func setNativeOcclusion(_ surface: ghostty_surface_t, _ visible: Bool) {
+        if let driver = nativeDriverForTesting {
+            driver.setOcclusion?(surface, visible)
+        } else {
+            ghostty_surface_set_occlusion(surface, visible)
+        }
+    }
+
+    private func refreshAfterDrain() {
+        let shouldRefresh = refreshWhenOutputDrains
+        refreshWhenOutputDrains = false
+        guard shouldRefresh, isRenderable, let surface = surfaceSlot.liveSurface() else { return }
         // Do NOT render synchronously on the main thread. ghostty_surface_render_now
         // makes the main thread a second renderer running concurrently with Ghostty's
         // own renderer thread and its cf_release thread, which races the CoreText
@@ -1403,6 +1531,18 @@ final class GhosttyTerminalView: NSView {
         onInputData?(data)
     }
 
+    /// A native callback is current only while its own surface is live: closed
+    /// views and recreated surfaces never receive effects from an older one.
+    func isCurrentNativeGeneration(_ generation: UInt64) -> Bool {
+        guard case .live(let current) = surfaceSlot.state else { return false }
+        return current == generation
+    }
+
+    func writeInputData(_ data: Data, fromNativeGeneration generation: UInt64) {
+        guard isCurrentNativeGeneration(generation) else { return }
+        writeInputData(data)
+    }
+
     func forceRefresh() {
         guard isRenderable else { return }
         ensureSurface()
@@ -1412,9 +1552,9 @@ final class GhosttyTerminalView: NSView {
         // make sure Ghostty's renderer is resumed before we ask it to draw.
         syncOcclusion()
         updateGhosttySize(force: true)
-        flushPendingOutput()
+        pumpOutput()
         if let surface = surfaceSlot.liveSurface() {
-            // Async refresh only — never render on the main thread (see processOutputImmediately).
+            // Async refresh only — never render on the main thread (see refreshAfterDrain).
             ghostty_surface_refresh(surface)
         }
     }
@@ -1430,7 +1570,7 @@ final class GhosttyTerminalView: NSView {
         syncOcclusion()
         // F2: paint any output buffered while occluded on reveal — a bare refresh
         // would only repaint the stale frame and the tail lines would be missing.
-        flushPendingOutput()
+        pumpOutput()
         let refreshedByResize = updateGhosttySize(force: true)
         guard !refreshedByResize else { return }
         if let surface = surfaceSlot.liveSurface() {
@@ -1441,14 +1581,11 @@ final class GhosttyTerminalView: NSView {
     func setOcclusion(visible: Bool) {
         visibleInUI = visible
         if !visible {
-            renderGeneration &+= 1
-            // F2: do NOT silently DROP the buffered tail on hide. Process it into the
-            // live surface (Ghostty owns the scrollback) WITHOUT rendering, so
-            // switching away mid-stream and back doesn't lose the last lines. Only
-            // discard when there is no surface to flush into.
-            if let surface = surfaceSlot.liveSurface() {
-                flushPendingOutput(to: surface, render: false)
-            }
+            // F2: do NOT silently DROP the buffered tail on hide. The pump keeps
+            // feeding the live surface (Ghostty owns the scrollback) without
+            // rendering, so switching away mid-stream and back doesn't lose the
+            // last lines. Hiding never cancels parser bytes.
+            pumpOutput()
         }
         // Drive Ghostty's occlusion from the *full* render gate, not raw tab
         // visibility: a selected tab whose window is off screen or mid-move must
@@ -1503,7 +1640,9 @@ final class GhosttyTerminalView: NSView {
     }
 
     func readViewportText() -> String? {
-        readText(pointTag: GHOSTTY_POINT_VIEWPORT)
+        let text = readText(pointTag: GHOSTTY_POINT_VIEWPORT)
+        if let text { lastViewportText = text }
+        return text
     }
 
     /// Full terminal screen text including scrollback (GHOSTTY_POINT_SCREEN),
@@ -1514,14 +1653,16 @@ final class GhosttyTerminalView: NSView {
 
     private func readText(pointTag: ghostty_point_tag_e) -> String? {
         ensureSurface()
-        guard let surface = surfaceSlot.liveSurface() else { return nil }
-        // Only force a synchronous render when there is actually pending output
-        // to apply; flushing it already renders the fresh frame. With nothing
-        // pending, read the existing frame's text directly to avoid a redundant
-        // GPU/main-thread render on every mirror poll (PERF-005).
-        if hasPendingOutput {
-            flushPendingOutput(to: surface, render: isRenderable)
+        guard surfaceSlot.isLive else { return nil }
+        // The parser has not absorbed all output yet. Never wait for the feed (it
+        // may be waiting for a main-thread tick): keep it draining and let the
+        // caller fall back to its ANSI mirror instead of reading stale text.
+        guard outputBytesOwned == 0 else {
+            pumpOutput()
+            return nil
         }
+        if let driver = nativeDriverForTesting { return driver.read?(pointTag == GHOSTTY_POINT_SCREEN) }
+        guard let surface = surfaceSlot.liveSurface() else { return nil }
 
         let topLeft = ghostty_point_s(
             tag: pointTag,
@@ -1549,6 +1690,20 @@ final class GhosttyTerminalView: NSView {
     }
 
     private func ensureSurface() {
+        if let driver = nativeDriverForTesting {
+            guard !releasedForTerminalMemoryBudget, !surfaceClosed,
+                  !surfaceSlot.isLive,
+                  let generation = surfaceSlot.beginCreate() else { return }
+            ioContext.generation = generation
+            guard let created = driver.create(),
+                  surfaceSlot.install(created, generation: generation, synthetic: true) else {
+                surfaceSlot.cancelCreate(generation: generation)
+                return
+            }
+            surfaceCreationCount += 1
+            pumpOutput()
+            return
+        }
         guard Self.nativeRendererEnabled else { return }
         guard !releasedForTerminalMemoryBudget else { return }
         if surfaceClosed {
@@ -1573,13 +1728,16 @@ final class GhosttyTerminalView: NSView {
         guard let displayID = window?.screen?.displayID ?? NSScreen.main?.displayID,
               displayID != 0 else { return }
         guard let generation = surfaceSlot.beginCreate() else { return }
+        ioContext.generation = generation
 
         var config = ghostty_surface_config_new()
         config.platform_tag = GHOSTTY_PLATFORM_MACOS
         config.platform = ghostty_platform_u(macos: ghostty_platform_macos_s(
             nsview: Unmanaged.passUnretained(self).toOpaque()
         ))
-        config.userdata = Unmanaged.passUnretained(self).toOpaque()
+        // The pinned IO context, not the view: callbacks that outlive the surface
+        // must resolve to a generation-tagged object that never dangles.
+        config.userdata = Unmanaged.passUnretained(ioContext).toOpaque()
         config.scale_factor = Double(window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1)
         config.font_size = Float(baseFontSize)
         config.context = GHOSTTY_SURFACE_CONTEXT_WINDOW
@@ -1622,7 +1780,7 @@ final class GhosttyTerminalView: NSView {
         }
         updateGhosttySize(force: true)
         updateFocus()
-        flushPendingOutput(to: created, render: isRenderable)
+        pumpOutput()
         // A freshly created surface inherits the current render gate: only run its
         // renderer (and ask for a first frame) when actually on screen — not merely
         // when the tab is selected (the window may be off screen / not yet ordered
@@ -1961,9 +2119,17 @@ final class GhosttyTerminalView: NSView {
     }
 
     @objc private func contextCopyAll(_ sender: Any?) {
-        guard let text = readViewportText(), !text.isEmpty else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
+        copyViewportText()
+    }
+
+    func copyViewportText() {
+        if let text = readViewportText() {
+            if !text.isEmpty { clipboardWriter(text) }
+            return
+        }
+        // Parser still absorbing output: copy the fresh viewport once it drains.
+        guard outputBytesOwned > 0 else { return }
+        onOutputDrained(key: "copyAll") { [weak self] in self?.copyViewportText() }
     }
 
     @objc private func contextPaste(_ sender: Any?) {
@@ -2038,7 +2204,7 @@ final class GhosttyTerminalView: NSView {
             _ = ghostty_surface_binding_action(surface, ptr, UInt(strlen(ptr)))
         }
         if isRenderable {
-            // Async refresh only — never render on the main thread (see processOutputImmediately).
+            // Async refresh only — never render on the main thread (see refreshAfterDrain).
             ghostty_surface_refresh(surface)
         }
     }
@@ -2110,6 +2276,8 @@ final class GhosttyTerminalView: NSView {
     }
 
     private func closeFindBar() {
+        drainActions["find"] = nil
+        findCountPlaceholder = nil
         findBar?.isHidden = true
         findMatchCount = 0
         findCurrentMatch = nil
@@ -2204,7 +2372,19 @@ final class GhosttyTerminalView: NSView {
     /// GhosttyKit exposes no selection-set/scroll-to API to embedders.
     private func recomputeFindMatches(forward: Bool, advance: Bool) {
         let query = findField?.stringValue ?? ""
-        let snapshot = readScrollbackText() ?? ""
+        guard let snapshot = readScrollbackText() else {
+            // No snapshot is not "no match": wait for the parser to drain, then search.
+            let waitingForParser = outputBytesOwned > 0 || surfaceSlot.isClosingWithDeferredFree
+            findCountPlaceholder = waitingForParser ? "…" : "—"
+            updateFindCountLabel()
+            if waitingForParser {
+                onOutputDrained(key: "find") { [weak self] in
+                    self?.recomputeFindMatches(forward: forward, advance: advance)
+                }
+            }
+            return
+        }
+        findCountPlaceholder = nil
         let ranges = TerminalScrollbackSearch.matchRanges(in: snapshot, query: query)
         findMatchCount = ranges.count
         if findMatchCount == 0 {
@@ -2222,6 +2402,8 @@ final class GhosttyTerminalView: NSView {
         guard let label = findCountLabel else { return }
         if (findField?.stringValue ?? "").isEmpty {
             label.stringValue = ""
+        } else if let findCountPlaceholder {
+            label.stringValue = findCountPlaceholder
         } else if findMatchCount == 0 {
             label.stringValue = "0/0"
         } else {
@@ -2326,7 +2508,7 @@ final class GhosttyTerminalView: NSView {
         }
         mods |= mouseMomentum(from: event) << 1
         ghostty_surface_mouse_scroll(surface, x, y, ghostty_input_scroll_mods_t(mods))
-        // Async refresh only — never render on the main thread (see processOutputImmediately).
+        // Async refresh only — never render on the main thread (see refreshAfterDrain).
         ghostty_surface_refresh(surface)
     }
 

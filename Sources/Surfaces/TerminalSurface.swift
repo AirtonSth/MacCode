@@ -724,6 +724,74 @@ final class TerminalMemoryBudgetAuthority {
     }
 }
 
+/// The terminal's single system-output stream. Reserve it before producing the
+/// text (so a busy terminal refuses before any work), then `deliver` the text
+/// plus its trailing notice: slices are cut lazily from those strings, so no
+/// full `Data` copy exists and the notice cannot be overtaken by other output.
+@MainActor
+public final class SystemOutputLease {
+    fileprivate weak var surface: TerminalSurface?
+    fileprivate var parts: [String] = []
+    fileprivate var partIndex = 0
+    fileprivate var offset = 0
+    fileprivate var delivering = false
+    fileprivate var finished = false
+
+    fileprivate init(surface: TerminalSurface) { self.surface = surface }
+
+    /// Bytes of the captured strings not yet handed to the terminal.
+    var remainingBytes: Int {
+        guard partIndex < parts.count else { return 0 }
+        return parts[partIndex...].reduce(0) { $0 + $1.utf8.count } - offset
+    }
+
+    /// The current string stays retained in full until its last slice is consumed.
+    var retainedBytes: Int {
+        guard partIndex < parts.count else { return 0 }
+        return parts[partIndex...].reduce(0) { $0 + $1.utf8.count }
+    }
+
+    public func deliver(_ text: String, trailing: String = "") {
+        guard !finished, !delivering, let surface else { return }
+        var text = text
+        var trailing = trailing
+        text.makeContiguousUTF8()
+        trailing.makeContiguousUTF8()
+        parts = [text, trailing]
+        surface.startSystemOutput(self)
+    }
+
+    /// Releases an undelivered reservation; a stream already delivering finishes itself.
+    public func cancel() {
+        guard !delivering else { return }
+        surface?.finishSystemOutput(self)
+    }
+
+    /// Next slice of at most `maxBytes`, ending on a UTF-8 scalar boundary.
+    fileprivate func nextSlice(maxBytes: Int) -> Data? {
+        while partIndex < parts.count {
+            let part = parts[partIndex]
+            let count = part.utf8.count
+            guard offset < count else {
+                parts[partIndex] = ""
+                partIndex += 1
+                offset = 0
+                continue
+            }
+            let start = offset
+            let slice = part.utf8.withContiguousStorageIfAvailable { buf -> (Data, Int) in
+                var end = min(start + maxBytes, count)
+                while end < count, end > start + 1, buf[end] & 0xC0 == 0x80 { end -= 1 }
+                return (Data(bytes: buf.baseAddress! + start, count: end - start), end)
+            }
+            guard let (data, end) = slice else { return nil }
+            offset = end
+            return data
+        }
+        return nil
+    }
+}
+
 /// PTY-backed shell surface. Spawns the user's shell via `forkpty(3)`
 /// and renders its output through `ANSIRenderer`. The terminal view is
 /// directly interactive — no separate input field (cmux model).
@@ -805,11 +873,30 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     private var inputPump: TerminalInputPump?
     private var readSource: DispatchSourceRead?
     private var historyReplayBackpressureActive = false
-    private var readSourceSuspendedForHistoryReplay = false
+    /// Live Ghostty queue saturation. The reader stays paused while a full
+    /// handoff might not fit, or while rejected handoffs wait in the owner FIFO.
+    private var liveOutputBackpressureActive = false
+    /// One balanced `DispatchSource` suspension shared by replay and live pressure.
+    private var readSourceSuspendedForBackpressure = false
     private var deferredUnhostedGhosttyReplay: Data?
     private var ownedGhosttyReplayOutput: [Data] = []
     private var ownedGhosttyReplayOutputBytes = 0
     private static let maxOwnedGhosttyReplayOutputBytes = 4 * 1024 * 1024
+    /// One full PTY event (`maxPTYReadEventBytes`) must always fit after the
+    /// reader is allowed to run, so the pause point leaves exactly this reserve.
+    private static let ptyHandoffReserveBytes = 256 * 1024
+    /// Reserved or streaming system output. While streaming, the PTY reader is
+    /// paused and every other writer waits in `heldBehindSystemOutput` (one
+    /// in-flight PTY batch plus small notices, bounded by the owner cap).
+    private var systemOutput: SystemOutputLease?
+    private var systemOutputPumpScheduled = false
+    private enum HeldOutput {
+        case pty(Data, renderAllowedAtRead: Bool)
+        case system(Data)
+    }
+    private var heldBehindSystemOutput: [HeldOutput] = []
+    private var heldBehindSystemOutputBytes = 0
+    private var systemOutputStreaming: Bool { systemOutput?.delivering == true }
     private var applicationTerminationBarrier: SurfaceTerminationBarrier?
     private var runtimeRestartRequiredHistoryBarrier: SurfaceTerminationBarrier?
     private var runtimeDispositionBarrierFactoryForTesting:
@@ -977,6 +1064,8 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
             + hiddenRendererBuffer.count
             + (deferredUnhostedGhosttyReplay?.count ?? 0)
             + ownedGhosttyReplayOutputBytes
+            + heldBehindSystemOutputBytes
+            + (systemOutput?.retainedBytes ?? 0)
             + cachedBytes
     }
 
@@ -1001,6 +1090,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     private func reclaimTerminalMemoryUnderPressure() {
         guard !isClosing,
               !historyReplayBackpressureActive else { return }
+        // Owner-held handoffs are already in the ANSI mirror this rebuild seeds
+        // from; replaying them again afterwards would print them twice. The budget
+        // is re-checked as soon as the owner queue empties.
+        guard ownedGhosttyReplayOutput.isEmpty else { return }
         if isVisible {
             compactVisibleTerminalMemory()
             return
@@ -1247,8 +1340,19 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     func drainInputPumpForTesting() { inputPump?.drain() }
     var readerConfiguredForTesting: Bool { readSource != nil }
     var readerPausedForHistoryReplayForTesting: Bool {
-        historyReplayBackpressureActive && readSourceSuspendedForHistoryReplay
+        historyReplayBackpressureActive && readSourceSuspendedForBackpressure
     }
+    var readerPausedForLiveOutputForTesting: Bool {
+        liveOutputBackpressureActive && readSourceSuspendedForBackpressure
+    }
+    var liveOutputBackpressureActiveForTesting: Bool { liveOutputBackpressureActive }
+    var readerSuspendedForTesting: Bool { readSourceSuspendedForBackpressure }
+    var systemOutputOwnedForTesting: Bool { systemOutput != nil }
+    var systemOutputHeldBytesForTesting: Int { heldBehindSystemOutputBytes }
+    func installGhosttyNativeDriverForTesting(_ driver: GhosttyTerminalView.NativeDriverForTesting) {
+        ghosttyView.nativeDriverForTesting = driver
+    }
+    func prepareGhosttyHostForTesting() -> Bool { ghosttyView.prepareHistoryReplayHost() }
     var ghosttyReplayInProgressForTesting: Bool {
         ghosttyView.historyReplayDrainInProgressForTesting
     }
@@ -1677,6 +1781,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         terminalView.nextHistoryReplayContinuation = { [weak self] in
             self?.takeNextOwnedGhosttyReplayOutput()
         }
+        terminalView.onOutputCapacityAvailable = { [weak self] in
+            self?.reconcileLiveOutputBackpressure()
+            self?.pumpSystemOutput()
+        }
         // Forward paste-confirmation requests from the Ghostty view to any
         // app-level handler wired on this surface (e.g. AppCommandRouter).
         terminalView.onPasteNeedsConfirm = { [weak self] (text: String) in
@@ -2022,11 +2130,11 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
                 DispatchQueue.main.sync(execute: handoffBlock)
             }
         }
-        if historyReplayBackpressureActive {
+        if historyReplayBackpressureActive || liveOutputBackpressureActive || systemOutputStreaming {
             // Dispatch sources are created suspended. Leave this one suspended
-            // until the bounded Ghostty replay finishes; the PTY kernel then
+            // until the bounded Ghostty queue drains; the PTY kernel then
             // supplies the backpressure without a second userspace byte queue.
-            readSourceSuspendedForHistoryReplay = true
+            readSourceSuspendedForBackpressure = true
         } else {
             src.resume()
         }
@@ -2047,10 +2155,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         }
         deferredUnhostedGhosttyReplay = nil
         historyReplayBackpressureActive = true
-        if let readSource, !readSourceSuspendedForHistoryReplay {
-            readSource.suspend()
-            readSourceSuspendedForHistoryReplay = true
-        }
+        suspendReaderForBackpressure()
         guard ghosttyView.resetSurfaceOutput(data) else {
             endGhosttyHistoryReplayBackpressure()
             return
@@ -2063,15 +2168,134 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     private func endGhosttyHistoryReplayBackpressure() {
         historyReplayBackpressureActive = false
         defer { touchTerminalMemoryBudget() }
-        guard readSourceSuspendedForHistoryReplay else { return }
-        readSourceSuspendedForHistoryReplay = false
+        reconcileLiveOutputBackpressure()
+        resumeReaderIfBackpressureCleared()
+        pumpSystemOutput()
+    }
+
+    public func reserveSystemOutput() -> SystemOutputLease? {
+        guard !isClosing, systemOutput == nil else { return nil }
+        let lease = SystemOutputLease(surface: self)
+        systemOutput = lease
+        return lease
+    }
+
+    fileprivate func startSystemOutput(_ lease: SystemOutputLease) {
+        guard systemOutput === lease, !isClosing else { return }
+        lease.delivering = true
+        suspendReaderForBackpressure()
+        scheduleSystemOutputPump()
+    }
+
+    private func scheduleSystemOutputPump() {
+        guard !systemOutputPumpScheduled else { return }
+        systemOutputPumpScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.systemOutputPumpScheduled = false
+            self.pumpSystemOutput()
+        }
+    }
+
+    /// One bounded slice per main-queue turn keeps mirror parsing responsive even
+    /// without a native parser. Capacity and replay callbacks restart a paused source.
+    private func pumpSystemOutput() {
+        guard let lease = systemOutput, lease.delivering, !isClosing,
+              !historyReplayBackpressureActive, ownedGhosttyReplayOutput.isEmpty else { return }
+        if ghosttyView.drainsOutputNatively,
+           !ghosttyView.hasOutputCapacity(forHandoffBytes: Self.ptyHandoffReserveBytes) { return }
+        guard let slice = lease.nextSlice(maxBytes: GhosttyTerminalView.historyReplayChunkBytes) else {
+            finishSystemOutput(lease)
+            return
+        }
+        deliverSystemData(slice)
+        scheduleSystemOutputPump()
+    }
+
+    /// Ends the stream (complete or cancelled), then replays what waited behind it.
+    fileprivate func finishSystemOutput(_ lease: SystemOutputLease) {
+        guard systemOutput === lease else { return }
+        systemOutput = nil
+        lease.finished = true
+        lease.parts = []
+        let held = heldBehindSystemOutput
+        heldBehindSystemOutput = []
+        heldBehindSystemOutputBytes = 0
+        for item in held {
+            switch item {
+            case .pty(let data, let renderAllowed): appendDataAsync(data, renderAllowedAtRead: renderAllowed)
+            case .system(let data): deliverSystemData(data)
+            }
+        }
+        resumeReaderIfBackpressureCleared()
+        touchTerminalMemoryBudget()
+    }
+
+    private func holdBehindSystemOutput(_ item: HeldOutput, bytes: Int) {
+        guard bytes <= Self.maxOwnedGhosttyReplayOutputBytes - heldBehindSystemOutputBytes else {
+            outputPartial = true
+            outputPartialReason = outputPartialReason ?? "system_output_held_cap"
+            terminalLog.error("terminal.system_output_held_cap surface=\(self.descriptor.id.value.uuidString, privacy: .public) bytes=\(bytes, privacy: .public)")
+            return
+        }
+        heldBehindSystemOutput.append(item)
+        heldBehindSystemOutputBytes += bytes
+    }
+
+    /// Reclaim skipped while handoffs were owner-held; run it again off this call stack.
+    private func recheckTerminalMemoryBudgetSoon() {
+        DispatchQueue.main.async { [weak self] in self?.touchTerminalMemoryBudget() }
+    }
+
+    private func suspendReaderForBackpressure() {
+        guard let readSource, !readSourceSuspendedForBackpressure else { return }
+        readSource.suspend()
+        readSourceSuspendedForBackpressure = true
+    }
+
+    private func resumeReaderIfBackpressureCleared() {
+        guard readSourceSuspendedForBackpressure,
+              !historyReplayBackpressureActive,
+              !liveOutputBackpressureActive,
+              !systemOutputStreaming else { return }
+        readSourceSuspendedForBackpressure = false
         readSource?.resume()
+    }
+
+    /// Live saturation control. Replays own their own pacing, so this only acts
+    /// outside them: it delivers owner-held handoffs to Ghostty in FIFO order as
+    /// capacity returns, pauses the PTY reader before a full handoff could be
+    /// rejected, and resumes it once the queue is at most half full.
+    private func reconcileLiveOutputBackpressure() {
+        guard !historyReplayBackpressureActive, !isClosing else { return }
+        while let next = ownedGhosttyReplayOutput.first {
+            guard ghosttyView.processOutput(next, render: renderDiagnostics().canRender) else {
+                return
+            }
+            ownedGhosttyReplayOutput.removeFirst()
+            ownedGhosttyReplayOutputBytes -= next.count
+            if ownedGhosttyReplayOutput.isEmpty { recheckTerminalMemoryBudgetSoon() }
+        }
+        let full = ghosttyView.drainsOutputNatively
+            && !ghosttyView.hasOutputCapacity(forHandoffBytes: Self.ptyHandoffReserveBytes)
+        if full {
+            liveOutputBackpressureActive = true
+            suspendReaderForBackpressure()
+            return
+        }
+        guard liveOutputBackpressureActive else { return }
+        let drained = !ghosttyView.drainsOutputNatively
+            || ghosttyView.outputBytesOwned <= GhosttyTerminalView.maxPendingOutputBytes / 2
+        guard drained else { return }
+        liveOutputBackpressureActive = false
+        resumeReaderIfBackpressureCleared()
     }
 
     private func takeNextOwnedGhosttyReplayOutput() -> Data? {
         guard !ownedGhosttyReplayOutput.isEmpty else { return nil }
         let next = ownedGhosttyReplayOutput.removeFirst()
         ownedGhosttyReplayOutputBytes -= next.count
+        if ownedGhosttyReplayOutput.isEmpty { recheckTerminalMemoryBudgetSoon() }
         return next
     }
 
@@ -2083,21 +2307,18 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
             retainGhosttyReplayOutput(data)
             return
         }
-        guard !ghosttyView.processOutput(data, render: render) else { return }
+        guard !ghosttyView.processOutput(data, render: render) else {
+            if !historyReplayBackpressureActive { reconcileLiveOutputBackpressure() }
+            return
+        }
         retainGhosttyReplayOutput(data)
     }
 
     private func retainGhosttyReplayOutput(_ data: Data) {
-        // Replay backpressure owns every rejected handoff explicitly. The PTY
-        // reader is suspended, so production can contribute at most one 256 KiB
-        // batch; local notices stay ordered behind it and are transferred back
-        // to Ghostty whole by `nextHistoryReplayContinuation`.
-        guard historyReplayBackpressureActive else {
-            outputPartial = true
-            outputPartialReason = outputPartialReason ?? "ghostty_unowned_output"
-            terminalLog.error("terminal.ghostty_output_unowned surface=\(self.descriptor.id.value.uuidString, privacy: .public) bytes=\(data.count, privacy: .public)")
-            return
-        }
+        // Backpressure owns every rejected handoff explicitly. The PTY reader is
+        // suspended, so production can contribute at most one 256 KiB batch; local
+        // notices stay ordered behind it and are transferred back to Ghostty whole
+        // by `nextHistoryReplayContinuation` (replay) or the capacity callback (live).
         guard data.count <= Self.maxOwnedGhosttyReplayOutputBytes - ownedGhosttyReplayOutputBytes else {
             // App-generated notices can still arrive while the PTY reader is
             // suspended. Bound that auxiliary queue too and fail loudly rather
@@ -2109,6 +2330,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         }
         ownedGhosttyReplayOutput.append(data)
         ownedGhosttyReplayOutputBytes += data.count
+        guard !historyReplayBackpressureActive else { return }
+        liveOutputBackpressureActive = true
+        suspendReaderForBackpressure()
+        reconcileLiveOutputBackpressure()
     }
 
     private func extendDeferredUnhostedReplay(_ data: Data) {
@@ -2131,10 +2356,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         if !preserveHistoryReplayOwnership {
             historyReplayBackpressureActive = false
         }
-        if readSourceSuspendedForHistoryReplay {
+        if readSourceSuspendedForBackpressure {
             // A suspended DispatchSource must be balanced before cancellation
             // can deliver its cancel handler and release the file descriptor.
-            readSourceSuspendedForHistoryReplay = false
+            readSourceSuspendedForBackpressure = false
             readSource?.resume()
         }
         readSource?.cancel()
@@ -2240,6 +2465,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
 
     private func appendDataAsync(_ data: Data, renderAllowedAtRead: Bool) {
         guard !isClosing else { return }
+        guard !systemOutputStreaming else {
+            holdBehindSystemOutput(.pty(data, renderAllowedAtRead: renderAllowedAtRead), bytes: data.count)
+            return
+        }
         recordHistoryReplayLiveData(data)
         // Audit #3: if output is arriving while we believe the surface is hidden but
         // its view is demonstrably on a key, on-screen window, the visibility reconcile
@@ -2339,6 +2568,14 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
 
     private func appendString(_ raw: String) {
         guard let data = raw.data(using: .utf8) else { return }
+        guard !systemOutputStreaming else {
+            holdBehindSystemOutput(.system(data), bytes: data.count)
+            return
+        }
+        deliverSystemData(data)
+    }
+
+    private func deliverSystemData(_ data: Data) {
         recordHistoryReplayLiveData(data)
         enqueueHistory(data)
         recordOutputTelemetry(bytes: data.count)
@@ -2545,8 +2782,24 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         beginGhosttyHistoryReplay(canonical)
     }
 
-    public func appendSystemText(_ raw: String) {
-        appendString(raw)
+    /// Returns false when a payload larger than one PTY handoff is refused because
+    /// another system-output stream owns the terminal (marked partial, never queued).
+    @discardableResult
+    public func appendSystemText(_ raw: String) -> Bool {
+        guard raw.utf8.count > Self.ptyHandoffReserveBytes else {
+            appendString(raw)
+            return true
+        }
+        guard let lease = reserveSystemOutput() else {
+            if !isClosing {
+                outputPartial = true
+                outputPartialReason = outputPartialReason ?? "system_output_busy"
+                terminalLog.error("terminal.system_output_busy surface=\(self.descriptor.id.value.uuidString, privacy: .public) bytes=\(raw.utf8.count, privacy: .public)")
+            }
+            return false
+        }
+        lease.deliver(raw)
+        return true
     }
 
     private func autoSubmitSavedSSHPasswordIfNeeded(from data: Data) {
@@ -2907,7 +3160,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
                 complete: false,
                 source: "ansi_fallback",
                 timestamp: Date(),
-                partialReason: outputPartialReason ?? "ghostty_unavailable",
+                // A parser that is still absorbing queued output is not "unavailable":
+                // the ANSI mirror above is current, only the native viewport lags.
+                partialReason: outputPartialReason
+                    ?? (ghosttyView.outputBytesOwned > 0 ? "ghostty_parser_draining" : "ghostty_unavailable"),
                 pendingBytes: outputPendingBytes,
                 rows: terminalSize.rows,
                 cols: terminalSize.cols,
@@ -3093,7 +3349,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         outputBytesAtLastTelemetry = totalOutputBytes
         lastOutputTelemetryAt = now
         let diagnostics = renderDiagnostics()
-        terminalLog.info("terminal.output_health surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(self.childPID, privacy: .public) totalBytes=\(self.totalOutputBytes, privacy: .public) pendingBytes=\(self.outputPendingBytes, privacy: .public) droppedBytes=\(self.ghosttyView.droppedOutputBytes, privacy: .public) historyOutstandingBytes=\(self.historyOutstandingBytes, privacy: .public) historyFailures=\(self.historyWriteFailures, privacy: .public) maxReadBatchBytes=\(self.maxPTYReadBatchBytesObserved, privacy: .public) maxReadCalls=\(self.maxPTYReadCallsObserved, privacy: .public) canRender=\(diagnostics.canRender, privacy: .public) blocked=\(diagnostics.blockedReason ?? "none", privacy: .public)")
+        terminalLog.info("terminal.output_health surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(self.childPID, privacy: .public) totalBytes=\(self.totalOutputBytes, privacy: .public) pendingBytes=\(self.outputPendingBytes, privacy: .public) ghosttyQueuedBytes=\(self.ghosttyView.outputBytesOwned, privacy: .public) ownerHeldBytes=\(self.ownedGhosttyReplayOutputBytes, privacy: .public) droppedBytes=\(self.ghosttyView.droppedOutputBytes, privacy: .public) historyOutstandingBytes=\(self.historyOutstandingBytes, privacy: .public) historyFailures=\(self.historyWriteFailures, privacy: .public) maxReadBatchBytes=\(self.maxPTYReadBatchBytesObserved, privacy: .public) maxReadCalls=\(self.maxPTYReadCallsObserved, privacy: .public) canRender=\(diagnostics.canRender, privacy: .public) blocked=\(diagnostics.blockedReason ?? "none", privacy: .public)")
     }
 
     func handleBell() {
@@ -3597,6 +3853,12 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         deferredUnhostedGhosttyReplay = nil
         ownedGhosttyReplayOutput.removeAll(keepingCapacity: false)
         ownedGhosttyReplayOutputBytes = 0
+        liveOutputBackpressureActive = false
+        systemOutput?.finished = true
+        systemOutput?.parts = []
+        systemOutput = nil
+        heldBehindSystemOutput = []
+        heldBehindSystemOutputBytes = 0
         cancelPendingPTYWinsize()
         let deferredHistoryState = TerminalDeferredTerminationState()
         let readerClosingSnapshot = readerHandoffState.beginClosing {

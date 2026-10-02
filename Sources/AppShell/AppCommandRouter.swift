@@ -8742,16 +8742,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func runSSHTransfer(surface: SurfaceID, upload: Bool, localPath: String, remotePath: String) throws -> JSONValue {
         let kind = upload ? "upload" : "download"
         let lifecycle = try beginSSHTransfer(surface: surface, direction: kind)
+        var lease: SystemOutputLease?
         do {
             let (profile, appendOutput) = try sshTransferProfileAndOutput(for: surface)
             let args = upload
                 ? SSHCommandBuilder.scpUploadArguments(profile: profile, localPath: localPath, remotePath: remotePath)
                 : SSHCommandBuilder.scpDownloadArguments(profile: profile, remotePath: remotePath, localPath: localPath)
+            lease = try reserveTransferOutput(for: surface)
             appendOutput("\n[ssh \(kind) started]\n")
             let result = try runCommand(executable: "/usr/bin/scp", arguments: args, password: profile.password)
-            if !result.output.isEmpty { appendOutput(result.output) }
             let ok = result.exitCode == 0
-            appendOutput("[ssh \(kind) \(ok ? "completed" : "failed")]\n")
+            deliverTransferOutput(lease, appendOutput, result.output, "[ssh \(kind) \(ok ? "completed" : "failed")]\n")
             finishSSHTransfer(lifecycle, exitCode: result.exitCode)
             return .object([
                 "ok": .bool(ok),
@@ -8759,8 +8760,49 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 "output": .string(result.output)
             ])
         } catch {
+            lease?.cancel()
             finishSSHTransfer(lifecycle, exitCode: nil)
             throw error
+        }
+    }
+
+    private static let transferOutputBusyCode = -32021
+
+    /// Reserves the terminal's system-output stream before scp runs. Nil means the
+    /// surface has no terminal (legacy direct append); busy throws before any work.
+    private func reserveTransferOutput(for surface: SurfaceID) throws -> SystemOutputLease? {
+        guard let object = SurfaceRegistry.shared.surface(surface) else { throw LayoutError.surfaceNotFound }
+        guard let terminal = (object as? TerminalSurface) ?? (object as? SSHTransferSurface)?.transferTerminal else {
+            return nil
+        }
+        guard let lease = terminal.reserveSystemOutput() else {
+            throw JSONRPCError(code: Self.transferOutputBusyCode, message: "terminal output busy")
+        }
+        return lease
+    }
+
+    /// Async callers wait (cancellably, bounded) for admission instead of failing.
+    private func reserveTransferOutputAwaiting(for surface: SurfaceID) async throws -> SystemOutputLease? {
+        for _ in 0..<600 {
+            do { return try reserveTransferOutput(for: surface) }
+            catch let error as JSONRPCError where error.code == Self.transferOutputBusyCode {
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+        return try reserveTransferOutput(for: surface)
+    }
+
+    private func deliverTransferOutput(
+        _ lease: SystemOutputLease?,
+        _ appendOutput: (String) -> Void,
+        _ output: String,
+        _ notice: String
+    ) {
+        if let lease {
+            lease.deliver(output, trailing: notice)
+        } else {
+            if !output.isEmpty { appendOutput(output) }
+            appendOutput(notice)
         }
     }
 
@@ -8778,20 +8820,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func runSSHTransferAsync(surface: SurfaceID, upload: Bool, localPath: String, remotePath: String) async throws -> JSONValue {
         let kind = upload ? "upload" : "download"
         let lifecycle = try beginSSHTransfer(surface: surface, direction: kind)
+        var lease: SystemOutputLease?
         do {
             let (profile, appendOutput) = try sshTransferProfileAndOutput(for: surface)
             let args = upload
                 ? SSHCommandBuilder.scpUploadArguments(profile: profile, localPath: localPath, remotePath: remotePath)
                 : SSHCommandBuilder.scpDownloadArguments(profile: profile, remotePath: remotePath, localPath: localPath)
+            lease = try await reserveTransferOutputAwaiting(for: surface)
             appendOutput("\n[ssh \(kind) started]\n")
             let password = profile.password
             let commandRunner = sshCommandRunner
             let result = try await ProviderCLIProbe.runOffCooperativePool {
                 Result { try commandRunner("/usr/bin/scp", args, password) }
             }.get()
-            if !result.output.isEmpty { appendOutput(result.output) }
             let ok = result.exitCode == 0
-            appendOutput("[ssh \(kind) \(ok ? "completed" : "failed")]\n")
+            deliverTransferOutput(lease, appendOutput, result.output, "[ssh \(kind) \(ok ? "completed" : "failed")]\n")
             finishSSHTransfer(lifecycle, exitCode: result.exitCode)
             return .object([
                 "ok": .bool(ok),
@@ -8799,6 +8842,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 "output": .string(result.output)
             ])
         } catch {
+            lease?.cancel()
             finishSSHTransfer(lifecycle, exitCode: nil)
             throw error
         }
