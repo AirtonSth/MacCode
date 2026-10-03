@@ -5257,11 +5257,18 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func publishInterestedDeskThreadID() {
-        let next = screen.resolvedDestination == .desk
+        var next = screen.resolvedDestination == .desk
             ? selectedConversation?.linkedAgentThreadID
             : nil
+        // The embedded Agent App paints this thread; a second desk paint pipeline
+        // would republish this view model on every token.
+        if let threadID = next, deskAgentOwnsLiveStream(threadID: threadID) { next = nil }
         if interestedDeskThread.get() != next { deskStreamAggregateBudgetOps = 0 }
         interestedDeskThread.set(next)
+    }
+
+    private func deskAgentOwnsLiveStream(threadID: AgentThreadID) -> Bool {
+        deskAgentVM != nil && deskAgentKey?.threadID == threadID
     }
 
     nonisolated private func currentInterestedDeskThreadID() -> AgentThreadID? {
@@ -9201,6 +9208,8 @@ public final class BotsViewModel: ObservableObject {
             }
             return
         }
+        // Agent App owns the transcript; the desk timeline replay would only feed deleted views.
+        if deskAgentOwnsLiveStream(threadID: threadID) { return }
         applyDeskLiveReplay(
             botID: botID,
             threadID: threadID,
@@ -9448,6 +9457,8 @@ public final class BotsViewModel: ObservableObject {
 
     private func startDeskLiveTurnWatch(botID: BotID, threadID: AgentThreadID) {
         deskLiveTurnWatch?.cancel()
+        deskLiveTurnWatch = nil
+        guard !deskAgentOwnsLiveStream(threadID: threadID) else { return }
         deskLiveTurnWatch = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -9914,7 +9925,10 @@ public final class BotsViewModel: ObservableObject {
     func syncDeskAgentVM() {
         guard !isSyncingDeskAgent else { return }
         isSyncingDeskAgent = true
-        defer { isSyncingDeskAgent = false }
+        defer {
+            isSyncingDeskAgent = false
+            publishInterestedDeskThreadID()
+        }
         guard screen == .desk,
               let bot = selectedBot,
               let conversation = selectedConversation,

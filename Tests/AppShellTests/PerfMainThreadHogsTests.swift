@@ -328,12 +328,11 @@ final class PerfMainThreadHogsTests: XCTestCase {
 
     // MARK: BT-20 / BT-22 / BT-24 (Bots desk)
 
+    /// No router means no embedded Agent App, so the desk's own stream pipeline stays active.
     private func makeDeskHarness() throws -> (context: AppContext, vm: BotsViewModel, bot: BotDefinition, thread: AgentThread, conversation: BotConversation) {
         let directory = NSTemporaryDirectory() + "RC2BotsPerf-\(UUID().uuidString)"
         let context = try AppContext(channel: .debug, appSupportOverride: directory)
-        let router = AppCommandRouter(context: context)
-        context.router = router
-        let vm = BotsViewModel(context: context, router: router)
+        let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
         try context.threadRepo.upsert(thread)

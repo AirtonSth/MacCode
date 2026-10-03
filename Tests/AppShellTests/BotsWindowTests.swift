@@ -2278,9 +2278,7 @@ final class BotsWindowTests: XCTestCase {
         // WHY: every Bots window observes the coordinator. Stream events for
         // other threads must not hop to MainActor or mutate the selected desk.
         let context = try makeContext()
-        let router = AppCommandRouter(context: context)
-        context.router = router
-        let vm = BotsViewModel(context: context, router: router)
+        let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         let threadA = AgentThread(title: "Standup", provider: .claude, model: "opus")
         try context.threadRepo.upsert(threadA)
@@ -16781,6 +16779,40 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertNotEqual(payload, raw)
         XCTAssertTrue(payload.contains(raw))
         XCTAssertTrue(payload.contains("Piper"), "compiled payload carries the bot brain")
+    }
+
+    func test_embeddedAgentAppOwnsLiveStream_becauseDeskMustNotRepublishPerTokenBesideAgentApp() async throws {
+        // WHY: the embedded Agent App already paints this thread. A second desk
+        // pipeline publishing deskLiveTimeline per token invalidates the whole
+        // Bots tree that hosts the Agent App, which was the reported slowness.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        XCTAssertNotNil(vm.deskAgentVM)
+        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID)
+        var publishes = 0
+        let sink = vm.$deskLiveTimeline.dropFirst().sink { _ in publishes += 1 }
+        defer { sink.cancel() }
+        vm.resetDeskStreamMainHopCountForTesting()
+        let runID = AgentRunID()
+        vm.runCoordinator(context.coordinator, didReceive: .turnStarted(turnId: "t1"), run: runID, threadId: threadID)
+        for i in 0..<50 {
+            vm.runCoordinator(
+                context.coordinator,
+                didReceive: .itemStarted(item: AssistantItem(id: "item-\(i)", turnId: "t1", type: .tool, startedAtMs: Int64(i))),
+                run: runID,
+                threadId: threadID
+            )
+        }
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(vm.deskStreamMainHopCountForTesting, 0, "events must drop at the nonisolated guard")
+        XCTAssertEqual(vm.applyIncomingDeskEventCountForTesting, 0)
+        XCTAssertEqual(publishes, 0)
+        XCTAssertTrue(vm.deskLiveTimeline.turns.isEmpty)
     }
 
     private func makeContext() throws -> AppContext {
