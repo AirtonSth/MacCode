@@ -3637,6 +3637,8 @@ public final class BotsViewModel: ObservableObject {
             recipeContext: AppShellResourceBundle.computerGuestRecipeURL()
         )
         context.botPeerHandoffAuthority.addObserver(self)
+        // Queued bot-thread sends can drain before any desk is opened.
+        if let router { installBotQueueHooks(on: router) }
         restoreQueuedFollowUpsIfNeeded()
         restoreComposerDraftsIfNeeded()
         restoreInspectorDraftsIfNeeded()
@@ -10024,7 +10026,6 @@ public final class BotsViewModel: ObservableObject {
         }
         vm.refreshProviderSnapshotsInBackground()
         AppCommandRouter.wireTokenSaverThreadFooter(on: vm, context: context)
-        installBotQueueHooks(on: router)
         deskAgentKey = key
         deskAgentVM = vm
     }
