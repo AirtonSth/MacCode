@@ -2499,25 +2499,35 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             if probeExistence {
                 do {
                     self.durableThreadExistenceProbeCountForTesting += 1
-                    guard let durableWorkspace = try self.threadRepo.workspaceId(of: id) else {
-                        if self.statusMessage.isEmpty {
-                            self.statusMessage = "Could not open thread: The thread is no longer available."
+                    if self.embedding?.pinnedThreadId == id {
+                        guard (try self.threadRepo.get(id: id)) != nil else {
+                            if self.statusMessage.isEmpty {
+                                self.statusMessage = "Could not open thread: The thread is no longer available."
+                            }
+                            self.retireUnbackedRailRow(id)
+                            return
                         }
-                        // The stale rail row was already bound before this probe ran,
-                        // so a missing durable row must undo the selection instead of
-                        // leaving the surface open on a thread the store no longer has.
-                        self.retireUnbackedRailRow(id)
-                        return
-                    }
-                    guard self.embedding?.pinnedThreadId == id || durableWorkspace == self.workspaceID else {
-                        if self.statusMessage.isEmpty {
-                            self.statusMessage = "Could not open thread: The thread belongs to another workspace."
+                    } else {
+                        guard let durableWorkspace = try self.threadRepo.workspaceId(of: id) else {
+                            if self.statusMessage.isEmpty {
+                                self.statusMessage = "Could not open thread: The thread is no longer available."
+                            }
+                            // The stale rail row was already bound before this probe ran,
+                            // so a missing durable row must undo the selection instead of
+                            // leaving the surface open on a thread the store no longer has.
+                            self.retireUnbackedRailRow(id)
+                            return
                         }
-                        // The durable owner wins over the rail row: this surface must
-                        // not stay bound to — or keep painting — another workspace's
-                        // thread, and the row is stale here for the same reason.
-                        self.retireUnbackedRailRow(id)
-                        return
+                        guard durableWorkspace == self.workspaceID else {
+                            if self.statusMessage.isEmpty {
+                                self.statusMessage = "Could not open thread: The thread belongs to another workspace."
+                            }
+                            // The durable owner wins over the rail row: this surface must
+                            // not stay bound to — or keep painting — another workspace's
+                            // thread, and the row is stale here for the same reason.
+                            self.retireUnbackedRailRow(id)
+                            return
+                        }
                     }
                 } catch {
                     self.statusMessage = "Could not open thread: \(error)"

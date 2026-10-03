@@ -2234,6 +2234,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             runAsUser: request.runAsUser,
             acceptancePermit: pendingProviderStart.acceptancePermit
         )
+        effectiveRequest.tokenSaverCompressesPrompt = request.tokenSaverCompressesPrompt
         guard let runner = providers[effectiveRequest.provider] else {
             throw AgentRunError.missingBinary(effectiveRequest.provider.rawValue)
         }

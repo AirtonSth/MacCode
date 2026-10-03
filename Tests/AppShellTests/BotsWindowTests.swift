@@ -8040,11 +8040,16 @@ final class BotsWindowTests: XCTestCase {
             models: [AgentModelDescriptor(id: "gpt-6-luna", label: "GPT-6 Luna", provider: .distill)],
             binaryPath: harnessURL.path,
             authenticated: true,
-            id: "distill"
+            id: "distill",
+            capabilitiesOverride: AgentProviderCapabilities(
+                supportsDistillMainEffortAuto: true,
+                supportsDistillReasoningModelEffort: true
+            )
         )
         router.rememberProviderSnapshotsForSend([snapshot])
 
         let vm = BotsViewModel(context: context, router: router)
+        vm.replaceProvidersForTests([snapshot])
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .codex, model: "legacy-only")
         vm.openDesk(bot)
         vm.createDeskThread()
@@ -13232,7 +13237,7 @@ final class BotsWindowTests: XCTestCase {
         )
         let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         XCTAssertTrue(bots.contains("AgentAppView("), "Desk must reuse Agent App, not fork its transcript")
-        XCTAssertTrue(bots.contains("AgentAppViewLayout(showsThreadRail: false"))
+        XCTAssertTrue(bots.contains("showsThreadRail: false"), "Desk embeds Agent App with the thread rail hidden")
     }
 
     func test_deskTimelineKeepsCurrentLiveTurnOutsideLazyHistory() {
@@ -13292,7 +13297,7 @@ final class BotsWindowTests: XCTestCase {
         // must be one shared container.
         let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         XCTAssertTrue(bots.contains("AgentAppView("), "Desk must reuse Agent App, not fork its transcript")
-        XCTAssertTrue(bots.contains("AgentAppViewLayout(showsThreadRail: false"))
+        XCTAssertTrue(bots.contains("showsThreadRail: false"), "Desk embeds Agent App with the thread rail hidden")
         let agent = try String(contentsOf: sourceURL("Sources/Surfaces/AgentAppSurface.swift"), encoding: .utf8)
         XCTAssertTrue(agent.contains("AgentChatTimelineScrollContainer("))
         XCTAssertFalse(agent.contains("private struct TimelineScrollFollower"))
@@ -16249,7 +16254,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(chatChrome.contains("arrow.up"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk\")"))
         XCTAssertTrue(bots.contains("AgentAppView("), "Desk must reuse Agent App, not fork its transcript")
-        XCTAssertTrue(bots.contains("AgentAppViewLayout(showsThreadRail: false"))
+        XCTAssertTrue(bots.contains("showsThreadRail: false"), "Desk embeds Agent App with the thread rail hidden")
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.timeline\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.desktop\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.desktop.honesty\")"))
@@ -16805,6 +16810,28 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.createDeskThread())
         XCTAssertNotNil(vm.deskAgentVM)
         let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID)
+        // Newly linked bot threads start .pending; the queue drain gate only
+        // runs on idle threads, so settle it before draining.
+        var settled = try XCTUnwrap(try context.threadRepo.get(id: threadID))
+        settled.status = .completed
+        // ensureLinkedThread keys the linked thread off the desk routing at
+        // open time; the default desk route is not grok, so lock the row to
+        // the test provider before draining.
+        settled.provider = .grok
+        settled.model = "grok-4.6"
+        settled.providerInstanceId = "grok"
+        settled.routingConfiguration = AgentRoutingConfiguration(
+            mode: .manual,
+            manualSelection: AgentModelSelection(
+                provider: .grok,
+                modelId: "grok-4.6",
+                reasoningEffort: .medium,
+                serviceTier: .auto
+            ),
+            manualProviderInstanceId: "grok",
+            revision: 0
+        )
+        try context.threadRepo.upsert(settled)
         let raw = "queued follow-up question"
         _ = try context.queuedMessageRepo.enqueue(
             threadId: threadID,
