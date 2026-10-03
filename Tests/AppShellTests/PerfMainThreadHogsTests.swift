@@ -309,20 +309,16 @@ final class PerfMainThreadHogsTests: XCTestCase {
     // MARK: BT-21 / BT-25 source pins
 
     func test_botsDeskLiveTurnRowsAreEquatableAndRailTakesOneLiveSnapshot() throws {
-        // WHY (BT-21): without `.equatable()` every finished turn re-ran
-        // compose + workBlocks on every Bots body pass (Agent App already gates
-        // it). WHY (BT-25): the rail took the coordinator's global lock and
+        // WHY (BT-21): Desk live turns now render through the embedded Agent
+        // App, which already gates finished turns; Desk must not mount its own
+        // rows again. WHY (BT-25): the rail took the coordinator's global lock and
         // allocated a Set per row per pass; one snapshot per pass instead.
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        var searchStart = source.startIndex
-        var liveTurnSites = 0
-        while let range = source.range(of: "AgentChatLiveTurnView(", range: searchStart..<source.endIndex) {
-            liveTurnSites += 1
-            let tail = String(source[range.upperBound...].prefix(900))
-            XCTAssertTrue(tail.contains(".equatable()"), "every Bots AgentChatLiveTurnView must be gated by .equatable()")
-            searchStart = range.upperBound
-        }
-        XCTAssertEqual(liveTurnSites, 2)
+        XCTAssertFalse(
+            source.contains("AgentChatLiveTurnView("),
+            "Desk live turns render through the embedded Agent App, which already gates them"
+        )
+        XCTAssertTrue(source.contains("AgentAppView("))
         let rail = try XCTUnwrap(source.range(of: "private var deskThreadRail: some View {"))
         let railSlice = String(source[rail.upperBound...].prefix(2_500))
         XCTAssertTrue(railSlice.contains("let liveThreadIDs = vm.liveDeskThreadIDsSnapshot()"))

@@ -1143,7 +1143,7 @@ final class AgentChatUXPresentationTests: XCTestCase {
         let agent = try String(contentsOf: root.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"), encoding: .utf8)
         let bots = try String(contentsOf: root.appendingPathComponent("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         XCTAssertTrue(agent.contains("AgentDistillModelPills("))
-        XCTAssertTrue(bots.contains("AgentDistillModelPills("))
+        XCTAssertTrue(bots.contains("AgentAppView("), "WHY: Desk reuses Agent App, so it mounts the same Main and Worker pills.")
         XCTAssertFalse(bots.contains("AgentDistillModelSelectors("), "WHY: Desk must use the same independently presented Main and Worker controls as Agent App.")
     }
 

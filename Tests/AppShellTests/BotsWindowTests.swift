@@ -1697,7 +1697,7 @@ final class BotsWindowTests: XCTestCase {
             return XCTFail("desk thread row must exist")
         }
         let rest = source[start.upperBound...]
-        let end = rest.range(of: "\n    private var deskQueuedFollowUps")?.lowerBound ?? rest.endIndex
+        let end = rest.range(of: "\n    private var filesTab")?.lowerBound ?? rest.endIndex
         let slice = String(source[start.lowerBound..<end])
         XCTAssertTrue(slice.contains("AgentThreadProviderMonogram(provider:"),
                       "desk rows need the same provider monogram chip as the Agent App rail")
@@ -2037,55 +2037,6 @@ final class BotsWindowTests: XCTestCase {
             vm.deskWorkingLabel(now: started.addingTimeInterval(9)),
             AgentWorkingStripPresentation.label(phase: .thinking, elapsedSeconds: 9)
         )
-    }
-
-    func test_deskComposerTimelineSchedule_stopsAfterInitialIdleRender() {
-        // WHY: with no live Desk run, the composer label is static. The old
-        // periodic TimelineView still invalidated it once per second forever.
-        let start = Date(timeIntervalSince1970: 1_700_000_000)
-        let entries = BotsComposerTimelineSchedule(runIsLive: false)
-            .entries(from: start, mode: .normal)
-        let renderedDates = Array(entries.prefix(61))
-
-        XCTAssertEqual(renderedDates, [start])
-        XCTAssertEqual(renderedDates.dropFirst().count, 0,
-                       "60 idle seconds must produce zero follow-up invalidations")
-    }
-
-    func test_deskComposerTimelineSchedule_keepsOneHertzDuringLiveRun() {
-        // WHY: the elapsed Working label must retain its existing one-second
-        // cadence while the selected Desk thread is actually running.
-        let start = Date(timeIntervalSince1970: 1_700_000_000)
-        let entries = BotsComposerTimelineSchedule(runIsLive: true)
-            .entries(from: start, mode: .normal)
-        let renderedDates = Array(entries.prefix(61))
-
-        XCTAssertEqual(renderedDates.count, 61)
-        XCTAssertEqual(renderedDates.first, start)
-        XCTAssertEqual(renderedDates.last, start.addingTimeInterval(60))
-        XCTAssertTrue(zip(renderedDates, renderedDates.dropFirst()).allSatisfy {
-            $1.timeIntervalSince($0) == 1
-        })
-    }
-
-    func test_microbenchDeskComposerTimelineSchedule_eliminatesIdleInvalidations() {
-        let warmups = 2
-        let samples = 7
-        let start = Date(timeIntervalSince1970: 1_700_000_000)
-        var optimizedSamples: [Int] = []
-
-        for iteration in 0..<(warmups + samples) {
-            let entries = BotsComposerTimelineSchedule(runIsLive: false)
-                .entries(from: start, mode: .normal)
-            let optimizedInvalidations = Array(entries.prefix(61)).dropFirst().count
-            if iteration >= warmups {
-                XCTAssertEqual(optimizedInvalidations, 0)
-                optimizedSamples.append(optimizedInvalidations)
-            }
-        }
-
-        XCTAssertEqual(optimizedSamples, Array(repeating: 0, count: samples))
-        print("PERF idle_bots_composer_clock warmup=2 n=7 baseline_invalidations=60 optimized_invalidations=0 reduction_pct=100 live_invalidations=60")
     }
 
     func test_deskReplaysStreamEventsOnOpen_becauseThinkingMustSurviveClose() throws {
@@ -5148,7 +5099,7 @@ final class BotsWindowTests: XCTestCase {
             return XCTFail("desk inspector routines must exist")
         }
         let rest = source[start.upperBound...]
-        let end = rest.range(of: "\n    private func deskTimeline")?.lowerBound ?? rest.endIndex
+        let end = rest.range(of: "\n    private var deskThreadRail")?.lowerBound ?? rest.endIndex
         let slice = String(source[start.lowerBound..<end])
         XCTAssertFalse(slice.contains("bots.routines.name"))
         XCTAssertFalse(slice.contains("bots.routines.save"))
@@ -8250,24 +8201,7 @@ final class BotsWindowTests: XCTestCase {
         vm.setDeskReasoningEffort(.high)
         XCTAssertEqual(vm.deskRunReasoning, .high)
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        XCTAssertTrue(source.contains("\"bots.desk.source\""))
-        XCTAssertTrue(source.contains("mainIdentifier: \"bots.desk.model\""))
-        XCTAssertTrue(source.contains("\"bots.desk.permission\""))
-        XCTAssertTrue(source.contains("mainPopoverIdentifier: \"bots.desk.model.popover\""))
-        XCTAssertTrue(
-            source.contains("AgentModelPopoverChrome("),
-            "Desk Auto must use the Agent App Model popover chrome, not a header-only fork"
-        )
-        XCTAssertTrue(source.contains("AgentSourceCapsule("))
-        XCTAssertTrue(source.contains("AgentPermissionCapsule("))
-        XCTAssertTrue(source.contains("AgentRunAsUserCapsule("))
-        XCTAssertTrue(source.contains("AgentModelPillLabel("))
-        XCTAssertTrue(source.contains("AgentCompactMenuRow("))
-        XCTAssertTrue(source.contains("AgentQueuedHeader("))
-        XCTAssertFalse(
-            source.contains(AgentModelPopoverPresentation.autoDisclaimer),
-            "Desk must not recopy the orchestration card; the shared chrome owns that copy"
-        )
+        XCTAssertTrue(source.contains("AgentAppView("), "Desk composer chips are the Agent App ones")
         XCTAssertFalse(
             source.contains("func deskChipLabel"),
             "Desk must not keep a private capsule fork"
@@ -13280,27 +13214,6 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(try store.refresh().items.filter { $0.route == .botsDesk(botID: piper.id) }.isEmpty)
     }
 
-    func test_deskWorkLogCardIsFullWidthOnItsOwnLine_becauseStatusCardsAreNotChatBubbles() throws {
-        // WHY: a 56pt timestamp gutter beside the Supervised-run panel left a
-        // hugging card. Status cards occupy one complete line at column width.
-        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        guard let start = bots.range(of: "private func deskWorkLogRow") else {
-            return XCTFail("deskWorkLogRow must exist")
-        }
-        let rest = bots[start.lowerBound...]
-        let end = rest.range(of: "\n    private func workLogTone")?.lowerBound ?? rest.endIndex
-        let slice = String(bots[start.lowerBound..<end])
-        XCTAssertTrue(slice.contains("AgentChatStatusCard("))
-        XCTAssertFalse(
-            slice.contains("frame(width: 56"),
-            "work-log must not keep a timestamp column beside the panel"
-        )
-        XCTAssertFalse(
-            slice.contains("style: .time"),
-            "time lives inside the shared full-width card, not a Desk gutter"
-        )
-    }
-
     func test_shortDeskTimelineUsesSharedEagerHistoryLayoutToKeepScrollBounded() throws {
         // WHY: packaged Claude Bot E2E hit an unbounded LazyVStack/self-sizing
         // text AttributeGraph loop on a short Desk timeline. Agent App already
@@ -13320,26 +13233,8 @@ final class BotsWindowTests: XCTestCase {
             "pid 36908 hung restoring a long thread in LazyVStack; Desk history must stay eager"
         )
         let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        let start = try XCTUnwrap(bots.range(of: "private func deskTimeline"))
-        let rest = bots[start.lowerBound...]
-        let end = rest.range(of: "\n    private func deskBubble")?.lowerBound ?? rest.endIndex
-        let slice = String(bots[start.lowerBound..<end])
-        XCTAssertTrue(
-            slice.contains("let items = vm.deskTimeline"),
-            "Desk must compute the timeline once per paint"
-        )
-        XCTAssertFalse(
-            slice.contains("LazyVStack("),
-            "Desk transcript history must not use LazyVStack for self-sizing NSTextView rows"
-        )
-        XCTAssertTrue(
-            slice.contains("VStack(alignment: .leading, spacing: DS.Space.xl)"),
-            "short Desk timelines must have an eager placement path"
-        )
-        XCTAssertTrue(slice.contains("let split = BotsDeskFollowThrough.splitLiveTail"))
-        XCTAssertTrue(slice.contains("ForEach(Array(historyItems.enumerated())"))
-        XCTAssertTrue(slice.contains("ForEach(Array(liveItems.enumerated())"))
-        XCTAssertFalse(slice.contains("ForEach(Array(vm.deskTimeline.enumerated())"))
+        XCTAssertTrue(bots.contains("AgentAppView("), "Desk must reuse Agent App, not fork its transcript")
+        XCTAssertTrue(bots.contains("AgentAppViewLayout(showsThreadRail: false"))
     }
 
     func test_deskTimelineKeepsCurrentLiveTurnOutsideLazyHistory() {
@@ -13398,14 +13293,8 @@ final class BotsWindowTests: XCTestCase {
         // only in AgentAppSurface, so send did not auto-scroll. Same control
         // must be one shared container.
         let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        let start = try XCTUnwrap(bots.range(of: "private func deskTimeline"))
-        let rest = bots[start.lowerBound...]
-        let end = rest.range(of: "\n    private func deskBubble")?.lowerBound ?? rest.endIndex
-        let slice = String(bots[start.lowerBound..<end])
-        XCTAssertTrue(slice.contains("AgentChatTimelineScrollContainer("))
-        XCTAssertTrue(slice.contains("deskTimelineRejoinToken"))
-        XCTAssertTrue(slice.contains("\"bots.desk.scrollToBottom\""))
-        XCTAssertFalse(slice.contains("ScrollView {"))
+        XCTAssertTrue(bots.contains("AgentAppView("), "Desk must reuse Agent App, not fork its transcript")
+        XCTAssertTrue(bots.contains("AgentAppViewLayout(showsThreadRail: false"))
         let agent = try String(contentsOf: sourceURL("Sources/Surfaces/AgentAppSurface.swift"), encoding: .utf8)
         XCTAssertTrue(agent.contains("AgentChatTimelineScrollContainer("))
         XCTAssertFalse(agent.contains("private struct TimelineScrollFollower"))
@@ -16337,58 +16226,33 @@ final class BotsWindowTests: XCTestCase {
             bots.contains("studioAvatarPane"),
             "Studio Profile right pane must be the avatar, not Configuration summary"
         )
-        XCTAssertTrue(bots.contains("AgentChatUserBubble"))
-        XCTAssertTrue(bots.contains("AgentChatAssistantReply"))
-        XCTAssertTrue(bots.contains("AgentChatComposerBar"))
         XCTAssertTrue(
             bots.contains("AgentChatTokenSaverThreadFooter"),
             "Desk must mount the shared Token Saver footer, not a lookalike capsule"
         )
-        XCTAssertTrue(
-            bots.contains("presentation: presentation"),
-            "Desk must pass the shared on/off presentation so off-state red is not Agent-App-only"
-        )
-        XCTAssertTrue(bots.contains("AgentChatTokenSaverDisplayControl"))
-        XCTAssertTrue(bots.contains("deskUserDisplayText"))
         XCTAssertTrue(bots.contains("bindTokenSaverThreadFooter"))
-        XCTAssertTrue(
-            bots.contains("placeholder: \"Message \\(bot.name)…\""),
-            "Desk composer must invite messaging the teammate, not Ask Claude for changes"
-        )
         XCTAssertFalse(
             bots.contains("AgentChatTranscriptChrome.composerPlaceholder("),
             "Bots Desk must not reuse the Agent App Ask <provider> for changes placeholder"
         )
-        XCTAssertTrue(bots.contains("AgentChatLiveTurnView"))
         XCTAssertTrue(bots.contains("applyIncomingDeskEvent"))
         let liveChrome = try String(contentsOf: sourceURL("Sources/Surfaces/AgentChatLiveTurnChrome.swift"), encoding: .utf8)
         XCTAssertTrue(liveChrome.contains("bots.desk.thought"))
         XCTAssertTrue(liveChrome.contains("Thinking…"))
         XCTAssertTrue(liveChrome.contains("Work so far"))
-        XCTAssertTrue(bots.contains("onAttach"))
-        XCTAssertTrue(
-            bots.contains("onFileDrop: { vm.insertDroppedFilePaths($0) }"),
-            "Desk composer must insert dropped file/folder paths into the prompt "
-                + "text exactly like Agent App — without onFileDrop the drop falls "
-                + "back to onAttach, which stages attachments and rejects folders"
-        )
         XCTAssertTrue(bots.contains("stopDeskRun"))
         XCTAssertTrue(bots.contains("attachments: attached") || bots.contains("attachments: attached,"))
         XCTAssertTrue(bots.contains("attachmentStore().stage"))
         XCTAssertTrue(chatChrome.contains("agent.attach"))
         XCTAssertTrue(chatChrome.contains("agent.workingPhase"))
         XCTAssertTrue(chatChrome.contains("agent.composer.stop"))
-        XCTAssertTrue(bots.contains("bots.desk.queued"))
-        XCTAssertTrue(bots.contains("bots.desk.queued.header"))
-        XCTAssertTrue(bots.contains("bots.desk.queued.remove"))
-        XCTAssertTrue(bots.contains("bots.desk.composer"))
         XCTAssertTrue(chatChrome.contains("accessibilityIdentifier(composerIdentifier)"))
         XCTAssertTrue(chatChrome.contains("\"bots.desk.composer\""))
         XCTAssertTrue(chatChrome.contains("arrow.up"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk\")"))
-        XCTAssertTrue(bots.contains("accessibilityIdentifier: \"bots.desk.timeline\""))
-        XCTAssertTrue(bots.contains("AgentChatStatusCard("))
-        XCTAssertTrue(bots.contains("\"bots.desk.workLog\""))
+        XCTAssertTrue(bots.contains("AgentAppView("), "Desk must reuse Agent App, not fork its transcript")
+        XCTAssertTrue(bots.contains("AgentAppViewLayout(showsThreadRail: false"))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.timeline\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.desktop\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.desktop.honesty\")"))
         XCTAssertTrue(
@@ -16399,10 +16263,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.handle\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.job\")"))
         XCTAssertFalse(bots.contains("accessibilityIdentifier(\"bots.desk.provider\")"))
-        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.model\")"))
         XCTAssertTrue(bots.contains("\"bots.desk.permission\""))
-        XCTAssertTrue(bots.contains("bots.desk.role.user"))
-        XCTAssertTrue(bots.contains("bots.desk.role.assistant"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.inspector\")"))
         XCTAssertTrue(bots.contains("bots.studio.tab.brain"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.tab.brain"))
