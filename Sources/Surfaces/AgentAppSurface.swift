@@ -9514,6 +9514,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Force rule for the aggregate hot-text budget walk: a quantum of 64 KiB or
+    /// more, or any structural (non delta/progress/state/tokenUsage) event.
+    public nonisolated static func forcesAggregateBudget(events: [AssistantEvent], quantumBytes: Int? = nil) -> Bool {
+        let bytes = quantumBytes ?? events.reduce(0) { $0 + max(1, $1.estimatedHotQueueBytes) }
+        return bytes >= 64 * 1024
+            || events.contains { event in
+                switch event {
+                case .itemDelta: return false
+                case .itemProgress, .itemState, .tokenUsage: return false
+                default: return true
+                }
+            }
+    }
+
     /// Pure stream quantum reduce (off-MainActor). Durable run gates are pre-resolved
     /// into `runsAllowedToMarkActive` so this never touches SQLite or the coordinator.
     nonisolated static func reduceStreamQuantum(_ input: StreamQuantumReduceInput) -> StreamQuantumReduceResult {
@@ -9579,14 +9593,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // Budget walk is O(items). Pure reduce only flags when this quantum is
         // large or structural; commitStreamQuantum coalesces cheap token quanta.
         let quantumBytes = input.entries.reduce(0) { $0 + max(1, $1.event.estimatedHotQueueBytes) }
-        let forceBudget = quantumBytes >= 64 * 1024
-            || appliedEvents.contains { event in
-                switch event {
-                case .itemDelta: return false
-                case .itemProgress, .itemState, .tokenUsage: return false
-                default: return true
-                }
-            }
+        let forceBudget = forcesAggregateBudget(events: appliedEvents, quantumBytes: quantumBytes)
         if shouldAutoClearTransientTimelineError(
             errorAfterBatch: nextTimeline.error,
             appliedEvents: appliedEvents
@@ -9623,13 +9630,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// threshold or that 64 KiB gate changes the bound; the per-item
     /// `liveTextLimit` / `liveOutputLimit` caps are a second, independent bound
     /// and must not be mistaken for this one.
-    static let streamAggregateBudgetThreshold = 16
+    public static let streamAggregateBudgetThreshold = 16
 
     /// Coalescing decision for the O(items) aggregate hot-text budget walk.
     ///
     /// Extracted from `commitStreamQuantum` so the skip window is directly
     /// testable: the walk itself is cheap per item but ran on every token quantum.
-    static func aggregateBudgetDecision(
+    public static func aggregateBudgetDecision(
         force: Bool,
         opsSinceLastWalk: Int,
         appliedEventCount: Int,
@@ -9969,6 +9976,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         timelineUpdateTick = 0
     }
 
+    /// ~30 Hz stream paint coalesce, shared with the Bots desk.
+    public static let streamPaintCoalesceInterval: Duration = .milliseconds(33)
+
     private func scheduleTimelineUpdateTick() {
         guard surfaceVisibility != .hidden else { return }
         timelineTickScheduleCountForTesting += 1
@@ -9976,7 +9986,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // ~30 Hz paint coalesce (was 16 ms / 60 Hz) — fewer full transcript
         // re-evaluations while tokens stream.
         timelineUpdateTickTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(33))
+            try? await Task.sleep(for: Self.streamPaintCoalesceInterval)
             guard !Task.isCancelled else { return }
             self.timelineUpdateTick &+= 1
             self.timelineUpdateTickTask = nil

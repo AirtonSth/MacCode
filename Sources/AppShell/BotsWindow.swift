@@ -3337,6 +3337,8 @@ public final class BotsViewModel: ObservableObject {
     /// nonisolated stream delivery can drop other threads without a MainActor hop.
     private let interestedDeskThread = InterestedDeskThreadBox()
     nonisolated private let deskStreamEventBatch = DeskStreamEventBatchBox()
+    /// Events applied since the last aggregate hot-text budget walk (shared cadence with Agent App).
+    private var deskStreamAggregateBudgetOps = 0
     /// Test seams: persisted suffix work used to confirm an observer watermark.
     public private(set) var deskLiveIncrementalDecodeEventCountForTesting = 0
     public private(set) var deskLiveIncrementalDecodeBytesForTesting: Int64 = 0
@@ -5251,11 +5253,11 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func publishInterestedDeskThreadID() {
-        if screen.resolvedDestination == .desk {
-            interestedDeskThread.set(selectedConversation?.linkedAgentThreadID)
-        } else {
-            interestedDeskThread.set(nil)
-        }
+        let next = screen.resolvedDestination == .desk
+            ? selectedConversation?.linkedAgentThreadID
+            : nil
+        if interestedDeskThread.get() != next { deskStreamAggregateBudgetOps = 0 }
+        interestedDeskThread.set(next)
     }
 
     nonisolated private func currentInterestedDeskThreadID() -> AgentThreadID? {
@@ -9378,10 +9380,13 @@ public final class BotsViewModel: ObservableObject {
         var next = deskLiveTimeline
         var touched = false
         var terminalReplay: (runId: AgentRunID, threadId: AgentThreadID)?
+        var appliedEvents: [AssistantEvent] = []
+        appliedEvents.reserveCapacity(batch.count)
         for entry in batch where entry.threadId == selectedThreadId {
             let event = entry.event
             let threadId = entry.threadId
             touched = true
+            appliedEvents.append(event)
             next.apply(event)
             if let runId = entry.runId, settledTerminalRunIDByThread[threadId] == runId {
                 terminalReplay = (runId, threadId)
@@ -9392,7 +9397,13 @@ public final class BotsViewModel: ObservableObject {
         }
         guard touched else { return }
         lastDeskStreamPushAt = Date()
-        next.enforceAggregateHotTextBudget()
+        let budget = AgentAppViewModel.aggregateBudgetDecision(
+            force: AgentAppViewModel.forcesAggregateBudget(events: appliedEvents),
+            opsSinceLastWalk: deskStreamAggregateBudgetOps,
+            appliedEventCount: appliedEvents.count
+        )
+        deskStreamAggregateBudgetOps = budget.nextOps
+        if budget.runsWalk { next.enforceAggregateHotTextBudget() }
         deskLiveTimeline = next
         storeLiveTimeline(next, for: selectedThreadId)
         if let terminalReplay, let botID = selectedBotID {
@@ -11027,7 +11038,9 @@ extension BotsViewModel: AgentRunObserver {
         let opensBatch = deskStreamEventBatch.append(.init(event: event, runId: run, threadId: threadId))
         guard opensBatch else { return }
         interestedDeskThread.incrementHopCount()
+        // Same ~30 Hz paint coalesce as Agent App: events arriving in the window share one publish.
         Task { @MainActor [weak self] in
+            try? await Task.sleep(for: AgentAppViewModel.streamPaintCoalesceInterval)
             self?.flushDeskStreamEventBatch()
         }
     }
@@ -11042,6 +11055,8 @@ extension BotsViewModel: AgentRunObserver {
     ) {
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // Pending paint batch must land before terminal reconciliation reads the timeline.
+            self.flushDeskStreamEventBatch()
             self.resolveExactRunWaiters(
                 runID: runId,
                 threadID: threadId,
@@ -11063,6 +11078,7 @@ extension BotsViewModel: AgentRunObserver {
         Task { @MainActor [weak self] in
             guard let self else { return }
             if BotsDeskFollowThrough.isTerminal(status) {
+                self.flushDeskStreamEventBatch()
                 if self.adoptLinkedRunTerminal(runId: runId, threadId: threadId) {
                     self.refreshActiveBotCount()
                 }

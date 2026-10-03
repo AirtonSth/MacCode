@@ -369,12 +369,92 @@ final class PerfMainThreadHogsTests: XCTestCase {
         XCTAssertEqual(h.vm.deskStreamMainHopCountForTesting, 1, "a burst delivered before the main actor drains must open exactly one hop")
         for _ in 0..<200 {
             if h.vm.applyIncomingDeskEventCountForTesting == 201 { break }
-            await Task.yield()
+            try await Task.sleep(for: .milliseconds(10))
         }
         XCTAssertEqual(h.vm.applyIncomingDeskEventCountForTesting, 201, "every event of the batch must still be applied")
         XCTAssertEqual(h.vm.deskLiveTimeline.turns.first?.turnId, "t1")
         XCTAssertEqual(h.vm.deskLiveTimeline.turns.first?.items.count, 200, "order and completeness must survive coalescing")
         XCTAssertEqual(h.vm.deskLiveTimeline.turns.first?.items.last?.id, "item-199")
+    }
+
+    func test_deskStreamBurstSharesAgentAppPaintWindow_becauseOneBatchMustPublishDeskLiveTimelineOnce() async throws {
+        // WHY: the hop used to drain as soon as the main actor was free, so a
+        // steady token stream published deskLiveTimeline on nearly every hop.
+        // The desk now waits Agent App's 33 ms paint window so a burst spread
+        // over the window is ONE hop and ONE publish.
+        let h = try makeDeskHarness()
+        h.vm.openDesk(h.bot)
+        h.vm.selectDeskThread(h.conversation.id)
+        var publishes = 0
+        let sink = h.vm.$deskLiveTimeline.dropFirst().sink { _ in publishes += 1 }
+        defer { sink.cancel() }
+        h.vm.resetDeskStreamMainHopCountForTesting()
+        let runID = AgentRunID()
+        h.vm.runCoordinator(h.context.coordinator, didReceive: .turnStarted(turnId: "t1"), run: runID, threadId: h.thread.id)
+        for i in 0..<50 {
+            h.vm.runCoordinator(
+                h.context.coordinator,
+                didReceive: .itemStarted(item: AssistantItem(id: "item-\(i)", turnId: "t1", type: .tool, startedAtMs: Int64(i))),
+                run: runID,
+                threadId: h.thread.id
+            )
+            await Task.yield()
+        }
+        XCTAssertEqual(h.vm.deskStreamMainHopCountForTesting, 1)
+        XCTAssertEqual(publishes, 0, "nothing may publish before the paint window elapses")
+        for _ in 0..<200 {
+            if h.vm.applyIncomingDeskEventCountForTesting == 51 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(h.vm.applyIncomingDeskEventCountForTesting, 51)
+        XCTAssertEqual(publishes, 1, "the whole burst must land in a single deskLiveTimeline publish")
+        XCTAssertEqual(h.vm.deskStreamMainHopCountForTesting, 1)
+    }
+
+    func test_deskDidFinishFlushesPendingBatch_becauseTheTailMustNotBeLost() async throws {
+        // WHY: with a paint window, events can still be pending when the run
+        // finishes. Terminal handling reads the timeline, so it must flush first
+        // and the final timeline must contain every event.
+        let h = try makeDeskHarness()
+        h.vm.openDesk(h.bot)
+        h.vm.selectDeskThread(h.conversation.id)
+        let runID = AgentRunID()
+        h.vm.runCoordinator(h.context.coordinator, didReceive: .turnStarted(turnId: "t1"), run: runID, threadId: h.thread.id)
+        for i in 0..<20 {
+            h.vm.runCoordinator(
+                h.context.coordinator,
+                didReceive: .itemStarted(item: AssistantItem(id: "item-\(i)", turnId: "t1", type: .tool, startedAtMs: Int64(i))),
+                run: runID,
+                threadId: h.thread.id
+            )
+        }
+        h.vm.runCoordinator(
+            h.context.coordinator,
+            didFinish: runID,
+            threadId: h.thread.id,
+            status: .completed,
+            finalMessage: nil,
+            providerThreadId: nil
+        )
+        for _ in 0..<200 {
+            if h.vm.applyIncomingDeskEventCountForTesting == 21 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(h.vm.applyIncomingDeskEventCountForTesting, 21)
+        XCTAssertEqual(h.vm.deskLiveTimeline.turns.first?.items.count, 20, "no tail event may be lost at didFinish")
+        XCTAssertEqual(h.vm.deskLiveTimeline.turns.first?.items.last?.id, "item-19")
+    }
+
+    func test_forcesAggregateBudget_structuralEventsForceButDeltasDoNot_becauseWalkIsOItems() {
+        // WHY: Agent App and the desk share this rule so token deltas coalesce
+        // the O(items) hot-text walk while structural events still force it.
+        XCTAssertFalse(AgentAppViewModel.forcesAggregateBudget(events: [
+            .itemDelta(itemId: "a", bodyAppend: "x", outputAppend: nil, summary: nil),
+        ]))
+        XCTAssertTrue(AgentAppViewModel.forcesAggregateBudget(events: [.turnStarted(turnId: "t")]))
+        XCTAssertTrue(AgentAppViewModel.forcesAggregateBudget(events: [
+            .itemDelta(itemId: "a", bodyAppend: String(repeating: "x", count: 70 * 1024), outputAppend: nil, summary: nil),
+        ]))
     }
 
     func test_deskTimelineIsMemoizedAcrossBodyPassesAndRematerializesLiveBodies() async throws {
@@ -388,7 +468,7 @@ final class PerfMainThreadHogsTests: XCTestCase {
         let runID = AgentRunID()
         func deliver(_ event: AssistantEvent) async {
             h.vm.runCoordinator(h.context.coordinator, didReceive: event, run: runID, threadId: h.thread.id)
-            for _ in 0..<50 { await Task.yield() }
+            try? await Task.sleep(for: .milliseconds(80))
         }
         await deliver(.turnStarted(turnId: "t1"))
         await deliver(.itemStarted(item: AssistantItem(id: "a", turnId: "t1", type: .assistantMessage, startedAtMs: 1)))

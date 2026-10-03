@@ -2370,7 +2370,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.deskStreamMainHopCountForTesting, 1)
         for _ in 0..<40 {
             if vm.applyIncomingDeskEventCountForTesting == 1 { break }
-            await Task.yield()
+            try await Task.sleep(for: .milliseconds(10))
         }
         XCTAssertEqual(vm.applyIncomingDeskEventCountForTesting, 1)
         XCTAssertEqual(vm.deskLiveTimeline.turns.first?.turnId, "t-matched")
@@ -2406,7 +2406,7 @@ final class BotsWindowTests: XCTestCase {
         )
         for _ in 0..<40 {
             if vm.applyIncomingDeskEventCountForTesting >= 1 { break }
-            await Task.yield()
+            try await Task.sleep(for: .milliseconds(10))
         }
         try await Task.sleep(nanoseconds: 400_000_000)
         XCTAssertEqual(vm.deskLiveTurnWatchApplyCountForTesting, watchApplies)
