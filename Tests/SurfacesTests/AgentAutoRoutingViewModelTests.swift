@@ -833,8 +833,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
             agent.contains("private func autoRoutingCard"),
             "Agent App must not keep a private Auto card after the shared chrome exists"
         )
-        XCTAssertTrue(bots.contains("AgentModelPopoverChrome("))
-        XCTAssertTrue(bots.contains("AgentDistillModelPills("))
+        XCTAssertTrue(bots.contains("AgentAppView("), "Bots Desk must reuse the Agent App Model popover")
         XCTAssertFalse(
             bots.contains(AgentModelPopoverPresentation.autoDisclaimer),
             "Bots Desk must not recopy the Auto card; use AgentModelPopoverChrome"

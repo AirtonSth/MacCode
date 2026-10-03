@@ -19,13 +19,9 @@ final class AgentChatHangClassAuditTests: XCTestCase {
             "Agent App ChatFlowRow history must not use LazyVStack"
         )
         let desk = try Self.readRepoFile("Sources/AppShell/BotsWindow.swift")
-        let start = try XCTUnwrap(desk.range(of: "private func deskTimeline"))
-        let rest = desk[start.lowerBound...]
-        let end = rest.range(of: "\n    private func deskBubble")?.lowerBound ?? rest.endIndex
-        let slice = String(desk[start.lowerBound..<end])
-        XCTAssertFalse(
-            slice.contains("LazyVStack("),
-            "Desk transcript history must not use LazyVStack"
+        XCTAssertTrue(
+            desk.contains("AgentAppView("),
+            "Desk transcript must reuse Agent App, so it cannot reintroduce its own LazyVStack history"
         )
     }
 

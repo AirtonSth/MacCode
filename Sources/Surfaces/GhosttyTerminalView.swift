@@ -192,6 +192,10 @@ enum GhosttyActionEffect {
     case openURL(URL)
     /// Cmd+click on an absolute file path or file:// URL — route to FilePreview.
     case openFilePath(String)
+    /// OSC 9;4 progress: true while a task reports SET/INDETERMINATE/ERROR.
+    case progressReport(active: Bool)
+    /// Shell integration reported a finished command (nil exit code = unknown).
+    case commandFinished(exitCode: Int?)
 }
 
 /// Pure mapper from a raw Ghostty action struct to an optional host effect.
@@ -216,6 +220,18 @@ enum GhosttyActionMapper {
             case .none:
                 return nil
             }
+        case GHOSTTY_ACTION_PROGRESS_REPORT:
+            let active: Bool
+            switch action.action.progress_report.state {
+            case GHOSTTY_PROGRESS_STATE_SET, GHOSTTY_PROGRESS_STATE_INDETERMINATE, GHOSTTY_PROGRESS_STATE_ERROR:
+                active = true
+            default:
+                active = false
+            }
+            return .progressReport(active: active)
+        case GHOSTTY_ACTION_COMMAND_FINISHED:
+            let code = Int(action.action.command_finished.exit_code)
+            return .commandFinished(exitCode: code >= 0 ? code : nil)
         default:
             return nil
         }
@@ -707,6 +723,10 @@ final class GhosttyTerminalView: NSView {
     var onTerminalSizeChange: ((TerminalViewportSize) -> Void)?
     /// Called on the main thread when the terminal program changes its title (OSC 2).
     var onTitleChange: ((String) -> Void)?
+    /// Called on the main thread when the terminal program reports or clears OSC 9;4 progress.
+    var onProgressReport: ((Bool) -> Void)?
+    /// Called on the main thread when shell integration reports a finished command.
+    var onCommandFinished: ((Int?) -> Void)?
     /// Called on the main thread when the user Cmd+clicks an absolute file path
     /// (or file:// URL) in the terminal. The owning surface routes this to
     /// FilePreview / Diff. When nil, file-path Cmd+clicks are silently ignored.
@@ -1178,6 +1198,8 @@ final class GhosttyTerminalView: NSView {
         onInputData = nil
         onTerminalSizeChange = nil
         onTitleChange = nil
+        onProgressReport = nil
+        onCommandFinished = nil
         onPasteNeedsConfirm = nil
         onPlainTextDragNeedsConfirm = nil
         onCmdClickFilePath = nil
@@ -1472,6 +1494,10 @@ final class GhosttyTerminalView: NSView {
         case .setTitle(let title):
             currentTitle = title
             onTitleChange?(title)
+        case .progressReport(let active):
+            onProgressReport?(active)
+        case .commandFinished(let exitCode):
+            onCommandFinished?(exitCode)
         case .mouseShape(let shape):
             NSCursor.pop()
             if let cursor = Self.cursor(for: shape) {

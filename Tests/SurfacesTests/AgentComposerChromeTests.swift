@@ -79,12 +79,10 @@ final class AgentComposerChromeTests: XCTestCase {
         XCTAssertFalse(agent.contains("private func sourceCapsuleLabelView"))
         XCTAssertFalse(agent.contains("private var permissionLabel"))
 
-        XCTAssertTrue(bots.contains("AgentSourceCapsule("))
-        XCTAssertTrue(bots.contains("AgentPermissionCapsule("))
-        XCTAssertTrue(bots.contains("AgentRunAsUserCapsule("))
-        XCTAssertTrue(bots.contains("AgentModelPillLabel("))
-        XCTAssertTrue(bots.contains("AgentCompactMenuRow("))
-        XCTAssertTrue(bots.contains("AgentQueuedHeader("))
+        XCTAssertTrue(
+            bots.contains("AgentAppView("),
+            "Desk must mount the Agent App composer instead of painting its own capsules"
+        )
         XCTAssertFalse(
             bots.contains("func deskChipLabel"),
             "Desk must not keep a private capsule fork after the shared chrome exists"

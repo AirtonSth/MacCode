@@ -91,6 +91,24 @@ final class DistillACPClientSessionParamsTests: XCTestCase {
         XCTAssertFalse(text.contains("Token Saver"))
     }
 
+    func test_slashCommandStaysExactFirstBlock_soDistillParsesArgsWithoutDirectiveText() throws {
+        // WHY: Distill reads `/name args` from the first text block only; appended directives corrupted `/goal status`.
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .distill,
+            model: "grok-4.6",
+            cwd: "/tmp",
+            prompt: "/goal status"
+        )
+        let capabilities = DistillACPInitializeResult(protocolVersion: 1, loadSession: true, embeddedContext: false)
+
+        let blocks = try DistillACPClient.promptBlocks(for: request, capabilities: capabilities)
+
+        XCTAssertEqual(blocks.first?["text"] as? String, "/goal status")
+        XCTAssertEqual(blocks.count, 2)
+        XCTAssertTrue((blocks[1]["text"] as? String)?.contains(BackgroundAwaitContinuation.awaitingMarker) == true)
+    }
+
     func test_otherProviderStillUsesGenericModePrompt() {
         let request = AgentRunRequest(
             threadId: AgentThreadID(),

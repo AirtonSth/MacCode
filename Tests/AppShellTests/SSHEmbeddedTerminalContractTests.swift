@@ -962,7 +962,7 @@ final class SSHEmbeddedTerminalContractTests: XCTestCase {
             ),
             .accepted
         )
-        let terminalBecameBusy = await waitUntilAsync(timeout: 2) { terminal.isBusy }
+        let terminalBecameBusy = await waitUntilAsync(timeout: 2) { terminal.foregroundJobAliveForTesting }
         XCTAssertTrue(terminalBecameBusy)
         let foregroundPGID = try XCTUnwrap(terminal.foregroundProcessGroupForTesting)
         let foregroundGroup = try XCTUnwrap(

@@ -82,7 +82,7 @@ final class TerminalReadTextSnapshotTests: XCTestCase {
         RunLoop.main.run(until: Date().addingTimeInterval(0.20))
 
         XCTAssertTrue(surface.descriptor.hasUnreadActivity,
-                      "terminal BEL output must still mark activity for tabs and mirrors")
+                      "terminal BEL must still mark the tab's unread dot")
         XCTAssertCGColorEqual(surface.view.layer?.backgroundColor, originalBackground,
                              "visible terminal BEL output must not repaint the pane background because repeated CLI bells read as flicker")
     }
@@ -108,6 +108,51 @@ final class TerminalReadTextSnapshotTests: XCTestCase {
             shellPID: 100,
             foregroundProcessGroup: nil
         ), "unknown foreground process-group state must fail closed so idle prompts do not spin forever")
+    }
+
+    func test_idleTUIWaitingForInputIsNotBusyAfterQuietWindow() {
+        let now = Date()
+        XCTAssertFalse(TerminalSurface.isBusy(
+            jobAlive: true, progressActive: false,
+            lastOutputAt: now.addingTimeInterval(-3), title: "claude", now: now
+        ), "a TUI waiting for input owns the foreground group but must not spin the tab or workspace")
+    }
+
+    func test_recentOutputKeepsLiveJobBusy() {
+        let now = Date()
+        XCTAssertTrue(TerminalSurface.isBusy(
+            jobAlive: true, progressActive: false,
+            lastOutputAt: now.addingTimeInterval(-0.5), title: "claude", now: now
+        ), "output within the quiet window means the job is working, so the spinner must show")
+    }
+
+    func test_activeProgressReportKeepsQuietJobBusy() {
+        let now = Date()
+        XCTAssertTrue(TerminalSurface.isBusy(
+            jobAlive: true, progressActive: true,
+            lastOutputAt: now.addingTimeInterval(-30), title: "build", now: now
+        ), "an OSC 9;4 progress report is an explicit working signal even when the job prints nothing")
+    }
+
+    func test_spinnerGlyphTitleKeepsQuietJobBusy() {
+        let now = Date()
+        for title in ["\u{280B} thinking", "\u{2810} Claude Code"] {
+            XCTAssertTrue(TerminalSurface.isBusy(
+                jobAlive: true, progressActive: false,
+                lastOutputAt: now.addingTimeInterval(-30), title: title, now: now
+            ), "TUIs animate a glyph in the title while working: \(title)")
+        }
+        XCTAssertFalse(TerminalSurface.hasSpinnerTitle("plain title"))
+        // Claude Code keeps a static ✳ in the title while idle at its prompt.
+        XCTAssertFalse(TerminalSurface.hasSpinnerTitle("\u{2733} Claude Code"))
+    }
+
+    func test_deadOrAbsentJobIsNeverBusy() {
+        let now = Date()
+        XCTAssertFalse(TerminalSurface.isBusy(
+            jobAlive: false, progressActive: true,
+            lastOutputAt: now, title: "\u{280B} x", now: now
+        ), "without a foreground job no signal may keep a stale spinner")
     }
 
     func test_terminalBusyStatePollingCoversDelayedStartAndLongRunningCommands() {

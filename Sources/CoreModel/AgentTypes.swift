@@ -684,6 +684,9 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     /// Runtime-only queue dispatch gate. Intentionally excluded from Codable and
     /// value equality; it has no meaning outside the current host process.
     public var acceptancePermit: AgentRunAcceptancePermit?
+    /// Runtime-only. True when `prompt` is a host-built envelope (bot brain) that
+    /// Token Saver must compress while `userMessageContent` stays the display text.
+    public var tokenSaverCompressesPrompt: Bool = false
     /// Canonical prior conversation captured before provider start. Runtime-only.
     public var contextSnapshot: TokenSaverCanonicalConversationSnapshot?
     /// Prepared RCSEED1 document for a confirmed fresh-fallback destination.
@@ -1406,9 +1409,12 @@ public enum AgentProviderSnapshotFactory {
                 environmentKeys: environmentKeys,
                 models: models,
                 slashCommands: uniqueSlashCommands(
-                    defaults: (interactionModesOverride ?? [.default]).contains(.plan)
+                    defaults: ((interactionModesOverride ?? [.default]).contains(.plan)
                         ? ["/clear", "/default", "/model", "/plan", "/status", "/goal"]
-                        : ["/clear", "/default", "/model", "/status", "/goal"],
+                        : ["/clear", "/default", "/model", "/status", "/goal"])
+                        + (provider == .distill
+                            ? ["/loop", "/compact", "/context", "/session-info", "/deep-research", "/workflow"]
+                            : []),
                     probed: slashCommands
                 ),
                 skills: unique(skills),

@@ -1087,15 +1087,22 @@ public struct AgentChatWorkingStatusStrip: View {
     public let isStopping: Bool
     public let context: AgentChatWorkingContext?
     public let hold: AgentBackgroundHoldSummary?
+    public let distill: DistillLiveStatus?
+    public let contextTokens: Int?
     public let onStop: () -> Void
+    @State private var subagentsExpanded = true
 
     public init(
         startedAt: Date,
         isStopping: Bool,
         context: AgentChatWorkingContext? = nil,
         hold: AgentBackgroundHoldSummary? = nil,
+        distill: DistillLiveStatus? = nil,
+        contextTokens: Int? = nil,
         onStop: @escaping () -> Void
     ) {
+        self.distill = distill
+        self.contextTokens = contextTokens
         self.startedAt = startedAt
         self.isStopping = isStopping
         self.context = context
@@ -1114,12 +1121,7 @@ public struct AgentChatWorkingStatusStrip: View {
                         .controlSize(.small)
                         .accessibilityLabel(showingHold ? "Holding on background work" : "Running")
                     VStack(alignment: .leading, spacing: DS.Space.xs) {
-                        Text(AgentChatWorkingCopy.statusLabel(
-                            context: context,
-                            elapsedSeconds: seconds,
-                            seed: seed,
-                            hold: hold
-                        ))
+                        statusLine(seconds: seconds, seed: seed, now: timeline.date)
                         .font(DS.Font.body)
                         .foregroundColor(DS.Palette.textSecondary)
                         .lineLimit(1)
@@ -1146,6 +1148,12 @@ public struct AgentChatWorkingStatusStrip: View {
                         elapsedSeconds: seconds,
                         hold: hold
                     ))
+                    if distill != nil, let tokens = contextTokens, tokens > 0 {
+                        Text("↓\(DistillLiveStatus.formatTokens(tokens))")
+                            .font(DS.Font.caption.monospacedDigit())
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .accessibilityIdentifier("agent.workingStatus.tokens")
+                    }
                     Button(isStopping ? "Stopping… (click to force)" : "Stop", action: onStop)
                         .buttonStyle(.plain)
                         .font(DS.Font.body.weight(.medium))
@@ -1154,9 +1162,84 @@ public struct AgentChatWorkingStatusStrip: View {
                         .accessibilityIdentifier("agent.working.stop")
                 }
             }
+            if let distill, distill.goal != nil || !distill.scheduledTasks.isEmpty {
+                goalLoopLine(distill)
+            }
+            if let distill, !distill.subagents.isEmpty {
+                subagentsList(distill)
+            }
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func statusLine(seconds: Int, seed: UInt64, now: Date) -> Text {
+        let base = AgentChatWorkingCopy.statusLabel(
+            context: context,
+            elapsedSeconds: seconds,
+            seed: seed,
+            hold: hold
+        )
+        guard let distill else { return Text(base) }
+        var line = Text(distill.headline.map { h in
+            let secs = distill.headlineSince.map { max(0, Int(now.timeIntervalSince($0))) }
+            return secs.map { "\(h) \($0)s" } ?? h
+        } ?? distill.goalHeadline ?? base)
+        if let meta = distill.modelEffortText {
+            line = line + Text(" · \(meta)").foregroundColor(DS.Palette.success)
+        }
+        return line
+    }
+
+    private func goalLoopLine(_ distill: DistillLiveStatus) -> some View {
+        var parts: [String] = []
+        if let goal = distill.goal {
+            parts.append("Goal \(goal.status.replacingOccurrences(of: "_", with: " ")) · \(goal.tokensText) tokens")
+        }
+        if !distill.scheduledTasks.isEmpty {
+            parts.append("Loops \(distill.scheduledTasks.count)")
+        }
+        return Text(parts.joined(separator: " · "))
+            .font(DS.Font.caption)
+            .foregroundColor(DS.Palette.textTertiary)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .accessibilityIdentifier("agent.workingStatus.goalLoops")
+    }
+
+    private func subagentsList(_ distill: DistillLiveStatus) -> some View {
+        DisclosureGroup(isExpanded: $subagentsExpanded) {
+            TimelineView(.periodic(from: .now, by: 1)) { tl in
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    ForEach(distill.subagents) { sub in
+                        HStack(spacing: DS.Space.sm) {
+                            Text(sub.typeLabel)
+                                .foregroundColor(DS.Palette.accent)
+                            Text(sub.description)
+                                .foregroundColor(DS.Palette.textSecondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            Text("— \(sub.phaseText)")
+                                .foregroundColor(DS.Palette.textTertiary)
+                            Spacer(minLength: DS.Space.sm)
+                            if let model = sub.shortModel {
+                                Text(model).foregroundColor(DS.Palette.textTertiary)
+                            }
+                            Text("\(sub.elapsedSeconds(now: tl.date))s")
+                                .monospacedDigit()
+                                .foregroundColor(DS.Palette.textTertiary)
+                        }
+                        .font(DS.Font.caption)
+                        .accessibilityElement(children: .combine)
+                    }
+                }
+            }
+        } label: {
+            Text("Subagents \(distill.subagents.count)")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+        }
+        .accessibilityIdentifier("agent.workingStatus.subagents")
     }
 
     private func stopHelp(showingHold: Bool) -> String {

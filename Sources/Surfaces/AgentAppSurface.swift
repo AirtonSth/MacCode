@@ -322,8 +322,32 @@ public enum AgentErrorRecoveryAction: String, Sendable, Equatable {
     }
 }
 
+/// Opt-in hooks for hosting one fixed thread (e.g. the bot desk) in Agent App.
+public struct AgentAppEmbedding {
+    public let pinnedThreadId: AgentThreadID
+    public let executionCwd: String?
+    public let promptTransform: (@MainActor (_ text: String, _ threadId: AgentThreadID, _ runId: AgentRunID) async throws -> String)?
+    public let onRunStarted: (@MainActor (AgentRunID, AgentThreadID) -> Void)?
+    public let onRunFinished: (@MainActor (AgentRunID, AgentThreadID, AgentRunStatus, String?) -> Void)?
+
+    public init(
+        pinnedThreadId: AgentThreadID,
+        executionCwd: String? = nil,
+        promptTransform: (@MainActor (_ text: String, _ threadId: AgentThreadID, _ runId: AgentRunID) async throws -> String)? = nil,
+        onRunStarted: (@MainActor (AgentRunID, AgentThreadID) -> Void)? = nil,
+        onRunFinished: (@MainActor (AgentRunID, AgentThreadID, AgentRunStatus, String?) -> Void)? = nil
+    ) {
+        self.pinnedThreadId = pinnedThreadId
+        self.executionCwd = executionCwd
+        self.promptTransform = promptTransform
+        self.onRunStarted = onRunStarted
+        self.onRunFinished = onRunFinished
+    }
+}
+
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
+    public let embedding: AgentAppEmbedding?
     @Published public var threads: [AgentThread] = [] { didSet { filteredThreadsCache = nil } }
     @Published public var selectedThreadId: AgentThreadID?
     /// Transcript paint lives on `transcriptState` so stream ticks do not
@@ -375,6 +399,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         set { composerState.cursorOffset = newValue }
     }
     @Published public var provider: AgentProvider = .defaultProvider
+    /// Live Distill compaction/model/subagent state for the selected thread's run.
+    @Published public private(set) var distillLive: DistillLiveStatus?
+    /// Commands Distill advertised via `available_commands_update` (kept across threads).
+    @Published public private(set) var distillSlashCommands: [DistillLiveStatus.AdvertisedCommand] = []
     @Published public var providerInstanceId: String = AgentProvider.defaultProvider.rawValue
     /// macOS account that will execute the next provider process through the shared helper.
     /// Nil / current-account means no privileged trampoline.
@@ -746,6 +774,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         for threadId: AgentThreadID,
         retainingForeignProbe: Bool
     ) -> WorkspaceID? {
+        if let embedding {
+            // Pinned surface owns exactly one thread, whatever its workspace row says.
+            return threadId == embedding.pinnedThreadId ? workspaceID : nil
+        }
         if let cached = threadWorkspaceCache[threadId] {
             return cached
         }
@@ -993,8 +1025,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         lastModelStore: AgentLastModelStore = .shared,
         initialRoutingMode: AgentRoutingMode = .manual,
         newThreadDefaultsStore: AgentNewThreadDefaultsStore? = nil,
-        orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime()
+        orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime(),
+        embedding: AgentAppEmbedding? = nil
     ) {
+        self.embedding = embedding
         self.workspaceID = workspaceID
         self.cwd = cwd
         self.coordinator = coordinator
@@ -1037,6 +1071,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.mergePersistedUserRCW1Requests(persisted.requests)
                 self.mergePersistedAssistantRCW1Responses(persisted.responses)
             }
+        }
+        if let embedding {
+            reloadPinnedThread()
+            applyNewThreadDefaultsFromRailIfNeeded()
+            selectThread(embedding.pinnedThreadId)
+            return
         }
         // XCTest: same-stack rail load so selectThread(initial) sees rows.
         // Production: first cap+list off MainActor so opening a tab does not hitch.
@@ -1100,6 +1140,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func loadGitBranch() {
+        guard embedding == nil else { return }
         let cwd = self.cwd
         DispatchQueue.global().async { [weak self] in
             let b = GitDiff.branches(in: cwd).current
@@ -1411,8 +1452,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             || NSClassFromString("XCTestCase") != nil
     }
 
+    /// Embedded surfaces list only their pinned thread.
+    private func reloadPinnedThread() {
+        guard let embedding else { return }
+        guard let thread = try? threadRepo.get(id: embedding.pinnedThreadId) else { return }
+        threads = [thread]
+        threadWorkspaceCache[thread.id] = thread.workspaceId ?? workspaceID
+    }
+
     public func reloadThreads() {
         guard !isDisposed else { return }
+        if embedding != nil {
+            reloadPinnedThread()
+            return
+        }
         if Self.isRunningUnitTests {
             reloadThreadsImmediate()
             return
@@ -2226,12 +2279,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func selectThread(_ id: AgentThreadID, markRead: Bool = true) {
         guard !isDisposed else { return }
+        if let embedding, id != embedding.pinnedThreadId { return }
+        let isPinned = embedding?.pinnedThreadId == id
         let selectedThread: AgentThread
         if let cached = Self.railThreadForSelection(
             id: id,
             workspaceID: workspaceID,
             rail: threads
-        ) {
+        ) ?? (isPinned ? threads.first(where: { $0.id == id }) : nil) {
             // Rail hits publish first. Existence probe runs after the first
             // frame so a click is not blocked on SQLite.
             selectedThread = cached
@@ -2251,8 +2306,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 statusMessage = "Could not open thread: \(error)"
                 return
             }
-            guard let selectedWorkspaceID = selectedThread.workspaceId,
-                  selectedWorkspaceID == workspaceID else {
+            guard isPinned || selectedThread.workspaceId == workspaceID else {
                 if statusMessage.isEmpty {
                     statusMessage = "Could not open thread: The thread belongs to another workspace."
                 }
@@ -2388,6 +2442,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             stopScheduledLivePoll()
         }
         normalizeInteractionModeForSelectedProvider()
+        if distillLive != nil { distillLive = nil }
         if let cachedTimeline = paintedTimelineByThread[id] {
             timeline = cachedTimeline
         } else {
@@ -2454,7 +2509,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                         self.retireUnbackedRailRow(id)
                         return
                     }
-                    guard durableWorkspace == self.workspaceID else {
+                    guard self.embedding?.pinnedThreadId == id || durableWorkspace == self.workspaceID else {
                         if self.statusMessage.isEmpty {
                             self.statusMessage = "Could not open thread: The thread belongs to another workspace."
                         }
@@ -5766,9 +5821,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             cursorOffset: composerCursorOffset,
             snapshot: selectedProviderSnapshot,
             localSlashCommands: Self.localSlashCommands,
-            extraCommands: isClaude ? ClaudeSlashCommandDiscovery.builtInClaudeCommands : [],
+            extraCommands: isClaude
+                ? ClaudeSlashCommandDiscovery.builtInClaudeCommands
+                : distillAdvertisedCommandNames,
             extraSkillNames: extraSkillNames,
-            mentionableBots: mentionableBots
+            mentionableBots: mentionableBots,
+            commandSubtitles: distillCommandSubtitles
         )
     }
 
@@ -7694,6 +7752,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// provider. Provider commands such as `/goal` must pass through.
     public static let localSlashCommands = ["/clear", "/default", "/fork", "/model", "/plan", "/status"]
 
+    private var distillAdvertisedCommandNames: [String] {
+        provider == .distill ? distillSlashCommands.map { "/\($0.name)" } : []
+    }
+
+    private var distillCommandSubtitles: [String: String] {
+        guard provider == .distill else { return [:] }
+        return Dictionary(
+            distillSlashCommands.compactMap { cmd in cmd.subtitle.map { (cmd.name.lowercased(), $0) } },
+            uniquingKeysWith: { first, _ in first }
+        )
+    }
+
     /// Parse a local RemoteCode slash/dollar command. Public so scheduled Path B
     /// can reject UI-only commands the same way Agent App intercepts them.
     public static func localSlashCommandParts(_ raw: String) -> (command: String, argument: String)? {
@@ -7713,6 +7783,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let parts = Self.localSlashCommandParts(raw) else { return false }
         let cmd = parts.command
         let arg = parts.argument
+        // Distill owns `/status` (alias of session-info); let it reach the agent.
+        if cmd == "status", provider == .distill { return false }
         switch cmd {
         case "clear":
             createThread(title: "New thread")
@@ -7988,6 +8060,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             providerSlashCommands: Array(Set(
                 (selectedProviderSnapshot?.slashCommands ?? [])
                     + AgentComposerSuggestions.passThroughSlashCommands
+                    + distillAdvertisedCommandNames
             )),
             skills: selectedProviderSnapshot?.skills ?? []
         )
@@ -8661,14 +8734,23 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             addingTurnContextTo: graphifyEnv,
             mentionedBots: mentionedBots
         )
-        let req = AgentRunRequest(
+        var transformFailure: Error?
+        var runPrompt = text
+        if let transform = embedding?.promptTransform {
+            do {
+                runPrompt = try await transform(text, tid, runId)
+            } catch {
+                transformFailure = error
+            }
+        }
+        var req = AgentRunRequest(
             runId: runId,
             threadId: tid,
             provider: runProvider,
             providerInstanceId: runProviderInstanceId,
             model: runModel,
-            cwd: cwd,
-            prompt: text,
+            cwd: embedding?.executionCwd ?? cwd,
+            prompt: runPrompt,
             userMessageContent: display,
             attachments: attached,
             providerThreadId: resumeInterrupted ? nil : providerThreadId,
@@ -8685,6 +8767,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             environment: providerEnvironment,
             runAsUser: threadRunAsUser
         )
+        req.tokenSaverCompressesPrompt = runPrompt != text
         do {
             // Status + unread + updated_at only. A leftover 26-column + routing
             // `get` then `upsert` hitchs every composer send and rewrites routing
@@ -8756,6 +8839,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return nil
         }
         do {
+            if let transformFailure {
+                try? threadRepo.updateStatus(id: tid, status: .failed, hasUnread: false, at: Date())
+                throw transformFailure
+            }
             let runId = try await coordinator.startRun(
                 req,
                 routingSnapshot: routingSnapshot,
@@ -8821,6 +8908,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.reloadThreads()
                 self.onRunStateChange?()
             }
+            embedding?.onRunStarted?(runId, tid)
             return runId
         } catch {
             let wasCancelled: Bool = {
@@ -9514,6 +9602,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Force rule for the aggregate hot-text budget walk: a quantum of 64 KiB or
+    /// more, or any structural (non delta/progress/state/tokenUsage) event.
+    public nonisolated static func forcesAggregateBudget(events: [AssistantEvent], quantumBytes: Int? = nil) -> Bool {
+        let bytes = quantumBytes ?? events.reduce(0) { $0 + max(1, $1.estimatedHotQueueBytes) }
+        return bytes >= 64 * 1024
+            || events.contains { event in
+                switch event {
+                case .itemDelta: return false
+                case .itemProgress, .itemState, .tokenUsage: return false
+                default: return true
+                }
+            }
+    }
+
     /// Pure stream quantum reduce (off-MainActor). Durable run gates are pre-resolved
     /// into `runsAllowedToMarkActive` so this never touches SQLite or the coordinator.
     nonisolated static func reduceStreamQuantum(_ input: StreamQuantumReduceInput) -> StreamQuantumReduceResult {
@@ -9579,14 +9681,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // Budget walk is O(items). Pure reduce only flags when this quantum is
         // large or structural; commitStreamQuantum coalesces cheap token quanta.
         let quantumBytes = input.entries.reduce(0) { $0 + max(1, $1.event.estimatedHotQueueBytes) }
-        let forceBudget = quantumBytes >= 64 * 1024
-            || appliedEvents.contains { event in
-                switch event {
-                case .itemDelta: return false
-                case .itemProgress, .itemState, .tokenUsage: return false
-                default: return true
-                }
-            }
+        let forceBudget = forcesAggregateBudget(events: appliedEvents, quantumBytes: quantumBytes)
         if shouldAutoClearTransientTimelineError(
             errorAfterBatch: nextTimeline.error,
             appliedEvents: appliedEvents
@@ -9623,13 +9718,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// threshold or that 64 KiB gate changes the bound; the per-item
     /// `liveTextLimit` / `liveOutputLimit` caps are a second, independent bound
     /// and must not be mistaken for this one.
-    static let streamAggregateBudgetThreshold = 16
+    public static let streamAggregateBudgetThreshold = 16
 
     /// Coalescing decision for the O(items) aggregate hot-text budget walk.
     ///
     /// Extracted from `commitStreamQuantum` so the skip window is directly
     /// testable: the walk itself is cheap per item but ran on every token quantum.
-    static func aggregateBudgetDecision(
+    public static func aggregateBudgetDecision(
         force: Bool,
         opsSinceLastWalk: Int,
         appliedEventCount: Int,
@@ -9925,6 +10020,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // PERF-MAC_AGENT-010: append to the batch buffer. If the buffer was
         // empty (first event of this tick), schedule a single flush Task.
         // Later events in the same tick just append — no extra Task allocation.
+        if case .providerRuntime(let runtime) = event,
+           runtime.provider == .distill,
+           DistillLiveStatus.isCarrierMethod(runtime.method) {
+            Task { @MainActor in
+                self.applyDistillRuntime(runtime, run: run, threadId: threadId)
+            }
+        } else if case .providerRuntime(let runtime) = event,
+                  runtime.provider == .distill,
+                  runtime.method == "available_commands_update" {
+            Task { @MainActor in
+                self.applyDistillAdvertisedCommands(runtime)
+            }
+        }
         let outcome = streamEventBatch.appendBounded(event: event, run: run, threadId: threadId)
         switch outcome {
         case .scheduled, .scheduledAfterEviction:
@@ -9963,11 +10071,39 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    private func applyDistillRuntime(_ runtime: ProviderRuntimeEvent, run: AgentRunID, threadId: AgentThreadID) {
+        guard !isDisposed, selectedThreadId == threadId else { return }
+        var next: DistillLiveStatus
+        if distillLive?.runId == run, let current = distillLive {
+            next = current
+        } else {
+            // Goal and loops outlive a run; compaction/subagents do not.
+            next = DistillLiveStatus(runId: run)
+            next.goal = distillLive?.goal
+            next.scheduledTasks = distillLive?.scheduledTasks ?? []
+        }
+        next.apply(method: runtime.method, payloadJSON: runtime.payloadJSON)
+        if next != distillLive { distillLive = next }
+    }
+
+    private func applyDistillAdvertisedCommands(_ runtime: ProviderRuntimeEvent) {
+        guard !isDisposed,
+              let commands = DistillLiveStatus.advertisedCommands(
+                method: runtime.method,
+                payloadJSON: runtime.payloadJSON
+              ),
+              commands != distillSlashCommands else { return }
+        distillSlashCommands = commands
+    }
+
     private func resetTimelineUpdateTick() {
         timelineUpdateTickTask?.cancel()
         timelineUpdateTickTask = nil
         timelineUpdateTick = 0
     }
+
+    /// ~30 Hz stream paint coalesce, shared with the Bots desk.
+    public static let streamPaintCoalesceInterval: Duration = .milliseconds(33)
 
     private func scheduleTimelineUpdateTick() {
         guard surfaceVisibility != .hidden else { return }
@@ -9976,7 +10112,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // ~30 Hz paint coalesce (was 16 ms / 60 Hz) — fewer full transcript
         // re-evaluations while tokens stream.
         timelineUpdateTickTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(33))
+            try? await Task.sleep(for: Self.streamPaintCoalesceInterval)
             guard !Task.isCancelled else { return }
             self.timelineUpdateTick &+= 1
             self.timelineUpdateTickTask = nil
@@ -10093,6 +10229,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 }
             }
             self.onRunStateChange?()
+            if let embedding = self.embedding, finishedTid == embedding.pinnedThreadId {
+                embedding.onRunFinished?(runId, finishedTid, status, finalMessage)
+            }
             // Final replies show cumulative thread savings; refresh after each turn
             // so the footer tracks ledger growth during the conversation.
             if finishedTid == self.selectedThreadId {
@@ -10719,6 +10858,7 @@ public enum AgentComposerSuggestions {
         extraCommands: [String] = [],
         extraSkillNames: [String] = [],
         mentionableBots: [BotDefinition] = [],
+        commandSubtitles: [String: String] = [:],
         limit: Int = 8
     ) -> [AgentComposerSuggestion] {
         let token = activeToken(in: text, cursorOffset: cursorOffset)
@@ -10767,7 +10907,11 @@ public enum AgentComposerSuggestions {
             let source = localSlashCommands.contains(command) || localSlashCommands.contains("/\(bare)")
                 ? "RemoteCode command"
                 : "\(display) command"
-            candidates.append(Candidate(bare: bare, kind: .slashCommand, subtitle: source))
+            candidates.append(Candidate(
+                bare: bare,
+                kind: .slashCommand,
+                subtitle: commandSubtitles[bare.lowercased()] ?? source
+            ))
         }
         for skill in skills where !skill.isEmpty {
             candidates.append(Candidate(
@@ -11995,6 +12139,20 @@ private struct PendingSessionApprovalConfirmation {
     let request: AssistantPendingRequest
 }
 
+public struct AgentAppViewLayout: Equatable {
+    public var showsThreadRail: Bool
+    public var showsHeader: Bool
+    public var showsPlanSidebar: Bool
+
+    public init(showsThreadRail: Bool = true, showsHeader: Bool = true, showsPlanSidebar: Bool = true) {
+        self.showsThreadRail = showsThreadRail
+        self.showsHeader = showsHeader
+        self.showsPlanSidebar = showsPlanSidebar
+    }
+
+    public static let standard = AgentAppViewLayout()
+}
+
 public struct AgentAppView: View {
     struct QueueStatusBannerPresentation: Equatable {
         let message: String
@@ -12120,6 +12278,7 @@ public struct AgentAppView: View {
     }
     @ObservedObject var vm: AgentAppViewModel
     private let accountPanel: AnyView?
+    private let layout: AgentAppViewLayout
     @State private var renamingThreadId: AgentThreadID?
     @State private var renameText: String = ""
     @State private var expandedTools: Set<String> = []
@@ -12187,9 +12346,10 @@ public struct AgentAppView: View {
     /// Always full chrome — no Simple/Power collapse toggle on macOS.
     private var composerChromeMode: AgentComposerChromeMode { .power }
 
-    public init(vm: AgentAppViewModel, accountPanel: AnyView? = nil) {
+    public init(vm: AgentAppViewModel, accountPanel: AnyView? = nil, layout: AgentAppViewLayout = .standard) {
         self.vm = vm
         self.accountPanel = accountPanel
+        self.layout = layout
     }
 
     /// Pure seam for the low-chrome Token Saver disclosure.
@@ -14582,7 +14742,7 @@ public struct AgentAppView: View {
     public var body: some View {
         GeometryReader { proxy in
             HSplitView {
-                if showThreadRail {
+                if showThreadRail && layout.showsThreadRail {
                     threadRail
                         .frame(
                             minWidth: Self.threadRailWidthRange.lowerBound,
@@ -14592,7 +14752,7 @@ public struct AgentAppView: View {
                 }
                 conversationColumn
                     .frame(minWidth: 0, maxWidth: .infinity)
-                if vm.showPlanSidebar {
+                if vm.showPlanSidebar && layout.showsPlanSidebar {
                     planSidebar.frame(minWidth: 240, idealWidth: Self.planSidebarIdealWidth, maxWidth: 420)
                 }
             }
@@ -14844,7 +15004,9 @@ public struct AgentAppView: View {
 
     private var conversationColumn: some View {
         VStack(spacing: 0) {
-            header
+            if layout.showsHeader {
+                header
+            }
             if vm.permissionMode == .fullAccess {
                 fullAccessBanner
             }
@@ -15324,6 +15486,8 @@ public struct AgentAppView: View {
                                         AgentChatWorkingContext.reviewing(peerName: $0)
                                     },
                                     hold: vm.backgroundHoldSummary,
+                                    distill: vm.provider == .distill ? vm.distillLive : nil,
+                                    contextTokens: vm.provider == .distill ? vm.timeline.tokenUsage?.contextTokens : nil,
                                     onStop: { vm.stop() }
                                 )
                                 .id("agent.workingStatus")

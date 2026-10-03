@@ -3196,6 +3196,7 @@ public final class BotsViewModel: ObservableObject {
             persistScreen()
             router?.windowController?.refreshBotsChromeTitle()
             publishInterestedDeskThreadID()
+            syncDeskAgentVM()
         }
     }
     @Published public var activeBotsTab: ActiveBotsTab = .active
@@ -3337,6 +3338,8 @@ public final class BotsViewModel: ObservableObject {
     /// nonisolated stream delivery can drop other threads without a MainActor hop.
     private let interestedDeskThread = InterestedDeskThreadBox()
     nonisolated private let deskStreamEventBatch = DeskStreamEventBatchBox()
+    /// Events applied since the last aggregate hot-text budget walk (shared cadence with Agent App).
+    private var deskStreamAggregateBudgetOps = 0
     /// Test seams: persisted suffix work used to confirm an observer watermark.
     public private(set) var deskLiveIncrementalDecodeEventCountForTesting = 0
     public private(set) var deskLiveIncrementalDecodeBytesForTesting: Int64 = 0
@@ -3425,9 +3428,12 @@ public final class BotsViewModel: ObservableObject {
                 clearDeskObservedEvents(threadID: previousThreadID)
             }
             publishInterestedDeskThreadID()
+            syncDeskAgentVM()
         }
     }
     @Published public private(set) var attentionItems: [BotAttentionItem] = []
+    /// Agent App VM pinned to the selected conversation's linked thread.
+    @Published public private(set) var deskAgentVM: AgentAppViewModel?
     @Published public private(set) var memoryItems: [BotMemoryItem] = []
     @Published public private(set) var skillBindings: [BotSkillBinding] = []
     @Published public private(set) var selectedRevision: BotRevision?
@@ -3631,6 +3637,8 @@ public final class BotsViewModel: ObservableObject {
             recipeContext: AppShellResourceBundle.computerGuestRecipeURL()
         )
         context.botPeerHandoffAuthority.addObserver(self)
+        // Queued bot-thread sends can drain before any desk is opened.
+        if let router { installBotQueueHooks(on: router) }
         restoreQueuedFollowUpsIfNeeded()
         restoreComposerDraftsIfNeeded()
         restoreInspectorDraftsIfNeeded()
@@ -5251,11 +5259,18 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func publishInterestedDeskThreadID() {
-        if screen.resolvedDestination == .desk {
-            interestedDeskThread.set(selectedConversation?.linkedAgentThreadID)
-        } else {
-            interestedDeskThread.set(nil)
-        }
+        var next = screen.resolvedDestination == .desk
+            ? selectedConversation?.linkedAgentThreadID
+            : nil
+        // The embedded Agent App paints this thread; a second desk paint pipeline
+        // would republish this view model on every token.
+        if let threadID = next, deskAgentOwnsLiveStream(threadID: threadID) { next = nil }
+        if interestedDeskThread.get() != next { deskStreamAggregateBudgetOps = 0 }
+        interestedDeskThread.set(next)
+    }
+
+    private func deskAgentOwnsLiveStream(threadID: AgentThreadID) -> Bool {
+        deskAgentVM != nil && deskAgentKey?.threadID == threadID
     }
 
     nonisolated private func currentInterestedDeskThreadID() -> AgentThreadID? {
@@ -9195,6 +9210,8 @@ public final class BotsViewModel: ObservableObject {
             }
             return
         }
+        // Agent App owns the transcript; the desk timeline replay would only feed deleted views.
+        if deskAgentOwnsLiveStream(threadID: threadID) { return }
         applyDeskLiveReplay(
             botID: botID,
             threadID: threadID,
@@ -9378,10 +9395,13 @@ public final class BotsViewModel: ObservableObject {
         var next = deskLiveTimeline
         var touched = false
         var terminalReplay: (runId: AgentRunID, threadId: AgentThreadID)?
+        var appliedEvents: [AssistantEvent] = []
+        appliedEvents.reserveCapacity(batch.count)
         for entry in batch where entry.threadId == selectedThreadId {
             let event = entry.event
             let threadId = entry.threadId
             touched = true
+            appliedEvents.append(event)
             next.apply(event)
             if let runId = entry.runId, settledTerminalRunIDByThread[threadId] == runId {
                 terminalReplay = (runId, threadId)
@@ -9392,7 +9412,13 @@ public final class BotsViewModel: ObservableObject {
         }
         guard touched else { return }
         lastDeskStreamPushAt = Date()
-        next.enforceAggregateHotTextBudget()
+        let budget = AgentAppViewModel.aggregateBudgetDecision(
+            force: AgentAppViewModel.forcesAggregateBudget(events: appliedEvents),
+            opsSinceLastWalk: deskStreamAggregateBudgetOps,
+            appliedEventCount: appliedEvents.count
+        )
+        deskStreamAggregateBudgetOps = budget.nextOps
+        if budget.runsWalk { next.enforceAggregateHotTextBudget() }
         deskLiveTimeline = next
         storeLiveTimeline(next, for: selectedThreadId)
         if let terminalReplay, let botID = selectedBotID {
@@ -9433,6 +9459,8 @@ public final class BotsViewModel: ObservableObject {
 
     private func startDeskLiveTurnWatch(botID: BotID, threadID: AgentThreadID) {
         deskLiveTurnWatch?.cancel()
+        deskLiveTurnWatch = nil
+        guard !deskAgentOwnsLiveStream(threadID: threadID) else { return }
         deskLiveTurnWatch = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -9869,13 +9897,299 @@ public final class BotsViewModel: ObservableObject {
         return BotDeskRouting(thread: thread)
     }
 
-    private func prepareSupervisedRun(
+    // MARK: - Embedded Agent App desk
+
+    /// One fixed workspace for every embedded bot desk. Bot threads have no
+    /// workspace row (created with nil); the pinned VM accepts them whatever
+    /// their workspace is, and this id only scopes rail/event filters that an
+    /// embedded desk never lists.
+    static let botDeskWorkspaceID = WorkspaceID(
+        UUID(uuidString: "00000000-0000-0000-0000-00000000B07D")!
+    )
+
+    struct BotDeskSendRefused: LocalizedError {
+        let reason: String
+        var errorDescription: String? { reason }
+    }
+
+    private struct DeskAgentKey: Equatable {
+        let botID: BotID
+        let conversationID: BotConversationID
+        let threadID: AgentThreadID
+    }
+
+    private var deskAgentKey: DeskAgentKey?
+    private var isSyncingDeskAgent = false
+    private var pendingDeskReceipts: [AgentRunID: ContextAssemblyReceipt] = [:]
+
+    /// Keeps at most one pinned Agent App VM on the selected conversation's
+    /// linked thread; creates the thread eagerly when the conversation has none.
+    func syncDeskAgentVM() {
+        guard !isSyncingDeskAgent else { return }
+        isSyncingDeskAgent = true
+        defer {
+            isSyncingDeskAgent = false
+            publishInterestedDeskThreadID()
+        }
+        guard screen == .desk,
+              let bot = selectedBot,
+              let conversation = selectedConversation,
+              conversation.botID == bot.id,
+              let router = resolvedRouter() else {
+            tearDownDeskAgentVM()
+            return
+        }
+        var live = conversation
+        if live.linkedAgentThreadID == nil {
+            do {
+                live = try ensureLinkedThread(
+                    bot: bot,
+                    conversation: conversation,
+                    routing: frozenDeskRouting(for: conversation),
+                    router: router,
+                    markStarted: false
+                ).conversation
+            } catch {
+                errorMessage = String(describing: error)
+                tearDownDeskAgentVM()
+                return
+            }
+        }
+        guard let threadID = live.linkedAgentThreadID else {
+            tearDownDeskAgentVM()
+            return
+        }
+        let key = DeskAgentKey(botID: bot.id, conversationID: live.id, threadID: threadID)
+        if deskAgentKey == key, deskAgentVM != nil { return }
+        tearDownDeskAgentVM()
+        let botHomeCwd = BotHome(appSupportDirectory: context.appSupportDirectory, bot: bot).root.path
+        try? FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: botHomeCwd),
+            withIntermediateDirectories: true
+        )
+        let embedding = AgentAppEmbedding(
+            pinnedThreadId: threadID,
+            executionCwd: botHomeCwd,
+            promptTransform: { [weak self] text, threadId, runId in
+                guard let self else { return text }
+                return try self.compileDeskPrompt(
+                    botID: bot.id,
+                    conversationID: live.id,
+                    text: text,
+                    threadID: threadId,
+                    runID: runId
+                )
+            },
+            onRunStarted: { [weak self] runId, _ in
+                self?.deskAgentRunStarted(botID: bot.id, conversationID: live.id, runID: runId)
+            }
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: Self.botDeskWorkspaceID,
+            cwd: botHomeCwd,
+            coordinator: context.coordinator,
+            threadRepo: context.threadRepo,
+            messageRepo: context.messageRepo,
+            draftRepo: AgentThreadDraftRepository(db: context.db),
+            attachmentStore: attachmentStore(),
+            queuedMessageRepo: context.queuedMessageRepo,
+            providerSessionRepo: context.providerSessionRuntimeRepo,
+            pendingCallbackRepo: context.providerPendingCallbackRepo,
+            proposedPlanRepo: context.proposedPlanRepo,
+            checkpointRepo: context.turnCheckpointRepo,
+            promptHistoryStore: PromptHistoryStore(db: context.db),
+            customModelStore: AgentCustomModelStore(repo: context.settingsRepo),
+            planNotesStore: PlanNotesStore(db: context.db),
+            initialThreadId: threadID,
+            // Routing is frozen per conversation on the thread row.
+            initialRoutingMode: .manual,
+            orchestrationRuntime: context.orchestrationRuntime,
+            embedding: embedding
+        )
+        vm.providerSnapshotLoader = { [weak router] in
+            await router?.listAgentProviderSnapshots(runAsUser: nil) ?? []
+        }
+        vm.providerLaunchConfig = { [weak router] provider, instanceId in
+            (
+                router?.providerBinary(provider: provider, instanceId: instanceId),
+                router?.providerEnvironment(provider: provider, instanceId: instanceId) ?? [:]
+            )
+        }
+        vm.mentionableBotsProvider = { [weak self] in
+            (try? self?.botStore.listCached()) ?? []
+        }
+        vm.mentionableBotsRevisionProvider = { [weak self] in
+            self?.botStore.botsListRevision ?? 0
+        }
+        vm.markThreadRead = { [weak router] id in
+            try router?.markAgentThreadRead(thread: id)
+        }
+        vm.refreshProviderSnapshotsInBackground()
+        AppCommandRouter.wireTokenSaverThreadFooter(on: vm, context: context)
+        deskAgentKey = key
+        deskAgentVM = vm
+    }
+
+    /// Queue-drained follow-ups bypass the embedded composer, so the router asks
+    /// here to compile the brain for any bot-linked thread, selected or not.
+    private func installBotQueueHooks(on router: AppCommandRouter) {
+        router.botThreadPromptTransform = { [weak self] threadID, text, runID in
+            guard let self,
+                  let conversation = try? self.botStore.conversationLinked(to: threadID),
+                  let bot = self.bots.first(where: { $0.id == conversation.botID })
+                    ?? (try? self.botStore.get(id: conversation.botID)) else { return nil }
+            let prompt = try self.compileDeskPrompt(
+                botID: bot.id,
+                conversationID: conversation.id,
+                text: text,
+                threadID: threadID,
+                runID: runID
+            )
+            let cwd = BotHome(appSupportDirectory: self.context.appSupportDirectory, bot: bot).root.path
+            try? FileManager.default.createDirectory(
+                at: URL(fileURLWithPath: cwd),
+                withIntermediateDirectories: true
+            )
+            return AppCommandRouter.BotThreadQueuedPrompt(prompt: prompt, cwd: cwd)
+        }
+        router.botThreadRunStarted = { [weak self] runID, threadID in
+            guard let self,
+                  let conversation = try? self.botStore.conversationLinked(to: threadID) else { return }
+            self.deskAgentRunStarted(
+                botID: conversation.botID,
+                conversationID: conversation.id,
+                runID: runID
+            )
+        }
+    }
+
+    func lastStartedConversationForTesting(botID: BotID) -> BotConversation? {
+        lastStartedConversationByBot[botID]
+    }
+
+    private func tearDownDeskAgentVM() {
+        deskAgentKey = nil
+        guard let vm = deskAgentVM else { return }
+        deskAgentVM = nil
+        vm.dispose()
+    }
+
+    /// Bot-specific half of a desk send: admission, then brain compile. The raw
+    /// user text stays the visible message; the compiled payload is the prompt.
+    private func compileDeskPrompt(
+        botID: BotID,
+        conversationID: BotConversationID,
+        text: String,
+        threadID: AgentThreadID,
+        runID: AgentRunID
+    ) throws -> String {
+        guard let bot = bots.first(where: { $0.id == botID }) ?? (try? botStore.get(id: botID)),
+              let revision = try currentRevision(for: bot) else {
+            throw BotDeskSendRefused(reason: "Bot runtime is unavailable.")
+        }
+        if selectedBotID == botID, let message = deskDistillEffortValidationMessage {
+            throw BotDeskSendRefused(reason: message)
+        }
+        do {
+            try admitDesktopSend(bot: bot)
+        } catch {
+            switch guestLaunchState(for: bot.id) {
+            case .starting:
+                throw BotDeskSendRefused(reason: "Linux desktop is starting. Try again when it is ready.")
+            case .failed(let message):
+                throw BotDeskSendRefused(reason: message)
+            case .idle:
+                throw BotDeskSendRefused(reason: "Docker desktop is not ready.")
+            }
+        }
+        let thread = try context.threadRepo.get(id: threadID)
+        let routing = thread.map { BotDeskRouting(thread: $0) } ?? deskRouting
+        let model = routing.resolvedModel(defaultModel: Self.defaultModel(for:))
+        let conversation = conversations.first(where: { $0.id == conversationID })
+            ?? ((try? botStore.conversation(id: conversationID)) ?? nil)
+        let brain = destBrainInputs(for: bot)
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot,
+            revision: revision,
+            userText: text,
+            memoryFiles: brain.memoryFiles,
+            skills: brain.skills,
+            ownedSkills: ownedSkillTexts(for: bot),
+            routines: brain.routines,
+            workspace: nil,
+            browser: advertisedBrowser,
+            conversationID: conversation?.id ?? conversationID,
+            liveRunMode: routing.permissionMode,
+            runProvider: routing.provider,
+            runModel: model,
+            turnDirective: BotPeerDelegation.turnDirective(
+                mentionedBots: BotMentionParser.mentionedBots(
+                    in: text,
+                    bots: bots,
+                    excluding: bot.id
+                )
+            )
+        )
+        lastSupervisedRunUserTextForTesting = text
+        pendingDeskReceipts[runID] = receipt
+        if let conversation {
+            _ = try? persistUserMessage(
+                bot: bot,
+                text: text,
+                adoptSelection: selectedConversation?.id == conversation.id,
+                conversationID: conversation.id
+            )
+        }
+        // Distill resolves `/name args` only when the prompt starts with the slash;
+        // the brain wrap would bury it, so slash commands go through raw.
+        if routing.provider == .distill,
+           text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/") {
+            return text
+        }
+        return receipt.compiledPayload
+    }
+
+    private func deskAgentRunStarted(
+        botID: BotID,
+        conversationID: BotConversationID,
+        runID: AgentRunID
+    ) {
+        guard let bot = bots.first(where: { $0.id == botID }) ?? (try? botStore.get(id: botID)),
+              let conversation = conversations.first(where: { $0.id == conversationID })
+                ?? (try? botStore.conversation(id: conversationID)) ?? nil else { return }
+        lastLinkedRunIDByBot[botID] = runID
+        lastSendStartedProviderRun = true
+        if let receipt = pendingDeskReceipts.removeValue(forKey: runID) {
+            recordStartedRun(bot: bot, conversation: conversation, receipt: receipt, resultRunID: runID)
+        } else {
+            _ = try? persistWorkingConversation(conversation)
+        }
+        restoreDeskWorkLog(botID: botID)
+        restoreDeskLiveTurn(botID: botID)
+    }
+
+    /// Peer rows persisted for the linked thread repaint in the embedded desk.
+    func applyDeskPeerMessage(
+        messageID: AgentMessageID,
+        threadID: AgentThreadID,
+        terminalStatus: AgentRunStatus?
+    ) {
+        deskAgentVM?.applyPersistedBotPeerMessage(
+            messageID: messageID,
+            threadId: threadID,
+            terminalStatus: terminalStatus
+        )
+    }
+
+    /// Reuses the conversation's linked thread (drifting model/effort/permission
+    /// in place) or creates it. Shared by the send path and the embedded desk.
+    private func ensureLinkedThread(
         bot: BotDefinition,
         conversation: BotConversation,
         routing: BotDeskRouting,
         router: AppCommandRouter,
-        runID: AgentRunID = AgentRunID()
-    ) throws -> BotStartedRun {
+        markStarted: Bool = true
+    ) throws -> (thread: AgentThread, conversation: BotConversation) {
         let model = routing.resolvedModel(defaultModel: Self.defaultModel(for:))
         var liveConversation = conversation
         // 1.8: Bot runs use BotHome as cwd (not "/") so provider file tools
@@ -9948,9 +10262,27 @@ public final class BotsViewModel: ObservableObject {
             thread = createdThread
             liveConversation.linkedAgentThreadID = thread.id
             try botStore.upsertConversation(liveConversation)
-            lastStartedConversationByBot[liveConversation.botID] = liveConversation
+            if markStarted {
+                lastStartedConversationByBot[liveConversation.botID] = liveConversation
+            }
             adoptFollowThroughConversation(liveConversation)
         }
+        return (thread, liveConversation)
+    }
+
+    private func prepareSupervisedRun(
+        bot: BotDefinition,
+        conversation: BotConversation,
+        routing: BotDeskRouting,
+        router: AppCommandRouter,
+        runID: AgentRunID = AgentRunID()
+    ) throws -> BotStartedRun {
+        let (thread, liveConversation) = try ensureLinkedThread(
+            bot: bot,
+            conversation: conversation,
+            routing: routing,
+            router: router
+        )
         // The rail memo is filled per id and never re-read: a send that drifts
         // the model on the existing thread must republish the row it wrote, or
         // the chip keeps painting the model the thread had before this send.
@@ -10063,6 +10395,30 @@ public final class BotsViewModel: ObservableObject {
         return prepared
     }
 
+    /// Dest persist cannot unstart a live provider turn: bookkeeping after the
+    /// provider accepted a bot turn (Desk send path and the embedded Agent App).
+    private func recordStartedRun(
+        bot: BotDefinition,
+        conversation: BotConversation,
+        receipt: ContextAssemblyReceipt,
+        resultRunID: AgentRunID?
+    ) {
+        var receipt = receipt
+        _ = try? persistWorkingConversation(conversation)
+        _ = try? botStore.insertContextReceipt(receipt)
+        if selectedBotID == bot.id {
+            lastContextReceipt = receipt
+            rememberStudioSupport(for: bot.id)
+        }
+        if let runId = resultRunID {
+            receipt.runID = runId
+            try? botStore.insertContextReceipt(receipt)
+            if selectedBotID == bot.id {
+                lastContextReceipt = receipt
+            }
+        }
+    }
+
     private func startSupervisedRun(
         bot: BotDefinition,
         revision: BotRevision,
@@ -10097,7 +10453,7 @@ public final class BotsViewModel: ObservableObject {
                 threadId: prepared.thread.id,
                 runId: prepared.runID
             )
-            var receipt = BotBrainCompiler.assemble(
+            let receipt = BotBrainCompiler.assemble(
                 bot: bot,
                 revision: revision,
                 userText: compressedUser,
@@ -10165,20 +10521,12 @@ public final class BotsViewModel: ObservableObject {
                 requestedRunID: prepared.runID,
                 executionCwdOverride: botHomeCwd
             )
-            // Dest persist cannot unstart a live provider turn.
-            _ = try? persistWorkingConversation(prepared.conversation)
-            _ = try? botStore.insertContextReceipt(receipt)
-            if selectedBotID == bot.id {
-                lastContextReceipt = receipt
-                rememberStudioSupport(for: bot.id)
-            }
-            if let runId = result.runId {
-                receipt.runID = runId
-                try? botStore.insertContextReceipt(receipt)
-                if selectedBotID == bot.id {
-                    lastContextReceipt = receipt
-                }
-            }
+            recordStartedRun(
+                bot: bot,
+                conversation: prepared.conversation,
+                receipt: receipt,
+                resultRunID: result.runId
+            )
             guard result.runId == prepared.runID else {
                 cancelExactRunWait(prepared.runID)
                 return nil
@@ -11027,7 +11375,9 @@ extension BotsViewModel: AgentRunObserver {
         let opensBatch = deskStreamEventBatch.append(.init(event: event, runId: run, threadId: threadId))
         guard opensBatch else { return }
         interestedDeskThread.incrementHopCount()
+        // Same ~30 Hz paint coalesce as Agent App: events arriving in the window share one publish.
         Task { @MainActor [weak self] in
+            try? await Task.sleep(for: AgentAppViewModel.streamPaintCoalesceInterval)
             self?.flushDeskStreamEventBatch()
         }
     }
@@ -11042,6 +11392,8 @@ extension BotsViewModel: AgentRunObserver {
     ) {
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // Pending paint batch must land before terminal reconciliation reads the timeline.
+            self.flushDeskStreamEventBatch()
             self.resolveExactRunWaiters(
                 runID: runId,
                 threadID: threadId,
@@ -11063,6 +11415,7 @@ extension BotsViewModel: AgentRunObserver {
         Task { @MainActor [weak self] in
             guard let self else { return }
             if BotsDeskFollowThrough.isTerminal(status) {
+                self.flushDeskStreamEventBatch()
                 if self.adoptLinkedRunTerminal(runId: runId, threadId: threadId) {
                     self.refreshActiveBotCount()
                 }
@@ -11491,31 +11844,6 @@ private struct BotsDeleteConfirmation: ViewModifier {
 
 // MARK: - Root view
 
-/// Keeps the Desk composer's elapsed label live only while a run can change it.
-/// An idle schedule yields the initial render and then ends, while a live run
-/// preserves the prior one-second cadence.
-struct BotsComposerTimelineSchedule: TimelineSchedule {
-    let runIsLive: Bool
-
-    func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
-        var next: Date? = startDate
-        return AnyIterator {
-            guard let current = next else { return nil }
-            next = runIsLive ? current.addingTimeInterval(1) : nil
-            return current
-        }
-    }
-}
-
-/// Scopes composer observation so a keystroke does not invalidate the enclosing
-/// Desk body, which also owns the transcript and live replay projection.
-private struct BotsComposerReactiveScope<Content: View>: View {
-    @ObservedObject var composerState: BotsComposerState
-    @ViewBuilder var content: () -> Content
-
-    var body: some View { content() }
-}
-
 /// Studio fields publish only inside Studio. A keystroke must not rebuild the
 /// roster, conversations, schedules, and every other Bots destination.
 private struct BotsStudioReactiveScope<Content: View>: View {
@@ -11530,8 +11858,6 @@ public struct BotsRootView: View {
     /// Standalone Bots window keeps its own rail. The main shell hosts the
     /// roster inside the single sidebar instead.
     private let embedsRosterRail: Bool
-    @State private var showDeskModelOptions = false
-    @State private var showDeskSourceOptions = false
     @State private var pendingClearAllDeskThreads = false
     @State private var pendingDockerDataClear: BotID?
 
@@ -12377,15 +12703,25 @@ public struct BotsRootView: View {
                     vm.resizeDeskThreadRail(by: delta)
                 }
             }
-            VStack(spacing: 0) {
-                deskTimeline(bot)
-                if !vm.queuedFollowUps.isEmpty {
-                    deskQueuedFollowUps
-                }
-                BotsComposerReactiveScope(composerState: vm.composerState) {
-                    composerBar(bot)
+            Group {
+                if let agentVM = vm.deskAgentVM {
+                    AgentAppView(
+                        vm: agentVM,
+                        layout: AgentAppViewLayout(
+                            showsThreadRail: false,
+                            showsHeader: false,
+                            showsPlanSidebar: false
+                        )
+                    )
+                    .id(agentVM.selectedThreadId)
+                } else {
+                    AgentChatLoadingStatusStrip()
+                        .padding(DS.Space.lg)
+                        .frame(maxHeight: .infinity, alignment: .top)
                 }
             }
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("bots.desk.timeline")
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             if vm.isDeskSidePaneVisible {
                 DSResizeDivider(axis: .vertical, help: "Resize inspector") { delta in
@@ -12765,364 +13101,6 @@ public struct BotsRootView: View {
         .frame(maxWidth: .infinity, minHeight: BotsChrome.hitTarget, alignment: .leading)
     }
 
-    private func deskTimeline(_ bot: BotDefinition) -> some View {
-        let items = vm.deskTimeline
-        let latestLiveTurnID = vm.deskRunIsLive
-            ? vm.deskLiveTimeline.turns.last(where: { !$0.finished })?.turnId
-            : nil
-        let split = BotsDeskFollowThrough.splitLiveTail(
-            items,
-            latestLiveTurnID: latestLiveTurnID
-        )
-        let historyItems = split.history
-        let liveItems = split.liveTail
-        let liveTurnItemCount = vm.deskLiveTimeline.turns.reduce(0) { $0 &+ $1.items.count }
-        return AgentChatTimelineScrollContainer(
-            rejoinToken: vm.deskTimelineRejoinToken,
-            followToken: items.count
-                &+ (vm.deskShowsLoading ? 1 : 0)
-                &+ (vm.deskRunIsLive ? 2 : 0)
-                &+ liveTurnItemCount,
-            scrollToBottomIdentifier: "bots.desk.scrollToBottom",
-            accessibilityIdentifier: "bots.desk.timeline",
-            horizontalPadding: DS.Space.xxl,
-            verticalPadding: DS.Space.xl,
-            columnGutter: AgentChatTranscriptChrome.userMessageBubbleLeadingGutter
-        ) { columnWidth in
-            VStack(alignment: .leading, spacing: DS.Space.xl) {
-                if items.isEmpty {
-                    deskTimelineEmptyState(bot)
-                }
-                // Never LazyVStack desk timeline rows: same hang class as
-                // Agent App ChatFlowRow (pid 36908 LazySubviewPlacements).
-                ForEach(Array(historyItems.enumerated()), id: \.element.id) { index, item in
-                    deskTimelineEntry(
-                        item,
-                        index: index,
-                        items: items,
-                        columnWidth: columnWidth
-                    )
-                }
-                ForEach(Array(liveItems.enumerated()), id: \.element.id) { index, item in
-                    deskTimelineEntry(
-                        item,
-                        index: historyItems.count + index,
-                        items: items,
-                        columnWidth: columnWidth
-                    )
-                }
-                if AgentAppView.shouldShowTokenSaverThreadFooter(
-                    runIsLive: vm.deskRunIsLive || vm.deskShowsLoading,
-                    footerText: vm.deskTokenSaverFooterText,
-                    hasFinishedTurn: vm.deskMessages.contains(where: { $0.role == .assistant })
-                ), let text = vm.deskTokenSaverFooterText,
-                   let presentation = vm.deskTokenSaverFooterPresentation {
-                    AgentChatTokenSaverThreadFooter(
-                        text: text,
-                        autoRouting: vm.deskRouting.routingMode == .auto,
-                        presentation: presentation
-                    )
-                    .id("agent.tokenSaver.footer")
-                }
-                deskTimelineStatusChrome()
-            }
-        }
-    }
-
-    private func deskTimelineEmptyState(_ bot: BotDefinition) -> some View {
-        Text("Message \(bot.name) to give it a first task.")
-            .font(DS.Font.body)
-            .foregroundColor(DS.Palette.textTertiary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.top, DS.Space.xl)
-    }
-
-    @ViewBuilder
-    private func deskTimelineEntry(
-        _ item: BotDeskTimelineItem,
-        index: Int,
-        items: [BotDeskTimelineItem],
-        columnWidth: CGFloat
-    ) -> some View {
-        deskPeerGroupHeader(at: index, items: items)
-        switch item {
-        case .message(let message):
-            deskBubble(message, columnWidth: columnWidth)
-        case .workLog(let row):
-            deskWorkLogRow(row)
-        // BT-21: same `.equatable()` gate the Agent App applies — without it
-        // every finished turn re-ran `compose` + `workBlocks` on every pass.
-        case .liveTurn(let turn, let hideAssistantOutput):
-            AgentChatLiveTurnView(
-                turn: turn,
-                live: vm.deskRunIsLive && !turn.finished,
-                hideAssistantOutput: hideAssistantOutput,
-                renderFinal: deskTokenSaverFinal(for: turn)
-            )
-            .equatable()
-        case .liveTurnSegment(let segment, let hideAssistantOutput):
-            AgentChatLiveTurnView(
-                turn: segment.snapshot,
-                live: vm.deskRunIsLive && !segment.snapshot.finished,
-                hideAssistantOutput: hideAssistantOutput,
-                showsWorkHeader: AgentChatLiveTurnChrome.showsWorkHeader(for: segment),
-                renderFinal: deskTokenSaverFinal(for: segment.snapshot)
-            )
-            .equatable()
-        }
-    }
-
-    @ViewBuilder
-    private func deskTimelineStatusChrome() -> some View {
-        if vm.deskShowsLoading {
-            AgentChatLoadingStatusStrip()
-        } else if vm.deskRunIsLive, let started = vm.deskWorkingStartedAt() {
-            AgentChatWorkingStatusStrip(
-                startedAt: started,
-                isStopping: vm.isStopping,
-                context: vm.deskWorkingContext,
-                onStop: { vm.stopDeskRun() }
-            )
-        }
-    }
-
-    private func deskBubble(_ message: BotDeskMessage, columnWidth: CGFloat) -> some View {
-        let trailing = message.peer?.direction != .fromPeer
-        return VStack(alignment: trailing ? .trailing : .leading, spacing: DS.Space.sm) {
-            if let peer = message.peer {
-                AgentChatPeerIdentityHeader(
-                    name: peer.name,
-                    handle: peer.handle,
-                    symbol: peer.avatarSymbol,
-                    trailing: trailing,
-                    caption: peer.caption,
-                    accessibilityIdentifier: peer.direction == .messaged
-                        ? "bots.desk.peer.messaged"
-                        : "bots.desk.peer.from"
-                )
-                .frame(maxWidth: .infinity, alignment: trailing ? .trailing : .leading)
-            }
-            Group {
-                if message.role == .user {
-                    AgentChatUserBubble(
-                        text: deskUserDisplayText(message),
-                        createdAt: message.createdAt,
-                        columnWidth: columnWidth,
-                        accessibilityIdentifier: "agent.userMessageBubble",
-                        roleIdentifier: "bots.desk.role.user",
-                        belowBubble: deskTokenSaverUserControl(message)
-                    )
-                } else {
-                    AgentChatAssistantReply(
-                        text: deskAssistantCopyText(message),
-                        roleIdentifier: "bots.desk.role.assistant",
-                        content: deskTokenSaverAssistantContent(message)
-                    )
-                }
-            }
-            if let peer = message.peer,
-               peer.direction == .messaged,
-               let phase = peer.activityPhase {
-                AgentChatPeerActivityRow(
-                    snapshot: BotPeerActivitySnapshot(
-                        phase: phase,
-                        name: peer.name,
-                        title: peer.title,
-                        handle: peer.handle
-                    ),
-                    startedAt: message.createdAt,
-                    avatarSymbol: peer.avatarSymbol
-                )
-            }
-        }
-    }
-
-    private func deskUserDisplayText(_ message: BotDeskMessage) -> String {
-        let mode = AgentChatTokenSaverDisplayMode.from(
-            displaysOriginal: message.agentMessageID.map { vm.tokenSaverDisplaysOriginal(for: $0) } ?? false
-        )
-        return AgentChatTokenSaverDisplayMode.userMessageDisplayText(
-            human: message.text,
-            wireRequest: message.tokenSaverWireRequest,
-            mode: mode
-        )
-    }
-
-    private func deskAssistantCopyText(_ message: BotDeskMessage) -> String {
-        guard let original = message.tokenSaverOriginal else { return message.text }
-        let mode = AgentChatTokenSaverDisplayMode.from(
-            displaysOriginal: message.agentMessageID.map { vm.tokenSaverDisplaysOriginal(for: $0) } ?? false
-        )
-        return AgentChatTokenSaverDisplayMode.copyText(
-            translated: message.text,
-            original: original,
-            request: message.tokenSaverWireRequest,
-            mode: mode
-        )
-    }
-
-    private func deskTokenSaverUserControl(_ message: BotDeskMessage) -> AnyView? {
-        guard let messageId = message.agentMessageID,
-              let request = message.tokenSaverWireRequest,
-              AgentChatTokenSaverDisplayMode.showsDisplayControl(
-                original: "",
-                request: request,
-                allowsRequestOnlyRCW1: true
-              ) else { return nil }
-        return AnyView(deskTokenSaverDisplayControl(messageId: messageId, alignment: .trailing))
-    }
-
-    private func deskTokenSaverAssistantContent(_ message: BotDeskMessage) -> AnyView? {
-        let showBadge = AgentChatTokenSaverDisplayMode.showsOptimizedBadge(
-            wasTokenSaverOptimized: message.tokenSaverOriginal != nil
-                || message.tokenSaverWireRequest != nil
-        )
-        guard showBadge else { return nil }
-        let messageId = message.agentMessageID
-        let original = message.tokenSaverOriginal
-        let mode = AgentChatTokenSaverDisplayMode.from(
-            displaysOriginal: messageId.map { vm.tokenSaverDisplaysOriginal(for: $0) } ?? false
-        )
-        return AnyView(
-            VStack(alignment: .leading, spacing: DS.Space.xs) {
-                if let original,
-                   AgentChatTokenSaverDisplayMode.showsOriginalContent(original: original, mode: mode) {
-                    AgentChatTokenSaverOriginalContent(
-                        original: original,
-                        request: message.tokenSaverWireRequest,
-                        identifierSuffix: messageId?.value.uuidString ?? message.id.uuidString,
-                        onCopy: { AgentChatTranscriptChrome.copyToPasteboard($0) }
-                    )
-                } else {
-                    if original == nil {
-                        AgentChatTokenSaverOptimizedBadge(
-                            messageId: messageId?.value.uuidString ?? message.id.uuidString
-                        )
-                    }
-                    AgentMessageMarkdownView(text: message.text)
-                        .foregroundColor(DS.Palette.text)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                if let messageId, let original,
-                   AgentChatTokenSaverDisplayMode.showsDisplayControl(
-                    original: original,
-                    request: message.tokenSaverWireRequest,
-                    allowsRequestOnlyRCW1: false
-                   ) {
-                    deskTokenSaverDisplayControl(messageId: messageId, alignment: .leading)
-                }
-            }
-        )
-    }
-
-    private func deskTokenSaverDisplayControl(
-        messageId: AgentMessageID,
-        alignment: Alignment
-    ) -> AgentChatTokenSaverDisplayControl {
-        let key = AgentChatTokenSaverDisplayMode.messageDisplayKey(messageId.value.uuidString)
-        return AgentChatTokenSaverDisplayControl(
-            mode: Binding(
-                get: {
-                    AgentChatTokenSaverDisplayMode.from(
-                        displaysOriginal: vm.tokenSaverDisplaysOriginal(for: messageId)
-                    )
-                },
-                set: { mode in
-                    vm.setTokenSaverDisplaysOriginal(mode == .rcw1, for: messageId)
-                }
-            ),
-            identifier: key,
-            alignment: alignment
-        )
-    }
-
-    private func deskTokenSaverFinal(
-        for turn: AssistantTurnSnapshot
-    ) -> ((String) -> AnyView)? {
-        guard let linked = vm.tokenSaverMessage(forTurnId: turn.turnId),
-              let original = linked.tokenSaverOriginal else { return nil }
-        return { final in
-            AnyView(
-                AgentChatAssistantReply(
-                    text: deskAssistantCopyText(
-                        BotDeskMessage(
-                            role: .assistant,
-                            text: final,
-                            agentMessageID: linked.agentMessageID,
-                            tokenSaverWireRequest: linked.tokenSaverWireRequest,
-                            tokenSaverOriginal: original
-                        )
-                    ),
-                    roleIdentifier: "bots.desk.role.assistant",
-                    content: deskTokenSaverAssistantContent(
-                        BotDeskMessage(
-                            role: .assistant,
-                            text: final,
-                            agentMessageID: linked.agentMessageID,
-                            tokenSaverWireRequest: linked.tokenSaverWireRequest,
-                            tokenSaverOriginal: original
-                        )
-                    )
-                )
-            )
-        }
-    }
-
-    @ViewBuilder
-    private func deskPeerGroupHeader(at index: Int, items: [BotDeskTimelineItem]) -> some View {
-        if items.indices.contains(index),
-           case .message(let message) = items[index],
-           let peer = message.peer {
-            let startsGroup: Bool = {
-                if index > 0, case .message(let previous) = items[index - 1],
-                   previous.peer?.botID == peer.botID {
-                    return false
-                }
-                return true
-            }()
-            if startsGroup {
-                let count = items[index...].prefix { item in
-                    if case .message(let next) = item { return next.peer?.botID == peer.botID }
-                    return false
-                }.count
-                if count >= 2, let host = vm.selectedBot {
-                    AgentChatPeerGroupHeader(
-                        hostName: host.name,
-                        hostHandle: host.handle,
-                        hostSymbol: host.avatarSymbol,
-                        peerName: peer.name,
-                        peerHandle: peer.handle,
-                        peerSymbol: peer.avatarSymbol,
-                        count: count
-                    )
-                }
-            }
-        }
-    }
-
-    private func deskWorkLogRow(_ row: BotDeskWorkLogRow) -> some View {
-        AgentChatStatusCard(
-            title: row.title,
-            detail: row.detail,
-            statusLabel: row.statusLabel,
-            statusTone: workLogTone(row.statusLabel),
-            createdAt: row.createdAt,
-            accessibilityIdentifier: "bots.desk.workLog",
-            accessibilityLabel: "work log \(row.title) \(row.statusLabel)"
-        )
-    }
-
-    private func workLogTone(_ status: String) -> DSPill.Tone {
-        switch status {
-        case "Working", "Done":
-            return .success
-        case "Needs you":
-            return .warning
-        default:
-            return .neutral
-        }
-    }
-
     private var deskThreadRail: some View {
         AgentChatThreadRail(
             title: AgentChatThreadRailCopy.headerTitle(activeCount: vm.deskThreadActiveCount),
@@ -13199,230 +13177,6 @@ public struct BotsRootView: View {
             trailing: { EmptyView() }
         )
         .help(conversation.title.isEmpty ? AgentThreadTitle.defaultTitle : conversation.title)
-    }
-
-    private var deskQueuedFollowUps: some View {
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
-            AgentQueuedHeader(count: vm.queuedFollowUps.count, identifier: "bots.desk.queued.header")
-            ForEach(vm.queuedFollowUps) { item in
-                AgentQueuedRow(
-                    text: AgentChatTranscriptChrome.displayUserLine(
-                        text: item.text,
-                        attachments: item.attachments
-                    ),
-                    identifier: "bots.desk.queued.row"
-                ) {
-                    Button("Remove") { vm.removeQueuedFollowUp(item) }
-                        .buttonStyle(.plain)
-                        .font(DS.Font.caption.weight(.medium))
-                        .foregroundColor(DS.Palette.textSecondary)
-                        .accessibilityIdentifier("bots.desk.queued.remove")
-                }
-            }
-        }
-        .padding(.horizontal, DS.Space.xxl)
-        .padding(.vertical, DS.Space.md)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(DS.Palette.bg)
-        .accessibilityIdentifier("bots.desk.queued")
-    }
-
-    private func composerBar(_ bot: BotDefinition) -> some View {
-        TimelineView(BotsComposerTimelineSchedule(runIsLive: vm.deskRunIsLive)) { context in
-            AgentChatComposerBar(
-                text: $vm.composerText,
-                attachments: vm.attachments,
-                placeholder: "Message \(bot.name)…",
-                sendEnabled: vm.deskSendEnabled,
-                runActive: vm.deskRunIsLive,
-                isStopping: vm.isStopping,
-                workingLabel: vm.deskWorkingLabel(now: context.date),
-                attachEnabled: true,
-                onSend: { vm.send() },
-                onStop: { vm.stopDeskRun() },
-                onAttach: { vm.addAttachments($0) },
-                onRemoveAttachment: { vm.removeAttachment($0) },
-                composerIdentifier: "bots.desk.composer",
-                sendIdentifier: "bots.desk.send",
-                leadingControls: AnyView(deskRoutingControls),
-                suggestions: vm.composerSuggestions,
-                onApplySuggestion: { vm.applyComposerSuggestion($0) },
-                onCursorMoved: { vm.composerCursorOffset = $0 },
-                suggestionIdentifier: "bots.desk.suggestion.popup",
-                onFileDrop: { vm.insertDroppedFilePaths($0) }
-            )
-        }
-    }
-
-    private var deskRoutingControls: some View {
-        HStack(spacing: DS.Space.sm) {
-            deskRunAsChip
-            if AgentSourceCapsulePresentation.isVisible(entryCount: deskSourceEntries.count) {
-                deskSourceMenu
-            }
-            if vm.deskRouting.provider == .distill {
-                AgentDistillModelPills(
-                    mainModel: vm.deskRunModel, mainModels: vm.deskModels, customMainModels: [],
-                    reasoningModel: vm.deskRouting.reasoningModel, reasoningModels: vm.deskModels,
-                    mainEffortSelection: vm.deskDistillMainEffortSelection, mainEfforts: vm.deskSupportedReasoning,
-                    supportsMainEffortAuto: vm.deskSupportsDistillMainEffortAuto,
-                    reasoningEffortSelection: vm.deskDistillReasoningEffortSelection,
-                    reasoningEfforts: vm.deskDistillReasoningEfforts,
-                    supportsReasoningModelEffort: vm.deskSupportsDistillReasoningModelEffort,
-                    homePath: vm.selectedDeskSnapshot?.homePath,
-                    mainUnavailable: !vm.deskRunModel.isEmpty && !vm.deskModels.contains(where: { $0.id == vm.deskRunModel }),
-                    isRunning: deskRoutingLocked, isDisabled: deskRoutingLocked,
-                    emptyListTitle: "No models yet. Connect an account on the start screen.",
-                    workerEmptyListTitle: "No models yet. Connect an account on the start screen.",
-                    menuWidth: AgentModelMenuWidth.estimatedWidth(titles: vm.deskModels.map(\.label) + AgentDistillModelCatalog.effortOptionLabels(vm.deskSupportedReasoning) + AgentDistillModelCatalog.effortOptionLabels(vm.deskDistillReasoningEfforts), min: AgentModelMenuWidth.distillMin, max: AgentModelMenuWidth.distillMax),
-                    mainIdentifier: "bots.desk.model", mainPopoverIdentifier: "bots.desk.model.popover",
-                    workerIdentifier: "bots.desk.workerModel", workerPopoverIdentifier: "bots.desk.workerModel.popover",
-                    onSelectMainModel: vm.setDeskModel, onSelectCustomMainModel: vm.setDeskModel,
-                    onSelectMainEffort: vm.setDeskDistillMainEffortSelection,
-                    onSelectWorkerModel: vm.setDeskReasoningModel,
-                    onSelectWorkerEffort: vm.setDeskDistillReasoningEffortSelection,
-                    statusHeader: { EmptyView() }, mainFooter: { EmptyView() }
-                )
-            } else { deskModelMenu }
-            deskPermissionMenu
-            deskExecutionChip
-        }
-    }
-
-    private var deskRoutingLocked: Bool { vm.deskRunIsLive }
-
-    private var deskRunAsChip: some View {
-        let users = vm.availableRunAsUsers.isEmpty
-            ? MacOSLocalUserCatalog.listEligibleUsers()
-            : vm.availableRunAsUsers
-        return AgentRunAsUserCapsule(
-            users: users,
-            selected: vm.deskRunAsUser,
-            runLocked: deskRoutingLocked,
-            identityLocked: false,
-            accessibilityIdentifier: "bots.desk.runAs",
-            onSelect: { vm.setDeskRunAsUser($0) },
-            onAppear: { vm.refreshAvailableRunAsUsers() }
-        )
-    }
-
-    private var deskSourceEntries: [AgentSourceCapsulePresentation.MenuEntry] {
-        AgentSourceCapsulePresentation.menuEntries(
-            snapshots: vm.providers,
-            selectedSnapshotId: vm.deskRouting.providerInstanceID,
-            selectedProvider: vm.deskRouting.provider,
-            providerDisplayName: vm.providerChipTitle
-        )
-    }
-
-    private var deskSourceMenu: some View {
-        let entries = deskSourceEntries
-        let label = AgentSourceCapsulePresentation.capsuleLabel(
-            selected: vm.selectedDeskSnapshot,
-            fallbackProvider: vm.deskRouting.provider,
-            fallbackInstanceId: vm.deskRouting.providerInstanceID,
-            snapshots: vm.providers
-        )
-        return AgentSourceCapsule(
-            label: label,
-            entries: entries,
-            runLocked: deskRoutingLocked,
-            providerLocked: false,
-            accessibilityIdentifier: "bots.desk.source",
-            popoverIdentifier: "bots.desk.source.popover",
-            isPresented: $showDeskSourceOptions,
-            onSelect: { entry in
-                if let snapshot = vm.providers.first(where: { $0.id == entry.id }) {
-                    vm.setDeskProvider(snapshot.provider, instanceID: snapshot.id)
-                } else if let provider = AgentProvider(rawValue: entry.id) {
-                    vm.setDeskProvider(provider)
-                }
-            }
-        )
-    }
-
-    private var deskModelPillPresentation: AgentModelPillPresentation {
-        let auto = vm.deskRouting.routingMode == .auto
-        return AgentModelPillPresentation(
-            title: vm.deskModelDisplayLabel,
-            effort: (!auto && vm.deskSupportsReasoning) ? vm.deskRunReasoning.displayName : nil
-        )
-    }
-
-    private var deskModelMenu: some View {
-        Button {
-            showDeskModelOptions.toggle()
-        } label: {
-            AgentModelPillLabel(presentation: deskModelPillPresentation)
-        }
-        .buttonStyle(.plain)
-        .fixedSize()
-        .disabled(deskRoutingLocked)
-        .help("Model · reasoning effort")
-        .accessibilityLabel(deskModelPillPresentation.accessibilityLabel)
-        .accessibilityIdentifier("bots.desk.model")
-        .popover(isPresented: $showDeskModelOptions, arrowEdge: .bottom) {
-            deskModelPopover
-        }
-    }
-
-    private var deskModelPopover: some View {
-        let models = vm.deskModels
-        let showsAutoRouting = vm.deskRouting.provider != .distill
-        let presentation = AgentModelPopoverPresentation.current(
-            mode: showsAutoRouting ? vm.deskRouting.routingMode : .manual
-        )
-        return AgentModelPopoverChrome(
-            presentation: presentation,
-            autoEnabled: Binding(
-                get: { vm.deskRouting.routingMode == .auto },
-                set: { vm.setDeskRoutingMode($0 ? .auto : .manual) }
-            ),
-            toggleDisabled: deskRoutingLocked,
-            showsAutoRouting: showsAutoRouting
-        ) {
-            AgentCompactMenuSection("Model")
-            ForEach(models, id: \.id) { model in
-                AgentCompactMenuRow(model.label, selected: model.id == vm.deskRunModel) {
-                    vm.setDeskModel(model.id)
-                    showDeskModelOptions = false
-                }
-                .disabled(deskRoutingLocked)
-            }
-            if vm.deskSupportsReasoning {
-                AgentCompactMenuDivider()
-                AgentCompactMenuSection("Reasoning effort")
-                ForEach(vm.deskSupportedReasoning, id: \.self) { effort in
-                    AgentCompactMenuRow(effort.displayName, selected: effort == vm.deskRunReasoning) {
-                        vm.setDeskReasoningEffort(effort)
-                        showDeskModelOptions = false
-                    }
-                    .disabled(deskRoutingLocked)
-                    .help(effort.pickerHelpText)
-                }
-            }
-        }
-        .accessibilityIdentifier("bots.desk.model.popover")
-    }
-
-    private var deskPermissionMenu: some View {
-        AgentPermissionCapsule(
-            selected: vm.deskRouting.permissionMode,
-            modes: vm.deskPermissionModes,
-            disabled: deskRoutingLocked,
-            help: deskRoutingLocked ? "Permission is fixed for the active run" : "Permission mode",
-            accessibilityIdentifier: "bots.desk.permission",
-            onSelect: { vm.setDeskPermissionMode($0) }
-        )
-    }
-
-    private var deskExecutionChip: some View {
-        AgentComposerCapsule {
-            AgentComposerCapsuleLabel(icon: "folder", title: "Local", chevron: false)
-        }
-        .help("Bots run locally. They are not bound to a workspace folder or worktree.")
-        .accessibilityLabel("Local")
-        .accessibilityIdentifier("bots.desk.execution")
     }
 
     private var filesTab: some View {

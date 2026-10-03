@@ -1697,7 +1697,7 @@ final class BotsWindowTests: XCTestCase {
             return XCTFail("desk thread row must exist")
         }
         let rest = source[start.upperBound...]
-        let end = rest.range(of: "\n    private var deskQueuedFollowUps")?.lowerBound ?? rest.endIndex
+        let end = rest.range(of: "\n    private var filesTab")?.lowerBound ?? rest.endIndex
         let slice = String(source[start.lowerBound..<end])
         XCTAssertTrue(slice.contains("AgentThreadProviderMonogram(provider:"),
                       "desk rows need the same provider monogram chip as the Agent App rail")
@@ -2039,55 +2039,6 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
-    func test_deskComposerTimelineSchedule_stopsAfterInitialIdleRender() {
-        // WHY: with no live Desk run, the composer label is static. The old
-        // periodic TimelineView still invalidated it once per second forever.
-        let start = Date(timeIntervalSince1970: 1_700_000_000)
-        let entries = BotsComposerTimelineSchedule(runIsLive: false)
-            .entries(from: start, mode: .normal)
-        let renderedDates = Array(entries.prefix(61))
-
-        XCTAssertEqual(renderedDates, [start])
-        XCTAssertEqual(renderedDates.dropFirst().count, 0,
-                       "60 idle seconds must produce zero follow-up invalidations")
-    }
-
-    func test_deskComposerTimelineSchedule_keepsOneHertzDuringLiveRun() {
-        // WHY: the elapsed Working label must retain its existing one-second
-        // cadence while the selected Desk thread is actually running.
-        let start = Date(timeIntervalSince1970: 1_700_000_000)
-        let entries = BotsComposerTimelineSchedule(runIsLive: true)
-            .entries(from: start, mode: .normal)
-        let renderedDates = Array(entries.prefix(61))
-
-        XCTAssertEqual(renderedDates.count, 61)
-        XCTAssertEqual(renderedDates.first, start)
-        XCTAssertEqual(renderedDates.last, start.addingTimeInterval(60))
-        XCTAssertTrue(zip(renderedDates, renderedDates.dropFirst()).allSatisfy {
-            $1.timeIntervalSince($0) == 1
-        })
-    }
-
-    func test_microbenchDeskComposerTimelineSchedule_eliminatesIdleInvalidations() {
-        let warmups = 2
-        let samples = 7
-        let start = Date(timeIntervalSince1970: 1_700_000_000)
-        var optimizedSamples: [Int] = []
-
-        for iteration in 0..<(warmups + samples) {
-            let entries = BotsComposerTimelineSchedule(runIsLive: false)
-                .entries(from: start, mode: .normal)
-            let optimizedInvalidations = Array(entries.prefix(61)).dropFirst().count
-            if iteration >= warmups {
-                XCTAssertEqual(optimizedInvalidations, 0)
-                optimizedSamples.append(optimizedInvalidations)
-            }
-        }
-
-        XCTAssertEqual(optimizedSamples, Array(repeating: 0, count: samples))
-        print("PERF idle_bots_composer_clock warmup=2 n=7 baseline_invalidations=60 optimized_invalidations=0 reduction_pct=100 live_invalidations=60")
-    }
-
     func test_deskReplaysStreamEventsOnOpen_becauseThinkingMustSurviveClose() throws {
         // WHY: Desk is not a second Agent App window, but it must replay the
         // linked thread's persisted stream events so Thought / Worked remain
@@ -2327,9 +2278,7 @@ final class BotsWindowTests: XCTestCase {
         // WHY: every Bots window observes the coordinator. Stream events for
         // other threads must not hop to MainActor or mutate the selected desk.
         let context = try makeContext()
-        let router = AppCommandRouter(context: context)
-        context.router = router
-        let vm = BotsViewModel(context: context, router: router)
+        let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
         let threadA = AgentThread(title: "Standup", provider: .claude, model: "opus")
         try context.threadRepo.upsert(threadA)
@@ -2370,7 +2319,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.deskStreamMainHopCountForTesting, 1)
         for _ in 0..<40 {
             if vm.applyIncomingDeskEventCountForTesting == 1 { break }
-            await Task.yield()
+            try await Task.sleep(for: .milliseconds(10))
         }
         XCTAssertEqual(vm.applyIncomingDeskEventCountForTesting, 1)
         XCTAssertEqual(vm.deskLiveTimeline.turns.first?.turnId, "t-matched")
@@ -2406,7 +2355,7 @@ final class BotsWindowTests: XCTestCase {
         )
         for _ in 0..<40 {
             if vm.applyIncomingDeskEventCountForTesting >= 1 { break }
-            await Task.yield()
+            try await Task.sleep(for: .milliseconds(10))
         }
         try await Task.sleep(nanoseconds: 400_000_000)
         XCTAssertEqual(vm.deskLiveTurnWatchApplyCountForTesting, watchApplies)
@@ -5148,7 +5097,7 @@ final class BotsWindowTests: XCTestCase {
             return XCTFail("desk inspector routines must exist")
         }
         let rest = source[start.upperBound...]
-        let end = rest.range(of: "\n    private func deskTimeline")?.lowerBound ?? rest.endIndex
+        let end = rest.range(of: "\n    private var deskThreadRail")?.lowerBound ?? rest.endIndex
         let slice = String(source[start.lowerBound..<end])
         XCTAssertFalse(slice.contains("bots.routines.name"))
         XCTAssertFalse(slice.contains("bots.routines.save"))
@@ -8250,24 +8199,7 @@ final class BotsWindowTests: XCTestCase {
         vm.setDeskReasoningEffort(.high)
         XCTAssertEqual(vm.deskRunReasoning, .high)
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        XCTAssertTrue(source.contains("\"bots.desk.source\""))
-        XCTAssertTrue(source.contains("mainIdentifier: \"bots.desk.model\""))
-        XCTAssertTrue(source.contains("\"bots.desk.permission\""))
-        XCTAssertTrue(source.contains("mainPopoverIdentifier: \"bots.desk.model.popover\""))
-        XCTAssertTrue(
-            source.contains("AgentModelPopoverChrome("),
-            "Desk Auto must use the Agent App Model popover chrome, not a header-only fork"
-        )
-        XCTAssertTrue(source.contains("AgentSourceCapsule("))
-        XCTAssertTrue(source.contains("AgentPermissionCapsule("))
-        XCTAssertTrue(source.contains("AgentRunAsUserCapsule("))
-        XCTAssertTrue(source.contains("AgentModelPillLabel("))
-        XCTAssertTrue(source.contains("AgentCompactMenuRow("))
-        XCTAssertTrue(source.contains("AgentQueuedHeader("))
-        XCTAssertFalse(
-            source.contains(AgentModelPopoverPresentation.autoDisclaimer),
-            "Desk must not recopy the orchestration card; the shared chrome owns that copy"
-        )
+        XCTAssertTrue(source.contains("AgentAppView("), "Desk composer chips are the Agent App ones")
         XCTAssertFalse(
             source.contains("func deskChipLabel"),
             "Desk must not keep a private capsule fork"
@@ -13280,27 +13212,6 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(try store.refresh().items.filter { $0.route == .botsDesk(botID: piper.id) }.isEmpty)
     }
 
-    func test_deskWorkLogCardIsFullWidthOnItsOwnLine_becauseStatusCardsAreNotChatBubbles() throws {
-        // WHY: a 56pt timestamp gutter beside the Supervised-run panel left a
-        // hugging card. Status cards occupy one complete line at column width.
-        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        guard let start = bots.range(of: "private func deskWorkLogRow") else {
-            return XCTFail("deskWorkLogRow must exist")
-        }
-        let rest = bots[start.lowerBound...]
-        let end = rest.range(of: "\n    private func workLogTone")?.lowerBound ?? rest.endIndex
-        let slice = String(bots[start.lowerBound..<end])
-        XCTAssertTrue(slice.contains("AgentChatStatusCard("))
-        XCTAssertFalse(
-            slice.contains("frame(width: 56"),
-            "work-log must not keep a timestamp column beside the panel"
-        )
-        XCTAssertFalse(
-            slice.contains("style: .time"),
-            "time lives inside the shared full-width card, not a Desk gutter"
-        )
-    }
-
     func test_shortDeskTimelineUsesSharedEagerHistoryLayoutToKeepScrollBounded() throws {
         // WHY: packaged Claude Bot E2E hit an unbounded LazyVStack/self-sizing
         // text AttributeGraph loop on a short Desk timeline. Agent App already
@@ -13320,26 +13231,8 @@ final class BotsWindowTests: XCTestCase {
             "pid 36908 hung restoring a long thread in LazyVStack; Desk history must stay eager"
         )
         let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        let start = try XCTUnwrap(bots.range(of: "private func deskTimeline"))
-        let rest = bots[start.lowerBound...]
-        let end = rest.range(of: "\n    private func deskBubble")?.lowerBound ?? rest.endIndex
-        let slice = String(bots[start.lowerBound..<end])
-        XCTAssertTrue(
-            slice.contains("let items = vm.deskTimeline"),
-            "Desk must compute the timeline once per paint"
-        )
-        XCTAssertFalse(
-            slice.contains("LazyVStack("),
-            "Desk transcript history must not use LazyVStack for self-sizing NSTextView rows"
-        )
-        XCTAssertTrue(
-            slice.contains("VStack(alignment: .leading, spacing: DS.Space.xl)"),
-            "short Desk timelines must have an eager placement path"
-        )
-        XCTAssertTrue(slice.contains("let split = BotsDeskFollowThrough.splitLiveTail"))
-        XCTAssertTrue(slice.contains("ForEach(Array(historyItems.enumerated())"))
-        XCTAssertTrue(slice.contains("ForEach(Array(liveItems.enumerated())"))
-        XCTAssertFalse(slice.contains("ForEach(Array(vm.deskTimeline.enumerated())"))
+        XCTAssertTrue(bots.contains("AgentAppView("), "Desk must reuse Agent App, not fork its transcript")
+        XCTAssertTrue(bots.contains("AgentAppViewLayout(showsThreadRail: false"))
     }
 
     func test_deskTimelineKeepsCurrentLiveTurnOutsideLazyHistory() {
@@ -13398,14 +13291,8 @@ final class BotsWindowTests: XCTestCase {
         // only in AgentAppSurface, so send did not auto-scroll. Same control
         // must be one shared container.
         let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        let start = try XCTUnwrap(bots.range(of: "private func deskTimeline"))
-        let rest = bots[start.lowerBound...]
-        let end = rest.range(of: "\n    private func deskBubble")?.lowerBound ?? rest.endIndex
-        let slice = String(bots[start.lowerBound..<end])
-        XCTAssertTrue(slice.contains("AgentChatTimelineScrollContainer("))
-        XCTAssertTrue(slice.contains("deskTimelineRejoinToken"))
-        XCTAssertTrue(slice.contains("\"bots.desk.scrollToBottom\""))
-        XCTAssertFalse(slice.contains("ScrollView {"))
+        XCTAssertTrue(bots.contains("AgentAppView("), "Desk must reuse Agent App, not fork its transcript")
+        XCTAssertTrue(bots.contains("AgentAppViewLayout(showsThreadRail: false"))
         let agent = try String(contentsOf: sourceURL("Sources/Surfaces/AgentAppSurface.swift"), encoding: .utf8)
         XCTAssertTrue(agent.contains("AgentChatTimelineScrollContainer("))
         XCTAssertFalse(agent.contains("private struct TimelineScrollFollower"))
@@ -16337,58 +16224,33 @@ final class BotsWindowTests: XCTestCase {
             bots.contains("studioAvatarPane"),
             "Studio Profile right pane must be the avatar, not Configuration summary"
         )
-        XCTAssertTrue(bots.contains("AgentChatUserBubble"))
-        XCTAssertTrue(bots.contains("AgentChatAssistantReply"))
-        XCTAssertTrue(bots.contains("AgentChatComposerBar"))
         XCTAssertTrue(
             bots.contains("AgentChatTokenSaverThreadFooter"),
             "Desk must mount the shared Token Saver footer, not a lookalike capsule"
         )
-        XCTAssertTrue(
-            bots.contains("presentation: presentation"),
-            "Desk must pass the shared on/off presentation so off-state red is not Agent-App-only"
-        )
-        XCTAssertTrue(bots.contains("AgentChatTokenSaverDisplayControl"))
-        XCTAssertTrue(bots.contains("deskUserDisplayText"))
         XCTAssertTrue(bots.contains("bindTokenSaverThreadFooter"))
-        XCTAssertTrue(
-            bots.contains("placeholder: \"Message \\(bot.name)…\""),
-            "Desk composer must invite messaging the teammate, not Ask Claude for changes"
-        )
         XCTAssertFalse(
             bots.contains("AgentChatTranscriptChrome.composerPlaceholder("),
             "Bots Desk must not reuse the Agent App Ask <provider> for changes placeholder"
         )
-        XCTAssertTrue(bots.contains("AgentChatLiveTurnView"))
         XCTAssertTrue(bots.contains("applyIncomingDeskEvent"))
         let liveChrome = try String(contentsOf: sourceURL("Sources/Surfaces/AgentChatLiveTurnChrome.swift"), encoding: .utf8)
         XCTAssertTrue(liveChrome.contains("bots.desk.thought"))
         XCTAssertTrue(liveChrome.contains("Thinking…"))
         XCTAssertTrue(liveChrome.contains("Work so far"))
-        XCTAssertTrue(bots.contains("onAttach"))
-        XCTAssertTrue(
-            bots.contains("onFileDrop: { vm.insertDroppedFilePaths($0) }"),
-            "Desk composer must insert dropped file/folder paths into the prompt "
-                + "text exactly like Agent App — without onFileDrop the drop falls "
-                + "back to onAttach, which stages attachments and rejects folders"
-        )
         XCTAssertTrue(bots.contains("stopDeskRun"))
         XCTAssertTrue(bots.contains("attachments: attached") || bots.contains("attachments: attached,"))
         XCTAssertTrue(bots.contains("attachmentStore().stage"))
         XCTAssertTrue(chatChrome.contains("agent.attach"))
         XCTAssertTrue(chatChrome.contains("agent.workingPhase"))
         XCTAssertTrue(chatChrome.contains("agent.composer.stop"))
-        XCTAssertTrue(bots.contains("bots.desk.queued"))
-        XCTAssertTrue(bots.contains("bots.desk.queued.header"))
-        XCTAssertTrue(bots.contains("bots.desk.queued.remove"))
-        XCTAssertTrue(bots.contains("bots.desk.composer"))
         XCTAssertTrue(chatChrome.contains("accessibilityIdentifier(composerIdentifier)"))
         XCTAssertTrue(chatChrome.contains("\"bots.desk.composer\""))
         XCTAssertTrue(chatChrome.contains("arrow.up"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk\")"))
-        XCTAssertTrue(bots.contains("accessibilityIdentifier: \"bots.desk.timeline\""))
-        XCTAssertTrue(bots.contains("AgentChatStatusCard("))
-        XCTAssertTrue(bots.contains("\"bots.desk.workLog\""))
+        XCTAssertTrue(bots.contains("AgentAppView("), "Desk must reuse Agent App, not fork its transcript")
+        XCTAssertTrue(bots.contains("AgentAppViewLayout(showsThreadRail: false"))
+        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.timeline\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.desktop\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.desktop.honesty\")"))
         XCTAssertTrue(
@@ -16399,10 +16261,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.handle\")"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.job\")"))
         XCTAssertFalse(bots.contains("accessibilityIdentifier(\"bots.desk.provider\")"))
-        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.model\")"))
         XCTAssertTrue(bots.contains("\"bots.desk.permission\""))
-        XCTAssertTrue(bots.contains("bots.desk.role.user"))
-        XCTAssertTrue(bots.contains("bots.desk.role.assistant"))
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.desk.inspector\")"))
         XCTAssertTrue(bots.contains("bots.studio.tab.brain"))
         XCTAssertTrue(bots.contains("bots.desk.inspector.tab.brain"))
@@ -16896,6 +16755,122 @@ final class BotsWindowTests: XCTestCase {
         var value = timespec()
         precondition(clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &value) == 0)
         return UInt64(value.tv_sec) * 1_000_000_000 + UInt64(value.tv_nsec)
+    }
+
+    func test_openingDeskPinsAgentAppToLinkedThreadAndCompilesBrainOnlyIntoPrompt_becauseDeskMustSendThroughAgentApp() async throws {
+        // WHY: the desk must drive Agent App on the bot's own thread; the bot
+        // brain belongs in the provider prompt while the user text stays raw.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        let agent = try XCTUnwrap(vm.deskAgentVM, "desk must own an Agent App VM")
+        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID,
+                                     "opening the desk creates the linked thread eagerly")
+        let embedding = try XCTUnwrap(agent.embedding)
+        XCTAssertEqual(embedding.pinnedThreadId, threadID)
+        XCTAssertEqual(agent.selectedThreadId, threadID)
+        let transform = try XCTUnwrap(embedding.promptTransform)
+        let raw = "Where is the report?"
+        let payload = try await transform(raw, threadID, AgentRunID())
+        XCTAssertNotEqual(payload, raw)
+        XCTAssertTrue(payload.contains(raw))
+        XCTAssertTrue(payload.contains("Piper"), "compiled payload carries the bot brain")
+    }
+
+    func test_queuedFollowUpOnBotThreadCompilesBrainButKeepsUserTextRaw_becauseQueueDrainBypassesEmbeddedComposer() async throws {
+        // WHY: a follow-up typed while a run is live is drained by the host, not
+        // the embedded composer; without the router hook the bot would answer
+        // with no identity, memory or approval honesty.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.grok, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .grok,
+                models: [AgentModelDescriptor(id: "grok-4.6", label: "Grok 4.6", provider: .grok)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "grok"
+            ),
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .grok, model: "grok-4.6")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        XCTAssertNotNil(vm.deskAgentVM)
+        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID)
+        let raw = "queued follow-up question"
+        _ = try context.queuedMessageRepo.enqueue(
+            threadId: threadID,
+            text: raw,
+            attachments: [],
+            interactionMode: .default
+        )
+        try await router.drainNextQueuedAgentMessage(thread: threadID)
+        let request = try XCTUnwrap(runner.requests.first)
+        XCTAssertNotEqual(request.prompt, raw)
+        XCTAssertTrue(request.prompt.contains(raw))
+        XCTAssertTrue(request.prompt.contains("Piper"), "queued send carries the bot brain")
+        XCTAssertEqual(request.userMessageContent, raw, "visible user message stays the raw text")
+        XCTAssertTrue(request.tokenSaverCompressesPrompt)
+        let home = BotHome(appSupportDirectory: context.appSupportDirectory, bot: bot).root
+        XCTAssertTrue(request.cwd.hasSuffix(home.lastPathComponent),
+                      "bot threads run in the bot home, not the process cwd")
+    }
+
+    func test_openingUnlinkedConversationDoesNotMarkItStarted_becauseViewingIsNotSending() throws {
+        // WHY: the embedded Agent App needs a thread, so viewing creates one, but
+        // lastStartedConversationByBot drives "the bot just ran" bookkeeping and
+        // must only move on a real send.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        XCTAssertNotNil(vm.selectedConversation?.linkedAgentThreadID, "viewing links a thread eagerly")
+        XCTAssertNil(vm.lastStartedConversationForTesting(botID: bot.id))
+    }
+
+    func test_embeddedAgentAppOwnsLiveStream_becauseDeskMustNotRepublishPerTokenBesideAgentApp() async throws {
+        // WHY: the embedded Agent App already paints this thread. A second desk
+        // pipeline publishing deskLiveTimeline per token invalidates the whole
+        // Bots tree that hosts the Agent App, which was the reported slowness.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        XCTAssertNotNil(vm.deskAgentVM)
+        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID)
+        var publishes = 0
+        let sink = vm.$deskLiveTimeline.dropFirst().sink { _ in publishes += 1 }
+        defer { sink.cancel() }
+        vm.resetDeskStreamMainHopCountForTesting()
+        let runID = AgentRunID()
+        vm.runCoordinator(context.coordinator, didReceive: .turnStarted(turnId: "t1"), run: runID, threadId: threadID)
+        for i in 0..<50 {
+            vm.runCoordinator(
+                context.coordinator,
+                didReceive: .itemStarted(item: AssistantItem(id: "item-\(i)", turnId: "t1", type: .tool, startedAtMs: Int64(i))),
+                run: runID,
+                threadId: threadID
+            )
+        }
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(vm.deskStreamMainHopCountForTesting, 0, "events must drop at the nonisolated guard")
+        XCTAssertEqual(vm.applyIncomingDeskEventCountForTesting, 0)
+        XCTAssertEqual(publishes, 0)
+        XCTAssertTrue(vm.deskLiveTimeline.turns.isEmpty)
     }
 
     private func makeContext() throws -> AppContext {
