@@ -546,10 +546,11 @@ public final class DistillACPEventMapper: @unchecked Sendable {
     private static func usage(_ raw: [String: Any]) -> AssistantTokenUsage? {
         let input = int(raw["inputTokens"]) ?? int(raw["input_tokens"]) ?? 0
         let output = int(raw["outputTokens"]) ?? int(raw["output_tokens"]) ?? 0
-        let total = int(raw["totalTokens"]) ?? int(raw["total_tokens"]) ?? input + output
+        // ACP `usage_update` is `{used, size}` (context occupancy / window).
+        let total = int(raw["totalTokens"]) ?? int(raw["total_tokens"]) ?? int(raw["used"]) ?? input + output
         let cached = int(raw["cachedReadTokens"]) ?? int(raw["cache_read_input_tokens"])
             ?? int(raw["cacheReadInputTokens"])
-        let window = int(raw["contextWindow"]) ?? int(raw["context_window"]) ?? int(raw["modelContextWindow"])
+        let window = int(raw["contextWindow"]) ?? int(raw["context_window"]) ?? int(raw["modelContextWindow"]) ?? int(raw["size"])
         guard total > 0 || input > 0 || output > 0 else { return nil }
         // ACP usage_update / finishTurn usage is per-request occupancy, not the
         // cumulative modelUsage shape from the CLI end event.

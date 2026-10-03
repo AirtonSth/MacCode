@@ -399,6 +399,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         set { composerState.cursorOffset = newValue }
     }
     @Published public var provider: AgentProvider = .defaultProvider
+    /// Live Distill compaction/model/subagent state for the selected thread's run.
+    @Published public private(set) var distillLive: DistillLiveStatus?
     @Published public var providerInstanceId: String = AgentProvider.defaultProvider.rawValue
     /// macOS account that will execute the next provider process through the shared helper.
     /// Nil / current-account means no privileged trampoline.
@@ -2438,6 +2440,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             stopScheduledLivePoll()
         }
         normalizeInteractionModeForSelectedProvider()
+        if distillLive != nil { distillLive = nil }
         if let cachedTimeline = paintedTimelineByThread[id] {
             timeline = cachedTimeline
         } else {
@@ -9997,6 +10000,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // PERF-MAC_AGENT-010: append to the batch buffer. If the buffer was
         // empty (first event of this tick), schedule a single flush Task.
         // Later events in the same tick just append — no extra Task allocation.
+        if case .providerRuntime(let runtime) = event,
+           runtime.provider == .distill,
+           DistillLiveStatus.isCarrierMethod(runtime.method) {
+            Task { @MainActor in
+                self.applyDistillRuntime(runtime, run: run, threadId: threadId)
+            }
+        }
         let outcome = streamEventBatch.appendBounded(event: event, run: run, threadId: threadId)
         switch outcome {
         case .scheduled, .scheduledAfterEviction:
@@ -10033,6 +10043,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.streamUIBackpressured = true
             }
         }
+    }
+
+    private func applyDistillRuntime(_ runtime: ProviderRuntimeEvent, run: AgentRunID, threadId: AgentThreadID) {
+        guard !isDisposed, selectedThreadId == threadId else { return }
+        var next = distillLive?.runId == run ? distillLive ?? DistillLiveStatus(runId: run) : DistillLiveStatus(runId: run)
+        next.apply(method: runtime.method, payloadJSON: runtime.payloadJSON)
+        if next != distillLive { distillLive = next }
     }
 
     private func resetTimelineUpdateTick() {
@@ -15420,6 +15437,8 @@ public struct AgentAppView: View {
                                         AgentChatWorkingContext.reviewing(peerName: $0)
                                     },
                                     hold: vm.backgroundHoldSummary,
+                                    distill: vm.provider == .distill ? vm.distillLive : nil,
+                                    contextTokens: vm.provider == .distill ? vm.timeline.tokenUsage?.contextTokens : nil,
                                     onStop: { vm.stop() }
                                 )
                                 .id("agent.workingStatus")
