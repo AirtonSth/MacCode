@@ -422,6 +422,7 @@ public final class PaneTabsView: NSObject {
                 self?.performSplitSurface(draggedID, targetPane: targetPane, direction: direction) ?? false
             }
         )
+        btn.setUnread(desc.type == .terminal && desc.hasUnreadActivity)
         btn.toolTip = Self.tabTooltipString(title: desc.title, type: desc.type)
         return btn
     }
@@ -480,6 +481,7 @@ public final class PaneTabsView: NSObject {
             tab.setTitle(desc.title)
             tab.setColorHex(TabColor.from(desc.metadata["color"])?.hex)
             tab.setDirty(surfaceIsUnsaved(desc.id))
+            tab.setUnread(desc.type == .terminal && desc.hasUnreadActivity)
             tab.setBusy(Self.isSurfaceBusy(desc, runningWorkspaceIDs: patchRunning, router: router))
         }
         // UX: scroll the newly selected tab into view ONLY when selection
@@ -753,6 +755,7 @@ public final class PaneTabsView: NSObject {
         if let window = contentArea.window, !window.isVisible { return }
         let running = Self.runningWorkspaceIDs(for: pane.surfaces, router: router)
         for desc in pane.surfaces {
+            tabButtons[desc.id]?.setUnread(desc.type == .terminal && desc.hasUnreadActivity)
             tabButtons[desc.id]?.setBusy(Self.isSurfaceBusy(desc, runningWorkspaceIDs: running, router: router))
         }
     }
@@ -1334,6 +1337,7 @@ final class PaneTabButton: NSView {
     private var mouseDownLocation: NSPoint?
     private var selected: Bool
     private var busy = false
+    private var unread = false
     private var dirty = false
     // PERF: in-place tab reconcile. These subviews used to be local to
     // init (baked once, then the whole strip was rebuilt on any change).
@@ -1517,6 +1521,13 @@ final class PaneTabButton: NSView {
         installIcon(busy: busy)
     }
 
+    /// Finished-dot: a small success dot takes the spinner's slot until the tab is focused.
+    func setUnread(_ unread: Bool) {
+        guard self.unread != unread else { return }
+        self.unread = unread
+        installIcon(busy: busy)
+    }
+
     /// PERF: in-place selection update used by the tab-strip reconcile.
     /// Re-styles this existing button instead of recreating it, so a focus
     /// change does not rebuild the strip.
@@ -1563,6 +1574,18 @@ final class PaneTabButton: NSView {
             spin.isIndeterminate = true
             spin.startAnimation(nil)
             icon = spin
+        } else if unread {
+            let dot = NSView()
+            dot.wantsLayer = true
+            dot.layer?.backgroundColor = DS.NS.success.cgColor
+            dot.layer?.cornerRadius = 3.5
+            dot.toolTip = "Finished"
+            dot.setAccessibilityLabel("Finished")
+            NSLayoutConstraint.activate([
+                dot.widthAnchor.constraint(equalToConstant: 7),
+                dot.heightAnchor.constraint(equalToConstant: 7)
+            ])
+            icon = dot
         } else {
             let image = NSImageView()
             image.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)

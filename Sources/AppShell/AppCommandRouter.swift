@@ -7554,6 +7554,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             terminal.refreshRestartActionForCurrentHealth()
         }
+        terminal.onBusyFinished = { [weak self, weak terminal] title, body, userIsLooking in
+            guard let self, let terminal, !userIsLooking else { return }
+            let surfaceID = terminal.descriptor.id
+            try? self.context?.apply(.markUnread(workspace, surfaceID, true))
+            self.windowController?.refreshFromState()
+            _ = try? self.notificationCreate(
+                workspaceId: workspace,
+                surfaceId: surfaceID,
+                title: title,
+                body: body,
+                category: "terminal"
+            )
+        }
+        terminal.onBecameFocused = { [weak self, weak terminal] in
+            guard let self, let terminal else { return }
+            let surfaceID = terminal.descriptor.id
+            guard let layout = self.context?.state.workspaces[workspace]?.layout,
+                  self.findSurface(surfaceID, in: layout)?.hasUnreadActivity == true else { return }
+            try? self.context?.apply(.markUnread(workspace, surfaceID, false))
+            self.windowController?.refreshFromState()
+        }
         terminal.onTitleChange = { [weak self, weak terminal] title in
             guard let self, let terminal else { return }
             let surfaceID = terminal.descriptor.id

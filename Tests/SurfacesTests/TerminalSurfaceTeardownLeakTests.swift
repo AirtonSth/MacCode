@@ -1232,7 +1232,7 @@ final class TerminalSurfaceTeardownLeakTests: XCTestCase {
     private func waitForBusy(_ surface: TerminalSurface, timeout: TimeInterval = 6) throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if surface.isBusy { return }
+            if surface.foregroundJobAliveForTesting { return }
             RunLoop.main.run(until: Date().addingTimeInterval(0.01))
         }
         XCTFail("timed out waiting for terminal foreground process; health=\(surface.runtimeHealth())")

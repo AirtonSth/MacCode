@@ -198,14 +198,14 @@ final class TerminalBusyPollingPerformanceTests: XCTestCase {
             surface.readTextSnapshot().text.contains(marker)
         }
         let outputObservedAt = Date()
-        try waitUntil(timeout: 0.50, message: "completion output did not expedite the hidden busy=false transition") {
+        try waitUntil(timeout: 2.60, message: "completion output did not clear busy after the 2 s quiet window") {
             !surface.lastPublishedBusyStateForTesting
         }
         let outputClearMilliseconds = Date().timeIntervalSince(outputObservedAt) * 1_000
         XCTAssertLessThanOrEqual(
             outputClearMilliseconds,
-            450,
-            "activity-triggered clear must retain the pre-change 250 ms cadence plus scheduler slack"
+            2_450,
+            "busy clears only after the 2 s output-quiet window (so an idle TUI is not busy) plus the 250 ms cadence and scheduler slack"
         )
 
         XCTAssertEqual(surface.sendTextStatus("sleep 0.40\n"), .accepted)
@@ -213,14 +213,14 @@ final class TerminalBusyPollingPerformanceTests: XCTestCase {
             surface.lastPublishedBusyStateForTesting
         }
         let silentBusyObservedAt = Date()
-        try waitUntil(timeout: 1.30, message: "eventless completion lost the final busy=false transition") {
+        try waitUntil(timeout: 2.60, message: "eventless completion lost the final busy=false transition") {
             !surface.lastPublishedBusyStateForTesting
         }
         let silentClearMilliseconds = Date().timeIntervalSince(silentBusyObservedAt) * 1_000
         XCTAssertLessThanOrEqual(
             silentClearMilliseconds,
-            1_200,
-            "a hidden job with no completion output must still clear on the one-second safety poll"
+            2_450,
+            "a hidden job with no completion output must still clear once the 2 s quiet window passes"
         )
         print("TERMINAL_BUSY_POLL_CLEAR output_triggered_ms=\(outputClearMilliseconds) silent_fallback_ms=\(silentClearMilliseconds)")
     }

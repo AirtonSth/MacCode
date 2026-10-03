@@ -973,6 +973,9 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
 #endif
     private var busyStateProbeUntil = Date.distantPast
     private var lastPublishedBusyState = false
+    private var progressActive = false
+    private var busySince: Date?
+    private var lastCommandExitCode: Int?
     private var didBeepForDeadInput = false
     // MARK: - readTextSnapshot cache
     // Tracks how many times TerminalSurface has mutated the ANSIRenderer (via
@@ -1239,6 +1242,11 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     public var onRestartRequested: (() -> Void)?
     /// Called after Ghostty accepts a new OSC terminal title.
     public var onTitleChange: ((String) -> Void)?
+    /// Called when a busy span of at least `minimumFinishedBusyDuration` ends.
+    /// `userIsLooking` is true when this terminal is visible in the key window.
+    public var onBusyFinished: ((_ title: String, _ body: String, _ userIsLooking: Bool) -> Void)?
+    /// Called when the terminal takes keyboard focus, so the host can clear its finished dot.
+    public var onBecameFocused: (() -> Void)?
     private static let hiddenBacklogQuietDelay: TimeInterval = 0.25
     /// Absolute cap on how long the hidden-backlog drain may keep re-arming before it
     /// force-completes, even under a never-quiet stream (#5). Bounds the frozen frame.
@@ -1261,6 +1269,43 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     }
 
     public var isBusy: Bool {
+        Self.isBusy(
+            jobAlive: foregroundJobAlive,
+            progressActive: progressActive,
+            lastOutputAt: lastOutputAt,
+            title: descriptor.title,
+            now: Date()
+        )
+    }
+
+    /// Quiet window after which a live foreground job with no progress report
+    /// and no spinner title reads as idle (e.g. a TUI waiting for input).
+    nonisolated static let busyQuietInterval: TimeInterval = 2.0
+    /// Busy spans shorter than this never produce a "finished" dot or notification.
+    nonisolated static let minimumFinishedBusyDuration: TimeInterval = 3.0
+
+    /// ponytail: a silent foreground command (e.g. `sleep 60`) reads idle after
+    /// `busyQuietInterval`; only output, OSC 9;4 progress or a spinner title keep it busy.
+    nonisolated static func isBusy(
+        jobAlive: Bool,
+        progressActive: Bool,
+        lastOutputAt: Date?,
+        title: String,
+        now: Date
+    ) -> Bool {
+        guard jobAlive else { return false }
+        if progressActive || hasSpinnerTitle(title) { return true }
+        guard let lastOutputAt else { return false }
+        return now.timeIntervalSince(lastOutputAt) < busyQuietInterval
+    }
+
+    /// TUIs animate a braille spinner in the title while working (Claude Code shows a static ✳ when idle).
+    nonisolated static func hasSpinnerTitle(_ title: String) -> Bool {
+        guard let scalar = title.unicodeScalars.first else { return false }
+        return (0x2800...0x28FF).contains(scalar.value)
+    }
+
+    private var foregroundJobAlive: Bool {
         let foregroundProcessGroup = foregroundProcessGroup()
         guard Self.isTerminalJobBusy(
             processAlive: processAlive,
@@ -1272,6 +1317,8 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         return capturedForegroundGroup.pgid == foregroundProcessGroup
             && capturedForegroundGroup.sessionID == childPID
     }
+
+    var foregroundJobAliveForTesting: Bool { foregroundJobAlive }
 
     var ownsTerminalFocusForTesting: Bool {
         view.window?.firstResponder === ghosttyView
@@ -1771,6 +1818,12 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
             guard let self, self.descriptor.title != title else { return }
             self.descriptor.title = title
             self.onTitleChange?(title)
+        }
+        terminalView.onProgressReport = { [weak self] active in
+            self?.handleProgressReport(active: active)
+        }
+        terminalView.onCommandFinished = { [weak self] exitCode in
+            self?.handleCommandFinished(exitCode: exitCode)
         }
         // Audit #4: let the view distinguish a legitimate teardown from a stray close
         // of a still-visible instance. A deallocated owner reports "closing" (true).
@@ -2509,7 +2562,6 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         }
         autoSubmitSavedSSHPasswordIfNeeded(from: data)
         lastOutputAt = Date()
-        descriptor.hasUnreadActivity = true
         // BEL (0x07): keep activity feedback non-visual. Some long-running CLIs
         // emit repeated bells, and repainting the terminal background reads as
         // pane flicker. Use BellDetector so that 0x07 acting as an OSC string-
@@ -3321,11 +3373,17 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
                 return
             }
             let busy = self.isBusy
+            let now = Date()
             if busy != self.lastPublishedBusyState {
                 self.lastPublishedBusyState = busy
+                if busy {
+                    self.busySince = now
+                    self.lastCommandExitCode = nil
+                } else {
+                    self.handleBusyFinished(now: now)
+                }
                 self.publishRuntimeHealth()
             }
-            let now = Date()
             guard Self.shouldContinueBusyStatePolling(
                 isBusy: busy,
                 now: now,
@@ -3337,6 +3395,27 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         }
         busyStatePollWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func handleBusyFinished(now: Date) {
+        let since = busySince
+        busySince = nil
+        guard let since, now.timeIntervalSince(since) >= Self.minimumFinishedBusyDuration else { return }
+        let looking = isVisible && view.window?.isKeyWindow == true
+        if !looking { descriptor.hasUnreadActivity = true }
+        var body = foregroundJobAlive ? "Terminal is waiting for input" : "Process exited"
+        if let code = lastCommandExitCode, code != 0 { body += " (exit \(code))" }
+        onBusyFinished?("\(descriptor.title) finished", body, looking)
+    }
+
+    private func handleProgressReport(active: Bool) {
+        progressActive = active
+        scheduleBusyStateRefresh()
+    }
+
+    private func handleCommandFinished(exitCode: Int?) {
+        lastCommandExitCode = exitCode
+        scheduleBusyStateRefresh()
     }
 
     private func recordOutputTelemetry(bytes: Int) {
@@ -3508,6 +3587,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         window.makeFirstResponder(ghosttyView)
         ghosttyView.refreshSurfaceOnly()
         descriptor.hasUnreadActivity = false
+        onBecameFocused?()
         return true
     }
 
@@ -4025,7 +4105,6 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
             historyCoordinator.enqueue(batch.data)
             recordOutputTelemetry(bytes: batch.data.count)
             lastOutputAt = Date()
-            descriptor.hasUnreadActivity = true
             if emitOutput {
                 outputBus.emit(descriptor.id, batch.data)
             }
