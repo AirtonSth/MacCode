@@ -108,9 +108,11 @@ if [ "$CONFIG" != "release" ] \
   exit 1
 fi
 
-BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
+# Swift 6.4's default (swiftbuild) system emits RCTailcat's module.modulemap twice.
+SWIFT_BUILD_SYSTEM="${RC2_SWIFT_BUILD_SYSTEM:-native}"
+BIN_DIR="$(swift build -c "$CONFIG" --build-system "$SWIFT_BUILD_SYSTEM" --show-bin-path)"
 echo "[package] building $CONFIG …"
-swift build -c "$CONFIG"
+swift build -c "$CONFIG" --build-system "$SWIFT_BUILD_SYSTEM"
 
 BIN="$BIN_DIR/RemoteCode"
 SCHEDULED_TASK_AGENT="$BIN_DIR/RemoteCodeScheduledTaskAgent"
