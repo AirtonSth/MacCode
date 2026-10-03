@@ -322,8 +322,32 @@ public enum AgentErrorRecoveryAction: String, Sendable, Equatable {
     }
 }
 
+/// Opt-in hooks for hosting one fixed thread (e.g. the bot desk) in Agent App.
+public struct AgentAppEmbedding {
+    public let pinnedThreadId: AgentThreadID
+    public let executionCwd: String?
+    public let promptTransform: (@MainActor (_ text: String, _ threadId: AgentThreadID, _ runId: AgentRunID) async throws -> String)?
+    public let onRunStarted: (@MainActor (AgentRunID, AgentThreadID) -> Void)?
+    public let onRunFinished: (@MainActor (AgentRunID, AgentThreadID, AgentRunStatus, String?) -> Void)?
+
+    public init(
+        pinnedThreadId: AgentThreadID,
+        executionCwd: String? = nil,
+        promptTransform: (@MainActor (_ text: String, _ threadId: AgentThreadID, _ runId: AgentRunID) async throws -> String)? = nil,
+        onRunStarted: (@MainActor (AgentRunID, AgentThreadID) -> Void)? = nil,
+        onRunFinished: (@MainActor (AgentRunID, AgentThreadID, AgentRunStatus, String?) -> Void)? = nil
+    ) {
+        self.pinnedThreadId = pinnedThreadId
+        self.executionCwd = executionCwd
+        self.promptTransform = promptTransform
+        self.onRunStarted = onRunStarted
+        self.onRunFinished = onRunFinished
+    }
+}
+
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
+    public let embedding: AgentAppEmbedding?
     @Published public var threads: [AgentThread] = [] { didSet { filteredThreadsCache = nil } }
     @Published public var selectedThreadId: AgentThreadID?
     /// Transcript paint lives on `transcriptState` so stream ticks do not
@@ -746,6 +770,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         for threadId: AgentThreadID,
         retainingForeignProbe: Bool
     ) -> WorkspaceID? {
+        if let embedding {
+            // Pinned surface owns exactly one thread, whatever its workspace row says.
+            return threadId == embedding.pinnedThreadId ? workspaceID : nil
+        }
         if let cached = threadWorkspaceCache[threadId] {
             return cached
         }
@@ -993,8 +1021,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         lastModelStore: AgentLastModelStore = .shared,
         initialRoutingMode: AgentRoutingMode = .manual,
         newThreadDefaultsStore: AgentNewThreadDefaultsStore? = nil,
-        orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime()
+        orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime(),
+        embedding: AgentAppEmbedding? = nil
     ) {
+        self.embedding = embedding
         self.workspaceID = workspaceID
         self.cwd = cwd
         self.coordinator = coordinator
@@ -1037,6 +1067,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.mergePersistedUserRCW1Requests(persisted.requests)
                 self.mergePersistedAssistantRCW1Responses(persisted.responses)
             }
+        }
+        if let embedding {
+            reloadPinnedThread()
+            applyNewThreadDefaultsFromRailIfNeeded()
+            selectThread(embedding.pinnedThreadId)
+            return
         }
         // XCTest: same-stack rail load so selectThread(initial) sees rows.
         // Production: first cap+list off MainActor so opening a tab does not hitch.
@@ -1100,6 +1136,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func loadGitBranch() {
+        guard embedding == nil else { return }
         let cwd = self.cwd
         DispatchQueue.global().async { [weak self] in
             let b = GitDiff.branches(in: cwd).current
@@ -1411,8 +1448,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             || NSClassFromString("XCTestCase") != nil
     }
 
+    /// Embedded surfaces list only their pinned thread.
+    private func reloadPinnedThread() {
+        guard let embedding else { return }
+        guard let thread = try? threadRepo.get(id: embedding.pinnedThreadId) else { return }
+        threads = [thread]
+        threadWorkspaceCache[thread.id] = thread.workspaceId ?? workspaceID
+    }
+
     public func reloadThreads() {
         guard !isDisposed else { return }
+        if embedding != nil {
+            reloadPinnedThread()
+            return
+        }
         if Self.isRunningUnitTests {
             reloadThreadsImmediate()
             return
@@ -2226,12 +2275,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func selectThread(_ id: AgentThreadID, markRead: Bool = true) {
         guard !isDisposed else { return }
+        if let embedding, id != embedding.pinnedThreadId { return }
+        let isPinned = embedding?.pinnedThreadId == id
         let selectedThread: AgentThread
         if let cached = Self.railThreadForSelection(
             id: id,
             workspaceID: workspaceID,
             rail: threads
-        ) {
+        ) ?? (isPinned ? threads.first(where: { $0.id == id }) : nil) {
             // Rail hits publish first. Existence probe runs after the first
             // frame so a click is not blocked on SQLite.
             selectedThread = cached
@@ -2251,8 +2302,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 statusMessage = "Could not open thread: \(error)"
                 return
             }
-            guard let selectedWorkspaceID = selectedThread.workspaceId,
-                  selectedWorkspaceID == workspaceID else {
+            guard isPinned || selectedThread.workspaceId == workspaceID else {
                 if statusMessage.isEmpty {
                     statusMessage = "Could not open thread: The thread belongs to another workspace."
                 }
@@ -2454,7 +2504,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                         self.retireUnbackedRailRow(id)
                         return
                     }
-                    guard durableWorkspace == self.workspaceID else {
+                    guard self.embedding?.pinnedThreadId == id || durableWorkspace == self.workspaceID else {
                         if self.statusMessage.isEmpty {
                             self.statusMessage = "Could not open thread: The thread belongs to another workspace."
                         }
@@ -8661,14 +8711,23 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             addingTurnContextTo: graphifyEnv,
             mentionedBots: mentionedBots
         )
+        var transformFailure: Error?
+        var runPrompt = text
+        if let transform = embedding?.promptTransform {
+            do {
+                runPrompt = try await transform(text, tid, runId)
+            } catch {
+                transformFailure = error
+            }
+        }
         let req = AgentRunRequest(
             runId: runId,
             threadId: tid,
             provider: runProvider,
             providerInstanceId: runProviderInstanceId,
             model: runModel,
-            cwd: cwd,
-            prompt: text,
+            cwd: embedding?.executionCwd ?? cwd,
+            prompt: runPrompt,
             userMessageContent: display,
             attachments: attached,
             providerThreadId: resumeInterrupted ? nil : providerThreadId,
@@ -8756,6 +8815,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return nil
         }
         do {
+            if let transformFailure {
+                try? threadRepo.updateStatus(id: tid, status: .failed, hasUnread: false, at: Date())
+                throw transformFailure
+            }
             let runId = try await coordinator.startRun(
                 req,
                 routingSnapshot: routingSnapshot,
@@ -8821,6 +8884,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.reloadThreads()
                 self.onRunStateChange?()
             }
+            embedding?.onRunStarted?(runId, tid)
             return runId
         } catch {
             let wasCancelled: Bool = {
@@ -10103,6 +10167,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 }
             }
             self.onRunStateChange?()
+            if let embedding = self.embedding, finishedTid == embedding.pinnedThreadId {
+                embedding.onRunFinished?(runId, finishedTid, status, finalMessage)
+            }
             // Final replies show cumulative thread savings; refresh after each turn
             // so the footer tracks ledger growth during the conversation.
             if finishedTid == self.selectedThreadId {
@@ -12005,6 +12072,20 @@ private struct PendingSessionApprovalConfirmation {
     let request: AssistantPendingRequest
 }
 
+public struct AgentAppViewLayout: Equatable {
+    public var showsThreadRail: Bool
+    public var showsHeader: Bool
+    public var showsPlanSidebar: Bool
+
+    public init(showsThreadRail: Bool = true, showsHeader: Bool = true, showsPlanSidebar: Bool = true) {
+        self.showsThreadRail = showsThreadRail
+        self.showsHeader = showsHeader
+        self.showsPlanSidebar = showsPlanSidebar
+    }
+
+    public static let standard = AgentAppViewLayout()
+}
+
 public struct AgentAppView: View {
     struct QueueStatusBannerPresentation: Equatable {
         let message: String
@@ -12130,6 +12211,7 @@ public struct AgentAppView: View {
     }
     @ObservedObject var vm: AgentAppViewModel
     private let accountPanel: AnyView?
+    private let layout: AgentAppViewLayout
     @State private var renamingThreadId: AgentThreadID?
     @State private var renameText: String = ""
     @State private var expandedTools: Set<String> = []
@@ -12197,9 +12279,10 @@ public struct AgentAppView: View {
     /// Always full chrome — no Simple/Power collapse toggle on macOS.
     private var composerChromeMode: AgentComposerChromeMode { .power }
 
-    public init(vm: AgentAppViewModel, accountPanel: AnyView? = nil) {
+    public init(vm: AgentAppViewModel, accountPanel: AnyView? = nil, layout: AgentAppViewLayout = .standard) {
         self.vm = vm
         self.accountPanel = accountPanel
+        self.layout = layout
     }
 
     /// Pure seam for the low-chrome Token Saver disclosure.
@@ -14592,7 +14675,7 @@ public struct AgentAppView: View {
     public var body: some View {
         GeometryReader { proxy in
             HSplitView {
-                if showThreadRail {
+                if showThreadRail && layout.showsThreadRail {
                     threadRail
                         .frame(
                             minWidth: Self.threadRailWidthRange.lowerBound,
@@ -14602,7 +14685,7 @@ public struct AgentAppView: View {
                 }
                 conversationColumn
                     .frame(minWidth: 0, maxWidth: .infinity)
-                if vm.showPlanSidebar {
+                if vm.showPlanSidebar && layout.showsPlanSidebar {
                     planSidebar.frame(minWidth: 240, idealWidth: Self.planSidebarIdealWidth, maxWidth: 420)
                 }
             }
@@ -14854,7 +14937,9 @@ public struct AgentAppView: View {
 
     private var conversationColumn: some View {
         VStack(spacing: 0) {
-            header
+            if layout.showsHeader {
+                header
+            }
             if vm.permissionMode == .fullAccess {
                 fullAccessBanner
             }
