@@ -4674,7 +4674,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 attachments: queued.attachments,
                 queueMessageId: queued.id,
                 queueAcceptancePermit: acceptancePermit,
-                routingSnapshot: queuedRouting
+                routingSnapshot: queuedRouting,
+                allowProviderCatalogListingDuringPreflight: false
             )
             providerStartConfirmed = acceptancePermit.outcome == .accepted
             let drained = try finalizeQueueDispatchAfterProviderStart(
@@ -4913,6 +4914,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // wait on that before startRun.
         let snapshots: [AgentProviderSnapshot]
         if !cachedProviderSnapshots.isEmpty, providerSnapshotsAreFresh {
+            snapshots = cachedProviderSnapshots
+        } else if !cachedProviderSnapshots.isEmpty, !allowProviderCatalogListing {
             snapshots = cachedProviderSnapshots
         } else if !allowProviderCatalogListing {
             return
@@ -5343,7 +5346,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 attachments: queued.attachments,
                 queueMessageId: queued.id,
                 queueAcceptancePermit: acceptancePermit,
-                routingSnapshot: queuedRouting
+                routingSnapshot: queuedRouting,
+                allowProviderCatalogListingDuringPreflight: false
             )
             providerStartConfirmed = acceptancePermit.outcome == .accepted
             let drained = try finalizeQueueDispatchAfterProviderStart(

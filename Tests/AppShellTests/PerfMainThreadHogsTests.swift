@@ -3,6 +3,7 @@ import AgentRuntime
 import CoreModel
 import Persistence
 @testable import AppShell
+@testable import Surfaces
 
 /// Regression pins for the 2026-09-14 live audit (TODO.md F1 / F4): work that
 /// interrupted the main thread per stream event with N concurrent runs.

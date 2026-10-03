@@ -441,15 +441,14 @@ final class ConnectionLifecyclePhase0Tests: XCTestCase {
         }
 
         let webSocketSinceSequence = EventBus.shared.snapshot().lastSeq
-        let completeWebSocketUpgrade = Data(
-            ("GET /v1/ws HTTP/1.1\r\n" +
-             "Host: localhost\r\n" +
-             "Upgrade: websocket\r\n" +
-             "Connection: Upgrade\r\n" +
-             "Sec-WebSocket-Version: 13\r\n" +
-             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
-             "X-RC2-Since-Seq: \(webSocketSinceSequence)\r\n\r\n").utf8
-        )
+        let completeWebSocketUpgradeText: String = "GET /v1/ws HTTP/1.1\r\n" +
+            "Host: localhost\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            "Sec-WebSocket-Version: 13\r\n" +
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+            "X-RC2-Since-Seq: \(webSocketSinceSequence)\r\n\r\n"
+        let completeWebSocketUpgrade = Data(completeWebSocketUpgradeText.utf8)
         let webSocketClient = try connectLoopback(port: port)
         clients.append(webSocketClient)
         let webSocketWritten = completeWebSocketUpgrade.withUnsafeBytes { bytes in
@@ -700,15 +699,14 @@ final class ConnectionLifecyclePhase0Tests: XCTestCase {
         // EventBus head so retained events from earlier suites cannot terminate
         // the WebSocket after its HTTP 101 response.
         let webSocketSinceSequence = EventBus.shared.snapshot().lastSeq
-        let webSocketUpgrade = Data(
-            ("GET /v1/ws HTTP/1.1\r\n" +
-             "Host: localhost\r\n" +
-             "Upgrade: websocket\r\n" +
-             "Connection: Upgrade\r\n" +
-             "Sec-WebSocket-Version: 13\r\n" +
-             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
-             "X-RC2-Since-Seq: \(webSocketSinceSequence)\r\n\r\n").utf8
-        )
+        let webSocketUpgradeText: String = "GET /v1/ws HTTP/1.1\r\n" +
+            "Host: localhost\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            "Sec-WebSocket-Version: 13\r\n" +
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+            "X-RC2-Since-Seq: \(webSocketSinceSequence)\r\n\r\n"
+        let webSocketUpgrade = Data(webSocketUpgradeText.utf8)
         let webSocketUpgradeWritten = webSocketUpgrade.withUnsafeBytes {
             Darwin.write(webSocketClient, $0.baseAddress, $0.count)
         }

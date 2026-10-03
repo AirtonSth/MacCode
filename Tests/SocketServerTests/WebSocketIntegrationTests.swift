@@ -501,15 +501,14 @@ final class WebSocketIntegrationTests: XCTestCase {
         let fd = try connectRawLoopback(port: port)
         defer { Darwin.close(fd) }
         let payload = Array("iOS".utf8)
-        let request = Data(
-            ("GET /v1/ws HTTP/1.1\r\n" +
-             "Host: 127.0.0.1:\(port)\r\n" +
-             "Upgrade: websocket\r\n" +
-             "Connection: Upgrade\r\n" +
-             "Sec-WebSocket-Version: 13\r\n" +
-             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
-             "X-RC2-Since-Seq: \(EventBus.shared.currentSeq)\r\n\r\n").utf8
-        )
+        let requestText: String = "GET /v1/ws HTTP/1.1\r\n" +
+            "Host: 127.0.0.1:\(port)\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            "Sec-WebSocket-Version: 13\r\n" +
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+            "X-RC2-Since-Seq: \(EventBus.shared.currentSeq)\r\n\r\n"
+        let request = Data(requestText.utf8)
         try writeAll(request + maskedPing(payload: payload), to: fd)
 
         let pong = Data([0x8A, UInt8(payload.count)] + payload)
