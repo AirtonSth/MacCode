@@ -2052,6 +2052,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // Token Saver: compress only the text sent to the provider; the
         // original prompt is preserved verbatim as the displayed user message.
         let preservedUserContent = request.userMessageContent ?? request.prompt
+        let tokenSaverInput = request.tokenSaverCompressesPrompt ? request.prompt : preservedUserContent
         var outboundPrompt = request.prompt
         var selectedTransportFormat: TokenSaverBestOfThreeSelector.Format?
         var effectiveEnvironment = request.environment
@@ -2077,14 +2078,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 provider: request.provider
             )
             let selectionRequest = TokenSaverOutboundSelectionRequest(
-                canonicalHuman: preservedUserContent,
+                canonicalHuman: tokenSaverInput,
                 admittedRequest: request,
                 autoRoute: admittedRequest.autoRoute,
                 admittedEnvironment: effectiveEnvironment
             )
             var decision = await selectedSelector(selectionRequest)
                 .bindingToCurrentHuman(
-                    canonicalHuman: preservedUserContent,
+                    canonicalHuman: tokenSaverInput,
                     admittedPrompt: request.prompt,
                     provider: request.provider.rawValue,
                     resolvedModel: request.model
@@ -2096,7 +2097,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     decision = decision.fallingBackToHuman(
                         payload: request.prompt,
                         reason: .candidateError,
-                        canonicalHuman: preservedUserContent
+                        canonicalHuman: tokenSaverInput
                     )
                 }
             }
@@ -2108,7 +2109,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     decision = decision.fallingBackToHuman(
                         payload: request.prompt,
                         reason: .candidateError,
-                        canonicalHuman: preservedUserContent
+                        canonicalHuman: tokenSaverInput
                     )
                 }
             }
@@ -2129,7 +2130,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // scoped-environment composition. Do not invert or double-run env.
             if let promptCompressor {
                 let transformed = await promptCompressor(
-                    preservedUserContent,
+                    tokenSaverInput,
                     request.provider,
                     request.threadId,
                     request.runId

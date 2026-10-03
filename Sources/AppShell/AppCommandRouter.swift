@@ -3731,6 +3731,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         messageID: AgentMessageID,
         terminalStatus: AgentRunStatus? = nil
     ) {
+        botsViewModel?.applyDeskPeerMessage(
+            messageID: messageID,
+            threadID: threadID,
+            terminalStatus: terminalStatus
+        )
         for surface in SurfaceRegistry.shared.all() {
             guard let agent = surface as? AgentAppSurface else { continue }
             agent.viewModel.applyPersistedBotPeerMessage(
@@ -7092,7 +7097,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return configuredProviderBinary(instance.provider)
     }
 
-    private func providerBinary(provider: AgentProvider, instanceId: String?) -> String? {
+    func providerBinary(provider: AgentProvider, instanceId: String?) -> String? {
         if let instance = providerInstanceConfig(id: instanceId, provider: provider) {
             return providerBinary(instance: instance)
         }

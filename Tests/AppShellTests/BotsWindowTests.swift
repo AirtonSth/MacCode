@@ -16898,6 +16898,30 @@ final class BotsWindowTests: XCTestCase {
         return UInt64(value.tv_sec) * 1_000_000_000 + UInt64(value.tv_nsec)
     }
 
+    func test_openingDeskPinsAgentAppToLinkedThreadAndCompilesBrainOnlyIntoPrompt_becauseDeskMustSendThroughAgentApp() async throws {
+        // WHY: the desk must drive Agent App on the bot's own thread; the bot
+        // brain belongs in the provider prompt while the user text stays raw.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        let agent = try XCTUnwrap(vm.deskAgentVM, "desk must own an Agent App VM")
+        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID,
+                                     "opening the desk creates the linked thread eagerly")
+        let embedding = try XCTUnwrap(agent.embedding)
+        XCTAssertEqual(embedding.pinnedThreadId, threadID)
+        XCTAssertEqual(agent.selectedThreadId, threadID)
+        let transform = try XCTUnwrap(embedding.promptTransform)
+        let raw = "Where is the report?"
+        let payload = try await transform(raw, threadID, AgentRunID())
+        XCTAssertNotEqual(payload, raw)
+        XCTAssertTrue(payload.contains(raw))
+        XCTAssertTrue(payload.contains("Piper"), "compiled payload carries the bot brain")
+    }
+
     private func makeContext() throws -> AppContext {
         try AppContext(channel: .debug, appSupportOverride: directory)
     }
