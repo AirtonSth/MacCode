@@ -1409,9 +1409,12 @@ public enum AgentProviderSnapshotFactory {
                 environmentKeys: environmentKeys,
                 models: models,
                 slashCommands: uniqueSlashCommands(
-                    defaults: (interactionModesOverride ?? [.default]).contains(.plan)
+                    defaults: ((interactionModesOverride ?? [.default]).contains(.plan)
                         ? ["/clear", "/default", "/model", "/plan", "/status", "/goal"]
-                        : ["/clear", "/default", "/model", "/status", "/goal"],
+                        : ["/clear", "/default", "/model", "/status", "/goal"])
+                        + (provider == .distill
+                            ? ["/loop", "/compact", "/context", "/session-info", "/deep-research", "/workflow"]
+                            : []),
                     probed: slashCommands
                 ),
                 skills: unique(skills),

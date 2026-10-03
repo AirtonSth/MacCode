@@ -1162,6 +1162,9 @@ public struct AgentChatWorkingStatusStrip: View {
                         .accessibilityIdentifier("agent.working.stop")
                 }
             }
+            if let distill, distill.goal != nil || !distill.scheduledTasks.isEmpty {
+                goalLoopLine(distill)
+            }
             if let distill, !distill.subagents.isEmpty {
                 subagentsList(distill)
             }
@@ -1181,11 +1184,27 @@ public struct AgentChatWorkingStatusStrip: View {
         var line = Text(distill.headline.map { h in
             let secs = distill.headlineSince.map { max(0, Int(now.timeIntervalSince($0))) }
             return secs.map { "\(h) \($0)s" } ?? h
-        } ?? base)
+        } ?? distill.goalHeadline ?? base)
         if let meta = distill.modelEffortText {
             line = line + Text(" · \(meta)").foregroundColor(DS.Palette.success)
         }
         return line
+    }
+
+    private func goalLoopLine(_ distill: DistillLiveStatus) -> some View {
+        var parts: [String] = []
+        if let goal = distill.goal {
+            parts.append("Goal \(goal.status.replacingOccurrences(of: "_", with: " ")) · \(goal.tokensText) tokens")
+        }
+        if !distill.scheduledTasks.isEmpty {
+            parts.append("Loops \(distill.scheduledTasks.count)")
+        }
+        return Text(parts.joined(separator: " · "))
+            .font(DS.Font.caption)
+            .foregroundColor(DS.Palette.textTertiary)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .accessibilityIdentifier("agent.workingStatus.goalLoops")
     }
 
     private func subagentsList(_ distill: DistillLiveStatus) -> some View {

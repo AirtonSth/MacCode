@@ -55,6 +55,53 @@ final class DistillLiveStatusTests: XCTestCase {
         XCTAssertTrue(s.isEmpty)
     }
 
+    func test_goalActiveThenCleared_stripShowsGoalOnlyWhileItExists() {
+        var s = DistillLiveStatus()
+        send(&s, "main", ["sessionUpdate": "goal_updated", "goal_id": "g1", "objective": "ship it",
+                          "status": "active", "phase": "executing", "token_budget": 100_000,
+                          "tokens_used": 12_000, "elapsed_ms": 5_000, "total_worker_rounds": 2])
+        XCTAssertEqual(s.goalHeadline, "Goal: ship it — executing")
+        XCTAssertEqual(s.goal?.tokensText, "12k / 100k")
+        XCTAssertEqual(s.goal?.rounds, 2)
+        send(&s, "main", ["sessionUpdate": "auto_compact_started"])
+        XCTAssertNil(s.goalHeadline, "compaction headline wins over the goal headline")
+        send(&s, "main", ["sessionUpdate": "goal_updated", "goal_id": "g1", "status": "cleared"])
+        XCTAssertNil(s.goal)
+        XCTAssertTrue(s.scheduledTasks.isEmpty)
+    }
+
+    func test_scheduledTaskCreatedFiredDeleted_loopsLineTracksLiveTasks() {
+        var s = DistillLiveStatus()
+        let fired = Date(timeIntervalSince1970: 100)
+        send(&s, "main", ["sessionUpdate": "scheduled_task_created", "task_id": "t1", "prompt": "check ci",
+                          "human_schedule": "every 5m"])
+        XCTAssertEqual(s.scheduledTasks.map(\.id), ["t1"])
+        XCTAssertEqual(s.scheduledTasks[0].humanSchedule, "every 5m")
+        send(&s, "main", ["sessionUpdate": "scheduled_task_fired", "task_id": "t1"], at: fired)
+        XCTAssertEqual(s.scheduledTasks[0].lastFiredAt, fired)
+        XCTAssertEqual(s.scheduledTasks[0].prompt, "check ci")
+        send(&s, "main", ["sessionUpdate": "scheduled_task_deleted", "task_id": "t1"])
+        XCTAssertTrue(s.isEmpty)
+    }
+
+    func test_advertisedCommands_foldIntoComposerSuggestionsWithDescriptionAndHint() throws {
+        // WHY: the composer must show Distill's own catalog (skills, /loop, ...) instead of a stale static list.
+        let json = #"{"availableCommands":[{"name":"loop","description":"Run on interval","input":{"hint":"<interval> <prompt>"}}]}"#
+        let commands = try XCTUnwrap(DistillLiveStatus.advertisedCommands(method: "available_commands_update", payloadJSON: json))
+        XCTAssertEqual(commands.map(\.name), ["loop"])
+        XCTAssertNil(DistillLiveStatus.advertisedCommands(method: "plan", payloadJSON: json))
+
+        let out = AgentComposerSuggestions.suggestions(
+            for: "/lo",
+            snapshot: nil,
+            localSlashCommands: [],
+            extraCommands: commands.map { "/\($0.name)" },
+            commandSubtitles: ["loop": try XCTUnwrap(commands[0].subtitle)]
+        )
+        XCTAssertEqual(out.first?.title, "/loop")
+        XCTAssertEqual(out.first?.subtitle, "Run on interval · <interval> <prompt>")
+    }
+
     func test_tokenFormatting_matchesTuiStyle() {
         XCTAssertEqual(DistillLiveStatus.formatTokens(135_000), "135k")
         XCTAssertEqual(DistillLiveStatus.formatTokens(1_500), "1.5k")

@@ -401,6 +401,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var provider: AgentProvider = .defaultProvider
     /// Live Distill compaction/model/subagent state for the selected thread's run.
     @Published public private(set) var distillLive: DistillLiveStatus?
+    /// Commands Distill advertised via `available_commands_update` (kept across threads).
+    @Published public private(set) var distillSlashCommands: [DistillLiveStatus.AdvertisedCommand] = []
     @Published public var providerInstanceId: String = AgentProvider.defaultProvider.rawValue
     /// macOS account that will execute the next provider process through the shared helper.
     /// Nil / current-account means no privileged trampoline.
@@ -5819,9 +5821,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             cursorOffset: composerCursorOffset,
             snapshot: selectedProviderSnapshot,
             localSlashCommands: Self.localSlashCommands,
-            extraCommands: isClaude ? ClaudeSlashCommandDiscovery.builtInClaudeCommands : [],
+            extraCommands: isClaude
+                ? ClaudeSlashCommandDiscovery.builtInClaudeCommands
+                : distillAdvertisedCommandNames,
             extraSkillNames: extraSkillNames,
-            mentionableBots: mentionableBots
+            mentionableBots: mentionableBots,
+            commandSubtitles: distillCommandSubtitles
         )
     }
 
@@ -7747,6 +7752,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// provider. Provider commands such as `/goal` must pass through.
     public static let localSlashCommands = ["/clear", "/default", "/fork", "/model", "/plan", "/status"]
 
+    private var distillAdvertisedCommandNames: [String] {
+        provider == .distill ? distillSlashCommands.map { "/\($0.name)" } : []
+    }
+
+    private var distillCommandSubtitles: [String: String] {
+        guard provider == .distill else { return [:] }
+        return Dictionary(
+            distillSlashCommands.compactMap { cmd in cmd.subtitle.map { (cmd.name.lowercased(), $0) } },
+            uniquingKeysWith: { first, _ in first }
+        )
+    }
+
     /// Parse a local RemoteCode slash/dollar command. Public so scheduled Path B
     /// can reject UI-only commands the same way Agent App intercepts them.
     public static func localSlashCommandParts(_ raw: String) -> (command: String, argument: String)? {
@@ -7766,6 +7783,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let parts = Self.localSlashCommandParts(raw) else { return false }
         let cmd = parts.command
         let arg = parts.argument
+        // Distill owns `/status` (alias of session-info); let it reach the agent.
+        if cmd == "status", provider == .distill { return false }
         switch cmd {
         case "clear":
             createThread(title: "New thread")
@@ -8041,6 +8060,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             providerSlashCommands: Array(Set(
                 (selectedProviderSnapshot?.slashCommands ?? [])
                     + AgentComposerSuggestions.passThroughSlashCommands
+                    + distillAdvertisedCommandNames
             )),
             skills: selectedProviderSnapshot?.skills ?? []
         )
@@ -10006,6 +10026,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             Task { @MainActor in
                 self.applyDistillRuntime(runtime, run: run, threadId: threadId)
             }
+        } else if case .providerRuntime(let runtime) = event,
+                  runtime.provider == .distill,
+                  runtime.method == "available_commands_update" {
+            Task { @MainActor in
+                self.applyDistillAdvertisedCommands(runtime)
+            }
         }
         let outcome = streamEventBatch.appendBounded(event: event, run: run, threadId: threadId)
         switch outcome {
@@ -10047,9 +10073,27 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private func applyDistillRuntime(_ runtime: ProviderRuntimeEvent, run: AgentRunID, threadId: AgentThreadID) {
         guard !isDisposed, selectedThreadId == threadId else { return }
-        var next = distillLive?.runId == run ? distillLive ?? DistillLiveStatus(runId: run) : DistillLiveStatus(runId: run)
+        var next: DistillLiveStatus
+        if distillLive?.runId == run, let current = distillLive {
+            next = current
+        } else {
+            // Goal and loops outlive a run; compaction/subagents do not.
+            next = DistillLiveStatus(runId: run)
+            next.goal = distillLive?.goal
+            next.scheduledTasks = distillLive?.scheduledTasks ?? []
+        }
         next.apply(method: runtime.method, payloadJSON: runtime.payloadJSON)
         if next != distillLive { distillLive = next }
+    }
+
+    private func applyDistillAdvertisedCommands(_ runtime: ProviderRuntimeEvent) {
+        guard !isDisposed,
+              let commands = DistillLiveStatus.advertisedCommands(
+                method: runtime.method,
+                payloadJSON: runtime.payloadJSON
+              ),
+              commands != distillSlashCommands else { return }
+        distillSlashCommands = commands
     }
 
     private func resetTimelineUpdateTick() {
@@ -10814,6 +10858,7 @@ public enum AgentComposerSuggestions {
         extraCommands: [String] = [],
         extraSkillNames: [String] = [],
         mentionableBots: [BotDefinition] = [],
+        commandSubtitles: [String: String] = [:],
         limit: Int = 8
     ) -> [AgentComposerSuggestion] {
         let token = activeToken(in: text, cursorOffset: cursorOffset)
@@ -10862,7 +10907,11 @@ public enum AgentComposerSuggestions {
             let source = localSlashCommands.contains(command) || localSlashCommands.contains("/\(bare)")
                 ? "RemoteCode command"
                 : "\(display) command"
-            candidates.append(Candidate(bare: bare, kind: .slashCommand, subtitle: source))
+            candidates.append(Candidate(
+                bare: bare,
+                kind: .slashCommand,
+                subtitle: commandSubtitles[bare.lowercased()] ?? source
+            ))
         }
         for skill in skills where !skill.isEmpty {
             candidates.append(Candidate(

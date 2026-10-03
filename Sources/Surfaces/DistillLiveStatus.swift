@@ -52,7 +52,42 @@ public struct DistillLiveStatus: Equatable, Sendable {
         }
     }
 
+    /// `/goal` progress folded from `goal_updated`.
+    public struct Goal: Equatable, Sendable {
+        public var id: String
+        public var objective: String
+        /// active / user_paused / back_off_paused / no_progress_paused / infra_paused / blocked / budget_limited / complete
+        public var status: String
+        /// idle / planning / executing
+        public var phase: String
+        public var tokensUsed: Int
+        public var tokenBudget: Int?
+        public var elapsedMs: Int
+        public var rounds: Int
+
+        public var isActive: Bool { status == "active" }
+
+        /// "Goal: <objective> — <phase>"
+        public var headline: String { "Goal: \(objective) — \(phase)" }
+
+        /// "12k / 100k" or "12k" without a budget.
+        public var tokensText: String {
+            let used = DistillLiveStatus.formatTokens(tokensUsed)
+            guard let tokenBudget, tokenBudget > 0 else { return used }
+            return "\(used) / \(DistillLiveStatus.formatTokens(tokenBudget))"
+        }
+    }
+
+    /// `/loop` task folded from `scheduled_task_*`.
+    public struct ScheduledTask: Equatable, Sendable, Identifiable {
+        public var id: String
+        public var prompt: String
+        public var humanSchedule: String?
+        public var lastFiredAt: Date?
+    }
+
     public static let maxSubagents = 50
+    public static let maxScheduledTasks = 50
 
     /// Run these events belong to; the owner resets the value when it changes.
     public var runId: AgentRunID?
@@ -60,6 +95,8 @@ public struct DistillLiveStatus: Equatable, Sendable {
     public var model: String?
     public var effort: String?
     public var subagents: [Subagent] = []
+    public var goal: Goal?
+    public var scheduledTasks: [ScheduledTask] = []
 
     public init(runId: AgentRunID? = nil) {
         self.runId = runId
@@ -74,6 +111,12 @@ public struct DistillLiveStatus: Equatable, Sendable {
         if let sub = compactingSubagent { return "Subagent (\(sub.description)): Compacting…" }
         if mainCompactingSince != nil { return "Compacting…" }
         return nil
+    }
+
+    /// Goal headline while a goal is actively running (compaction headline wins).
+    public var goalHeadline: String? {
+        guard headline == nil, let goal, goal.isActive else { return nil }
+        return goal.headline
     }
 
     /// Start of the compaction the headline describes.
@@ -92,6 +135,7 @@ public struct DistillLiveStatus: Equatable, Sendable {
 
     public var isEmpty: Bool {
         headline == nil && modelEffortText == nil && subagents.isEmpty
+            && goal == nil && scheduledTasks.isEmpty
     }
 
     /// 135000 → "135k", 1500 → "1.5k", 950 → "950".
@@ -109,7 +153,7 @@ public struct DistillLiveStatus: Equatable, Sendable {
     }
 
     private static let kinds: [String] = [
-        "auto_compact_", "subagent_", "model_changed"
+        "auto_compact_", "subagent_", "model_changed", "goal_updated", "scheduled_task_"
     ]
 
     public static func isCarrierMethod(_ method: String) -> Bool {
@@ -174,8 +218,72 @@ public struct DistillLiveStatus: Equatable, Sendable {
         case "model_changed":
             model = Self.string(update["model_id"]) ?? model
             effort = Self.string(update["reasoning_effort"]) ?? effort
+        case "goal_updated":
+            let status = Self.string(update["status"]) ?? "active"
+            guard status != "cleared" else { goal = nil; return }
+            guard let objective = Self.string(update["objective"]) ?? goal?.objective else { return }
+            goal = Goal(
+                id: Self.string(update["goal_id"]) ?? goal?.id ?? "goal",
+                objective: objective,
+                status: status,
+                phase: Self.string(update["phase"]) ?? goal?.phase ?? "idle",
+                tokensUsed: Self.int(update["tokens_used"]) ?? goal?.tokensUsed ?? 0,
+                tokenBudget: Self.int(update["token_budget"]) ?? goal?.tokenBudget,
+                elapsedMs: Self.int(update["elapsed_ms"]) ?? goal?.elapsedMs ?? 0,
+                rounds: Self.int(update["total_worker_rounds"]) ?? goal?.rounds ?? 0
+            )
+        case "scheduled_task_created", "scheduled_task_fired":
+            guard let id = Self.string(update["task_id"]) else { return }
+            let index = scheduledTasks.firstIndex(where: { $0.id == id })
+            var task = index.map { scheduledTasks[$0] }
+                ?? ScheduledTask(id: id, prompt: "", humanSchedule: nil, lastFiredAt: nil)
+            task.prompt = Self.string(update["prompt"]) ?? task.prompt
+            task.humanSchedule = Self.string(update["human_schedule"]) ?? task.humanSchedule
+            if kind == "scheduled_task_fired" { task.lastFiredAt = receivedAt }
+            if let index {
+                scheduledTasks[index] = task
+            } else {
+                scheduledTasks.append(task)
+                if scheduledTasks.count > Self.maxScheduledTasks { scheduledTasks.removeFirst() }
+            }
+        case "scheduled_task_deleted":
+            guard let id = Self.string(update["task_id"]) else { return }
+            scheduledTasks.removeAll(where: { $0.id == id })
         default:
             break
+        }
+    }
+
+    /// Distill-advertised slash command (`available_commands_update`).
+    public struct AdvertisedCommand: Equatable, Sendable {
+        public var name: String
+        public var description: String?
+        public var hint: String?
+
+        /// Composer subtitle: "<description> · <hint>".
+        public var subtitle: String? {
+            let parts = [description, hint].compactMap { $0 }.filter { !$0.isEmpty }
+            return parts.isEmpty ? nil : parts.joined(separator: " · ")
+        }
+    }
+
+    /// Replace-all list from an `available_commands_update` runtime event; nil for other methods.
+    public static func advertisedCommands(method: String, payloadJSON: String) -> [AdvertisedCommand]? {
+        guard method == "available_commands_update",
+              let data = payloadJSON.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let raw = (payload["availableCommands"] as? [[String: Any]])
+            ?? ((payload["update"] as? [String: Any])?["availableCommands"] as? [[String: Any]])
+            ?? []
+        return raw.compactMap { entry in
+            guard let name = Self.string(entry["name"]) else { return nil }
+            return AdvertisedCommand(
+                name: name,
+                description: Self.string(entry["description"]),
+                hint: Self.string((entry["input"] as? [String: Any])?["hint"])
+            )
         }
     }
 

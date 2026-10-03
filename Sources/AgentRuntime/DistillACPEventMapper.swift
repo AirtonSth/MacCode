@@ -359,7 +359,8 @@ public final class DistillACPEventMapper: @unchecked Sendable {
     private func applyAvailableCommandsUpdate(_ update: [String: Any], events: inout [AssistantEvent]) {
         availableCommands = (update["availableCommands"] as? [[String: Any]] ?? []).compactMap { raw in
             guard let name = raw["name"] as? String, !name.isEmpty else { return nil }
-            return DistillACPAvailableCommand(name: name, description: raw["description"] as? String)
+            let hint = (raw["input"] as? [String: Any])?["hint"] as? String
+            return DistillACPAvailableCommand(name: name, description: raw["description"] as? String, hint: hint)
         }
         events.append(Self.runtimeEvent(method: "available_commands_update", payload: update))
     }

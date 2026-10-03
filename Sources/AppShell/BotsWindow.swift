@@ -10140,6 +10140,12 @@ public final class BotsViewModel: ObservableObject {
                 conversationID: conversation.id
             )
         }
+        // Distill resolves `/name args` only when the prompt starts with the slash;
+        // the brain wrap would bury it, so slash commands go through raw.
+        if routing.provider == .distill,
+           text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/") {
+            return text
+        }
         return receipt.compiledPayload
     }
 

@@ -5057,10 +5057,18 @@ final class AgentAppViewModelTests: XCTestCase {
     func test_slashStatus_appendsSystemSummary() throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "t")
+        vm.provider = .codex
         vm.handleSlashCommand("/status")
         XCTAssertEqual(vm.messages.last?.role, .system)
         XCTAssertTrue(vm.messages.last?.content.contains("provider=") ?? false,
                       "/status must surface the run configuration")
+    }
+
+    func test_distillSlashStatus_reachesAgentBecauseDistillOwnsSessionInfoAlias() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "t")
+        vm.provider = .distill
+        XCTAssertFalse(vm.handleSlashCommand("/status"))
     }
 
     func test_slashUnknown_returnsFalseSoProviderCanHandleIt() async throws {

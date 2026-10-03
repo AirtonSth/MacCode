@@ -329,6 +329,13 @@ public struct DistillACPInitializeResult: Sendable, Equatable {
 public struct DistillACPAvailableCommand: Sendable, Equatable {
     public let name: String
     public let description: String?
+    public let hint: String?
+
+    public init(name: String, description: String?, hint: String? = nil) {
+        self.name = name
+        self.description = description
+        self.hint = hint
+    }
 }
 
 public struct DistillACPPermissionOption: Sendable, Equatable {
@@ -1212,10 +1219,17 @@ public final class DistillACPClient: @unchecked Sendable {
                 + "\n\n" + BotPeerDelegation.providerDirective,
             environment: request.environment
         )
-        let composed = providerPrompt.isEmpty
-            ? alwaysOn
-            : providerPrompt + "\n\n" + alwaysOn
-        if !composed.isEmpty { blocks.append(["type": "text", "text": composed]) }
+        if providerPrompt.drop(while: { $0.isWhitespace }).hasPrefix("/") {
+            // Distill parses `/name args` from the FIRST text block only, so the
+            // directive rides in its own following block to keep args exact.
+            blocks.append(["type": "text", "text": providerPrompt])
+            if !alwaysOn.isEmpty { blocks.append(["type": "text", "text": alwaysOn]) }
+        } else {
+            let composed = providerPrompt.isEmpty
+                ? alwaysOn
+                : providerPrompt + "\n\n" + alwaysOn
+            if !composed.isEmpty { blocks.append(["type": "text", "text": composed]) }
+        }
         for attachment in request.attachments {
             switch attachment.kind {
             case .image:
