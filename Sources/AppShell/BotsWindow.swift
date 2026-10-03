@@ -9944,7 +9944,8 @@ public final class BotsViewModel: ObservableObject {
                     bot: bot,
                     conversation: conversation,
                     routing: frozenDeskRouting(for: conversation),
-                    router: router
+                    router: router,
+                    markStarted: false
                 ).conversation
             } catch {
                 errorMessage = String(describing: error)
@@ -10022,8 +10023,47 @@ public final class BotsViewModel: ObservableObject {
             try router?.markAgentThreadRead(thread: id)
         }
         vm.refreshProviderSnapshotsInBackground()
+        AppCommandRouter.wireTokenSaverThreadFooter(on: vm, context: context)
+        installBotQueueHooks(on: router)
         deskAgentKey = key
         deskAgentVM = vm
+    }
+
+    /// Queue-drained follow-ups bypass the embedded composer, so the router asks
+    /// here to compile the brain for any bot-linked thread, selected or not.
+    private func installBotQueueHooks(on router: AppCommandRouter) {
+        router.botThreadPromptTransform = { [weak self] threadID, text, runID in
+            guard let self,
+                  let conversation = try? self.botStore.conversationLinked(to: threadID),
+                  let bot = self.bots.first(where: { $0.id == conversation.botID })
+                    ?? (try? self.botStore.get(id: conversation.botID)) else { return nil }
+            let prompt = try self.compileDeskPrompt(
+                botID: bot.id,
+                conversationID: conversation.id,
+                text: text,
+                threadID: threadID,
+                runID: runID
+            )
+            let cwd = BotHome(appSupportDirectory: self.context.appSupportDirectory, bot: bot).root.path
+            try? FileManager.default.createDirectory(
+                at: URL(fileURLWithPath: cwd),
+                withIntermediateDirectories: true
+            )
+            return AppCommandRouter.BotThreadQueuedPrompt(prompt: prompt, cwd: cwd)
+        }
+        router.botThreadRunStarted = { [weak self] runID, threadID in
+            guard let self,
+                  let conversation = try? self.botStore.conversationLinked(to: threadID) else { return }
+            self.deskAgentRunStarted(
+                botID: conversation.botID,
+                conversationID: conversation.id,
+                runID: runID
+            )
+        }
+    }
+
+    func lastStartedConversationForTesting(botID: BotID) -> BotConversation? {
+        lastStartedConversationByBot[botID]
     }
 
     private func tearDownDeskAgentVM() {
@@ -10065,7 +10105,7 @@ public final class BotsViewModel: ObservableObject {
         let routing = thread.map { BotDeskRouting(thread: $0) } ?? deskRouting
         let model = routing.resolvedModel(defaultModel: Self.defaultModel(for:))
         let conversation = conversations.first(where: { $0.id == conversationID })
-            ?? selectedConversation
+            ?? ((try? botStore.conversation(id: conversationID)) ?? nil)
         let brain = destBrainInputs(for: bot)
         let receipt = BotBrainCompiler.assemble(
             bot: bot,
@@ -10095,6 +10135,7 @@ public final class BotsViewModel: ObservableObject {
             _ = try? persistUserMessage(
                 bot: bot,
                 text: text,
+                adoptSelection: selectedConversation?.id == conversation.id,
                 conversationID: conversation.id
             )
         }
@@ -10139,7 +10180,8 @@ public final class BotsViewModel: ObservableObject {
         bot: BotDefinition,
         conversation: BotConversation,
         routing: BotDeskRouting,
-        router: AppCommandRouter
+        router: AppCommandRouter,
+        markStarted: Bool = true
     ) throws -> (thread: AgentThread, conversation: BotConversation) {
         let model = routing.resolvedModel(defaultModel: Self.defaultModel(for:))
         var liveConversation = conversation
@@ -10213,7 +10255,9 @@ public final class BotsViewModel: ObservableObject {
             thread = createdThread
             liveConversation.linkedAgentThreadID = thread.id
             try botStore.upsertConversation(liveConversation)
-            lastStartedConversationByBot[liveConversation.botID] = liveConversation
+            if markStarted {
+                lastStartedConversationByBot[liveConversation.botID] = liveConversation
+            }
             adoptFollowThroughConversation(liveConversation)
         }
         return (thread, liveConversation)

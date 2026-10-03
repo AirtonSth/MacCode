@@ -404,6 +404,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     var terminalRestartRuntimePreparerForTesting: ((WorkspaceID, String, SurfaceID) -> TerminalPreparedPTYRuntime?)?
     var terminalRestartPreparedDiscardAdditionalBarrierForTesting: (() -> SurfaceTerminationBarrier?)?
     var queueDispatchBeforeProviderStartForTesting: (() async -> Void)?
+    /// Bot desk hook for queue-drained sends: returns the compiled brain prompt and
+    /// bot-home cwd for a bot-linked thread, nil for any other thread.
+    struct BotThreadQueuedPrompt {
+        let prompt: String
+        let cwd: String?
+    }
+    var botThreadPromptTransform: (@MainActor (AgentThreadID, String, AgentRunID) async throws -> BotThreadQueuedPrompt?)?
+    /// Fires after a queue-drained run starts on any thread; the bot desk records its receipt here.
+    var botThreadRunStarted: (@MainActor (AgentRunID, AgentThreadID) -> Void)?
     var beforePullRequestThreadCommitForTesting: (() throws -> Void)?
     /// Fires after inbound attachments pass `validatedForRetry` on the managed store.
     var sendAgentMessageResolvedAttachmentsProbeForTesting: (([AgentAttachment]) -> Void)?
@@ -3747,7 +3756,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     /// Bind the cumulative Token Saver "saved in this thread" footer to the shared ledger.
-    private static func wireTokenSaverThreadFooter(on viewModel: AgentAppViewModel, context: AppContext) {
+    static func wireTokenSaverThreadFooter(on viewModel: AgentAppViewModel, context: AppContext) {
         let savingsRepo = context.tokenSaverSavingsRepo
         let db = context.db
         let settingsRepo = context.settingsRepo
@@ -5182,14 +5191,25 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 )
             }
         }
-        let req = AgentRunRequest(
+        var runPrompt = text
+        var runCwd = cwd
+        var botPromptApplied = false
+        if queueMessageId != nil,
+           let transform = botThreadPromptTransform,
+           let transformed = try await transform(thread, text, requestedRunID) {
+            runPrompt = transformed.prompt
+            if let botCwd = transformed.cwd { runCwd = GrokACPClient.resolvedSessionCwd(botCwd) }
+            botPromptApplied = true
+        }
+        var req = AgentRunRequest(
             runId: requestedRunID,
             threadId: thread,
             provider: prov,
             providerInstanceId: t.providerInstanceId,
             model: m,
-            cwd: cwd,
-            prompt: text,
+            cwd: runCwd,
+            prompt: runPrompt,
+            userMessageContent: botPromptApplied ? text : nil,
             attachments: resolvedAttachments,
             providerThreadId: t.providerThreadId,
             permissionMode: t.permissionMode,
@@ -5206,6 +5226,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             runAsUser: t.runAsUser,
             acceptancePermit: acceptancePermit
         )
+        req.tokenSaverCompressesPrompt = botPromptApplied
         let runId: AgentRunID
         do {
             runId = try await ctx.coordinator.startRun(req, routingSnapshot: coordinatorSnapshot)
@@ -5229,6 +5250,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             workspace: t.workspaceId,
             reloadTranscriptIfSelected: true
         )
+        if botPromptApplied { botThreadRunStarted?(runId, thread) }
         return AgentMessageSendResult(status: .started, runId: runId)
     }
 

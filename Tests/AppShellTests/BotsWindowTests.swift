@@ -16781,6 +16781,64 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(payload.contains("Piper"), "compiled payload carries the bot brain")
     }
 
+    func test_queuedFollowUpOnBotThreadCompilesBrainButKeepsUserTextRaw_becauseQueueDrainBypassesEmbeddedComposer() async throws {
+        // WHY: a follow-up typed while a run is live is drained by the host, not
+        // the embedded composer; without the router hook the bot would answer
+        // with no identity, memory or approval honesty.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.grok, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .grok,
+                models: [AgentModelDescriptor(id: "grok-4.6", label: "Grok 4.6", provider: .grok)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "grok"
+            ),
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .grok, model: "grok-4.6")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        XCTAssertNotNil(vm.deskAgentVM)
+        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID)
+        let raw = "queued follow-up question"
+        _ = try context.queuedMessageRepo.enqueue(
+            threadId: threadID,
+            text: raw,
+            attachments: [],
+            interactionMode: .default
+        )
+        try await router.drainNextQueuedAgentMessage(thread: threadID)
+        let request = try XCTUnwrap(runner.requests.first)
+        XCTAssertNotEqual(request.prompt, raw)
+        XCTAssertTrue(request.prompt.contains(raw))
+        XCTAssertTrue(request.prompt.contains("Piper"), "queued send carries the bot brain")
+        XCTAssertEqual(request.userMessageContent, raw, "visible user message stays the raw text")
+        XCTAssertTrue(request.tokenSaverCompressesPrompt)
+        let home = BotHome(appSupportDirectory: context.appSupportDirectory, bot: bot).root
+        XCTAssertTrue(request.cwd.hasSuffix(home.lastPathComponent),
+                      "bot threads run in the bot home, not the process cwd")
+    }
+
+    func test_openingUnlinkedConversationDoesNotMarkItStarted_becauseViewingIsNotSending() throws {
+        // WHY: the embedded Agent App needs a thread, so viewing creates one, but
+        // lastStartedConversationByBot drives "the bot just ran" bookkeeping and
+        // must only move on a real send.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        XCTAssertNotNil(vm.selectedConversation?.linkedAgentThreadID, "viewing links a thread eagerly")
+        XCTAssertNil(vm.lastStartedConversationForTesting(botID: bot.id))
+    }
+
     func test_embeddedAgentAppOwnsLiveStream_becauseDeskMustNotRepublishPerTokenBesideAgentApp() async throws {
         // WHY: the embedded Agent App already paints this thread. A second desk
         // pipeline publishing deskLiveTimeline per token invalidates the whole
