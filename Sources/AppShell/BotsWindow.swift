@@ -10140,13 +10140,26 @@ public final class BotsViewModel: ObservableObject {
                 conversationID: conversation.id
             )
         }
-        // Distill resolves `/name args` only when the prompt starts with the slash;
-        // the brain wrap would bury it, so slash commands go through raw.
-        if routing.provider == .distill,
-           text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/") {
-            return text
+        return Self.supervisedRunPrompt(
+            userText: text,
+            compiledPayload: receipt.compiledPayload,
+            provider: routing.provider
+        )
+    }
+
+    /// Distill resolves `/name args` only when the prompt starts with the slash;
+    /// the brain wrap would bury it, so slash commands go through raw. Shared by
+    /// the embedded desk and the paired-device (iOS) supervised run.
+    nonisolated static func supervisedRunPrompt(
+        userText: String,
+        compiledPayload: String,
+        provider: AgentProvider
+    ) -> String {
+        if provider == .distill,
+           userText.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/") {
+            return userText
         }
-        return receipt.compiledPayload
+        return compiledPayload
     }
 
     private func deskAgentRunStarted(
@@ -10500,7 +10513,11 @@ public final class BotsViewModel: ObservableObject {
             try? FileManager.default.createDirectory(at: URL(fileURLWithPath: botHomeCwd), withIntermediateDirectories: true)
             let result = try await router.sendAgentMessage(
                 thread: prepared.thread.id,
-                text: receipt.compiledPayload,
+                text: Self.supervisedRunPrompt(
+                    userText: userText,
+                    compiledPayload: receipt.compiledPayload,
+                    provider: routing.provider
+                ),
                 provider: routing.provider,
                 model: model,
                 permissionMode: routing.permissionMode,

@@ -11,6 +11,23 @@ import Surfaces
 
 @MainActor
 final class BotsWindowTests: XCTestCase {
+    func test_supervisedRunPromptKeepsDistillSlashRaw_becausePairedDeviceSendsMustReachDistillCommands() {
+        // iOS bot sends run startSupervisedRun, not the embedded desk; the brain
+        // wrap would bury `/goal status` so Distill would treat it as a goal objective.
+        XCTAssertEqual(
+            BotsViewModel.supervisedRunPrompt(userText: "  /goal status", compiledPayload: "BRAIN\nUser request:\n/goal status", provider: .distill),
+            "  /goal status"
+        )
+        XCTAssertEqual(
+            BotsViewModel.supervisedRunPrompt(userText: "hello", compiledPayload: "BRAIN", provider: .distill),
+            "BRAIN"
+        )
+        XCTAssertEqual(
+            BotsViewModel.supervisedRunPrompt(userText: "/goal x", compiledPayload: "BRAIN", provider: .codex),
+            "BRAIN"
+        )
+    }
+
     func test_botScheduleLegacyDistillInstanceResolvesModelsFromDistillACPSnapshot() {
         let snapshot = AgentProviderSnapshot(
             id: "distill-acp", provider: .distill, driverKind: .distillACP,
@@ -17446,4 +17463,5 @@ final class ControlledBotHandoffRunner: AgentProviderRunner, @unchecked Sendable
         ))
         return true
     }
+
 }
