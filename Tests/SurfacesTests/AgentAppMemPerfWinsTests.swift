@@ -808,14 +808,15 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
         )
     }
 
-    // MARK: - Unique vs 393: memoize history chatFlowRows; live tail stays fresh
+    // MARK: - Unique vs 404: skip split + live weave on chrome-only ticks
 
     @MainActor
     func test_cachedChatFlowPaint_skipsRebuildOnChromeOnlyTicks() throws {
         // WHY: chrome-only / paint-tick bodies split and wove ChatFlowRow on
         // every column pass. History identity (generation + history first/last
         // ids + count) is stable on those ticks — rebuilding the finished
-        // weave is wasted. The live suffix still weaves each pass.
+        // weave is wasted. The live suffix still weaves every pass so progress
+        // and same-length tool text cannot go stale.
         let (vm, rootURL) = try makeVM()
         defer {
             vm.dispose()
@@ -833,6 +834,7 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
 
         let before = AgentAppView.chatFlowPaintComputeCountForTesting
         let beforeLive = AgentAppView.chatFlowPaintLiveComputeCountForTesting
+        let beforeSplit = AgentAppView.chatFlowPaintSplitCountForTesting
         let first = view.cachedChatFlowPaintForTesting(
             paintSequence: paint,
             latestLiveTurnId: "t-live"
@@ -857,7 +859,12 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
         XCTAssertEqual(
             AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive,
             201,
-            "live tail must reweave on every paint while a live turn exists"
+            "live tail must reweave on every paint so progress and text stay fresh"
+        )
+        XCTAssertEqual(
+            AgentAppView.chatFlowPaintSplitCountForTesting - beforeSplit,
+            1,
+            "chrome-only ticks with stable paint ends must skip splitTrailingLiveTurns"
         )
 
         let longer = paint + [.message(extra)]
@@ -904,15 +911,14 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
             start: "private func cachedChatFlowPaint(",
             endMarker: "func cachedChatRowPaintContextForTesting"
         )
-        XCTAssertTrue(helper.contains("historyRows = Self.chatFlowRows(split.history)"))
-        XCTAssertTrue(helper.contains("Self.chatFlowRows(split.liveTail)"))
         XCTAssertTrue(helper.contains("Self.splitTrailingLiveTurns("))
+        XCTAssertFalse(helper.contains("liveTailGrowthSignature"))
         XCTAssertFalse(
             helper.contains("chatFlowPaintCache.liveRows"),
             "live ChatFlowRows must not be memoized"
         )
         let countsIdx = try XCTUnwrap(helper.range(of: "chatFlowPaintCache.count == count"))
-        let rowsIdx = try XCTUnwrap(helper.range(of: "Self.chatFlowRows(split.history)"))
+        let rowsIdx = try XCTUnwrap(helper.range(of: "Self.chatFlowRows("))
         XCTAssertTrue(
             countsIdx.lowerBound < rowsIdx.lowerBound,
             "generation+first/last/count hit must precede history chatFlowRows"
@@ -1001,6 +1007,107 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
         )
         XCTAssertEqual(AgentAppView.chatFlowPaintComputeCountForTesting - before, 1)
         XCTAssertEqual(AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive, 3)
+
+        live.items[0].output = "b"
+        let replaced = view.cachedChatFlowPaintForTesting(
+            paintSequence: [.turn(history), .turn(live)],
+            latestLiveTurnId: "t-live"
+        )
+        XCTAssertEqual(
+            Self.chatFlowToolPayloads(replaced.liveRows).first,
+            "tool-1:ls:b",
+            "same-length tool output replacement must miss the live-tail cache"
+        )
+        XCTAssertEqual(AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive, 4)
+
+        live.items[0].progress = 0.4
+        let progressed = view.cachedChatFlowPaintForTesting(
+            paintSequence: [.turn(history), .turn(live)],
+            latestLiveTurnId: "t-live"
+        )
+        XCTAssertEqual(
+            Self.firstLiveTool(progressed.liveRows)?.progress,
+            0.4,
+            "progress-only updates must miss the live-tail cache"
+        )
+        XCTAssertEqual(AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive, 5)
+
+        live.items[0].summary = "compile"
+        let summarized = view.cachedChatFlowPaintForTesting(
+            paintSequence: [.turn(history), .turn(live)],
+            latestLiveTurnId: "t-live"
+        )
+        XCTAssertEqual(
+            Self.firstLiveTool(summarized.liveRows)?.summary,
+            "compile",
+            "summary-only updates must miss the live-tail cache"
+        )
+        XCTAssertEqual(AgentAppView.chatFlowPaintLiveComputeCountForTesting - beforeLive, 6)
+    }
+
+    func test_workingStripScan_warmedTrailingWalkBeatsFullTimeline() {
+        // WHY: header chrome scanned every finished turn. The replacement must
+        // be faster on the same 800-turn workload, five warmed samples, and
+        // inside max(25ms, 5%). A full-text live-row hash failed that bar, so
+        // live rows stay uncached.
+        let item = AssistantItem(
+            id: "old-tool",
+            turnId: "t",
+            type: .tool,
+            state: .completed,
+            body: "echo",
+            startedAtMs: 1
+        )
+        let finished = (0..<800).map { index in
+            AssistantTurnSnapshot(
+                turnId: "t-\(index)",
+                items: Array(repeating: item, count: 25),
+                finished: true
+            )
+        }
+        let turns = finished + [AssistantTurnSnapshot(turnId: "t-live", finished: false)]
+        func fullScan() -> Bool {
+            var found = false
+            for _ in 0..<40 {
+                found = turns.contains { turn in
+                    !turn.finished && turn.items.contains {
+                        $0.state == .streaming && AgentAppView.isGroupableTool($0.type)
+                    }
+                }
+            }
+            return found
+        }
+        func trailingScan() -> Bool {
+            var found = false
+            for _ in 0..<40 {
+                found = AgentAppView.hasStreamingGroupableTools(in: turns)
+            }
+            return found
+        }
+        for _ in 0..<3 {
+            _ = fullScan()
+            _ = trailingScan()
+        }
+        var beforeMs: [Double] = []
+        var afterMs: [Double] = []
+        for _ in 0..<5 {
+            let start = CFAbsoluteTimeGetCurrent()
+            XCTAssertFalse(fullScan())
+            beforeMs.append((CFAbsoluteTimeGetCurrent() - start) * 1_000)
+        }
+        for _ in 0..<5 {
+            let start = CFAbsoluteTimeGetCurrent()
+            XCTAssertFalse(trailingScan())
+            afterMs.append((CFAbsoluteTimeGetCurrent() - start) * 1_000)
+        }
+        let beforeMedian = beforeMs.sorted()[beforeMs.count / 2]
+        let afterMedian = afterMs.sorted()[afterMs.count / 2]
+        let allowance = max(25.0, beforeMedian * 0.05)
+        print(
+            "[perf-proof] working-strip before_ms=\(beforeMs) after_ms=\(afterMs) before_median=\(beforeMedian) after_median=\(afterMedian)"
+        )
+        XCTAssertLessThan(afterMedian, beforeMedian, "trailing scan must beat the full timeline walk")
+        XCTAssertLessThanOrEqual(afterMedian, beforeMedian + allowance)
     }
 
     @MainActor
@@ -1129,7 +1236,92 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
         )
     }
 
+    func test_relativeTimestampNowBucket_isOneSecondIdentity() {
+        // WHY: user bubbles formatted relative time against Date() in every
+        // body. A 1 Hz bucket keeps Equatable rows stable across ~30 Hz ticks
+        // inside the same second.
+        let a = Date(timeIntervalSinceReferenceDate: 100.2)
+        let b = Date(timeIntervalSinceReferenceDate: 100.9)
+        let c = Date(timeIntervalSinceReferenceDate: 101.0)
+        XCTAssertEqual(
+            AgentAppView.relativeTimestampNowBucket(a),
+            AgentAppView.relativeTimestampNowBucket(b)
+        )
+        XCTAssertNotEqual(
+            AgentAppView.relativeTimestampNowBucket(a),
+            AgentAppView.relativeTimestampNowBucket(c)
+        )
+        XCTAssertEqual(
+            AgentChatUserBubble(
+                text: "hi",
+                createdAt: a,
+                now: AgentAppView.relativeTimestampNowBucket(a)
+            ),
+            AgentChatUserBubble(
+                text: "hi",
+                createdAt: a,
+                now: AgentAppView.relativeTimestampNowBucket(b)
+            )
+        )
+    }
+
+    func test_hasStreamingGroupableTools_stopsAtFirstFinishedTurnFromTheEnd() {
+        // WHY: the header working strip walked every turn's items on ~30 Hz
+        // chrome. Streaming tools can only exist on trailing unfinished turns.
+        let finishedTool = AssistantItem(
+            id: "old-tool",
+            turnId: "t-old",
+            type: .tool,
+            state: .streaming,
+            body: "echo old",
+            startedAtMs: 1
+        )
+        let finished = AssistantTurnSnapshot(
+            turnId: "t-old",
+            items: [finishedTool],
+            finished: true
+        )
+        let liveIdle = AssistantTurnSnapshot(turnId: "t-live", finished: false)
+        XCTAssertFalse(
+            AgentAppView.hasStreamingGroupableTools(in: [finished, liveIdle]),
+            "a streaming item on a finished turn must not light the working strip"
+        )
+        let liveStreaming = AssistantTurnSnapshot(
+            turnId: "t-live",
+            items: [
+                AssistantItem(
+                    id: "live-tool",
+                    turnId: "t-live",
+                    type: .tool,
+                    state: .streaming,
+                    body: "echo live",
+                    startedAtMs: 2
+                )
+            ],
+            finished: false
+        )
+        XCTAssertTrue(
+            AgentAppView.hasStreamingGroupableTools(in: [finished, liveStreaming])
+        )
+        let many = (0..<400).map { index in
+            AssistantTurnSnapshot(
+                turnId: "t-\(index)",
+                items: [finishedTool],
+                finished: true
+            )
+        } + [liveIdle]
+        XCTAssertFalse(AgentAppView.hasStreamingGroupableTools(in: many))
+    }
+
     private static func chatFlowToolPayloads(_ rows: [AgentAppView.ChatFlowRow]) -> [String] {
+        chatFlowToolPayloadItems(rows).map { "\($0.id):\($0.body):\($0.output ?? "")" }
+    }
+
+    private static func firstLiveTool(_ rows: [AgentAppView.ChatFlowRow]) -> AssistantItem? {
+        chatFlowToolPayloadItems(rows).first
+    }
+
+    private static func chatFlowToolPayloadItems(_ rows: [AgentAppView.ChatFlowRow]) -> [AssistantItem] {
         rows.flatMap { row -> [AssistantItem] in
             switch row {
             case .entry(.turn(let turn)):
@@ -1139,7 +1331,7 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
             case .segment(let segment):
                 return segment.snapshot.items
             }
-        }.filter { $0.type == .tool }.map { "\($0.id):\($0.body):\($0.output ?? "")" }
+        }.filter { $0.type == .tool }
     }
 
     private func repoSource(_ relative: String) throws -> String {

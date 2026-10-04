@@ -92,7 +92,8 @@ struct AgentChromePerfGapTests {
     func chatFlowPaint_shortCircuitsOnGenerationAndPaintEnds() throws {
         // WHY: chrome-only ticks rebuilt the finished history weave even when
         // generation + history first/last ids + count were unchanged. Live
-        // ChatFlowRows embed tool snapshots and must reweave on each pass.
+        // ChatFlowRows stay uncached: hashing tool text to skip them measured
+        // slower than the weave, and a length-only key hid progress updates.
         let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
         let start = try #require(source.range(of: "private func cachedChatFlowPaint("))
         let rest = source[start.lowerBound...]
@@ -101,16 +102,18 @@ struct AgentChromePerfGapTests {
         let counts = try #require(chunk.range(of: "chatFlowPaintCache.count == count"))
         let first = try #require(chunk.range(of: "chatFlowPaintCache.firstId == firstId"))
         let last = try #require(chunk.range(of: "chatFlowPaintCache.lastId == lastId"))
-        let rows = try #require(chunk.range(of: "Self.chatFlowRows(split.history)"))
-        let live = try #require(chunk.range(of: "Self.chatFlowRows(split.liveTail)"))
+        let rows = try #require(chunk.range(of: "Self.chatFlowRows("))
+        let afterHistory = chunk[rows.upperBound...]
+        let live = try #require(afterHistory.range(of: "Self.chatFlowRows("))
         #expect(counts.lowerBound < rows.lowerBound)
         #expect(first.lowerBound < rows.lowerBound)
         #expect(last.lowerBound < rows.lowerBound)
-        #expect(rows.lowerBound < live.lowerBound)
         #expect(chunk.contains("chatFlowPaintCache.generation == generation"))
         #expect(chunk.contains("Self.splitTrailingLiveTurns("))
         #expect(chunk.contains("latestLiveTurnId: latestLiveTurnId"))
+        #expect(!chunk.contains("liveTailGrowthSignature"))
         #expect(!chunk.contains("chatFlowPaintCache.liveRows"))
+        _ = live
         let columnStart = try #require(source.range(of: "let flow = cachedChatFlowPaint("))
         let columnRest = source[columnStart.lowerBound...]
         let columnEnd = columnRest.range(of: "VStack(alignment: .leading, spacing: 32)")?.lowerBound
@@ -118,6 +121,22 @@ struct AgentChromePerfGapTests {
         let column = String(source[columnStart.lowerBound..<columnEnd])
         #expect(column.contains("flow.historyRows"))
         #expect(!column.contains("Self.chatFlowRows("))
+        #expect(column.contains("relativeTimestampNowBucket"))
+    }
+
+    @Test("working strip scans trailing unfinished turns only")
+    func workingStrip_doesNotScanFinishedHistoryTurns() throws {
+        // WHY: header chrome at ~30 Hz used turns.contains over the whole
+        // timeline. Streaming groupable tools only exist on trailing live turns.
+        let source = try repoSource("Sources/Surfaces/AgentAppSurface.swift")
+        let start = try #require(source.range(of: "private var workingPhaseStrip: some View {"))
+        let rest = source[start.lowerBound...]
+        let end = rest.range(of: "private func statusTone")?.lowerBound
+            ?? rest.range(of: "\n    @ViewBuilder\n    private var")?.lowerBound
+            ?? rest.endIndex
+        let chunk = String(source[start.lowerBound..<end])
+        #expect(chunk.contains("hasStreamingGroupableTools(in:"))
+        #expect(!chunk.contains("vm.timeline.turns.contains"))
     }
 
     @Test("header Subagents now skips currentTime when snapshot empty and popover closed")

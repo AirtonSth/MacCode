@@ -301,6 +301,10 @@ public struct AgentChatStatusCard: View {
 public struct AgentChatUserBubble: View, Equatable {
     public let text: String
     public let createdAt: Date
+    /// Bucketed clock for relative copy. `nil` formats against `Date()` in
+    /// body (desk / tests). Agent App passes a 1 Hz bucket so Equatable
+    /// rows skip ~30 Hz timestamp remounts.
+    public var now: Date? = nil
     public var columnWidth: CGFloat = 10_000
     public var accessibilityIdentifier: String = "agent.userMessageBubble"
     public var roleIdentifier: String = "bots.desk.role.user"
@@ -311,6 +315,7 @@ public struct AgentChatUserBubble: View, Equatable {
     public init(
         text: String,
         createdAt: Date,
+        now: Date? = nil,
         columnWidth: CGFloat = 10_000,
         accessibilityIdentifier: String = "agent.userMessageBubble",
         roleIdentifier: String = "bots.desk.role.user",
@@ -320,6 +325,7 @@ public struct AgentChatUserBubble: View, Equatable {
     ) {
         self.text = text
         self.createdAt = createdAt
+        self.now = now
         self.columnWidth = columnWidth
         self.accessibilityIdentifier = accessibilityIdentifier
         self.roleIdentifier = roleIdentifier
@@ -361,7 +367,7 @@ public struct AgentChatUserBubble: View, Equatable {
                     .accessibilityLabel("Copy message")
                     .accessibilityIdentifier(copyIdentifier ?? "agent.userMessage.copy")
                     .help("Copy message")
-                    Text(AgentChatTranscriptChrome.relativeTimestamp(createdAt))
+                    Text(AgentChatTranscriptChrome.relativeTimestamp(createdAt, now: now ?? Date()))
                         .font(DS.Font.caption2)
                         .foregroundColor(DS.Palette.textTertiary)
                         .lineLimit(1)
@@ -382,6 +388,7 @@ public struct AgentChatUserBubble: View, Equatable {
     public static func == (lhs: AgentChatUserBubble, rhs: AgentChatUserBubble) -> Bool {
         lhs.text == rhs.text
             && lhs.createdAt == rhs.createdAt
+            && lhs.now == rhs.now
             && lhs.columnWidth == rhs.columnWidth
             && lhs.accessibilityIdentifier == rhs.accessibilityIdentifier
             && lhs.roleIdentifier == rhs.roleIdentifier
