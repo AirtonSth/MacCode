@@ -16896,6 +16896,7 @@ final class BotsWindowTests: XCTestCase {
         deliver(.turnStarted(turnId: "t"))
         deliver(.itemStarted(item: AssistantItem(id: "a", turnId: "t", type: .assistantMessage, startedAtMs: 1)))
         let clock = ContinuousClock()
+        let memBefore = botDeskPhysFootprintBytes()
         let start = clock.now
         for i in 0..<2_000 {
             deliver(.itemDelta(itemId: "a", bodyAppend: "w\(i) ", outputAppend: nil, summary: nil))
@@ -16907,7 +16908,9 @@ final class BotsWindowTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(1))
         }
         let tailLag = sentAt.duration(to: clock.now)
-        print("PERF botDesk deltas=2000 agentPublishes=\(agentPublishes) deskPublishes=\(deskPublishes) tailLag=\(tailLag) elapsed=\(start.duration(to: clock.now))")
+        let memGrowth = Int64(botDeskPhysFootprintBytes()) - Int64(memBefore)
+        print("PERF botDesk deltas=2000 agentPublishes=\(agentPublishes) deskPublishes=\(deskPublishes) tailLag=\(tailLag) elapsed=\(start.duration(to: clock.now)) memGrowthKB=\(memGrowth / 1024)")
+        XCTAssertLessThan(memGrowth, 64 * 1024 * 1024, "a ~16 KB bot reply must not grow resident memory by tens of MB")
         let body = agentVM.timeline.turns.first?.items.first?.body ?? ""
         XCTAssertTrue(body.hasPrefix("w0 ") && body.hasSuffix("w1999 "), "every delta must land in the embedded Agent App (sel=\(String(describing: agentVM.selectedThreadId)) tid=\(threadID) turns=\(agentVM.timeline.turns.map { "\($0.turnId):\($0.items.map { "\($0.id)/\($0.body.count)" })" }) status=\(agentVM.status))")
         XCTAssertEqual(deskPublishes, 0, "BotsViewModel must not republish per token")
@@ -17496,4 +17499,16 @@ final class ControlledBotHandoffRunner: AgentProviderRunner, @unchecked Sendable
         ))
         return true
     }
+}
+
+/// Resident memory (phys_footprint), as Activity Monitor reports it.
+private func botDeskPhysFootprintBytes() -> UInt64 {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let result = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+    }
+    return result == KERN_SUCCESS ? info.phys_footprint : 0
 }

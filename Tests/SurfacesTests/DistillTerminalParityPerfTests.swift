@@ -1,8 +1,21 @@
 import AgentRuntime
 import CoreModel
 import Persistence
+import Darwin
 import XCTest
 @testable import Surfaces
+
+/// Resident memory (phys_footprint), as Activity Monitor reports it.
+func perfPhysFootprintBytes() -> UInt64 {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let result = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+    }
+    return result == KERN_SUCCESS ? info.phys_footprint : 0
+}
 
 /// Goal: Agent App / bot desk streaming should cost about what Distill in a
 /// terminal costs. These drive the shipped live-row markdown path and the
@@ -92,11 +105,15 @@ final class DistillTerminalParityPerfTests: XCTestCase {
         for delta in deltas { text += delta; prefixes.append(text) }
         AgentMessageMarkdown.inlineComputeCountForTesting = 0
         let clock = ContinuousClock()
+        let memBefore = perfPhysFootprintBytes()
         let start = clock.now
-        for prefix in prefixes { paintLiveRow(prefix) }
+        for prefix in prefixes { autoreleasepool { paintLiveRow(prefix) } }
         let elapsed = start.duration(to: clock.now)
+        let memGrowth = Int64(perfPhysFootprintBytes()) - Int64(memBefore)
         let inline = AgentMessageMarkdown.inlineComputeCountForTesting
-        print("PERF liveRow deltas=\(deltas.count) inlineParses=\(inline) elapsed=\(elapsed)")
+        print("PERF liveRow deltas=\(deltas.count) inlineParses=\(inline) elapsed=\(elapsed) memGrowthKB=\(memGrowth / 1024)")
+        // A ~27 KB reply must not leave tens of MB resident (the old path parsed 27 MB).
+        XCTAssertLessThan(memGrowth, 32 * 1024 * 1024, "live row paint must not retain memory proportional to prefixes parsed")
         XCTAssertLessThan(inline, deltas.count * 3, "each paint may attribute only the growing block, not every prose block")
     }
 }

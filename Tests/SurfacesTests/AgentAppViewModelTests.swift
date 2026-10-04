@@ -10088,6 +10088,7 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.runCoordinator(vm.coordinator, didReceive: .turnStarted(turnId: "t"), run: run, threadId: thread.id)
         vm.runCoordinator(vm.coordinator, didReceive: .itemStarted(item: AssistantItem(id: "a", turnId: "t", type: .assistantMessage, startedAtMs: 1)), run: run, threadId: thread.id)
         let clock = ContinuousClock()
+        let memBefore = perfPhysFootprintBytes()
         let start = clock.now
         for i in 0..<2_000 {
             vm.runCoordinator(vm.coordinator, didReceive: .itemDelta(itemId: "a", bodyAppend: "w\(i) ", outputAppend: nil, summary: nil), run: run, threadId: thread.id)
@@ -10102,7 +10103,9 @@ final class AgentAppViewModelTests: XCTestCase {
         let tailLag = sentAt.duration(to: clock.now)
         let body = vm.timeline.turns.first?.items.first?.body ?? ""
         print("PERF vmStream tailLag=\(tailLag)")
-        print("PERF vmStream deltas=2000 timelinePublishes=\(publishes) elapsed=\(elapsed)")
+        let memGrowth = Int64(perfPhysFootprintBytes()) - Int64(memBefore)
+        print("PERF vmStream deltas=2000 timelinePublishes=\(publishes) elapsed=\(elapsed) memGrowthKB=\(memGrowth / 1024)")
+        XCTAssertLessThan(memGrowth, 64 * 1024 * 1024, "a ~16 KB streamed reply must not grow resident memory by tens of MB")
         XCTAssertTrue(body.hasPrefix("w0 ") && body.hasSuffix("w1999 "), "every delta must land in order (turns=\(vm.timeline.turns.map { "\($0.turnId):\($0.items.count)" }) len=\(body.count) tail=\(body.suffix(30)) head=\(body.prefix(12)))")
         XCTAssertLessThan(publishes, 200, "deltas must coalesce into batched publishes, not one per token")
         XCTAssertLessThan(tailLag, .milliseconds(100), "the last token must paint right after the provider sends it, not ~40 hops later")
