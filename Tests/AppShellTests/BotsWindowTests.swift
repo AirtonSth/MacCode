@@ -11,6 +11,17 @@ import Surfaces
 
 @MainActor
 final class BotsWindowTests: XCTestCase {
+    func test_workspaceBusyMetadataClearsWithEmptyString_becauseIOSRemovesKeyOnEmpty() {
+        // Terminal busy transitions reach iOS via workspace.updated; iOS
+        // (MirrorEventReducer .workspaceUpdated) removes a key on "".
+        XCTAssertEqual(AppCommandRouter.workspaceBusyMetadata(true), ["busy": .string("true")])
+        XCTAssertEqual(AppCommandRouter.workspaceBusyMetadata(false), ["busy": .string("")])
+        guard case .object(let payload) = AppCommandRouter.workspaceUpdatedPayload(
+            id: WorkspaceID(UUID()), metadata: AppCommandRouter.workspaceBusyMetadata(false)
+        ) else { return XCTFail("payload must be an object") }
+        XCTAssertEqual(payload["metadata"], .object(["busy": .string("")]))
+    }
+
     func test_supervisedRunPromptKeepsDistillSlashRaw_becausePairedDeviceSendsMustReachDistillCommands() {
         // iOS bot sends run startSupervisedRun, not the embedded desk; the brain
         // wrap would bury `/goal status` so Distill would treat it as a goal objective.

@@ -1417,6 +1417,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ])
     }
 
+    /// iOS applies `workspace.updated` metadata; an empty string removes the key.
+    nonisolated static func workspaceBusyMetadata(_ busy: Bool) -> [String: JSONValue] {
+        ["busy": .string(busy ? "true" : "")]
+    }
+
     nonisolated static func workspaceReorderedPayload(id: WorkspaceID, position: Int?, order: [WorkspaceID]) -> JSONValue {
         var payload: [String: JSONValue] = [
             "workspace_id": .string(id.value.uuidString),
@@ -7570,6 +7575,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 body: body,
                 category: "terminal"
             )
+        }
+        terminal.onBusyStateChanged = { [weak self] _ in
+            guard let self else { return }
+            self.publishWorkspaceUpdated(workspace, metadata: Self.workspaceBusyMetadata(self.isWorkspaceBusy(workspace)))
         }
         terminal.onBecameFocused = { [weak self, weak terminal] in
             guard let self, let terminal else { return }
