@@ -11,6 +11,34 @@ import Surfaces
 
 @MainActor
 final class BotsWindowTests: XCTestCase {
+    func test_workspaceBusyMetadataClearsWithEmptyString_becauseIOSRemovesKeyOnEmpty() {
+        // Terminal busy transitions reach iOS via workspace.updated; iOS
+        // (MirrorEventReducer .workspaceUpdated) removes a key on "".
+        XCTAssertEqual(AppCommandRouter.workspaceBusyMetadata(true), ["busy": .string("true")])
+        XCTAssertEqual(AppCommandRouter.workspaceBusyMetadata(false), ["busy": .string("")])
+        guard case .object(let payload) = AppCommandRouter.workspaceUpdatedPayload(
+            id: WorkspaceID(UUID()), metadata: AppCommandRouter.workspaceBusyMetadata(false)
+        ) else { return XCTFail("payload must be an object") }
+        XCTAssertEqual(payload["metadata"], .object(["busy": .string("")]))
+    }
+
+    func test_supervisedRunPromptKeepsDistillSlashRaw_becausePairedDeviceSendsMustReachDistillCommands() {
+        // iOS bot sends run startSupervisedRun, not the embedded desk; the brain
+        // wrap would bury `/goal status` so Distill would treat it as a goal objective.
+        XCTAssertEqual(
+            BotsViewModel.supervisedRunPrompt(userText: "  /goal status", compiledPayload: "BRAIN\nUser request:\n/goal status", provider: .distill),
+            "  /goal status"
+        )
+        XCTAssertEqual(
+            BotsViewModel.supervisedRunPrompt(userText: "hello", compiledPayload: "BRAIN", provider: .distill),
+            "BRAIN"
+        )
+        XCTAssertEqual(
+            BotsViewModel.supervisedRunPrompt(userText: "/goal x", compiledPayload: "BRAIN", provider: .codex),
+            "BRAIN"
+        )
+    }
+
     func test_botScheduleLegacyDistillInstanceResolvesModelsFromDistillACPSnapshot() {
         let snapshot = AgentProviderSnapshot(
             id: "distill-acp", provider: .distill, driverKind: .distillACP,
@@ -17446,4 +17474,5 @@ final class ControlledBotHandoffRunner: AgentProviderRunner, @unchecked Sendable
         ))
         return true
     }
+
 }

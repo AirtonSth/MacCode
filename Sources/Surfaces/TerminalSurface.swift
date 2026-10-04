@@ -1245,6 +1245,8 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     /// Called when a busy span of at least `minimumFinishedBusyDuration` ends.
     /// `userIsLooking` is true when this terminal is visible in the key window.
     public var onBusyFinished: ((_ title: String, _ body: String, _ userIsLooking: Bool) -> Void)?
+    /// Fires on every published busy/idle transition so paired devices see the spinner change.
+    public var onBusyStateChanged: ((_ busy: Bool) -> Void)?
     /// Called when the terminal takes keyboard focus, so the host can clear its finished dot.
     public var onBecameFocused: (() -> Void)?
     private static let hiddenBacklogQuietDelay: TimeInterval = 0.25
@@ -3382,6 +3384,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
                 } else {
                     self.handleBusyFinished(now: now)
                 }
+                self.onBusyStateChanged?(busy)
                 self.publishRuntimeHealth()
             }
             guard Self.shouldContinueBusyStatePolling(
