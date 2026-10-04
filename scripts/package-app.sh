@@ -108,6 +108,20 @@ if [ "$CONFIG" != "release" ] \
   exit 1
 fi
 
+# This repo's git config skips LFS smudge, so checkouts can leave Vendor xcframework
+# files as LFS pointer stubs. Materialize them from the local LFS store before building.
+if command -v git-lfs >/dev/null 2>&1 \
+  && git lfs ls-files -n 2>/dev/null | {
+       while IFS= read -r p; do
+         head -c 64 "$p" 2>/dev/null | grep -q "git-lfs.github.com/spec" && exit 0
+       done
+       exit 1
+     }; then
+  echo "[package] materializing LFS pointer files …"
+  git lfs fetch
+  git lfs checkout
+fi
+
 # Swift 6.4's default (swiftbuild) system emits RCTailcat's module.modulemap twice.
 SWIFT_BUILD_SYSTEM="${RC2_SWIFT_BUILD_SYSTEM:-native}"
 BIN_DIR="$(swift build -c "$CONFIG" --build-system "$SWIFT_BUILD_SYSTEM" --show-bin-path)"
