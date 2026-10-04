@@ -22,6 +22,52 @@ public enum GraphifyGitProbe {
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: absURL.path, isDirectory: &isDir) else { return nil }
         let cwd = isDir.boolValue ? absURL.path : absURL.deletingLastPathComponent().path
+        // Every Agent App / bot send resolved Graphify roots before the provider
+        // started, spawning two `git` processes per candidate directory (hundreds
+        // for a multi-repo container). Repo identity for a directory is stable
+        // over seconds, so reuse it briefly instead of re-spawning on each send.
+        if let cached = identityCache.lookup(cwd, now: Date()) { return cached.identity }
+        let resolved = uncachedIdentity(cwd: cwd)
+        identityCache.store(cwd, identity: resolved, now: Date())
+        return resolved
+    }
+
+    /// TTL for cached directory → repo identity (including "not a repo").
+    public static let identityCacheTTL: TimeInterval = 60
+    nonisolated(unsafe) public static var gitSpawnCountForTesting = 0
+
+    public static func resetIdentityCacheForTesting() { identityCache.clear() }
+
+    private final class IdentityCache: @unchecked Sendable {
+        struct Entry { let identity: RepoIdentity?; let at: Date }
+        private let lock = NSLock()
+        private var entries: [String: Entry] = [:]
+
+        func lookup(_ key: String, now: Date) -> Entry? {
+            lock.lock(); defer { lock.unlock() }
+            guard let entry = entries[key] else { return nil }
+            guard now.timeIntervalSince(entry.at) < GraphifyGitProbe.identityCacheTTL else {
+                entries[key] = nil
+                return nil
+            }
+            return entry
+        }
+
+        func store(_ key: String, identity: RepoIdentity?, now: Date) {
+            lock.lock(); defer { lock.unlock() }
+            if entries.count >= 1_024 { entries.removeAll(keepingCapacity: true) }
+            entries[key] = Entry(identity: identity, at: now)
+        }
+
+        func clear() {
+            lock.lock(); defer { lock.unlock() }
+            entries.removeAll()
+        }
+    }
+
+    private static let identityCache = IdentityCache()
+
+    private static func uncachedIdentity(cwd: String) -> RepoIdentity? {
         let top = revParse(["--show-toplevel"], cwd: cwd)
         let common = revParse(["--git-common-dir"], cwd: cwd)
         guard let top, let common, !top.isEmpty, !common.isEmpty else { return nil }
@@ -96,6 +142,7 @@ public enum GraphifyGitProbe {
     }
 
     private static func runGit(_ args: [String], cwd: String) -> ProcessResult {
+        gitSpawnCountForTesting &+= 1
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         p.arguments = ["git"] + args

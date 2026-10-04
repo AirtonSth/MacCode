@@ -64,6 +64,8 @@ enum AgentMessageMarkdown {
     // Test-only observability: how many times the uncached parse actually ran, so a
     // unit test can prove repeated renders of identical content hit the cache.
     nonisolated(unsafe) static var blocksComputeCountForTesting = 0
+    /// Test-only: UTF-8 bytes tokenized by `computeBlocks` (live-tail proof).
+    nonisolated(unsafe) static var blocksParsedUTF8BytesForTesting = 0
     nonisolated(unsafe) static var inlineComputeCountForTesting = 0
     /// Test-only: every `blocks(from:)` entry, including cache hits. Hover isolation
     /// must not increment this after the first parent body evaluation.
@@ -105,6 +107,22 @@ enum AgentMessageMarkdown {
         #if DEBUG
         blocksLookupCountForTesting &+= 1
         #endif
+        // Live streaming rows grow every paint tick. Re-tokenizing the whole
+        // body each tick made a long reply O(n²); the prefix before the last
+        // blank line outside a code fence is final, so parse (and cache) it
+        // once and re-parse only the growing tail.
+        if !cache {
+            let chunks = stableLiveChunks(text)
+            if chunks.count > 1 {
+                var result: [AgentMessageMarkdownBlock] = []
+                for (index, chunk) in chunks.enumerated() {
+                    let isTail = index == chunks.count - 1
+                    if isTail, !chunk.contains(where: { !$0.isWhitespace }) { break }
+                    result += blocks(from: String(chunk), cache: !isTail)
+                }
+                return result
+            }
+        }
         let key = cacheKey(for: text)
         // Perf CH-04: `cache: false` (live streaming rows) must only skip the
         // STORE — the read still hits, so a body that was parsed while finished
@@ -119,6 +137,42 @@ enum AgentMessageMarkdown {
             #endif
         }
         return result
+    }
+
+    /// Splits at every blank line outside a ``` fence that follows visible
+    /// content. `computeBlocks` flushes every block at such a line, so the
+    /// concatenated per-chunk parses equal the full parse. All chunks but the
+    /// last are final and cache; only the growing last chunk re-parses.
+    static func stableLiveChunks(_ text: String) -> [Substring] {
+        let utf8 = text.utf8
+        var fenceOpen = false
+        var lineStart = utf8.startIndex
+        var chunkStart = utf8.startIndex
+        var sawContent = false
+        var chunks: [Substring] = []
+        var index = utf8.startIndex
+        while index < utf8.endIndex {
+            if utf8[index] == UInt8(ascii: "\n") {
+                let trimmed = text[lineStart..<index].drop(while: { $0 == " " || $0 == "\t" })
+                let next = utf8.index(after: index)
+                if trimmed.hasPrefix("```") {
+                    fenceOpen.toggle()
+                    sawContent = true
+                } else if trimmed.allSatisfy(\.isWhitespace) {
+                    if !fenceOpen, sawContent {
+                        chunks.append(text[chunkStart..<lineStart])
+                        chunkStart = next
+                        sawContent = false
+                    }
+                } else {
+                    sawContent = true
+                }
+                lineStart = next
+            }
+            index = utf8.index(after: index)
+        }
+        chunks.append(text[chunkStart...])
+        return chunks
     }
 
     static func selectionGroups(from blocks: [AgentMessageMarkdownBlock]) -> [[AgentMessageMarkdownBlock]] {
@@ -221,6 +275,7 @@ enum AgentMessageMarkdown {
     private static func computeBlocks(from text: String) -> [AgentMessageMarkdownBlock] {
         #if DEBUG
         blocksComputeCountForTesting &+= 1
+        blocksParsedUTF8BytesForTesting &+= text.utf8.count
         #endif
         var blocks: [AgentMessageMarkdownBlock] = []
         var paragraph: [String] = []
