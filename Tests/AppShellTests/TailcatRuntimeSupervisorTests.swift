@@ -253,6 +253,30 @@ final class TailcatRuntimeSupervisorTests: XCTestCase {
         XCTAssertFalse(activeAfterDisable)
     }
 
+    func testPublishHintRetainsPublishedHostAndClearsWhenDisabled() async {
+        let snapshot = makeSnapshot(epoch: "epoch-hint", revision: 1, peers: [peer(0xbb)])
+        let catalog = FakeTailcatCatalog(snapshot: snapshot, leaseExpiresAt: "2099-01-01T00:00:00Z")
+        let supervisor = makeSupervisor(bridge: FakeTailcatBridge(), catalog: catalog, store: FakeTailcatStore())
+
+        let beforePublish = await supervisor.pushHint()
+        XCTAssertNil(beforePublish, "no publication yet: nothing to hint")
+
+        await supervisor.setEnabled(true)
+        await supervisor.reconcileNowForTesting()
+
+        let hint = await supervisor.pushHint()
+        XCTAssertEqual(hint, TailcatPushHint(
+            serverId: "server-1",
+            version: 2,
+            leaseExpiresAt: "2099-01-01T00:00:00Z",
+            transportBuildId: TailcatTransportContract.buildID
+        ))
+
+        await supervisor.setEnabled(false)
+        let afterDisable = await supervisor.pushHint()
+        XCTAssertNil(afterDisable, "deleted host must not be advertised to iOS")
+    }
+
     func testPublishedRuntimeReconcilesTwiceWithOneSecureStoreLoad() async throws {
         let snapshot = makeSnapshot(epoch: "epoch-cached", revision: 1, peers: [peer(0xad)])
         let catalog = FakeTailcatCatalog(snapshot: snapshot)
@@ -819,7 +843,12 @@ actor FakeTailcatCatalog: TailcatCatalogAPI {
     private(set) var hostAccessTokens: [String] = []
     private(set) var publishAccessTokens: [String] = []
 
-    init(snapshot: TailcatAllowlistSnapshot) { self.snapshot = snapshot }
+    private let leaseExpiresAt: String
+
+    init(snapshot: TailcatAllowlistSnapshot, leaseExpiresAt: String = "2026-08-30T00:15:00Z") {
+        self.snapshot = snapshot
+        self.leaseExpiresAt = leaseExpiresAt
+    }
 
     func setUnavailable(_ unavailable: Bool) { self.unavailable = unavailable }
     func setSnapshot(_ snapshot: TailcatAllowlistSnapshot) { self.snapshot = snapshot }
@@ -882,7 +911,7 @@ actor FakeTailcatCatalog: TailcatCatalogAPI {
             transportBuildId: TailcatTransportContract.buildID,
             createdAt: "2026-08-30T00:00:00Z",
             updatedAt: "2026-08-30T00:00:00Z",
-            leaseExpiresAt: "2026-08-30T00:15:00Z",
+            leaseExpiresAt: leaseExpiresAt,
             version: version
         )
     }

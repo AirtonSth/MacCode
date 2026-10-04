@@ -66,6 +66,7 @@ actor TailcatRuntimeSupervisor {
     private var lastRenewal: Date?
     private var currentSnapshot: TailcatAllowlistSnapshot?
     private var currentETag: String?
+    private var publishedHost: TailcatCatalogHost?
     private var lastAccessToken: String?
     private var reconcilePending = false
     private var reconciling = false
@@ -151,6 +152,18 @@ actor TailcatRuntimeSupervisor {
     }
 
     var isEnabled: Bool { enabled }
+
+    /// Last successfully published catalog host while a runtime is active;
+    /// nil once the runtime stops or the host is deleted. Public facts only.
+    func pushHint() -> TailcatPushHint? {
+        guard runtime != nil, let host = publishedHost else { return nil }
+        return TailcatPushHint(
+            serverId: host.serverId,
+            version: host.version,
+            leaseExpiresAt: host.leaseExpiresAt,
+            transportBuildId: host.transportBuildId
+        )
+    }
 
 #if DEBUG
     func reconcileNowForTesting() async {
@@ -435,6 +448,7 @@ actor TailcatRuntimeSupervisor {
             lastBackendSuccess = now()
             lastRenewal = now()
             currentETag = published.eTag
+            publishedHost = published.host
             try saveSecureState(TailcatSecureState(
                 phase: .active,
                 accountID: session.user.id,
@@ -472,6 +486,7 @@ actor TailcatRuntimeSupervisor {
             lastBackendSuccess = now()
             lastRenewal = now()
             currentETag = published.eTag
+            publishedHost = published.host
             if var stored = try loadSecureState() {
                 stored.eTag = published.eTag
                 if let snapshot = currentSnapshot {
@@ -573,6 +588,7 @@ actor TailcatRuntimeSupervisor {
     }
 
     private func beginStopRuntime() -> ClosingRuntime? {
+        publishedHost = nil
         authenticator.removeAllContexts()
         listener.stop()
         guard let runtime else { return nil }
@@ -611,6 +627,7 @@ actor TailcatRuntimeSupervisor {
     }
 
     private func deletePublishedHost(accessToken: String?) async {
+        publishedHost = nil
         guard let accessToken else { return }
         try? await catalog.deleteHost(serverID: serverID, accessToken: accessToken)
     }

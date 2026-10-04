@@ -1177,6 +1177,13 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
     private let silentWakeOutbox: SilentWakeOutbox
     /// Indirection so the outbox send closure can bind after `self` exists.
     private let silentWakeSendBox: SilentWakeOutboxSendBox
+    private struct ConnectionHintSources {
+        var tailcat: (@Sendable () async -> TailcatPushHint?)?
+        var watermark: (@Sendable () -> String?)?
+        var bootEpoch: (@Sendable () -> String?)?
+    }
+    private let connectionHintLock = NSLock()
+    private var connectionHintSources = ConnectionHintSources()
 
     /// Holds the outbox → bridge send handler without a process-wide singleton.
     private final class SilentWakeOutboxSendBox: @unchecked Sendable {
@@ -1223,6 +1230,32 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         }
         // Survive Mac relaunch when the flag is canary-on: drain durable backlog.
         self.silentWakeOutbox.resumePending()
+    }
+
+    /// Late-bound sources for `PushConnectionHints` (the Tailcat supervisor is
+    /// built after this bridge). Unset sources contribute nothing.
+    func setConnectionHintSources(
+        tailcat: (@Sendable () async -> TailcatPushHint?)? = nil,
+        watermark: (@Sendable () -> String?)? = nil,
+        bootEpoch: (@Sendable () -> String?)? = nil
+    ) {
+        connectionHintLock.withLock {
+            if let tailcat { connectionHintSources.tailcat = tailcat }
+            if let watermark { connectionHintSources.watermark = watermark }
+            if let bootEpoch { connectionHintSources.bootEpoch = bootEpoch }
+        }
+    }
+
+    /// Every host -> iOS push goes through this so alert, silent, and outbox
+    /// replay carry the same connection and catch-up hints.
+    private func withConnectionHints(_ data: [String: String]) async -> [String: String] {
+        let sources = connectionHintLock.withLock { connectionHintSources }
+        return PushConnectionHints.merge(
+            into: data,
+            tailcat: await sources.tailcat?(),
+            watermark: sources.watermark?(),
+            bootEpoch: sources.bootEpoch?()
+        )
     }
 
     /// Test seam: observe the durable silent-wake outbox.
@@ -1279,6 +1312,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             return
         }
         var alertDelivered = false
+        let alertData = await withConnectionHints(content.userInfo)
         do {
             let result = try await sessionRefresher.perform(session: session) { accessToken in
                 try await self.api.deliverAlert(
@@ -1286,7 +1320,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                     title: content.title,
                     body: content.body,
                     // Carry routing keys so a remote alert opens the exact thread.
-                    data: content.userInfo,
+                    data: alertData,
                     pushToken: target.pushToken,
                     pushTokenType: target.pushTokenType,
                     idempotencyKey: content.identifier,
@@ -1417,7 +1451,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         }
         var contract = payload
         contract.catchUp = true
-        let data = contract.asPushData()
+        let data = await withConnectionHints(contract.asPushData())
         let idempotencyKey = "catchup.\(coalesceClass.rawValue).\(hostHint).\(bucket)"
         HostWakeMetrics.shared.increment(.silentAttempt)
         do {
@@ -1475,7 +1509,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         }
         var contract = record.payload
         contract.catchUp = true
-        let data = contract.asPushData()
+        let data = await withConnectionHints(contract.asPushData())
         HostWakeMetrics.shared.increment(.silentAttempt)
         do {
             let result = try await sessionRefresher.perform(session: session) { accessToken in

@@ -673,6 +673,163 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertTrue(silent.idempotencyKey.hasPrefix("catchup."))
     }
 
+    // MARK: - Push connection hints (rc2_tc_* + rc2_wm/rc2_boot_epoch)
+
+    private func makeHintBridge(
+        leaseExpiresAt: String,
+        publish: Bool
+    ) async throws -> (bridge: PrivateNotificationBridge, api: RecordingPrivateAccountAPI, supervisor: TailcatRuntimeSupervisor) {
+        let dir = NSTemporaryDirectory() + "RC2PushHints-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        let api = RecordingPrivateAccountAPI()
+        accountStore.save(api.session)
+        try targetStore.save(pushToken: "apns-token", pushTokenType: "apns", liveActivityToken: nil, deviceId: "device-1")
+        let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
+        UserDefaults.standard.removeObject(forKey: "private.silentCatchUp.lastBucket")
+        UserDefaults.standard.removeObject(forKey: "private.silentCatchUp.lastBuckets")
+
+        let peer = "nodekey:" + String(repeating: "aa", count: 32)
+        let snapshot = TailcatAllowlistSnapshot(
+            epoch: "epoch-hints",
+            revision: 1,
+            clients: [TailcatCatalogClient(
+                clientId: "client-0",
+                displayName: "Client",
+                nodePublic: peer,
+                transportBuildId: TailcatTransportContract.buildID,
+                createdAt: "2026-08-30T00:00:00Z",
+                updatedAt: "2026-08-30T00:00:00Z",
+                leaseExpiresAt: "2099-01-01T00:00:00Z",
+                version: 1
+            )]
+        )
+        let session = api.session
+        let supervisor = TailcatRuntimeSupervisor(
+            serverID: "server-1",
+            displayName: "Test Mac",
+            bridge: FakeTailcatBridge(),
+            catalog: FakeTailcatCatalog(snapshot: snapshot, leaseExpiresAt: leaseExpiresAt),
+            secureStore: FakeTailcatStore(),
+            sessionProvider: { session },
+            authenticator: TailcatRemoteConnectionAuthenticator(),
+            listener: FakeTailcatListener(),
+            automaticPolling: false,
+            statusHandler: { _ in }
+        )
+        if publish {
+            await supervisor.setEnabled(true)
+            await supervisor.reconcileNowForTesting()
+        }
+        bridge.setConnectionHintSources(
+            tailcat: { await supervisor.pushHint() },
+            watermark: { "42" },
+            bootEpoch: { "7" }
+        )
+        return (bridge, api, supervisor)
+    }
+
+    private func assertTailcatHints(_ data: [String: String], file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(data["rc2_tc_sid"], "server-1", file: file, line: line)
+        XCTAssertEqual(data["rc2_tc_ver"], "2", file: file, line: line)
+        XCTAssertEqual(data["rc2_tc_exp"], "2099-01-01T00:00:00Z", file: file, line: line)
+        XCTAssertEqual(data["rc2_tc_build"], TailcatTransportContract.buildID, file: file, line: line)
+        XCTAssertEqual(data["rc2_wm"], "42", file: file, line: line)
+        XCTAssertEqual(data["rc2_boot_epoch"], "7", file: file, line: line)
+        XCTAssertFalse(
+            data.values.contains { $0.contains("blob") },
+            "connBlob must never ride in a push (APNs 4 KB, transits Apple)",
+            file: file, line: line
+        )
+    }
+
+    func testAlertAndSilentPushesCarryTailcatAndCatchUpHints() async throws {
+        let (bridge, api, supervisor) = try await makeHintBridge(leaseExpiresAt: "2099-01-01T00:00:00Z", publish: true)
+        let content = try XCTUnwrap(RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-1", workspaceId: "ws-1", title: "Build fix", phase: .completed
+        ))
+        await bridge.deliver(content)
+        await supervisor.setEnabled(false)
+
+        XCTAssertEqual(api.alertRequests.count, 2)
+        let alert = try XCTUnwrap(api.alertRequests.first)
+        XCTAssertFalse(alert.silent)
+        assertTailcatHints(alert.data)
+        XCTAssertEqual(alert.data["threadId"], "thread-1", "routing keys must survive the merge")
+        XCTAssertNil(alert.data["rc2_catch_up"], "alerts must not masquerade as silent catch-up")
+        XCTAssertNil(alert.data["rc2_schema"])
+        let silent = try XCTUnwrap(api.alertRequests.last)
+        XCTAssertTrue(silent.silent)
+        assertTailcatHints(silent.data)
+        XCTAssertEqual(silent.data["rc2_catch_up"], "1")
+    }
+
+    func testOutboxReplayCarriesTailcatAndCatchUpHints() async throws {
+        let (bridge, api, supervisor) = try await makeHintBridge(leaseExpiresAt: "2099-01-01T00:00:00Z", publish: true)
+        let record = SilentWakeOutboxRecord(
+            coalesceClass: .runProgress,
+            hostHint: "agent.run.completed",
+            force: true,
+            payload: SilentCatchUpV1(reason: "agent_run_completed"),
+            idempotencyKey: "catchup.run_progress.replay"
+        )
+        try await bridge.performSilentCatchUpDelivery(record)
+        await supervisor.setEnabled(false)
+
+        let replay = try XCTUnwrap(api.alertRequests.last)
+        XCTAssertTrue(replay.silent)
+        XCTAssertEqual(replay.idempotencyKey, "catchup.run_progress.replay")
+        assertTailcatHints(replay.data)
+    }
+
+    func testPushOmitsTailcatKeysWithoutPublicationOrWithExpiredLease() async throws {
+        let none = try await makeHintBridge(leaseExpiresAt: "2099-01-01T00:00:00Z", publish: false)
+        await none.bridge.deliverSilentCatchUp(hostHint: "h", force: true)
+        let noPublication = try XCTUnwrap(none.api.alertRequests.last)
+        XCTAssertTrue(PushConnectionHints.tailcatKeys.allSatisfy { noPublication.data[$0] == nil })
+        XCTAssertEqual(noPublication.data["rc2_wm"], "42", "catch-up hints do not depend on Tailcat")
+        XCTAssertEqual(noPublication.data["rc2_boot_epoch"], "7")
+
+        let expired = try await makeHintBridge(leaseExpiresAt: "2020-01-01T00:00:00Z", publish: true)
+        await expired.bridge.deliverSilentCatchUp(hostHint: "h", force: true)
+        await expired.supervisor.setEnabled(false)
+        let expiredPush = try XCTUnwrap(expired.api.alertRequests.last)
+        XCTAssertTrue(
+            PushConnectionHints.tailcatKeys.allSatisfy { expiredPush.data[$0] == nil },
+            "tailcat keys are all-or-nothing; an expired lease must drop all four"
+        )
+    }
+
+    func testPushConnectionHintsMergeValidatesWireFormats() {
+        let now = Date(timeIntervalSince1970: 1_000)
+        func hint(sid: String = "srv-1", build: String = "build-1", exp: String = "2099-01-01T00:00:00.500Z") -> TailcatPushHint {
+            TailcatPushHint(serverId: sid, version: 5, leaseExpiresAt: exp, transportBuildId: build)
+        }
+        func merged(_ h: TailcatPushHint?) -> [String: String] {
+            PushConnectionHints.merge(into: ["keep": "1"], tailcat: h, watermark: "9", bootEpoch: "3", now: now)
+        }
+
+        let ok = merged(hint())
+        XCTAssertEqual(ok["keep"], "1")
+        XCTAssertEqual(ok["rc2_tc_ver"], "5")
+        XCTAssertEqual(ok["rc2_tc_exp"], "2099-01-01T00:00:00.500Z", "fractional ISO8601 leases are accepted verbatim")
+        for bad in [
+            hint(sid: ""), hint(sid: "bad id"), hint(sid: String(repeating: "a", count: 129)),
+            hint(build: ""), hint(build: String(repeating: "b", count: 97)),
+            hint(exp: "not-a-date"), hint(exp: "1970-01-01T00:00:10Z"),
+        ] {
+            let out = merged(bad)
+            XCTAssertTrue(PushConnectionHints.tailcatKeys.allSatisfy { out[$0] == nil }, "\(bad)")
+            XCTAssertEqual(out["rc2_wm"], "9")
+        }
+        XCTAssertEqual(
+            PushConnectionHints.merge(into: ["rc2_wm": "1"], tailcat: nil, watermark: "9", bootEpoch: nil, now: now)["rc2_wm"],
+            "1",
+            "an existing event watermark is never overwritten"
+        )
+    }
+
     func testPrivateNotificationBridgeDoesNotArmFromLegacyLiveActivityTokenAlone() async throws {
         // WHY: push-to-start / legacy liveActivityToken latches forever and must
         // not suppress finish banners when no activity_update courier exists.

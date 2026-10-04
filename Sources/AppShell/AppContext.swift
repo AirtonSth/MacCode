@@ -1041,6 +1041,10 @@ public final class AppContext {
         self.privateNotificationBridge = privateNotificationBridge
         let liveActivityIdentity = try LiveActivityIdentityStore.beginBoot(settings: self.settingsRepo)
         self.liveActivityHostIdentity = liveActivityIdentity
+        privateNotificationBridge.setConnectionHintSources(
+            watermark: { String(EventBus.shared.currentSeq) },
+            bootEpoch: { String(liveActivityIdentity.bootEpoch) }
+        )
         // S-005a/S-006: Phase A silent wakes with silent_catchup.v1 wm/boot_epoch/since_seq.
         MaterialWakeCoordinator.shared.start(
             bridge: privateNotificationBridge,

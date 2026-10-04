@@ -354,6 +354,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 }
             }
         )
+        if let supervisor = tailcatSupervisor {
+            context.privateNotificationBridge.setConnectionHintSources(
+                tailcat: { await supervisor.pushHint() }
+            )
+        }
         configureTailcatAccess()
 
         palette = CommandPalette(router: router)
