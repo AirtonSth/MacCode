@@ -16866,6 +16866,56 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertNil(vm.lastStartedConversationForTesting(botID: bot.id))
     }
 
+    func test_botDesk2000DeltaDistillReplyPaintsThroughEmbeddedAgentAppWithoutDeskRepublish() async throws {
+        // WHY (Distill terminal parity for Bots): a 2,000-token reply in the bot
+        // desk must reach the embedded Agent App with bounded publishes and no
+        // trailing paint lag, while BotsViewModel (the whole Bots tree) never
+        // republishes per token.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        let agentVM = try XCTUnwrap(vm.deskAgentVM)
+        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID)
+        // Let desk open + embedded thread hydration settle so only streaming is measured.
+        try await Task.sleep(for: .milliseconds(500))
+        var deskPublishes = 0
+        let deskSink = vm.objectWillChange.sink { _ in deskPublishes += 1 }
+        defer { deskSink.cancel() }
+        var agentPublishes = 0
+        let agentSink = agentVM.transcriptState.$timeline.dropFirst().sink { _ in agentPublishes += 1 }
+        defer { agentSink.cancel() }
+        let run = AgentRunID()
+        func deliver(_ event: AssistantEvent) {
+            vm.runCoordinator(context.coordinator, didReceive: event, run: run, threadId: threadID)
+            agentVM.runCoordinator(context.coordinator, didReceive: event, run: run, threadId: threadID)
+        }
+        deliver(.turnStarted(turnId: "t"))
+        deliver(.itemStarted(item: AssistantItem(id: "a", turnId: "t", type: .assistantMessage, startedAtMs: 1)))
+        let clock = ContinuousClock()
+        let start = clock.now
+        for i in 0..<2_000 {
+            deliver(.itemDelta(itemId: "a", bodyAppend: "w\(i) ", outputAppend: nil, summary: nil))
+            if i % 50 == 49 { await Task.yield() }
+        }
+        let sentAt = clock.now
+        for _ in 0..<5_000 {
+            if agentVM.timeline.turns.first?.items.first?.body.hasSuffix("w1999 ") == true { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let tailLag = sentAt.duration(to: clock.now)
+        print("PERF botDesk deltas=2000 agentPublishes=\(agentPublishes) deskPublishes=\(deskPublishes) tailLag=\(tailLag) elapsed=\(start.duration(to: clock.now))")
+        let body = agentVM.timeline.turns.first?.items.first?.body ?? ""
+        XCTAssertTrue(body.hasPrefix("w0 ") && body.hasSuffix("w1999 "), "every delta must land in the embedded Agent App (sel=\(String(describing: agentVM.selectedThreadId)) tid=\(threadID) turns=\(agentVM.timeline.turns.map { "\($0.turnId):\($0.items.map { "\($0.id)/\($0.body.count)" })" }) status=\(agentVM.status))")
+        XCTAssertEqual(deskPublishes, 0, "BotsViewModel must not republish per token")
+        XCTAssertEqual(vm.deskStreamMainHopCountForTesting, 0)
+        XCTAssertLessThan(agentPublishes, 200)
+        XCTAssertLessThan(tailLag, .milliseconds(100), "the last token must paint right after it arrives")
+    }
+
     func test_embeddedAgentAppOwnsLiveStream_becauseDeskMustNotRepublishPerTokenBesideAgentApp() async throws {
         // WHY: the embedded Agent App already paints this thread. A second desk
         // pipeline publishing deskLiveTimeline per token invalidates the whole
