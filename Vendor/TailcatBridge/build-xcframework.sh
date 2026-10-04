@@ -46,9 +46,11 @@ build_slice() {
       "$GO_BIN" build -trimpath -buildmode=c-archive -ldflags=-buildid= \
       -o "$slice_dir/libRCTailcat.a" .
   )
-  mv "$slice_dir/libRCTailcat.h" "$slice_dir/Headers/RCTailcat.h"
+  # Nested so SwiftPM's include/ copy does not collide with GhosttyKit's module.modulemap.
+  mkdir -p "$slice_dir/Headers/RCTailcat"
+  mv "$slice_dir/libRCTailcat.h" "$slice_dir/Headers/RCTailcat/RCTailcat.h"
   ZERO_AR_DATE=1 xcrun ranlib "$slice_dir/libRCTailcat.a"
-  printf 'module RCTailcat {\n  header "RCTailcat.h"\n  export *\n}\n' > "$slice_dir/Headers/module.modulemap"
+  printf 'module RCTailcat {\n  header "RCTailcat.h"\n  export *\n}\n' > "$slice_dir/Headers/RCTailcat/module.modulemap"
 }
 
 build_slice macos-arm64 macosx -mmacosx-version-min=14.0
