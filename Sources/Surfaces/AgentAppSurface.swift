@@ -10629,7 +10629,10 @@ final class StreamEventBatch: @unchecked Sendable {
         var maxBufferedCount: Int = 4_096
         /// Was 32 MiB; 2 MiB keeps each MainActor hop short under multi-thread streams.
         var maxBufferedBytes: Int = 2 * 1_024 * 1_024
-        var drainCount: Int = 48
+        /// Token deltas are tiny and reduced off the MainActor; `drainBytes`
+        /// bounds hop cost. 48 made a 2,000-delta burst paint ~42 hops (~217 ms)
+        /// behind the provider and republish the transcript ~84 times.
+        var drainCount: Int = 512
         var drainBytes: Int = 512 * 1_024
     }
 

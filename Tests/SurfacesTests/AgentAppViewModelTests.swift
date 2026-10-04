@@ -10071,6 +10071,46 @@ final class AgentAppViewModelTests: XCTestCase {
         )
     }
 
+    func test_2000DeltaDistillReplyPublishesBoundedAndKeepsFullText() async throws {
+        // WHY (Distill terminal parity): a 2,000-token Distill reply must cost a
+        // bounded number of transcript publishes, not one per token, and every
+        // delta must land in order.
+        let (vm, repo) = try makeVM()
+        let thread = AgentThread(workspaceId: vm.workspaceID, title: "distill budget",
+                                 provider: .distill, model: "meta/muse", status: .running)
+        try repo.upsert(thread)
+        vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        var publishes = 0
+        let sink = vm.transcriptState.$timeline.dropFirst().sink { _ in publishes += 1 }
+        defer { sink.cancel() }
+        let run = AgentRunID()
+        vm.runCoordinator(vm.coordinator, didReceive: .turnStarted(turnId: "t"), run: run, threadId: thread.id)
+        vm.runCoordinator(vm.coordinator, didReceive: .itemStarted(item: AssistantItem(id: "a", turnId: "t", type: .assistantMessage, startedAtMs: 1)), run: run, threadId: thread.id)
+        let clock = ContinuousClock()
+        let memBefore = perfPhysFootprintBytes()
+        let start = clock.now
+        for i in 0..<2_000 {
+            vm.runCoordinator(vm.coordinator, didReceive: .itemDelta(itemId: "a", bodyAppend: "w\(i) ", outputAppend: nil, summary: nil), run: run, threadId: thread.id)
+            if i % 50 == 49 { await Task.yield() }
+        }
+        let sentAt = clock.now
+        for _ in 0..<5_000 {
+            if vm.timeline.turns.first?.items.first?.body.hasSuffix("w1999 ") == true { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let elapsed = start.duration(to: clock.now)
+        let tailLag = sentAt.duration(to: clock.now)
+        let body = vm.timeline.turns.first?.items.first?.body ?? ""
+        print("PERF vmStream tailLag=\(tailLag)")
+        let memGrowth = Int64(perfPhysFootprintBytes()) - Int64(memBefore)
+        print("PERF vmStream deltas=2000 timelinePublishes=\(publishes) elapsed=\(elapsed) memGrowthKB=\(memGrowth / 1024)")
+        XCTAssertLessThan(memGrowth, 64 * 1024 * 1024, "a ~16 KB streamed reply must not grow resident memory by tens of MB")
+        XCTAssertTrue(body.hasPrefix("w0 ") && body.hasSuffix("w1999 "), "every delta must land in order (turns=\(vm.timeline.turns.map { "\($0.turnId):\($0.items.count)" }) len=\(body.count) tail=\(body.suffix(30)) head=\(body.prefix(12)))")
+        XCTAssertLessThan(publishes, 200, "deltas must coalesce into batched publishes, not one per token")
+        XCTAssertLessThan(tailLag, .milliseconds(100), "the last token must paint right after the provider sends it, not ~40 hops later")
+    }
+
     func test_hiddenSurface_dropsStaleStreamAfterThreadSwitch() async throws {
         // WHY: hide → switch thread → show must not paint the leaving thread.
         let (vm, repo) = try makeVM()
@@ -10593,3 +10633,4 @@ private final class CapturingProviderRunner: AgentProviderRunner, @unchecked Sen
         return AgentRunHandle(runId: request.runId, process: nil) {}
     }
 }
+
