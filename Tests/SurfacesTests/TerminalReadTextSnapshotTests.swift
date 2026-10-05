@@ -147,6 +147,18 @@ final class TerminalReadTextSnapshotTests: XCTestCase {
         XCTAssertFalse(TerminalSurface.hasSpinnerTitle("\u{2733} Claude Code"))
     }
 
+    /// WHY: Distill idle at its prompt repaints ~10x/s with escape-only frames
+    /// (sync-update brackets, cursor moves, kitty graphics probe). Counting those as
+    /// output kept the tab/sidebar spinner on with no active work.
+    func test_escapeOnlyRepaintIsNotVisibleOutput() {
+        let idleFrame = Data("\u{1B}[?2026h\u{1B}[m\u{1B}[0m\u{1B}_Ga=d,d=i,i=1,q=2\u{1B}\\\u{1B}[37;7H\u{1B}[?2026l".utf8)
+        XCTAssertFalse(TerminalSurface.containsVisibleOutput(idleFrame))
+        XCTAssertFalse(TerminalSurface.containsVisibleOutput(Data("\u{1B}]0;title\u{07}\r\n".utf8)))
+        XCTAssertTrue(TerminalSurface.containsVisibleOutput(Data("\u{1B}[32mok\u{1B}[0m".utf8)))
+        XCTAssertTrue(TerminalSurface.containsVisibleOutput(Data("building...\n".utf8)))
+        XCTAssertTrue(TerminalSurface.containsVisibleOutput(Data("\u{2834}".utf8)), "UTF-8 spinner glyph is visible output")
+    }
+
     func test_deadOrAbsentJobIsNeverBusy() {
         let now = Date()
         XCTAssertFalse(TerminalSurface.isBusy(

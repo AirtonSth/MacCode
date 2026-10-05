@@ -1301,6 +1301,35 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         return now.timeIntervalSince(lastOutputAt) < busyQuietInterval
     }
 
+    /// True when `data` carries printable text outside escape sequences. Idle TUIs
+    /// (Distill at its prompt) repaint ~10x/s with escape-only frames (cursor moves,
+    /// synchronized-update brackets, kitty graphics probes); those are not work and
+    /// must not keep the busy spinner on. Escape state is tracked per chunk only.
+    nonisolated static func containsVisibleOutput(_ data: Data) -> Bool {
+        enum State { case ground, escape, csi, string, stringEscape }
+        var state = State.ground
+        for byte in data {
+            switch state {
+            case .ground:
+                if byte == 0x1B { state = .escape }
+                else if byte >= 0x20 && byte != 0x7F { return true }
+            case .escape:
+                switch byte {
+                case 0x5B: state = .csi
+                case 0x5D, 0x50, 0x5F, 0x5E, 0x58: state = .string
+                default: state = .ground
+                }
+            case .csi:
+                if (0x40...0x7E).contains(byte) { state = .ground }
+            case .string:
+                if byte == 0x07 { state = .ground } else if byte == 0x1B { state = .stringEscape }
+            case .stringEscape:
+                state = byte == 0x5C ? .ground : .string
+            }
+        }
+        return false
+    }
+
     /// TUIs animate a braille spinner in the title while working (Claude Code shows a static ✳ when idle).
     nonisolated static func hasSpinnerTitle(_ title: String) -> Bool {
         guard let scalar = title.unicodeScalars.first else { return false }
@@ -2563,7 +2592,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
             descriptor.metadata["ssh_status"] = "connected"
         }
         autoSubmitSavedSSHPasswordIfNeeded(from: data)
-        lastOutputAt = Date()
+        if Self.containsVisibleOutput(data) { lastOutputAt = Date() }
         // BEL (0x07): keep activity feedback non-visual. Some long-running CLIs
         // emit repeated bells, and repainting the terminal background reads as
         // pane flicker. Use BellDetector so that 0x07 acting as an OSC string-
@@ -2644,7 +2673,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         ) {
             ensureRendererCurrent()
         }
-        lastOutputAt = Date()
+        if Self.containsVisibleOutput(data) { lastOutputAt = Date() }
         outputBus.emit(descriptor.id, data)
         extendDeferredUnhostedReplay(data)
         if renderDiagnostics().canRender {
@@ -4107,7 +4136,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
             )
             historyCoordinator.enqueue(batch.data)
             recordOutputTelemetry(bytes: batch.data.count)
-            lastOutputAt = Date()
+            if Self.containsVisibleOutput(batch.data) { lastOutputAt = Date() }
             if emitOutput {
                 outputBus.emit(descriptor.id, batch.data)
             }
