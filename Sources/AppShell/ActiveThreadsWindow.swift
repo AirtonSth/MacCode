@@ -156,7 +156,7 @@ public final class ActiveThreadsViewModel: ObservableObject {
             let tabs = activeSurfaces.count
             var parts: [String] = []
             if threads > 0 { parts.append(threads == 1 ? "1 agent thread" : "\(threads) agent threads") }
-            if tabs > 0 { parts.append(tabs == 1 ? "1 running tab" : "\(tabs) running tabs") }
+            if tabs > 0 { parts.append(tabs == 1 ? "1 tab" : "\(tabs) tabs") }
             return parts.joined(separator: " and ") + (activeCount == 1 ? " is running" : " are running")
         case .lastFinished:
             return "Recent completed, failed, cancelled, and interrupted runs"
