@@ -1036,10 +1036,15 @@ public final class JSONRPCDispatcher {
                         let state = try await snapshotRouter.readConnectionSnapshotState()
                         try Task.checkCancellation()
                         let after = EventBus.shared.snapshotMetadata()
-                        if before == after {
+                        // Live-only stream events (terminal output, agent
+                        // deltas) cannot change the state read above, so only
+                        // a state revision change forces a retry. Return the
+                        // pre-read watermark: the client applies every event
+                        // after it, including in-window deltas, from the stream.
+                        if before.stateRevision == after.stateRevision {
                             outcome.resolve(.success(EventBus.SnapshotBarrierResult(
                                 state: state,
-                                metadata: after
+                                metadata: before
                             )))
                             self.finishConnectionSnapshotRead(id: readID)
                             return

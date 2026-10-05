@@ -132,6 +132,20 @@ public final class EventBus: @unchecked Sendable {
     private var domainRevisions = ConnectionDomainRevisions(
         shell: 0, surfaces: 0, agentThreads: 0, browser: 0, files: 0
     )
+    /// Seq of the latest event that can change snapshot-read state. Live-only
+    /// stream kinds do not advance it (see `liveOnlyStreamEventKinds`).
+    private var snapshotStateRevision: Int64 = 0
+
+    /// High-frequency stream kinds that never back snapshot state: they are
+    /// not persisted (`AppDelegate.shouldPersistEvent`) and carry no thread,
+    /// layout or settings mutation. The `sync.snapshot` fence ignores them so
+    /// a streaming agent or printing terminal cannot starve baseline reads.
+    public static let liveOnlyStreamEventKinds: Set<String> = [
+        "surface.output",
+        "agent.item.delta",
+        "agent.item.progress",
+        "agent.provider_runtime.event",
+    ]
     private struct Subscriber {
         var filter: EventStreamFilter
         /// Called with the seq of an event this subscriber's filter dropped,
@@ -204,6 +218,8 @@ public final class EventBus: @unchecked Sendable {
         public let sequence: Int64
         public let oldestReplaySequence: Int64
         public let domainRevisions: ConnectionDomainRevisions
+        /// Changes only for events outside `liveOnlyStreamEventKinds`.
+        public let stateRevision: Int64
     }
 
     public struct SnapshotBarrierResult<Value> {
@@ -342,6 +358,7 @@ public final class EventBus: @unchecked Sendable {
                     precondition(event.seq > lastSeq)
                     lastSeq = event.seq
                     domainRevisions = Self.revisions(after: event, current: domainRevisions)
+                    advanceSnapshotStateRevisionLocked(after: event)
                     if shouldRetainRecentEvent?(event) ?? true {
                         retainRecent(event)
                     }
@@ -379,6 +396,7 @@ public final class EventBus: @unchecked Sendable {
         lastSeq += 1
         let ev = Event(seq: lastSeq, kind: kind, payload: payload, ts: clock().timeIntervalSince1970)
         domainRevisions = Self.revisions(after: ev, current: domainRevisions)
+        advanceSnapshotStateRevisionLocked(after: ev)
         if shouldRetainRecentEvent?(ev) ?? true {
             retainRecent(ev)
         }
@@ -421,6 +439,7 @@ public final class EventBus: @unchecked Sendable {
         // added between the two lock regions; sizes are already walked via newSizes.
         lock.lock()
         self.lastSeq = max(self.lastSeq, lastSeq)
+        snapshotStateRevision = max(snapshotStateRevision, self.lastSeq)
         let liveKnown = Set(self.recent.map(\.seq))
         for ev in candidates where !liveKnown.contains(ev.seq) {
             let bytes = newSizes[ev.seq] ?? 0
@@ -652,8 +671,14 @@ public final class EventBus: @unchecked Sendable {
         return SnapshotMetadata(
             sequence: lastSeq,
             oldestReplaySequence: replayFloor < lastSeq ? replayFloor + 1 : lastSeq,
-            domainRevisions: domainRevisions
+            domainRevisions: domainRevisions,
+            stateRevision: snapshotStateRevision
         )
+    }
+
+    private func advanceSnapshotStateRevisionLocked(after event: Event) {
+        guard !Self.liveOnlyStreamEventKinds.contains(event.kind) else { return }
+        snapshotStateRevision = max(snapshotStateRevision, event.seq)
     }
 
     /// Returns the oldest cursor that can reach `lastSeq` using only a

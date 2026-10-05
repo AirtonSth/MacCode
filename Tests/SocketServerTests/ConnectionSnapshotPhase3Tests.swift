@@ -13,6 +13,9 @@ private final class Phase3SnapshotFakeRouter: FakeRouter, ConnectionSnapshotRout
     /// When set, the expensive portion of the read runs off MainActor (mirrors
     /// production AgentThreadListGateway hop) so MainActor/HTTP stay free.
     var offMainDelayNanoseconds: UInt64 = 0
+    /// Event kinds published on EventBus.shared inside every off-main read
+    /// window, mirroring host activity that lands while the snapshot is built.
+    var publishKindsDuringRead: [String] = []
     nonisolated(unsafe) private(set) var threadQueryOnMainCount = 0
     nonisolated(unsafe) private(set) var threadQueryOffMainCount = 0
 
@@ -25,6 +28,7 @@ private final class Phase3SnapshotFakeRouter: FakeRouter, ConnectionSnapshotRout
             _ = snapshotReadRelease.wait(timeout: .now() + 2)
         }
         let delay = offMainDelayNanoseconds
+        let kindsDuringRead = publishKindsDuringRead
         if delay > 0 {
             // Capture probe counters off MainActor like AgentThreadListGateway.
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -33,6 +37,9 @@ private final class Phase3SnapshotFakeRouter: FakeRouter, ConnectionSnapshotRout
                         self.threadQueryOnMainCount += 1
                     } else {
                         self.threadQueryOffMainCount += 1
+                    }
+                    for kind in kindsDuringRead {
+                        EventBus.shared.publishRawForTesting(kind: kind, payload: .object([:]))
                     }
                     Thread.sleep(forTimeInterval: TimeInterval(delay) / 1_000_000_000)
                     continuation.resume()
@@ -165,6 +172,68 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
             "MainActor must keep pumping while snapshot thread query is delayed off-main"
         )
         XCTAssertEqual(result.metadata.sequence, EventBus.shared.currentSeq)
+    }
+
+    func test_dispatcherSnapshotRead_liveOnlyStreamEventsDoNotBreakFenceAndStayReplayable() async throws {
+        // WHY (C17): a streaming agent or a printing terminal publishes
+        // surface.output / agent.item.delta / progress / provider_runtime at
+        // ~100 events/s. Those kinds never change state the snapshot reads, so
+        // they must not make sync.snapshot fail with -32012 (iOS then never
+        // commits a baseline and loops "Still reconnecting"). The returned
+        // sequence must stay at the pre-read watermark so the client still
+        // applies every delta published inside the read from its live buffer.
+        let router = await MainActor.run {
+            let router = Phase3SnapshotFakeRouter()
+            router.offMainDelayNanoseconds = 20_000_000
+            router.publishKindsDuringRead = [
+                "surface.output",
+                "agent.item.delta",
+                "agent.item.progress",
+                "agent.provider_runtime.event",
+            ]
+            return router
+        }
+        let startSequence = EventBus.shared.currentSeq
+
+        let result = try await Task { @MainActor in
+            try await JSONRPCDispatcher(router: router).readConnectionSnapshot()
+        }.value
+
+        let readCount = await MainActor.run { router.snapshotReadCount }
+        XCTAssertEqual(readCount, 1, "live-only stream events must not force a fence retry")
+        XCTAssertEqual(
+            result.metadata.sequence,
+            startSequence,
+            "metadata must be the pre-read watermark so in-window deltas are replayed, not dropped"
+        )
+        XCTAssertGreaterThanOrEqual(EventBus.shared.currentSeq, startSequence + 4)
+    }
+
+    func test_dispatcherSnapshotRead_stateMutationDuringEveryAttemptStillFailsFenceRetryably() async throws {
+        // WHY (C17): the fence still guards real snapshot-domain mutations. A
+        // rename landing inside every read could be applied twice on replay,
+        // so the host must keep returning the retryable -32012 for it.
+        let router = await MainActor.run {
+            let router = Phase3SnapshotFakeRouter()
+            router.offMainDelayNanoseconds = 1_000_000
+            router.publishKindsDuringRead = ["surface.renamed"]
+            return router
+        }
+
+        let code: Int? = await Task { @MainActor in
+            do {
+                _ = try await JSONRPCDispatcher(router: router).readConnectionSnapshot()
+                return nil
+            } catch let error as JSONRPCError {
+                return error.code
+            } catch {
+                return nil
+            }
+        }.value
+
+        XCTAssertEqual(code, JSONRPCDispatcher.snapshotSequenceFenceUnstable.code)
+        let readCount = await MainActor.run { router.snapshotReadCount }
+        XCTAssertEqual(readCount, 3)
     }
 
     func test_dispatcherSnapshotRead_timeoutIsFailFastAndSingleFlight() async throws {
