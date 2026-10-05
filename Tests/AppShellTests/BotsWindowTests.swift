@@ -22,6 +22,23 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(payload["metadata"], .object(["busy": .string("")]))
     }
 
+    func test_surfaceBusyPayloadCarriesSurfaceIDAndClearsWithEmptyString_becauseIOSListsBusyTerminals() {
+        let ws = WorkspaceID(UUID())
+        let sid = SurfaceID(UUID())
+        XCTAssertEqual(
+            AppCommandRouter.surfaceBusyPayload(workspace: ws, surface: sid, busy: true),
+            .object([
+                "workspace_id": .string(ws.value.uuidString),
+                "id": .string(sid.value.uuidString),
+                "surface_id": .string(sid.value.uuidString),
+                "metadata": .object(["busy": .string("true")])
+            ])
+        )
+        guard case .object(let idle) = AppCommandRouter.surfaceBusyPayload(workspace: ws, surface: sid, busy: false)
+        else { return XCTFail("payload must be an object") }
+        XCTAssertEqual(idle["metadata"], .object(["busy": .string("")]))
+    }
+
     func test_supervisedRunPromptKeepsDistillSlashRaw_becausePairedDeviceSendsMustReachDistillCommands() {
         // iOS bot sends run startSupervisedRun, not the embedded desk; the brain
         // wrap would bury `/goal status` so Distill would treat it as a goal objective.
