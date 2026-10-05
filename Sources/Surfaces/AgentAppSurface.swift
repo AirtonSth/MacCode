@@ -424,6 +424,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Compiles the bot brain into the provider prompt for a bot-run workspace thread.
     public var botPromptTransform: (@MainActor (BotID, String, AgentThreadID, AgentRunID) async throws -> String)?
     public var botRunStarted: (@MainActor (BotID, AgentRunID, AgentThreadID) -> Void)?
+    /// Non-nil when another thread already holds the bot's VM.
+    public var botBusyMessage: ((BotID, AgentThreadID) -> String?)?
     @Published public var availableRunAsUsers: [AgentRunAsUser] = MacOSLocalUserCatalog.listEligibleUsers()
     @Published public var model: String = AgentDefaultModelSelection.builtInDefault(for: .defaultProvider)
     /// Last model the user chose per provider (new threads + provider switches).
@@ -8223,6 +8225,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return
         }
         if (text.hasPrefix("/") || text.hasPrefix("$")), handleSlashCommand(text) {
+            return
+        }
+        if let sendThreadId,
+           case .bot(let botID)? = threads.first(where: { $0.id == sendThreadId })?.actor,
+           executionTarget(for: botID) == .vm,
+           let busy = botBusyMessage?(botID, sendThreadId),
+           await enqueuePromptWhileRunning(text: text, attached: attachedForSend) {
+            statusMessage = busy
             return
         }
         if selectedThreadCanQueuePrompt,
