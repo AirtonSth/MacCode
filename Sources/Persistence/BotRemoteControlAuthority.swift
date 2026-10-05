@@ -813,6 +813,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             throw error
         }
         try? store.deleteQueuedFollowUps(botID: bot.id)
+        BotComputerControl.shared.forget(bot.id)
+        ManualActionRequestStore(appSupportDirectory: appSupport).closeAll(botID: bot.id)
 
         var residuals: [String] = []
         if quarantined.guest != nil {

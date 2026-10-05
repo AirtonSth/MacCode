@@ -5698,6 +5698,8 @@ public final class BotsViewModel: ObservableObject {
         do {
             try botSecretStore.deleteAll(botID: id)
             try botStore.delete(id: id)
+            BotComputerControl.shared.forget(id)
+            router?.manualActionStore.closeAll(botID: id)
             if let service = computerGuestService {
                 Task.detached { [service] in
                     service.teardown(botID: id)

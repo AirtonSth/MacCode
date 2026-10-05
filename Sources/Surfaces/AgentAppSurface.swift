@@ -426,6 +426,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var botRunStarted: (@MainActor (BotID, AgentRunID, AgentThreadID) -> Void)?
     /// Non-nil when another thread already holds the bot's VM.
     public var botBusyMessage: ((BotID, AgentThreadID) -> String?)?
+    /// Pending Mac-execution approvals pushed by the host, per thread (reason text).
+    @Published public var pendingMacExecutionByThread: [AgentThreadID: String] = [:]
+    /// Approves or declines a pending Mac-execution request; wired by the host.
+    public var botMacExecutionResolver: (@MainActor (AgentThreadID, Bool) async -> Void)?
+    /// Returns a user-facing error when the bot VM cannot run; nil when ready. Wired by the host.
+    public var botVMPreflight: ((BotID) async -> String?)?
+    /// Starts (provisions) the bot VM; returns a user-facing error or nil. Wired by the host.
+    public var botVMProvision: ((BotID) async -> String?)?
+    /// Set when the VM preflight failed; drives the "VM indisponível" banner.
+    @Published public var vmUnavailableBotID: BotID?
     @Published public var availableRunAsUsers: [AgentRunAsUser] = MacOSLocalUserCatalog.listEligibleUsers()
     @Published public var model: String = AgentDefaultModelSelection.builtInDefault(for: .defaultProvider)
     /// Last model the user chose per provider (new threads + provider switches).
@@ -6068,6 +6078,78 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return true
     }
 
+    public var pendingMacExecutionReason: String? {
+        selectedThreadId.flatMap { pendingMacExecutionByThread[$0] }
+    }
+
+    public func resolveMacExecution(approve: Bool) {
+        guard let id = selectedThreadId, pendingMacExecutionByThread[id] != nil else { return }
+        pendingMacExecutionByThread[id] = nil
+        guard let resolver = botMacExecutionResolver else { return }
+        Task { await resolver(id, approve) }
+    }
+
+    /// Updates the painted row only; the caller already persisted the target.
+    public func mirrorExecutionTarget(_ target: ExecutionTarget, thread id: AgentThreadID) {
+        guard let index = threads.firstIndex(where: { $0.id == id }) else { return }
+        threads[index].executionTarget = target
+    }
+
+    /// Blocks the send (true) when a bot thread's workspace is gone or its VM is down. Never falls back to the Mac.
+    private func botVMGateBlocksRun(botID: BotID, thread: AgentThread?) async -> Bool {
+        let workspace = thread?.worktreePath ?? cwd
+        if !FileManager.default.fileExists(atPath: workspace) {
+            statusMessage = "Workspace removido"
+            return true
+        }
+        guard executionTarget(for: botID) == .vm else { return false }
+        guard let preflight = botVMPreflight else { return false }
+        if let failure = await preflight(botID) {
+            statusMessage = "VM indisponível: \(failure)"
+            vmUnavailableBotID = botID
+            return true
+        }
+        vmUnavailableBotID = nil
+        return false
+    }
+
+    /// "Iniciar VM": provisions through the host, then clears the banner.
+    public func startUnavailableBotVM() {
+        guard let botID = vmUnavailableBotID, let provision = botVMProvision else { return }
+        Task {
+            if let failure = await provision(botID) {
+                statusMessage = "VM indisponível: \(failure)"
+            } else {
+                vmUnavailableBotID = nil
+                statusMessage = ""
+            }
+        }
+    }
+
+    /// "Rodar esta thread no Mac": explicit user choice, locks the thread to the Mac target.
+    public func runSelectedThreadOnMac() {
+        guard let botID = vmUnavailableBotID, let tid = selectedThreadId,
+              let thread = threads.first(where: { $0.id == tid }) else { return }
+        do {
+            let lockedAt = thread.actorLockedAt ?? Date()
+            if thread.actorLockedAt == nil {
+                guard let linker = botThreadLinker else { throw BotRunUnavailableError() }
+                try linker(botID, tid)
+            }
+            let actor = thread.actorLockedAt == nil ? RunActor.bot(botID) : thread.actor
+            guard try threadRepo.setActor(id: tid, actor: actor, lockedAt: lockedAt, executionTarget: .mac) else { return }
+            if let index = threads.firstIndex(where: { $0.id == tid }) {
+                threads[index].actor = actor
+                threads[index].actorLockedAt = lockedAt
+                threads[index].executionTarget = .mac
+            }
+            vmUnavailableBotID = nil
+            statusMessage = ""
+        } catch {
+            statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        }
+    }
+
     /// Max chars kept per message in the handoff summary.
     static let handoffMessageLimit = 300
     static let handoffMessageCount = 6
@@ -8719,6 +8801,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let actorThread = threads.first(where: { $0.id == tid })
         let runActor: RunActor = actorThread?.actorLockedAt != nil ? (actorThread?.actor ?? .none) : selectedRunActor
         var botPrompt: String?
+        if embedding == nil, case .bot(let botID) = runActor,
+           await botVMGateBlocksRun(botID: botID, thread: actorThread) {
+            return nil
+        }
         if embedding == nil, case .bot(let botID) = runActor {
             do {
                 if actorThread?.actorLockedAt == nil {
@@ -15269,6 +15355,12 @@ public struct AgentAppView: View {
             }
             if vm.selectedThreadBotUnavailable {
                 deletedBotBanner
+            }
+            if vm.pendingMacExecutionReason != nil {
+                BotMacExecutionBanner(vm: vm)
+            }
+            if vm.vmUnavailableBotID != nil {
+                BotVMUnavailableBanner(vm: vm)
             }
             ComposerReactiveScope(composerState: vm.composerState) {
                 composer
