@@ -1010,6 +1010,30 @@ final class SSHEmbeddedTerminalContractTests: XCTestCase {
         XCTAssertGreaterThan(snapshot.pendingBytes, 0)
     }
 
+    func testBusyForwardsOnlyFromCurrentInnerTerminalAndDetachesReplaced() async throws {
+        // WHY: Active Threads lists a busy SSH tab from the wrapper's callback.
+        // A replaced/disconnected inner terminal must stop reporting, or a dead
+        // session could re-mark the tab busy.
+        let surface = try makeSurface()
+        var events: [Bool] = []
+        surface.onBusyStateChanged = { events.append($0) }
+        try await surface.installEmbeddedPlaceholderForTesting()
+        let first = try XCTUnwrap(surface.embeddedTerminalForTesting)
+        first.onBusyStateChanged?(true)
+        XCTAssertEqual(events, [true], "current inner terminal busy must reach the wrapper")
+
+        try await surface.installEmbeddedPlaceholderForTesting()
+        let second = try XCTUnwrap(surface.embeddedTerminalForTesting)
+        XCTAssertFalse(first === second)
+        XCTAssertNil(first.onBusyStateChanged, "replaced terminal must be detached")
+        second.onBusyStateChanged?(false)
+        XCTAssertEqual(events.last, false)
+
+        surface.disconnectForTesting()
+        XCTAssertNil(second.onBusyStateChanged, "disconnect must detach the inner terminal")
+        XCTAssertFalse(surface.isBusy)
+    }
+
     private func makeSurface(outputBus: SurfaceOutputBus = SurfaceOutputBus()) throws -> SSHSurface {
         let surface = try SSHSurface(
             workspaceID: WorkspaceID(),

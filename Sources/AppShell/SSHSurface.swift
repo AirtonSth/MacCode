@@ -104,7 +104,18 @@ final class SSHSurface: NSObject, SSHTransferSurface, TerminalRuntimeRoutingSurf
     private var dragStartSidebarWidth: CGFloat?
     private var dragStartTransferWidth: CGFloat?
     private var terminal: TerminalSurface? {
-        didSet { terminal?.onBusyStateChanged = { [weak self] busy in self?.onBusyStateChanged?(busy) } }
+        didSet {
+            guard terminal !== oldValue else { return }
+            oldValue?.onBusyStateChanged = nil
+            terminal?.onBusyStateChanged = { [weak self, weak terminal] busy in
+                // Only the current inner terminal may report busy for this tab.
+                guard let self, let terminal, self.terminal === terminal else { return }
+                self.onBusyStateChanged?(busy)
+            }
+            // Replacement or disconnect: publish the wrapper's state so a busy
+            // row clears when its session goes away.
+            if (oldValue?.isBusy ?? false) != isBusy { onBusyStateChanged?(isBusy) }
+        }
     }
     var isBusy: Bool { terminal?.isBusy ?? false }
     var onBusyStateChanged: ((Bool) -> Void)?
