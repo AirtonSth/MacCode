@@ -218,4 +218,40 @@ final class BotVMFailureHandlingTests: XCTestCase {
         XCTAssertNil(BotComputerControl.shared.openRequest(f.bot.id))
         XCTAssertFalse(BotComputerControl.shared.isControlledByUser(f.bot.id))
     }
+
+    private final class TopDocker: BotComputerDockerClienting, @unchecked Sendable {
+        var tops: [String: String] = [:]
+        var execs: [(name: String, command: [String], user: String?)] = []
+        func info() throws -> String { "" }
+        func imageExists(tag: String) throws -> Bool { true }
+        func imageLabel(tag: String, key: String) throws -> String { "" }
+        func imageID(tag: String) throws -> String { "" }
+        func build(context: URL, tag: String) throws {}
+        func create(options: BotComputerContainerCreateOptions) throws -> String { "" }
+        func start(name: String) throws {}
+        func stop(name: String) throws {}
+        func inspect(name: String) throws -> BotComputerContainerInspect { throw BotComputerGuestError.notReady }
+        func exec(name: String, command: [String], user: String?, detach: Bool, workdir: String?, environment: [String: String]) throws -> Data {
+            execs.append((name, command, user))
+            return Data()
+        }
+        func rename(from: String, to: String) throws {}
+        func ensureNetwork(name: String) throws {}
+        func remove(name: String) throws {}
+        func removeMatching(namePrefix: String) throws {}
+        func top(name: String) throws -> String { tops[name] ?? "" }
+    }
+
+    /// WHY: a restart must not leave an unowned `bash -lc` driving a bot VM, and idle VMs must stay untouched.
+    func test_orphanScan_reapsOnlyContainersWithBashLc() {
+        let docker = TopDocker()
+        docker.tops["busy"] = "PID CMD\n42 bash -lc sleep 999"
+        docker.tops["idle"] = "PID CMD\n1 supervisord"
+        let found = BotVMOrphanScan.reap(docker: docker, names: ["busy", "idle"])
+        XCTAssertEqual(found, ["busy"])
+        XCTAssertEqual(docker.execs.count, 1)
+        XCTAssertEqual(docker.execs.first?.name, "busy")
+        XCTAssertEqual(docker.execs.first?.command, ["pkill", "-f", "bash -lc"])
+        XCTAssertEqual(docker.execs.first?.user, "root")
+    }
 }

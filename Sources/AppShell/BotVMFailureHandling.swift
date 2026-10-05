@@ -68,3 +68,41 @@ extension AppCommandRouter {
         }.value
     }
 }
+
+/// A restart leaves `bash -lc` execs running inside bot containers with no run owning them.
+enum BotVMOrphanScan {
+    static func orphans(docker: any BotComputerDockerClienting, names: [String]) -> [String] {
+        names.filter { name in
+            (try? docker.top(name: name))?.contains("bash -lc") == true
+        }
+    }
+
+    /// Logs each orphan and kills its stray shells as root. Returns the orphaned container names.
+    @discardableResult
+    static func reap(docker: any BotComputerDockerClienting, names: [String]) -> [String] {
+        let found = orphans(docker: docker, names: names)
+        for name in found {
+            NSLog("bot vm orphan exec: \(name)")
+            _ = try? docker.exec(name: name, command: ["pkill", "-f", "bash -lc"], user: "root", detach: false)
+        }
+        return found
+    }
+}
+
+extension AppCommandRouter {
+    /// Scans Docker-desktop bot containers off the main thread; Docker being down is not an error.
+    func scanBotVMOrphansOnLaunch() {
+        guard let store = context?.botStore else { return }
+        let docker = botVMDocker
+        DispatchQueue.global(qos: .utility).async {
+            let bots = (try? store.list()) ?? []
+            let names = bots.compactMap { bot -> String? in
+                guard let revisionID = bot.currentRevisionID,
+                      let revision = (try? store.getRevision(id: revisionID)) ?? nil,
+                      revision.desktopKind == .dockerDesktop else { return nil }
+                return BotComputerGuestSpec.containerName(botID: bot.id)
+            }
+            BotVMOrphanScan.reap(docker: docker, names: names)
+        }
+    }
+}

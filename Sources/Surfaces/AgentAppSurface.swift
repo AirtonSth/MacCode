@@ -509,6 +509,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
     /// Who drives the bot computer; tests inject an isolated instance.
     public var botComputerControl: BotComputerControl = .shared
+    public var openBotScreen: ((BotID) -> Void)?
+    @Published public internal(set) var botScreenControlled = false
     /// Request awaiting the user on the selected thread (open or taken).
     @Published public internal(set) var openManualAction: ManualActionRequest?
     /// Continued/declined requests of the selected thread, oldest first.
@@ -15450,6 +15452,7 @@ public struct AgentAppView: View {
                 .foregroundColor(DS.Palette.textTertiary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer(minLength: 0)
+            botScreenControls
             // Unified working phase strip (replaces separate awaiting/shell/status pills).
             workingPhaseStrip
             // Provider-neutral Subagents activity for the selected thread only
@@ -15478,6 +15481,22 @@ public struct AgentAppView: View {
         }
         .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
         .dsBar(edge: .bottom)
+    }
+
+    @ViewBuilder
+    private var botScreenControls: some View {
+        if vm.botScreenBotID != nil {
+            Button("Ver tela") { vm.viewBotScreen() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("agent.botScreen.view")
+            Button(vm.botScreenControlled ? "Devolver" : "Assumir controle") {
+                Task { await vm.toggleBotScreenControl() }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityIdentifier("agent.botScreen.control")
+        }
     }
 
     // Persistent, prominent banner while full access is on, beyond the small

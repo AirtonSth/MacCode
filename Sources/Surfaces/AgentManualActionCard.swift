@@ -44,8 +44,38 @@ extension AgentAppViewModel {
             open = request
         }
         let resolved = store.all(threadID: threadID).filter { $0.state == .continued || $0.state == .declined }
+        let controlled = botScreenBotID.map { botComputerControl.isControlledByUser($0) } ?? false
+        if botScreenControlled != controlled { botScreenControlled = controlled }
         if openManualAction != open { openManualAction = open }
         if resolvedManualActions != resolved { resolvedManualActions = resolved }
+    }
+
+    /// The bot whose VM screen the selected thread uses; nil for any other thread.
+    public var botScreenBotID: BotID? {
+        guard let thread = threads.first(where: { $0.id == selectedThreadId }),
+              thread.executionTarget == .vm, case .bot(let botID) = thread.actor else { return nil }
+        return botID
+    }
+
+    public func viewBotScreen() {
+        if let botID = botScreenBotID { openBotScreen?(botID) }
+    }
+
+    /// Devolver with an open request behaves like Continuar; otherwise it only releases control.
+    public func toggleBotScreenControl() async {
+        guard let botID = botScreenBotID else { return }
+        if botComputerControl.isControlledByUser(botID) {
+            if let request = openManualAction, request.botID == botID {
+                await continueManualAction(note: nil)
+            } else {
+                botComputerControl.release(botID)
+            }
+        } else if let request = openManualAction, request.botID == botID {
+            takeManualControl()
+        } else {
+            botComputerControl.take(botID)
+        }
+        botScreenControlled = botComputerControl.isControlledByUser(botID)
     }
 
     public func takeManualControl() {

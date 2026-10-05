@@ -204,4 +204,46 @@ final class ManualActionCardTests: XCTestCase {
         try await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertEqual(f.runner.requests.count, 1, "second surface must see the request already resolved")
     }
+
+    private func lockToBotVM(_ f: Fixture) throws {
+        let lockedAt = Date()
+        XCTAssertTrue(try f.ctx.threadRepo.setActor(
+            id: f.thread.id, actor: .bot(f.bot.id), lockedAt: lockedAt, executionTarget: .vm
+        ))
+        let index = try XCTUnwrap(f.vm.threads.firstIndex(where: { $0.id == f.thread.id }))
+        f.vm.threads[index].actor = .bot(f.bot.id)
+        f.vm.threads[index].actorLockedAt = lockedAt
+        f.vm.mirrorExecutionTarget(.vm, thread: f.thread.id)
+    }
+
+    /// WHY: the user must be able to take the VM screen and hand it back; handing back mid-request resumes the bot once.
+    func test_botScreen_takeThenDevolverWithOpenRequestContinuesOnce() async throws {
+        let f = try makeFixture()
+        let control = BotComputerControl()
+        f.vm.botComputerControl = control
+        try lockToBotVM(f)
+        f.vm.botVMPreflight = { _ in nil }
+        f.vm.botThreadLinker = { _, _ in }
+        f.vm.botPromptTransform = { _, text, _, _ in text }
+        f.vm.botRunStarted = { _, _, _ in }
+        XCTAssertEqual(f.vm.botScreenBotID, f.bot.id)
+        var opened: [BotID] = []
+        f.vm.openBotScreen = { opened.append($0) }
+        f.vm.viewBotScreen()
+        XCTAssertEqual(opened, [f.bot.id])
+
+        await f.vm.toggleBotScreenControl()
+        XCTAssertTrue(control.isControlledByUser(f.bot.id))
+        XCTAssertTrue(f.vm.botScreenControlled)
+
+        _ = post(f, control: control)
+        _ = await waitUntil { f.vm.openManualAction != nil }
+        await f.vm.toggleBotScreenControl()
+        XCTAssertFalse(control.isControlledByUser(f.bot.id))
+        XCTAssertFalse(f.vm.botScreenControlled)
+        _ = await waitUntil { f.runner.requests.count >= 1 }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(f.runner.requests.count, 1)
+        XCTAssertEqual(f.vm.resolvedManualActions.first?.state, .continued)
+    }
 }

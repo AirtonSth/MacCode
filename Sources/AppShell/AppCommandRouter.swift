@@ -2803,6 +2803,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         agent.viewModel.botMacExecutionResolver = { [weak self] threadID, approve in
             await self?.resolveMacExecution(thread: threadID, approve: approve)
         }
+        agent.viewModel.openBotScreen = { [weak self] botID in self?.openBotGuestDesktopInNewWindow(botID) }
         agent.viewModel.botVMPreflight = { [weak self] botID in await self?.botVMPreflight(botID) }
         agent.viewModel.botVMProvision = { [weak self] botID in await self?.provisionBotVM(botID) }
         agent.viewModel.pendingMacExecutionByThread = pendingMacExecution
