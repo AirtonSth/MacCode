@@ -16839,6 +16839,44 @@ final class BotsWindowTests: XCTestCase {
         return UInt64(value.tv_sec) * 1_000_000_000 + UInt64(value.tv_nsec)
     }
 
+    /// Links the selected desk conversation through the real first-send path
+    /// (the desk creates threads lazily) and waits for the fake run to settle.
+    @discardableResult
+    private func linkDeskThreadByFirstSend(
+        _ vm: BotsViewModel,
+        context: AppContext,
+        router: AppCommandRouter,
+        providerAlreadyInstalled: Bool = false
+    ) async throws -> AgentThreadID {
+        if !providerAlreadyInstalled {
+            context.coordinator.replaceProvider(
+                .claude,
+                runner: FakeProviderRunner(provider: .claude, scenario: .simpleAssistant(reply: "ok"))
+            )
+            router.rememberProviderSnapshotsForSend([
+                AgentProviderSnapshotFactory.snapshot(
+                    provider: .claude,
+                    models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                    binaryPath: "/usr/bin/true",
+                    authenticated: true,
+                    id: "claude"
+                ),
+            ])
+            router.preflightListedProviderSnapshotsForTesting = false
+            vm.setDeskProvider(.claude)
+        }
+        XCTAssertTrue(vm.send("hello"))
+        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID,
+                                     "first send links the thread")
+        if !providerAlreadyInstalled {
+            for _ in 0..<500 where context.coordinator.activeRunId(threadId: threadID) != nil
+                || vm.deskSendInFlight {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        return threadID
+    }
+
     func test_openingDeskPinsAgentAppToLinkedThreadAndCompilesBrainOnlyIntoPrompt_becauseDeskMustSendThroughAgentApp() async throws {
         // WHY: the desk must drive Agent App on the bot's own thread; the bot
         // brain belongs in the provider prompt while the user text stays raw.
@@ -16849,9 +16887,9 @@ final class BotsWindowTests: XCTestCase {
         let bot = try vm.create(name: "Piper", title: "Scout")
         vm.openDesk(bot)
         XCTAssertTrue(vm.createDeskThread())
+        XCTAssertNil(vm.deskAgentVM, "unlinked desk has no embedded VM until the first send")
+        let threadID = try await linkDeskThreadByFirstSend(vm, context: context, router: router)
         let agent = try XCTUnwrap(vm.deskAgentVM, "desk must own an Agent App VM")
-        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID,
-                                     "opening the desk creates the linked thread eagerly")
         let embedding = try XCTUnwrap(agent.embedding)
         XCTAssertEqual(embedding.pinnedThreadId, threadID)
         XCTAssertEqual(agent.selectedThreadId, threadID)
@@ -16885,8 +16923,10 @@ final class BotsWindowTests: XCTestCase {
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .grok, model: "grok-4.6")
         vm.openDesk(bot)
         XCTAssertTrue(vm.createDeskThread())
+        let threadID = try await linkDeskThreadByFirstSend(
+            vm, context: context, router: router, providerAlreadyInstalled: true
+        )
         XCTAssertNotNil(vm.deskAgentVM)
-        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID)
         // Newly linked bot threads start .pending; the queue drain gate only
         // runs on idle threads, so settle it before draining.
         var settled = try XCTUnwrap(try context.threadRepo.get(id: threadID))
@@ -16917,7 +16957,7 @@ final class BotsWindowTests: XCTestCase {
             interactionMode: .default
         )
         try await router.drainNextQueuedAgentMessage(thread: threadID)
-        let request = try XCTUnwrap(runner.requests.first)
+        let request = try XCTUnwrap(runner.requests.last, "drained follow-up is the newest request")
         XCTAssertNotEqual(request.prompt, raw)
         XCTAssertTrue(request.prompt.contains(raw))
         XCTAssertTrue(request.prompt.contains("Piper"), "queued send carries the bot brain")
@@ -16928,10 +16968,9 @@ final class BotsWindowTests: XCTestCase {
                       "bot threads run in the bot home, not the process cwd")
     }
 
-    func test_openingUnlinkedConversationDoesNotMarkItStarted_becauseViewingIsNotSending() throws {
-        // WHY: the embedded Agent App needs a thread, so viewing creates one, but
-        // lastStartedConversationByBot drives "the bot just ran" bookkeeping and
-        // must only move on a real send.
+    func test_openingUnlinkedConversationDoesNotMarkItStarted_becauseViewingIsNotSending() async throws {
+        // WHY: lastStartedConversationByBot drives "the bot just ran" bookkeeping
+        // and must only move on a real send, never on viewing.
         let context = try makeContext()
         let router = AppCommandRouter(context: context)
         context.router = router
@@ -16939,8 +16978,74 @@ final class BotsWindowTests: XCTestCase {
         let bot = try vm.create(name: "Piper", title: "Scout")
         vm.openDesk(bot)
         XCTAssertTrue(vm.createDeskThread())
-        XCTAssertNotNil(vm.selectedConversation?.linkedAgentThreadID, "viewing links a thread eagerly")
+        XCTAssertNil(vm.selectedConversation?.linkedAgentThreadID, "viewing links no thread")
         XCTAssertNil(vm.lastStartedConversationForTesting(botID: bot.id))
+        try await linkDeskThreadByFirstSend(vm, context: context, router: router)
+        XCTAssertNotNil(vm.lastStartedConversationForTesting(botID: bot.id), "a real send marks it started")
+    }
+
+    func test_openingUnlinkedDeskConversationCreatesNoThreadOrHome() throws {
+        // WHY: viewing an empty conversation must not leave an AgentThread row
+        // or a BotHome directory behind for every "New thread" click.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        let homeRoot = BotHome(appSupportDirectory: context.appSupportDirectory, bot: bot).root
+        let threadsBefore = try context.threadRepo.list().count
+        // Bot creation seeds the home; remove it so only the desk could recreate it.
+        try? FileManager.default.removeItem(at: homeRoot)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: homeRoot.path))
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        XCTAssertNil(vm.selectedConversation?.linkedAgentThreadID)
+        XCTAssertNil(vm.deskAgentVM, "no thread to pin yet")
+        XCTAssertEqual(try context.threadRepo.list().count, threadsBefore)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: homeRoot.path),
+            "BotHome is created with the thread, not by viewing"
+        )
+        XCTAssertNil(vm.lastStartedConversationForTesting(botID: bot.id))
+    }
+
+    func test_firstSendOnUnlinkedDeskConversationCreatesExactlyOneLinkedThread() async throws {
+        // WHY: lazy thread creation must still give the first message a thread,
+        // and the embedded Agent App must attach to it afterwards.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        context.coordinator.replaceProvider(
+            .claude,
+            runner: FakeProviderRunner(provider: .claude, scenario: .simpleAssistant(reply: "ok"))
+        )
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            ),
+        ])
+        router.preflightListedProviderSnapshotsForTesting = false
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.openDesk(bot)
+        vm.setDeskProvider(.claude)
+        XCTAssertTrue(vm.createDeskThread())
+        XCTAssertNil(vm.selectedConversation?.linkedAgentThreadID)
+        let threadsBefore = try context.threadRepo.list().count
+        XCTAssertTrue(vm.send("first words"))
+        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID,
+                                     "first send links the thread")
+        XCTAssertEqual(try context.threadRepo.list().count, threadsBefore + 1)
+        XCTAssertEqual(vm.deskAgentVM?.embedding?.pinnedThreadId, threadID,
+                       "embedded Agent App attaches once the thread exists")
+        let home = BotHome(appSupportDirectory: context.appSupportDirectory, bot: bot).root
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.path))
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(try context.threadRepo.list().count, threadsBefore + 1)
     }
 
     func test_botDesk2000DeltaDistillReplyPaintsThroughEmbeddedAgentAppWithoutDeskRepublish() async throws {
@@ -16955,8 +17060,8 @@ final class BotsWindowTests: XCTestCase {
         let bot = try vm.create(name: "Piper", title: "Scout")
         vm.openDesk(bot)
         XCTAssertTrue(vm.createDeskThread())
+        let threadID = try await linkDeskThreadByFirstSend(vm, context: context, router: router)
         let agentVM = try XCTUnwrap(vm.deskAgentVM)
-        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID)
         // Let desk open + embedded thread hydration settle so only streaming is measured.
         try await Task.sleep(for: .milliseconds(500))
         var deskPublishes = 0
@@ -16981,14 +17086,14 @@ final class BotsWindowTests: XCTestCase {
         }
         let sentAt = clock.now
         for _ in 0..<5_000 {
-            if agentVM.timeline.turns.first?.items.first?.body.hasSuffix("w1999 ") == true { break }
+            if agentVM.timeline.turns.first(where: { $0.turnId == "t" })?.items.first?.body.hasSuffix("w1999 ") == true { break }
             try await Task.sleep(for: .milliseconds(1))
         }
         let tailLag = sentAt.duration(to: clock.now)
         let memGrowth = Int64(botDeskPhysFootprintBytes()) - Int64(memBefore)
         print("PERF botDesk deltas=2000 agentPublishes=\(agentPublishes) deskPublishes=\(deskPublishes) tailLag=\(tailLag) elapsed=\(start.duration(to: clock.now)) memGrowthKB=\(memGrowth / 1024)")
         XCTAssertLessThan(memGrowth, 64 * 1024 * 1024, "a ~16 KB bot reply must not grow resident memory by tens of MB")
-        let body = agentVM.timeline.turns.first?.items.first?.body ?? ""
+        let body = agentVM.timeline.turns.first(where: { $0.turnId == "t" })?.items.first?.body ?? ""
         XCTAssertTrue(body.hasPrefix("w0 ") && body.hasSuffix("w1999 "), "every delta must land in the embedded Agent App (sel=\(String(describing: agentVM.selectedThreadId)) tid=\(threadID) turns=\(agentVM.timeline.turns.map { "\($0.turnId):\($0.items.map { "\($0.id)/\($0.body.count)" })" }) status=\(agentVM.status))")
         XCTAssertEqual(deskPublishes, 0, "BotsViewModel must not republish per token")
         XCTAssertEqual(vm.deskStreamMainHopCountForTesting, 0)
@@ -17007,8 +17112,8 @@ final class BotsWindowTests: XCTestCase {
         let bot = try vm.create(name: "Piper", title: "Scout")
         vm.openDesk(bot)
         XCTAssertTrue(vm.createDeskThread())
+        let threadID = try await linkDeskThreadByFirstSend(vm, context: context, router: router)
         XCTAssertNotNil(vm.deskAgentVM)
-        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID)
         var publishes = 0
         let sink = vm.$deskLiveTimeline.dropFirst().sink { _ in publishes += 1 }
         defer { sink.cancel() }

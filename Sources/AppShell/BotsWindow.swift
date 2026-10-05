@@ -9939,26 +9939,12 @@ public final class BotsViewModel: ObservableObject {
             tearDownDeskAgentVM()
             return
         }
-        var live = conversation
-        if live.linkedAgentThreadID == nil {
-            do {
-                live = try ensureLinkedThread(
-                    bot: bot,
-                    conversation: conversation,
-                    routing: frozenDeskRouting(for: conversation),
-                    router: router,
-                    markStarted: false
-                ).conversation
-            } catch {
-                errorMessage = String(describing: error)
-                tearDownDeskAgentVM()
-                return
-            }
-        }
-        guard let threadID = live.linkedAgentThreadID else {
+        // Unlinked conversations get their thread (and BotHome) on first send.
+        guard let threadID = conversation.linkedAgentThreadID else {
             tearDownDeskAgentVM()
             return
         }
+        let live = conversation
         let key = DeskAgentKey(botID: bot.id, conversationID: live.id, threadID: threadID)
         if deskAgentKey == key, deskAgentVM != nil { return }
         tearDownDeskAgentVM()
@@ -12731,6 +12717,10 @@ public struct BotsRootView: View {
                         )
                     )
                     .id(agentVM.selectedThreadId)
+                } else if let conversation = vm.selectedConversation,
+                          conversation.botID == bot.id,
+                          conversation.linkedAgentThreadID == nil {
+                    deskUnlinkedComposer(bot)
                 } else {
                     AgentChatLoadingStatusStrip()
                         .padding(DS.Space.lg)
@@ -12769,6 +12759,33 @@ public struct BotsRootView: View {
             Button("Cancel", role: .cancel) { pendingClearAllDeskThreads = false }
         } message: {
             Text("Deletes every thread for this teammate. A live run will be stopped first. This cannot be undone.")
+        }
+    }
+
+    /// Unlinked conversation: no thread exists yet. The first send creates it
+    /// through the legacy send path, then the embedded Agent App takes over.
+    private func deskUnlinkedComposer(_ bot: BotDefinition) -> some View {
+        VStack(spacing: 0) {
+            Spacer(minLength: 0)
+            AgentChatComposerBar(
+                text: $vm.composerText,
+                attachments: vm.attachments,
+                placeholder: "Message \(bot.name)…",
+                sendEnabled: vm.deskSendEnabled,
+                runActive: vm.deskRunIsLive,
+                isStopping: vm.isStopping,
+                onSend: { vm.send() },
+                onStop: { vm.stopDeskRun() },
+                onAttach: { vm.addAttachments($0) },
+                onRemoveAttachment: { vm.removeAttachment($0) },
+                composerIdentifier: "bots.desk.composer",
+                sendIdentifier: "bots.desk.send",
+                suggestions: vm.composerSuggestions,
+                onApplySuggestion: { vm.applyComposerSuggestion($0) },
+                onCursorMoved: { vm.composerCursorOffset = $0 },
+                suggestionIdentifier: "bots.desk.suggestion.popup",
+                onFileDrop: { vm.insertDroppedFilePaths($0) }
+            )
         }
     }
 
