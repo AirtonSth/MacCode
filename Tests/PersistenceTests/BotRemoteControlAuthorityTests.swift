@@ -941,9 +941,133 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(restoredPeer["owner_run_id"] as? String, ownerRunID.value.uuidString.lowercased())
     }
 
+    private func delegatedRow(
+        peer: (botID: String, conversationID: String),
+        peerThreadID: AgentThreadID,
+        owner: (botID: String, conversationID: String),
+        ownerThreadID: AgentThreadID,
+        state: String
+    ) -> (id: String, row: [String: Any]) {
+        let activityID = UUID().uuidString.lowercased()
+        return (activityID, [
+            "id": activityID,
+            "lifecycle_receipt_id": activityID,
+            "bot_id": peer.botID,
+            "conversation_id": peer.conversationID,
+            "thread_id": peerThreadID.value.uuidString.lowercased(),
+            "run_id": UUID().uuidString.lowercased(),
+            "owner_bot_id": owner.botID,
+            "owner_conversation_id": owner.conversationID,
+            "owner_thread_id": ownerThreadID.value.uuidString.lowercased(),
+            "owner_run_id": UUID().uuidString.lowercased(),
+            "state": state,
+            "finished_at": state == "finished" ? Date().timeIntervalSince1970 as Any : NSNull() as Any,
+            "ownership": "delegated",
+            "primary": false,
+            "delegated": true,
+            "source": "bot_peer_handoff",
+            "peer_phase": state == "finished" ? "completed" : "peer_running",
+        ])
+    }
+
+    private func linkConversation(_ conversationID: String, to threadID: AgentThreadID) throws {
+        let id = BotConversationID(try XCTUnwrap(UUID(uuidString: conversationID)))
+        var conversation = try XCTUnwrap(try store.conversation(id: id))
+        conversation.linkedAgentThreadID = threadID
+        try store.upsertConversation(conversation)
+    }
+
+    /// WHY (C28): the host keeps emitting the newest handoff per peer forever,
+    /// including completed ones whose owner conversation was later relinked
+    /// to a new Agent thread (provider switch) or whose Bot was deleted. One
+    /// such historical row used to fail the whole bot.attention.list with
+    /// -32084, so iOS lost every Working/Needs-you/Finished badge and showed
+    /// "Attachment grant does not match" with nothing attached.
+    func test_delegatedAttentionListSurvivesRelinkedAndDeletedHandoffRows() throws {
+        let owner = try createLiveBot(prefix: "c28-owner", name: "Sam Twitter")
+        let peer = try createBotConversation(prefix: "c28-writer")
+        let gone = try createBotConversation(prefix: "c28-gone")
+        let oldOwnerThread = AgentThreadID()
+        let peerThread = AgentThreadID()
+        let goneThread = AgentThreadID()
+        try linkConversation(owner.conversationID, to: oldOwnerThread)
+        try linkConversation(peer.conversationID, to: peerThread)
+        try linkConversation(gone.conversationID, to: goneThread)
+        let finished = delegatedRow(
+            peer: peer, peerThreadID: peerThread,
+            owner: (owner.botID, owner.conversationID), ownerThreadID: oldOwnerThread,
+            state: "finished"
+        )
+        let deleted = delegatedRow(
+            peer: gone, peerThreadID: goneThread,
+            owner: (owner.botID, owner.conversationID), ownerThreadID: oldOwnerThread,
+            state: "working"
+        )
+        authority.onDelegatedAttentionSnapshot = { [finished.row, deleted.row] }
+
+        // Provider switch relinks the owner conversation; the Bot is deleted.
+        try linkConversation(owner.conversationID, to: AgentThreadID())
+        try store.delete(id: BotID(try XCTUnwrap(UUID(uuidString: gone.botID))))
+
+        let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let items = try XCTUnwrap(listed["items"] as? [[String: Any]])
+        let peerItem = try XCTUnwrap(
+            items.first { $0["bot_id"] as? String == peer.botID },
+            "a finished handoff stays visible after its owner thread was relinked"
+        )
+        XCTAssertEqual(peerItem["id"] as? String, finished.id)
+        XCTAssertEqual(peerItem["state"] as? String, "finished")
+        XCTAssertEqual(peerItem["ownership"] as? String, "delegated")
+        XCTAssertNil(
+            items.first { $0["bot_id"] as? String == gone.botID },
+            "a deleted peer's handoff is dropped, not surfaced"
+        )
+        XCTAssertNotNil(
+            items.first { $0["bot_id"] as? String == owner.botID },
+            "other bots' attention is still listed"
+        )
+    }
+
+    /// WHY (C28): dropping a stale row must not widen authority. An active
+    /// (working) handoff whose owner conversation no longer links the
+    /// recorded owner thread is not adopted, yet the list still succeeds.
+    func test_delegatedAttentionDropsActiveRowWithStaleOwnerThreadWithoutFailingList() throws {
+        let owner = try createLiveBot(prefix: "c28-active-owner", name: "Owner")
+        let peer = try createLiveBot(prefix: "c28-active-peer", name: "Peer")
+        let ownerThread = AgentThreadID()
+        let peerThread = AgentThreadID()
+        try linkConversation(owner.conversationID, to: ownerThread)
+        try linkConversation(peer.conversationID, to: peerThread)
+        let active = delegatedRow(
+            peer: (peer.botID, peer.conversationID), peerThreadID: peerThread,
+            owner: (owner.botID, owner.conversationID), ownerThreadID: ownerThread,
+            state: "working"
+        )
+        authority.onDelegatedAttentionSnapshot = { [active.row] }
+        let adopted = try XCTUnwrap(
+            try authority.dispatch(method: "bot.attention.list", params: [:])["items"] as? [[String: Any]]
+        )
+        XCTAssertEqual(
+            adopted.first { $0["bot_id"] as? String == peer.botID }?["id"] as? String,
+            active.id,
+            "a live-matching active handoff is adopted"
+        )
+
+        try linkConversation(owner.conversationID, to: AgentThreadID())
+
+        let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let items = try XCTUnwrap(listed["items"] as? [[String: Any]])
+        XCTAssertFalse(
+            items.contains { $0["id"] as? String == active.id },
+            "an active handoff that no longer matches live thread links is not adopted"
+        )
+        XCTAssertNotNil(items.first { $0["bot_id"] as? String == owner.botID })
+    }
+
     /// WHY: ownership comes from the host, not from labels supplied by iOS.
     /// Missing or future ownership values must fail closed before any row is
-    /// adopted or persisted.
+    /// adopted or persisted; the bad row is dropped so the rest of the list
+    /// still reaches the roster (C28).
     func test_delegatedAttentionRejectsMissingAndUnknownOwnership() throws {
         let delegated = try createLiveBot(prefix: "ownership-invalid", name: "Invalid Peer")
         let threadID = AgentThreadID()
@@ -971,16 +1095,14 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         ]
 
         authority.onDelegatedAttentionSnapshot = { [base] }
-        XCTAssertThrowsError(try authority.dispatch(method: "bot.attention.list", params: [:])) {
-            XCTAssertEqual($0 as? BotRemoteControlAuthority.Error, .crossTarget)
-        }
+        let missing = try authority.dispatch(method: "bot.attention.list", params: [:])
+        XCTAssertEqual((missing["items"] as? [[String: Any]])?.first?["ownership"] as? String, "primary")
 
         var unknown = base
         unknown["ownership"] = "descendant"
         authority.onDelegatedAttentionSnapshot = { [unknown] }
-        XCTAssertThrowsError(try authority.dispatch(method: "bot.attention.list", params: [:])) {
-            XCTAssertEqual($0 as? BotRemoteControlAuthority.Error, .crossTarget)
-        }
+        let future = try authority.dispatch(method: "bot.attention.list", params: [:])
+        XCTAssertEqual((future["items"] as? [[String: Any]])?.first?["ownership"] as? String, "primary")
 
         authority.onDelegatedAttentionSnapshot = nil
         let listed = try authority.dispatch(method: "bot.attention.list", params: [:])

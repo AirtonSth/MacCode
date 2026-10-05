@@ -295,14 +295,29 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard let onDelegatedAttentionSnapshot else { return }
         let snapshot = try onDelegatedAttentionSnapshot()
         var delegatedByBot: [String: [String: Any]] = [:]
+        var conflictedBots: Set<String> = []
         for raw in snapshot {
-            let item = try validatedDelegatedAttention(raw)
-            guard let botID = item["bot_id"] as? String else { throw Error.crossTarget }
+            // One stale handoff (deleted Bot, cleared or relinked conversation)
+            // must not fail the whole list; drop only that row.
+            guard let item = try? validatedDelegatedAttention(raw),
+                  let botID = item["bot_id"] as? String else {
+                botRemoteControlLog.error(
+                    "bot.attention.delegated_row_dropped id=\(String(describing: raw["id"] ?? "nil"), privacy: .public) bot=\(String(describing: raw["bot_id"] ?? "nil"), privacy: .public) state=\(String(describing: raw["state"] ?? "nil"), privacy: .public)"
+                )
+                continue
+            }
             if let existing = delegatedByBot[botID],
                !NSDictionary(dictionary: existing).isEqual(to: item) {
-                throw Error.crossTarget
+                conflictedBots.insert(botID)
             }
             delegatedByBot[botID] = item
+        }
+        for botID in conflictedBots {
+            // Ambiguous ownership for one Bot: show neither row for that Bot.
+            botRemoteControlLog.error(
+                "bot.attention.delegated_conflict_dropped bot=\(botID, privacy: .public)"
+            )
+            delegatedByBot.removeValue(forKey: botID)
         }
 
         var next = attention.filter { _, item in
@@ -332,7 +347,6 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               let bot = try store.get(id: BotID(botID)), bot.deletedAt == nil,
               let conversation = try store.conversation(id: BotConversationID(conversationID)),
               conversation.botID == bot.id,
-              conversation.linkedAgentThreadID == AgentThreadID(threadID),
               let ownerBot = try store.get(id: BotID(ownerBotID)), ownerBot.deletedAt == nil,
               let ownerConversation = try store.conversation(id: BotConversationID(ownerConversationID)),
               ownerConversation.botID == ownerBot.id else {
@@ -343,9 +357,19 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         } else {
             guard raw["finished_at"] is NSNull else { throw Error.crossTarget }
         }
+        // Finished rows are historical provenance: a conversation may since
+        // have been relinked to a new Agent thread. Only active rows must
+        // still match the live thread links.
+        let requiresLiveLinks = state != "finished"
+        if requiresLiveLinks {
+            guard conversation.linkedAgentThreadID == AgentThreadID(threadID) else {
+                throw Error.crossTarget
+            }
+        }
         if raw["owner_thread_id"] != nil && !(raw["owner_thread_id"] is NSNull) {
             guard let ownerThreadID = stringUUID(raw, "owner_thread_id"),
-                  ownerConversation.linkedAgentThreadID == AgentThreadID(ownerThreadID) else {
+                  !requiresLiveLinks
+                    || ownerConversation.linkedAgentThreadID == AgentThreadID(ownerThreadID) else {
                 throw Error.crossTarget
             }
         }
