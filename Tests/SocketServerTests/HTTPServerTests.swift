@@ -50,6 +50,13 @@ private final class HTTPAttachmentReceiptRouter: FakeRouter, CommandReceiptState
         paramsHash: String
     ) throws {}
 
+    func releaseCommandReceiptClaim(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws {}
+
     func commandReceiptStatus(
         method: String,
         clientRequestId: String,

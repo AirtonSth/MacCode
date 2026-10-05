@@ -8755,6 +8755,36 @@ public final class CommandReceiptRepository {
         )
     }
 
+    /// Removes this request's own `claimed` row after a definite pre-effect
+    /// rejection. Committed and unknown outcomes are never removed.
+    public func releaseClaim(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws {
+        try db.performSync { db in
+            try db.transaction {
+                guard let existing = try receipt(
+                    db: db,
+                    method: method,
+                    clientRequestId: clientRequestId
+                ), existing.ownerFingerprint == ownerFingerprint,
+                   existing.paramsHash == paramsHash,
+                   existing.state == "claimed" else {
+                    throw SQLiteError.execute("Command receipt release lost its immutable claim.")
+                }
+                let delete = try db.prepare("""
+                    DELETE FROM command_receipts
+                    WHERE method = ? AND client_request_id = ? AND state = 'claimed';
+                """)
+                try delete.bind(1, method)
+                try delete.bind(2, clientRequestId)
+                _ = try delete.step()
+            }
+        }
+    }
+
     public func status(
         method: String,
         clientRequestId: String,

@@ -77,6 +77,62 @@ final class Phase4CommandReceiptRepositoryTests: XCTestCase {
                        "the newest link must remain available for ambiguous-commit reread and post-commit fanout")
     }
 
+    /// WHY: C35. A definite pre-effect rejection frees only its own in-flight
+    /// claim so the request id can be retried; a committed outcome or an
+    /// unknown tombstone must never be erased, or at-most-once breaks.
+    func test_releaseClaimFreesOnlyOwnClaimedReceipt() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let repository = CommandReceiptRepository(db: db)
+        func claim(_ id: String) throws -> CommandReceiptClaimResult {
+            try repository.claim(
+                method: "agent.message.send",
+                clientRequestId: id,
+                ownerFingerprint: "owner-a",
+                paramsHash: "hash"
+            )
+        }
+        func release(_ id: String, owner: String = "owner-a") throws {
+            try repository.releaseClaim(
+                method: "agent.message.send",
+                clientRequestId: id,
+                ownerFingerprint: owner,
+                paramsHash: "hash"
+            )
+        }
+
+        XCTAssertEqual(try claim("rejected"), .claimed)
+        XCTAssertThrowsError(try release("rejected", owner: "owner-b"))
+        try release("rejected")
+        XCTAssertEqual(try repository.status(
+            method: "agent.message.send",
+            clientRequestId: "rejected",
+            ownerFingerprint: "owner-a"
+        ), .absent)
+        XCTAssertEqual(try claim("rejected"), .claimed, "the freed id must run again")
+
+        XCTAssertEqual(try claim("committed"), .claimed)
+        try repository.commit(
+            method: "agent.message.send",
+            clientRequestId: "committed",
+            ownerFingerprint: "owner-a",
+            paramsHash: "hash",
+            resultJSON: "true"
+        )
+        XCTAssertThrowsError(try release("committed"))
+        XCTAssertEqual(try claim("committed"), .committed(resultJSON: "true"))
+
+        XCTAssertEqual(try claim("unknown"), .claimed)
+        try repository.markUnknown(
+            method: "agent.message.send",
+            clientRequestId: "unknown",
+            ownerFingerprint: "owner-a",
+            paramsHash: "hash"
+        )
+        XCTAssertThrowsError(try release("unknown"))
+        XCTAssertEqual(try claim("unknown"), .unknown)
+    }
+
     func test_claimCommitAndPermanentTerminalStates() throws {
         let db = try SQLiteDB(path: ":memory:")
         try Schema.migrate(db)
