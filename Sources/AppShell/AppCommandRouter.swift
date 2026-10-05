@@ -2694,6 +2694,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let revision = (try? store.get(id: botID))?.currentRevisionID.flatMap { try? store.getRevision(id: $0) }
             return BotExecutionDefault.target(for: revision ?? nil)
         }
+        agent.viewModel.botIsAvailable = { [weak self] botID in
+            guard let store = self?.context?.botStore else { return false }
+            if ((try? store.listCached()) ?? []).contains(where: { $0.id == botID }) { return true }
+            // Hidden bots are absent from the cached list; only a missing or deleted row is unavailable.
+            guard let bot = (try? store.get(id: botID)) ?? nil else { return false }
+            return bot.deletedAt == nil
+        }
+        agent.viewModel.botNameProvider = { [weak self] botID in
+            (try? self?.context?.botStore.get(id: botID))??.name
+        }
         agent.viewModel.botThreadLinker = { [weak self] botID, threadID in
             guard let hooks = self?.botWorkspaceRunHooks else { throw BotWorkspaceRunUnavailable() }
             try hooks.link(botID, threadID)

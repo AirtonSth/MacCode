@@ -203,4 +203,112 @@ final class AgentAppBotRunActorTests: XCTestCase {
         XCTAssertEqual(stored.actor, .none)
         XCTAssertNil(stored.actorLockedAt)
     }
+
+    private func runFirstBotTurn(_ f: Fixture) async throws {
+        f.vm.setRunActor(.bot(f.bot.id))
+        f.vm.prompt = "first question"
+        await f.vm.send()
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started, "run must start: \(f.vm.statusMessage ?? "no status")")
+        let first = try XCTUnwrap(f.runner.requests.first)
+        XCTAssertTrue(f.runner.finish(runID: first.runId, status: .completed, reply: "first answer"))
+        let settled = await waitUntil {
+            (try? f.ctx.threadRepo.get(id: f.thread.id))?.status == .completed
+        }
+        XCTAssertTrue(settled)
+    }
+
+    func test_lockedThreadWithDeletedBotIsReadOnlyAndRefusesSend() async throws {
+        let f = try makeFixture()
+        try await runFirstBotTurn(f)
+        XCTAssertFalse(f.vm.selectedThreadBotUnavailable)
+        try f.ctx.botStore.delete(id: f.bot.id)
+        XCTAssertTrue(f.vm.selectedThreadBotUnavailable, "banner shows once the bot is gone")
+        f.vm.prompt = "still there?"
+        await f.vm.send()
+        XCTAssertEqual(f.vm.statusMessage, "Bot Quinn foi apagado. Use \"Continuar sem bot\".")
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(f.runner.requests.count, 1, "no second run for a deleted bot")
+    }
+
+    func test_handoffCreatesUnlockedThreadWithSummaryDraftAndLeavesOldThreadUntouched() async throws {
+        let f = try makeFixture()
+        try await runFirstBotTurn(f)
+        let oldBefore = try XCTUnwrap(try f.ctx.threadRepo.get(id: f.thread.id))
+        let newId = try XCTUnwrap(f.vm.startHandoffThread(from: f.thread.id, actor: .none))
+        XCTAssertNotEqual(newId, f.thread.id)
+        XCTAssertEqual(f.vm.selectedThreadId, newId)
+        XCTAssertEqual(f.vm.selectedRunActor, .none)
+        XCTAssertFalse(f.vm.runActorLocked, "new thread locks only on first send")
+        XCTAssertTrue(f.vm.prompt.hasPrefix("Continuação da thread \"Actor thread\" (id \(f.thread.id.value.uuidString.lowercased()))"))
+        XCTAssertTrue(f.vm.prompt.contains("first question"))
+        XCTAssertTrue(f.vm.prompt.contains("first answer"))
+        let oldAfter = try XCTUnwrap(try f.ctx.threadRepo.get(id: f.thread.id))
+        XCTAssertEqual(oldAfter.actor, oldBefore.actor)
+        XCTAssertEqual(oldAfter.actorLockedAt, oldBefore.actorLockedAt)
+        XCTAssertEqual(oldAfter.executionTarget, oldBefore.executionTarget)
+        let newStored = try XCTUnwrap(try f.ctx.threadRepo.get(id: newId))
+        XCTAssertEqual(newStored.workspaceId, f.thread.workspaceId)
+        XCTAssertEqual(newStored.actor, .none)
+        XCTAssertNil(newStored.actorLockedAt)
+    }
+
+    func test_handoffSummaryIsDeterministicLastSixTurnsTruncated() {
+        let tid = AgentThreadID()
+        var messages: [AgentMessage] = []
+        for i in 0..<10 {
+            messages.append(AgentMessage(threadId: tid, role: i % 2 == 0 ? .user : .assistant, content: "m\(i)"))
+        }
+        messages.append(AgentMessage(threadId: tid, role: .system, content: "SYSTEM-NOTE"))
+        messages[9] = AgentMessage(threadId: tid, role: .assistant, content: String(repeating: "x", count: 500))
+        let a = AgentAppViewModel.handoffSummary(title: "T", threadId: tid, messages: messages)
+        XCTAssertEqual(a, AgentAppViewModel.handoffSummary(title: "T", threadId: tid, messages: messages))
+        XCTAssertFalse(a.contains("SYSTEM-NOTE"))
+        XCTAssertFalse(a.contains("m3"), "only the last six user/assistant messages")
+        XCTAssertTrue(a.contains("m4"))
+        let long = a.split(separator: "\n").first { $0.hasPrefix("Assistente: x") }
+        XCTAssertEqual(long?.count, "Assistente: ".count + 300 + 1, "300 chars plus ellipsis")
+        XCTAssertEqual(a.split(separator: "\n").count, 7)
+    }
+
+    func test_freshViewModelRestoresActorLockAndExecutionTarget() async throws {
+        let f = try makeFixture()
+        try await runFirstBotTurn(f)
+        let fresh = AgentAppSurface(
+            workspaceID: f.vm.workspaceID,
+            cwd: f.workspaceCwd,
+            coordinator: f.ctx.coordinator,
+            threadRepo: f.ctx.threadRepo,
+            messageRepo: f.ctx.messageRepo,
+            queuedMessageRepo: f.ctx.queuedMessageRepo,
+            providerSessionRepo: f.ctx.providerSessionRuntimeRepo,
+            checkpointRepo: f.ctx.turnCheckpointRepo,
+            initialThreadId: nil
+        )
+        f.router.configureAgentAppBotMentions(fresh)
+        let vm = fresh.viewModel
+        vm.selectThread(f.thread.id)
+        XCTAssertEqual(vm.selectedRunActor, .bot(f.bot.id))
+        XCTAssertTrue(vm.runActorLocked)
+        let row = try XCTUnwrap(vm.threads.first(where: { $0.id == f.thread.id }))
+        XCTAssertNotNil(row.actorLockedAt)
+        XCTAssertEqual(row.executionTarget, .mac)
+        XCTAssertEqual(vm.executionTarget(for: f.bot.id), .mac)
+        vm.setRunActor(.none)
+        XCTAssertEqual(vm.selectedRunActor, .bot(f.bot.id), "restored lock still refuses chip changes")
+    }
+
+    func test_botSendWithMissingProviderSnapshotIsBlockedBeforeAnyRequest() async throws {
+        let f = try makeFixture()
+        f.vm.providerSnapshotLoader = { [] }
+        f.vm.providerSnapshots = []
+        f.router.rememberProviderSnapshotsForSend([])
+        f.vm.setRunActor(.bot(f.bot.id))
+        f.vm.prompt = "hello"
+        await f.vm.send()
+        let message = try XCTUnwrap(f.vm.statusMessage, "send must explain why it is blocked")
+        XCTAssertFalse(message.isEmpty)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(f.runner.requests.isEmpty, "no provider request without a provider snapshot")
+    }
 }
