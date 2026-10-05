@@ -1577,6 +1577,89 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual((listed["routines"] as? [[String: Any]])?.count, 1)
     }
 
+    /// C30: a conversation cleared on the Mac used to fail select / send /
+    /// attachment reads with -32084 "Attachment grant does not match…", so
+    /// iOS showed attachment copy with nothing attached and never refreshed.
+    /// A gone conversation or routine must carry its own code so the phone
+    /// can re-read the list, while real grant mismatches stay -32084.
+    func test_goneConversationAndRoutineReportDistinctErrorsNotAttachmentGrantMismatch() throws {
+        let target = try createBotConversation(prefix: "gone")
+        _ = try authority.dispatch(method: "bot.conversation.clear_all", params: [
+            "client_request_id": "gone-clear",
+            "bot_id": target.botID,
+            "confirm": "clear",
+        ])
+        let conversationGone = BotRemoteControlAuthority.Error(
+            code: -32080,
+            message: "This Bot conversation no longer exists on the Mac. Refresh to continue."
+        )
+        for (method, extra) in [
+            ("bot.conversation.select", [:]),
+            ("bot.send", ["text": "still there?"]),
+            ("bot.attachment.list", [:]),
+            ("bot.attachment.stage", [
+                "attachment_id": "rcatt1_\(String(repeating: "a", count: 32))",
+                "filename": "gone.txt",
+                "kind": "file",
+                "digest": String(repeating: "b", count: 64),
+                "size": 4,
+            ]),
+            ("bot.attachment.remove", ["id": "missing-grant"]),
+            ("bot.attachment.import", ["root_handle": "root", "handle": "file"]),
+        ] as [(String, [String: Any])] {
+            var params: [String: Any] = [
+                "client_request_id": "gone-\(method)",
+                "bot_id": target.botID,
+                "conversation_id": target.conversationID,
+            ]
+            params.merge(extra) { _, new in new }
+            XCTAssertThrowsError(try authority.dispatch(method: method, params: params), method) { error in
+                XCTAssertEqual(error as? BotRemoteControlAuthority.Error, conversationGone, method)
+            }
+        }
+
+        let routineGone = BotRemoteControlAuthority.Error(
+            code: -32079,
+            message: "This routine no longer exists on the Mac."
+        )
+        let missingRoutineID = UUID().uuidString.lowercased()
+        for (method, extra) in [
+            ("bot.routine.update", ["name": "Gone", "prompt": "No", "schedule_spec_json": "{}"]),
+            ("bot.routine.enable", ["enabled": true]),
+            ("bot.routine.run", [:]),
+            ("bot.routine.delete", [:]),
+        ] as [(String, [String: Any])] {
+            var params: [String: Any] = [
+                "client_request_id": "gone-\(method)",
+                "bot_id": target.botID,
+                "routine_id": missingRoutineID,
+            ]
+            params.merge(extra) { _, new in new }
+            XCTAssertThrowsError(try authority.dispatch(method: method, params: params), method) { error in
+                XCTAssertEqual(error as? BotRemoteControlAuthority.Error, routineGone, method)
+            }
+        }
+
+        // A live conversation owned by another Bot, or a grant that does not
+        // exist, is still a real cross-target mismatch, not a gone conversation.
+        let live = try createBotConversation(prefix: "gone-live")
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.conversation.select", params: [
+            "client_request_id": "gone-live-foreign-select",
+            "bot_id": target.botID,
+            "conversation_id": live.conversationID,
+        ])) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .crossTarget)
+        }
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.attachment.remove", params: [
+            "client_request_id": "gone-live-remove",
+            "bot_id": live.botID,
+            "conversation_id": live.conversationID,
+            "id": "missing-grant",
+        ])) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .crossTarget)
+        }
+    }
+
     func test_mutationReceiptReplayRejectsChangedMethodOrSemanticParams() throws {
         let params: [String: Any] = ["client_request_id": "semantic-replay", "name": "Original"]
         let first = try authority.dispatch(method: "bot.create", params: params)
