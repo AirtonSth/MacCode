@@ -30,7 +30,13 @@ public enum BotComputerCatalog: Sendable {
     public static let act = BotStandingInstructions.computerActTool
     public static let exec = BotStandingInstructions.computerExecTool
     public static let rebuild = BotStandingInstructions.computerRebuildTool
-    public static var toolNames: [String] { [observe, act, exec, rebuild] }
+    public static let requestUserAction = BotStandingInstructions.requestUserActionTool
+    public static let postScreenshot = BotStandingInstructions.postScreenshotTool
+    public static let requestMacExecution = BotStandingInstructions.requestMacExecutionTool
+    public static let threadEnvironmentKey = "RC_REMOTE_CODE_SUBAGENT_THREAD_ID"
+    public static var toolNames: [String] {
+        [observe, act, exec, rebuild, requestUserAction, postScreenshot, requestMacExecution]
+    }
 
     /// Read-only content tools whose (large) results are safe to route through
     /// the Token Saver distill lane. `observe`/`act` results carry coordinates
@@ -57,6 +63,12 @@ public enum BotComputerCatalog: Sendable {
             return "Run a command inside this bot's Linux container. Use this to install packages (apt-get) or edit files. Do not run host docker."
         case rebuild:
             return "Rebuild this bot's Linux image from /home/remotecode/Dockerfile and restart the desktop. Use after editing that Dockerfile."
+        case requestUserAction:
+            return "Pause and ask the user to do a manual step on the computer (login, captcha, 2FA, payment, human confirmation). Never ask for passwords, codes or card data in chat. Returns at once; end your turn, the user's reply arrives as a new message."
+        case postScreenshot:
+            return "Post a screenshot of the Linux desktop into the chat. Use at the end of a visual task, on a visible error, before an irreversible action or after a big screen change. Limited to one per 30 seconds except kind error or action."
+        case requestMacExecution:
+            return "Ask the user to approve running something on the Mac, because this Linux environment lacks macOS-only tools (swift, xcodebuild, xcrun). Never automatic; end your turn after calling."
         default:
             return name
         }
@@ -82,6 +94,40 @@ public enum BotComputerCatalog: Sendable {
             ]
         case rebuild:
             return ["type": "object", "properties": botID]
+        case requestUserAction:
+            return [
+                "type": "object",
+                "properties": botID.merging([
+                    "reason": ["type": "string", "description": "Why the user must act. Max 280 characters."],
+                    "kind": [
+                        "type": "string",
+                        "enum": ManualActionKind.allCases.map(\.rawValue),
+                        "description": "login, captcha, 2fa, payment, confirm, or other.",
+                    ],
+                ]) { _, new in new },
+                "required": ["reason", "kind"],
+            ]
+        case postScreenshot:
+            return [
+                "type": "object",
+                "properties": botID.merging([
+                    "reason": ["type": "string", "description": "Short caption for the screenshot."],
+                    "kind": [
+                        "type": "string",
+                        "enum": ["normal", "error", "action"],
+                        "description": "normal is rate limited; error and action are not.",
+                    ],
+                ]) { _, new in new },
+                "required": ["reason"],
+            ]
+        case requestMacExecution:
+            return [
+                "type": "object",
+                "properties": botID.merging([
+                    "reason": ["type": "string", "description": "What must run on the Mac and why."],
+                ]) { _, new in new },
+                "required": ["reason"],
+            ]
         case act:
             return [
                 "type": "object",
@@ -116,23 +162,34 @@ public struct BotComputerPendingAction: Codable, Equatable, Sendable {
     public var kind: String
     public var steps: [BotComputerActStep]
     public var command: String
+    /// Calling thread (`RC_REMOTE_CODE_SUBAGENT_THREAD_ID`), when the run has one.
+    public var threadID: String?
+    public var reason: String
+    /// Manual-action kind or screenshot kind, depending on `kind`.
+    public var subkind: String
 
     public init(
         id: String,
         botID: String,
         kind: String,
         steps: [BotComputerActStep] = [],
-        command: String = ""
+        command: String = "",
+        threadID: String? = nil,
+        reason: String = "",
+        subkind: String = ""
     ) {
         self.id = id
         self.botID = botID
         self.kind = kind
         self.steps = steps
         self.command = command
+        self.threadID = threadID
+        self.reason = reason
+        self.subkind = subkind
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, botID, kind, steps, command
+        case id, botID, kind, steps, command, threadID, reason, subkind
     }
 
     public init(from decoder: Decoder) throws {
@@ -142,6 +199,9 @@ public struct BotComputerPendingAction: Codable, Equatable, Sendable {
         kind = try container.decode(String.self, forKey: .kind)
         steps = try container.decodeIfPresent([BotComputerActStep].self, forKey: .steps) ?? []
         command = try container.decodeIfPresent(String.self, forKey: .command) ?? ""
+        threadID = try container.decodeIfPresent(String.self, forKey: .threadID)
+        reason = try container.decodeIfPresent(String.self, forKey: .reason) ?? ""
+        subkind = try container.decodeIfPresent(String.self, forKey: .subkind) ?? ""
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -151,6 +211,9 @@ public struct BotComputerPendingAction: Codable, Equatable, Sendable {
         try container.encode(kind, forKey: .kind)
         try container.encode(steps, forKey: .steps)
         try container.encode(command, forKey: .command)
+        try container.encodeIfPresent(threadID, forKey: .threadID)
+        try container.encode(reason, forKey: .reason)
+        try container.encode(subkind, forKey: .subkind)
     }
 }
 
@@ -342,13 +405,15 @@ public enum BotComputerHost: Sendable {
 public struct BotComputerService: Sendable {
     public let callerBotID: BotID
     public let store: BotComputerStore
+    public var callerThreadID: String?
     public var timeoutMS: Double = 20_000
 
     private static let resultPollInterval: TimeInterval = 0.1
 
-    public init(callerBotID: BotID, store: BotComputerStore) {
+    public init(callerBotID: BotID, store: BotComputerStore, callerThreadID: String? = nil) {
         self.callerBotID = callerBotID
         self.store = store
+        self.callerThreadID = callerThreadID
     }
 
     public static func make(environment: [String: String], store: BotComputerStore) throws -> BotComputerService {
@@ -357,7 +422,13 @@ public struct BotComputerService: Sendable {
               let uuid = UUID(uuidString: raw) else {
             throw BotComputerError.callerMissing
         }
-        return BotComputerService(callerBotID: BotID(uuid), store: store)
+        let thread = environment[BotComputerCatalog.threadEnvironmentKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return BotComputerService(
+            callerBotID: BotID(uuid),
+            store: store,
+            callerThreadID: (thread?.isEmpty == false) ? thread : nil
+        )
     }
 
     public func call(name: String, arguments: [String: Any]) throws -> [String: Any] {
@@ -381,6 +452,31 @@ public struct BotComputerService: Sendable {
             return try perform(kind: BotComputerCatalog.exec, command: command)
         case BotComputerCatalog.rebuild:
             return try perform(kind: BotComputerCatalog.rebuild)
+        case BotComputerCatalog.requestUserAction:
+            let rawKind = (arguments["kind"] as? String ?? "other").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let kind = ManualActionKind(rawValue: rawKind) else {
+                throw BotComputerError.invalid("kind must be login, captcha, 2fa, payment, confirm, or other.")
+            }
+            return try perform(
+                kind: BotComputerCatalog.requestUserAction,
+                reason: ManualActionRequest.normalizedReason(arguments["reason"] as? String ?? ""),
+                subkind: kind.rawValue
+            )
+        case BotComputerCatalog.postScreenshot:
+            let rawKind = (arguments["kind"] as? String ?? "normal").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard BotScreenshotKind(rawValue: rawKind) != nil else {
+                throw BotComputerError.invalid("kind must be normal, error, or action.")
+            }
+            return try perform(
+                kind: BotComputerCatalog.postScreenshot,
+                reason: ManualActionRequest.normalizedReason(arguments["reason"] as? String ?? ""),
+                subkind: rawKind
+            )
+        case BotComputerCatalog.requestMacExecution:
+            return try perform(
+                kind: BotComputerCatalog.requestMacExecution,
+                reason: ManualActionRequest.normalizedReason(arguments["reason"] as? String ?? "")
+            )
         default:
             throw BotComputerError.invalid("unknown tool: \(name)")
         }
@@ -404,7 +500,9 @@ public struct BotComputerService: Sendable {
     private func perform(
         kind: String,
         steps: [BotComputerActStep] = [],
-        command: String = ""
+        command: String = "",
+        reason: String = "",
+        subkind: String = ""
     ) throws -> [String: Any] {
         let waitMS = (kind == BotComputerCatalog.exec || kind == BotComputerCatalog.rebuild)
             ? max(timeoutMS, 180_000)
@@ -414,7 +512,10 @@ public struct BotComputerService: Sendable {
             botID: callerBotID.value.uuidString.lowercased(),
             kind: kind,
             steps: steps,
-            command: command
+            command: command,
+            threadID: callerThreadID,
+            reason: reason,
+            subkind: subkind
         )
         try BotComputerHost.request(store: store, action: pending)
         let deadline = Date().addingTimeInterval(max(0.2, waitMS / 1000))

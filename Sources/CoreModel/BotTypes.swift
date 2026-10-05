@@ -363,6 +363,9 @@ public enum BotStandingInstructions {
     public static let computerActTool = "bot_computer_act"
     public static let computerExecTool = "bot_computer_exec"
     public static let computerRebuildTool = "bot_computer_rebuild"
+    public static let requestUserActionTool = "bot_request_user_action"
+    public static let postScreenshotTool = "bot_post_screenshot"
+    public static let requestMacExecutionTool = "request_mac_execution"
     public static let computerUseObservationTool = "screenshot"
     public static let generatedGuestComputerLine =
         "When asked to see or use the Linux desktop, call \(computerObserveTool) then \(computerActTool). To install packages or run a command in the guest, call \(computerExecTool). To change the guest image, edit /home/remotecode/Dockerfile then call \(computerRebuildTool). That screen is the Docker guest on 127.0.0.1. For websites, prefer \(openBrowserTool) then \(snapshotBrowserTool) and \(actBrowserTool) — that browser is Playwright running inside this bot's Docker guest. If those browser tools fail, open the Chrome-engine browser on the guest desktop and drive it with \(computerObserveTool) and \(computerActTool). Do not use host computer-use, the host default browser, or host docker."

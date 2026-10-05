@@ -398,6 +398,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     var botBrowserGuestEnsureForTesting: (@Sendable (BotID) throws -> Void)?
     /// Replaces the real pending-action worker in tests without starting Docker.
     var botComputerReconciliationWorkerForTesting: (@Sendable () -> Void)?
+    /// Who drives each bot computer. Shared with the guest service; tests inject their own.
+    var botComputerControl: BotComputerControl = .shared
+    /// Overrides the bot -> thread lookup for manual-action cards (tests). Default: newest linked conversation thread.
+    var botActiveThreadResolverForTesting: (@Sendable (BotID) -> AgentThreadID?)?
     public private(set) var lastAgentAppHopTextForTesting: String?
     var destinationWindowIsKeyForTests: ((NSWindow) -> Bool)?
     var providerSignInTerminalInputSenderForTests: ((SurfaceID, String) -> TerminalInputStatus)?
@@ -7862,12 +7866,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
+    nonisolated private static var botBrowserRefusalPayload: String {
+        let data = try? JSONSerialization.data(withJSONObject: ["refusal": ManualActionRequest.refusalPhrase])
+        return data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    }
+
     private func performBotBrowserPendingAction(
         botID: BotID,
         action: BotBrowserPendingAction
     ) async throws -> String {
         guard let ctx = context else {
             throw BotBrowserError.invalid("Bot browser is not available. Keep the RemoteCode app running and try again.")
+        }
+        if action.kind == BotBrowserCatalog.act, botComputerControl.isControlledByUser(botID) {
+            return Self.botBrowserRefusalPayload
         }
         let route = try botBrowserRoute(botID: botID)
         if case .refused(let message) = route {
@@ -7883,6 +7895,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             throw BotBrowserError.invalid("unknown bot browser action kind: \(action.kind)")
         }
         let appSupport = ctx.appSupportDirectory
+        if action.kind == BotBrowserCatalog.stateKind, action.action == BotBrowserCatalog.waitLoginAction {
+            let openedURL = (try? BotBrowserStore(appSupportDirectory: appSupport).loadTarget(botID: botID))?.url ?? ""
+            ManualActionHost.request(
+                control: botComputerControl,
+                botID: botID,
+                threadID: botActiveThreadResolverForTesting?(botID)
+                    ?? ((try? ctx.botStore.listConversations(botID: botID)) ?? []).lazy
+                        .compactMap(\.linkedAgentThreadID).first,
+                kind: .login,
+                reason: BotBrowserLoginWait.userPrompt(url: openedURL),
+                screenshotPNG: nil
+            )
+        }
         if action.kind == BotBrowserCatalog.open {
             // Same URL validation + persist rule the old surface path applied.
             _ = try BotBrowserService(callerBotID: botID, store: BotBrowserStore(appSupportDirectory: appSupport))

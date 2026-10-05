@@ -64,6 +64,9 @@ public final class BotComputerGuestService: @unchecked Sendable {
     private let observeAttempts: Int
     private let observeDelay: TimeInterval
     private let sleep: @Sendable (TimeInterval) -> Void
+    private let control: BotComputerControl
+    private let screenshotLimiter: BotScreenshotRateLimiter
+    private let notificationCenter: NotificationCenter
     private let stateLock = NSLock()
     private var _lastReady: BotComputerGuestReady?
     private var _lastReason = "Guest is proving the screen…"
@@ -77,8 +80,14 @@ public final class BotComputerGuestService: @unchecked Sendable {
         recipeContext: URL? = nil,
         observeAttempts: Int = 60,
         observeDelay: TimeInterval = 0.5,
-        sleep: @escaping @Sendable (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
+        sleep: @escaping @Sendable (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        control: BotComputerControl = .shared,
+        screenshotLimiter: BotScreenshotRateLimiter = .shared,
+        notificationCenter: NotificationCenter = .default
     ) {
+        self.control = control
+        self.screenshotLimiter = screenshotLimiter
+        self.notificationCenter = notificationCenter
         self.appSupport = appSupport
         self.docker = docker
         self.recipeContext = recipeContext
@@ -390,16 +399,16 @@ public final class BotComputerGuestService: @unchecked Sendable {
             throw BotComputerError.invalid("Invalid bot id.")
         }
         let botID = BotID(uuid)
+        // Refused, never queued: nothing below runs while the user drives.
+        if action.kind == BotComputerCatalog.act || action.kind == BotComputerCatalog.exec,
+           control.isControlledByUser(botID) {
+            return ["refusal": ManualActionRequest.refusalPhrase]
+        }
+        let threadID = action.threadID.flatMap(UUID.init(uuidString:)).map(AgentThreadID.init)
         switch action.kind {
         case BotComputerCatalog.observe:
             let shot = try observe(botID: botID)
-            let base64 = shot.png.base64EncodedString()
-            guard base64.utf8.count <= Self.maxScreenshotBase64Bytes else {
-                throw BotComputerGuestServiceError.screenshotResultTooLarge(
-                    actualBytes: base64.utf8.count,
-                    maximumBytes: Self.maxScreenshotBase64Bytes
-                )
-            }
+            let base64 = try Self.boundedBase64(shot.png)
             return [
                 "png_magic": shot.magic,
                 "png_hash": shot.hash,
@@ -423,9 +432,64 @@ public final class BotComputerGuestService: @unchecked Sendable {
                 "host": ready.screenURL.host ?? "127.0.0.1",
                 "image": BotComputerGuestSpec.botImageTag(botID: botID),
             ]
+        case BotComputerCatalog.requestUserAction:
+            let shot = try observe(botID: botID)
+            let base64 = try Self.boundedBase64(shot.png)
+            let kind = ManualActionKind(rawValue: action.subkind) ?? .other
+            let id = ManualActionHost.request(
+                control: control,
+                botID: botID,
+                threadID: threadID,
+                kind: kind,
+                reason: action.reason,
+                screenshotPNG: shot.png,
+                center: notificationCenter
+            )
+            return [
+                "request_id": id.uuidString.lowercased(),
+                "message": ManualActionRequest.pauseReply,
+                "png_base64": base64,
+            ]
+        case BotComputerCatalog.postScreenshot:
+            let kind = BotScreenshotKind(rawValue: action.subkind) ?? .normal
+            if let blocked = screenshotLimiter.acquire(botID: botID, kind: kind).message {
+                throw BotComputerError.invalid(blocked)
+            }
+            let shot = try observe(botID: botID)
+            let jpeg = try BotScreenshotEncoder.jpeg(fromPNG: shot.png)
+            var userInfo: [String: Any] = [
+                BotHostNotificationKey.botID: botID,
+                BotHostNotificationKey.jpeg: jpeg.data,
+                BotHostNotificationKey.reason: action.reason,
+                BotHostNotificationKey.kind: kind.rawValue,
+            ]
+            if let threadID { userInfo[BotHostNotificationKey.threadID] = threadID }
+            notificationCenter.post(name: .botScreenshotPosted, object: nil, userInfo: userInfo)
+            return ["ok": true, "width": jpeg.width, "height": jpeg.height]
+        case BotComputerCatalog.requestMacExecution:
+            var userInfo: [String: Any] = [
+                BotHostNotificationKey.botID: botID,
+                BotHostNotificationKey.reason: action.reason,
+            ]
+            if let threadID { userInfo[BotHostNotificationKey.threadID] = threadID }
+            notificationCenter.post(name: .botMacExecutionRequested, object: nil, userInfo: userInfo)
+            return ["ok": true, "message": Self.macExecutionReply]
         default:
             throw BotComputerError.invalid("unknown tool: \(action.kind)")
         }
+    }
+
+    public static let macExecutionReply = "Pedido enviado ao usuário; aguarde aprovação. Encerre o turno."
+
+    private static func boundedBase64(_ png: Data) throws -> String {
+        let base64 = png.base64EncodedString()
+        guard base64.utf8.count <= maxScreenshotBase64Bytes else {
+            throw BotComputerGuestServiceError.screenshotResultTooLarge(
+                actualBytes: base64.utf8.count,
+                maximumBytes: maxScreenshotBase64Bytes
+            )
+        }
+        return base64
     }
 
     private func waitForPNG(name: String) throws -> Data {

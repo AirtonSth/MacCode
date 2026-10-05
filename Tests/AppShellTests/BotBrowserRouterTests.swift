@@ -343,4 +343,79 @@ final class BotBrowserRouterTests: XCTestCase {
         XCTAssertEqual(page.cookies["session"], "live")
         XCTAssertTrue(try BotBrowserService(callerBotID: bot.id, store: store).waitLogin().isComplete)
     }
+
+    @MainActor
+    func test_manualAction_8_waitLoginStatePollOpensLoginRequestOnActiveThread() async throws {
+        // WHY: wait_login must open the same unified card (kind=login) on the bot's thread, not a private flow.
+        let appSupport = NSTemporaryDirectory() + "RC2BotBrowserWaitLogin-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let router = AppCommandRouter(context: ctx)
+        router.botBrowserBridge = FakeBotBrowserBridge()
+        let workspace = try router.createWorkspace(name: "desk", cwd: NSTemporaryDirectory())
+        let bot = try ctx.botStore.create(name: "Piper", title: "", description: "", workspaceID: workspace.id)
+        let thread = AgentThreadID()
+        router.botActiveThreadResolverForTesting = { _ in thread }
+        let store = BotBrowserStore(appSupportDirectory: URL(fileURLWithPath: appSupport, isDirectory: true))
+        try store.persistTarget(BotBrowserTarget(url: "https://login.example.test/in", title: "Sign in"), botID: bot.id)
+
+        var seen: [ManualActionRequest] = []
+        let token = NotificationCenter.default.addObserver(
+            forName: .botManualActionRequested, object: nil, queue: nil
+        ) { note in
+            if let request = note.userInfo?[BotHostNotificationKey.request] as? ManualActionRequest,
+               request.botID == bot.id { seen.append(request) }
+        }
+        defer {
+            NotificationCenter.default.removeObserver(token)
+            BotComputerControl.shared.forget(bot.id)
+        }
+        try BotBrowserHost.requestAction(
+            store: store,
+            action: BotBrowserPendingAction(
+                id: "wait-1",
+                botID: bot.id.value.uuidString.lowercased(),
+                kind: BotBrowserCatalog.stateKind,
+                action: BotBrowserCatalog.waitLoginAction,
+                ref: "",
+                text: ""
+            ),
+            notify: { _ in }
+        )
+        await router.reconcileBotBrowserActions()
+
+        XCTAssertEqual(seen.count, 1)
+        XCTAssertEqual(seen.first?.kind, .login)
+        XCTAssertEqual(seen.first?.threadID, thread)
+        XCTAssertEqual(BotComputerControl.shared.openRequest(bot.id)?.kind, .login)
+    }
+
+    @MainActor
+    func test_browserActRefusedWhileUserControlsBot() async throws {
+        // WHY: the bot browser act must obey the same control block as computer act (nothing executes).
+        let appSupport = NSTemporaryDirectory() + "RC2BotBrowserControl-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let router = AppCommandRouter(context: ctx)
+        let fake = FakeBotBrowserBridge()
+        router.botBrowserBridge = fake
+        let control = BotComputerControl()
+        router.botComputerControl = control
+        let workspace = try router.createWorkspace(name: "desk", cwd: NSTemporaryDirectory())
+        let bot = try ctx.botStore.create(name: "Piper", title: "", description: "", workspaceID: workspace.id)
+        control.take(bot.id)
+        let store = BotBrowserStore(appSupportDirectory: URL(fileURLWithPath: appSupport, isDirectory: true))
+        try BotBrowserHost.requestAction(
+            store: store,
+            action: BotBrowserPendingAction(
+                id: "act-ctl", botID: bot.id.value.uuidString.lowercased(),
+                kind: BotBrowserCatalog.act, action: "click", ref: "e1", text: ""
+            ),
+            notify: { _ in }
+        )
+        await router.reconcileBotBrowserActions()
+        let result = try XCTUnwrap(try store.takeActionResult(id: "act-ctl"))
+        XCTAssertTrue(result.payload.contains("NÃO foi executada"))
+        XCTAssertTrue(fake.recorded().isEmpty)
+    }
 }

@@ -60,6 +60,13 @@ public struct ManagedBotComputerMCP: Sendable {
                 }
                 let service = try BotComputerService.make(environment: env, store: store)
                 let object = try service.call(name: name, arguments: arguments)
+                // Host refusal is a normal result carrying the fixed phrase (nothing ran).
+                if let refusal = object["refusal"] as? String {
+                    return reply(id: id, result: [
+                        "content": [["type": "text", "text": refusal]],
+                        "isError": false,
+                    ])
+                }
                 var text = encodeJSON(object) ?? "{}"
                 // Screenshot payloads are delivered as an image block; their JSON
                 // envelope must stay verbatim, so only image-free results distill.
