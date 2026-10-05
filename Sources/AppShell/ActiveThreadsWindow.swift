@@ -450,7 +450,7 @@ public struct ActiveThreadsRootView: View {
                     .padding(.horizontal, 8)
                     .frame(minWidth: 28, minHeight: 28)
                     .background(Circle().fill(Color.blue))
-                    .accessibilityLabel(PetActiveThreadCountFormatter.accessibilityValue(count: vm.activeCount))
+                    .accessibilityLabel(PetActiveThreadCountFormatter.activeItemsAccessibilityValue(count: vm.activeCount))
             }
         }
         .padding(.horizontal, DS.Space.xxl)

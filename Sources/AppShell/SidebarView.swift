@@ -2962,11 +2962,11 @@ public struct SidebarRootView: View {
                     )
                 }
                 .buttonStyle(.plain)
-                .help(PetActiveThreadCountFormatter.accessibilityValue(count: vm.activeThreadCount))
+                .help(PetActiveThreadCountFormatter.activeItemsAccessibilityValue(count: vm.activeThreadCount))
                 .accessibilityIdentifier("sidebar.activeThreads")
                 .accessibilityLabel(
                     vm.activeThreadCount > 0
-                        ? PetActiveThreadCountFormatter.accessibilityValue(count: vm.activeThreadCount)
+                        ? PetActiveThreadCountFormatter.activeItemsAccessibilityValue(count: vm.activeThreadCount)
                         : "Active Threads"
                 )
                 .accessibilityAddTraits(vm.isActiveThreadsSelected ? .isSelected : [])

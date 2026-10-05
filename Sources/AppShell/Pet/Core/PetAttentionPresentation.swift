@@ -195,6 +195,15 @@ public enum PetActiveThreadCountFormatter {
         }
     }
 
+    /// Sidebar/Active Threads count also includes busy terminals.
+    public static func activeItemsAccessibilityValue(count: Int) -> String {
+        switch max(0, count) {
+        case 0: return "Nothing running"
+        case 1: return "1 item running"
+        case let count: return "\(count) items running"
+        }
+    }
+
     public static func combinedAccessibilityValue(activeCount: Int, attentionCount: Int) -> String {
         let active = accessibilityValue(count: activeCount)
         let attention = PetAttentionCountFormatter.accessibilityValue(count: attentionCount)

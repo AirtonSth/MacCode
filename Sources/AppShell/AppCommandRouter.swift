@@ -1078,7 +1078,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         var browserURLs: [String: String] = [:]
         for workspace in workspaces {
             var descriptors: [SurfaceDescriptor] = []
-            forEachSurface(in: workspace.layout) { descriptors.append($0) }
+            forEachSurface(in: workspace.layout) { descriptors.append(Self.clientSurfaceDescriptor($0)) }
             descriptorsByWorkspace[workspace.id.value.uuidString] = descriptors
             for descriptor in descriptors where descriptor.type == .browser {
                 browserURLs[descriptor.id.value.uuidString] =
@@ -8127,14 +8127,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func paneSurfaces(pane: PaneID, workspace: WorkspaceID) throws -> [SurfaceDescriptor] {
         guard let ctx = context, let ws = ctx.state.workspaces[workspace] else { return [] }
-        // Client-facing copies: live terminal busy is injected at read time, never persisted.
-        return (ws.layout.find(paneID: pane)?.surfaces ?? []).map { descriptor in
-            guard descriptor.type == .terminal,
-                  SurfaceRegistry.shared.surface(descriptor.id)?.isBusy == true else { return descriptor }
-            var copy = descriptor
-            copy.metadata["busy"] = "true"
-            return copy
-        }
+        return (ws.layout.find(paneID: pane)?.surfaces ?? []).map(Self.clientSurfaceDescriptor)
+    }
+
+    /// Client-facing copy: live terminal busy is injected at read time, never persisted.
+    static func clientSurfaceDescriptor(_ descriptor: SurfaceDescriptor) -> SurfaceDescriptor {
+        guard descriptor.type == .terminal,
+              SurfaceRegistry.shared.surface(descriptor.id)?.isBusy == true else { return descriptor }
+        var copy = descriptor
+        copy.metadata["busy"] = "true"
+        return copy
     }
 
     public func paneResize(workspace: WorkspaceID, splitID: UUID, ratios: [Double]) throws {

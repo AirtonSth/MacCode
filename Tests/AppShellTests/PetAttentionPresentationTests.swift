@@ -50,6 +50,9 @@ final class PetAttentionPresentationTests: XCTestCase {
             PetActiveThreadCountFormatter.accessibilityValue(count: 3),
             "3 active agent threads"
         )
+        // Sidebar badge counts busy terminals too, so its copy must not say "agent thread".
+        XCTAssertEqual(PetActiveThreadCountFormatter.activeItemsAccessibilityValue(count: 1), "1 item running")
+        XCTAssertEqual(PetActiveThreadCountFormatter.activeItemsAccessibilityValue(count: 0), "Nothing running")
         XCTAssertEqual(
             PetActiveThreadCountFormatter.combinedAccessibilityValue(activeCount: 2, attentionCount: 1),
             "2 active agent threads. 1 item needs attention"
