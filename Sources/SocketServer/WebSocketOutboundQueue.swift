@@ -327,8 +327,6 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     private var waitMetrics = OutboundQueueWaitMetricsSnapshot.zero
     /// EMA of observed application+control drain rate (bytes/sec).
     private var measuredDrainBytesPerSecond: Double = 0
-    private var lastDrainAt: TimeInterval = 0
-    private var lastDrainByteSample = 0
 
     init(
         label: String = "rc2.ws.outbound",
@@ -438,9 +436,13 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         let softBulkCeiling = max(0, softAppCeiling - interactiveReserve)
         let applicationQueued = max(0, queuedBytes - queuedControlBytes)
         let priority = frame.priority
+        // A single frame on an empty application queue is not backlog: admit it
+        // up to the cold-start budget so a large non-sheddable event (e.g. a
+        // whole tool_result) is not dropped when the drain-sized budget is small.
+        let hardBudget = applicationQueued == 0 ? max(budget, configuredMaxQueuedBytes) : budget
         // Hard bound: never exceed the total byte/frame budget.
         guard queuedFrames < maxQueuedFrames,
-              byteCount <= budget - queuedBytes else {
+              byteCount <= hardBudget - queuedBytes else {
             lock.unlock()
             return .queueFull
         }
@@ -1010,8 +1012,13 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             terminateImmediatelyAfterWriteFailure()
             return
         }
+        let writeStartedAt = now()
         let succeeded = applicationWriter(data)
-        removeQueuedItem(byteCount: byteCount, isControl: false, countAsDrain: succeeded)
+        removeQueuedItem(
+            byteCount: byteCount,
+            isControl: false,
+            drainStartedAt: succeeded ? writeStartedAt : nil
+        )
         if !succeeded { terminateImmediatelyAfterWriteFailure() }
     }
 
@@ -1020,8 +1027,13 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             removeQueuedItem(byteCount: data.count, isControl: true)
             return
         }
+        let writeStartedAt = now()
         let succeeded = controlWriter(opcode, data)
-        removeQueuedItem(byteCount: data.count, isControl: true, countAsDrain: succeeded)
+        removeQueuedItem(
+            byteCount: data.count,
+            isControl: true,
+            drainStartedAt: succeeded ? writeStartedAt : nil
+        )
         if !succeeded { terminateImmediatelyAfterWriteFailure() }
     }
 
@@ -1037,36 +1049,33 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         return true
     }
 
-    private func removeQueuedItem(byteCount: Int, isControl: Bool, countAsDrain: Bool = false) {
+    private func removeQueuedItem(byteCount: Int, isControl: Bool, drainStartedAt: TimeInterval? = nil) {
         lock.lock()
         queuedBytes = max(0, queuedBytes - byteCount)
         queuedFrames = max(0, queuedFrames - 1)
         if isControl {
             queuedControlBytes = max(0, queuedControlBytes - byteCount)
         }
-        if countAsDrain, byteCount > 0 {
-            noteDrainLocked(bytes: byteCount)
+        if let drainStartedAt, byteCount > 0 {
+            noteDrainLocked(bytes: byteCount, startedAt: drainStartedAt)
         }
         lock.unlock()
     }
 
-    private func noteDrainLocked(bytes: Int) {
-        let now = Date().timeIntervalSinceReferenceDate
-        if lastDrainAt > 0 {
-            let dt = now - lastDrainAt
-            if dt > 0.000_5 {
-                // Attribute the previous sample's bytes over the inter-write gap.
-                let instant = Double(lastDrainByteSample) / dt
-                if measuredDrainBytesPerSecond <= 0 {
-                    measuredDrainBytesPerSecond = instant
-                } else {
-                    measuredDrainBytesPerSecond =
-                        measuredDrainBytesPerSecond * 0.8 + instant * 0.2
-                }
+    private func noteDrainLocked(bytes: Int, startedAt: TimeInterval) {
+        // Time only the write itself. The gap between writes includes producer
+        // idle time, which would size the budget from the event trickle rate
+        // instead of what the link can actually drain.
+        let dt = now() - startedAt
+        if dt > 0.000_5 {
+            let instant = Double(bytes) / dt
+            if measuredDrainBytesPerSecond <= 0 {
+                measuredDrainBytesPerSecond = instant
+            } else {
+                measuredDrainBytesPerSecond =
+                    measuredDrainBytesPerSecond * 0.8 + instant * 0.2
             }
         }
-        lastDrainAt = now
-        lastDrainByteSample = bytes
     }
 
     private func terminateImmediatelyAfterWriteFailure() {
