@@ -849,6 +849,78 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertTrue(try store.listAttention(includeAcknowledged: true).isEmpty)
     }
 
+    /// WHY: a run may ask the user more than once (two `bot_ask_user` calls,
+    /// or ask_user plus a desk "Needs you" row). That is normal, not a
+    /// cross-target violation: the list must keep working and show the newest
+    /// question, and the run must still settle so the Bot stops reading as live.
+    func test_multipleQuestionsInOneRunPickNewestAndStillSettle() throws {
+        let (botID, conversationID) = try createBotConversation(prefix: "multi-question")
+        let bot = BotID(try XCTUnwrap(UUID(uuidString: botID)))
+        let conversation = BotConversationID(try XCTUnwrap(UUID(uuidString: conversationID)))
+        let threadID = UUID()
+        let runID = UUID()
+        authority.onSend = { _, _, _, _, _ in
+            [
+                "bot_id": botID,
+                "conversation_id": conversationID,
+                "thread_id": threadID.uuidString.lowercased(),
+                "run_id": runID.uuidString.lowercased(),
+                "enqueued": true,
+                "queued_follow_up": false,
+            ]
+        }
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "multi-question-send",
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "text": "Ask whatever you need.",
+        ])
+        var linked = try XCTUnwrap(try store.conversation(id: conversation))
+        linked.linkedAgentThreadID = AgentThreadID(threadID)
+        try store.upsertConversation(linked)
+
+        let older = BotAttentionItem(
+            botID: bot,
+            conversationID: conversation,
+            kind: .question,
+            title: "Needs you",
+            detail: "First question",
+            createdAt: Date().addingTimeInterval(5)
+        )
+        let newer = BotAttentionItem(
+            botID: bot,
+            conversationID: conversation,
+            kind: .question,
+            title: "Needs you",
+            detail: "Second question",
+            createdAt: Date().addingTimeInterval(10)
+        )
+        try store.upsertAttention(newer)
+        try store.upsertAttention(older)
+
+        let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let item = try XCTUnwrap((listed["items"] as? [[String: Any]])?.first {
+            $0["bot_id"] as? String == botID
+        })
+        XCTAssertEqual(item["id"] as? String, newer.id.value.uuidString.lowercased())
+        XCTAssertEqual(item["state"] as? String, "needs_attention")
+
+        XCTAssertTrue(
+            authority.settleRuntime(botID: botID, runID: runID.uuidString, failed: false),
+            "a second question must not block the terminal settle"
+        )
+        let settled = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let settledItem = try XCTUnwrap((settled["items"] as? [[String: Any]])?.first {
+            $0["bot_id"] as? String == botID
+        })
+        XCTAssertEqual(settledItem["id"] as? String, newer.id.value.uuidString.lowercased())
+        XCTAssertEqual(settledItem["state"] as? String, "needs_attention")
+        XCTAssertFalse(
+            authority.settleRuntime(botID: botID, runID: runID.uuidString, failed: false),
+            "the live run entry must be gone after the first settle"
+        )
+    }
+
     /// WHY: peer descendants are real Bot work, but they must never inflate
     /// the primary count or lose their exact activity/conversation/run owner
     /// after the paired authority is reconstructed.

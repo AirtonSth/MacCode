@@ -242,6 +242,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               var item = attention[botID],
               let attentionRunID = item["run_id"] as? String,
               runtimeIDsMatch(attentionRunID, runID) else { return false }
+        // A projection read failure must not block the terminal settle;
+        // otherwise liveRuns stays pinned until the host restarts.
         let durableQuestion: [String: Any]?
         do {
             durableQuestion = try durableNeedsAttention(
@@ -250,7 +252,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 items: store.listAttention(includeAcknowledged: true)
             )
         } catch {
-            return false
+            botRemoteControlLog.error(
+                "bot.attention.settle_projection_failed bot=\(botID, privacy: .public) error=\(String(describing: error), privacy: .public)"
+            )
+            durableQuestion = nil
         }
         liveRuns.removeValue(forKey: botID)
         if let durableQuestion {
@@ -277,11 +282,17 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let items = try store.listAttention(includeAcknowledged: true)
         var changed = false
         for (botID, run) in liveRuns {
-            guard let item = try durableNeedsAttention(
-                botID: botID,
-                run: run,
-                items: items
-            ) else { continue }
+            // One failing run must not fail the whole list.
+            let projected: [String: Any]?
+            do {
+                projected = try durableNeedsAttention(botID: botID, run: run, items: items)
+            } catch {
+                botRemoteControlLog.error(
+                    "bot.attention.durable_projection_failed bot=\(botID, privacy: .public) error=\(String(describing: error), privacy: .public)"
+                )
+                continue
+            }
+            guard let item = projected else { continue }
             if attention[botID]?["id"] as? String != item["id"] as? String
                 || attention[botID]?["state"] as? String != "needs_attention" {
                 attention[botID] = item
@@ -414,8 +425,11 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 && $0.kind == .question
                 && $0.createdAt.timeIntervalSince1970 >= floor(startedAt)
         }
-        guard candidates.count <= 1 else { throw Error.crossTarget }
-        guard let question = candidates.first else { return nil }
+        // A run may ask more than once (repeated bot_ask_user, desk "Needs
+        // you" rows); the newest question wins, ids break same-second ties.
+        guard let question = candidates.max(by: {
+            ($0.createdAt, $0.id.value.uuidString) < ($1.createdAt, $1.id.value.uuidString)
+        }) else { return nil }
         return canonicalAttentionItem([
             "id": question.id.value.uuidString.lowercased(),
             "bot_id": exactBotID.value.uuidString.lowercased(),
