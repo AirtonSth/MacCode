@@ -10030,13 +10030,16 @@ public final class BotsViewModel: ObservableObject {
                       conversation.botID == bot.id else {
                     throw BotDeskSendRefused(reason: "Bot indisponível.")
                 }
-                return try self.compileDeskPrompt(
+                let prompt = try self.compileDeskPrompt(
                     botID: bot.id,
                     conversationID: conversation.id,
                     text: text,
                     threadID: threadID,
                     runID: runID
                 )
+                let thread = try? self.context.threadRepo.get(id: threadID)
+                guard thread?.executionTarget == .vm else { return prompt }
+                return prompt + "\n\n" + BotStandingInstructions.vmThreadRules
             },
             runStarted: { [weak self] botID, runID, threadID in
                 guard let self,

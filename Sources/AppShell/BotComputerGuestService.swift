@@ -67,6 +67,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
     private let control: BotComputerControl
     private let screenshotLimiter: BotScreenshotRateLimiter
     private let notificationCenter: NotificationCenter
+    private let vmRuns: BotVMRunRegistry
+    private let gitRun: @Sendable ([String]) -> String?
     private let stateLock = NSLock()
     private var _lastReady: BotComputerGuestReady?
     private var _lastReason = "Guest is proving the screen…"
@@ -83,8 +85,12 @@ public final class BotComputerGuestService: @unchecked Sendable {
         sleep: @escaping @Sendable (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
         control: BotComputerControl = .shared,
         screenshotLimiter: BotScreenshotRateLimiter = .shared,
-        notificationCenter: NotificationCenter = .default
+        notificationCenter: NotificationCenter = .default,
+        vmRuns: BotVMRunRegistry = .shared,
+        gitRun: @escaping @Sendable ([String]) -> String? = BotComputerGuestService.runGit
     ) {
+        self.vmRuns = vmRuns
+        self.gitRun = gitRun
         self.control = control
         self.screenshotLimiter = screenshotLimiter
         self.notificationCenter = notificationCenter
@@ -420,7 +426,18 @@ public final class BotComputerGuestService: @unchecked Sendable {
             try act(botID: botID, steps: action.steps)
             return ["ok": true, "steps": action.steps.count]
         case BotComputerCatalog.exec:
-            let output = try exec(botID: botID, command: action.command)
+            let output: Data
+            if let run = vmRuns.active(botID: botID) {
+                output = try exec(
+                    botID: botID,
+                    command: action.command,
+                    workspace: run.workspace,
+                    user: "\(getuid()):\(getgid())",
+                    gitIdentity: Self.gitIdentity(run: gitRun)
+                )
+            } else {
+                output = try exec(botID: botID, command: action.command)
+            }
             return [
                 "ok": true,
                 "output": String(data: output, encoding: .utf8) ?? "",

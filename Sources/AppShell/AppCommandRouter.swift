@@ -2769,8 +2769,24 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             guard let hooks = self?.botWorkspaceRunHooks else { throw BotWorkspaceRunUnavailable() }
             return try await hooks.promptTransform(botID, text, threadID, runID)
         }
-        agent.viewModel.botRunStarted = { [weak self] botID, runID, threadID in
+        agent.viewModel.botRunStarted = { [weak self, weak viewModel = agent.viewModel] botID, runID, threadID in
             self?.botWorkspaceRunHooks?.runStarted(botID, runID, threadID)
+            if let viewModel,
+               let thread = viewModel.threads.first(where: { $0.id == threadID }),
+               thread.executionTarget == .vm {
+                BotVMRunRegistry.shared.begin(
+                    botID: botID,
+                    entry: BotVMRunRegistry.Entry(
+                        threadID: threadID,
+                        runID: runID,
+                        title: thread.title,
+                        workspace: thread.worktreePath ?? viewModel.cwd
+                    )
+                )
+            }
+        }
+        agent.viewModel.botBusyMessage = { botID, threadID in
+            BotVMRunRegistry.shared.busyMessage(botID: botID, threadID: threadID)
         }
     }
 

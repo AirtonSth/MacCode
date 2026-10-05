@@ -1690,6 +1690,7 @@ public final class AppContext {
             }
         }
         coordinator.onRunFinished = { [weak self] tid, rid, status in
+            BotVMRunRegistry.shared.endRun(runID: rid)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let kind: RemoteCodeEventKind = status == .completed

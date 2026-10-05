@@ -301,6 +301,15 @@ public enum BotAvatar {
 /// a custom soul must not hide Desk-admitted tools. The starter is replaceable
 /// standing rules.
 public enum BotStandingInstructions {
+    /// Appended to the prompt of bot threads that run in the VM.
+    public static let vmThreadRules: String = """
+    Este ambiente é Linux; ferramentas só-macOS (swift, xcodebuild, xcrun) não existem. Use request_mac_execution(reason) para pedir execução no Mac.
+
+    Screenshots: enviar bot_post_screenshot em: fim de tarefa visual; erro visível; pedido de login/ação humana; antes de ação irreversível; mudança grande de tela em tarefa longa.
+
+    Ação manual: Peça ação manual só para login, captcha, 2FA, pagamento ou confirmação humana. Nunca peça senha, código ou dados de cartão no chat. Depois de retomar, sempre tire screenshot antes de agir.
+    """
+
     /// Unique last line so Studio can refresh the starter without overwriting a custom soul.
     public static let generatedSignature =
         "Do not invent tools, files, accounts, or access you do not have."
