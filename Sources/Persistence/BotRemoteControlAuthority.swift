@@ -336,7 +336,18 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         var next = attention.filter { _, item in
             item["source"] as? String != "bot_peer_handoff"
         }
-        for (botID, item) in delegatedByBot { next[botID] = item }
+        for (botID, item) in delegatedByBot {
+            // A historical finished handoff must not replace the item of a
+            // newer live bot.send run: settleRuntime matches that item's
+            // run_id, so the run would never settle and liveRuns would pin.
+            if item["state"] as? String == "finished",
+               let liveRunID = liveRuns[botID]?["run_id"] as? String,
+               let delegatedRunID = item["run_id"] as? String,
+               !runtimeIDsMatch(liveRunID, delegatedRunID) {
+                continue
+            }
+            next[botID] = item
+        }
         guard !NSDictionary(dictionary: attention).isEqual(to: next) else { return }
         attention = next
         persistSidecar()

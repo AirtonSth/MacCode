@@ -1100,6 +1100,37 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         )
     }
 
+    /// WHY (C28 x C29): the host emits the newest handoff per peer forever.
+    /// Once finished rows are no longer rejected for relinked threads, such an
+    /// old finished row must not replace the peer's own newer bot.send run:
+    /// settleRuntime matches that item's run_id, so the run would never
+    /// settle and the Bot would read as working until the host restarts.
+    func test_finishedHandoffDoesNotDisplaceNewerLiveRunSoItStillSettles() throws {
+        let owner = try createBotConversation(prefix: "c28-live-owner")
+        let peer = try createLiveBot(prefix: "c28-live-peer", name: "Writer")
+        let ownerThread = AgentThreadID()
+        let peerThread = AgentThreadID()
+        try linkConversation(owner.conversationID, to: ownerThread)
+        try linkConversation(peer.conversationID, to: peerThread)
+        let oldHandoff = delegatedRow(
+            peer: (peer.botID, peer.conversationID), peerThreadID: peerThread,
+            owner: owner, ownerThreadID: ownerThread,
+            state: "finished"
+        )
+        authority.onDelegatedAttentionSnapshot = { [oldHandoff.row] }
+        try linkConversation(owner.conversationID, to: AgentThreadID())
+
+        let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let items = try XCTUnwrap(listed["items"] as? [[String: Any]])
+        let peerItem = try XCTUnwrap(items.first { $0["bot_id"] as? String == peer.botID })
+        XCTAssertEqual(peerItem["run_id"] as? String, peer.runID, "the live run keeps its own item")
+        XCTAssertEqual(peerItem["state"] as? String, "working")
+        XCTAssertTrue(
+            authority.settleRuntime(botID: peer.botID, runID: peer.runID, failed: false),
+            "the live run must still settle"
+        )
+    }
+
     /// WHY (C28): dropping a stale row must not widen authority. An active
     /// (working) handoff whose owner conversation no longer links the
     /// recorded owner thread is not adopted, yet the list still succeeds.
