@@ -1647,6 +1647,16 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             XCTAssertThrowsError(try authority.dispatch(method: method, params: params), method) { error in
                 XCTAssertEqual(error as? BotRemoteControlAuthority.Error, conversationGone, method)
             }
+            guard method != "bot.attachment.list" else { continue }
+            // Paired mutations reach the phone as this failed receipt, not as
+            // a JSON-RPC error, so the receipt must carry the code too.
+            let failed = try authority.dispatch(method: "bot.receipt.status", params: [
+                "client_request_id": "gone-\(method)",
+            ])
+            XCTAssertEqual(failed["status"] as? String, "failed", method)
+            let readback = failed["readback"] as? [String: Any]
+            XCTAssertEqual(readback?["error_code"] as? Int, -32080, method)
+            XCTAssertEqual(readback?["error"] as? String, conversationGone.message, method)
         }
 
         let routineGone = BotRemoteControlAuthority.Error(

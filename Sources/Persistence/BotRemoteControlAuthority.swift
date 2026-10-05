@@ -625,7 +625,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 requestID: requestID,
                 status: .failed,
                 botID: string(params, "bot_id"),
-                readback: ["error": error.message]
+                // Remote mutations answer with this failed receipt, not a
+                // JSON-RPC error, so the code (e.g. -32080 conversation gone
+                // vs -32084 grant mismatch) must travel in the readback.
+                readback: ["error": error.message, "error_code": error.code]
             )
             receipts[requestID] = failed
             receiptClaims[requestID] = claim
