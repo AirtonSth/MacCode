@@ -3436,37 +3436,45 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     registry.close(fd)
                     return
                 }
-                let writeStarted = DispatchTime.now().uptimeNanoseconds
-                let wrote = self.send(
-                    fd: fd,
-                    status: 200,
-                    contentType: "application/json",
-                    body: respData,
-                    acceptEncoding: ae
-                )
-                self.requestPhaseMetrics.record(
-                    .responseWrite,
-                    latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: writeStarted)
-                )
-                if !wrote {
-                    self.requestPhaseMetrics.recordWriteAborted()
-                    ownerRegistry.unbind(fd)
-                    registry.close(fd)
-                    return
+                // C21: the response write and the keep-alive read block, so
+                // they run on a dedicated Thread (as in C-25), never on the
+                // cooperative pool this Task runs on.
+                let thread = Thread {
+                    let writeStarted = DispatchTime.now().uptimeNanoseconds
+                    let wrote = self.send(
+                        fd: fd,
+                        status: 200,
+                        contentType: "application/json",
+                        body: respData,
+                        acceptEncoding: ae
+                    )
+                    self.requestPhaseMetrics.record(
+                        .responseWrite,
+                        latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: writeStarted)
+                    )
+                    if !wrote {
+                        self.requestPhaseMetrics.recordWriteAborted()
+                        ownerRegistry.unbind(fd)
+                        registry.close(fd)
+                        return
+                    }
+                    if rpcClientClose || !registry.isActive(fd) {
+                        ownerRegistry.unbind(fd)
+                        registry.close(fd)
+                        return
+                    }
+                    // C-07: continue keep-alive on this Thread (owns close).
+                    self.serveHTTPSession(
+                        fd: fd,
+                        peer: peer,
+                        initialBuffer: rpcLeftover,
+                        ownsClose: true,
+                        remoteAuthenticated: remoteAuthenticated
+                    )
                 }
-                if rpcClientClose || !registry.isActive(fd) {
-                    ownerRegistry.unbind(fd)
-                    registry.close(fd)
-                    return
-                }
-                // C-07: continue keep-alive on this Task (owns close).
-                self.serveHTTPSession(
-                    fd: fd,
-                    peer: peer,
-                    initialBuffer: rpcLeftover,
-                    ownsClose: true,
-                    remoteAuthenticated: remoteAuthenticated
-                )
+                thread.name = "rc2.conn.\(fd)"
+                thread.qualityOfService = .userInitiated
+                thread.start()
             }
             return
         case ("POST", "/v1/pair"):
