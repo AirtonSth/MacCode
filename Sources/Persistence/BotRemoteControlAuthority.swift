@@ -813,6 +813,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             throw error
         }
         try? store.deleteQueuedFollowUps(botID: bot.id)
+        BotComputerControl.shared.forget(bot.id)
+        do { try ManualActionRequestStore(appSupportDirectory: appSupport).closeAll(botID: bot.id) } catch {
+            NSLog("RemoteCode: manual actions of deleted bot could not be closed: \(error)")
+        }
 
         var residuals: [String] = []
         if quarantined.guest != nil {

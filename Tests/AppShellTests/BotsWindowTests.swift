@@ -3332,7 +3332,7 @@ final class BotsWindowTests: XCTestCase {
         func inspect(name: String) throws -> BotComputerContainerInspect {
             BotComputerContainerInspect(running: false, imageID: "img", hostPort: 49152)
         }
-        func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data { Data() }
+        func exec(name: String, command: [String], user: String?, detach: Bool, workdir: String?, environment: [String: String]) throws -> Data { Data() }
         func rename(from: String, to: String) throws {}
         func ensureNetwork(name: String) throws {}
         func remove(name: String) throws {}
@@ -11357,7 +11357,7 @@ final class BotsWindowTests: XCTestCase {
             guard let value = containers[name] else { throw BotComputerGuestError.notReady }
             return value
         }
-        func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data {
+        func exec(name: String, command: [String], user: String?, detach: Bool, workdir: String?, environment: [String: String]) throws -> Data {
             execCallCount += 1
             if let failExecAfterCall, execCallCount > failExecAfterCall {
                 throw BotComputerGuestError.observeFailed

@@ -398,6 +398,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     var botBrowserGuestEnsureForTesting: (@Sendable (BotID) throws -> Void)?
     /// Replaces the real pending-action worker in tests without starting Docker.
     var botComputerReconciliationWorkerForTesting: (@Sendable () -> Void)?
+    /// Who drives each bot computer. Shared with the guest service; tests inject their own.
+    var botComputerControl: BotComputerControl = .shared
+    /// Overrides the bot -> thread lookup for manual-action cards (tests). Default: newest linked conversation thread.
+    var botActiveThreadResolverForTesting: (@Sendable (BotID) -> AgentThreadID?)?
+    /// Runs on the background queue after guest provisioning, right before the bridge act (tests).
+    var botBrowserBeforeBridgeActForTesting: (@Sendable () -> Void)?
     public private(set) var lastAgentAppHopTextForTesting: String?
     var destinationWindowIsKeyForTests: ((NSWindow) -> Bool)?
     var providerSignInTerminalInputSenderForTests: ((SurfaceID, String) -> TerminalInputStatus)?
@@ -494,6 +500,73 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         self.sshCommandRunner = sshCommandRunner
         self.botSecretStore = secretStore
         self.agentAppReadGateway = AgentAppReadGateway(db: context.db)
+        installBotHostObservers()
+    }
+
+    lazy var manualActionStore: ManualActionRequestStore = {
+        ManualActionRequestStore(appSupportDirectory: context?.appSupportDirectory ?? AppPaths.appSupportDirectory(for: .debug, override: nil))
+    }()
+    private var botHostObservers: [NSObjectProtocol] = []
+    /// Mac-execution approvals awaiting the user, per thread (reason text). Never auto-approved.
+    var pendingMacExecution: [AgentThreadID: String] = [:]
+    var botVMDocker: any BotComputerDockerClienting = BotComputerDockerCLI()
+    var botVMProvisionServiceForTesting: BotComputerGuestService?
+
+    deinit {
+        for token in botHostObservers { NotificationCenter.default.removeObserver(token) }
+    }
+
+    /// Notifications arrive on the poster's thread; the store is thread-safe, UI work hops to MainActor.
+    private func installBotHostObservers() {
+        let center = NotificationCenter.default
+        botHostObservers.append(center.addObserver(forName: .botManualActionRequested, object: nil, queue: nil) { [weak self] note in
+            guard let request = note.userInfo?[BotHostNotificationKey.request] as? ManualActionRequest else { return }
+            Task { @MainActor [weak self] in self?.handleManualActionRequested(request) }
+        })
+        botHostObservers.append(center.addObserver(forName: .botMacExecutionRequested, object: nil, queue: nil) { [weak self] note in
+            guard let info = note.userInfo,
+                  let threadID = info[BotHostNotificationKey.threadID] as? AgentThreadID else { return }
+            let reason = info[BotHostNotificationKey.reason] as? String ?? ""
+            Task { @MainActor [weak self] in self?.handleMacExecutionRequested(threadID: threadID, reason: reason) }
+        })
+        botHostObservers.append(center.addObserver(forName: .botScreenshotPosted, object: nil, queue: nil) { [weak self] note in
+            guard let info = note.userInfo,
+                  let threadID = info[BotHostNotificationKey.threadID] as? AgentThreadID,
+                  let jpeg = info[BotHostNotificationKey.jpeg] as? Data else { return }
+            let reason = info[BotHostNotificationKey.reason] as? String ?? ""
+            Task { @MainActor [weak self] in self?.handleBotScreenshotPosted(threadID: threadID, jpeg: jpeg, reason: reason) }
+        })
+    }
+
+    private func handleManualActionRequested(_ request: ManualActionRequest) {
+        guard let threadID = request.threadID else { return }
+        // A late main-actor hop must not overwrite a request the user already resolved.
+        guard !manualActionStore.all(threadID: threadID).contains(where: { $0.id == request.id }) else { return }
+        do { try manualActionStore.upsert(request) } catch {
+            NSLog("RemoteCode: manual action request could not be saved: \(error)")
+        }
+        guard let ctx = context else { return }
+        // The pausing turn may already have ended; a fresh run id still passes the nested-worker check.
+        let runID = (try? ctx.runRepo.latestActive(for: threadID))?.id ?? AgentRunID()
+        ctx.postAgentUserActionPushIfNeeded(
+            threadId: threadID,
+            runId: runID,
+            requestId: request.id.uuidString,
+            actionTitle: "Aguardando você"
+        )
+    }
+
+    private func handleBotScreenshotPosted(threadID: AgentThreadID, jpeg: Data, reason: String) {
+        guard let ctx = context else { return }
+        do {
+            let attachment = try agentAttachmentStore().stage(
+                data: jpeg, displayName: "screenshot.jpg", kind: .image, mimeType: "image/jpeg"
+            )
+            try ctx.messageRepo.append(AgentMessage(
+                threadId: threadID, role: .assistant, content: "📷 \(reason)", attachments: [attachment]
+            ))
+            refreshAgentSurfaces(thread: threadID, reloadTranscriptIfSelected: true)
+        } catch {}
     }
 
     private func publishAgentThreadUpdated(_ thread: AgentThread) {
@@ -2726,6 +2799,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Serves `BotStore.listCached()` so transcript bodies and keystrokes never
     /// hit SQLite (perf audit AA-01).
     func configureAgentAppBotMentions(_ agent: AgentAppSurface) {
+        agent.viewModel.botComputerControl = botComputerControl
+        agent.viewModel.manualActionStore = manualActionStore
         agent.viewModel.mentionableBotsProvider = { [weak self] in
             (try? self?.context?.botStore.listCached()) ?? []
         }
@@ -2755,9 +2830,37 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             guard let hooks = self?.botWorkspaceRunHooks else { throw BotWorkspaceRunUnavailable() }
             return try await hooks.promptTransform(botID, text, threadID, runID)
         }
-        agent.viewModel.botRunStarted = { [weak self] botID, runID, threadID in
+        agent.viewModel.botRunStarted = { [weak self, weak viewModel = agent.viewModel] botID, runID, threadID in
             self?.botWorkspaceRunHooks?.runStarted(botID, runID, threadID)
+            if let viewModel,
+               let thread = viewModel.threads.first(where: { $0.id == threadID }),
+               thread.executionTarget == .vm {
+                _ = BotVMRunRegistry.shared.tryBegin(
+                    botID: botID,
+                    entry: BotVMRunRegistry.Entry(
+                        threadID: threadID,
+                        runID: runID,
+                        title: thread.title,
+                        workspace: thread.worktreePath ?? viewModel.cwd
+                    )
+                )
+            }
         }
+        agent.viewModel.botBusyMessage = { botID, threadID in
+            BotVMRunRegistry.shared.busyMessage(botID: botID, threadID: threadID)
+        }
+        agent.viewModel.botWaitForVM = { botID, threadID in
+            BotVMRunRegistry.shared.addWaiting(botID: botID, threadID: threadID)
+        }
+        agent.viewModel.botMacExecutionResolver = { [weak self] threadID, approve in
+            await self?.resolveMacExecution(thread: threadID, approve: approve)
+        }
+        agent.viewModel.openBotScreen = { [weak self] botID in self?.openBotGuestDesktopInNewWindow(botID) }
+        agent.viewModel.botVMPreflight = { [weak self] botID, workspace in
+            await self?.botVMPreflight(botID, workspace: workspace)
+        }
+        agent.viewModel.botVMProvision = { [weak self] botID in await self?.provisionBotVM(botID) }
+        agent.viewModel.pendingMacExecutionByThread = pendingMacExecution
     }
 
     private struct BotWorkspaceRunUnavailable: LocalizedError {
@@ -7942,12 +8045,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
+    nonisolated private static var botBrowserRefusalPayload: String {
+        let data = try? JSONSerialization.data(withJSONObject: ["refusal": ManualActionRequest.refusalPhrase])
+        return data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    }
+
     private func performBotBrowserPendingAction(
         botID: BotID,
         action: BotBrowserPendingAction
     ) async throws -> String {
         guard let ctx = context else {
             throw BotBrowserError.invalid("Bot browser is not available. Keep the RemoteCode app running and try again.")
+        }
+        if action.kind == BotBrowserCatalog.act, botComputerControl.isControlledByUser(botID) {
+            return Self.botBrowserRefusalPayload
         }
         let route = try botBrowserRoute(botID: botID)
         if case .refused(let message) = route {
@@ -7963,6 +8074,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             throw BotBrowserError.invalid("unknown bot browser action kind: \(action.kind)")
         }
         let appSupport = ctx.appSupportDirectory
+        if action.kind == BotBrowserCatalog.stateKind, action.action == BotBrowserCatalog.waitLoginAction {
+            let openedURL = (try? BotBrowserStore(appSupportDirectory: appSupport).loadTarget(botID: botID))?.url ?? ""
+            ManualActionHost.request(
+                control: botComputerControl,
+                botID: botID,
+                threadID: action.threadID.flatMap { UUID(uuidString: $0) }.map { AgentThreadID($0) }
+                    ?? botActiveThreadResolverForTesting?(botID)
+                    ?? ((try? ctx.botStore.listConversations(botID: botID)) ?? []).lazy
+                        .compactMap(\.linkedAgentThreadID).first,
+                kind: .login,
+                reason: BotBrowserLoginWait.userPrompt(url: openedURL),
+                screenshotPNG: nil
+            )
+        }
         if action.kind == BotBrowserCatalog.open {
             // Same URL validation + persist rule the old surface path applied.
             _ = try BotBrowserService(callerBotID: botID, store: BotBrowserStore(appSupportDirectory: appSupport))
@@ -7970,12 +8095,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         let bridge = botBrowserBridge
         let ensureGuest = botBrowserGuestEnsure(route: route, botID: botID, appSupport: appSupport)
+        let control = botComputerControl
+        let beforeAct = botBrowserBeforeBridgeActForTesting
         // Guest provisioning (docker CLI) and child-process IO must never run
         // on MainActor — hop to a utility queue and await the result.
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 do {
                     try ensureGuest?()
+                    beforeAct?()
+                    // Provisioning can take seconds; the user may have taken control meanwhile.
+                    if action.kind == BotBrowserCatalog.act, control.isControlledByUser(botID) {
+                        continuation.resume(returning: Self.botBrowserRefusalPayload)
+                        return
+                    }
                     let payload = try bridge.perform(
                         botID: botID,
                         route: route,

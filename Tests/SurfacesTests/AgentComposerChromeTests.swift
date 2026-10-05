@@ -105,8 +105,11 @@ final class AgentComposerChromeTests: XCTestCase {
             userCount: 1, botsAvailable: false, actor: .none, identityLocked: false, runLocked: false))
         XCTAssertTrue(AgentRunAsUserPresentation.isInteractive(
             userCount: 3, botsAvailable: true, actor: bot, identityLocked: true, runLocked: false))
+        XCTAssertTrue(AgentRunAsUserPresentation.isInteractive(
+            userCount: 3, botsAvailable: true, actor: .none, identityLocked: true, runLocked: false),
+            "locked thread without a bot still offers hand-off to a bot")
         XCTAssertFalse(AgentRunAsUserPresentation.isInteractive(
-            userCount: 3, botsAvailable: true, actor: .none, identityLocked: true, runLocked: false))
+            userCount: 3, botsAvailable: false, actor: .none, identityLocked: true, runLocked: false))
         XCTAssertFalse(AgentRunAsUserPresentation.isInteractive(
             userCount: 3, botsAvailable: true, actor: bot, identityLocked: false, runLocked: true))
     }

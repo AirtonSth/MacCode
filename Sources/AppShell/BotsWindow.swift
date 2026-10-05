@@ -5698,6 +5698,10 @@ public final class BotsViewModel: ObservableObject {
         do {
             try botSecretStore.deleteAll(botID: id)
             try botStore.delete(id: id)
+            BotComputerControl.shared.forget(id)
+            do { try router?.manualActionStore.closeAll(botID: id) } catch {
+                NSLog("RemoteCode: manual actions of deleted bot could not be closed: \(error)")
+            }
             if let service = computerGuestService {
                 Task.detached { [service] in
                     service.teardown(botID: id)
@@ -10012,6 +10016,8 @@ public final class BotsViewModel: ObservableObject {
         vm.mentionableBotsRevisionProvider = { [weak self] in
             self?.botStore.botsListRevision ?? 0
         }
+        vm.botComputerControl = router.botComputerControl
+        vm.manualActionStore = router.manualActionStore
         vm.botNameProvider = { [weak self] botID in
             (try? self?.botStore.get(id: botID))??.name
         }
@@ -10055,13 +10061,16 @@ public final class BotsViewModel: ObservableObject {
                       conversation.botID == bot.id else {
                     throw BotDeskSendRefused(reason: "Bot indisponível.")
                 }
-                return try self.compileDeskPrompt(
+                let prompt = try self.compileDeskPrompt(
                     botID: bot.id,
                     conversationID: conversation.id,
                     text: text,
                     threadID: threadID,
                     runID: runID
                 )
+                let thread = try? self.context.threadRepo.get(id: threadID)
+                guard thread?.executionTarget == .vm else { return prompt }
+                return prompt + "\n\n" + BotStandingInstructions.vmThreadRules
             },
             runStarted: { [weak self] botID, runID, threadID in
                 guard let self,
@@ -10107,6 +10116,17 @@ public final class BotsViewModel: ObservableObject {
         router.botThreadRunStarted = { [weak self] runID, threadID in
             guard let self,
                   let conversation = try? self.botStore.conversationLinked(to: threadID) else { return }
+            if let thread = (try? self.context.threadRepo.get(id: threadID)) ?? nil, thread.executionTarget == .vm {
+                _ = BotVMRunRegistry.shared.tryBegin(
+                    botID: conversation.botID,
+                    entry: BotVMRunRegistry.Entry(
+                        threadID: threadID,
+                        runID: runID,
+                        title: thread.title,
+                        workspace: thread.worktreePath ?? ""
+                    )
+                )
+            }
             self.deskAgentRunStarted(
                 botID: conversation.botID,
                 conversationID: conversation.id,

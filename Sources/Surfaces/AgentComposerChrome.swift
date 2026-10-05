@@ -435,6 +435,7 @@ public struct AgentPermissionCapsule: View {
 public enum AgentRunAsUserPresentation {
     public static let noBotLabel = "No Bot"
     public static let continueWithoutBotLabel = "Continuar sem bot"
+    public static let handoffToBotSection = "Nova thread com outro bot…"
     public static let botActorIcon = "cpu"
 
     public static func isInteractive(userCount: Int, identityLocked: Bool, runLocked: Bool) -> Bool {
@@ -442,7 +443,7 @@ public enum AgentRunAsUserPresentation {
     }
 
     /// The chip opens a popover when there is anything to choose, or when a
-    /// locked bot thread offers the hand-off.
+    /// locked thread offers the hand-off.
     public static func isInteractive(
         userCount: Int,
         botsAvailable: Bool,
@@ -451,7 +452,7 @@ public enum AgentRunAsUserPresentation {
         runLocked: Bool
     ) -> Bool {
         if runLocked { return false }
-        if identityLocked { return actor.botID != nil }
+        if identityLocked { return actor.botID != nil || botsAvailable }
         return userCount > 1 || botsAvailable
     }
 
@@ -516,6 +517,7 @@ public struct AgentRunAsUserCapsule: View {
     public let onSelect: (AgentRunAsUser) -> Void
     public let onSelectActor: (RunActor) -> Void
     public let onContinueWithoutBot: () -> Void
+    public let onHandoffToBot: ((BotID) -> Void)?
     public let onAppear: (() -> Void)?
 
     @State private var isPresented = false
@@ -537,6 +539,7 @@ public struct AgentRunAsUserCapsule: View {
         onSelect: @escaping (AgentRunAsUser) -> Void,
         onSelectActor: @escaping (RunActor) -> Void = { _ in },
         onContinueWithoutBot: @escaping () -> Void = {},
+        onHandoffToBot: ((BotID) -> Void)? = nil,
         onAppear: (() -> Void)? = nil
     ) {
         self.usersProvider = usersProvider
@@ -552,6 +555,7 @@ public struct AgentRunAsUserCapsule: View {
         self.onSelect = onSelect
         self.onSelectActor = onSelectActor
         self.onContinueWithoutBot = onContinueWithoutBot
+        self.onHandoffToBot = onHandoffToBot
         self.onAppear = onAppear
     }
 
@@ -636,12 +640,27 @@ public struct AgentRunAsUserCapsule: View {
     private var popover: some View {
         VStack(alignment: .leading, spacing: DS.Space.xs) {
             if identityLocked {
-                AgentCompactMenuRow(
-                    AgentRunAsUserPresentation.continueWithoutBotLabel,
-                    selected: false
-                ) {
-                    onContinueWithoutBot()
-                    isPresented = false
+                if botID != nil {
+                    AgentCompactMenuRow(
+                        AgentRunAsUserPresentation.continueWithoutBotLabel,
+                        selected: false
+                    ) {
+                        onContinueWithoutBot()
+                        isPresented = false
+                    }
+                }
+                if let onHandoffToBot {
+                    AgentCompactMenuSection(AgentRunAsUserPresentation.handoffToBotSection)
+                    ForEach(bots.filter { $0.id != botID }, id: \.id.value) { bot in
+                        AgentCompactMenuRow(
+                            bot.name,
+                            detail: AgentRunAsUserPresentation.targetBadge(executionTarget(bot.id)),
+                            selected: false
+                        ) {
+                            onHandoffToBot(bot.id)
+                            isPresented = false
+                        }
+                    }
                 }
             } else {
                 if users.count > 1 {

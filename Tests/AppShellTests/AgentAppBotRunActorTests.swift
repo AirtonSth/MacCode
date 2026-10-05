@@ -131,6 +131,24 @@ final class AgentAppBotRunActorTests: XCTestCase {
         )
     }
 
+    func test_vmBotBusyOnOtherThreadQueuesFreshThreadInsteadOfRunning() async throws {
+        // WHY: one VM runs one thread at a time; a second thread must wait, not start a run.
+        let f = try makeFixture()
+        f.vm.botExecutionTargetProvider = { _ in .vm }
+        let holder = BotVMRunRegistry.Entry(
+            threadID: AgentThreadID(), runID: AgentRunID(), title: "Tarefa A", workspace: f.workspaceCwd
+        )
+        XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: f.bot.id, entry: holder))
+        defer { _ = BotVMRunRegistry.shared.releaseAndNextWaiting(runID: holder.runID) }
+        f.vm.setRunActor(.bot(f.bot.id))
+        f.vm.prompt = "second task"
+        await f.vm.send()
+        XCTAssertTrue(f.runner.requests.isEmpty, "no run while another thread holds the VM")
+        XCTAssertTrue(f.vm.statusMessage.contains("bot ocupado em Tarefa A"), f.vm.statusMessage)
+        XCTAssertEqual(BotVMRunRegistry.shared.waitingThreads(botID: f.bot.id), [f.thread.id])
+        XCTAssertEqual(try f.ctx.queuedMessageRepo.list(threadId: f.thread.id).count, 1)
+    }
+
     func test_noActorRequestMatchesPreChangeValuesFieldByField() async throws {
         let f = try makeFixture()
         f.vm.prompt = "plain question"
@@ -251,6 +269,22 @@ final class AgentAppBotRunActorTests: XCTestCase {
         XCTAssertEqual(newStored.workspaceId, f.thread.workspaceId)
         XCTAssertEqual(newStored.actor, .none)
         XCTAssertNil(newStored.actorLockedAt)
+    }
+
+    func test_handoffToAnotherBotOpensUnlockedThreadForNewBotAndKeepsOldBotLock() async throws {
+        // WHY: switching bots must never rewrite the locked thread; it forks a fresh one.
+        let f = try makeFixture()
+        try await runFirstBotTurn(f)
+        let other = try f.botsVM.create(name: "Rhea", title: "Scout", soul: "other soul")
+        let newId = try XCTUnwrap(f.vm.startHandoffThread(from: f.thread.id, actor: .bot(other.id)))
+        XCTAssertEqual(f.vm.selectedThreadId, newId)
+        XCTAssertEqual(f.vm.selectedRunActor, .bot(other.id))
+        XCTAssertFalse(f.vm.runActorLocked, "new thread locks only on first send")
+        XCTAssertTrue(f.vm.prompt.contains("Actor thread"))
+        XCTAssertTrue(f.vm.prompt.contains(f.thread.id.value.uuidString.lowercased()))
+        let oldRow = try XCTUnwrap(f.vm.threads.first(where: { $0.id == f.thread.id }))
+        XCTAssertEqual(oldRow.actor, .bot(f.bot.id))
+        XCTAssertNotNil(oldRow.actorLockedAt)
     }
 
     func test_handoffSummaryIsDeterministicLastSixTurnsTruncated() {

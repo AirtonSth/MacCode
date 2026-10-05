@@ -301,6 +301,15 @@ public enum BotAvatar {
 /// a custom soul must not hide Desk-admitted tools. The starter is replaceable
 /// standing rules.
 public enum BotStandingInstructions {
+    /// Appended to the prompt of bot threads that run in the VM.
+    public static let vmThreadRules: String = """
+    Este ambiente é Linux; ferramentas só-macOS (swift, xcodebuild, xcrun) não existem. Use request_mac_execution(reason) para pedir execução no Mac.
+
+    Screenshots: enviar bot_post_screenshot em: fim de tarefa visual; erro visível; pedido de login/ação humana; antes de ação irreversível; mudança grande de tela em tarefa longa.
+
+    Ação manual: Peça ação manual só para login, captcha, 2FA, pagamento ou confirmação humana. Nunca peça senha, código ou dados de cartão no chat. Depois de retomar, sempre tire screenshot antes de agir.
+    """
+
     /// Unique last line so Studio can refresh the starter without overwriting a custom soul.
     public static let generatedSignature =
         "Do not invent tools, files, accounts, or access you do not have."
@@ -363,6 +372,9 @@ public enum BotStandingInstructions {
     public static let computerActTool = "bot_computer_act"
     public static let computerExecTool = "bot_computer_exec"
     public static let computerRebuildTool = "bot_computer_rebuild"
+    public static let requestUserActionTool = "bot_request_user_action"
+    public static let postScreenshotTool = "bot_post_screenshot"
+    public static let requestMacExecutionTool = "request_mac_execution"
     public static let computerUseObservationTool = "screenshot"
     public static let generatedGuestComputerLine =
         "When asked to see or use the Linux desktop, call \(computerObserveTool) then \(computerActTool). To install packages or run a command in the guest, call \(computerExecTool). To change the guest image, edit /home/remotecode/Dockerfile then call \(computerRebuildTool). That screen is the Docker guest on 127.0.0.1. For websites, prefer \(openBrowserTool) then \(snapshotBrowserTool) and \(actBrowserTool) — that browser is Playwright running inside this bot's Docker guest. If those browser tools fail, open the Chrome-engine browser on the guest desktop and drive it with \(computerObserveTool) and \(computerActTool). Do not use host computer-use, the host default browser, or host docker."

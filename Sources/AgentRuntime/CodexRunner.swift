@@ -396,6 +396,12 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             BotSelfConfigCatalog.callerEnvironmentKey,
             "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY",
         ]
+        if serverName == BotComputerMCPAdmit.serverName {
+            keys.append(BotComputerCatalog.threadEnvironmentKey)
+        }
+        if serverName == BotBrowserMCPAdmit.serverName {
+            keys.append(BotBrowserCatalog.threadEnvironmentKey)
+        }
         if serverName == BotSelfConfigMCPAdmit.serverName {
             keys += [
                 BotPeerDelegation.threadEnvironmentKey,

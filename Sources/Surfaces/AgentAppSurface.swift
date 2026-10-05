@@ -429,6 +429,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Compiles the bot brain into the provider prompt for a bot-run workspace thread.
     public var botPromptTransform: (@MainActor (BotID, String, AgentThreadID, AgentRunID) async throws -> String)?
     public var botRunStarted: (@MainActor (BotID, AgentRunID, AgentThreadID) -> Void)?
+    /// Non-nil when another thread already holds the bot's VM.
+    public var botBusyMessage: ((BotID, AgentThreadID) -> String?)?
+    /// Registers a thread queued behind another thread's run on the bot's VM.
+    public var botWaitForVM: ((BotID, AgentThreadID) -> Void)?
+    /// Pending Mac-execution approvals pushed by the host, per thread (reason text).
+    @Published public var pendingMacExecutionByThread: [AgentThreadID: String] = [:]
+    /// Approves or declines a pending Mac-execution request; wired by the host.
+    public var botMacExecutionResolver: (@MainActor (AgentThreadID, Bool) async -> Void)?
+    /// Returns a user-facing error when the bot VM cannot run; nil when ready. Wired by the host.
+    public var botVMPreflight: ((BotID, String) async -> String?)?
+    /// Starts (provisions) the bot VM; returns a user-facing error or nil. Wired by the host.
+    public var botVMProvision: ((BotID) async -> String?)?
+    /// Set when the VM preflight failed; drives the "VM indisponível" banner.
+    @Published public var vmUnavailableBotID: BotID?
     @Published public var availableRunAsUsers: [AgentRunAsUser] = MacOSLocalUserCatalog.listEligibleUsers()
     @Published public var model: String = AgentDefaultModelSelection.builtInDefault(for: .defaultProvider)
     /// Last model the user chose per provider (new threads + provider switches).
@@ -495,6 +509,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var tokenSaverGraphifySignalCountCheck: (@Sendable () -> Int)?
     private var tokenSaverMeasuredLoader: (@Sendable (Bool, AgentThreadID?, TokenSaverSavingsRepository?) async -> Int?)?
     private var tokenSaverFooterObserver: NSObjectProtocol?
+    var manualActionObserver: NSObjectProtocol?
+    var manualActionStateObserver: NSObjectProtocol?
+    /// Durable manual-action requests; wired by the host. Setting it loads the selected thread's card.
+    public var manualActionStore: ManualActionRequestStore? {
+        didSet { manualActionStoreDidChange() }
+    }
+    /// Who drives the bot computer; tests inject an isolated instance.
+    public var botComputerControl: BotComputerControl = .shared
+    public var openBotScreen: ((BotID) -> Void)?
+    @Published public internal(set) var botScreenControlled = false
+    /// Request awaiting the user on the selected thread (open or taken).
+    @Published public internal(set) var openManualAction: ManualActionRequest?
+    /// Continued/declined requests of the selected thread, oldest first.
+    @Published public internal(set) var resolvedManualActions: [ManualActionRequest] = []
     private var tokenSaverFooterAccountObserver: NSObjectProtocol?
     private var tokenSaverFooterStatusObserver: NSObjectProtocol?
     /// PERF: cancel-and-coalesce off-main ledger reads (same pattern as sidebar
@@ -1309,6 +1337,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if let tokenSaverFooterObserver {
             NotificationCenter.default.removeObserver(tokenSaverFooterObserver)
             self.tokenSaverFooterObserver = nil
+        }
+        if let manualActionObserver {
+            NotificationCenter.default.removeObserver(manualActionObserver)
+            self.manualActionObserver = nil
+        }
+        if let manualActionStateObserver {
+            NotificationCenter.default.removeObserver(manualActionStateObserver)
+            self.manualActionStateObserver = nil
         }
         if let tokenSaverFooterAccountObserver {
             NotificationCenter.default.removeObserver(tokenSaverFooterAccountObserver)
@@ -2346,6 +2382,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // messages, re-fetch provider snapshot → multi-blink on an already-open
         // thread. Soft path keeps the painted transcript and only syncs chrome.
         if !isThreadSwitch {
+            refreshManualAction()
             softReselectOpenThread(selectedThread, markRead: markRead)
             return
         }
@@ -2363,6 +2400,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             rememberPaintedTimeline(previous, timeline)
         }
         selectedThreadId = id
+        refreshManualAction()
         transcriptState.selectedThreadIdForPeerFlag = id
         transcriptState.waitingBotPeerActivity = AgentTranscriptState.hasWaitingBotPeerActivity(
             in: messages,
@@ -6071,6 +6109,100 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return true
     }
 
+    public var pendingMacExecutionReason: String? {
+        selectedThreadId.flatMap { pendingMacExecutionByThread[$0] }
+    }
+
+    public func resolveMacExecution(approve: Bool) {
+        guard let id = selectedThreadId, pendingMacExecutionByThread[id] != nil else { return }
+        pendingMacExecutionByThread[id] = nil
+        guard let resolver = botMacExecutionResolver else { return }
+        Task { await resolver(id, approve) }
+    }
+
+    /// Updates the painted row only; the caller already persisted the target.
+    public func mirrorExecutionTarget(_ target: ExecutionTarget, thread id: AgentThreadID) {
+        guard let index = threads.firstIndex(where: { $0.id == id }) else { return }
+        threads[index].executionTarget = target
+    }
+
+    /// Blocks the send (true) when a bot thread's workspace is gone or its VM is down. Never falls back to the Mac.
+    private func botVMGateBlocksRun(botID: BotID, thread: AgentThread?) async -> Bool {
+        let workspace = thread?.worktreePath ?? cwd
+        if !FileManager.default.fileExists(atPath: workspace) {
+            statusMessage = "Workspace removido"
+            return true
+        }
+        guard executionTarget(for: botID) == .vm else { return false }
+        guard let preflight = botVMPreflight else { return false }
+        if let failure = await preflight(botID, workspace) {
+            statusMessage = "VM indisponível: \(failure)"
+            vmUnavailableBotID = botID
+            return true
+        }
+        vmUnavailableBotID = nil
+        return false
+    }
+
+    /// Links the thread to the bot and locks the thread's actor and execution target.
+    private func lockBotActor(botID: BotID, threadId tid: AgentThreadID) throws {
+        guard let linker = botThreadLinker else { throw BotRunUnavailableError() }
+        try linker(botID, tid)
+        let lockedAt = Date()
+        let target = botExecutionTargetProvider(botID)
+        guard try threadRepo.setActor(
+            id: tid, actor: .bot(botID), lockedAt: lockedAt, executionTarget: target
+        ) else {
+            throw NSError(
+                domain: "RemoteCode.AgentAppViewModel",
+                code: 404,
+                userInfo: [NSLocalizedDescriptionKey: "A conversa sumiu antes de iniciar."]
+            )
+        }
+        if let index = threads.firstIndex(where: { $0.id == tid }) {
+            threads[index].actor = .bot(botID)
+            threads[index].actorLockedAt = lockedAt
+            threads[index].executionTarget = target
+        }
+    }
+
+    /// "Iniciar VM": provisions through the host, then clears the banner.
+    public func startUnavailableBotVM() {
+        guard let botID = vmUnavailableBotID, let provision = botVMProvision else { return }
+        Task {
+            if let failure = await provision(botID) {
+                statusMessage = "VM indisponível: \(failure)"
+            } else {
+                vmUnavailableBotID = nil
+                statusMessage = ""
+            }
+        }
+    }
+
+    /// "Rodar esta thread no Mac": explicit user choice, locks the thread to the Mac target.
+    public func runSelectedThreadOnMac() {
+        guard let botID = vmUnavailableBotID, let tid = selectedThreadId,
+              let thread = threads.first(where: { $0.id == tid }) else { return }
+        do {
+            let lockedAt = thread.actorLockedAt ?? Date()
+            if thread.actorLockedAt == nil {
+                guard let linker = botThreadLinker else { throw BotRunUnavailableError() }
+                try linker(botID, tid)
+            }
+            let actor = thread.actorLockedAt == nil ? RunActor.bot(botID) : thread.actor
+            guard try threadRepo.setActor(id: tid, actor: actor, lockedAt: lockedAt, executionTarget: .mac) else { return }
+            if let index = threads.firstIndex(where: { $0.id == tid }) {
+                threads[index].actor = actor
+                threads[index].actorLockedAt = lockedAt
+                threads[index].executionTarget = .mac
+            }
+            vmUnavailableBotID = nil
+            statusMessage = ""
+        } catch {
+            statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        }
+    }
+
     /// Max chars kept per message in the handoff summary.
     static let handoffMessageLimit = 300
     static let handoffMessageCount = 6
@@ -8234,6 +8366,32 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if (text.hasPrefix("/") || text.hasPrefix("$")), handleSlashCommand(text) {
             return
         }
+        // One run per bot VM: a second thread queues behind the holder. A fresh thread
+        // is created and its bot actor locked first so the drained message runs as the bot.
+        let sendThread = sendThreadId.flatMap { id in threads.first(where: { $0.id == id }) }
+        let sendActor: RunActor = sendThread?.actorLockedAt != nil ? (sendThread?.actor ?? .none) : selectedRunActor
+        if case .bot(let botID) = sendActor,
+           (sendThread?.actorLockedAt != nil ? sendThread?.executionTarget : nil) ?? botExecutionTargetProvider(botID) == .vm,
+           let busy = botBusyMessage?(botID, sendThreadId ?? AgentThreadID()) {
+            if selectedThreadId == nil { createThread(title: "New thread") }
+            if let tid = selectedThreadId {
+                if threads.first(where: { $0.id == tid })?.actorLockedAt == nil {
+                    do { try lockBotActor(botID: botID, threadId: tid) } catch {
+                        statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                        restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
+                        return
+                    }
+                }
+                if await enqueuePromptWhileRunning(text: text, attached: attachedForSend) {
+                    botWaitForVM?(botID, tid)
+                    statusMessage = busy
+                    return
+                }
+            }
+            statusMessage = busy
+            restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
+            return
+        }
         if selectedThreadCanQueuePrompt,
            await enqueuePromptWhileRunning(text: text, attached: attachedForSend) {
             return
@@ -8718,28 +8876,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let actorThread = threads.first(where: { $0.id == tid })
         let runActor: RunActor = actorThread?.actorLockedAt != nil ? (actorThread?.actor ?? .none) : selectedRunActor
         var botPrompt: String?
+        if embedding == nil, case .bot(let botID) = runActor,
+           await botVMGateBlocksRun(botID: botID, thread: actorThread) {
+            return nil
+        }
         if embedding == nil, case .bot(let botID) = runActor {
             do {
-                if actorThread?.actorLockedAt == nil {
-                    guard let linker = botThreadLinker else { throw BotRunUnavailableError() }
-                    try linker(botID, tid)
-                    let lockedAt = Date()
-                    let target = botExecutionTargetProvider(botID)
-                    guard try threadRepo.setActor(
-                        id: tid, actor: runActor, lockedAt: lockedAt, executionTarget: target
-                    ) else {
-                        throw NSError(
-                            domain: "RemoteCode.AgentAppViewModel",
-                            code: 404,
-                            userInfo: [NSLocalizedDescriptionKey: "A conversa sumiu antes de iniciar."]
-                        )
-                    }
-                    if let index = threads.firstIndex(where: { $0.id == tid }) {
-                        threads[index].actor = runActor
-                        threads[index].actorLockedAt = lockedAt
-                        threads[index].executionTarget = target
-                    }
-                }
+                if actorThread?.actorLockedAt == nil { try lockBotActor(botID: botID, threadId: tid) }
                 guard let transform = botPromptTransform else { throw BotRunUnavailableError() }
                 botPrompt = try await transform(botID, text, tid, runId)
             } catch {
@@ -15269,6 +15412,12 @@ public struct AgentAppView: View {
             if vm.selectedThreadBotUnavailable {
                 deletedBotBanner
             }
+            if vm.pendingMacExecutionReason != nil {
+                BotMacExecutionBanner(vm: vm)
+            }
+            if vm.vmUnavailableBotID != nil {
+                BotVMUnavailableBanner(vm: vm)
+            }
             ComposerReactiveScope(composerState: vm.composerState) {
                 composer
                     .disabled(vm.isLegacyProviderThread || vm.selectedThreadBotUnavailable)
@@ -15340,6 +15489,7 @@ public struct AgentAppView: View {
                 .foregroundColor(DS.Palette.textTertiary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer(minLength: 0)
+            botScreenControls
             // Unified working phase strip (replaces separate awaiting/shell/status pills).
             workingPhaseStrip
             // Provider-neutral Subagents activity for the selected thread only
@@ -15368,6 +15518,22 @@ public struct AgentAppView: View {
         }
         .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
         .dsBar(edge: .bottom)
+    }
+
+    @ViewBuilder
+    private var botScreenControls: some View {
+        if vm.botScreenBotID != nil {
+            Button("Ver tela") { vm.viewBotScreen() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("agent.botScreen.view")
+            Button(vm.botScreenControlled ? "Devolver" : "Assumir controle") {
+                Task { await vm.toggleBotScreenControl() }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityIdentifier("agent.botScreen.control")
+        }
     }
 
     // Persistent, prominent banner while full access is on, beyond the small
@@ -15857,8 +16023,10 @@ public struct AgentAppView: View {
 
     @ViewBuilder
     private var pendingCallbackRows: some View {
-        if !vm.visiblePendingRequests.isEmpty || !vm.visiblePendingUserInputs.isEmpty {
+        if !vm.visiblePendingRequests.isEmpty || !vm.visiblePendingUserInputs.isEmpty
+            || vm.openManualAction != nil || !vm.resolvedManualActions.isEmpty {
             VStack(alignment: .leading, spacing: DS.Space.sm) {
+                AgentManualActionCard(vm: vm)
                 ForEach(vm.visiblePendingRequests) { request in
                     pendingRequestRow(request)
                 }
@@ -18770,9 +18938,9 @@ public struct AgentAppView: View {
             )
         } else {
             AgentChatWorkingPill(
-                label: vm.status.rawValue,
+                label: vm.statusLabel,
                 identifier: "agent.status.pill",
-                tone: statusTone(vm.status),
+                tone: vm.openManualAction != nil ? .warning : statusTone(vm.status),
                 padded: false
             )
         }
@@ -18860,6 +19028,10 @@ public struct AgentAppView: View {
             onSelect: { vm.setRunAsUser($0) },
             onSelectActor: { vm.setRunActor($0) },
             onContinueWithoutBot: { continueWithoutBot() },
+            onHandoffToBot: { botID in
+                guard let id = vm.selectedThreadId else { return }
+                vm.startHandoffThread(from: id, actor: .bot(botID))
+            },
             onAppear: { vm.refreshAvailableRunAsUsers() }
         )
     }
