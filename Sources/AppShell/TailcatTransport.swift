@@ -511,7 +511,7 @@ enum TailcatAdmission {
         guard let stored else { return true }
         return stored.accountID != accountID
             || stored.allowlistEpoch != snapshot.epoch
-            || stored.revision != snapshot.revision
+            || legacyRevisionChanged(stored: stored, snapshot: snapshot)
             || admittedPeersChanged(stored: stored, snapshot: snapshot)
             || stored.phase != .active
             || stored.active == nil
@@ -528,6 +528,16 @@ enum TailcatAdmission {
     ) -> Bool {
         guard let digest = stored.admissionDigest else { return false }
         return digest != snapshot.admissionDigest
+    }
+
+    /// The backend also bumps `revision` for clients the host never admits
+    /// (incompatible build). Only a pre-digest record, which has no digest to
+    /// compare, treats a revision bump as a possible admission change.
+    static func legacyRevisionChanged(
+        stored: TailcatSecureState,
+        snapshot: TailcatAllowlistSnapshot
+    ) -> Bool {
+        stored.admissionDigest == nil && stored.revision != snapshot.revision
     }
 
     static func validate(

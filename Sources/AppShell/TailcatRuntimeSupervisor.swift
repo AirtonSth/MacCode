@@ -556,7 +556,11 @@ actor TailcatRuntimeSupervisor {
         guard var stored = try loadSecureState() else { return }
         let digest = snapshot.admissionDigest
         let hash = snapshot.hash
-        guard stored.snapshotHash != hash || stored.admissionDigest != digest else { return }
+        guard stored.snapshotHash != hash
+            || stored.admissionDigest != digest
+            || stored.revision != snapshot.revision
+        else { return }
+        stored.revision = snapshot.revision
         stored.snapshotHash = hash
         stored.admissionDigest = digest
         try saveSecureState(stored)
@@ -632,8 +636,8 @@ actor TailcatRuntimeSupervisor {
         try? await catalog.deleteHost(serverID: serverID, accessToken: accessToken)
     }
 
-    /// Reuse stored identity keys after sleep when account, epoch, revision,
-    /// and admission digest are unchanged. Host/runtime absence is not a
+    /// Reuse stored identity keys after sleep when account, epoch, and
+    /// admission digest are unchanged. Host/runtime absence is not a
     /// rotation reason on wake — we republish the same keys.
     private static func reusableKeys(
         stored: TailcatSecureState?,
@@ -645,7 +649,7 @@ actor TailcatRuntimeSupervisor {
               let keys = stored.active,
               stored.accountID == accountID,
               stored.allowlistEpoch == snapshot.epoch,
-              stored.revision == snapshot.revision,
+              !TailcatAdmission.legacyRevisionChanged(stored: stored, snapshot: snapshot),
               !TailcatAdmission.admittedPeersChanged(stored: stored, snapshot: snapshot)
         else { return nil }
         return keys

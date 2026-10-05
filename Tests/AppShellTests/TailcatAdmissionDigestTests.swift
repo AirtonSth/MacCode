@@ -186,6 +186,66 @@ final class TailcatAdmissionDigestTests: XCTestCase {
         XCTAssertTrue(TailcatAdmission.admittedPeersChanged(stored: stored, snapshot: next))
     }
 
+    /// C24: the backend bumps `revision` for client churn the host never
+    /// admits (an incompatible-build client registering, renewing its key,
+    /// signing out or expiring). Rotating on that bump tears down every live
+    /// iPhone session and replaces the ConnBlobs they cached, for no change in
+    /// who may connect.
+    func testNeedsRotation_isFalseWhenRevisionBumpsWithoutAdmissionChange() {
+        let original = snapshot(clients: [client(id: "client-0", node: peer(0xaa))])
+        let bumped = snapshot(revision: 2, clients: [
+            client(id: "client-0", node: peer(0xaa)),
+            client(id: "legacy", node: peer(0xff), buildID: "tailcat-other"),
+        ])
+        let stored = storedState(for: original)
+        XCTAssertEqual(original.admissionDigest, bumped.admissionDigest)
+        XCTAssertFalse(
+            TailcatAdmission.needsRotation(
+                stored: stored,
+                snapshot: bumped,
+                accountID: stored.accountID,
+                hostPresent: true,
+                eTagPresent: true,
+                runtimePresent: true
+            ),
+            "a revision bump with an unchanged admitted-peer set must not restart transport"
+        )
+        XCTAssertNoThrow(try TailcatAdmission.validate(bumped, stored: stored, accountID: stored.accountID))
+    }
+
+    /// A pre-digest keychain record has nothing to compare peers against, so a
+    /// revision bump is the only signal that admission may have changed; it
+    /// must still rotate or a newly signed-in device would never be admitted.
+    func testNeedsRotation_legacyRecordWithoutDigest_stillRotatesOnRevisionChange() {
+        let original = snapshot(clients: [client(id: "client-0", node: peer(0xaa))])
+        let next = snapshot(revision: 2, clients: [
+            client(id: "client-0", node: peer(0xaa)),
+            client(id: "client-1", node: peer(0xbb)),
+        ])
+        var stored = storedState(for: original)
+        stored.admissionDigest = nil
+        XCTAssertTrue(
+            TailcatAdmission.needsRotation(
+                stored: stored,
+                snapshot: next,
+                accountID: stored.accountID,
+                hostPresent: true,
+                eTagPresent: true,
+                runtimePresent: true
+            )
+        )
+        XCTAssertFalse(
+            TailcatAdmission.needsRotation(
+                stored: stored,
+                snapshot: original,
+                accountID: stored.accountID,
+                hostPresent: true,
+                eTagPresent: true,
+                runtimePresent: true
+            )
+        )
+    }
+
     func testSameRevisionDifferentDigest_isRejected() {
         let original = snapshot(clients: [client(id: "client-0", node: peer(0xaa))])
         let conflicting = snapshot(clients: [client(id: "client-0", node: peer(0xcc))])
@@ -235,6 +295,70 @@ final class TailcatAdmissionDigestTests: XCTestCase {
         XCTAssertEqual(store.state?.snapshotHash, renamed.hash)
         let active = await supervisor.hasActiveRuntimeForTesting
         XCTAssertTrue(active)
+        await supervisor.setEnabled(false)
+    }
+
+    /// C24: an unadmitted-client revision bump must keep the running servers,
+    /// keys and ConnBlobs (live iPhone streams survive, cached hosts stay
+    /// valid) while still advancing the stored revision for monotonicity.
+    func testSupervisor_keepsRuntimeWhenRevisionBumpsWithoutAdmissionChange() async throws {
+        let original = snapshot(clients: [client(id: "client-0", node: peer(0xaa))])
+        let bumped = snapshot(revision: 2, clients: [
+            client(id: "client-0", node: peer(0xaa)),
+            client(id: "legacy", node: peer(0xff), buildID: "tailcat-other"),
+        ])
+        let catalog = FakeTailcatCatalog(snapshot: original)
+        let bridge = FakeTailcatBridge()
+        let store = FakeTailcatStore()
+        let supervisor = makeSupervisor(bridge: bridge, catalog: catalog, store: store)
+
+        await supervisor.setEnabled(true)
+        await supervisor.reconcileNowForTesting()
+        XCTAssertEqual(bridge.startCalls.count, 2)
+        let keys = store.state?.active
+
+        await catalog.setSnapshot(bumped)
+        await supervisor.reconcileNowForTesting()
+
+        XCTAssertEqual(bridge.startCalls.count, 2, "an unadmitted-client revision bump must not restart Tailcat servers")
+        XCTAssertTrue(bridge.closedHandles.isEmpty, "live remote sessions must not be torn down")
+        XCTAssertEqual(store.state?.active, keys, "ConnBlobs cached by iOS must stay valid")
+        XCTAssertEqual(store.state?.phase, .active)
+        XCTAssertEqual(store.state?.revision, 2, "the accepted revision must advance so a stale catalog is still rejected")
+        let active = await supervisor.hasActiveRuntimeForTesting
+        XCTAssertTrue(active)
+        await supervisor.setEnabled(false)
+    }
+
+    /// Wake after an unadmitted-client revision bump republishes the same keys
+    /// instead of minting new ones that would invalidate every cached host.
+    func testSupervisor_wakeReusesKeysWhenRevisionBumpsWithoutAdmissionChange() async throws {
+        let original = snapshot(clients: [client(id: "client-0", node: peer(0xaa))])
+        let bumped = snapshot(revision: 2, clients: [
+            client(id: "client-0", node: peer(0xaa)),
+            client(id: "legacy", node: peer(0xff), buildID: "tailcat-other"),
+        ])
+        let catalog = FakeTailcatCatalog(snapshot: original)
+        let bridge = FakeTailcatBridge()
+        let store = FakeTailcatStore()
+        let supervisor = makeSupervisor(bridge: bridge, catalog: catalog, store: store)
+
+        await supervisor.setEnabled(true)
+        await supervisor.reconcileNowForTesting()
+        let firstKeys = Set(bridge.startCalls.map(\.key.privateKey))
+        XCTAssertEqual(firstKeys.count, 2)
+
+        await supervisor.suspend()
+        await catalog.setSnapshot(bumped)
+        await supervisor.resume()
+
+        XCTAssertEqual(bridge.startCalls.count, 4)
+        XCTAssertEqual(
+            Set(bridge.startCalls.dropFirst(2).map(\.key.privateKey)),
+            firstKeys,
+            "wake must republish the same identity keys when admission is unchanged"
+        )
+        XCTAssertEqual(store.state?.revision, 2)
         await supervisor.setEnabled(false)
     }
 
