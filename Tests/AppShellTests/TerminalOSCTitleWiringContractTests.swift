@@ -108,6 +108,56 @@ final class TerminalOSCTitleWiringContractTests: XCTestCase {
     )
   }
 
+  func testSpinnerOnlyOSCTitleFramesPublishOneStableRenameAndKeepBusyTitleLocal() throws {
+    // WHY (C19): Claude/Distill TUIs animate a braille spinner as the first
+    // title glyph ~3-4x/s. Forwarding every frame persisted and broadcast a
+    // critical surface.renamed per frame, evicting the 128-event replay ring
+    // and forcing iOS full baselines on reconnect. Only a real title change may
+    // leave the Mac, but the raw spinner title must stay on the live surface
+    // because busy detection reads it.
+    let (context, router, _) = try makeHarness()
+    let workspace = try router.createWorkspace(name: "OSC spinner", cwd: NSTemporaryDirectory())
+    let descriptor = try router.createSurface(
+      workspace: workspace.id,
+      type: .terminal,
+      paneID: nil,
+      title: "Before OSC"
+    )
+    let terminal = try XCTUnwrap(
+      SurfaceRegistry.shared.surface(descriptor.id) as? TerminalSurface
+    )
+    let glyphs = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"]
+    let frames = (0..<16).map { "\(glyphs[$0 % glyphs.count]) - Run tests - Distill" }
+
+    let events = captureSurfaceRenamedEvents {
+      for frame in frames { terminal.handleOSCTitle(frame) }
+    }
+
+    try assertTitleChange(
+      events,
+      context: context,
+      workspaceID: workspace.id,
+      surfaceID: descriptor.id,
+      title: "Run tests - Distill"
+    )
+    XCTAssertEqual(
+      terminal.descriptor.title,
+      frames.last,
+      "the live surface keeps the raw spinner title so isBusy still sees the spinner"
+    )
+    XCTAssertTrue(TerminalSurface.hasSpinnerTitle(terminal.descriptor.title))
+
+    let changed = captureSurfaceRenamedEvents {
+      terminal.handleOSCTitle("⠋ - Fix build - Distill")
+    }
+    XCTAssertEqual(
+      changed.first?.payload.objectValue?["title"]?.stringValue,
+      "Fix build - Distill",
+      "a real title change behind the spinner must still reach iOS"
+    )
+    XCTAssertEqual(changed.count, 1)
+  }
+
   private func makeHarness() throws -> (AppContext, AppCommandRouter, String) {
     let directory = NSTemporaryDirectory() + "RC2TerminalOSC-" + UUID().uuidString
     temporaryDirectories.append(directory)

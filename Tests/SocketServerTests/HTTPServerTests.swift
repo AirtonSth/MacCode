@@ -50,6 +50,13 @@ private final class HTTPAttachmentReceiptRouter: FakeRouter, CommandReceiptState
         paramsHash: String
     ) throws {}
 
+    func releaseCommandReceiptClaim(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws {}
+
     func commandReceiptStatus(
         method: String,
         clientRequestId: String,
@@ -766,6 +773,65 @@ final class HTTPServerTests: XCTestCase {
             Thread.sleep(forTimeInterval: 0.01)
         }
         XCTAssertTrue(closed, "server must close an idle keep-alive connection via SO_RCVTIMEO")
+    }
+
+    /// C21: after a /v1/rpc response the keep-alive session must wait for the
+    /// next request on a dedicated Thread, not on the Swift cooperative pool.
+    /// WHY: that wait is a blocking read for up to the 25 s keep-alive budget.
+    /// Phones hold several idle keep-alive sockets (RPC, snapshot, files) and
+    /// dead Wi-Fi/Tailcat paths never send FIN, so a few more idle sockets than
+    /// the pool is wide would stall every async RPC hop on the Mac and push
+    /// iOS into its reconnect loop.
+    @MainActor
+    func test_idleRPCKeepAliveConnectionsDoNotStarveLaterRPCs() throws {
+        let port = UInt16.random(in: 33000...44000)
+        let s = DirectHTTPServer(
+            port: port,
+            loopbackOnly: true,
+            dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+            bootEpoch: 1,
+            clientReceiveTimeoutSeconds: 20
+        )
+        try s.start()
+        var clients: [Int32] = []
+        defer {
+            s.stop()
+            for fd in clients { Darwin.close(fd) }
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        // The body is irrelevant: a parse error still runs the full RPC
+        // hand-off (Task, response write, keep-alive) without any main-actor hop.
+        let body = "not-json"
+        let request = Data((
+            "POST /v1/rpc HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\n" +
+            "Content-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\n\r\n" + body
+        ).utf8)
+
+        // More idle keep-alives than the cooperative pool is wide.
+        let idleCount = ProcessInfo.processInfo.activeProcessorCount + 2
+        for index in 0..<idleCount {
+            let fd = try connectLocalhost(port: port)
+            clients.append(fd)
+            try writeAll(fd: fd, data: request)
+            let response: String
+            do {
+                response = try readFullHTTPResponse(fd: fd, timeout: 2)
+            } catch {
+                XCTFail("RPC #\(index + 1) of \(idleCount) stalled behind idle keep-alive sockets: \(error)")
+                return
+            }
+            XCTAssertTrue(response.contains("HTTP/1.1 200"), "RPC #\(index + 1) must succeed, got: \(response.prefix(120))")
+        }
+
+        let probe = try connectLocalhost(port: port)
+        clients.append(probe)
+        let started = Date()
+        try writeAll(fd: probe, data: request)
+        let probeResponse = try readFullHTTPResponse(fd: probe, timeout: 2)
+        XCTAssertTrue(probeResponse.contains("HTTP/1.1 200"))
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1,
+                          "a fresh RPC must not wait for idle keep-alive sockets to time out")
     }
 
     func test_httpClientRequestsClose_parsesConnectionHeader() {

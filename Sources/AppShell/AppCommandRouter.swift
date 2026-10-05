@@ -4548,20 +4548,25 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let ctx = context,
               let queued = try ctx.queuedMessageRepo.get(id: id),
               let admission = try ctx.threadRepo.sendAdmission(of: queued.threadId) else {
-            throw JSONRPCError.invalidParams
+            // Already drained or never queued: nothing was updated.
+            throw DefiniteMutationRejection(JSONRPCError.invalidParams)
         }
         let resolved = try resolveInboundAgentAttachments(attachments)
-        try await preflightAgentRun(
-            fallbackProvider: admission.provider,
-            fallbackProviderInstanceId: admission.providerInstanceId,
-            provider: nil,
-            providerInstanceId: nil,
-            permissionMode: admission.permissionMode,
-            interactionMode: queued.interactionMode,
-            attachments: resolved
-        )
+        do {
+            try await preflightAgentRun(
+                fallbackProvider: admission.provider,
+                fallbackProviderInstanceId: admission.providerInstanceId,
+                provider: nil,
+                providerInstanceId: nil,
+                permissionMode: admission.permissionMode,
+                interactionMode: queued.interactionMode,
+                attachments: resolved
+            )
+        } catch {
+            throw DefiniteMutationRejection(error)
+        }
         guard let updated = try ctx.queuedMessageRepo.update(id: id, text: text, attachments: resolved) else {
-            throw JSONRPCError.invalidParams
+            throw DefiniteMutationRejection(JSONRPCError.invalidParams)
         }
         publishQueuedMessage(kind: "agent.message.queue.updated", updated)
         refreshAgentSurfaces(thread: updated.threadId)
@@ -4571,7 +4576,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func cancelAgentQueuedMessage(id: AgentQueuedMessageID) throws -> AgentQueuedMessage {
         guard let ctx = context,
               let cancelled = try ctx.queuedMessageRepo.delete(id: id) else {
-            throw JSONRPCError.invalidParams
+            // Already drained or never queued: nothing was deleted.
+            throw DefiniteMutationRejection(JSONRPCError.invalidParams)
         }
         publishQueuedMessage(kind: "agent.message.queue.cancelled", cancelled)
         refreshAgentSurfaces(thread: cancelled.threadId)
@@ -4874,32 +4880,35 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // Existence + routing row only. A leftover 26-column `get` hitchs every
         // `agent.message.send` just to check revision/mode before sendAgentMessage
         // loads the row again for mutate.
+        // Only the remote agent.message.send handler calls this, so the
+        // pre-write guards below are DefiniteMutationRejection: the request
+        // ledger returns them as-is instead of commandOutcomeUnknown.
         guard try ctx.threadRepo.status(of: thread) != nil else {
-            throw LayoutError.workspaceNotFound
+            throw DefiniteMutationRejection(LayoutError.workspaceNotFound)
         }
         let storedRouting = try ctx.threadRepo.routingConfiguration(of: thread)
         if let routing {
             let currentRevision = storedRouting?.revision ?? 0
             let currentMode = storedRouting?.mode ?? .manual
             guard routing.expectedRevision == currentRevision else {
-                throw AgentRoutingRevisionError.conflict(
+                throw DefiniteMutationRejection(AgentRoutingRevisionError.conflict(
                     expected: routing.expectedRevision,
                     actual: currentRevision
-                )
+                ))
             }
             guard routing.mode == currentMode else {
-                throw JSONRPCError(
+                throw DefiniteMutationRejection(JSONRPCError(
                     code: -32020,
                     message: "Model routing mode changed on the host. Refresh the thread and try again.",
                     data: .object(["domain": .string("routing"), "kind": .string("mode_conflict")])
-                )
+                ))
             }
         } else if storedRouting?.mode == .auto {
-            throw JSONRPCError(
+            throw DefiniteMutationRejection(JSONRPCError(
                 code: -32020,
                 message: "This thread requires an Auto routing revision. Refresh the thread and try again.",
                 data: .object(["domain": .string("routing"), "kind": .string("routing_required")])
-            )
+            ))
         }
         return try await sendAgentMessage(
             thread: thread,
@@ -4915,7 +4924,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             attachments: attachments,
             queueMessageId: nil,
             routingConfiguration: storedRouting,
-            nestedRunContext: nestedRunContext
+            nestedRunContext: nestedRunContext,
+            preflightRejectionIsDefinite: true
         )
     }
 
@@ -4966,7 +4976,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true, preflightRejectionIsDefinite: Bool = false) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         // Status + permission + provider identity only. A leftover 26-column
         // + routing `get` hitchs every send before configureAgentThread loads
@@ -4986,16 +4996,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let resolvedAttachments = try resolveInboundAgentAttachments(attachments)
         sendAgentMessageResolvedAttachmentsProbeForTesting?(resolvedAttachments)
         if !autoRoutingActive {
-            try await preflightAgentRun(
-                fallbackProvider: admission.provider,
-                fallbackProviderInstanceId: admission.providerInstanceId,
-                provider: modelSelection?.provider ?? provider,
-                providerInstanceId: providerInstanceId,
-                permissionMode: permissionMode ?? admission.permissionMode,
-                interactionMode: interactionMode ?? .default,
-                attachments: resolvedAttachments,
-                allowProviderCatalogListing: allowProviderCatalogListingDuringPreflight
-            )
+            do {
+                try await preflightAgentRun(
+                    fallbackProvider: admission.provider,
+                    fallbackProviderInstanceId: admission.providerInstanceId,
+                    provider: modelSelection?.provider ?? provider,
+                    providerInstanceId: providerInstanceId,
+                    permissionMode: permissionMode ?? admission.permissionMode,
+                    interactionMode: interactionMode ?? .default,
+                    attachments: resolvedAttachments,
+                    allowProviderCatalogListing: allowProviderCatalogListingDuringPreflight
+                )
+            } catch let error where preflightRejectionIsDefinite {
+                // Nothing in this send has been written yet.
+                throw DefiniteMutationRejection(error)
+            }
         }
         if let probe = sendAgentMessageAfterPreflightProbeForTesting {
             await probe()
@@ -6011,6 +6026,24 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let repo = context.commandReceiptRepo
         try CommandReceiptPersistenceGateway.shared.syncThrowing {
             try repo.markUnknown(
+                method: method,
+                clientRequestId: clientRequestId,
+                ownerFingerprint: ownerFingerprint,
+                paramsHash: paramsHash
+            )
+        }
+    }
+
+    public func releaseCommandReceiptClaim(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws {
+        guard let context else { throw LayoutError.workspaceNotFound }
+        let repo = context.commandReceiptRepo
+        try CommandReceiptPersistenceGateway.shared.syncThrowing {
+            try repo.releaseClaim(
                 method: method,
                 clientRequestId: clientRequestId,
                 ownerFingerprint: ownerFingerprint,

@@ -53,6 +53,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         public static let reserved = Error(code: -32083, message: "Reserved capability has no positive Bot parity.")
         public static let missingRequest = Error(code: -32097, message: "Mutation requires a non-empty client_request_id.")
         public static let crossTarget = Error(code: -32084, message: "Attachment grant does not match this Bot or conversation.")
+        public static let conversationGone = Error(code: -32080, message: "This Bot conversation no longer exists on the Mac. Refresh to continue.")
+        public static let routineGone = Error(code: -32079, message: "This routine no longer exists on the Mac.")
         public static let handleConflict = Error(code: -32085, message: "Bot handle is already used or retired.")
         public static let guestConflict = Error(code: -32092, message: "Bot Guest authority is stale or does not match this host, Bot, task, runtime, grant, or frame.")
     }
@@ -242,6 +244,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               var item = attention[botID],
               let attentionRunID = item["run_id"] as? String,
               runtimeIDsMatch(attentionRunID, runID) else { return false }
+        // A projection read failure must not block the terminal settle;
+        // otherwise liveRuns stays pinned until the host restarts.
         let durableQuestion: [String: Any]?
         do {
             durableQuestion = try durableNeedsAttention(
@@ -250,7 +254,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 items: store.listAttention(includeAcknowledged: true)
             )
         } catch {
-            return false
+            botRemoteControlLog.error(
+                "bot.attention.settle_projection_failed bot=\(botID, privacy: .public) error=\(String(describing: error), privacy: .public)"
+            )
+            durableQuestion = nil
         }
         liveRuns.removeValue(forKey: botID)
         if let durableQuestion {
@@ -277,11 +284,17 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let items = try store.listAttention(includeAcknowledged: true)
         var changed = false
         for (botID, run) in liveRuns {
-            guard let item = try durableNeedsAttention(
-                botID: botID,
-                run: run,
-                items: items
-            ) else { continue }
+            // One failing run must not fail the whole list.
+            let projected: [String: Any]?
+            do {
+                projected = try durableNeedsAttention(botID: botID, run: run, items: items)
+            } catch {
+                botRemoteControlLog.error(
+                    "bot.attention.durable_projection_failed bot=\(botID, privacy: .public) error=\(String(describing: error), privacy: .public)"
+                )
+                continue
+            }
+            guard let item = projected else { continue }
             if attention[botID]?["id"] as? String != item["id"] as? String
                 || attention[botID]?["state"] as? String != "needs_attention" {
                 attention[botID] = item
@@ -295,20 +308,46 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard let onDelegatedAttentionSnapshot else { return }
         let snapshot = try onDelegatedAttentionSnapshot()
         var delegatedByBot: [String: [String: Any]] = [:]
+        var conflictedBots: Set<String> = []
         for raw in snapshot {
-            let item = try validatedDelegatedAttention(raw)
-            guard let botID = item["bot_id"] as? String else { throw Error.crossTarget }
+            // One stale handoff (deleted Bot, cleared or relinked conversation)
+            // must not fail the whole list; drop only that row.
+            guard let item = try? validatedDelegatedAttention(raw),
+                  let botID = item["bot_id"] as? String else {
+                botRemoteControlLog.error(
+                    "bot.attention.delegated_row_dropped id=\(String(describing: raw["id"] ?? "nil"), privacy: .public) bot=\(String(describing: raw["bot_id"] ?? "nil"), privacy: .public) state=\(String(describing: raw["state"] ?? "nil"), privacy: .public)"
+                )
+                continue
+            }
             if let existing = delegatedByBot[botID],
                !NSDictionary(dictionary: existing).isEqual(to: item) {
-                throw Error.crossTarget
+                conflictedBots.insert(botID)
             }
             delegatedByBot[botID] = item
+        }
+        for botID in conflictedBots {
+            // Ambiguous ownership for one Bot: show neither row for that Bot.
+            botRemoteControlLog.error(
+                "bot.attention.delegated_conflict_dropped bot=\(botID, privacy: .public)"
+            )
+            delegatedByBot.removeValue(forKey: botID)
         }
 
         var next = attention.filter { _, item in
             item["source"] as? String != "bot_peer_handoff"
         }
-        for (botID, item) in delegatedByBot { next[botID] = item }
+        for (botID, item) in delegatedByBot {
+            // A historical finished handoff must not replace the item of a
+            // newer live bot.send run: settleRuntime matches that item's
+            // run_id, so the run would never settle and liveRuns would pin.
+            if item["state"] as? String == "finished",
+               let liveRunID = liveRuns[botID]?["run_id"] as? String,
+               let delegatedRunID = item["run_id"] as? String,
+               !runtimeIDsMatch(liveRunID, delegatedRunID) {
+                continue
+            }
+            next[botID] = item
+        }
         guard !NSDictionary(dictionary: attention).isEqual(to: next) else { return }
         attention = next
         persistSidecar()
@@ -332,7 +371,6 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               let bot = try store.get(id: BotID(botID)), bot.deletedAt == nil,
               let conversation = try store.conversation(id: BotConversationID(conversationID)),
               conversation.botID == bot.id,
-              conversation.linkedAgentThreadID == AgentThreadID(threadID),
               let ownerBot = try store.get(id: BotID(ownerBotID)), ownerBot.deletedAt == nil,
               let ownerConversation = try store.conversation(id: BotConversationID(ownerConversationID)),
               ownerConversation.botID == ownerBot.id else {
@@ -343,9 +381,19 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         } else {
             guard raw["finished_at"] is NSNull else { throw Error.crossTarget }
         }
+        // Finished rows are historical provenance: a conversation may since
+        // have been relinked to a new Agent thread. Only active rows must
+        // still match the live thread links.
+        let requiresLiveLinks = state != "finished"
+        if requiresLiveLinks {
+            guard conversation.linkedAgentThreadID == AgentThreadID(threadID) else {
+                throw Error.crossTarget
+            }
+        }
         if raw["owner_thread_id"] != nil && !(raw["owner_thread_id"] is NSNull) {
             guard let ownerThreadID = stringUUID(raw, "owner_thread_id"),
-                  ownerConversation.linkedAgentThreadID == AgentThreadID(ownerThreadID) else {
+                  !requiresLiveLinks
+                    || ownerConversation.linkedAgentThreadID == AgentThreadID(ownerThreadID) else {
                 throw Error.crossTarget
             }
         }
@@ -390,8 +438,11 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 && $0.kind == .question
                 && $0.createdAt.timeIntervalSince1970 >= floor(startedAt)
         }
-        guard candidates.count <= 1 else { throw Error.crossTarget }
-        guard let question = candidates.first else { return nil }
+        // A run may ask more than once (repeated bot_ask_user, desk "Needs
+        // you" rows); the newest question wins, ids break same-second ties.
+        guard let question = candidates.max(by: {
+            ($0.createdAt, $0.id.value.uuidString) < ($1.createdAt, $1.id.value.uuidString)
+        }) else { return nil }
         return canonicalAttentionItem([
             "id": question.id.value.uuidString.lowercased(),
             "bot_id": exactBotID.value.uuidString.lowercased(),
@@ -574,7 +625,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 requestID: requestID,
                 status: .failed,
                 botID: string(params, "bot_id"),
-                readback: ["error": error.message]
+                // Remote mutations answer with this failed receipt, not a
+                // JSON-RPC error, so the code (e.g. -32080 conversation gone
+                // vs -32084 grant mismatch) must travel in the readback.
+                readback: ["error": error.message, "error_code": error.code]
             )
             receipts[requestID] = failed
             receiptClaims[requestID] = claim
@@ -951,10 +1005,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let conversation: BotConversationID?
         if let requestedConversationID, !requestedConversationID.isEmpty {
             guard let uuid = UUID(uuidString: requestedConversationID),
-                  let stored = try store.conversation(id: BotConversationID(uuid)),
-                  stored.botID == bot.id else {
-                throw Error.crossTarget
+                  let stored = try store.conversation(id: BotConversationID(uuid)) else {
+                throw Error.conversationGone
             }
+            guard stored.botID == bot.id else { throw Error.crossTarget }
             conversation = stored.id
         } else {
             conversation = nil
@@ -1314,8 +1368,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let bot = try requireBot(params)
         let conversationID = string(params, "conversation_id") ?? ""
         guard let uuid = UUID(uuidString: conversationID),
-              let conversation = try store.conversation(id: BotConversationID(uuid)),
-              conversation.botID == bot.id else { throw Error.crossTarget }
+              let conversation = try store.conversation(id: BotConversationID(uuid)) else { throw Error.conversationGone }
+        guard conversation.botID == bot.id else { throw Error.crossTarget }
         let normalizedID = conversation.id.value.uuidString.lowercased()
         selectedConversation[id(bot)] = normalizedID
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
@@ -1340,7 +1394,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         if let existingID {
             guard try store.listRoutines(botID: bot.id).contains(where: {
                 $0.definition.id == existingID
-            }) else { throw Error.crossTarget }
+            }) else { throw Error.routineGone }
         }
         let definition = BotRoutineDefinition(
             id: existingID ?? BotRoutineID(),
@@ -1375,7 +1429,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard let raw = string(params, "routine_id"), let uuid = UUID(uuidString: raw) else { throw Error.invalidParams }
         guard try store.listRoutines(botID: bot.id).contains(where: {
             $0.definition.id == BotRoutineID(uuid)
-        }) else { throw Error.crossTarget }
+        }) else { throw Error.routineGone }
         let enabled = bool(params, "enabled") ?? false
         try store.setRoutineEnabled(id: BotRoutineID(uuid), botID: bot.id, enabled: enabled)
         let stored = try store.listRoutines(botID: bot.id).first {
@@ -1400,7 +1454,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               let routineUUID = UUID(uuidString: routineID),
               try store.listRoutines(botID: bot.id).contains(where: {
                   $0.definition.id == BotRoutineID(routineUUID)
-              }) else { throw Error.crossTarget }
+              }) else { throw Error.routineGone }
         let run: [String: Any] = [
             "run_id": UUID().uuidString.lowercased(),
             "routine_id": routineID,
@@ -1445,7 +1499,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard let raw = string(params, "routine_id"), let uuid = UUID(uuidString: raw) else { throw Error.invalidParams }
         guard try store.listRoutines(botID: bot.id).contains(where: {
             $0.definition.id == BotRoutineID(uuid)
-        }) else { throw Error.crossTarget }
+        }) else { throw Error.routineGone }
         try store.deleteRoutine(id: BotRoutineID(uuid), botID: bot.id)
         routineRuntime.removeValue(forKey: raw.lowercased())
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: ["deleted": true])
@@ -1523,9 +1577,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let bot = try requireBot(params)
         guard let conversationRaw = string(params, "conversation_id"),
               let conversationUUID = UUID(uuidString: conversationRaw),
-              let conversation = try store.conversation(id: BotConversationID(conversationUUID)),
-              conversation.botID == bot.id,
-              let attachmentID = string(params, "attachment_id"), !attachmentID.isEmpty,
+              let conversation = try store.conversation(id: BotConversationID(conversationUUID)) else { throw Error.conversationGone }
+        guard conversation.botID == bot.id else { throw Error.crossTarget }
+        guard let attachmentID = string(params, "attachment_id"), !attachmentID.isEmpty,
               let filename = string(params, "filename"), !filename.isEmpty,
               let rawKind = string(params, "kind"), AgentAttachmentKind(rawValue: rawKind) != nil,
               let digest = string(params, "digest")?.lowercased(),
@@ -1549,8 +1603,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let bot = try requireBot(params)
         guard let conversationRaw = string(params, "conversation_id"),
               let conversationUUID = UUID(uuidString: conversationRaw),
-              let conversation = try store.conversation(id: BotConversationID(conversationUUID)),
-              conversation.botID == bot.id else { throw Error.crossTarget }
+              let conversation = try store.conversation(id: BotConversationID(conversationUUID)) else { throw Error.conversationGone }
+        guard conversation.botID == bot.id else { throw Error.crossTarget }
         let hostID = try requireFileHost(params: params, botID: id(bot))
         let rootHandle = string(params, "root_handle") ?? ""
         let handle = string(params, "handle") ?? ""
@@ -1628,8 +1682,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let bot = try requireBot(params)
         guard let conversationRaw = string(params, "conversation_id"),
               let conversationUUID = UUID(uuidString: conversationRaw),
-              let conversation = try store.conversation(id: BotConversationID(conversationUUID)),
-              conversation.botID == bot.id else { throw Error.crossTarget }
+              let conversation = try store.conversation(id: BotConversationID(conversationUUID)) else { throw Error.conversationGone }
+        guard conversation.botID == bot.id else { throw Error.crossTarget }
         let botID = id(bot)
         let conversationID = conversation.id.value.uuidString.lowercased()
         let rows = attachments.values.filter {
@@ -1650,8 +1704,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let bot = try requireBot(params)
         guard let conversationRaw = string(params, "conversation_id"),
               let conversationUUID = UUID(uuidString: conversationRaw),
-              let conversation = try store.conversation(id: BotConversationID(conversationUUID)),
-              conversation.botID == bot.id else { throw Error.crossTarget }
+              let conversation = try store.conversation(id: BotConversationID(conversationUUID)) else { throw Error.conversationGone }
+        guard conversation.botID == bot.id else { throw Error.crossTarget }
         let conversationID = conversation.id.value.uuidString.lowercased()
         let grantID = string(params, "id") ?? ""
         guard let grant = attachments[grantID],

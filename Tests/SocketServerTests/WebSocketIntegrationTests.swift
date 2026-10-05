@@ -818,10 +818,10 @@ final class WebSocketIntegrationTests: XCTestCase {
         defer { server.stop() }
         try await Task.sleep(nanoseconds: 80_000_000)
 
-        // Roll the shared retained ring past its 512-event capacity so the
+        // Roll the shared retained ring past its default capacity so the
         // replay floor sits above 0 and since-seq=0 is deterministically expired.
         let fillerKind = uniqueEventKind("test.ws.replay_roll")
-        for _ in 0..<513 {
+        for _ in 0...EventBus.defaultRecentLimit {
             EventBus.shared.publishRawForTesting(kind: fillerKind, payload: .object([:]))
         }
 
@@ -1012,6 +1012,43 @@ final class WebSocketIntegrationTests: XCTestCase {
             }
         }
         XCTAssertTrue(sawSecond, "the event after the filtered hole must be delivered on the still-open connection")
+    }
+
+    /// C02 WHY: the default (Wi-Fi, no filter header) stream also omits
+    /// sequences on purpose (provider_runtime is diagnostics-only; same-item
+    /// deltas coalesce). iOS treats an unfiltered stream as contiguous unless
+    /// the welcome says otherwise, so every such hole became a sync.snapshot
+    /// and, mid-run, a snapshot-commit gap that tore the socket down. The host
+    /// must advertise `sequence.omissions.v1` on the stream that omits.
+    func testUnfilteredStreamOmitsProviderRuntimeSequenceAndAdvertisesOmissions() async throws {
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        let task = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+        let welcome = try object(from: await receiveWithTimeout(task))
+        XCTAssertEqual(welcome["type"] as? String, "welcome")
+
+        let firstKind = uniqueEventKind("test.ws.full_before_omission")
+        let secondKind = uniqueEventKind("test.ws.full_after_omission")
+        EventBus.shared.publishRawForTesting(kind: firstKind, payload: .object(["k": .number(1)]))
+        EventBus.shared.publishRawForTesting(
+            kind: "agent.provider_runtime.event",
+            payload: .object(["d": .bool(true)])
+        )
+        EventBus.shared.publishRawForTesting(kind: secondKind, payload: .object(["k": .number(3)]))
+
+        let first = try await receiveEvent(task, kind: firstKind)
+        let second = try await receiveEvent(task, kind: secondKind)
+        let firstSeq = try XCTUnwrap((first["sequence"] as? NSNumber)?.int64Value)
+        let secondSeq = try XCTUnwrap((second["sequence"] as? NSNumber)?.int64Value)
+        XCTAssertEqual(secondSeq - firstSeq, 2,
+                       "the unfiltered stream drops provider_runtime but still spends its sequence")
+        XCTAssertTrue(
+            (welcome["capabilities"] as? [String] ?? []).contains(DirectHTTPServer.sequenceOmissionsCapability),
+            "a stream that omits sequences must tell the client so a hole is not treated as loss"
+        )
     }
 
     func testHandshakeThenDeliversPublishedEvent() async throws {

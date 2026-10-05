@@ -849,6 +849,78 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertTrue(try store.listAttention(includeAcknowledged: true).isEmpty)
     }
 
+    /// WHY: a run may ask the user more than once (two `bot_ask_user` calls,
+    /// or ask_user plus a desk "Needs you" row). That is normal, not a
+    /// cross-target violation: the list must keep working and show the newest
+    /// question, and the run must still settle so the Bot stops reading as live.
+    func test_multipleQuestionsInOneRunPickNewestAndStillSettle() throws {
+        let (botID, conversationID) = try createBotConversation(prefix: "multi-question")
+        let bot = BotID(try XCTUnwrap(UUID(uuidString: botID)))
+        let conversation = BotConversationID(try XCTUnwrap(UUID(uuidString: conversationID)))
+        let threadID = UUID()
+        let runID = UUID()
+        authority.onSend = { _, _, _, _, _ in
+            [
+                "bot_id": botID,
+                "conversation_id": conversationID,
+                "thread_id": threadID.uuidString.lowercased(),
+                "run_id": runID.uuidString.lowercased(),
+                "enqueued": true,
+                "queued_follow_up": false,
+            ]
+        }
+        _ = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "multi-question-send",
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "text": "Ask whatever you need.",
+        ])
+        var linked = try XCTUnwrap(try store.conversation(id: conversation))
+        linked.linkedAgentThreadID = AgentThreadID(threadID)
+        try store.upsertConversation(linked)
+
+        let older = BotAttentionItem(
+            botID: bot,
+            conversationID: conversation,
+            kind: .question,
+            title: "Needs you",
+            detail: "First question",
+            createdAt: Date().addingTimeInterval(5)
+        )
+        let newer = BotAttentionItem(
+            botID: bot,
+            conversationID: conversation,
+            kind: .question,
+            title: "Needs you",
+            detail: "Second question",
+            createdAt: Date().addingTimeInterval(10)
+        )
+        try store.upsertAttention(newer)
+        try store.upsertAttention(older)
+
+        let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let item = try XCTUnwrap((listed["items"] as? [[String: Any]])?.first {
+            $0["bot_id"] as? String == botID
+        })
+        XCTAssertEqual(item["id"] as? String, newer.id.value.uuidString.lowercased())
+        XCTAssertEqual(item["state"] as? String, "needs_attention")
+
+        XCTAssertTrue(
+            authority.settleRuntime(botID: botID, runID: runID.uuidString, failed: false),
+            "a second question must not block the terminal settle"
+        )
+        let settled = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let settledItem = try XCTUnwrap((settled["items"] as? [[String: Any]])?.first {
+            $0["bot_id"] as? String == botID
+        })
+        XCTAssertEqual(settledItem["id"] as? String, newer.id.value.uuidString.lowercased())
+        XCTAssertEqual(settledItem["state"] as? String, "needs_attention")
+        XCTAssertFalse(
+            authority.settleRuntime(botID: botID, runID: runID.uuidString, failed: false),
+            "the live run entry must be gone after the first settle"
+        )
+    }
+
     /// WHY: peer descendants are real Bot work, but they must never inflate
     /// the primary count or lose their exact activity/conversation/run owner
     /// after the paired authority is reconstructed.
@@ -941,9 +1013,164 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(restoredPeer["owner_run_id"] as? String, ownerRunID.value.uuidString.lowercased())
     }
 
+    private func delegatedRow(
+        peer: (botID: String, conversationID: String),
+        peerThreadID: AgentThreadID,
+        owner: (botID: String, conversationID: String),
+        ownerThreadID: AgentThreadID,
+        state: String
+    ) -> (id: String, row: [String: Any]) {
+        let activityID = UUID().uuidString.lowercased()
+        return (activityID, [
+            "id": activityID,
+            "lifecycle_receipt_id": activityID,
+            "bot_id": peer.botID,
+            "conversation_id": peer.conversationID,
+            "thread_id": peerThreadID.value.uuidString.lowercased(),
+            "run_id": UUID().uuidString.lowercased(),
+            "owner_bot_id": owner.botID,
+            "owner_conversation_id": owner.conversationID,
+            "owner_thread_id": ownerThreadID.value.uuidString.lowercased(),
+            "owner_run_id": UUID().uuidString.lowercased(),
+            "state": state,
+            "finished_at": state == "finished" ? Date().timeIntervalSince1970 as Any : NSNull() as Any,
+            "ownership": "delegated",
+            "primary": false,
+            "delegated": true,
+            "source": "bot_peer_handoff",
+            "peer_phase": state == "finished" ? "completed" : "peer_running",
+        ])
+    }
+
+    private func linkConversation(_ conversationID: String, to threadID: AgentThreadID) throws {
+        let id = BotConversationID(try XCTUnwrap(UUID(uuidString: conversationID)))
+        var conversation = try XCTUnwrap(try store.conversation(id: id))
+        conversation.linkedAgentThreadID = threadID
+        try store.upsertConversation(conversation)
+    }
+
+    /// WHY (C28): the host keeps emitting the newest handoff per peer forever,
+    /// including completed ones whose owner conversation was later relinked
+    /// to a new Agent thread (provider switch) or whose Bot was deleted. One
+    /// such historical row used to fail the whole bot.attention.list with
+    /// -32084, so iOS lost every Working/Needs-you/Finished badge and showed
+    /// "Attachment grant does not match" with nothing attached.
+    func test_delegatedAttentionListSurvivesRelinkedAndDeletedHandoffRows() throws {
+        let owner = try createLiveBot(prefix: "c28-owner", name: "Sam Twitter")
+        let peer = try createBotConversation(prefix: "c28-writer")
+        let gone = try createBotConversation(prefix: "c28-gone")
+        let oldOwnerThread = AgentThreadID()
+        let peerThread = AgentThreadID()
+        let goneThread = AgentThreadID()
+        try linkConversation(owner.conversationID, to: oldOwnerThread)
+        try linkConversation(peer.conversationID, to: peerThread)
+        try linkConversation(gone.conversationID, to: goneThread)
+        let finished = delegatedRow(
+            peer: peer, peerThreadID: peerThread,
+            owner: (owner.botID, owner.conversationID), ownerThreadID: oldOwnerThread,
+            state: "finished"
+        )
+        let deleted = delegatedRow(
+            peer: gone, peerThreadID: goneThread,
+            owner: (owner.botID, owner.conversationID), ownerThreadID: oldOwnerThread,
+            state: "working"
+        )
+        authority.onDelegatedAttentionSnapshot = { [finished.row, deleted.row] }
+
+        // Provider switch relinks the owner conversation; the Bot is deleted.
+        try linkConversation(owner.conversationID, to: AgentThreadID())
+        try store.delete(id: BotID(try XCTUnwrap(UUID(uuidString: gone.botID))))
+
+        let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let items = try XCTUnwrap(listed["items"] as? [[String: Any]])
+        let peerItem = try XCTUnwrap(
+            items.first { $0["bot_id"] as? String == peer.botID },
+            "a finished handoff stays visible after its owner thread was relinked"
+        )
+        XCTAssertEqual(peerItem["id"] as? String, finished.id)
+        XCTAssertEqual(peerItem["state"] as? String, "finished")
+        XCTAssertEqual(peerItem["ownership"] as? String, "delegated")
+        XCTAssertNil(
+            items.first { $0["bot_id"] as? String == gone.botID },
+            "a deleted peer's handoff is dropped, not surfaced"
+        )
+        XCTAssertNotNil(
+            items.first { $0["bot_id"] as? String == owner.botID },
+            "other bots' attention is still listed"
+        )
+    }
+
+    /// WHY (C28 x C29): the host emits the newest handoff per peer forever.
+    /// Once finished rows are no longer rejected for relinked threads, such an
+    /// old finished row must not replace the peer's own newer bot.send run:
+    /// settleRuntime matches that item's run_id, so the run would never
+    /// settle and the Bot would read as working until the host restarts.
+    func test_finishedHandoffDoesNotDisplaceNewerLiveRunSoItStillSettles() throws {
+        let owner = try createBotConversation(prefix: "c28-live-owner")
+        let peer = try createLiveBot(prefix: "c28-live-peer", name: "Writer")
+        let ownerThread = AgentThreadID()
+        let peerThread = AgentThreadID()
+        try linkConversation(owner.conversationID, to: ownerThread)
+        try linkConversation(peer.conversationID, to: peerThread)
+        let oldHandoff = delegatedRow(
+            peer: (peer.botID, peer.conversationID), peerThreadID: peerThread,
+            owner: owner, ownerThreadID: ownerThread,
+            state: "finished"
+        )
+        authority.onDelegatedAttentionSnapshot = { [oldHandoff.row] }
+        try linkConversation(owner.conversationID, to: AgentThreadID())
+
+        let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let items = try XCTUnwrap(listed["items"] as? [[String: Any]])
+        let peerItem = try XCTUnwrap(items.first { $0["bot_id"] as? String == peer.botID })
+        XCTAssertEqual(peerItem["run_id"] as? String, peer.runID, "the live run keeps its own item")
+        XCTAssertEqual(peerItem["state"] as? String, "working")
+        XCTAssertTrue(
+            authority.settleRuntime(botID: peer.botID, runID: peer.runID, failed: false),
+            "the live run must still settle"
+        )
+    }
+
+    /// WHY (C28): dropping a stale row must not widen authority. An active
+    /// (working) handoff whose owner conversation no longer links the
+    /// recorded owner thread is not adopted, yet the list still succeeds.
+    func test_delegatedAttentionDropsActiveRowWithStaleOwnerThreadWithoutFailingList() throws {
+        let owner = try createLiveBot(prefix: "c28-active-owner", name: "Owner")
+        let peer = try createLiveBot(prefix: "c28-active-peer", name: "Peer")
+        let ownerThread = AgentThreadID()
+        let peerThread = AgentThreadID()
+        try linkConversation(owner.conversationID, to: ownerThread)
+        try linkConversation(peer.conversationID, to: peerThread)
+        let active = delegatedRow(
+            peer: (peer.botID, peer.conversationID), peerThreadID: peerThread,
+            owner: (owner.botID, owner.conversationID), ownerThreadID: ownerThread,
+            state: "working"
+        )
+        authority.onDelegatedAttentionSnapshot = { [active.row] }
+        let adopted = try XCTUnwrap(
+            try authority.dispatch(method: "bot.attention.list", params: [:])["items"] as? [[String: Any]]
+        )
+        XCTAssertEqual(
+            adopted.first { $0["bot_id"] as? String == peer.botID }?["id"] as? String,
+            active.id,
+            "a live-matching active handoff is adopted"
+        )
+
+        try linkConversation(owner.conversationID, to: AgentThreadID())
+
+        let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let items = try XCTUnwrap(listed["items"] as? [[String: Any]])
+        XCTAssertFalse(
+            items.contains { $0["id"] as? String == active.id },
+            "an active handoff that no longer matches live thread links is not adopted"
+        )
+        XCTAssertNotNil(items.first { $0["bot_id"] as? String == owner.botID })
+    }
+
     /// WHY: ownership comes from the host, not from labels supplied by iOS.
     /// Missing or future ownership values must fail closed before any row is
-    /// adopted or persisted.
+    /// adopted or persisted; the bad row is dropped so the rest of the list
+    /// still reaches the roster (C28).
     func test_delegatedAttentionRejectsMissingAndUnknownOwnership() throws {
         let delegated = try createLiveBot(prefix: "ownership-invalid", name: "Invalid Peer")
         let threadID = AgentThreadID()
@@ -971,16 +1198,14 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         ]
 
         authority.onDelegatedAttentionSnapshot = { [base] }
-        XCTAssertThrowsError(try authority.dispatch(method: "bot.attention.list", params: [:])) {
-            XCTAssertEqual($0 as? BotRemoteControlAuthority.Error, .crossTarget)
-        }
+        let missing = try authority.dispatch(method: "bot.attention.list", params: [:])
+        XCTAssertEqual((missing["items"] as? [[String: Any]])?.first?["ownership"] as? String, "primary")
 
         var unknown = base
         unknown["ownership"] = "descendant"
         authority.onDelegatedAttentionSnapshot = { [unknown] }
-        XCTAssertThrowsError(try authority.dispatch(method: "bot.attention.list", params: [:])) {
-            XCTAssertEqual($0 as? BotRemoteControlAuthority.Error, .crossTarget)
-        }
+        let future = try authority.dispatch(method: "bot.attention.list", params: [:])
+        XCTAssertEqual((future["items"] as? [[String: Any]])?.first?["ownership"] as? String, "primary")
 
         authority.onDelegatedAttentionSnapshot = nil
         let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
@@ -1381,6 +1606,99 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         }
         let listed = try authority.dispatch(method: "bot.routine.list", params: ["bot_id": a.botID])
         XCTAssertEqual((listed["routines"] as? [[String: Any]])?.count, 1)
+    }
+
+    /// C30: a conversation cleared on the Mac used to fail select / send /
+    /// attachment reads with -32084 "Attachment grant does not match…", so
+    /// iOS showed attachment copy with nothing attached and never refreshed.
+    /// A gone conversation or routine must carry its own code so the phone
+    /// can re-read the list, while real grant mismatches stay -32084.
+    func test_goneConversationAndRoutineReportDistinctErrorsNotAttachmentGrantMismatch() throws {
+        let target = try createBotConversation(prefix: "gone")
+        _ = try authority.dispatch(method: "bot.conversation.clear_all", params: [
+            "client_request_id": "gone-clear",
+            "bot_id": target.botID,
+            "confirm": "clear",
+        ])
+        let conversationGone = BotRemoteControlAuthority.Error(
+            code: -32080,
+            message: "This Bot conversation no longer exists on the Mac. Refresh to continue."
+        )
+        for (method, extra) in [
+            ("bot.conversation.select", [:]),
+            ("bot.send", ["text": "still there?"]),
+            ("bot.attachment.list", [:]),
+            ("bot.attachment.stage", [
+                "attachment_id": "rcatt1_\(String(repeating: "a", count: 32))",
+                "filename": "gone.txt",
+                "kind": "file",
+                "digest": String(repeating: "b", count: 64),
+                "size": 4,
+            ]),
+            ("bot.attachment.remove", ["id": "missing-grant"]),
+            ("bot.attachment.import", ["root_handle": "root", "handle": "file"]),
+        ] as [(String, [String: Any])] {
+            var params: [String: Any] = [
+                "client_request_id": "gone-\(method)",
+                "bot_id": target.botID,
+                "conversation_id": target.conversationID,
+            ]
+            params.merge(extra) { _, new in new }
+            XCTAssertThrowsError(try authority.dispatch(method: method, params: params), method) { error in
+                XCTAssertEqual(error as? BotRemoteControlAuthority.Error, conversationGone, method)
+            }
+            guard method != "bot.attachment.list" else { continue }
+            // Paired mutations reach the phone as this failed receipt, not as
+            // a JSON-RPC error, so the receipt must carry the code too.
+            let failed = try authority.dispatch(method: "bot.receipt.status", params: [
+                "client_request_id": "gone-\(method)",
+            ])
+            XCTAssertEqual(failed["status"] as? String, "failed", method)
+            let readback = failed["readback"] as? [String: Any]
+            XCTAssertEqual(readback?["error_code"] as? Int, -32080, method)
+            XCTAssertEqual(readback?["error"] as? String, conversationGone.message, method)
+        }
+
+        let routineGone = BotRemoteControlAuthority.Error(
+            code: -32079,
+            message: "This routine no longer exists on the Mac."
+        )
+        let missingRoutineID = UUID().uuidString.lowercased()
+        for (method, extra) in [
+            ("bot.routine.update", ["name": "Gone", "prompt": "No", "schedule_spec_json": "{}"]),
+            ("bot.routine.enable", ["enabled": true]),
+            ("bot.routine.run", [:]),
+            ("bot.routine.delete", [:]),
+        ] as [(String, [String: Any])] {
+            var params: [String: Any] = [
+                "client_request_id": "gone-\(method)",
+                "bot_id": target.botID,
+                "routine_id": missingRoutineID,
+            ]
+            params.merge(extra) { _, new in new }
+            XCTAssertThrowsError(try authority.dispatch(method: method, params: params), method) { error in
+                XCTAssertEqual(error as? BotRemoteControlAuthority.Error, routineGone, method)
+            }
+        }
+
+        // A live conversation owned by another Bot, or a grant that does not
+        // exist, is still a real cross-target mismatch, not a gone conversation.
+        let live = try createBotConversation(prefix: "gone-live")
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.conversation.select", params: [
+            "client_request_id": "gone-live-foreign-select",
+            "bot_id": target.botID,
+            "conversation_id": live.conversationID,
+        ])) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .crossTarget)
+        }
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.attachment.remove", params: [
+            "client_request_id": "gone-live-remove",
+            "bot_id": live.botID,
+            "conversation_id": live.conversationID,
+            "id": "missing-grant",
+        ])) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .crossTarget)
+        }
     }
 
     func test_mutationReceiptReplayRejectsChangedMethodOrSemanticParams() throws {

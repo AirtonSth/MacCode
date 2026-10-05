@@ -981,7 +981,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
         "events.replay", "snapshot.v3",
         "snapshot.incremental", "resume.v1",
         SnapshotChunkCapability.wireName,
+        sequenceOmissionsCapability,
     ]
+
+    /// Every WS filter (including the default `.full`) may skip sequences:
+    /// provider_runtime events are filtered and same-item deltas coalesce.
+    /// Real loss is reported by the host (1012 eventGap / baselineRequired), so
+    /// clients must not treat a sequence hole as a gap when this is advertised.
+    public static let sequenceOmissionsCapability = "sequence.omissions.v1"
 
     /// Wire name for mid-session interest control (iOS sends `rc2.interest` only
     /// after seeing this capability on welcome).
@@ -3429,37 +3436,45 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     registry.close(fd)
                     return
                 }
-                let writeStarted = DispatchTime.now().uptimeNanoseconds
-                let wrote = self.send(
-                    fd: fd,
-                    status: 200,
-                    contentType: "application/json",
-                    body: respData,
-                    acceptEncoding: ae
-                )
-                self.requestPhaseMetrics.record(
-                    .responseWrite,
-                    latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: writeStarted)
-                )
-                if !wrote {
-                    self.requestPhaseMetrics.recordWriteAborted()
-                    ownerRegistry.unbind(fd)
-                    registry.close(fd)
-                    return
+                // C21: the response write and the keep-alive read block, so
+                // they run on a dedicated Thread (as in C-25), never on the
+                // cooperative pool this Task runs on.
+                let thread = Thread {
+                    let writeStarted = DispatchTime.now().uptimeNanoseconds
+                    let wrote = self.send(
+                        fd: fd,
+                        status: 200,
+                        contentType: "application/json",
+                        body: respData,
+                        acceptEncoding: ae
+                    )
+                    self.requestPhaseMetrics.record(
+                        .responseWrite,
+                        latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: writeStarted)
+                    )
+                    if !wrote {
+                        self.requestPhaseMetrics.recordWriteAborted()
+                        ownerRegistry.unbind(fd)
+                        registry.close(fd)
+                        return
+                    }
+                    if rpcClientClose || !registry.isActive(fd) {
+                        ownerRegistry.unbind(fd)
+                        registry.close(fd)
+                        return
+                    }
+                    // C-07: continue keep-alive on this Thread (owns close).
+                    self.serveHTTPSession(
+                        fd: fd,
+                        peer: peer,
+                        initialBuffer: rpcLeftover,
+                        ownsClose: true,
+                        remoteAuthenticated: remoteAuthenticated
+                    )
                 }
-                if rpcClientClose || !registry.isActive(fd) {
-                    ownerRegistry.unbind(fd)
-                    registry.close(fd)
-                    return
-                }
-                // C-07: continue keep-alive on this Task (owns close).
-                self.serveHTTPSession(
-                    fd: fd,
-                    peer: peer,
-                    initialBuffer: rpcLeftover,
-                    ownsClose: true,
-                    remoteAuthenticated: remoteAuthenticated
-                )
+                thread.name = "rc2.conn.\(fd)"
+                thread.qualityOfService = .userInitiated
+                thread.start()
             }
             return
         case ("POST", "/v1/pair"):

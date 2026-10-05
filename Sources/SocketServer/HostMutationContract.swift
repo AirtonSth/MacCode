@@ -698,6 +698,20 @@ public struct MutationRequestContext: @unchecked Sendable {
     }
 }
 
+/// A mutation failure raised before the request produced any effect.
+///
+/// Remote mutation admission releases the durable claim and returns the
+/// wrapped error instead of recording a permanent `commandOutcomeUnknown`.
+/// Throw it only from guards that run before the first write of the whole
+/// request; an unmarked error keeps the conservative unknown outcome.
+public struct DefiniteMutationRejection: Error {
+    public let underlying: Error
+
+    public init(_ underlying: Error) {
+        self.underlying = underlying
+    }
+}
+
 @MainActor
 public protocol CommandReceiptStateRouting: AnyObject {
     func claimCommandReceipt(
@@ -723,6 +737,14 @@ public protocol CommandReceiptStateRouting: AnyObject {
         minimumEventSequence: Int64
     ) throws -> [EventBus.Event]
     func markCommandReceiptUnknown(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws
+    /// Deletes a still-`claimed` receipt whose request was definitely
+    /// rejected before any effect, so the request id holds no outcome.
+    func releaseCommandReceiptClaim(
         method: String,
         clientRequestId: String,
         ownerFingerprint: String,

@@ -675,6 +675,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         eventBus.shouldRetainRecentEvent = { event in
             Self.shouldRetainRecentEvent(event)
         }
+        eventBus.recentReplayStandIn = EventStreamFilter.terminalOutputReplayStandIn
         context.wireBackgroundPersister(eventBus: eventBus)
     }
 
@@ -1030,15 +1031,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// and run lifecycle still persist. Live EventBus plus the recent ring still
     /// carry deltas and provider-runtime for in-session iOS reconnect.
     static func shouldPersistEvent(_ event: EventBus.Event) -> Bool {
-        switch event.kind {
-        case "surface.output",
-             "agent.item.delta",
-             "agent.item.progress",
-             "agent.provider_runtime.event":
-            return false
-        default:
-            return true
-        }
+        !EventBus.liveOnlyStreamEventKinds.contains(event.kind)
     }
 
     static func shouldRetainRecentEvent(_ event: EventBus.Event) -> Bool {

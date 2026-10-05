@@ -1336,6 +1336,26 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         return (0x2800...0x28FF).contains(scalar.value)
     }
 
+    /// `title` without its leading braille spinner run and the " - " that follows it.
+    nonisolated static func stableTitle(_ title: String) -> String {
+        guard hasSpinnerTitle(title) else { return title }
+        var rest = Substring(title).drop { $0.unicodeScalars.allSatisfy { (0x2800...0x28FF).contains($0.value) } }
+        rest = rest.drop { $0.isWhitespace }
+        if rest.first == "-" { rest = rest.dropFirst().drop { $0.isWhitespace } }
+        return String(rest)
+    }
+
+    /// The raw title stays on the descriptor (isBusy reads the spinner); only a change
+    /// to the stable title is forwarded, so spinner frames are never persisted or broadcast.
+    func handleOSCTitle(_ title: String) {
+        guard descriptor.title != title else { return }
+        let previousStable = Self.stableTitle(descriptor.title)
+        descriptor.title = title
+        let stable = Self.stableTitle(title)
+        guard !stable.isEmpty, stable != previousStable else { return }
+        onTitleChange?(stable)
+    }
+
     private var foregroundJobAlive: Bool {
         let foregroundProcessGroup = foregroundProcessGroup()
         guard Self.isTerminalJobBusy(
@@ -1846,9 +1866,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
             }
         }
         terminalView.onTitleChange = { [weak self] title in
-            guard let self, self.descriptor.title != title else { return }
-            self.descriptor.title = title
-            self.onTitleChange?(title)
+            self?.handleOSCTitle(title)
         }
         terminalView.onProgressReport = { [weak self] active in
             self?.handleProgressReport(active: active)

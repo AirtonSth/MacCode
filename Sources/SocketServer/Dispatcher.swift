@@ -617,6 +617,12 @@ struct BoundedReceiptCache {
     var count: Int { store.count }
 }
 
+/// Per-request flag set when a remote mutation handler failed with a
+/// `DefiniteMutationRejection` (no effect happened).
+private final class DefiniteRejectionRecorder: @unchecked Sendable {
+    var rejected = false
+}
+
 /// Bounded fence for unknown mutation outcomes. Stores only owner fingerprint +
 /// params hash (never secrets or arbitrary payloads). Evicts oldest-first.
 struct BoundedUnknownReceiptCache {
@@ -743,6 +749,7 @@ public final class JSONRPCDispatcher {
         AgentCheckpointListContract.maxEncodedResponseIDBytes
     private var volatileCommandReceipts = BoundedReceiptCache()
     @TaskLocal private static var centralMutationExecution = false
+    @TaskLocal private static var definiteRejectionRecorder: DefiniteRejectionRecorder?
     /// Transport context for methods that are HTTP-only (checkpoint list).
     /// Default `.localTest` keeps unit tests exerciseable; production entry
     /// points set unix / webSocket / http explicitly.
@@ -1036,10 +1043,15 @@ public final class JSONRPCDispatcher {
                         let state = try await snapshotRouter.readConnectionSnapshotState()
                         try Task.checkCancellation()
                         let after = EventBus.shared.snapshotMetadata()
-                        if before == after {
+                        // Live-only stream events (terminal output, agent
+                        // deltas) cannot change the state read above, so only
+                        // a state revision change forces a retry. Return the
+                        // pre-read watermark: the client applies every event
+                        // after it, including in-window deltas, from the stream.
+                        if before.stateRevision == after.stateRevision {
                             outcome.resolve(.success(EventBus.SnapshotBarrierResult(
                                 state: state,
-                                metadata: after
+                                metadata: before
                             )))
                             self.finishConnectionSnapshotRead(id: readID)
                             return
@@ -1978,27 +1990,58 @@ public final class JSONRPCDispatcher {
         let eventSink: EventBus.MutationEventSink? = Self.durableSynchronousMutationMethods.contains(req.method)
             ? EventBus.MutationEventSink()
             : nil
+        let rejectionRecorder = DefiniteRejectionRecorder()
         let response: JSONRPCResponse
-        response = await Self.$centralMutationExecution.withValue(true) {
-            if let eventSink {
-                return await EventBus.$activeMutationEventSink.withValue(eventSink) {
-                    if Self.canonicalImmediateEventMethods.contains(req.method) {
-                        let response = await EventBus.$suppressMutationEventCapture.withValue(true) {
-                            await dispatchCore(businessRequest)
+        response = await Self.$definiteRejectionRecorder.withValue(rejectionRecorder) {
+            await Self.$centralMutationExecution.withValue(true) {
+                if let eventSink {
+                    return await EventBus.$activeMutationEventSink.withValue(eventSink) {
+                        if Self.canonicalImmediateEventMethods.contains(req.method) {
+                            let response = await EventBus.$suppressMutationEventCapture.withValue(true) {
+                                await dispatchCore(businessRequest)
+                            }
+                            if response.error == nil, let result = response.result {
+                                publishCanonicalImmediateEvent(
+                                    method: req.method,
+                                    params: businessParams,
+                                    result: result
+                                )
+                            }
+                            return response
                         }
-                        if response.error == nil, let result = response.result {
-                            publishCanonicalImmediateEvent(
-                                method: req.method,
-                                params: businessParams,
-                                result: result
-                            )
-                        }
-                        return response
+                        return await dispatchCore(businessRequest)
                     }
-                    return await dispatchCore(businessRequest)
                 }
+                return await dispatchCore(businessRequest)
             }
-            return await dispatchCore(businessRequest)
+        }
+        if response.error != nil, rejectionRecorder.rejected {
+            // Rejected before any effect: the outcome is known, so return the
+            // domain error and free the request id instead of fencing it as
+            // a permanent commandOutcomeUnknown.
+            do {
+                try receiptRouter.releaseCommandReceiptClaim(
+                    method: req.method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: context.ownerFingerprint,
+                    paramsHash: paramsHash
+                )
+            } catch {
+                // The claim may still be durable; fence the id in memory too so
+                // a retry cannot read a stuck 'claimed' row as commandInProgress.
+                volatileUnknownReceipts.insert(
+                    key: key,
+                    ownerFingerprint: context.ownerFingerprint,
+                    paramsHash: paramsHash
+                )
+                try? receiptRouter.markCommandReceiptUnknown(
+                    method: req.method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: context.ownerFingerprint,
+                    paramsHash: paramsHash
+                )
+            }
+            return response
         }
         guard response.error == nil, let result = response.result else {
             volatileUnknownReceipts.insert(
@@ -3274,7 +3317,12 @@ public final class JSONRPCDispatcher {
             case "agent.thread.select":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let selectSurfaceID = (params["surface_id"]?.stringValue ?? params["surfaceId"]?.stringValue).flatMap(UUID.init).map(SurfaceID.init)
-                try router.selectAgentThread(thread: tid, surfaceID: selectSurfaceID)
+                do {
+                    try router.selectAgentThread(thread: tid, surfaceID: selectSurfaceID)
+                } catch LayoutError.workspaceNotFound {
+                    // Missing thread: rejected before any selection changed.
+                    throw DefiniteMutationRejection(LayoutError.workspaceNotFound)
+                }
                 EventBus.shared.publish(kind: .agentThreadSelected, payload: .object(["thread_id": .string(tid.value.uuidString)]))
                 return .init(id: id, result: .bool(true))
             case "agent.message.send":
@@ -3300,21 +3348,28 @@ public final class JSONRPCDispatcher {
                     throw JSONRPCError.invalidParams
                 }
                 if params["worker_model"] != nil { _ = try router.setAgentWorkerModel(thread: tid, model: workerModel(from: params)) }
-                let sendResult = try await router.sendAgentMessageRouting(
-                    thread: tid,
-                    text: text,
-                    provider: provider,
-                    model: model,
-                    permissionMode: permission,
-                    reasoningEffort: reasoning,
-                    serviceTier: serviceTier,
-                    interactionMode: interactionMode,
-                    modelSelection: modelSelection,
-                    providerInstanceId: providerInstanceId,
-                    attachments: attachments,
-                    routing: routing,
-                    nestedRunContext: nestedRunContext
-                )
+                let sendResult: AgentMessageSendResult
+                do {
+                    sendResult = try await router.sendAgentMessageRouting(
+                        thread: tid,
+                        text: text,
+                        provider: provider,
+                        model: model,
+                        permissionMode: permission,
+                        reasoningEffort: reasoning,
+                        serviceTier: serviceTier,
+                        interactionMode: interactionMode,
+                        modelSelection: modelSelection,
+                        providerInstanceId: providerInstanceId,
+                        attachments: attachments,
+                        routing: routing,
+                        nestedRunContext: nestedRunContext
+                    )
+                } catch let rejection as DefiniteMutationRejection where params["worker_model"] != nil {
+                    // The worker model was already written above, so this
+                    // request is no longer effect-free.
+                    throw rejection.underlying
+                }
                 let result = messageSendResultPayload(sendResult)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
@@ -3449,10 +3504,10 @@ public final class JSONRPCDispatcher {
                 if let saveCaps = try PlanNotesProjectionV1.parseSaveCaps(params) {
                     let current = try router.agentPlanNotes(thread: tid)
                     if PlanNotesProjectionV1.contentDigest(of: current) != saveCaps.expectedContentDigest {
-                        throw PlanNotesProjectionV1.saveDigestMismatchError(
+                        throw DefiniteMutationRejection(PlanNotesProjectionV1.saveDigestMismatchError(
                             currentNotes: current,
                             expectedDigest: saveCaps.expectedContentDigest
-                        )
+                        ))
                     }
                     try router.saveAgentPlanNotes(thread: tid, notes: notes)
                     let result = PlanNotesProjectionV1.saveResult(notes: notes)
@@ -3461,11 +3516,11 @@ public final class JSONRPCDispatcher {
                 }
                 if let expected = params["expected_notes"]?.stringValue,
                    try router.agentPlanNotes(thread: tid) != expected {
-                    throw JSONRPCError(
+                    throw DefiniteMutationRejection(JSONRPCError(
                         code: -32009,
                         message: "Plan notes changed on another device.",
                         data: nil
-                    )
+                    ))
                 }
                 try router.saveAgentPlanNotes(thread: tid, notes: notes)
                 let result: JSONValue = .bool(true)
@@ -3990,7 +4045,12 @@ public final class JSONRPCDispatcher {
                 if let (_, cached) = commandReceipt(method: req.method, params: params) {
                     return .init(id: id, result: cached)
                 }
-                try router.markAgentThreadRead(thread: tid)
+                do {
+                    try router.markAgentThreadRead(thread: tid)
+                } catch LayoutError.workspaceNotFound {
+                    // Missing thread: rejected before unread state changed.
+                    throw DefiniteMutationRejection(LayoutError.workspaceNotFound)
+                }
                 // has_unread + unread: iOS accepts both; markAgentThreadRead also
                 // emits agent.thread.read. Keep updated for clients that only
                 // watch thread.updated for rail badges.
@@ -4568,6 +4628,12 @@ public final class JSONRPCDispatcher {
             default:
                 throw JSONRPCError.methodNotFound
             }
+        } catch let rejection as DefiniteMutationRejection {
+            Self.definiteRejectionRecorder?.rejected = true
+            if let e = rejection.underlying as? JSONRPCError {
+                return .init(id: id, error: e)
+            }
+            return .init(id: id, error: Self.mapDomainError(rejection.underlying, method: req.method))
         } catch let e as JSONRPCError {
             return .init(id: id, error: e)
         } catch {

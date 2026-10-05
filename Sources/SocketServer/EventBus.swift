@@ -132,6 +132,20 @@ public final class EventBus: @unchecked Sendable {
     private var domainRevisions = ConnectionDomainRevisions(
         shell: 0, surfaces: 0, agentThreads: 0, browser: 0, files: 0
     )
+    /// Seq of the latest event that can change snapshot-read state. Live-only
+    /// stream kinds do not advance it (see `liveOnlyStreamEventKinds`).
+    private var snapshotStateRevision: Int64 = 0
+
+    /// High-frequency stream kinds that never back snapshot state: they are
+    /// not persisted (`AppDelegate.shouldPersistEvent`) and carry no thread,
+    /// layout or settings mutation. The `sync.snapshot` fence ignores them so
+    /// a streaming agent or printing terminal cannot starve baseline reads.
+    public static let liveOnlyStreamEventKinds: Set<String> = [
+        "surface.output",
+        "agent.item.delta",
+        "agent.item.progress",
+        "agent.provider_runtime.event",
+    ]
     private struct Subscriber {
         var filter: EventStreamFilter
         /// Called with the seq of an event this subscriber's filter dropped,
@@ -176,6 +190,10 @@ public final class EventBus: @unchecked Sendable {
     /// receipt cannot physically overtake an earlier normal event.
     public var persistenceCommitFence: (() -> Void)?
     public var shouldRetainRecentEvent: ((Event) -> Bool)?
+    /// Compact same-seq stand-in retained in place of an event that
+    /// `shouldRetainRecentEvent` rejects. Without it the ring has a hole and
+    /// `replayFloorLocked` collapses to head, so every resume needs a baseline.
+    public var recentReplayStandIn: ((Event) -> Event?)?
 
     // PERF: EventLog persisters encode payload on every retained publish.
     // Share one encoder under a short lock (JSONEncoder is not thread-safe)
@@ -204,6 +222,8 @@ public final class EventBus: @unchecked Sendable {
         public let sequence: Int64
         public let oldestReplaySequence: Int64
         public let domainRevisions: ConnectionDomainRevisions
+        /// Changes only for events outside `liveOnlyStreamEventKinds`.
+        public let stateRevision: Int64
     }
 
     public struct SnapshotBarrierResult<Value> {
@@ -212,9 +232,9 @@ public final class EventBus: @unchecked Sendable {
     }
 
     /// Peak events retained in the in-process recent ring (and encode cache).
-    /// Bounds reconnect catch-up / agent host-state flood memory. 128 matches
-    /// other agent surface caps — was 512, then 256.
-    public static let defaultRecentLimit = 128
+    /// Terminal-output stand-ins share the ring, so 128 covered only ~1 s of
+    /// a busy session; memory stays bounded by `defaultRecentByteLimit`.
+    public static let defaultRecentLimit = 4_096
     /// Peak payload bytes retained alongside `defaultRecentLimit`.
     /// Must cover several client replay pages: a DERP/cellular round trip can
     /// otherwise evict the required prefix between baselineRequired and
@@ -342,9 +362,8 @@ public final class EventBus: @unchecked Sendable {
                     precondition(event.seq > lastSeq)
                     lastSeq = event.seq
                     domainRevisions = Self.revisions(after: event, current: domainRevisions)
-                    if shouldRetainRecentEvent?(event) ?? true {
-                        retainRecent(event)
-                    }
+                    advanceSnapshotStateRevisionLocked(after: event)
+                    retainRecentOrStandIn(event)
                     deliveries.append((event, subscribersSnapshot))
                 }
                 lock.unlock()
@@ -379,9 +398,8 @@ public final class EventBus: @unchecked Sendable {
         lastSeq += 1
         let ev = Event(seq: lastSeq, kind: kind, payload: payload, ts: clock().timeIntervalSince1970)
         domainRevisions = Self.revisions(after: ev, current: domainRevisions)
-        if shouldRetainRecentEvent?(ev) ?? true {
-            retainRecent(ev)
-        }
+        advanceSnapshotStateRevisionLocked(after: ev)
+        retainRecentOrStandIn(ev)
         let subs = subscribersSnapshot
         let p = persister
         lock.unlock()
@@ -421,6 +439,7 @@ public final class EventBus: @unchecked Sendable {
         // added between the two lock regions; sizes are already walked via newSizes.
         lock.lock()
         self.lastSeq = max(self.lastSeq, lastSeq)
+        snapshotStateRevision = max(snapshotStateRevision, self.lastSeq)
         let liveKnown = Set(self.recent.map(\.seq))
         for ev in candidates where !liveKnown.contains(ev.seq) {
             let bytes = newSizes[ev.seq] ?? 0
@@ -652,8 +671,14 @@ public final class EventBus: @unchecked Sendable {
         return SnapshotMetadata(
             sequence: lastSeq,
             oldestReplaySequence: replayFloor < lastSeq ? replayFloor + 1 : lastSeq,
-            domainRevisions: domainRevisions
+            domainRevisions: domainRevisions,
+            stateRevision: snapshotStateRevision
         )
+    }
+
+    private func advanceSnapshotStateRevisionLocked(after event: Event) {
+        guard !Self.liveOnlyStreamEventKinds.contains(event.kind) else { return }
+        snapshotStateRevision = max(snapshotStateRevision, event.seq)
     }
 
     /// Returns the oldest cursor that can reach `lastSeq` using only a
@@ -690,6 +715,14 @@ public final class EventBus: @unchecked Sendable {
             browser: browser ? max(current.browser, event.seq) : current.browser,
             files: files ? max(current.files, event.seq) : current.files
         )
+    }
+
+    private func retainRecentOrStandIn(_ ev: Event) {
+        if shouldRetainRecentEvent?(ev) ?? true {
+            retainRecent(ev)
+        } else if let standIn = recentReplayStandIn?(ev), standIn.seq == ev.seq {
+            retainRecent(standIn)
+        }
     }
 
     private func retainRecent(_ ev: Event) {
@@ -1136,6 +1169,15 @@ public enum EventStreamFilter: Sendable, Equatable {
     private static func isGeometryOnlyTerminalOutput(_ event: EventBus.KnownEvent) -> Bool {
         let payload = event.payload
         return payload["base64"] == nil && payload["rows"] != nil && payload["cols"] != nil
+    }
+
+    /// Recent-ring stand-in for a `surface.output` chunk: the same seq as a
+    /// partial `surface.output.summary`, so replay stays contiguous and the
+    /// client refetches only that terminal instead of a full baseline.
+    public static func terminalOutputReplayStandIn(_ event: EventBus.Event) -> EventBus.Event? {
+        guard event.kind == RemoteCodeEventKind.surfaceOutput.rawValue,
+              let known = event.knownEvent else { return nil }
+        return terminalOutputSummary(from: known)?.rawEvent
     }
 
     private static func terminalOutputSummary(

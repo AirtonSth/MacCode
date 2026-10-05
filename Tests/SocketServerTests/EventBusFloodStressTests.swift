@@ -58,15 +58,15 @@ final class EventBusFloodStressTests: XCTestCase {
 
     // MARK: - Both caps simultaneously (default limits, >512 events)
 
-    /// Publish 600 events (> default recentLimit) with small payloads and
-    /// assert both count and byte invariants hold simultaneously.
+    /// Publish more events than the default recentLimit with small payloads
+    /// and assert both count and byte invariants hold simultaneously.
     func test_flood_defaultLimits_countAndByteBothBounded() {
         // use default limits to verify production config is correctly wired
         let bus = EventBus()
         let limit = EventBus.defaultRecentLimit
         let byteLimit = EventBus.defaultRecentByteLimit
 
-        for i in 0..<600 {
+        for i in 0..<(limit + 100) {
             bus.publishRawForTesting(kind: "e\(i)", payload: .number(Double(i)))
         }
 
@@ -74,9 +74,9 @@ final class EventBusFloodStressTests: XCTestCase {
         let bytes = bus.recentBytesForTests
 
         XCTAssertLessThanOrEqual(count, limit,
-            "recent count (\(count)) exceeds default recentLimit=\(limit) after 600-event flood")
+            "recent count (\(count)) exceeds default recentLimit=\(limit) after flood")
         XCTAssertLessThanOrEqual(bytes, byteLimit,
-            "recentBytes (\(bytes)) exceeds default recentByteLimit after 600-event flood")
+            "recentBytes (\(bytes)) exceeds default recentByteLimit after flood")
     }
 
     // MARK: - requiresBaseline flag
@@ -182,23 +182,22 @@ final class EventBusFloodStressTests: XCTestCase {
     }
 
     func test_defaultRecentLimitsStayBoundedForDERPCatchUp() {
-        XCTAssertEqual(EventBus.defaultRecentLimit, 128)
+        XCTAssertEqual(EventBus.defaultRecentLimit, 4_096)
         XCTAssertEqual(EventBus.defaultRecentByteLimit, 2 * 1_024 * 1_024)
     }
 
-    func test_retentionEstimate_256EventsTo128Window() {
-        let uncapped = 256 // prior defaultRecentLimit
+    /// C18 WHY: terminal-output stand-ins (~100 B summaries) now share the
+    /// ring, so a 128-event count cap covered ~1 s of a busy terminal and
+    /// every resume needed a full snapshot. The count cap must leave room for
+    /// seconds of small events while the byte cap stays the memory bound.
+    func test_countCapCoversSecondsOfSmallEventsWithinByteBudget() {
         let limit = EventBus.defaultRecentLimit
-        let reduction = Double(uncapped - limit) / Double(uncapped)
-        XCTAssertGreaterThan(reduction, 0.49)
-        XCTAssertEqual(limit, 128)
-        // Basis: typical EventBus payload + encode-cache entry ≈ 1KB.
-        // Prior default 256 events (encode cache mirrors the ring).
-        // 256 × 1KB ≈ 256KB → 128 × 1KB ≈ 128KB (−50%) for ring+cache keys;
-        // The independent byte limit still bounds large payloads.
-        let perEvent = 1_024
-        XCTAssertEqual(uncapped * perEvent, 262_144)
-        XCTAssertEqual(limit * perEvent, 131_072)
+        let summaryBytes = 128
+        let eventsPerSecond = 100
+        XCTAssertGreaterThanOrEqual(limit / eventsPerSecond, 30,
+            "the ring must bridge a typical reconnect without a baseline")
+        XCTAssertLessThanOrEqual(limit * summaryBytes, EventBus.defaultRecentByteLimit,
+            "small events must not exceed the byte budget before the count cap trims")
     }
 
     func test_defaultRecentByteLimitCoversMultipleHealthyReplayWindows() {

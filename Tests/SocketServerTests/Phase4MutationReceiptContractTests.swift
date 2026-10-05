@@ -77,6 +77,11 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
     var receiptPersistenceUnavailable = false
     var finalizationPersistenceUnavailable = false
     var effectThenOutcomeUnknown = false
+    /// Models a router guard (provider preflight, routing CAS) that refuses
+    /// the send before anything is written.
+    var definiteSendRejection: JSONRPCError?
+    /// Models SQLite failing for both the claim release and the unknown mark.
+    var receiptReleasePersistenceUnavailable = false
     var firstEffectGate: Phase4FirstEffectGate?
     var lateEventGate: Phase4LateEventGate?
     var lateEventKind = "agent.phase4.late"
@@ -803,12 +808,34 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         ownerFingerprint: String,
         paramsHash: String
     ) throws {
+        guard !receiptReleasePersistenceUnavailable else {
+            throw Phase4InjectedReceiptUnavailable()
+        }
         let key = phase4ReceiptKey(method: method, clientRequestId: clientRequestId)
         guard var receipt = phase4Receipts[key],
               receipt.ownerFingerprint == ownerFingerprint,
               receipt.paramsHash == paramsHash else { return }
         receipt.state = "unknown"
         phase4Receipts[key] = receipt
+    }
+
+    func releaseCommandReceiptClaim(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws {
+        guard !receiptReleasePersistenceUnavailable else {
+            throw Phase4InjectedReceiptUnavailable()
+        }
+        let key = phase4ReceiptKey(method: method, clientRequestId: clientRequestId)
+        guard let receipt = phase4Receipts[key],
+              receipt.ownerFingerprint == ownerFingerprint,
+              receipt.paramsHash == paramsHash,
+              receipt.state == "claimed" else {
+            throw Phase4InjectedReceiptUnavailable()
+        }
+        phase4Receipts[key] = nil
     }
 
     func commandReceiptStatus(
@@ -841,6 +868,9 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         providerInstanceId: String?,
         attachments: [AgentAttachment]
     ) async throws -> AgentMessageSendResult {
+        if let definiteSendRejection {
+            throw DefiniteMutationRejection(definiteSendRejection)
+        }
         let result = try await super.sendAgentMessage(
             thread: thread,
             text: text,
@@ -1731,6 +1761,135 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
                 XCTAssertTrue(faultRecorder.events.isEmpty, testCase.method)
             }
         }
+    }
+
+    /// WHY: C35. A send the host refuses before writing anything (provider
+    /// preflight failed, e.g. Distill logged out) used to come back as
+    /// permanent -32095 commandOutcomeUnknown, so iOS kept the bubble as
+    /// "couldn't confirm" and the same-id retry stayed unknown forever. The
+    /// original domain error must reach the client on every attempt, the
+    /// receipt must not be fenced as unknown, and once the cause is fixed the
+    /// same request id must still be able to send.
+    func test_definitePreEffectSendRejectionReturnsDomainErrorAndKeepsRequestIdUsable() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "phase4-rejected", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        router.definiteSendRejection = JSONRPCError(code: -32013, message: "Provider unavailable")
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 2_020)
+        defer { live.stop() }
+        let params = live.mutationParams(
+            requestId: "send-rejected-preflight",
+            threadId: thread.id,
+            text: "hello"
+        )
+
+        let first = try await live.rpc(method: "agent.message.send", params: params)
+        let retry = try await live.rpc(method: "agent.message.send", params: params)
+        let status = try await live.rpc(method: "command.receipt.status", params: statusParams(
+            live: live,
+            method: "agent.message.send",
+            requestId: "send-rejected-preflight"
+        ))
+
+        XCTAssertEqual(errorCode(first), -32013)
+        XCTAssertEqual((first["error"] as? [String: Any])?["message"] as? String, "Provider unavailable")
+        XCTAssertEqual(errorCode(retry), -32013)
+        XCTAssertEqual(router.finalizationCallCount, 0)
+        XCTAssertEqual(router.sendAgentMessageCallCount, 0, "the rejection happened before any send effect")
+        try assertStatusResult(status, status: "absent", requestId: "send-rejected-preflight")
+
+        router.definiteSendRejection = nil
+        let afterFix = try await live.rpc(method: "agent.message.send", params: params)
+        XCTAssertNil(afterFix["error"])
+        XCTAssertEqual(router.sendAgentMessageCallCount, 1)
+    }
+
+    /// WHY: C35. A plan-notes save that loses the CAS against a Mac edit is
+    /// rejected before saving. iOS only opens its conflict UI on -32009; the
+    /// remote ledger used to replace it with -32095 so the UI never fired.
+    func test_planNotesConflictReturnsMinus32009NotUnknownOutcome() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        let threadID = AgentThreadID()
+        router.planNotesByThread[threadID] = "edited on the Mac"
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 2_021)
+        defer { live.stop() }
+        var params = live.mutationParams(
+            requestId: "plan-notes-conflict",
+            threadId: threadID,
+            text: "unused"
+        )
+        params.removeValue(forKey: "text")
+        params["notes"] = "edited on the phone"
+        params["expected_notes"] = "original"
+
+        let first = try await live.rpc(method: "agent.plan.notes.save", params: params)
+        let retry = try await live.rpc(method: "agent.plan.notes.save", params: params)
+        let status = try await live.rpc(method: "command.receipt.status", params: statusParams(
+            live: live,
+            method: "agent.plan.notes.save",
+            requestId: "plan-notes-conflict"
+        ))
+
+        XCTAssertEqual(errorCode(first), -32009)
+        XCTAssertEqual(errorCode(retry), -32009)
+        XCTAssertEqual(router.planNotesSaveCallCount, 0)
+        XCTAssertEqual(router.planNotesByThread[threadID], "edited on the Mac")
+        try assertStatusResult(
+            status,
+            status: "absent",
+            method: "agent.plan.notes.save",
+            requestId: "plan-notes-conflict"
+        )
+    }
+
+    /// WHY: C35. If SQLite cannot release the claim (nor mark it unknown),
+    /// the durable row stays 'claimed'. A retry must not read that stuck row
+    /// as a retryable commandInProgress forever; it gets the same in-memory
+    /// unknown fence as any other unconfirmed outcome.
+    func test_definiteRejectionWithFailedClaimReleaseFencesRetryAsUnknown() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "phase4-release-fail", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        router.definiteSendRejection = JSONRPCError(code: -32013, message: "Provider unavailable")
+        router.receiptReleasePersistenceUnavailable = true
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 2_023)
+        defer { live.stop() }
+        let params = live.mutationParams(
+            requestId: "send-release-failed",
+            threadId: thread.id,
+            text: "hello"
+        )
+
+        let first = try await live.rpc(method: "agent.message.send", params: params)
+        let retry = try await live.rpc(method: "agent.message.send", params: params)
+
+        XCTAssertEqual(errorCode(first), -32013, "the first answer is still the known rejection")
+        XCTAssertEqual(errorCode(retry), commandOutcomeUnknown)
+    }
+
+    /// WHY: C35 at-most-once. When a write already happened (the worker model
+    /// was saved) a later guard refusal is no longer effect-free, so the
+    /// request must keep the conservative unknown outcome instead of freeing
+    /// the id for a re-run.
+    func test_rejectionAfterWorkerModelWriteStaysUnknownOutcome() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "phase4-worker", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        router.definiteSendRejection = JSONRPCError(code: -32013, message: "Provider unavailable")
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 2_022)
+        defer { live.stop() }
+        var params = live.mutationParams(
+            requestId: "send-after-worker-model",
+            threadId: thread.id,
+            text: "hello"
+        )
+        params["worker_model"] = "gpt-5.5-mini"
+
+        let first = try await live.rpc(method: "agent.message.send", params: params)
+        let retry = try await live.rpc(method: "agent.message.send", params: params)
+
+        XCTAssertEqual(errorCode(first), commandOutcomeUnknown)
+        XCTAssertEqual(errorCode(retry), commandOutcomeUnknown)
     }
 
     /// WHY: a syntactically valid UUID that is absent on the host used to claim

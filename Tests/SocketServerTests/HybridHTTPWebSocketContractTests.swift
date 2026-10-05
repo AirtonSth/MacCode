@@ -123,6 +123,20 @@ private final class HybridReceiptRouter: FakeRouter, CommandReceiptStateRouting,
         receipts[k] = receipt
     }
 
+    func releaseCommandReceiptClaim(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws {
+        let k = key(method: method, clientRequestId: clientRequestId)
+        guard let receipt = receipts[k],
+              receipt.ownerFingerprint == ownerFingerprint,
+              receipt.paramsHash == paramsHash,
+              receipt.state == "claimed" else { return }
+        receipts[k] = nil
+    }
+
     func commandReceiptStatus(
         method: String,
         clientRequestId: String,

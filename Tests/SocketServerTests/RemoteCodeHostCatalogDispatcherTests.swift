@@ -758,6 +758,15 @@ private final class HostCatalogReceiptRouter: FakeRouter, CommandReceiptStateRou
         receipts[key] = Receipt(owner: ownerFingerprint, hash: paramsHash, state: "unknown", result: nil)
     }
 
+    func releaseCommandReceiptClaim(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws {
+        receipts["\(method):\(clientRequestId)"] = nil
+    }
+
     func commandReceiptStatus(
         method: String,
         clientRequestId: String,
