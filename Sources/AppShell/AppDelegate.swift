@@ -675,6 +675,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         eventBus.shouldRetainRecentEvent = { event in
             Self.shouldRetainRecentEvent(event)
         }
+        eventBus.recentReplayStandIn = EventStreamFilter.terminalOutputReplayStandIn
         context.wireBackgroundPersister(eventBus: eventBus)
     }
 

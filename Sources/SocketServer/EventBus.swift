@@ -190,6 +190,10 @@ public final class EventBus: @unchecked Sendable {
     /// receipt cannot physically overtake an earlier normal event.
     public var persistenceCommitFence: (() -> Void)?
     public var shouldRetainRecentEvent: ((Event) -> Bool)?
+    /// Compact same-seq stand-in retained in place of an event that
+    /// `shouldRetainRecentEvent` rejects. Without it the ring has a hole and
+    /// `replayFloorLocked` collapses to head, so every resume needs a baseline.
+    public var recentReplayStandIn: ((Event) -> Event?)?
 
     // PERF: EventLog persisters encode payload on every retained publish.
     // Share one encoder under a short lock (JSONEncoder is not thread-safe)
@@ -228,9 +232,9 @@ public final class EventBus: @unchecked Sendable {
     }
 
     /// Peak events retained in the in-process recent ring (and encode cache).
-    /// Bounds reconnect catch-up / agent host-state flood memory. 128 matches
-    /// other agent surface caps — was 512, then 256.
-    public static let defaultRecentLimit = 128
+    /// Terminal-output stand-ins share the ring, so 128 covered only ~1 s of
+    /// a busy session; memory stays bounded by `defaultRecentByteLimit`.
+    public static let defaultRecentLimit = 4_096
     /// Peak payload bytes retained alongside `defaultRecentLimit`.
     /// Must cover several client replay pages: a DERP/cellular round trip can
     /// otherwise evict the required prefix between baselineRequired and
@@ -359,9 +363,7 @@ public final class EventBus: @unchecked Sendable {
                     lastSeq = event.seq
                     domainRevisions = Self.revisions(after: event, current: domainRevisions)
                     advanceSnapshotStateRevisionLocked(after: event)
-                    if shouldRetainRecentEvent?(event) ?? true {
-                        retainRecent(event)
-                    }
+                    retainRecentOrStandIn(event)
                     deliveries.append((event, subscribersSnapshot))
                 }
                 lock.unlock()
@@ -397,9 +399,7 @@ public final class EventBus: @unchecked Sendable {
         let ev = Event(seq: lastSeq, kind: kind, payload: payload, ts: clock().timeIntervalSince1970)
         domainRevisions = Self.revisions(after: ev, current: domainRevisions)
         advanceSnapshotStateRevisionLocked(after: ev)
-        if shouldRetainRecentEvent?(ev) ?? true {
-            retainRecent(ev)
-        }
+        retainRecentOrStandIn(ev)
         let subs = subscribersSnapshot
         let p = persister
         lock.unlock()
@@ -715,6 +715,14 @@ public final class EventBus: @unchecked Sendable {
             browser: browser ? max(current.browser, event.seq) : current.browser,
             files: files ? max(current.files, event.seq) : current.files
         )
+    }
+
+    private func retainRecentOrStandIn(_ ev: Event) {
+        if shouldRetainRecentEvent?(ev) ?? true {
+            retainRecent(ev)
+        } else if let standIn = recentReplayStandIn?(ev), standIn.seq == ev.seq {
+            retainRecent(standIn)
+        }
     }
 
     private func retainRecent(_ ev: Event) {
@@ -1161,6 +1169,15 @@ public enum EventStreamFilter: Sendable, Equatable {
     private static func isGeometryOnlyTerminalOutput(_ event: EventBus.KnownEvent) -> Bool {
         let payload = event.payload
         return payload["base64"] == nil && payload["rows"] != nil && payload["cols"] != nil
+    }
+
+    /// Recent-ring stand-in for a `surface.output` chunk: the same seq as a
+    /// partial `surface.output.summary`, so replay stays contiguous and the
+    /// client refetches only that terminal instead of a full baseline.
+    public static func terminalOutputReplayStandIn(_ event: EventBus.Event) -> EventBus.Event? {
+        guard event.kind == RemoteCodeEventKind.surfaceOutput.rawValue,
+              let known = event.knownEvent else { return nil }
+        return terminalOutputSummary(from: known)?.rawEvent
     }
 
     private static func terminalOutputSummary(

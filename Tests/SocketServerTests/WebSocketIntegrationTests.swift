@@ -818,10 +818,10 @@ final class WebSocketIntegrationTests: XCTestCase {
         defer { server.stop() }
         try await Task.sleep(nanoseconds: 80_000_000)
 
-        // Roll the shared retained ring past its 512-event capacity so the
+        // Roll the shared retained ring past its default capacity so the
         // replay floor sits above 0 and since-seq=0 is deterministically expired.
         let fillerKind = uniqueEventKind("test.ws.replay_roll")
-        for _ in 0..<513 {
+        for _ in 0...EventBus.defaultRecentLimit {
             EventBus.shared.publishRawForTesting(kind: fillerKind, payload: .object([:]))
         }
 

@@ -260,6 +260,54 @@ final class EventBusPersistencePerformanceTests: XCTestCase {
     }
 
     @MainActor
+    func test_productionWiringKeepsReplayContiguousAcrossTerminalOutput() throws {
+        // C18 WHY: every PTY chunk spends a global sequence but its base64 is
+        // too large for the recent ring. If the ring simply skips it, the
+        // replay floor collapses to head whenever any terminal printed after
+        // the client's cursor, so every iOS resume / gap repair falls back to
+        // a full sync.snapshot. The ring must keep a compact per-surface
+        // refresh hint in the hole so cheap replay still works and the one
+        // terminal refetches its own text.
+        let context = try makeContext(label: "replay-contiguous")
+        let eventBus = EventBus()
+        AppDelegate.wireEventPersistence(context: context, eventBus: eventBus)
+        defer { context.flushEventPersistence(eventBus: eventBus) }
+
+        eventBus.publish(kind: .workspaceCreated, payload: .object([:]))
+        let cursor = eventBus.currentSeq
+        eventBus.publish(kind: .surfaceOutput, payload: .object([
+            "surface_id": .string("surface-1"),
+            "seq": .number(7),
+            "base64": .string(String(repeating: "x", count: 4_096)),
+        ]))
+        eventBus.publish(kind: .workspaceUpdated, payload: .object([:]))
+
+        let replay = eventBus.recentEvents(since: cursor, maxBytes: nil)
+        XCTAssertFalse(replay.requiresBaseline,
+            "terminal output after the cursor must not force a full baseline")
+        XCTAssertEqual(replay.events.map(\.seq), [cursor + 1, cursor + 2],
+            "replay must stay contiguous so iOS does not see an internal hole")
+        XCTAssertEqual(replay.events.map(\.kind), ["surface.output.summary", "workspace.updated"])
+        let summary = try XCTUnwrap(replay.events.first?.payload.objectValue)
+        XCTAssertEqual(summary["surface_id"]?.stringValue, "surface-1")
+        XCTAssertEqual(summary["seq"]?.intValue, 7,
+            "iOS needs the per-surface sequence to refetch only that terminal")
+        XCTAssertEqual(summary["partial"], .bool(true))
+        XCTAssertNil(summary["base64"], "the ring must not pin raw terminal bytes")
+
+        var expired = false
+        var resumed: [String] = []
+        let subscription = eventBus.subscribeDetectingReplayExpiry(
+            since: cursor,
+            onReplayExpired: { _ in expired = true },
+            { resumed.append($0.kind) }
+        )
+        defer { eventBus.unsubscribe(subscription) }
+        XCTAssertFalse(expired, "a WS resume across terminal output must not send baselineRequired")
+        XCTAssertEqual(resumed, ["surface.output.summary", "workspace.updated"])
+    }
+
+    @MainActor
     private func makeContext(label: String) throws -> AppContext {
         let fallback = FileManager.default.temporaryDirectory.path
         let root = ProcessInfo.processInfo.environment["RC2_SANDBOX_APP_SUPPORT"] ?? fallback
