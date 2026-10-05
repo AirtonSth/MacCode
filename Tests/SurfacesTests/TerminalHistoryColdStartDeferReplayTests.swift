@@ -61,7 +61,7 @@ final class TerminalHistoryColdStartDeferReplayTests: XCTestCase {
         XCTAssertFalse(coordinator.isReplayDeferredForTesting)
         XCTAssertEqual(
             delegate.renderedData,
-            marker,
+            marker + TerminalHistoryCoordinator.restoredModeReset,
             "demand replay must feed the persisted cold-start prefix once unlocked"
         )
     }
@@ -96,7 +96,7 @@ final class TerminalHistoryColdStartDeferReplayTests: XCTestCase {
         XCTAssertFalse(coordinator.isReplayDeferredForTesting)
         XCTAssertEqual(
             delegate.renderedData,
-            marker,
+            marker + TerminalHistoryCoordinator.restoredModeReset,
             "default prepare(restored:) must still auto-replay for non-deferred paths"
         )
     }
