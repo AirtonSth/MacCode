@@ -322,6 +322,10 @@ public enum AgentErrorRecoveryAction: String, Sendable, Equatable {
     }
 }
 
+private struct BotRunUnavailableError: LocalizedError {
+    var errorDescription: String? { "Bot indisponível." }
+}
+
 /// Opt-in hooks for hosting one fixed thread (e.g. the bot desk) in Agent App.
 public struct AgentAppEmbedding {
     public let pinnedThreadId: AgentThreadID
@@ -407,6 +411,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// macOS account that will execute the next provider process through the shared helper.
     /// Nil / current-account means no privileged trampoline.
     @Published public var runAsUser: AgentRunAsUser? = AgentRunAsUser.current()
+    /// Bot (or none) that runs the selected thread; mirrors the thread row once selected.
+    @Published public private(set) var selectedRunActor: RunActor = .none
+    /// Where a bot-run thread executes by default; wired by the host from the bot's revision.
+    public var botExecutionTargetProvider: (BotID) -> ExecutionTarget = { _ in .mac }
+    /// False when the bot was deleted or no longer exists; wired by the host from the bot store.
+    public var botIsAvailable: (BotID) -> Bool = { _ in true }
+    /// Display name used in refusal messages; nil when unknown.
+    public var botNameProvider: (BotID) -> String? = { _ in nil }
+    /// Embedded desk only: opens the hand-off thread in the source thread's workspace
+    /// (the desk's synthetic workspace cannot hold it). Nil hides "Continuar sem bot".
+    public var handoffHost: ((AgentThreadID, RunActor) -> Void)?
+    /// A hand-off needs a host when this VM is an embedded desk.
+    public var canContinueWithoutBot: Bool { embedding == nil || handoffHost != nil }
+    /// Links the workspace thread to a bot conversation (single thread, no copy) on the first bot send.
+    public var botThreadLinker: (@MainActor (BotID, AgentThreadID) throws -> Void)?
+    /// Compiles the bot brain into the provider prompt for a bot-run workspace thread.
+    public var botPromptTransform: (@MainActor (BotID, String, AgentThreadID, AgentRunID) async throws -> String)?
+    public var botRunStarted: (@MainActor (BotID, AgentRunID, AgentThreadID) -> Void)?
     @Published public var availableRunAsUsers: [AgentRunAsUser] = MacOSLocalUserCatalog.listEligibleUsers()
     @Published public var model: String = AgentDefaultModelSelection.builtInDefault(for: .defaultProvider)
     /// Last model the user chose per provider (new threads + provider switches).
@@ -2400,6 +2422,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         provider = manual.provider
         providerInstanceId = routing.manualProviderInstanceId ?? manual.provider.rawValue
         runAsUser = selectedThread.runAsUser ?? AgentRunAsUser.current()
+        selectedRunActor = selectedThread.actor
         model = manual.effectiveModel
         permissionMode = selectedThread.permissionMode
         reasoningEffort = manual.reasoningEffort
@@ -4053,6 +4076,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let nextRunAsUser = selectedThread.runAsUser ?? AgentRunAsUser.current()
         if Self.shouldAssignIfChanged(current: runAsUser, next: nextRunAsUser) {
             runAsUser = nextRunAsUser
+        }
+        if Self.shouldAssignIfChanged(current: selectedRunActor, next: selectedThread.actor) {
+            selectedRunActor = selectedThread.actor
         }
         if Self.shouldAssignIfChanged(current: model, next: manual.effectiveModel) {
             model = manual.effectiveModel
@@ -6027,6 +6053,62 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return "This conversation used \(name). RemoteCode now runs Distill only, so it is read-only."
     }
 
+    /// A thread locked to a bot that was deleted is read-only; the user continues without the bot.
+    public var selectedThreadBotUnavailable: Bool {
+        guard let id = selectedThreadId,
+              let thread = threads.first(where: { $0.id == id }),
+              thread.actorLockedAt != nil,
+              case .bot(let botID) = thread.actor else { return false }
+        return !botIsAvailable(botID)
+    }
+
+    private func refuseUnavailableBotThreadRun() -> Bool {
+        guard selectedThreadBotUnavailable,
+              let id = selectedThreadId,
+              case .bot(let botID) = threads.first(where: { $0.id == id })?.actor else { return false }
+        let label = botNameProvider(botID).map { "Bot \($0)" } ?? "Bot"
+        statusMessage = "\(label) foi apagado. Use \"Continuar sem bot\"."
+        return true
+    }
+
+    /// Max chars kept per message in the handoff summary.
+    static let handoffMessageLimit = 300
+    static let handoffMessageCount = 6
+
+    /// Deterministic continuation draft: header plus the last user/assistant messages, truncated.
+    public static func handoffSummary(title: String, threadId: AgentThreadID, messages: [AgentMessage]) -> String {
+        var lines = ["Continuação da thread \"\(title)\" (id \(threadId.value.uuidString.lowercased()))"]
+        let turns = messages.filter { $0.role == .user || $0.role == .assistant }.suffix(handoffMessageCount)
+        for message in turns {
+            let label = message.role == .user ? "Usuário" : "Assistente"
+            let text = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            let clipped = text.count > handoffMessageLimit ? String(text.prefix(handoffMessageLimit)) + "…" : text
+            lines.append("\(label): \(clipped)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Opens a new thread in this workspace for `actor`, with a draft summarising `oldThreadId`.
+    /// The old thread (actor, lock) is untouched.
+    @discardableResult
+    public func startHandoffThread(from oldThreadId: AgentThreadID, actor: RunActor) -> AgentThreadID? {
+        if embedding != nil {
+            handoffHost?(oldThreadId, actor)
+            return nil
+        }
+        let old = threads.first(where: { $0.id == oldThreadId })
+        let recent = (try? messageRepo.listRecent(threadId: oldThreadId, limit: 50)) ?? []
+        let summary = Self.handoffSummary(
+            title: old?.title ?? "", threadId: oldThreadId, messages: recent
+        )
+        createThread(title: "New thread")
+        guard let newId = selectedThreadId, newId != oldThreadId else { return nil }
+        selectedRunActor = actor
+        prompt = summary
+        persistComposerDraft(for: newId)
+        return newId
+    }
+
     private func refuseLegacyProviderThreadRun() -> Bool {
         guard isLegacyProviderThread else { return false }
         statusMessage = "This conversation is read-only. Start a new Distill conversation."
@@ -6637,6 +6719,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         provider = routing.manualSelection.provider
         providerInstanceId = routing.manualProviderInstanceId ?? routing.manualSelection.provider.rawValue
         runAsUser = thread.runAsUser ?? AgentRunAsUser.current()
+        selectedRunActor = thread.actor
         model = routing.manualSelection.effectiveModel
         permissionMode = thread.permissionMode
         reasoningEffort = routing.manualSelection.reasoningEffort
@@ -6647,6 +6730,26 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if let i = threads.firstIndex(where: { $0.id == thread.id }) {
             threads[i] = thread
         }
+    }
+
+    /// Actor chip lock: first real message or a persisted actor lock.
+    public var runActorLocked: Bool {
+        let lockedAt = selectedThreadId.flatMap { id in threads.first(where: { $0.id == id })?.actorLockedAt }
+        return AgentRunAsUserPresentation.identityLocked(providerLocked: providerLocked, actorLockedAt: lockedAt)
+    }
+
+    /// Locked threads show the stored target; otherwise the bot's default.
+    public func executionTarget(for botID: BotID) -> ExecutionTarget {
+        let thread = selectedThreadId.flatMap { id in threads.first(where: { $0.id == id }) }
+        if thread?.actorLockedAt != nil, let stored = thread?.executionTarget { return stored }
+        return botExecutionTargetProvider(botID)
+    }
+
+    /// Picks who runs the next send. Refused once the thread is locked or running.
+    public func setRunActor(_ actor: RunActor) {
+        guard !runActorLocked else { return }
+        guard !selectedThreadRunIsStartingOrRunning else { return }
+        selectedRunActor = actor
     }
 
     /// Select the macOS account that will execute provider processes through the shared helper.
@@ -6879,6 +6982,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                             reasoningModel: reasoningModel,
                             serviceTier: serviceTier, modelSelection: currentModelSelection,
                             runAsUser: runAsUser, routingConfiguration: routingConfiguration)
+        // The chip choice made before the thread existed survives selection; it is written at first send.
+        let pendingRunActor = selectedRunActor
         let prunedThreadIDs: [AgentThreadID]
         do {
             prunedThreadIDs = try threadRepo.upsertEnforcingWorkspaceThreadLimit(t)
@@ -6900,6 +7005,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadThreads()
         onThreadLifecycle?(.created(threads.first(where: { $0.id == t.id }) ?? t))
         selectThread(t.id)
+        selectedRunActor = pendingRunActor
     }
 
     /// Delete every thread in this workspace (stops active providers first).
@@ -8012,6 +8118,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
         if refuseLegacyProviderThreadRun() { return }
+        if refuseUnavailableBotThreadRun() { return }
         if let message = selectedDistillEffortValidationMessage {
             statusMessage = message
             return
@@ -8509,6 +8616,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         recoveryDisplayText: String? = nil
     ) async -> AgentRunID? {
         guard !refuseLegacyProviderThreadRun() else { return nil }
+        guard !refuseUnavailableBotThreadRun() else { return nil }
         let baseRouting = queuedRoutingSnapshot?.configuration
             ?? routingConfiguration
             ?? selectedThreadId.map { routingConfigurationForSend(threadId: $0) }
@@ -8605,12 +8713,45 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             createThread(title: "New thread")
         }
         guard let tid = selectedThreadId else { return nil }
+        let runId = requestedRunId ?? AgentRunID()
+        // A locked thread keeps its stored actor; the chip only decides the first send.
+        let actorThread = threads.first(where: { $0.id == tid })
+        let runActor: RunActor = actorThread?.actorLockedAt != nil ? (actorThread?.actor ?? .none) : selectedRunActor
+        var botPrompt: String?
+        if embedding == nil, case .bot(let botID) = runActor {
+            do {
+                if actorThread?.actorLockedAt == nil {
+                    guard let linker = botThreadLinker else { throw BotRunUnavailableError() }
+                    try linker(botID, tid)
+                    let lockedAt = Date()
+                    let target = botExecutionTargetProvider(botID)
+                    guard try threadRepo.setActor(
+                        id: tid, actor: runActor, lockedAt: lockedAt, executionTarget: target
+                    ) else {
+                        throw NSError(
+                            domain: "RemoteCode.AgentAppViewModel",
+                            code: 404,
+                            userInfo: [NSLocalizedDescriptionKey: "A conversa sumiu antes de iniciar."]
+                        )
+                    }
+                    if let index = threads.firstIndex(where: { $0.id == tid }) {
+                        threads[index].actor = runActor
+                        threads[index].actorLockedAt = lockedAt
+                        threads[index].executionTarget = target
+                    }
+                }
+                guard let transform = botPromptTransform else { throw BotRunUnavailableError() }
+                botPrompt = try await transform(botID, text, tid, runId)
+            } catch {
+                statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                return nil
+            }
+        }
         // Everything from here to the tracked run below is preparation the user
         // cannot see (Graphify roots, prompt compression, provider spawn). Show
         // "Loading…" for it; the defer covers the failure exits so a thread can
         // never be left permanently loading.
         // Run identity is fixed at acceptance so Stop can cancel this generation.
-        let runId = requestedRunId ?? AgentRunID()
         // A prior run's last snapshot is not evidence for this run. Clear the
         // holder projection at acceptance, before the new run becomes live, so
         // an idle → new-run transition cannot resurrect old Stop-strip details.
@@ -8745,7 +8886,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             mentionedBots: mentionedBots
         )
         var transformFailure: Error?
-        var runPrompt = text
+        var runPrompt = botPrompt ?? text
         if let transform = embedding?.promptTransform {
             do {
                 runPrompt = try await transform(text, tid, runId)
@@ -8919,6 +9060,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.onRunStateChange?()
             }
             embedding?.onRunStarted?(runId, tid)
+            if embedding == nil, case .bot(let botID) = runActor { botRunStarted?(botID, runId, tid) }
             return runId
         } catch {
             let wasCancelled: Bool = {
@@ -15124,9 +15266,12 @@ public struct AgentAppView: View {
             if vm.isLegacyProviderThread {
                 legacyProviderBanner
             }
+            if vm.selectedThreadBotUnavailable {
+                deletedBotBanner
+            }
             ComposerReactiveScope(composerState: vm.composerState) {
                 composer
-                    .disabled(vm.isLegacyProviderThread)
+                    .disabled(vm.isLegacyProviderThread || vm.selectedThreadBotUnavailable)
                     .onChange(of: vm.composerState.focusTick) { _ in
                         collapseTranscriptForNewTurn()
                     }
@@ -18444,6 +18589,37 @@ public struct AgentAppView: View {
         }
     }
 
+    private var deletedBotBanner: some View {
+        HStack(alignment: .center, spacing: DS.Space.sm) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(DS.Palette.textSecondary)
+                .frame(width: 14, height: 14, alignment: .center)
+            Text("Bot apagado. Esta conversa é somente leitura.")
+                .font(.system(size: 11))
+                .foregroundColor(DS.Palette.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if vm.canContinueWithoutBot {
+                Button("Continuar sem bot") {
+                    continueWithoutBot()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("agent.deletedBot.continueWithoutBot")
+            }
+        }
+        .padding(.horizontal, DS.Space.lg)
+        .padding(.vertical, DS.Space.sm)
+        .background(DS.Palette.surfaceRaised)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("agent.deletedBot.banner")
+    }
+
+    private func continueWithoutBot() {
+        guard let id = vm.selectedThreadId else { return }
+        vm.startHandoffThread(from: id, actor: .none)
+    }
+
     private var legacyProviderBanner: some View {
         HStack(alignment: .center, spacing: DS.Space.sm) {
             Image(systemName: "lock.fill")
@@ -18667,17 +18843,23 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.execution.menu")
     }
 
-    /// macOS user capsule (shared helper). Left of provider source + model.
+    /// Run-as capsule: macOS user + Bot actor. Left of provider source + model.
     private var runAsUserMenu: some View {
-        let users = vm.availableRunAsUsers.isEmpty ? MacOSLocalUserCatalog.listEligibleUsers() : vm.availableRunAsUsers
         let selected = vm.runAsUser ?? AgentRunAsUser.current()
         return AgentRunAsUserCapsule(
-            users: users,
+            usersProvider: { vm.availableRunAsUsers.isEmpty ? MacOSLocalUserCatalog.listEligibleUsers() : vm.availableRunAsUsers },
             selected: selected,
             runLocked: vm.selectedThreadRunIsStartingOrRunning,
-            identityLocked: vm.providerLocked,
+            identityLocked: vm.runActorLocked,
             accessibilityIdentifier: "agent.runAsUser.menu",
+            actor: vm.selectedRunActor,
+            botsProvider: { vm.mentionableBotsProvider() },
+            botName: { vm.botNameProvider($0) },
+            canContinueWithoutBot: vm.canContinueWithoutBot,
+            executionTarget: { vm.executionTarget(for: $0) },
             onSelect: { vm.setRunAsUser($0) },
+            onSelectActor: { vm.setRunActor($0) },
+            onContinueWithoutBot: { continueWithoutBot() },
             onAppear: { vm.refreshAvailableRunAsUsers() }
         )
     }

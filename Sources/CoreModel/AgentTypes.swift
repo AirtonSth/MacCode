@@ -1487,6 +1487,10 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
     /// macOS account that executes provider processes for this thread through the shared helper.
     /// Nil means the current login user. Distinct from `providerInstanceId`.
     public var runAsUser: AgentRunAsUser?
+    /// Who runs this thread. Locked once `actorLockedAt` is set.
+    public var actor: RunActor
+    public var actorLockedAt: Date?
+    public var executionTarget: ExecutionTarget?
 
     public var effectiveInteractionMode: AgentInteractionMode {
         interactionMode ?? .default
@@ -1528,7 +1532,10 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         modelSelection: AgentModelSelection? = nil,
         interactionMode: AgentInteractionMode = .default,
         runAsUser: AgentRunAsUser? = nil,
-        routingConfiguration: AgentRoutingConfiguration? = nil
+        routingConfiguration: AgentRoutingConfiguration? = nil,
+        actor: RunActor = .none,
+        actorLockedAt: Date? = nil,
+        executionTarget: ExecutionTarget? = nil
     ) {
         self.id = id
         self.projectId = projectId
@@ -1563,6 +1570,45 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         self.routingConfiguration = routingConfiguration
         self.interactionMode = interactionMode
         self.runAsUser = runAsUser
+        self.actor = actor
+        self.actorLockedAt = actorLockedAt
+        self.executionTarget = executionTarget
+    }
+
+    /// Hand-written only so pre-actor JSON (no `actor` key) still decodes.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(AgentThreadID.self, forKey: .id)
+        projectId = try c.decodeIfPresent(ProjectID.self, forKey: .projectId)
+        workspaceId = try c.decodeIfPresent(WorkspaceID.self, forKey: .workspaceId)
+        title = try c.decode(String.self, forKey: .title)
+        provider = try c.decode(AgentProvider.self, forKey: .provider)
+        providerInstanceId = try c.decodeIfPresent(String.self, forKey: .providerInstanceId)
+        model = try c.decode(String.self, forKey: .model)
+        permissionMode = try c.decode(AgentPermissionMode.self, forKey: .permissionMode)
+        reasoningEffort = try c.decode(AgentReasoningEffort.self, forKey: .reasoningEffort)
+        reasoningModel = try c.decodeIfPresent(String.self, forKey: .reasoningModel)
+        providerThreadId = try c.decodeIfPresent(String.self, forKey: .providerThreadId)
+        status = try c.decode(AgentRunStatus.self, forKey: .status)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+        diffAdditions = try c.decode(Int.self, forKey: .diffAdditions)
+        diffDeletions = try c.decode(Int.self, forKey: .diffDeletions)
+        hasUnread = try c.decode(Bool.self, forKey: .hasUnread)
+        color = try c.decodeIfPresent(String.self, forKey: .color)
+        pinned = try c.decode(Bool.self, forKey: .pinned)
+        sortOrder = try c.decode(Int.self, forKey: .sortOrder)
+        executionMode = try c.decode(AgentExecutionMode.self, forKey: .executionMode)
+        baseBranch = try c.decodeIfPresent(String.self, forKey: .baseBranch)
+        worktreePath = try c.decodeIfPresent(String.self, forKey: .worktreePath)
+        serviceTier = try c.decode(AgentServiceTier.self, forKey: .serviceTier)
+        modelSelection = try c.decode(AgentModelSelection.self, forKey: .modelSelection)
+        routingConfiguration = try c.decodeIfPresent(AgentRoutingConfiguration.self, forKey: .routingConfiguration)
+        interactionMode = try c.decodeIfPresent(AgentInteractionMode.self, forKey: .interactionMode)
+        runAsUser = try c.decodeIfPresent(AgentRunAsUser.self, forKey: .runAsUser)
+        actor = try c.decodeIfPresent(RunActor.self, forKey: .actor) ?? .none
+        actorLockedAt = try c.decodeIfPresent(Date.self, forKey: .actorLockedAt)
+        executionTarget = try c.decodeIfPresent(ExecutionTarget.self, forKey: .executionTarget)
     }
 }
 

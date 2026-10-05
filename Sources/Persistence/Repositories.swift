@@ -140,6 +140,26 @@ private func decodeRunAsUser(_ json: String?) -> AgentRunAsUser? {
     return user
 }
 
+private func encodeRunActor(_ actor: RunActor) -> String? {
+    guard actor != .none else { return nil }
+    agentThreadJSONCodecLock.lock()
+    let data = try? agentThreadJSONEncoder.encode(actor)
+    agentThreadJSONCodecLock.unlock()
+    guard let data else { return nil }
+    return String(data: data, encoding: .utf8)
+}
+
+private func decodeRunActor(_ json: String?) -> RunActor {
+    guard let json,
+          let data = json.data(using: .utf8) else {
+        return .none
+    }
+    agentThreadJSONCodecLock.lock()
+    let actor = try? agentThreadJSONDecoder.decode(RunActor.self, from: data)
+    agentThreadJSONCodecLock.unlock()
+    return actor ?? .none
+}
+
 private func encodeRoutingConfiguration(_ configuration: AgentRoutingConfiguration) throws -> String {
     agentThreadJSONCodecLock.lock()
     defer { agentThreadJSONCodecLock.unlock() }
@@ -548,9 +568,9 @@ public final class AgentThreadRepository {
     public func upsert(_ t: AgentThread) throws {
         Self.bumpIdentityRevision()
         let st = try db.prepare("""
-            INSERT INTO agent_threads(id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json, reasoning_model)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET title=excluded.title, provider=excluded.provider, provider_instance_id=excluded.provider_instance_id, model=excluded.model, provider_thread_id=excluded.provider_thread_id, status=excluded.status, updated_at=excluded.updated_at, diff_additions=excluded.diff_additions, diff_deletions=excluded.diff_deletions, has_unread=excluded.has_unread, color=excluded.color, pinned=excluded.pinned, sort_order=excluded.sort_order, permission_mode=excluded.permission_mode, reasoning_effort=excluded.reasoning_effort, execution_mode=excluded.execution_mode, base_branch=excluded.base_branch, worktree_path=excluded.worktree_path, service_tier=excluded.service_tier, model_selection_json=excluded.model_selection_json, interaction_mode=excluded.interaction_mode, run_as_user_json=excluded.run_as_user_json, reasoning_model=excluded.reasoning_model;
+            INSERT INTO agent_threads(id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json, reasoning_model, actor_json, actor_locked_at, execution_target)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET title=excluded.title, provider=excluded.provider, provider_instance_id=excluded.provider_instance_id, model=excluded.model, provider_thread_id=excluded.provider_thread_id, status=excluded.status, updated_at=excluded.updated_at, diff_additions=excluded.diff_additions, diff_deletions=excluded.diff_deletions, has_unread=excluded.has_unread, color=excluded.color, pinned=excluded.pinned, sort_order=excluded.sort_order, permission_mode=excluded.permission_mode, reasoning_effort=excluded.reasoning_effort, execution_mode=excluded.execution_mode, base_branch=excluded.base_branch, worktree_path=excluded.worktree_path, service_tier=excluded.service_tier, model_selection_json=excluded.model_selection_json, interaction_mode=excluded.interaction_mode, run_as_user_json=excluded.run_as_user_json, reasoning_model=excluded.reasoning_model, actor_json=excluded.actor_json, actor_locked_at=excluded.actor_locked_at, execution_target=excluded.execution_target;
         """)
         try st.bind(1, t.id.value.uuidString)
         try st.bind(2, t.projectId?.value.uuidString)
@@ -579,6 +599,9 @@ public final class AgentThreadRepository {
         try st.bind(25, t.effectiveInteractionMode.rawValue)
         try st.bind(26, encodeRunAsUser(t.runAsUser))
         try st.bind(27, t.reasoningModel)
+        try st.bind(28, encodeRunActor(t.actor))
+        try st.bind(29, t.actorLockedAt.map { iso.string(from: $0) })
+        try st.bind(30, t.executionTarget?.rawValue)
         _ = try st.step()
 
         if let routingConfiguration = t.routingConfiguration {
@@ -939,7 +962,7 @@ public final class AgentThreadRepository {
         // JOIN routing so a 20-thread rail is one statement, not 1+N.
         // PF-30: WAL reader so the rail does not wait on stream writers.
         let columns = """
-            t.id, t.project_id, t.workspace_id, t.title, t.provider, t.provider_instance_id, t.model, t.provider_thread_id, t.status, unixepoch(t.created_at), unixepoch(t.updated_at), t.diff_additions, t.diff_deletions, t.has_unread, t.color, t.pinned, t.sort_order, t.permission_mode, t.reasoning_effort, t.execution_mode, t.base_branch, t.worktree_path, t.service_tier, t.model_selection_json, t.interaction_mode, t.run_as_user_json, t.reasoning_model, r.mode, r.configuration_json, r.revision
+            t.id, t.project_id, t.workspace_id, t.title, t.provider, t.provider_instance_id, t.model, t.provider_thread_id, t.status, unixepoch(t.created_at), unixepoch(t.updated_at), t.diff_additions, t.diff_deletions, t.has_unread, t.color, t.pinned, t.sort_order, t.permission_mode, t.reasoning_effort, t.execution_mode, t.base_branch, t.worktree_path, t.service_tier, t.model_selection_json, t.interaction_mode, t.run_as_user_json, t.reasoning_model, r.mode, r.configuration_json, r.revision, t.actor_json, t.actor_locked_at, t.execution_target
             """
         let from = "FROM agent_threads t LEFT JOIN agent_thread_routing r ON r.thread_id = t.id"
         let order = "ORDER BY t.updated_at DESC, t.id DESC"
@@ -998,7 +1021,10 @@ public final class AgentThreadRepository {
                     modelSelection: decodeModelSelection(st.columnText(23), provider: provider, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
                     interactionMode: AgentInteractionMode(rawValue: st.columnText(24) ?? "") ?? .default,
                     runAsUser: decodeRunAsUser(st.columnText(25)),
-                    routingConfiguration: routing
+                    routingConfiguration: routing,
+                    actor: decodeRunActor(st.columnText(30)),
+                    actorLockedAt: st.columnText(31).map { parseDate($0) },
+                    executionTarget: st.columnText(32).flatMap { ExecutionTarget(rawValue: $0) }
                 ))
             }
             return out
@@ -1462,7 +1488,7 @@ public final class AgentThreadRepository {
     }
 
     private func loadThread(id: AgentThreadID, includeRouting: Bool) throws -> AgentThread? {
-        let st = try db.prepare("SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json, reasoning_model FROM agent_threads WHERE id = ?;")
+        let st = try db.prepare("SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json, reasoning_model, actor_json, actor_locked_at, execution_target FROM agent_threads WHERE id = ?;")
         try st.bind(1, id.value.uuidString)
         if try st.step() {
             let idVal = AgentThreadID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID())
@@ -1500,7 +1526,10 @@ public final class AgentThreadRepository {
                 modelSelection: decodeModelSelection(st.columnText(23), provider: provider, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
                 interactionMode: AgentInteractionMode(rawValue: st.columnText(24) ?? "") ?? .default,
                 runAsUser: decodeRunAsUser(st.columnText(25)),
-                routingConfiguration: includeRouting ? try loadRoutingConfiguration(threadId: idVal) : nil
+                routingConfiguration: includeRouting ? try loadRoutingConfiguration(threadId: idVal) : nil,
+                actor: decodeRunActor(st.columnText(27)),
+                actorLockedAt: st.columnText(28).map { parseDate($0) },
+                executionTarget: st.columnText(29).flatMap { ExecutionTarget(rawValue: $0) }
             )
         }
         return nil
@@ -2231,6 +2260,32 @@ public final class AgentThreadRepository {
         try st.bind(10, reasoningModel)
         try st.bind(11, iso.string(from: date))
         try st.bind(12, id.value.uuidString)
+        _ = try st.step()
+        let changes = try db.prepare("SELECT changes();")
+        return try changes.step() && changes.columnInt64(0) == 1
+    }
+
+    /// Run-actor lock only. `setPickerConfig` does not write these columns.
+    /// Missing rows return false.
+    @discardableResult
+    public func setActor(
+        id: AgentThreadID,
+        actor: RunActor,
+        lockedAt: Date?,
+        executionTarget: ExecutionTarget?
+    ) throws -> Bool {
+        Self.bumpIdentityRevision()
+        let st = try db.prepare("""
+            UPDATE agent_threads
+            SET actor_json = ?,
+                actor_locked_at = ?,
+                execution_target = ?
+            WHERE id = ?;
+            """)
+        try st.bind(1, encodeRunActor(actor))
+        try st.bind(2, lockedAt.map { iso.string(from: $0) })
+        try st.bind(3, executionTarget?.rawValue)
+        try st.bind(4, id.value.uuidString)
         _ = try st.step()
         let changes = try db.prepare("SELECT changes();")
         return try changes.step() && changes.columnInt64(0) == 1

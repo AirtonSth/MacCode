@@ -433,8 +433,53 @@ public struct AgentPermissionCapsule: View {
 // MARK: - Run as
 
 public enum AgentRunAsUserPresentation {
+    public static let noBotLabel = "No Bot"
+    public static let continueWithoutBotLabel = "Continuar sem bot"
+    public static let botActorIcon = "cpu"
+
     public static func isInteractive(userCount: Int, identityLocked: Bool, runLocked: Bool) -> Bool {
         userCount > 1 && !identityLocked && !runLocked
+    }
+
+    /// The chip opens a popover when there is anything to choose, or when a
+    /// locked bot thread offers the hand-off.
+    public static func isInteractive(
+        userCount: Int,
+        botsAvailable: Bool,
+        actor: RunActor,
+        identityLocked: Bool,
+        runLocked: Bool
+    ) -> Bool {
+        if runLocked { return false }
+        if identityLocked { return actor.botID != nil }
+        return userCount > 1 || botsAvailable
+    }
+
+    /// Chip label lookup: one name for one bot, never the bot list.
+    public static func resolveBotName(botID: BotID?, lookup: (BotID) -> String?) -> String? {
+        botID.flatMap(lookup)
+    }
+
+    public static func identityLocked(providerLocked: Bool, actorLockedAt: Date?) -> Bool {
+        providerLocked || actorLockedAt != nil
+    }
+
+    public static func targetBadge(_ target: ExecutionTarget) -> String {
+        target == .vm ? "VM" : "Mac"
+    }
+
+    public static func actorTitle(botName: String, target: ExecutionTarget) -> String {
+        "\(botName) · \(targetBadge(target))"
+    }
+
+    public static func actorIcon(identityLocked: Bool) -> String {
+        identityLocked ? "lock.fill" : botActorIcon
+    }
+
+    public static func actorAccessibilityLabel(botName: String, target: ExecutionTarget, identityLocked: Bool) -> String {
+        identityLocked
+            ? "Locked to bot \(botName)"
+            : "Run as bot \(botName) on \(targetBadge(target))"
     }
 
     public static func helpText(
@@ -455,13 +500,60 @@ public enum AgentRunAsUserPresentation {
 }
 
 public struct AgentRunAsUserCapsule: View {
-    public let users: [AgentRunAsUser]
+    public let usersProvider: () -> [AgentRunAsUser]
     public let selected: AgentRunAsUser
     public let runLocked: Bool
     public let identityLocked: Bool
     public let accessibilityIdentifier: String
+    public let actor: RunActor
+    /// Read only while the popover is open.
+    public let botsProvider: (() -> [BotDefinition])?
+    /// Single-name lookup for the chip label; never the full list.
+    public let botNameLookup: (BotID) -> String?
+    /// False hides the locked-thread hand-off (embedded desk without a host).
+    public let canContinueWithoutBot: Bool
+    public let executionTarget: (BotID) -> ExecutionTarget
     public let onSelect: (AgentRunAsUser) -> Void
+    public let onSelectActor: (RunActor) -> Void
+    public let onContinueWithoutBot: () -> Void
     public let onAppear: (() -> Void)?
+
+    @State private var isPresented = false
+    @State private var users: [AgentRunAsUser] = []
+    @State private var bots: [BotDefinition] = []
+    @State private var actorName: String?
+
+    public init(
+        usersProvider: @escaping () -> [AgentRunAsUser],
+        selected: AgentRunAsUser,
+        runLocked: Bool,
+        identityLocked: Bool,
+        accessibilityIdentifier: String,
+        actor: RunActor = .none,
+        botsProvider: (() -> [BotDefinition])? = nil,
+        botName: @escaping (BotID) -> String? = { _ in nil },
+        canContinueWithoutBot: Bool = true,
+        executionTarget: @escaping (BotID) -> ExecutionTarget = { _ in .mac },
+        onSelect: @escaping (AgentRunAsUser) -> Void,
+        onSelectActor: @escaping (RunActor) -> Void = { _ in },
+        onContinueWithoutBot: @escaping () -> Void = {},
+        onAppear: (() -> Void)? = nil
+    ) {
+        self.usersProvider = usersProvider
+        self.selected = selected
+        self.runLocked = runLocked
+        self.identityLocked = identityLocked
+        self.accessibilityIdentifier = accessibilityIdentifier
+        self.actor = actor
+        self.botsProvider = botsProvider
+        self.botNameLookup = botName
+        self.canContinueWithoutBot = canContinueWithoutBot
+        self.executionTarget = executionTarget
+        self.onSelect = onSelect
+        self.onSelectActor = onSelectActor
+        self.onContinueWithoutBot = onContinueWithoutBot
+        self.onAppear = onAppear
+    }
 
     public init(
         users: [AgentRunAsUser],
@@ -472,52 +564,52 @@ public struct AgentRunAsUserCapsule: View {
         onSelect: @escaping (AgentRunAsUser) -> Void,
         onAppear: (() -> Void)? = nil
     ) {
-        self.users = users
-        self.selected = selected
-        self.runLocked = runLocked
-        self.identityLocked = identityLocked
-        self.accessibilityIdentifier = accessibilityIdentifier
-        self.onSelect = onSelect
-        self.onAppear = onAppear
+        self.init(
+            usersProvider: { users },
+            selected: selected,
+            runLocked: runLocked,
+            identityLocked: identityLocked,
+            accessibilityIdentifier: accessibilityIdentifier,
+            onSelect: onSelect,
+            onAppear: onAppear
+        )
     }
 
+    private var botID: BotID? { actor.botID }
+    private var botName: String { actorName ?? "Bot" }
+
     private var interactive: Bool {
-        AgentRunAsUserPresentation.isInteractive(
+        if identityLocked && !canContinueWithoutBot { return false }
+        return AgentRunAsUserPresentation.isInteractive(
             userCount: users.count,
+            botsAvailable: botsProvider != nil,
+            actor: actor,
             identityLocked: identityLocked,
             runLocked: runLocked
+        )
+    }
+
+    private var accessibilityText: String {
+        guard let botID else { return "Run as macOS user \(selected.shortName)" }
+        return AgentRunAsUserPresentation.actorAccessibilityLabel(
+            botName: botName,
+            target: executionTarget(botID),
+            identityLocked: identityLocked
         )
     }
 
     public var body: some View {
         Group {
             if interactive {
-                Menu {
-                    ForEach(users, id: \.id) { user in
-                        Button {
-                            onSelect(user)
-                        } label: {
-                            HStack {
-                                if user.uid == selected.uid {
-                                    Image(systemName: "checkmark")
-                                }
-                                Text(user.shortName)
-                                if let full = user.fullName, full != user.shortName {
-                                    Text("· \(full)")
-                                        .foregroundColor(.secondary)
-                                }
-                            }
-                        }
-                    }
+                Button {
+                    isPresented.toggle()
                 } label: {
-                    capsule(chevron: true, locked: false)
+                    capsule(chevron: !identityLocked)
                 }
-                .menuStyle(.button)
                 .buttonStyle(.plain)
-                .menuIndicator(.hidden)
-                .fixedSize()
+                .popover(isPresented: $isPresented, arrowEdge: .bottom) { popover }
             } else {
-                capsule(chevron: false, locked: identityLocked)
+                capsule(chevron: false)
             }
         }
         .disabled(runLocked)
@@ -527,18 +619,87 @@ public struct AgentRunAsUserCapsule: View {
             identityLocked: identityLocked,
             runLocked: runLocked
         ))
-        .accessibilityLabel("Run as macOS user \(selected.shortName)")
+        .accessibilityLabel(accessibilityText)
         .accessibilityIdentifier(accessibilityIdentifier)
-        .onAppear { onAppear?() }
+        .onAppear {
+            users = usersProvider()
+            resolveActorName()
+            onAppear?()
+        }
+        .onChange(of: actor) { _ in resolveActorName() }
     }
 
-    private func capsule(chevron: Bool, locked: Bool) -> some View {
+    private func resolveActorName() {
+        actorName = AgentRunAsUserPresentation.resolveBotName(botID: botID, lookup: botNameLookup)
+    }
+
+    private var popover: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            if identityLocked {
+                AgentCompactMenuRow(
+                    AgentRunAsUserPresentation.continueWithoutBotLabel,
+                    selected: false
+                ) {
+                    onContinueWithoutBot()
+                    isPresented = false
+                }
+            } else {
+                if users.count > 1 {
+                    AgentCompactMenuSection("macOS user")
+                    ForEach(users, id: \.id) { user in
+                        AgentCompactMenuRow(
+                            user.shortName,
+                            detail: user.fullName.flatMap { $0 != user.shortName ? $0 : nil },
+                            selected: user.uid == selected.uid
+                        ) {
+                            onSelect(user)
+                            isPresented = false
+                        }
+                    }
+                }
+                if botsProvider != nil {
+                    AgentCompactMenuRow(AgentRunAsUserPresentation.noBotLabel, selected: actor == .none) {
+                        onSelectActor(.none)
+                        isPresented = false
+                    }
+                    AgentCompactMenuSection("Bots")
+                    ForEach(bots, id: \.id.value) { bot in
+                        AgentCompactMenuRow(
+                            bot.name,
+                            detail: AgentRunAsUserPresentation.targetBadge(executionTarget(bot.id)),
+                            selected: actor == .bot(bot.id)
+                        ) {
+                            onSelectActor(.bot(bot.id))
+                            isPresented = false
+                        }
+                    }
+                }
+            }
+        }
+        .padding(DS.Space.sm)
+        .background(DS.Palette.surfaceOverlay)
+        .fixedSize(horizontal: true, vertical: false)
+        .onAppear {
+            users = usersProvider()
+            bots = botsProvider?() ?? []
+        }
+    }
+
+    private func capsule(chevron: Bool) -> some View {
         AgentComposerCapsule {
-            AgentComposerCapsuleLabel(
-                icon: locked ? "lock.fill" : "person.fill",
-                title: selected.shortName,
-                chevron: chevron
-            )
+            if let botID {
+                AgentComposerCapsuleLabel(
+                    icon: AgentRunAsUserPresentation.actorIcon(identityLocked: identityLocked),
+                    title: AgentRunAsUserPresentation.actorTitle(botName: botName, target: executionTarget(botID)),
+                    chevron: chevron
+                )
+            } else {
+                AgentComposerCapsuleLabel(
+                    icon: identityLocked ? "lock.fill" : "person.fill",
+                    title: selected.shortName,
+                    chevron: chevron
+                )
+            }
         }
     }
 }
