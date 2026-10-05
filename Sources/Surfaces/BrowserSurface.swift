@@ -222,6 +222,8 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     private var waitForToken = 0
     private var isClosed = false
     public var onNavigationChange: ((SurfaceID, String, String?) -> Void)?
+    /// Fires on every page-load start/finish so the host can refresh busy listings.
+    public var onBusyStateChanged: ((Bool) -> Void)?
     /// WKHTTPCookieStore snapshot for bot login-wait. Names and values only.
     public var onHTTPCookiesCaptured: ((SurfaceID, [HTTPCookie], String, String?) -> Void)?
     public var externalURLOpener: ((URL) -> Void)?
@@ -536,6 +538,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.updateLoadingChrome(isLoading: webView.isLoading)
+                self.onBusyStateChanged?(webView.isLoading)
             }
         }
         // Push title changes to the iOS mirror as they happen (IMP-MAC_BROWSER-011),

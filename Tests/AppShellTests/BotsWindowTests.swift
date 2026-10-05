@@ -22,6 +22,38 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(payload["metadata"], .object(["busy": .string("")]))
     }
 
+    @MainActor
+    func test_clientSurfaceDescriptorInjectsBusyForLiveNonAgentSurfaces_butNeverAgentApp() {
+        final class BusyStub: Surface {
+            let descriptor: SurfaceDescriptor
+            let view = NSView()
+            var isBusy: Bool { true }
+            init(_ descriptor: SurfaceDescriptor) { self.descriptor = descriptor }
+            func focus() {}
+            func unfocus() {}
+            func close() {}
+            func sendText(_ text: String) {}
+            func readText() -> String { "" }
+            func snapshot() -> [String: String] { [:] }
+        }
+        let types: [SurfaceType] = [.terminal, .ssh, .browser, .rightSidebarTool, .agentApp]
+        let descriptors = types.map { SurfaceDescriptor(type: $0, title: "t") }
+        let stubs = descriptors.map(BusyStub.init)
+        stubs.forEach { SurfaceRegistry.shared.register($0) }
+        defer { descriptors.forEach { SurfaceRegistry.shared.unregister($0.id) } }
+
+        for descriptor in descriptors {
+            let client = AppCommandRouter.clientSurfaceDescriptor(descriptor)
+            if descriptor.type == .agentApp {
+                XCTAssertEqual(client, descriptor, "agent runs already list as threads")
+            } else {
+                XCTAssertEqual(client.metadata["busy"], "true", "\(descriptor.type) busy must reach iOS")
+            }
+        }
+        let idle = SurfaceDescriptor(type: .browser, title: "idle")
+        XCTAssertEqual(AppCommandRouter.clientSurfaceDescriptor(idle), idle, "unregistered surface stays unchanged")
+    }
+
     func test_surfaceBusyPayloadCarriesSurfaceIDAndClearsWithEmptyString_becauseIOSListsBusyTerminals() {
         let ws = WorkspaceID(UUID())
         let sid = SurfaceID(UUID())

@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import Combine
 import SwiftUI
 import CoreModel
 import AgentRuntime
@@ -2172,6 +2173,10 @@ public final class DiffPanelSurface: NSObject, Surface {
     public private(set) var descriptor: SurfaceDescriptor
     public let view: NSView
     public let viewModel: DiffPanelViewModel
+    public var isBusy: Bool { viewModel.isBusy }
+    /// Fires when a mutating git action starts or finishes.
+    public var onBusyStateChanged: ((Bool) -> Void)?
+    private var busyCancellable: AnyCancellable?
 
     public init(workspaceID: WorkspaceID, cwd: String, title: String = "Diff",
                 settings: SettingsStore? = nil,
@@ -2201,6 +2206,9 @@ public final class DiffPanelSurface: NSObject, Surface {
                 surfaceID: surfaceID,
                 succeeded: succeeded
             ))
+        }
+        busyCancellable = viewModel.$isBusy.removeDuplicates().dropFirst().sink { [weak self] busy in
+            self?.onBusyStateChanged?(busy)
         }
     }
 

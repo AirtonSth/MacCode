@@ -751,7 +751,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                                 workspace: wid
                             )
                         } else {
-                            surface = try SSHSurface(
+                            let ssh = try SSHSurface(
                                 workspaceID: wid,
                                 cwd: cwd,
                                 title: title,
@@ -761,6 +761,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                                 settingsRepo: ctx.settingsRepo,
                                 terminalFontSize: terminalFontSize
                             )
+                            configureSSHBusy(ssh, workspace: wid)
+                            surface = ssh
                         }
                     case .browser:
                         let botID = desc.metadata["bot_id"].flatMap { UUID(uuidString: $0) }.map(BotID.init)
@@ -771,7 +773,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             }
                         }
                         surface = configureBrowserSurface(
-                            BrowserSurface(workspaceID: wid, initialURL: restored, title: title, botID: botID)
+                            BrowserSurface(workspaceID: wid, initialURL: restored, title: title, botID: botID),
+                            workspace: wid
                         )
                     case .agentApp:
                         // Per-surface thread binding restore: prefer the persisted
@@ -916,7 +919,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     case .filePreview:
                         surface = FilePreviewSurface(workspaceID: wid, filePath: desc.metadata["path"], title: title)
                     case .rightSidebarTool:
-                        surface = DiffPanelSurface(workspaceID: wid, cwd: cwd, title: title, settings: SettingsStore(db: ctx.db))
+                        let diff = DiffPanelSurface(workspaceID: wid, cwd: cwd, title: title, settings: SettingsStore(db: ctx.db))
+                        diff.onBusyStateChanged = { [weak self, weak diff] busy in
+                            guard let self, let diff else { return }
+                            self.surfaceBusyDidChange(workspace: wid, surface: diff.descriptor.id, busy: busy)
+                        }
+                        surface = diff
                     }
                     idMap[desc.id] = surface.descriptor.id
                     SurfaceRegistry.shared.register(surface)
@@ -1804,7 +1812,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func makeBrowserSurface(workspace: WorkspaceID, url: URL, title: String) -> SurfaceDescriptor {
-        let browser = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: url, title: title))
+        let browser = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: url, title: title), workspace: workspace)
         SurfaceRegistry.shared.register(browser)
         var desc = browser.descriptor
         // Persist the target up front so an app restart before the first
@@ -7546,7 +7554,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return s
     }
 
-    private func configureBrowserSurface(_ browser: BrowserSurface) -> BrowserSurface {
+    private func configureBrowserSurface(_ browser: BrowserSurface, workspace: WorkspaceID) -> BrowserSurface {
+        browser.onBusyStateChanged = { [weak self, weak browser] busy in
+            guard let self, let browser else { return }
+            self.surfaceBusyDidChange(workspace: workspace, surface: browser.descriptor.id, busy: busy)
+        }
         browser.onNavigationChange = { [weak self] surfaceID, url, title in
             self?.persistBrowserNavigation(surfaceID: surfaceID, url: url, title: title)
             let fields = BotBrowserHostState.makePayload(surfaceID: surfaceID, url: url, title: title)
@@ -7560,6 +7572,24 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             self?.persistBotBrowserCookies(surfaceID: surfaceID, cookies: cookies, url: url, title: title)
         }
         return browser
+    }
+
+    private func surfaceBusyDidChange(workspace: WorkspaceID, surface: SurfaceID, busy: Bool) {
+        publishWorkspaceUpdated(workspace, metadata: Self.workspaceBusyMetadata(isWorkspaceBusy(workspace)))
+        windowController?.activeThreadsDidChange()
+        if shouldPublishLayoutEvents {
+            EventBus.shared.publish(
+                kind: .surfaceUpdated,
+                payload: Self.surfaceBusyPayload(workspace: workspace, surface: surface, busy: busy)
+            )
+        }
+    }
+
+    private func configureSSHBusy(_ ssh: SSHSurface, workspace: WorkspaceID) {
+        ssh.onBusyStateChanged = { [weak self, weak ssh] busy in
+            guard let self, let ssh else { return }
+            self.surfaceBusyDidChange(workspace: workspace, surface: ssh.descriptor.id, busy: busy)
+        }
     }
 
     private func configureTerminalSurface(
@@ -7587,15 +7617,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             )
         }
         terminal.onBusyStateChanged = { [weak self, weak terminal] busy in
-            guard let self else { return }
-            self.publishWorkspaceUpdated(workspace, metadata: Self.workspaceBusyMetadata(self.isWorkspaceBusy(workspace)))
-            self.windowController?.activeThreadsDidChange()
-            if let terminal, self.shouldPublishLayoutEvents {
-                EventBus.shared.publish(
-                    kind: .surfaceUpdated,
-                    payload: Self.surfaceBusyPayload(workspace: workspace, surface: terminal.descriptor.id, busy: busy)
-                )
-            }
+            guard let self, let terminal else { return }
+            self.surfaceBusyDidChange(workspace: workspace, surface: terminal.descriptor.id, busy: busy)
         }
         terminal.onBecameFocused = { [weak self, weak terminal] in
             guard let self, let terminal else { return }
@@ -8130,9 +8153,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return (ws.layout.find(paneID: pane)?.surfaces ?? []).map(Self.clientSurfaceDescriptor)
     }
 
-    /// Client-facing copy: live terminal busy is injected at read time, never persisted.
+    /// Client-facing copy: live surface busy is injected at read time, never persisted.
     static func clientSurfaceDescriptor(_ descriptor: SurfaceDescriptor) -> SurfaceDescriptor {
-        guard descriptor.type == .terminal,
+        guard descriptor.type != .agentApp,
               SurfaceRegistry.shared.surface(descriptor.id)?.isBusy == true else { return descriptor }
         var copy = descriptor
         copy.metadata["busy"] = "true"
@@ -8498,7 +8521,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         workspace: workspace
                     )
                 } else {
-                    surface = try SSHSurface(
+                    let ssh = try SSHSurface(
                         workspaceID: workspace,
                         cwd: cwd,
                         title: baseTitle,
@@ -8507,12 +8530,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         settingsRepo: context?.settingsRepo,
                         terminalFontSize: terminalFontSize
                     )
+                    configureSSHBusy(ssh, workspace: workspace)
+                    surface = ssh
                 }
             case .browser:
                 // bot_id keeps the reopened tab on the bot's WKWebView data
                 // store (cookies/session) and its BotBrowserStore target.
                 let botID = restore?.metadata["bot_id"].flatMap { UUID(uuidString: $0) }.map(BotID.init)
-                surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: restore.flatMap(restoredBrowserURL(from:)), title: baseTitle, botID: botID))
+                surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: restore.flatMap(restoredBrowserURL(from:)), title: baseTitle, botID: botID), workspace: workspace)
             case .agentApp:
                 guard let ctx = context else { return descriptor }
                 let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, draftRepo: AgentThreadDraftRepository(db: ctx.db), attachmentStore: AgentAttachmentStore(root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)), queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId, orchestrationRuntime: ctx.orchestrationRuntime, accountPanel: distillAccountsPanel)
@@ -8670,7 +8695,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     feed.onClose = { EventBus.shared.unsubscribe(token) }
                     surface = feed
                 } else {
-                    surface = DiffPanelSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, settings: context.map { SettingsStore(db: $0.db) })
+                    let diff = DiffPanelSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, settings: context.map { SettingsStore(db: $0.db) })
+                    diff.onBusyStateChanged = { [weak self, weak diff] busy in
+                        guard let self, let diff else { return }
+                        self.surfaceBusyDidChange(workspace: workspace, surface: diff.descriptor.id, busy: busy)
+                    }
+                    surface = diff
                 }
             }
             var finalDescriptor = SurfaceDescriptor(id: surface.descriptor.id, type: type, title: baseTitle, iconName: surface.descriptor.iconName, metadata: surface.descriptor.metadata)
@@ -8728,6 +8758,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             settingsRepo: context?.settingsRepo,
             terminalFontSize: terminalFontSize
         )
+        configureSSHBusy(surface, workspace: workspace)
         surface.connectForRouter(profile)
         SurfaceRegistry.shared.register(surface)
         return surface.descriptor

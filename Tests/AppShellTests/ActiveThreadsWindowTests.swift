@@ -319,22 +319,24 @@ final class ActiveThreadsWindowTests: XCTestCase {
         Workspace(name: name, cwd: "/tmp", layout: .pane(PaneNode(surfaces: surfaces)))
     }
 
-    func test_projectorListsOnlyBusyTerminals_inWorkspaceThenLayoutOrder() {
-        let busyA = SurfaceDescriptor(type: .terminal, title: "build")
+    func test_projectorListsEveryBusySurfaceExceptAgentApp_inWorkspaceThenLayoutOrder() {
+        let busyTerminal = SurfaceDescriptor(type: .terminal, title: "build")
         let idle = SurfaceDescriptor(type: .terminal, title: "idle")
-        let busyBrowser = SurfaceDescriptor(type: .browser, title: "page")
+        let busySSH = SurfaceDescriptor(type: .ssh, title: "")
+        let busyBrowser = SurfaceDescriptor(type: .browser, title: "")
+        let busyDiff = SurfaceDescriptor(type: .rightSidebarTool, title: "")
         let busyAgentApp = SurfaceDescriptor(type: .agentApp, title: "agent")
         let busyUntitled = SurfaceDescriptor(type: .terminal, title: "")
-        let first = workspace("One", [busyA, idle, busyBrowser, busyAgentApp])
-        let second = workspace("Two", [busyUntitled])
-        let busy: Set<SurfaceID> = [busyA.id, busyBrowser.id, busyAgentApp.id, busyUntitled.id]
+        let first = workspace("One", [busyTerminal, idle, busySSH, busyBrowser, busyAgentApp])
+        let second = workspace("Two", [busyDiff, busyUntitled])
+        let busy: Set<SurfaceID> = [busyTerminal.id, busySSH.id, busyBrowser.id, busyDiff.id, busyAgentApp.id, busyUntitled.id]
 
         let items = ActiveSurfaceProjector.items(workspaces: [first, second]) { busy.contains($0.id) }
 
-        XCTAssertEqual(items.map(\.surfaceID), [busyA.id, busyUntitled.id],
-                       "only busy terminals count, ordered by workspace then layout")
-        XCTAssertEqual(items.map(\.title), ["build", "Terminal"])
-        XCTAssertEqual(items.map(\.workspaceName), ["One", "Two"])
+        XCTAssertEqual(items.map(\.surfaceID), [busyTerminal.id, busySSH.id, busyBrowser.id, busyDiff.id, busyUntitled.id],
+                       "every busy non-agentApp surface counts, ordered by workspace then layout")
+        XCTAssertEqual(items.map(\.title), ["build", "Terminal", "Browser", "Diff", "Terminal"])
+        XCTAssertEqual(items.map(\.workspaceName), ["One", "One", "One", "Two", "Two"])
         XCTAssertEqual(items.first?.workspaceID, first.id)
     }
 
@@ -362,11 +364,11 @@ final class ActiveThreadsWindowTests: XCTestCase {
         let first = try router.createWorkspace(name: "first", cwd: NSTemporaryDirectory())
         _ = try router.createWorkspace(name: "second", cwd: NSTemporaryDirectory())
         XCTAssertNotEqual(context.state.window.selectedWorkspaceID, first.id)
-        let target = try XCTUnwrap(
-            context.state.workspaces[first.id]?.layout.paneIDs()
-                .compactMap { context.state.workspaces[first.id]?.layout.find(paneID: $0)?.surfaces.first }
-                .first
-        )
+        let paneID = try XCTUnwrap(context.state.workspaces[first.id]?.layout.paneIDs().first)
+        let target = try XCTUnwrap(context.state.workspaces[first.id]?.layout.find(paneID: paneID)?.surfaces.first)
+        let other = try router.createSurface(workspace: first.id, type: .browser, paneID: paneID, title: "other")
+        XCTAssertEqual(context.state.workspaces[first.id]?.layout.find(paneID: paneID)?.selectedSurfaceID, other.id,
+                       "precondition: the newer tab is selected so opening the first one must change selection")
         let item = ActiveSurfaceItem(
             id: target.id.value, workspaceID: first.id, workspaceName: "first",
             surfaceID: target.id, title: target.title, type: target.type
@@ -378,5 +380,7 @@ final class ActiveThreadsWindowTests: XCTestCase {
         XCTAssertNil(viewModel.errorMessage)
         XCTAssertEqual(context.state.window.selectedWorkspaceID, first.id,
                        "opening a busy terminal must switch to its workspace")
+        XCTAssertEqual(context.state.workspaces[first.id]?.layout.find(paneID: paneID)?.selectedSurfaceID, target.id,
+                       "opening a busy tab must select it inside its pane, not just its workspace")
     }
 }

@@ -103,7 +103,11 @@ final class SSHSurface: NSObject, SSHTransferSurface, TerminalRuntimeRoutingSurf
     private var transferDividerWidthConstraint: NSLayoutConstraint?
     private var dragStartSidebarWidth: CGFloat?
     private var dragStartTransferWidth: CGFloat?
-    private var terminal: TerminalSurface?
+    private var terminal: TerminalSurface? {
+        didSet { terminal?.onBusyStateChanged = { [weak self] busy in self?.onBusyStateChanged?(busy) } }
+    }
+    var isBusy: Bool { terminal?.isBusy ?? false }
+    var onBusyStateChanged: ((Bool) -> Void)?
     private var isVisible = true
     private var shouldReplayHistoryOnNextConnect: Bool
     private struct ConnectionRequest {

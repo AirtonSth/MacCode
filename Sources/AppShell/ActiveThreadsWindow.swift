@@ -16,7 +16,7 @@ public struct ActiveSurfaceItem: Identifiable, Equatable, Sendable {
     public let type: SurfaceType
 }
 
-/// Busy terminal surfaces across workspaces. Agent App surfaces are excluded:
+/// Busy surfaces (terminal, ssh, browser, diff, ...) across workspaces. Agent App surfaces are excluded:
 /// their runs already appear as active threads and there is no cheap dedupe.
 public enum ActiveSurfaceProjector {
     public static func items(
@@ -27,19 +27,28 @@ public enum ActiveSurfaceProjector {
         for workspace in workspaces {
             for paneID in workspace.layout.paneIDs() {
                 for descriptor in workspace.layout.find(paneID: paneID)?.surfaces ?? []
-                where descriptor.type == .terminal && isBusy(descriptor) {
+                where descriptor.type != .agentApp && isBusy(descriptor) {
                     result.append(ActiveSurfaceItem(
                         id: descriptor.id.value,
                         workspaceID: workspace.id,
                         workspaceName: workspace.name,
                         surfaceID: descriptor.id,
-                        title: descriptor.title.isEmpty ? "Terminal" : descriptor.title,
+                        title: descriptor.title.isEmpty ? Self.fallbackTitle(for: descriptor.type) : descriptor.title,
                         type: descriptor.type
                     ))
                 }
             }
         }
         return result
+    }
+
+    private static func fallbackTitle(for type: SurfaceType) -> String {
+        switch type {
+        case .terminal, .ssh: return "Terminal"
+        case .browser: return "Browser"
+        case .rightSidebarTool: return "Diff"
+        default: return "Tab"
+        }
     }
 
     @MainActor
@@ -141,13 +150,13 @@ public final class ActiveThreadsViewModel: ObservableObject {
         switch selectedTab {
         case .active:
             if activeCount == 0 {
-                return "No agents or terminals running right now"
+                return "Nothing running right now"
             }
             let threads = activeItems.count
-            let terminals = activeSurfaces.count
+            let tabs = activeSurfaces.count
             var parts: [String] = []
             if threads > 0 { parts.append(threads == 1 ? "1 agent thread" : "\(threads) agent threads") }
-            if terminals > 0 { parts.append(terminals == 1 ? "1 terminal" : "\(terminals) terminals") }
+            if tabs > 0 { parts.append(tabs == 1 ? "1 running tab" : "\(tabs) running tabs") }
             return parts.joined(separator: " and ") + (activeCount == 1 ? " is running" : " are running")
         case .lastFinished:
             return "Recent completed, failed, cancelled, and interrupted runs"
@@ -593,9 +602,19 @@ private struct ActiveTerminalCard: View {
     let item: ActiveSurfaceItem
     let onOpen: () -> Void
 
+    private var icon: String {
+        switch item.type {
+        case .terminal: return "terminal"
+        case .ssh: return "network"
+        case .browser: return "globe"
+        case .rightSidebarTool: return "doc.text.magnifyingglass"
+        default: return "square.stack"
+        }
+    }
+
     var body: some View {
         AgentOverviewCard(
-            icon: "terminal",
+            icon: icon,
             iconColor: Color.blue,
             title: item.title,
             subtitle: item.workspaceName,
