@@ -418,4 +418,35 @@ final class BotBrowserRouterTests: XCTestCase {
         XCTAssertTrue(result.payload.contains("NÃO foi executada"))
         XCTAssertTrue(fake.recorded().isEmpty)
     }
+
+    @MainActor
+    func test_browserActRefusedWhenUserTakesControlDuringProvisioning() async throws {
+        // WHY: control can flip while the guest provisions; the act must re-check right before it fires.
+        let appSupport = NSTemporaryDirectory() + "RC2BotBrowserRace-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let router = AppCommandRouter(context: ctx)
+        let fake = FakeBotBrowserBridge()
+        router.botBrowserBridge = fake
+        let control = BotComputerControl()
+        router.botComputerControl = control
+        let workspace = try router.createWorkspace(name: "desk", cwd: NSTemporaryDirectory())
+        let bot = try ctx.botStore.create(name: "Piper", title: "", description: "", workspaceID: workspace.id)
+        XCTAssertFalse(control.isControlledByUser(bot.id))
+        let botID = bot.id
+        router.botBrowserBeforeBridgeActForTesting = { control.take(botID) }
+        let store = BotBrowserStore(appSupportDirectory: URL(fileURLWithPath: appSupport, isDirectory: true))
+        try BotBrowserHost.requestAction(
+            store: store,
+            action: BotBrowserPendingAction(
+                id: "act-race", botID: bot.id.value.uuidString.lowercased(),
+                kind: BotBrowserCatalog.act, action: "click", ref: "e1", text: ""
+            ),
+            notify: { _ in }
+        )
+        await router.reconcileBotBrowserActions()
+        let result = try XCTUnwrap(try store.takeActionResult(id: "act-race"))
+        XCTAssertTrue(result.payload.contains("NÃO foi executada"))
+        XCTAssertTrue(fake.recorded().isEmpty)
+    }
 }

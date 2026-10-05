@@ -438,7 +438,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Approves or declines a pending Mac-execution request; wired by the host.
     public var botMacExecutionResolver: (@MainActor (AgentThreadID, Bool) async -> Void)?
     /// Returns a user-facing error when the bot VM cannot run; nil when ready. Wired by the host.
-    public var botVMPreflight: ((BotID) async -> String?)?
+    public var botVMPreflight: ((BotID, String) async -> String?)?
     /// Starts (provisions) the bot VM; returns a user-facing error or nil. Wired by the host.
     public var botVMProvision: ((BotID) async -> String?)?
     /// Set when the VM preflight failed; drives the "VM indisponível" banner.
@@ -6135,7 +6135,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         guard executionTarget(for: botID) == .vm else { return false }
         guard let preflight = botVMPreflight else { return false }
-        if let failure = await preflight(botID) {
+        if let failure = await preflight(botID, workspace) {
             statusMessage = "VM indisponível: \(failure)"
             vmUnavailableBotID = botID
             return true

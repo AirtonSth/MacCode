@@ -37,12 +37,19 @@ extension AppCommandRouter {
         )
     }
 
-    /// nil when Docker answers; otherwise the user-facing failure.
-    func botVMPreflight(_ botID: BotID) async -> String? {
+    /// nil when Docker answers and the run's workspace is mounted; otherwise the user-facing failure.
+    /// A bot already running elsewhere keeps its container: the send queues instead of remounting.
+    func botVMPreflight(_ botID: BotID, workspace: String) async -> String? {
+        guard let ctx = context else { return "Contexto indisponível." }
         let docker = botVMDocker
+        let service = botVMService(appSupport: ctx.appSupportDirectory)
+        let registered = Set(ctx.state.workspaces.values.map(\.cwd))
         return await Task.detached(priority: .userInitiated) { () -> String? in
             do {
                 _ = try docker.info()
+                if BotVMRunRegistry.shared.active(botID: botID) == nil {
+                    try service.ensureWorkspaceMounted(botID: botID, workspace: workspace, registered: registered)
+                }
                 return nil
             } catch {
                 return (error as? LocalizedError)?.errorDescription ?? String(describing: error)
@@ -50,14 +57,18 @@ extension AppCommandRouter {
         }.value
     }
 
-    /// nil on success; otherwise the user-facing failure.
-    func provisionBotVM(_ botID: BotID) async -> String? {
-        guard let appSupport = context?.appSupportDirectory else { return "Contexto indisponível." }
-        let service = botVMProvisionServiceForTesting ?? BotComputerGuestService(
+    private func botVMService(appSupport: URL) -> BotComputerGuestService {
+        botVMProvisionServiceForTesting ?? BotComputerGuestService(
             appSupport: appSupport,
             docker: botVMDocker,
             recipeContext: AppShellResourceBundle.computerGuestRecipeURL()
         )
+    }
+
+    /// nil on success; otherwise the user-facing failure.
+    func provisionBotVM(_ botID: BotID) async -> String? {
+        guard let appSupport = context?.appSupportDirectory else { return "Contexto indisponível." }
+        let service = botVMService(appSupport: appSupport)
         return await Task.detached(priority: .userInitiated) { () -> String? in
             do {
                 _ = try service.provision(botID: botID)

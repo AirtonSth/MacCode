@@ -151,7 +151,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
 
     func test_preflightFailureBlocksSendWithoutFallbackThenRunOnMacSwitches() async throws {
         let f = try makeFixture()
-        f.vm.botVMPreflight = { _ in "docker parado" }
+        f.vm.botVMPreflight = { _, _ in "docker parado" }
         f.vm.setRunActor(.bot(f.bot.id))
         f.vm.prompt = "oi"
         await f.vm.send()
@@ -204,6 +204,48 @@ final class BotVMFailureHandlingTests: XCTestCase {
         let saved = try JSONDecoder().decode([String].self, from: Data(contentsOf: url))
         XCTAssertEqual(saved, [fresh.path, live.path].sorted())
         XCTAssertFalse(saved.contains(gone.path), "a removed workspace must not break container create")
+    }
+
+    private final class RecordingDockerRun: @unchecked Sendable {
+        private let lock = NSLock()
+        private var recorded: [[String]] = []
+        var calls: [[String]] { lock.withLock { recorded } }
+        func run(_ args: [String]) throws -> Data {
+            lock.withLock { recorded.append(args) }
+            switch args.first {
+            case "inspect":
+                if args.contains(where: { $0.contains("Config.Labels\"") }) {
+                    return Data(BotComputerGuestSpec.recipeRevision.utf8)
+                }
+                if args.contains("{{.Id}}") { return Data("img".utf8) }
+                return Data("true img 49152  {}".utf8)
+            case "create": return Data("cid".utf8)
+            case "exec": return BotComputerGuestObserve.pngSignature + Data(repeating: 1, count: 16)
+            default: return Data()
+            }
+        }
+    }
+
+    /// WHY: a thread's workspace must be bind-mounted in the bot VM before the send is allowed, or the bot edits nothing.
+    func test_preflightMountsRunWorkspaceBeforeAllowingSend() async throws {
+        let f = try makeFixture()
+        let docker = RecordingDockerRun()
+        f.router.botVMDocker = BotComputerDockerCLI(run: { try docker.run($0) })
+        let failure = await f.router.botVMPreflight(f.bot.id, workspace: f.workspaceDir.path)
+        XCTAssertNil(failure)
+        let create = try XCTUnwrap(docker.calls.first { $0.first == "create" })
+        let ws = f.workspaceDir.path
+        XCTAssertTrue(create.contains("\(ws):\(ws)"), "missing bind in \(create)")
+    }
+
+    /// WHY: an unregistered path must block the send instead of mounting arbitrary host directories.
+    func test_preflightRefusesUnregisteredWorkspace() async throws {
+        let f = try makeFixture()
+        let docker = RecordingDockerRun()
+        f.router.botVMDocker = BotComputerDockerCLI(run: { try docker.run($0) })
+        let failure = await f.router.botVMPreflight(f.bot.id, workspace: "/tmp/rc-not-registered/x")
+        XCTAssertNotNil(failure)
+        XCTAssertFalse(docker.calls.contains { $0.first == "create" })
     }
 
     func test_deletingBotClosesManualRequestsAndForgetsControl() async throws {

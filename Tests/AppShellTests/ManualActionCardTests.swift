@@ -222,7 +222,7 @@ final class ManualActionCardTests: XCTestCase {
         let control = BotComputerControl()
         f.vm.botComputerControl = control
         try lockToBotVM(f)
-        f.vm.botVMPreflight = { _ in nil }
+        f.vm.botVMPreflight = { _, _ in nil }
         f.vm.botThreadLinker = { _, _ in }
         f.vm.botPromptTransform = { _, text, _, _ in text }
         f.vm.botRunStarted = { _, _, _ in }

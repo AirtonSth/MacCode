@@ -441,58 +441,42 @@ final class BotBrowserStoreTests: XCTestCase {
         }
     }
 
-    func test_waitLoginPollsLiveHostStateAndCompletesOnURLChange() throws {
-        // WHY: Playwright lanes feed no cookies, so the login wait must see
-        // the LIVE page URL through the host (the user logs in inside the
-        // Playwright Chrome, never touching the store) and complete when the
-        // browser left the login page.
+    func test_waitLoginCreatesOneRequestOnCallerThreadAndReturnsPaused() throws {
+        // WHY: wait_login must pause the run once on the caller's thread; polling re-requested the card every 2s.
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("rc-bot-browser-wait-live-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("rc-bot-browser-wait-pause-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let bot = BotID()
+        let thread = UUID().uuidString
         let store = BotBrowserStore(appSupportDirectory: root)
-        let service = BotBrowserService(callerBotID: bot, store: store)
+        let service = BotBrowserService(callerBotID: bot, store: store, callerThreadID: thread)
         _ = try service.persistNavigation(url: "https://example.test/login", title: "Sign in")
-        let responder = BotBrowserHostResponder(store: store) { item in
-            XCTAssertEqual(item.kind, BotBrowserCatalog.stateKind, "waitLogin must poll the state kind")
-            return BotBrowserActionResult(
-                id: item.id,
-                botID: item.botID,
-                payload: "{\"url\":\"https://example.test/home\",\"title\":\"Home\",\"content\":\"### Page\"}",
-                error: ""
-            )
-        }
+        let responder = BotBrowserHostResponder(store: store)
         defer { responder.stop() }
 
         let result = try service.call(name: BotBrowserCatalog.waitLogin, arguments: ["timeout_ms": 8_000.0])
-        XCTAssertEqual(result["complete"] as? Bool, true)
-        XCTAssertEqual(result["url"] as? String, "https://example.test/home")
-        XCTAssertEqual(result["user_message"] as? String, "")
-        XCTAssertFalse(responder.seenActions().isEmpty)
+        XCTAssertEqual(result["status"] as? String, "paused")
+        XCTAssertEqual(result["message"] as? String, ManualActionRequest.pauseReply)
+        let seen = responder.seenActions()
+        XCTAssertEqual(seen.count, 1)
+        XCTAssertEqual(seen.first?.kind, BotBrowserCatalog.stateKind)
+        XCTAssertEqual(seen.first?.action, BotBrowserCatalog.waitLoginAction)
+        XCTAssertEqual(seen.first?.threadID, thread)
     }
 
-    func test_waitLoginFallsBackToStoredStateWhenHostIsGone() throws {
-        // WHY: with the app closed the state poll times out; the wait must
-        // then read the persisted page state (legacy tabs persist cookies
-        // there) instead of throwing away a completed login.
+    func test_makeReadsCallerThreadFromEnvironment() throws {
+        // WHY: the MCP process learns the calling thread only through this env key.
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("rc-bot-browser-wait-fallback-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("rc-bot-browser-env-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        let bot = BotID()
-        let store = BotBrowserStore(appSupportDirectory: root)
-        let service = BotBrowserService(callerBotID: bot, store: store)
-        _ = try service.persistNavigation(url: "https://example.test/login", title: "Sign in")
-        try store.persistPageState(
-            BotBrowserPageState(url: "https://example.test/home", cookies: ["session": "1"]),
-            botID: bot
+        let thread = UUID().uuidString
+        let service = try BotBrowserService.make(
+            environment: [
+                BotBrowserCatalog.callerEnvironmentKey: UUID().uuidString,
+                BotBrowserCatalog.threadEnvironmentKey: thread,
+            ],
+            store: BotBrowserStore(appSupportDirectory: root)
         )
-        let responder = BotBrowserHostResponder(store: store) { item in
-            // Simulate a host that answers but cannot serve the state poll.
-            BotBrowserActionResult(id: item.id, botID: item.botID, payload: "", error: "Bot browser is not available. Keep the RemoteCode app running and try again.")
-        }
-        defer { responder.stop() }
-
-        let result = try service.call(name: BotBrowserCatalog.waitLogin, arguments: ["timeout_ms": 8_000.0])
-        XCTAssertEqual(result["complete"] as? Bool, true, "stored logged-in state completes the wait")
+        XCTAssertEqual(service.callerThreadID, thread)
     }
 }
