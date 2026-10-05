@@ -61,3 +61,31 @@ final class BotComputerWorkspaceMountSpecTests: XCTestCase {
         XCTAssertEqual(empty.labels[BotComputerGuestSpec.workspacesLabelKey], BotComputerGuestSpec.workspacesLabel([]))
     }
 }
+
+extension BotComputerWorkspaceMountSpecTests {
+    func test_symlinkResolvingToHomeIsRejected() throws {
+        // WHY: Docker follows symlinks at bind time, so a link to the home dir would mount the whole home.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-symlink-\(UUID().uuidString)", isDirectory: true)
+            .resolvingSymlinksInPath()
+        let fakeHome = root.appendingPathComponent("home", isDirectory: true)
+        try FileManager.default.createDirectory(at: fakeHome, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let link = root.appendingPathComponent("innocent")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: fakeHome)
+        XCTAssertThrowsError(
+            try BotComputerGuestSpec.assertWorkspaceMountPath(link.path, userHome: fakeHome.path)
+        ) { XCTAssertEqual($0 as? BotComputerGuestError, .invalidWorkspacePath(link.path)) }
+        let inside = fakeHome.appendingPathComponent("a")
+        let nestedLink = root.appendingPathComponent("nested")
+        try FileManager.default.createDirectory(at: inside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: nestedLink, withDestinationURL: inside)
+        XCTAssertThrowsError(
+            try BotComputerGuestSpec.assertWorkspaceMountPath(nestedLink.path, userHome: fakeHome.path),
+            "any symlink resolving elsewhere is refused"
+        )
+        let plain = root.appendingPathComponent("plain", isDirectory: true)
+        try FileManager.default.createDirectory(at: plain, withIntermediateDirectories: true)
+        XCTAssertNoThrow(try BotComputerGuestSpec.assertWorkspaceMountPath(plain.path, userHome: fakeHome.path))
+    }
+}

@@ -43,7 +43,8 @@ final class BotComputerWorkspaceMountTests: XCTestCase {
 
     private func makeService(
         _ scripted: ScriptedDocker,
-        stored: [String] = []
+        stored: [String] = [],
+        workspacesWriter: @escaping @Sendable (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) }
     ) throws -> (BotComputerGuestService, BotID, URL) {
         let support = FileManager.default.temporaryDirectory
             .appendingPathComponent("rc-ws-\(UUID().uuidString)", isDirectory: true)
@@ -52,7 +53,8 @@ final class BotComputerWorkspaceMountTests: XCTestCase {
             appSupport: support,
             docker: BotComputerDockerCLI(run: { try scripted.run($0) }),
             observeAttempts: 1,
-            observeDelay: 0
+            observeDelay: 0,
+            workspacesWriter: workspacesWriter
         )
         if !stored.isEmpty {
             let url = BotComputerGuestSpec.workspacesURL(appSupport: support, botID: botID)
@@ -104,6 +106,24 @@ final class BotComputerWorkspaceMountTests: XCTestCase {
         let renames = scripted.calls.filter { $0.first == "rename" }
         XCTAssertEqual(renames.last, ["rename", name + "-backup", name])
         XCTAssertEqual(scripted.calls.last { $0.first == "rm" }, ["rm", "-f", name])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: BotComputerGuestSpec.workspacesURL(appSupport: support, botID: botID).path
+        ))
+    }
+
+    func test_manifestSaveFailureRollsBackToOldContainer() throws {
+        // WHY: the backup may only be dropped once the new bind list is durable, else the VM and manifest diverge.
+        struct WriteFailure: Error {}
+        let scripted = ScriptedDocker(canonicalLabels: [:])
+        let (service, botID, support) = try makeService(scripted, workspacesWriter: { _, _ in throw WriteFailure() })
+        XCTAssertThrowsError(
+            try service.ensureWorkspaceMounted(botID: botID, workspace: workspace, registered: [workspace])
+        ) { XCTAssertTrue($0 is WriteFailure) }
+        XCTAssertEqual(scripted.verbs, ["stop", "rename", "create", "start", "rm", "rename", "start"])
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        XCTAssertEqual(scripted.calls.filter { $0.first == "rename" }.last, ["rename", name + "-backup", name])
+        XCTAssertEqual(scripted.calls.last { $0.first == "start" }, ["start", name])
+        XCTAssertFalse(scripted.calls.contains(["rm", "-f", name + "-backup"]))
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: BotComputerGuestSpec.workspacesURL(appSupport: support, botID: botID).path
         ))

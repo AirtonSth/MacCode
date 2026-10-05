@@ -13,15 +13,15 @@ public final class ManualActionRequestStore: @unchecked Sendable {
             .appendingPathComponent("requests.json")
     }
 
-    public func upsert(_ request: ManualActionRequest) {
-        lock.withLock {
+    public func upsert(_ request: ManualActionRequest) throws {
+        try lock.withLock {
             var items = load()
             if let index = items.firstIndex(where: { $0.id == request.id }) {
                 items[index] = request
             } else {
                 items.append(request)
             }
-            save(items)
+            try save(items)
         }
     }
 
@@ -36,14 +36,15 @@ public final class ManualActionRequestStore: @unchecked Sendable {
     }
 
     /// Only transitions an open/taken request; returns nil for unknown or already closed ids.
+    /// A failed write throws and the request stays open.
     @discardableResult
     public func resolve(
         id: UUID,
         state: ManualActionState,
         note: String? = nil,
         at date: Date = Date()
-    ) -> ManualActionRequest? {
-        lock.withLock {
+    ) throws -> ManualActionRequest? {
+        try lock.withLock {
             var items = load()
             guard let index = items.firstIndex(where: { $0.id == id }), items[index].state.isOpen else {
                 return nil
@@ -51,19 +52,33 @@ public final class ManualActionRequestStore: @unchecked Sendable {
             items[index].state = state
             items[index].note = note
             items[index].resolvedAt = date
-            save(items)
+            try save(items)
+            return items[index]
+        }
+    }
+
+    /// Only transitions open -> taken; nil for unknown, already taken or terminal ids.
+    @discardableResult
+    public func take(id: UUID) throws -> ManualActionRequest? {
+        try lock.withLock {
+            var items = load()
+            guard let index = items.firstIndex(where: { $0.id == id }), items[index].state == .open else {
+                return nil
+            }
+            items[index].state = .taken
+            try save(items)
             return items[index]
         }
     }
 
     /// Stale timers pass an old id; a newer open request is untouched.
     @discardableResult
-    public func expire(id: UUID) -> ManualActionRequest? {
-        resolve(id: id, state: .expired)
+    public func expire(id: UUID) throws -> ManualActionRequest? {
+        try resolve(id: id, state: .expired)
     }
 
-    public func closeAll(botID: BotID) {
-        lock.withLock {
+    public func closeAll(botID: BotID) throws {
+        try lock.withLock {
             var items = load()
             var changed = false
             for index in items.indices where items[index].botID == botID && items[index].state.isOpen {
@@ -71,7 +86,7 @@ public final class ManualActionRequestStore: @unchecked Sendable {
                 items[index].resolvedAt = Date()
                 changed = true
             }
-            if changed { save(items) }
+            if changed { try save(items) }
         }
     }
 
@@ -80,11 +95,11 @@ public final class ManualActionRequestStore: @unchecked Sendable {
         return (try? JSONDecoder().decode([ManualActionRequest].self, from: data)) ?? []
     }
 
-    private func save(_ items: [ManualActionRequest]) {
-        guard let data = try? JSONEncoder().encode(items) else { return }
-        try? FileManager.default.createDirectory(
+    private func save(_ items: [ManualActionRequest]) throws {
+        let data = try JSONEncoder().encode(items)
+        try FileManager.default.createDirectory(
             at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true
         )
-        try? data.write(to: fileURL, options: .atomic)
+        try data.write(to: fileURL, options: .atomic)
     }
 }

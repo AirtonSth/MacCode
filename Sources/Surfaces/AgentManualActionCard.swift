@@ -12,7 +12,19 @@ extension AgentAppViewModel {
 
     func manualActionStoreDidChange() {
         refreshManualAction()
-        guard manualActionStore != nil, manualActionObserver == nil else { return }
+        guard manualActionStore != nil else { return }
+        if manualActionStateObserver == nil {
+            manualActionStateObserver = NotificationCenter.default.addObserver(
+                forName: .manualActionStateChanged, object: nil, queue: .main
+            ) { [weak self] note in
+                let threadID = note.userInfo?[BotHostNotificationKey.threadID] as? AgentThreadID
+                MainActor.assumeIsolated {
+                    guard let self, threadID == nil || threadID == self.selectedThreadId else { return }
+                    self.refreshManualAction()
+                }
+            }
+        }
+        guard manualActionObserver == nil else { return }
         manualActionObserver = NotificationCenter.default.addObserver(
             forName: .botManualActionRequested, object: nil, queue: .main
         ) { [weak self] note in
@@ -25,9 +37,19 @@ extension AgentAppViewModel {
         guard let threadID = request.threadID, threadID == selectedThreadId, let store = manualActionStore else { return }
         // The router persists too; upsert is idempotent and keeps the card independent of observer order.
         if store.all(threadID: threadID).first(where: { $0.id == request.id }) == nil {
-            store.upsert(request)
+            do { try store.upsert(request) } catch { reportManualActionStoreFailure(error) }
         }
         refreshManualAction()
+    }
+
+    private func reportManualActionStoreFailure(_ error: Error) {
+        statusMessage = "Manual action could not be saved: \(error.localizedDescription)"
+    }
+
+    private func postManualActionStateChanged(_ request: ManualActionRequest) {
+        var info: [String: Any] = [:]
+        if let threadID = request.threadID { info[BotHostNotificationKey.threadID] = threadID }
+        NotificationCenter.default.post(name: .manualActionStateChanged, object: nil, userInfo: info)
     }
 
     func refreshManualAction() {
@@ -40,7 +62,7 @@ extension AgentAppViewModel {
         // Control is in-memory only: after a restart a taken request is handed back to the bot.
         if var request = open, request.state == .taken, !botComputerControl.isControlledByUser(request.botID) {
             request.state = .open
-            store.upsert(request)
+            do { try store.upsert(request) } catch { reportManualActionStoreFailure(error) }
             open = request
         }
         let resolved = store.all(threadID: threadID).filter { $0.state == .continued || $0.state == .declined }
@@ -79,10 +101,16 @@ extension AgentAppViewModel {
     }
 
     public func takeManualControl() {
-        guard let store = manualActionStore, var request = openManualAction else { return }
-        request.state = .taken
-        store.upsert(request)
-        botComputerControl.take(request.botID)
+        guard let store = manualActionStore, let request = openManualAction else { return }
+        do {
+            // Stale cards lose here: a terminal or already-taken request is never revived.
+            if try store.take(id: request.id) != nil {
+                botComputerControl.take(request.botID)
+                postManualActionStateChanged(request)
+            }
+        } catch {
+            reportManualActionStoreFailure(error)
+        }
         refreshManualAction()
     }
 
@@ -104,13 +132,25 @@ extension AgentAppViewModel {
         note: String?,
         followUp: (ManualActionRequest) -> String
     ) async {
-        guard let store = manualActionStore, let open = openManualAction,
-              let resolved = store.resolve(id: open.id, state: state, note: note) else {
+        guard let store = manualActionStore, let open = openManualAction else {
+            refreshManualAction()
+            return
+        }
+        let resolved: ManualActionRequest
+        do {
+            guard let result = try store.resolve(id: open.id, state: state, note: note) else {
+                refreshManualAction()
+                return
+            }
+            resolved = result
+        } catch {
+            reportManualActionStoreFailure(error)
             refreshManualAction()
             return
         }
         botComputerControl.release(resolved.botID)
         botComputerControl.dismiss(resolved.id, as: state, note: note)
+        postManualActionStateChanged(resolved)
         refreshManualAction()
         await sendManualActionFollowUp(followUp(resolved))
     }

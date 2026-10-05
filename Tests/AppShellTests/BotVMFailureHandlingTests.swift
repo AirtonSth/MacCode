@@ -209,7 +209,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
     func test_deletingBotClosesManualRequestsAndForgetsControl() async throws {
         let f = try makeFixture()
         let request = ManualActionRequest(botID: f.bot.id, threadID: f.thread.id, kind: .login, reason: "Entre")
-        f.router.manualActionStore.upsert(request)
+        try f.router.manualActionStore.upsert(request)
         BotComputerControl.shared.requestHelp(request)
         BotComputerControl.shared.take(f.bot.id)
         XCTAssertNotNil(f.router.manualActionStore.open(threadID: f.thread.id))

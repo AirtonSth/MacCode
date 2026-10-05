@@ -67,6 +67,12 @@ public enum BotComputerGuestSpec {
         guard path != home, !home.hasPrefix(path + "/") else {
             throw BotComputerGuestError.invalidWorkspacePath(path)
         }
+        // Docker follows symlinks at bind time; a link resolving elsewhere would bypass the checks above.
+        let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        let resolvedHome = URL(fileURLWithPath: home).resolvingSymlinksInPath().path
+        guard resolved == path, resolved != "/", resolved != resolvedHome,
+              !resolvedHome.hasPrefix(resolved + "/")
+        else { throw BotComputerGuestError.invalidWorkspacePath(path) }
         if let registeredWorkspaces, !registeredWorkspaces.contains(path) {
             throw BotComputerGuestError.invalidWorkspacePath(path)
         }

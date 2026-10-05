@@ -246,4 +246,50 @@ final class ManualActionCardTests: XCTestCase {
         XCTAssertEqual(f.runner.requests.count, 1)
         XCTAssertEqual(f.vm.resolvedManualActions.first?.state, .continued)
     }
+
+    func test_manualAction_8_unwritableStoreDoesNotContinueOrFollowUp() async throws {
+        // WHY: continuing without a durable resolve would resend the follow-up after restart.
+        let f = try makeFixture()
+        let control = BotComputerControl()
+        f.vm.botComputerControl = control
+        let request = post(f, control: control)
+        _ = await waitUntil { f.vm.openManualAction != nil }
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ManualActionBroken-\(UUID().uuidString)", isDirectory: true)
+        let broken = ManualActionRequestStore(appSupportDirectory: dir)
+        try broken.upsert(request)
+        let actions = dir.appendingPathComponent("ManualActions")
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: actions.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: actions.path) }
+        f.vm.manualActionStore = broken
+        f.vm.openManualAction = request
+        await f.vm.continueManualAction(note: "ok")
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(f.runner.requests.count, 0, "no follow-up when the resolve was not persisted")
+        XCTAssertFalse(f.vm.statusMessage.isEmpty)
+        XCTAssertNotNil(control.openRequest(f.bot.id), "control request stays open")
+        XCTAssertEqual(broken.open(threadID: f.thread.id)?.state, .open, "request stays open on disk")
+    }
+
+    func test_manualAction_9_staleSecondSurfaceTakeIsRefusedAfterContinue() async throws {
+        // WHY: a stale card on another surface must not revive a continued request or add a follow-up.
+        let f = try makeFixture()
+        let control = BotComputerControl()
+        f.vm.botComputerControl = control
+        let other = makeSurface(f, control: control)
+        _ = post(f, control: control)
+        _ = await waitUntil { f.vm.openManualAction != nil && other.openManualAction != nil }
+        let stale = try XCTUnwrap(other.openManualAction)
+        await f.vm.continueManualAction(note: "ok")
+        _ = await waitUntil { f.runner.requests.count >= 1 }
+        other.openManualAction = stale
+        other.takeManualControl()
+        XCTAssertEqual(f.router.manualActionStore.all(threadID: f.thread.id).first?.state, .continued)
+        XCTAssertFalse(control.isControlledByUser(f.bot.id))
+        await other.continueManualAction(note: "ok")
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(f.runner.requests.count, 1)
+        let refreshed = await waitUntil { other.openManualAction == nil }
+        XCTAssertTrue(refreshed, "stale card refreshes via state-change notification or take refresh")
+    }
 }

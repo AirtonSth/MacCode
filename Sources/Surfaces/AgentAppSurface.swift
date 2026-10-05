@@ -503,6 +503,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var tokenSaverMeasuredLoader: (@Sendable (Bool, AgentThreadID?, TokenSaverSavingsRepository?) async -> Int?)?
     private var tokenSaverFooterObserver: NSObjectProtocol?
     var manualActionObserver: NSObjectProtocol?
+    var manualActionStateObserver: NSObjectProtocol?
     /// Durable manual-action requests; wired by the host. Setting it loads the selected thread's card.
     public var manualActionStore: ManualActionRequestStore? {
         didSet { manualActionStoreDidChange() }
@@ -1333,6 +1334,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if let manualActionObserver {
             NotificationCenter.default.removeObserver(manualActionObserver)
             self.manualActionObserver = nil
+        }
+        if let manualActionStateObserver {
+            NotificationCenter.default.removeObserver(manualActionStateObserver)
+            self.manualActionStateObserver = nil
         }
         if let tokenSaverFooterAccountObserver {
             NotificationCenter.default.removeObserver(tokenSaverFooterAccountObserver)

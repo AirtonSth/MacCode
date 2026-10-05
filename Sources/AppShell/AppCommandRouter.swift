@@ -538,7 +538,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func handleManualActionRequested(_ request: ManualActionRequest) {
         guard let threadID = request.threadID else { return }
-        manualActionStore.upsert(request)
+        // A late main-actor hop must not overwrite a request the user already resolved.
+        guard !manualActionStore.all(threadID: threadID).contains(where: { $0.id == request.id }) else { return }
+        do { try manualActionStore.upsert(request) } catch {
+            NSLog("RemoteCode: manual action request could not be saved: \(error)")
+        }
         guard let ctx = context else { return }
         // The pausing turn may already have ended; a fresh run id still passes the nested-worker check.
         let runID = (try? ctx.runRepo.latestActive(for: threadID))?.id ?? AgentRunID()

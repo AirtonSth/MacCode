@@ -69,6 +69,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
     private let notificationCenter: NotificationCenter
     private let vmRuns: BotVMRunRegistry
     private let gitRun: @Sendable ([String]) -> String?
+    private let workspacesWriter: @Sendable (Data, URL) throws -> Void
     private let stateLock = NSLock()
     private var _lastReady: BotComputerGuestReady?
     private var _lastReason = "Guest is proving the screen…"
@@ -87,8 +88,10 @@ public final class BotComputerGuestService: @unchecked Sendable {
         screenshotLimiter: BotScreenshotRateLimiter = .shared,
         notificationCenter: NotificationCenter = .default,
         vmRuns: BotVMRunRegistry = .shared,
-        gitRun: @escaping @Sendable ([String]) -> String? = BotComputerGuestService.runGit
+        gitRun: @escaping @Sendable ([String]) -> String? = BotComputerGuestService.runGit,
+        workspacesWriter: @escaping @Sendable (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) }
     ) {
+        self.workspacesWriter = workspacesWriter
         self.vmRuns = vmRuns
         self.gitRun = gitRun
         self.control = control
@@ -248,8 +251,23 @@ public final class BotComputerGuestService: @unchecked Sendable {
             try? docker.start(name: canonical)
             throw error
         }
+        // Persist before dropping the backup: a failed save must leave the old VM and manifest intact.
+        let manifestURL = BotComputerGuestSpec.workspacesURL(appSupport: appSupport, botID: botID)
+        let previousManifest = try? Data(contentsOf: manifestURL)
+        do {
+            try saveWorkspaces(wanted, botID: botID)
+        } catch {
+            try? docker.remove(name: canonical)
+            try? docker.rename(from: backup, to: canonical)
+            try? docker.start(name: canonical)
+            if let previousManifest {
+                try? previousManifest.write(to: manifestURL, options: .atomic)
+            } else {
+                try? FileManager.default.removeItem(at: manifestURL)
+            }
+            throw error
+        }
         try? docker.remove(name: backup)
-        try saveWorkspaces(wanted, botID: botID)
     }
 
     private func currentWorkspacesLabel(_ existing: BotComputerContainerInspect) -> String {
@@ -278,7 +296,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try JSONEncoder().encode(paths.sorted()).write(to: url, options: .atomic)
+        try workspacesWriter(JSONEncoder().encode(paths.sorted()), url)
     }
 
     /// Makes the bot's editable build recipe visible without starting Docker.
