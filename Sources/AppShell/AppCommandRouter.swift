@@ -2682,6 +2682,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         agent.viewModel.mentionableBotsRevisionProvider = { [weak self] in
             self?.context?.botStore.botsListRevision ?? 0
         }
+        agent.viewModel.botExecutionTargetProvider = { [weak self] botID in
+            guard let store = self?.context?.botStore else { return .mac }
+            let revision = (try? store.get(id: botID))?.currentRevisionID.flatMap { try? store.getRevision(id: $0) }
+            return BotExecutionDefault.target(for: revision ?? nil)
+        }
     }
 
     private var hostCatalogCreatedBots: [AgentRunID: Set<BotID>] = [:]

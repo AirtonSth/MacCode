@@ -407,6 +407,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// macOS account that will execute the next provider process through the shared helper.
     /// Nil / current-account means no privileged trampoline.
     @Published public var runAsUser: AgentRunAsUser? = AgentRunAsUser.current()
+    /// Bot (or none) that runs the selected thread; mirrors the thread row once selected.
+    @Published public private(set) var selectedRunActor: RunActor = .none
+    /// Where a bot-run thread executes by default; wired by the host from the bot's revision.
+    public var botExecutionTargetProvider: (BotID) -> ExecutionTarget = { _ in .mac }
     @Published public var availableRunAsUsers: [AgentRunAsUser] = MacOSLocalUserCatalog.listEligibleUsers()
     @Published public var model: String = AgentDefaultModelSelection.builtInDefault(for: .defaultProvider)
     /// Last model the user chose per provider (new threads + provider switches).
@@ -2400,6 +2404,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         provider = manual.provider
         providerInstanceId = routing.manualProviderInstanceId ?? manual.provider.rawValue
         runAsUser = selectedThread.runAsUser ?? AgentRunAsUser.current()
+        selectedRunActor = selectedThread.actor
         model = manual.effectiveModel
         permissionMode = selectedThread.permissionMode
         reasoningEffort = manual.reasoningEffort
@@ -4053,6 +4058,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let nextRunAsUser = selectedThread.runAsUser ?? AgentRunAsUser.current()
         if Self.shouldAssignIfChanged(current: runAsUser, next: nextRunAsUser) {
             runAsUser = nextRunAsUser
+        }
+        if Self.shouldAssignIfChanged(current: selectedRunActor, next: selectedThread.actor) {
+            selectedRunActor = selectedThread.actor
         }
         if Self.shouldAssignIfChanged(current: model, next: manual.effectiveModel) {
             model = manual.effectiveModel
@@ -6637,6 +6645,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         provider = routing.manualSelection.provider
         providerInstanceId = routing.manualProviderInstanceId ?? routing.manualSelection.provider.rawValue
         runAsUser = thread.runAsUser ?? AgentRunAsUser.current()
+        selectedRunActor = thread.actor
         model = routing.manualSelection.effectiveModel
         permissionMode = thread.permissionMode
         reasoningEffort = routing.manualSelection.reasoningEffort
@@ -6647,6 +6656,26 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if let i = threads.firstIndex(where: { $0.id == thread.id }) {
             threads[i] = thread
         }
+    }
+
+    /// Actor chip lock: first real message or a persisted actor lock.
+    public var runActorLocked: Bool {
+        let lockedAt = selectedThreadId.flatMap { id in threads.first(where: { $0.id == id })?.actorLockedAt }
+        return AgentRunAsUserPresentation.identityLocked(providerLocked: providerLocked, actorLockedAt: lockedAt)
+    }
+
+    /// Locked threads show the stored target; otherwise the bot's default.
+    public func executionTarget(for botID: BotID) -> ExecutionTarget {
+        let thread = selectedThreadId.flatMap { id in threads.first(where: { $0.id == id }) }
+        if thread?.actorLockedAt != nil, let stored = thread?.executionTarget { return stored }
+        return botExecutionTargetProvider(botID)
+    }
+
+    /// Picks who runs the next send. Refused once the thread is locked or running.
+    public func setRunActor(_ actor: RunActor) {
+        guard !runActorLocked else { return }
+        guard !selectedThreadRunIsStartingOrRunning else { return }
+        selectedRunActor = actor
     }
 
     /// Select the macOS account that will execute provider processes through the shared helper.
@@ -6879,6 +6908,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                             reasoningModel: reasoningModel,
                             serviceTier: serviceTier, modelSelection: currentModelSelection,
                             runAsUser: runAsUser, routingConfiguration: routingConfiguration)
+        // The chip choice made before the thread existed survives selection; it is written at first send.
+        let pendingRunActor = selectedRunActor
         let prunedThreadIDs: [AgentThreadID]
         do {
             prunedThreadIDs = try threadRepo.upsertEnforcingWorkspaceThreadLimit(t)
@@ -6900,6 +6931,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadThreads()
         onThreadLifecycle?(.created(threads.first(where: { $0.id == t.id }) ?? t))
         selectThread(t.id)
+        selectedRunActor = pendingRunActor
     }
 
     /// Delete every thread in this workspace (stops active providers first).
@@ -18667,17 +18699,21 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.execution.menu")
     }
 
-    /// macOS user capsule (shared helper). Left of provider source + model.
+    /// Run-as capsule: macOS user + Bot actor. Left of provider source + model.
     private var runAsUserMenu: some View {
-        let users = vm.availableRunAsUsers.isEmpty ? MacOSLocalUserCatalog.listEligibleUsers() : vm.availableRunAsUsers
         let selected = vm.runAsUser ?? AgentRunAsUser.current()
         return AgentRunAsUserCapsule(
-            users: users,
+            usersProvider: { vm.availableRunAsUsers.isEmpty ? MacOSLocalUserCatalog.listEligibleUsers() : vm.availableRunAsUsers },
             selected: selected,
             runLocked: vm.selectedThreadRunIsStartingOrRunning,
-            identityLocked: vm.providerLocked,
+            identityLocked: vm.runActorLocked,
             accessibilityIdentifier: "agent.runAsUser.menu",
+            actor: vm.selectedRunActor,
+            botsProvider: { vm.mentionableBotsProvider() },
+            executionTarget: { vm.executionTarget(for: $0) },
             onSelect: { vm.setRunAsUser($0) },
+            onSelectActor: { vm.setRunActor($0) },
+            onContinueWithoutBot: {},
             onAppear: { vm.refreshAvailableRunAsUsers() }
         )
     }
