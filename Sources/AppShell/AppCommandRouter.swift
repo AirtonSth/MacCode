@@ -1422,6 +1422,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ["busy": .string(busy ? "true" : "")]
     }
 
+    /// Non-persisted per-surface busy event; shape matches `surface.updated` metadata (empty string clears the key on iOS).
+    nonisolated static func surfaceBusyPayload(workspace: WorkspaceID, surface: SurfaceID, busy: Bool) -> JSONValue {
+        .object([
+            "workspace_id": .string(workspace.value.uuidString),
+            "id": .string(surface.value.uuidString),
+            "surface_id": .string(surface.value.uuidString),
+            "metadata": .object(workspaceBusyMetadata(busy))
+        ])
+    }
+
     nonisolated static func workspaceReorderedPayload(id: WorkspaceID, position: Int?, order: [WorkspaceID]) -> JSONValue {
         var payload: [String: JSONValue] = [
             "workspace_id": .string(id.value.uuidString),
@@ -7576,10 +7586,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 category: "terminal"
             )
         }
-        terminal.onBusyStateChanged = { [weak self] _ in
+        terminal.onBusyStateChanged = { [weak self, weak terminal] busy in
             guard let self else { return }
             self.publishWorkspaceUpdated(workspace, metadata: Self.workspaceBusyMetadata(self.isWorkspaceBusy(workspace)))
             self.windowController?.activeThreadsDidChange()
+            if let terminal, self.shouldPublishLayoutEvents {
+                EventBus.shared.publish(
+                    kind: .surfaceUpdated,
+                    payload: Self.surfaceBusyPayload(workspace: workspace, surface: terminal.descriptor.id, busy: busy)
+                )
+            }
         }
         terminal.onBecameFocused = { [weak self, weak terminal] in
             guard let self, let terminal else { return }
@@ -8111,7 +8127,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func paneSurfaces(pane: PaneID, workspace: WorkspaceID) throws -> [SurfaceDescriptor] {
         guard let ctx = context, let ws = ctx.state.workspaces[workspace] else { return [] }
-        return ws.layout.find(paneID: pane)?.surfaces ?? []
+        // Client-facing copies: live terminal busy is injected at read time, never persisted.
+        return (ws.layout.find(paneID: pane)?.surfaces ?? []).map { descriptor in
+            guard descriptor.type == .terminal,
+                  SurfaceRegistry.shared.surface(descriptor.id)?.isBusy == true else { return descriptor }
+            var copy = descriptor
+            copy.metadata["busy"] = "true"
+            return copy
+        }
     }
 
     public func paneResize(workspace: WorkspaceID, splitID: UUID, ratios: [Double]) throws {
