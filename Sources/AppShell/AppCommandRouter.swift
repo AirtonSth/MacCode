@@ -413,6 +413,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     var botThreadPromptTransform: (@MainActor (AgentThreadID, String, AgentRunID) async throws -> BotThreadQueuedPrompt?)?
     /// Fires after a queue-drained run starts on any thread; the bot desk records its receipt here.
     var botThreadRunStarted: (@MainActor (AgentRunID, AgentThreadID) -> Void)?
+    /// Bot desk hooks for workspace Agent App threads run as a bot; installed by `BotsViewModel`.
+    struct BotWorkspaceRunHooks {
+        let link: @MainActor (BotID, AgentThreadID) throws -> Void
+        let promptTransform: @MainActor (BotID, String, AgentThreadID, AgentRunID) async throws -> String
+        let runStarted: @MainActor (BotID, AgentRunID, AgentThreadID) -> Void
+    }
+    var botWorkspaceRunHooks: BotWorkspaceRunHooks?
     var beforePullRequestThreadCommitForTesting: (() throws -> Void)?
     /// Fires after inbound attachments pass `validatedForRetry` on the managed store.
     var sendAgentMessageResolvedAttachmentsProbeForTesting: (([AgentAttachment]) -> Void)?
@@ -2675,7 +2682,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// layer must not infer or pre-dispatch a peer prompt from user prose.
     /// Serves `BotStore.listCached()` so transcript bodies and keystrokes never
     /// hit SQLite (perf audit AA-01).
-    private func configureAgentAppBotMentions(_ agent: AgentAppSurface) {
+    func configureAgentAppBotMentions(_ agent: AgentAppSurface) {
         agent.viewModel.mentionableBotsProvider = { [weak self] in
             (try? self?.context?.botStore.listCached()) ?? []
         }
@@ -2687,6 +2694,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let revision = (try? store.get(id: botID))?.currentRevisionID.flatMap { try? store.getRevision(id: $0) }
             return BotExecutionDefault.target(for: revision ?? nil)
         }
+        agent.viewModel.botThreadLinker = { [weak self] botID, threadID in
+            guard let hooks = self?.botWorkspaceRunHooks else { throw BotWorkspaceRunUnavailable() }
+            try hooks.link(botID, threadID)
+        }
+        agent.viewModel.botPromptTransform = { [weak self] botID, text, threadID, runID in
+            guard let hooks = self?.botWorkspaceRunHooks else { throw BotWorkspaceRunUnavailable() }
+            return try await hooks.promptTransform(botID, text, threadID, runID)
+        }
+        agent.viewModel.botRunStarted = { [weak self] botID, runID, threadID in
+            self?.botWorkspaceRunHooks?.runStarted(botID, runID, threadID)
+        }
+    }
+
+    private struct BotWorkspaceRunUnavailable: LocalizedError {
+        var errorDescription: String? { "Bot indisponível." }
     }
 
     private var hostCatalogCreatedBots: [AgentRunID: Set<BotID>] = [:]

@@ -322,6 +322,10 @@ public enum AgentErrorRecoveryAction: String, Sendable, Equatable {
     }
 }
 
+private struct BotRunUnavailableError: LocalizedError {
+    var errorDescription: String? { "Bot indisponível." }
+}
+
 /// Opt-in hooks for hosting one fixed thread (e.g. the bot desk) in Agent App.
 public struct AgentAppEmbedding {
     public let pinnedThreadId: AgentThreadID
@@ -411,6 +415,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public private(set) var selectedRunActor: RunActor = .none
     /// Where a bot-run thread executes by default; wired by the host from the bot's revision.
     public var botExecutionTargetProvider: (BotID) -> ExecutionTarget = { _ in .mac }
+    /// Links the workspace thread to a bot conversation (single thread, no copy) on the first bot send.
+    public var botThreadLinker: (@MainActor (BotID, AgentThreadID) throws -> Void)?
+    /// Compiles the bot brain into the provider prompt for a bot-run workspace thread.
+    public var botPromptTransform: (@MainActor (BotID, String, AgentThreadID, AgentRunID) async throws -> String)?
+    public var botRunStarted: (@MainActor (BotID, AgentRunID, AgentThreadID) -> Void)?
     @Published public var availableRunAsUsers: [AgentRunAsUser] = MacOSLocalUserCatalog.listEligibleUsers()
     @Published public var model: String = AgentDefaultModelSelection.builtInDefault(for: .defaultProvider)
     /// Last model the user chose per provider (new threads + provider switches).
@@ -8637,12 +8646,45 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             createThread(title: "New thread")
         }
         guard let tid = selectedThreadId else { return nil }
+        let runId = requestedRunId ?? AgentRunID()
+        // A locked thread keeps its stored actor; the chip only decides the first send.
+        let actorThread = threads.first(where: { $0.id == tid })
+        let runActor: RunActor = actorThread?.actorLockedAt != nil ? (actorThread?.actor ?? .none) : selectedRunActor
+        var botPrompt: String?
+        if embedding == nil, case .bot(let botID) = runActor {
+            do {
+                if actorThread?.actorLockedAt == nil {
+                    guard let linker = botThreadLinker else { throw BotRunUnavailableError() }
+                    try linker(botID, tid)
+                    let lockedAt = Date()
+                    let target = botExecutionTargetProvider(botID)
+                    guard try threadRepo.setActor(
+                        id: tid, actor: runActor, lockedAt: lockedAt, executionTarget: target
+                    ) else {
+                        throw NSError(
+                            domain: "RemoteCode.AgentAppViewModel",
+                            code: 404,
+                            userInfo: [NSLocalizedDescriptionKey: "A conversa sumiu antes de iniciar."]
+                        )
+                    }
+                    if let index = threads.firstIndex(where: { $0.id == tid }) {
+                        threads[index].actor = runActor
+                        threads[index].actorLockedAt = lockedAt
+                        threads[index].executionTarget = target
+                    }
+                }
+                guard let transform = botPromptTransform else { throw BotRunUnavailableError() }
+                botPrompt = try await transform(botID, text, tid, runId)
+            } catch {
+                statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                return nil
+            }
+        }
         // Everything from here to the tracked run below is preparation the user
         // cannot see (Graphify roots, prompt compression, provider spawn). Show
         // "Loading…" for it; the defer covers the failure exits so a thread can
         // never be left permanently loading.
         // Run identity is fixed at acceptance so Stop can cancel this generation.
-        let runId = requestedRunId ?? AgentRunID()
         // A prior run's last snapshot is not evidence for this run. Clear the
         // holder projection at acceptance, before the new run becomes live, so
         // an idle → new-run transition cannot resurrect old Stop-strip details.
@@ -8777,7 +8819,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             mentionedBots: mentionedBots
         )
         var transformFailure: Error?
-        var runPrompt = text
+        var runPrompt = botPrompt ?? text
         if let transform = embedding?.promptTransform {
             do {
                 runPrompt = try await transform(text, tid, runId)
@@ -8951,6 +8993,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.onRunStateChange?()
             }
             embedding?.onRunStarted?(runId, tid)
+            if embedding == nil, case .bot(let botID) = runActor { botRunStarted?(botID, runId, tid) }
             return runId
         } catch {
             let wasCancelled: Bool = {

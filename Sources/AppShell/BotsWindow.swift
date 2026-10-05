@@ -10033,11 +10033,48 @@ public final class BotsViewModel: ObservableObject {
     /// Queue-drained follow-ups bypass the embedded composer, so the router asks
     /// here to compile the brain for any bot-linked thread, selected or not.
     private func installBotQueueHooks(on router: AppCommandRouter) {
+        router.botWorkspaceRunHooks = AppCommandRouter.BotWorkspaceRunHooks(
+            link: { [weak self] botID, threadID in
+                try self?.linkWorkspaceThread(threadID, toBot: botID)
+            },
+            promptTransform: { [weak self] botID, text, threadID, runID in
+                guard let self else { throw BotDeskSendRefused(reason: "Bot indisponível.") }
+                let bot = try self.liveBotForWorkspaceRun(botID)
+                guard let conversation = try self.botStore.conversationLinked(to: threadID),
+                      conversation.botID == bot.id else {
+                    throw BotDeskSendRefused(reason: "Bot indisponível.")
+                }
+                return try self.compileDeskPrompt(
+                    botID: bot.id,
+                    conversationID: conversation.id,
+                    text: text,
+                    threadID: threadID,
+                    runID: runID
+                )
+            },
+            runStarted: { [weak self] botID, runID, threadID in
+                guard let self,
+                      let conversation = try? self.botStore.conversationLinked(to: threadID),
+                      conversation.botID == botID else { return }
+                self.deskAgentRunStarted(botID: botID, conversationID: conversation.id, runID: runID)
+            }
+        )
         router.botThreadPromptTransform = { [weak self] threadID, text, runID in
-            guard let self,
-                  let conversation = try? self.botStore.conversationLinked(to: threadID),
-                  let bot = self.bots.first(where: { $0.id == conversation.botID })
-                    ?? (try? self.botStore.get(id: conversation.botID)) else { return nil }
+            guard let self else { return nil }
+            let thread = try? self.context.threadRepo.get(id: threadID)
+            let conversation = try? self.botStore.conversationLinked(to: threadID)
+            let actorBotID: BotID? = {
+                if case .bot(let id)? = thread?.actor { return id }
+                return nil
+            }()
+            guard let botID = actorBotID ?? conversation?.botID else { return nil }
+            let bot = actorBotID != nil
+                ? try self.liveBotForWorkspaceRun(botID)
+                : (self.bots.first(where: { $0.id == botID }) ?? (try? self.botStore.get(id: botID)))
+            guard let bot, let conversation, conversation.botID == bot.id else {
+                if actorBotID != nil { throw BotDeskSendRefused(reason: "Bot indisponível.") }
+                return nil
+            }
             let prompt = try self.compileDeskPrompt(
                 botID: bot.id,
                 conversationID: conversation.id,
@@ -10045,6 +10082,10 @@ public final class BotsViewModel: ObservableObject {
                 threadID: threadID,
                 runID: runID
             )
+            // Workspace threads keep the workspace cwd; only bot-home threads move.
+            if thread?.workspaceId != nil {
+                return AppCommandRouter.BotThreadQueuedPrompt(prompt: prompt, cwd: nil)
+            }
             let cwd = BotHome(appSupportDirectory: self.context.appSupportDirectory, bot: bot).root.path
             try? FileManager.default.createDirectory(
                 at: URL(fileURLWithPath: cwd),
@@ -10061,6 +10102,38 @@ public final class BotsViewModel: ObservableObject {
                 runID: runID
             )
         }
+    }
+
+    /// Deleted or missing bots refuse the send with a recovery hint.
+    private func liveBotForWorkspaceRun(_ botID: BotID) throws -> BotDefinition {
+        let stored = try? botStore.get(id: botID)
+        guard let bot = stored ?? nil, bot.deletedAt == nil else {
+            let label = (stored ?? nil).map { "Bot \($0.name)" } ?? "Bot"
+            throw BotDeskSendRefused(reason: "\(label) foi apagado. Use \"Continuar sem bot\".")
+        }
+        return bot
+    }
+
+    /// First bot send on a workspace thread: link the existing thread to a new bot
+    /// conversation (single thread, no copy). Idempotent for the same bot.
+    private func linkWorkspaceThread(_ threadID: AgentThreadID, toBot botID: BotID) throws {
+        let bot = try liveBotForWorkspaceRun(botID)
+        if let existing = try botStore.conversationLinked(to: threadID) {
+            guard existing.botID == bot.id else {
+                throw BotDeskSendRefused(reason: "Esta conversa já pertence a outro bot.")
+            }
+            return
+        }
+        guard let thread = try context.threadRepo.get(id: threadID) else {
+            throw BotDeskSendRefused(reason: "A conversa sumiu antes de iniciar.")
+        }
+        let conversation = BotConversation(
+            botID: bot.id,
+            title: thread.title,
+            linkedAgentThreadID: threadID
+        )
+        try botStore.upsertConversation(conversation)
+        adoptFollowThroughConversation(conversation)
     }
 
     func lastStartedConversationForTesting(botID: BotID) -> BotConversation? {

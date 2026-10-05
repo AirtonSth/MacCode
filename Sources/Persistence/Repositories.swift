@@ -2265,6 +2265,32 @@ public final class AgentThreadRepository {
         return try changes.step() && changes.columnInt64(0) == 1
     }
 
+    /// Run-actor lock only. `setPickerConfig` does not write these columns.
+    /// Missing rows return false.
+    @discardableResult
+    public func setActor(
+        id: AgentThreadID,
+        actor: RunActor,
+        lockedAt: Date?,
+        executionTarget: ExecutionTarget?
+    ) throws -> Bool {
+        Self.bumpIdentityRevision()
+        let st = try db.prepare("""
+            UPDATE agent_threads
+            SET actor_json = ?,
+                actor_locked_at = ?,
+                execution_target = ?
+            WHERE id = ?;
+            """)
+        try st.bind(1, encodeRunActor(actor))
+        try st.bind(2, lockedAt.map { iso.string(from: $0) })
+        try st.bind(3, executionTarget?.rawValue)
+        try st.bind(4, id.value.uuidString)
+        _ = try st.step()
+        let changes = try db.prepare("SELECT changes();")
+        return try changes.step() && changes.columnInt64(0) == 1
+    }
+
     /// Permission-mode chrome only. Avoids the full get+upsert (26 columns +
     /// routing JSON rewrite) when an unselected session-grant must persist
     /// `permission_mode`. Missing rows return false.
