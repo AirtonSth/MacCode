@@ -10116,6 +10116,17 @@ public final class BotsViewModel: ObservableObject {
         router.botThreadRunStarted = { [weak self] runID, threadID in
             guard let self,
                   let conversation = try? self.botStore.conversationLinked(to: threadID) else { return }
+            if let thread = (try? self.context.threadRepo.get(id: threadID)) ?? nil, thread.executionTarget == .vm {
+                _ = BotVMRunRegistry.shared.tryBegin(
+                    botID: conversation.botID,
+                    entry: BotVMRunRegistry.Entry(
+                        threadID: threadID,
+                        runID: runID,
+                        title: thread.title,
+                        workspace: thread.worktreePath ?? ""
+                    )
+                )
+            }
             self.deskAgentRunStarted(
                 botID: conversation.botID,
                 conversationID: conversation.id,

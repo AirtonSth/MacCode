@@ -22,6 +22,32 @@ final class BotVMExecutionTests: XCTestCase {
         XCTAssertNil(registry.busyMessage(botID: botID, threadID: threadA))
     }
 
+    func test_tryBeginGivesSecondThreadTheHolderAndSameThreadReclaims() {
+        // WHY: claim must be atomic so two threads can never both run on one bot VM.
+        let registry = BotVMRunRegistry()
+        XCTAssertNil(registry.tryBegin(botID: botID, entry: entry()))
+        let other = BotVMRunRegistry.Entry(threadID: threadB, runID: AgentRunID(), title: "B", workspace: workspace)
+        XCTAssertEqual(registry.tryBegin(botID: botID, entry: other), entry())
+        XCTAssertEqual(registry.active(botID: botID), entry())
+        let sameThread = BotVMRunRegistry.Entry(threadID: threadA, runID: AgentRunID(), title: "A", workspace: workspace)
+        XCTAssertNil(registry.tryBegin(botID: botID, entry: sameThread))
+    }
+
+    func test_releaseAndNextWaitingFreesBotAndPopsFirstWaiterOnce() {
+        // WHY: the first queued thread must resume when the VM frees, in order, exactly once.
+        let registry = BotVMRunRegistry()
+        _ = registry.tryBegin(botID: botID, entry: entry())
+        registry.addWaiting(botID: botID, threadID: threadB)
+        registry.addWaiting(botID: botID, threadID: threadB)
+        let threadC = AgentThreadID()
+        registry.addWaiting(botID: botID, threadID: threadC)
+        XCTAssertEqual(registry.releaseAndNextWaiting(runID: AgentRunID()), nil)
+        XCTAssertNotNil(registry.active(botID: botID), "unknown run must not free the bot")
+        XCTAssertEqual(registry.releaseAndNextWaiting(runID: runA), threadB)
+        XCTAssertNil(registry.active(botID: botID))
+        XCTAssertEqual(registry.waitingThreads(botID: botID), [threadC])
+    }
+
     func test_endWithWrongRunKeepsEntryAndRightRunClears() {
         // WHY: a stale finish event must not free the VM held by a newer run.
         let registry = BotVMRunRegistry()

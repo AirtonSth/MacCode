@@ -21,7 +21,36 @@ public final class BotVMRunRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [BotID: Entry] = [:]
 
+    private var waiting: [BotID: [AgentThreadID]] = [:]
     public init() {}
+
+    /// Claims the bot for `entry.threadID`; returns the other thread's entry when it holds the bot.
+    public func tryBegin(botID: BotID, entry: Entry) -> Entry? {
+        lock.withLock {
+            if let holder = entries[botID], holder.threadID != entry.threadID { return holder }
+            entries[botID] = entry
+            return nil
+        }
+    }
+    public func addWaiting(botID: BotID, threadID: AgentThreadID) {
+        lock.withLock {
+            if waiting[botID]?.contains(threadID) != true { waiting[botID, default: []].append(threadID) }
+        }
+    }
+    public func waitingThreads(botID: BotID) -> [AgentThreadID] {
+        lock.withLock { waiting[botID] ?? [] }
+    }
+    /// Frees the bot held by `runID` and pops the first thread queued for it.
+    public func releaseAndNextWaiting(runID: AgentRunID) -> AgentThreadID? {
+        lock.withLock {
+            guard let botID = entries.first(where: { $0.value.runID == runID })?.key else { return nil }
+            entries[botID] = nil
+            guard var queue = waiting[botID], !queue.isEmpty else { return nil }
+            let next = queue.removeFirst()
+            waiting[botID] = queue.isEmpty ? nil : queue
+            return next
+        }
+    }
 
     public func begin(botID: BotID, entry: Entry) {
         lock.withLock { entries[botID] = entry }

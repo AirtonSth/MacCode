@@ -2833,7 +2833,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             if let viewModel,
                let thread = viewModel.threads.first(where: { $0.id == threadID }),
                thread.executionTarget == .vm {
-                BotVMRunRegistry.shared.begin(
+                _ = BotVMRunRegistry.shared.tryBegin(
                     botID: botID,
                     entry: BotVMRunRegistry.Entry(
                         threadID: threadID,
@@ -2846,6 +2846,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         agent.viewModel.botBusyMessage = { botID, threadID in
             BotVMRunRegistry.shared.busyMessage(botID: botID, threadID: threadID)
+        }
+        agent.viewModel.botWaitForVM = { botID, threadID in
+            BotVMRunRegistry.shared.addWaiting(botID: botID, threadID: threadID)
         }
         agent.viewModel.botMacExecutionResolver = { [weak self] threadID, approve in
             await self?.resolveMacExecution(thread: threadID, approve: approve)

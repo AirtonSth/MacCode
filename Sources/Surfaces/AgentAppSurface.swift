@@ -431,6 +431,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var botRunStarted: (@MainActor (BotID, AgentRunID, AgentThreadID) -> Void)?
     /// Non-nil when another thread already holds the bot's VM.
     public var botBusyMessage: ((BotID, AgentThreadID) -> String?)?
+    /// Registers a thread queued behind another thread's run on the bot's VM.
+    public var botWaitForVM: ((BotID, AgentThreadID) -> Void)?
     /// Pending Mac-execution approvals pushed by the host, per thread (reason text).
     @Published public var pendingMacExecutionByThread: [AgentThreadID: String] = [:]
     /// Approves or declines a pending Mac-execution request; wired by the host.
@@ -6142,6 +6144,28 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return false
     }
 
+    /// Links the thread to the bot and locks the thread's actor and execution target.
+    private func lockBotActor(botID: BotID, threadId tid: AgentThreadID) throws {
+        guard let linker = botThreadLinker else { throw BotRunUnavailableError() }
+        try linker(botID, tid)
+        let lockedAt = Date()
+        let target = botExecutionTargetProvider(botID)
+        guard try threadRepo.setActor(
+            id: tid, actor: .bot(botID), lockedAt: lockedAt, executionTarget: target
+        ) else {
+            throw NSError(
+                domain: "RemoteCode.AgentAppViewModel",
+                code: 404,
+                userInfo: [NSLocalizedDescriptionKey: "A conversa sumiu antes de iniciar."]
+            )
+        }
+        if let index = threads.firstIndex(where: { $0.id == tid }) {
+            threads[index].actor = .bot(botID)
+            threads[index].actorLockedAt = lockedAt
+            threads[index].executionTarget = target
+        }
+    }
+
     /// "Iniciar VM": provisions through the host, then clears the banner.
     public func startUnavailableBotVM() {
         guard let botID = vmUnavailableBotID, let provision = botVMProvision else { return }
@@ -8342,12 +8366,30 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if (text.hasPrefix("/") || text.hasPrefix("$")), handleSlashCommand(text) {
             return
         }
-        if let sendThreadId,
-           case .bot(let botID)? = threads.first(where: { $0.id == sendThreadId })?.actor,
-           executionTarget(for: botID) == .vm,
-           let busy = botBusyMessage?(botID, sendThreadId),
-           await enqueuePromptWhileRunning(text: text, attached: attachedForSend) {
+        // One run per bot VM: a second thread queues behind the holder. A fresh thread
+        // is created and its bot actor locked first so the drained message runs as the bot.
+        let sendThread = sendThreadId.flatMap { id in threads.first(where: { $0.id == id }) }
+        let sendActor: RunActor = sendThread?.actorLockedAt != nil ? (sendThread?.actor ?? .none) : selectedRunActor
+        if case .bot(let botID) = sendActor,
+           (sendThread?.actorLockedAt != nil ? sendThread?.executionTarget : nil) ?? botExecutionTargetProvider(botID) == .vm,
+           let busy = botBusyMessage?(botID, sendThreadId ?? AgentThreadID()) {
+            if selectedThreadId == nil { createThread(title: "New thread") }
+            if let tid = selectedThreadId {
+                if threads.first(where: { $0.id == tid })?.actorLockedAt == nil {
+                    do { try lockBotActor(botID: botID, threadId: tid) } catch {
+                        statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                        restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
+                        return
+                    }
+                }
+                if await enqueuePromptWhileRunning(text: text, attached: attachedForSend) {
+                    botWaitForVM?(botID, tid)
+                    statusMessage = busy
+                    return
+                }
+            }
             statusMessage = busy
+            restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
             return
         }
         if selectedThreadCanQueuePrompt,
@@ -8840,26 +8882,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         if embedding == nil, case .bot(let botID) = runActor {
             do {
-                if actorThread?.actorLockedAt == nil {
-                    guard let linker = botThreadLinker else { throw BotRunUnavailableError() }
-                    try linker(botID, tid)
-                    let lockedAt = Date()
-                    let target = botExecutionTargetProvider(botID)
-                    guard try threadRepo.setActor(
-                        id: tid, actor: runActor, lockedAt: lockedAt, executionTarget: target
-                    ) else {
-                        throw NSError(
-                            domain: "RemoteCode.AgentAppViewModel",
-                            code: 404,
-                            userInfo: [NSLocalizedDescriptionKey: "A conversa sumiu antes de iniciar."]
-                        )
-                    }
-                    if let index = threads.firstIndex(where: { $0.id == tid }) {
-                        threads[index].actor = runActor
-                        threads[index].actorLockedAt = lockedAt
-                        threads[index].executionTarget = target
-                    }
-                }
+                if actorThread?.actorLockedAt == nil { try lockBotActor(botID: botID, threadId: tid) }
                 guard let transform = botPromptTransform else { throw BotRunUnavailableError() }
                 botPrompt = try await transform(botID, text, tid, runId)
             } catch {
