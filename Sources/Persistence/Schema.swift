@@ -41,9 +41,11 @@ public enum Schema {
     /// can read its append signature without a table scan, v83 indexes
     /// agent_threads(workspace_id, updated_at DESC, id DESC) for the rail list,
     /// v84 adds agent_threads.reasoning_model, and v85 adds scheduled-task
-    /// model fields, including repair for databases that already recorded v84.
+    /// model fields, including repair for databases that already recorded v84,
+    /// and v86 adds agent_threads.actor_json / actor_locked_at / execution_target.
     private static let scheduledTaskModelColumnsSchemaVersion = 85
-    public static let currentVersion: Int = scheduledTaskModelColumnsSchemaVersion
+    private static let threadActorSchemaVersion = 86
+    public static let currentVersion: Int = threadActorSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1786,6 +1788,11 @@ public enum Schema {
             ON agent_threads(workspace_id, updated_at DESC, id DESC);
         """),
         SchemaStep(scheduledTaskModelColumnsSchemaVersion, scheduledTaskModelColumnsMigrationSQL),
+        SchemaStep(threadActorSchemaVersion, """
+        ALTER TABLE agent_threads ADD COLUMN actor_json TEXT;
+        ALTER TABLE agent_threads ADD COLUMN actor_locked_at TEXT;
+        ALTER TABLE agent_threads ADD COLUMN execution_target TEXT;
+        """),
     ]
 
     /// Tables that exist in the schema for historical reasons but have no
