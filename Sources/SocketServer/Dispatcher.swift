@@ -2027,6 +2027,13 @@ public final class JSONRPCDispatcher {
                     paramsHash: paramsHash
                 )
             } catch {
+                // The claim may still be durable; fence the id in memory too so
+                // a retry cannot read a stuck 'claimed' row as commandInProgress.
+                volatileUnknownReceipts.insert(
+                    key: key,
+                    ownerFingerprint: context.ownerFingerprint,
+                    paramsHash: paramsHash
+                )
                 try? receiptRouter.markCommandReceiptUnknown(
                     method: req.method,
                     clientRequestId: clientRequestId,

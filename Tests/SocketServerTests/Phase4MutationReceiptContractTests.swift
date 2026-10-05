@@ -80,6 +80,8 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
     /// Models a router guard (provider preflight, routing CAS) that refuses
     /// the send before anything is written.
     var definiteSendRejection: JSONRPCError?
+    /// Models SQLite failing for both the claim release and the unknown mark.
+    var receiptReleasePersistenceUnavailable = false
     var firstEffectGate: Phase4FirstEffectGate?
     var lateEventGate: Phase4LateEventGate?
     var lateEventKind = "agent.phase4.late"
@@ -806,6 +808,9 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         ownerFingerprint: String,
         paramsHash: String
     ) throws {
+        guard !receiptReleasePersistenceUnavailable else {
+            throw Phase4InjectedReceiptUnavailable()
+        }
         let key = phase4ReceiptKey(method: method, clientRequestId: clientRequestId)
         guard var receipt = phase4Receipts[key],
               receipt.ownerFingerprint == ownerFingerprint,
@@ -820,6 +825,9 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         ownerFingerprint: String,
         paramsHash: String
     ) throws {
+        guard !receiptReleasePersistenceUnavailable else {
+            throw Phase4InjectedReceiptUnavailable()
+        }
         let key = phase4ReceiptKey(method: method, clientRequestId: clientRequestId)
         guard let receipt = phase4Receipts[key],
               receipt.ownerFingerprint == ownerFingerprint,
@@ -1832,6 +1840,31 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             method: "agent.plan.notes.save",
             requestId: "plan-notes-conflict"
         )
+    }
+
+    /// WHY: C35. If SQLite cannot release the claim (nor mark it unknown),
+    /// the durable row stays 'claimed'. A retry must not read that stuck row
+    /// as a retryable commandInProgress forever; it gets the same in-memory
+    /// unknown fence as any other unconfirmed outcome.
+    func test_definiteRejectionWithFailedClaimReleaseFencesRetryAsUnknown() async throws {
+        let router = Phase4ReceiptFakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "phase4-release-fail", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        router.definiteSendRejection = JSONRPCError(code: -32013, message: "Provider unavailable")
+        router.receiptReleasePersistenceUnavailable = true
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 2_023)
+        defer { live.stop() }
+        let params = live.mutationParams(
+            requestId: "send-release-failed",
+            threadId: thread.id,
+            text: "hello"
+        )
+
+        let first = try await live.rpc(method: "agent.message.send", params: params)
+        let retry = try await live.rpc(method: "agent.message.send", params: params)
+
+        XCTAssertEqual(errorCode(first), -32013, "the first answer is still the known rejection")
+        XCTAssertEqual(errorCode(retry), commandOutcomeUnknown)
     }
 
     /// WHY: C35 at-most-once. When a write already happened (the worker model
