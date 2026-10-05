@@ -1380,6 +1380,7 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     try waitForReplayCompletion(coordinator)
 
     var expected = persistedMarker
+    expected.append(TerminalHistoryCoordinator.restoredModeReset)
     expected.append(liveTail)
     XCTAssertEqual(
       delegate.renderedData,
@@ -1390,6 +1391,43 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     XCTAssertEqual(occurrences(of: liveMarker, in: delegate.renderedData), 1)
     XCTAssertEqual(delegate.replayReadFailureCount, 0)
     XCTAssertEqual(delegate.replayReadRecoveryCount, 0)
+  }
+
+  func testRestoredReplayDisablesDeadProcessModesBeforeLiveBytes() throws {
+    // WHY: persisted history may leave mouse tracking on from a dead TUI while
+    // the restored PTY is a fresh shell; mouse moves would print at the prompt.
+    // The reset must sit before live bytes so the new shell can re-enable modes.
+    let database = try SQLiteDB(path: ":memory:")
+    try Schema.migrate(database)
+    let repository = TerminalOutputRepository(db: database)
+    let surfaceID = SurfaceID().value.uuidString
+    let workspaceID = WorkspaceID().value.uuidString
+    let payload = Data("\u{1B}[?1003h\u{1B}[?1006hDEAD_TUI\n".utf8)
+    let liveData = Data("\u{1B}[?2004hNEW_SHELL_PROMPT$ ".utf8)
+    try repository.append(
+      surfaceID: surfaceID,
+      workspaceID: workspaceID,
+      chunkIndex: 1,
+      data: payload
+    )
+    let delegate = HistoryCoordinatorDelegateSpy()
+    let coordinator = TerminalHistoryCoordinator(
+      repository: repository,
+      surfaceID: surfaceID,
+      workspaceID: workspaceID
+    )
+    coordinator.delegate = delegate
+    coordinator.prepare(restored: true, deferReplay: true)
+    try waitForPreparationReady(coordinator)
+
+    coordinator.recordLiveReplayData(liveData, maxBytes: 4 * 1024 * 1024)
+    coordinator.requestReplayIfNeeded()
+    try waitForReplayCompletion(coordinator)
+
+    var expected = payload
+    expected.append(TerminalHistoryCoordinator.restoredModeReset)
+    expected.append(liveData)
+    XCTAssertEqual(delegate.renderedData, expected)
   }
 
   func testCombinedReplayOverBoundPreservesLiveParserInsteadOfResettingFromPartialBytes() throws {
@@ -1689,7 +1727,9 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     coordinator.replayIfNeeded()
     try waitForReplayCompletion(coordinator)
 
-    XCTAssertEqual(delegate.renderedData, persisted)
+    var expectedReplay = persisted
+    expectedReplay.append(TerminalHistoryCoordinator.restoredModeReset)
+    XCTAssertEqual(delegate.renderedData, expectedReplay)
     XCTAssertEqual(delegate.replayReadFailureCount, 1)
     XCTAssertEqual(
       delegate.replayReadRecoveryCount,
@@ -2047,7 +2087,7 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     )
     XCTAssertLessThanOrEqual(
       delegate.renderedData.count,
-      256 * 1024,
+      256 * 1024 + TerminalHistoryCoordinator.restoredModeReset.count,
       "startup must never hydrate the complete oversized legacy transcript"
     )
     XCTAssertTrue(delegate.renderedData.contains(newestMarker))

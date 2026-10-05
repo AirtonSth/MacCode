@@ -764,6 +764,10 @@ final class TerminalHistoryCoordinator {
     /// Ghostty replay. Larger canonical merges preserve the current live parser
     /// and report partial history instead of resetting from a truncated stream.
     nonisolated static let maxCanonicalReplayBytes = (4 * 1024 * 1024) - (256 * 1024)
+    /// Persisted history belongs to a process that no longer exists, so disable modes it may have left on before the new shell's bytes.
+    nonisolated static let restoredModeReset = Data(
+        "\u{1B}[?1000l\u{1B}[?1002l\u{1B}[?1003l\u{1B}[?1005l\u{1B}[?1006l\u{1B}[?1015l\u{1B}[?1004l\u{1B}[?2004l\u{1B}[?2026l\u{1B}[?1049l\u{1B}[?1l\u{1B}>\u{1B}[<99u\u{1B}[>4;0m\u{1B}[?25h".utf8
+    )
     private nonisolated static let finalDeleteRetryTimeout: TimeInterval = 2
     /// Recent scrollback remains useful, but terminal sessions are expected to
     /// stay open for weeks. Keep a Terminal-like rolling window instead of an
@@ -2911,6 +2915,7 @@ final class TerminalHistoryCoordinator {
         }
 
         var canonical = payload
+        if !payload.isEmpty { canonical.append(Self.restoredModeReset) }
         canonical.append(liveData)
         delegate.terminalHistoryCoordinator(self, didPrepareReplay: canonical)
         replayReadFailurePending = false
