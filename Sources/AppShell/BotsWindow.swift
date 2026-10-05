@@ -10007,6 +10007,8 @@ public final class BotsViewModel: ObservableObject {
         vm.mentionableBotsRevisionProvider = { [weak self] in
             self?.botStore.botsListRevision ?? 0
         }
+        vm.botComputerControl = router.botComputerControl
+        vm.manualActionStore = router.manualActionStore
         vm.markThreadRead = { [weak router] id in
             try router?.markAgentThreadRead(thread: id)
         }

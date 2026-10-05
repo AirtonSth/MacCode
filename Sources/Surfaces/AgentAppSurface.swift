@@ -492,6 +492,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var tokenSaverGraphifySignalCountCheck: (@Sendable () -> Int)?
     private var tokenSaverMeasuredLoader: (@Sendable (Bool, AgentThreadID?, TokenSaverSavingsRepository?) async -> Int?)?
     private var tokenSaverFooterObserver: NSObjectProtocol?
+    var manualActionObserver: NSObjectProtocol?
+    /// Durable manual-action requests; wired by the host. Setting it loads the selected thread's card.
+    public var manualActionStore: ManualActionRequestStore? {
+        didSet { manualActionStoreDidChange() }
+    }
+    /// Who drives the bot computer; tests inject an isolated instance.
+    public var botComputerControl: BotComputerControl = .shared
+    /// Request awaiting the user on the selected thread (open or taken).
+    @Published public internal(set) var openManualAction: ManualActionRequest?
+    /// Continued/declined requests of the selected thread, oldest first.
+    @Published public internal(set) var resolvedManualActions: [ManualActionRequest] = []
     private var tokenSaverFooterAccountObserver: NSObjectProtocol?
     private var tokenSaverFooterStatusObserver: NSObjectProtocol?
     /// PERF: cancel-and-coalesce off-main ledger reads (same pattern as sidebar
@@ -1306,6 +1317,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if let tokenSaverFooterObserver {
             NotificationCenter.default.removeObserver(tokenSaverFooterObserver)
             self.tokenSaverFooterObserver = nil
+        }
+        if let manualActionObserver {
+            NotificationCenter.default.removeObserver(manualActionObserver)
+            self.manualActionObserver = nil
         }
         if let tokenSaverFooterAccountObserver {
             NotificationCenter.default.removeObserver(tokenSaverFooterAccountObserver)
@@ -2343,6 +2358,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // messages, re-fetch provider snapshot → multi-blink on an already-open
         // thread. Soft path keeps the painted transcript and only syncs chrome.
         if !isThreadSwitch {
+            refreshManualAction()
             softReselectOpenThread(selectedThread, markRead: markRead)
             return
         }
@@ -2360,6 +2376,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             rememberPaintedTimeline(previous, timeline)
         }
         selectedThreadId = id
+        refreshManualAction()
         transcriptState.selectedThreadIdForPeerFlag = id
         transcriptState.waitingBotPeerActivity = AgentTranscriptState.hasWaitingBotPeerActivity(
             in: messages,
@@ -15858,8 +15875,10 @@ public struct AgentAppView: View {
 
     @ViewBuilder
     private var pendingCallbackRows: some View {
-        if !vm.visiblePendingRequests.isEmpty || !vm.visiblePendingUserInputs.isEmpty {
+        if !vm.visiblePendingRequests.isEmpty || !vm.visiblePendingUserInputs.isEmpty
+            || vm.openManualAction != nil || !vm.resolvedManualActions.isEmpty {
             VStack(alignment: .leading, spacing: DS.Space.sm) {
+                AgentManualActionCard(vm: vm)
                 ForEach(vm.visiblePendingRequests) { request in
                     pendingRequestRow(request)
                 }
@@ -18769,9 +18788,9 @@ public struct AgentAppView: View {
             )
         } else {
             AgentChatWorkingPill(
-                label: vm.status.rawValue,
+                label: vm.statusLabel,
                 identifier: "agent.status.pill",
-                tone: statusTone(vm.status),
+                tone: vm.openManualAction != nil ? .warning : statusTone(vm.status),
                 padded: false
             )
         }

@@ -2740,6 +2740,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Serves `BotStore.listCached()` so transcript bodies and keystrokes never
     /// hit SQLite (perf audit AA-01).
     func configureAgentAppBotMentions(_ agent: AgentAppSurface) {
+        agent.viewModel.botComputerControl = botComputerControl
+        agent.viewModel.manualActionStore = manualActionStore
         agent.viewModel.mentionableBotsProvider = { [weak self] in
             (try? self?.context?.botStore.listCached()) ?? []
         }
