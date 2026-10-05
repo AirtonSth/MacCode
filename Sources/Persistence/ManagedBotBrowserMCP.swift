@@ -53,6 +53,13 @@ public struct ManagedBotBrowserMCP: Sendable {
                 }
                 let service = try BotBrowserService.make(environment: env, store: store)
                 let object = try service.call(name: name, arguments: arguments)
+                // Host refusal while the user controls the bot (nothing ran).
+                if let refusal = object["refusal"] as? String {
+                    return reply(id: id, result: [
+                        "content": [["type": "text", "text": refusal]],
+                        "isError": false,
+                    ])
+                }
                 return reply(id: id, result: [
                     "content": [["type": "text", "text": encodeJSON(object) ?? "{}"]],
                     "isError": false,

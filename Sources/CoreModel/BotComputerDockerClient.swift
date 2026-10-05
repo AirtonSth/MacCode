@@ -78,7 +78,14 @@ public protocol BotComputerDockerClienting: Sendable {
     func stop(name: String) throws
     func inspect(name: String) throws -> BotComputerContainerInspect
     func containerExists(name: String) throws -> Bool
-    func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data
+    func exec(
+        name: String,
+        command: [String],
+        user: String?,
+        detach: Bool,
+        workdir: String?,
+        environment: [String: String]
+    ) throws -> Data
     func rename(from: String, to: String) throws
     func ensureNetwork(name: String) throws
     func removeNetwork(name: String) throws
@@ -88,6 +95,10 @@ public protocol BotComputerDockerClienting: Sendable {
 
 public extension BotComputerDockerClienting {
     func removeNetwork(name: String) throws {}
+
+    func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data {
+        try exec(name: name, command: command, user: user, detach: detach, workdir: nil, environment: [:])
+    }
 
     func containerExists(name: String) throws -> Bool {
         do {
@@ -104,11 +115,19 @@ public struct BotComputerContainerInspect: Equatable, Sendable {
     public var imageID: String
     public var hostPort: Int
     public var networkNames: [String]
-    public init(running: Bool, imageID: String, hostPort: Int, networkNames: [String] = []) {
+    public var labels: [String: String]
+    public init(
+        running: Bool,
+        imageID: String,
+        hostPort: Int,
+        networkNames: [String] = [],
+        labels: [String: String] = [:]
+    ) {
         self.running = running
         self.imageID = imageID
         self.hostPort = hostPort
         self.networkNames = networkNames
+        self.labels = labels
     }
 }
 
@@ -260,23 +279,28 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         let data = try run([
             "inspect",
             "-f",
-            "{{.State.Running}} {{.Image}} {{with (index .NetworkSettings.Ports \"6080/tcp\")}}{{(index . 0).HostPort}}{{else}}0{{end}} {{range $k, $_ := .NetworkSettings.Networks}}{{$k}},{{end}}",
+            "{{.State.Running}} {{.Image}} {{with (index .NetworkSettings.Ports \"6080/tcp\")}}{{(index . 0).HostPort}}{{else}}0{{end}} {{range $k, $_ := .NetworkSettings.Networks}}{{$k}},{{end}} {{json .Config.Labels}}",
             name,
         ])
-        let parts = (String(data: data, encoding: .utf8) ?? "")
+        let text = (String(data: data, encoding: .utf8) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .split(separator: " ")
+        let parts = text.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: false)
         let running = parts.first.map { $0.caseInsensitiveCompare("true") == .orderedSame } ?? false
         let image = parts.dropFirst().first.map(String.init) ?? ""
         let port = Int(parts.dropFirst(2).first.map(String.init) ?? "") ?? 0
-        let networks = parts.dropFirst(3).first.map(String.init)?
+        let rest = parts.dropFirst(3).first.map(String.init) ?? ""
+        let restParts = rest.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: false)
+        let networks = restParts.first.map(String.init)?
             .split(separator: ",")
             .map(String.init) ?? []
+        let labels = restParts.dropFirst().first
+            .flatMap { try? JSONDecoder().decode([String: String].self, from: Data($0.utf8)) } ?? [:]
         return BotComputerContainerInspect(
             running: running,
             imageID: image,
             hostPort: port,
-            networkNames: networks
+            networkNames: networks,
+            labels: labels
         )
     }
 
@@ -287,11 +311,24 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             .isEmpty == false
     }
 
-    public func exec(name: String, command: [String], user: String? = nil, detach: Bool = false) throws -> Data {
+    public func exec(
+        name: String,
+        command: [String],
+        user: String? = nil,
+        detach: Bool = false,
+        workdir: String? = nil,
+        environment: [String: String] = [:]
+    ) throws -> Data {
         var args = ["exec"]
         if detach { args.append("-d") }
         if let user, !user.isEmpty {
             args += ["-u", user]
+        }
+        if let workdir, !workdir.isEmpty {
+            args += ["-w", workdir]
+        }
+        for (key, value) in environment.sorted(by: { $0.key < $1.key }) {
+            args += ["-e", "\(key)=\(value)"]
         }
         args.append(name)
         args += command

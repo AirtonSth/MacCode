@@ -68,7 +68,7 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
         guard let value = containers[name] else { throw BotComputerGuestError.notReady }
         return value
     }
-    func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data {
+    func exec(name: String, command: [String], user: String?, detach: Bool, workdir: String?, environment: [String: String]) throws -> Data {
         execCalls += 1
         lastExec = (name, command, user, detach)
         if execFailuresRemaining > 0 {

@@ -26,6 +26,16 @@ public struct BotComputerGuestFrameEvidence: Equatable, Sendable {
     public var pngHash: String
 }
 
+public struct GitIdentity: Equatable, Sendable {
+    public var name: String
+    public var email: String
+
+    public init(name: String, email: String) {
+        self.name = name
+        self.email = email
+    }
+}
+
 public enum BotComputerGuestServiceError: Error, Equatable, Sendable, CustomStringConvertible {
     case screenshotTooLarge(actualBytes: Int, maximumBytes: Int)
     case screenshotResultTooLarge(actualBytes: Int, maximumBytes: Int)
@@ -54,6 +64,9 @@ public final class BotComputerGuestService: @unchecked Sendable {
     private let observeAttempts: Int
     private let observeDelay: TimeInterval
     private let sleep: @Sendable (TimeInterval) -> Void
+    private let control: BotComputerControl
+    private let screenshotLimiter: BotScreenshotRateLimiter
+    private let notificationCenter: NotificationCenter
     private let stateLock = NSLock()
     private var _lastReady: BotComputerGuestReady?
     private var _lastReason = "Guest is proving the screen…"
@@ -67,8 +80,14 @@ public final class BotComputerGuestService: @unchecked Sendable {
         recipeContext: URL? = nil,
         observeAttempts: Int = 60,
         observeDelay: TimeInterval = 0.5,
-        sleep: @escaping @Sendable (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
+        sleep: @escaping @Sendable (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        control: BotComputerControl = .shared,
+        screenshotLimiter: BotScreenshotRateLimiter = .shared,
+        notificationCenter: NotificationCenter = .default
     ) {
+        self.control = control
+        self.screenshotLimiter = screenshotLimiter
+        self.notificationCenter = notificationCenter
         self.appSupport = appSupport
         self.docker = docker
         self.recipeContext = recipeContext
@@ -102,7 +121,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
                 botID: botID,
                 guestHome: home.path,
                 appSupport: appSupport,
-                viewerToken: viewerToken
+                viewerToken: viewerToken,
+                workspaces: loadWorkspaces(botID: botID)
             )
             options.name = name
             options.network = nil
@@ -144,8 +164,11 @@ public final class BotComputerGuestService: @unchecked Sendable {
         let name = BotComputerGuestSpec.containerName(botID: botID)
         let network = try availableNetwork(botID: botID)
         let image = try resolvedImage(botID: botID)
+        let workspaces = loadWorkspaces(botID: botID)
         if let existing = try? docker.inspect(name: name) {
-            if imageMatches(existing, tag: image), networkMatches(existing, network: network) {
+            if imageMatches(existing, tag: image),
+               networkMatches(existing, network: network),
+               currentWorkspacesLabel(existing) == BotComputerGuestSpec.workspacesLabel(workspaces) {
                 if existing.running == false {
                     try docker.start(name: name)
                 }
@@ -159,12 +182,85 @@ public final class BotComputerGuestService: @unchecked Sendable {
             guestHome: home.path,
             appSupport: appSupport,
             viewerToken: viewerToken,
-            image: image
+            image: image,
+            workspaces: workspaces
         )
         options.network = network
         _ = try docker.create(options: options)
         try docker.start(name: name)
         return try readyState(name: name, botID: botID, resumed: false)
+    }
+
+    /// Mounts `workspace` at the same path in the bot container. The old container
+    /// stays as `<name>-backup` until the replacement is running.
+    public func ensureWorkspaceMounted(botID: BotID, workspace: String, registered: Set<String>) throws {
+        try BotComputerGuestSpec.assertWorkspaceMountPath(workspace, registeredWorkspaces: registered)
+        let stored = loadWorkspaces(botID: botID)
+        let wanted = Array(Set(stored).union([workspace])).sorted()
+        let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
+        let canonical = BotComputerGuestSpec.containerName(botID: botID)
+        guard let existing = try? docker.inspect(name: canonical) else {
+            try saveWorkspaces(wanted, botID: botID)
+            _ = try provision(botID: botID)
+            return
+        }
+        if stored.contains(workspace),
+           existing.labels[BotComputerGuestSpec.workspacesLabelKey] == BotComputerGuestSpec.workspacesLabel(wanted) {
+            return
+        }
+        let backup = canonical + "-backup"
+        let network = try availableNetwork(botID: botID)
+        var options = try BotComputerGuestSpec.containerCreateOptions(
+            botID: botID,
+            guestHome: home.path,
+            appSupport: appSupport,
+            viewerToken: try viewerToken(botID: botID),
+            image: try resolvedImage(botID: botID),
+            workspaces: wanted,
+            registeredWorkspaces: registered.union(stored)
+        )
+        options.network = network
+        if (try? docker.containerExists(name: backup)) == true {
+            try? docker.remove(name: backup)
+        }
+        var renamed = false
+        do {
+            try docker.stop(name: canonical)
+            try docker.rename(from: canonical, to: backup)
+            renamed = true
+            _ = try docker.create(options: options)
+            try docker.start(name: canonical)
+        } catch {
+            if renamed {
+                try? docker.remove(name: canonical)
+                try? docker.rename(from: backup, to: canonical)
+            }
+            try? docker.start(name: canonical)
+            throw error
+        }
+        try? docker.remove(name: backup)
+        try saveWorkspaces(wanted, botID: botID)
+    }
+
+    private func currentWorkspacesLabel(_ existing: BotComputerContainerInspect) -> String {
+        existing.labels[BotComputerGuestSpec.workspacesLabelKey] ?? BotComputerGuestSpec.workspacesLabel([])
+    }
+
+    private func loadWorkspaces(botID: BotID) -> [String] {
+        let url = BotComputerGuestSpec.workspacesURL(appSupport: appSupport, botID: botID)
+        guard let data = try? Data(contentsOf: url),
+              let paths = try? JSONDecoder().decode([String].self, from: data)
+        else { return [] }
+        return paths.sorted()
+    }
+
+    private func saveWorkspaces(_ paths: [String], botID: BotID) throws {
+        let url = BotComputerGuestSpec.workspacesURL(appSupport: appSupport, botID: botID)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try JSONEncoder().encode(paths.sorted()).write(to: url, options: .atomic)
     }
 
     /// Makes the bot's editable build recipe visible without starting Docker.
@@ -190,6 +286,64 @@ public final class BotComputerGuestService: @unchecked Sendable {
         )
         if data.count <= 32_768 { return data }
         return data.prefix(32_768)
+    }
+
+    /// Runs inside a mounted workspace as the host user's uid:gid ("0" for root commands).
+    /// Only git identity is injected; no host credentials reach the guest.
+    public func exec(
+        botID: BotID,
+        command: String,
+        workspace: String,
+        user: String,
+        gitIdentity: GitIdentity?
+    ) throws -> Data {
+        let trimmed = try BotComputerGuestSpec.assertExecCommand(command)
+        try BotComputerGuestSpec.assertWorkspaceMountPath(workspace)
+        _ = try provision(botID: botID)
+        var environment: [String: String] = [:]
+        if let gitIdentity {
+            environment = [
+                "GIT_AUTHOR_NAME": gitIdentity.name,
+                "GIT_AUTHOR_EMAIL": gitIdentity.email,
+                "GIT_COMMITTER_NAME": gitIdentity.name,
+                "GIT_COMMITTER_EMAIL": gitIdentity.email,
+            ]
+        }
+        let data = try docker.exec(
+            name: BotComputerGuestSpec.containerName(botID: botID),
+            command: ["bash", "-lc", trimmed],
+            user: BotComputerGuestSpec.execUsesRoot(trimmed) ? "0" : user,
+            detach: false,
+            workdir: workspace,
+            environment: environment
+        )
+        if data.count <= 32_768 { return data }
+        return data.prefix(32_768)
+    }
+
+    /// `run` receives git arguments and returns trimmed stdout, or nil on failure.
+    public static func gitIdentity(
+        run: ([String]) -> String? = BotComputerGuestService.runGit
+    ) -> GitIdentity? {
+        guard let name = run(["config", "--get", "user.name"]), !name.isEmpty,
+              let email = run(["config", "--get", "user.email"]), !email.isEmpty
+        else { return nil }
+        return GitIdentity(name: name, email: email)
+    }
+
+    public static func runGit(_ arguments: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = arguments
+        let stdout = Pipe()
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public func openTerminal(botID: BotID) throws {
@@ -220,7 +374,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
             appSupport: appSupport,
             viewerToken: viewerToken,
             image: tag,
-            name: next
+            name: next,
+            workspaces: loadWorkspaces(botID: botID)
         )
         options.network = network
         _ = try docker.create(options: options)
@@ -244,16 +399,16 @@ public final class BotComputerGuestService: @unchecked Sendable {
             throw BotComputerError.invalid("Invalid bot id.")
         }
         let botID = BotID(uuid)
+        // Refused, never queued: nothing below runs while the user drives.
+        if action.kind == BotComputerCatalog.act || action.kind == BotComputerCatalog.exec,
+           control.isControlledByUser(botID) {
+            return ["refusal": ManualActionRequest.refusalPhrase]
+        }
+        let threadID = action.threadID.flatMap(UUID.init(uuidString:)).map(AgentThreadID.init)
         switch action.kind {
         case BotComputerCatalog.observe:
             let shot = try observe(botID: botID)
-            let base64 = shot.png.base64EncodedString()
-            guard base64.utf8.count <= Self.maxScreenshotBase64Bytes else {
-                throw BotComputerGuestServiceError.screenshotResultTooLarge(
-                    actualBytes: base64.utf8.count,
-                    maximumBytes: Self.maxScreenshotBase64Bytes
-                )
-            }
+            let base64 = try Self.boundedBase64(shot.png)
             return [
                 "png_magic": shot.magic,
                 "png_hash": shot.hash,
@@ -277,9 +432,64 @@ public final class BotComputerGuestService: @unchecked Sendable {
                 "host": ready.screenURL.host ?? "127.0.0.1",
                 "image": BotComputerGuestSpec.botImageTag(botID: botID),
             ]
+        case BotComputerCatalog.requestUserAction:
+            let shot = try observe(botID: botID)
+            let base64 = try Self.boundedBase64(shot.png)
+            let kind = ManualActionKind(rawValue: action.subkind) ?? .other
+            let id = ManualActionHost.request(
+                control: control,
+                botID: botID,
+                threadID: threadID,
+                kind: kind,
+                reason: action.reason,
+                screenshotPNG: shot.png,
+                center: notificationCenter
+            )
+            return [
+                "request_id": id.uuidString.lowercased(),
+                "message": ManualActionRequest.pauseReply,
+                "png_base64": base64,
+            ]
+        case BotComputerCatalog.postScreenshot:
+            let kind = BotScreenshotKind(rawValue: action.subkind) ?? .normal
+            if let blocked = screenshotLimiter.acquire(botID: botID, kind: kind).message {
+                throw BotComputerError.invalid(blocked)
+            }
+            let shot = try observe(botID: botID)
+            let jpeg = try BotScreenshotEncoder.jpeg(fromPNG: shot.png)
+            var userInfo: [String: Any] = [
+                BotHostNotificationKey.botID: botID,
+                BotHostNotificationKey.jpeg: jpeg.data,
+                BotHostNotificationKey.reason: action.reason,
+                BotHostNotificationKey.kind: kind.rawValue,
+            ]
+            if let threadID { userInfo[BotHostNotificationKey.threadID] = threadID }
+            notificationCenter.post(name: .botScreenshotPosted, object: nil, userInfo: userInfo)
+            return ["ok": true, "width": jpeg.width, "height": jpeg.height]
+        case BotComputerCatalog.requestMacExecution:
+            var userInfo: [String: Any] = [
+                BotHostNotificationKey.botID: botID,
+                BotHostNotificationKey.reason: action.reason,
+            ]
+            if let threadID { userInfo[BotHostNotificationKey.threadID] = threadID }
+            notificationCenter.post(name: .botMacExecutionRequested, object: nil, userInfo: userInfo)
+            return ["ok": true, "message": Self.macExecutionReply]
         default:
             throw BotComputerError.invalid("unknown tool: \(action.kind)")
         }
+    }
+
+    public static let macExecutionReply = "Pedido enviado ao usuário; aguarde aprovação. Encerre o turno."
+
+    private static func boundedBase64(_ png: Data) throws -> String {
+        let base64 = png.base64EncodedString()
+        guard base64.utf8.count <= maxScreenshotBase64Bytes else {
+            throw BotComputerGuestServiceError.screenshotResultTooLarge(
+                actualBytes: base64.utf8.count,
+                maximumBytes: maxScreenshotBase64Bytes
+            )
+        }
+        return base64
     }
 
     private func waitForPNG(name: String) throws -> Data {

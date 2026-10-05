@@ -22,6 +22,11 @@ public enum BotComputerMCPAdmit: Sendable {
            !botID.isEmpty {
             extra[BotComputerCatalog.callerEnvironmentKey] = botID
         }
+        if let thread = environment[BotComputerCatalog.threadEnvironmentKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !thread.isEmpty {
+            extra[BotComputerCatalog.threadEnvironmentKey] = thread
+        }
         return GrokACPMcpServer.stdio(
             name: serverName,
             command: command,

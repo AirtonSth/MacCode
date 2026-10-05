@@ -31,6 +31,8 @@ public enum BotBrowserCatalog: Sendable {
     /// Host action kind for live page-state polls (login wait). NOT a tool;
     /// `toolNames` stays the five advertised tools.
     public static let stateKind = "state"
+    /// `action` on a state poll that comes from `bot_browser_wait_login`; the host opens a login ManualActionRequest.
+    public static let waitLoginAction = "wait_login"
 
     public static var toolNames: [String] { [open, get, waitLogin, snapshot, act] }
 
@@ -591,7 +593,7 @@ public struct BotBrowserService: Sendable {
                     let cookies = (try? self.store.readWebsiteData(botID: self.callerBotID)) ?? [:]
                     if let payload = try? self.performHostAction(
                         kind: BotBrowserCatalog.stateKind,
-                        action: "",
+                        action: BotBrowserCatalog.waitLoginAction,
                         ref: "",
                         text: "",
                         timeoutMS: 10_000
