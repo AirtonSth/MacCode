@@ -31,6 +31,31 @@ final class AgentComposerChromeTests: XCTestCase {
         XCTAssertFalse(manual.isAuto)
     }
 
+    func test_chipBotNameUsesSingleNameLookup_becauseListProviderMustOnlyRunWhenPopoverOpens() {
+        let botID = BotID()
+        var lookups: [BotID] = []
+        var listCalls = 0
+        let botsProvider: () -> [BotDefinition] = { listCalls += 1; return [] }
+        let capsule = AgentRunAsUserCapsule(
+            usersProvider: { [] },
+            selected: AgentRunAsUser.current(),
+            runLocked: false,
+            identityLocked: true,
+            accessibilityIdentifier: "t",
+            actor: .bot(botID),
+            botsProvider: botsProvider,
+            botName: { lookups.append($0); return "Piper" },
+            onSelect: { _ in }
+        )
+        XCTAssertEqual(
+            AgentRunAsUserPresentation.resolveBotName(botID: capsule.actor.botID, lookup: capsule.botNameLookup),
+            "Piper"
+        )
+        XCTAssertEqual(lookups, [botID])
+        XCTAssertEqual(listCalls, 0, "naming the chip must not load the bot list")
+        XCTAssertNil(AgentRunAsUserPresentation.resolveBotName(botID: nil, lookup: capsule.botNameLookup))
+    }
+
     func test_runAsPresentationLocksWhileRunningOrIdentityLocked() {
         XCTAssertTrue(
             AgentRunAsUserPresentation.isInteractive(userCount: 2, identityLocked: false, runLocked: false)

@@ -455,6 +455,11 @@ public enum AgentRunAsUserPresentation {
         return userCount > 1 || botsAvailable
     }
 
+    /// Chip label lookup: one name for one bot, never the bot list.
+    public static func resolveBotName(botID: BotID?, lookup: (BotID) -> String?) -> String? {
+        botID.flatMap(lookup)
+    }
+
     public static func identityLocked(providerLocked: Bool, actorLockedAt: Date?) -> Bool {
         providerLocked || actorLockedAt != nil
     }
@@ -501,8 +506,12 @@ public struct AgentRunAsUserCapsule: View {
     public let identityLocked: Bool
     public let accessibilityIdentifier: String
     public let actor: RunActor
-    /// Read only while the popover is open (and once to name a bot actor), never per body pass.
+    /// Read only while the popover is open.
     public let botsProvider: (() -> [BotDefinition])?
+    /// Single-name lookup for the chip label; never the full list.
+    public let botNameLookup: (BotID) -> String?
+    /// False hides the locked-thread hand-off (embedded desk without a host).
+    public let canContinueWithoutBot: Bool
     public let executionTarget: (BotID) -> ExecutionTarget
     public let onSelect: (AgentRunAsUser) -> Void
     public let onSelectActor: (RunActor) -> Void
@@ -522,6 +531,8 @@ public struct AgentRunAsUserCapsule: View {
         accessibilityIdentifier: String,
         actor: RunActor = .none,
         botsProvider: (() -> [BotDefinition])? = nil,
+        botName: @escaping (BotID) -> String? = { _ in nil },
+        canContinueWithoutBot: Bool = true,
         executionTarget: @escaping (BotID) -> ExecutionTarget = { _ in .mac },
         onSelect: @escaping (AgentRunAsUser) -> Void,
         onSelectActor: @escaping (RunActor) -> Void = { _ in },
@@ -535,6 +546,8 @@ public struct AgentRunAsUserCapsule: View {
         self.accessibilityIdentifier = accessibilityIdentifier
         self.actor = actor
         self.botsProvider = botsProvider
+        self.botNameLookup = botName
+        self.canContinueWithoutBot = canContinueWithoutBot
         self.executionTarget = executionTarget
         self.onSelect = onSelect
         self.onSelectActor = onSelectActor
@@ -566,7 +579,8 @@ public struct AgentRunAsUserCapsule: View {
     private var botName: String { actorName ?? "Bot" }
 
     private var interactive: Bool {
-        AgentRunAsUserPresentation.isInteractive(
+        if identityLocked && !canContinueWithoutBot { return false }
+        return AgentRunAsUserPresentation.isInteractive(
             userCount: users.count,
             botsAvailable: botsProvider != nil,
             actor: actor,
@@ -616,11 +630,7 @@ public struct AgentRunAsUserCapsule: View {
     }
 
     private func resolveActorName() {
-        guard let botID, let botsProvider else {
-            actorName = nil
-            return
-        }
-        actorName = botsProvider().first(where: { $0.id == botID })?.name
+        actorName = AgentRunAsUserPresentation.resolveBotName(botID: botID, lookup: botNameLookup)
     }
 
     private var popover: some View {

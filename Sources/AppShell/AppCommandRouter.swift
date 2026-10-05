@@ -2645,6 +2645,49 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return nil
     }
 
+    /// Embedded bot desk hand-off: new thread in the source thread's workspace with
+    /// the summary as draft and `actor` selected (unlocked). The source thread is untouched.
+    @discardableResult
+    func createBotHandoffThread(from oldThreadID: AgentThreadID, actor: RunActor) throws -> AgentThread {
+        guard let ctx = context,
+              let old = try ctx.threadRepo.get(id: oldThreadID),
+              let workspaceID = old.workspaceId else {
+            throw LayoutError.workspaceNotFound
+        }
+        let recent = (try? ctx.messageRepo.listRecent(threadId: oldThreadID, limit: 50)) ?? []
+        let summary = AgentAppViewModel.handoffSummary(title: old.title, threadId: oldThreadID, messages: recent)
+        var created = try createAgentThread(
+            workspace: workspaceID,
+            title: "New thread",
+            provider: old.provider,
+            model: old.model,
+            permissionMode: old.permissionMode,
+            reasoningEffort: old.reasoningEffort,
+            reasoningModel: old.reasoningModel,
+            serviceTier: old.serviceTier,
+            modelSelection: old.modelSelection,
+            providerInstanceId: old.providerInstanceId,
+            runAsUser: old.runAsUser,
+            routingConfiguration: old.routingConfiguration,
+            quiet: true
+        )
+        if actor != created.actor {
+            created.actor = actor
+            try ctx.threadRepo.upsert(created)
+        }
+        try AgentThreadDraftRepository(db: ctx.db).upsert(AgentThreadDraft(
+            threadId: created.id,
+            providerInstanceId: created.providerInstanceId ?? created.provider.rawValue,
+            text: summary
+        ))
+        return created
+    }
+
+    func startBotHandoff(from oldThreadID: AgentThreadID, actor: RunActor) throws {
+        let created = try createBotHandoffThread(from: oldThreadID, actor: actor)
+        try openAgentThread(thread: created.id)
+    }
+
     private func destinationWindowIsKey(_ window: NSWindow) -> Bool {
         destinationWindowIsKeyForTests?(window) ?? window.isKeyWindow
     }

@@ -9948,14 +9948,19 @@ public final class BotsViewModel: ObservableObject {
         let key = DeskAgentKey(botID: bot.id, conversationID: live.id, threadID: threadID)
         if deskAgentKey == key, deskAgentVM != nil { return }
         tearDownDeskAgentVM()
-        let botHomeCwd = BotHome(appSupportDirectory: context.appSupportDirectory, bot: bot).root.path
-        try? FileManager.default.createDirectory(
-            at: URL(fileURLWithPath: botHomeCwd),
-            withIntermediateDirectories: true
-        )
+        let deskCwd: String
+        if let workspaceCwd = workspaceExecutionCwd(forThread: threadID) {
+            deskCwd = workspaceCwd
+        } else {
+            deskCwd = BotHome(appSupportDirectory: context.appSupportDirectory, bot: bot).root.path
+            try? FileManager.default.createDirectory(
+                at: URL(fileURLWithPath: deskCwd),
+                withIntermediateDirectories: true
+            )
+        }
         let embedding = AgentAppEmbedding(
             pinnedThreadId: threadID,
-            executionCwd: botHomeCwd,
+            executionCwd: deskCwd,
             promptTransform: { [weak self] text, threadId, runId in
                 guard let self else { return text }
                 return try self.compileDeskPrompt(
@@ -9972,7 +9977,7 @@ public final class BotsViewModel: ObservableObject {
         )
         let vm = AgentAppViewModel(
             workspaceID: Self.botDeskWorkspaceID,
-            cwd: botHomeCwd,
+            cwd: deskCwd,
             coordinator: context.coordinator,
             threadRepo: context.threadRepo,
             messageRepo: context.messageRepo,
@@ -10007,6 +10012,18 @@ public final class BotsViewModel: ObservableObject {
         vm.mentionableBotsRevisionProvider = { [weak self] in
             self?.botStore.botsListRevision ?? 0
         }
+        vm.botNameProvider = { [weak self] botID in
+            (try? self?.botStore.get(id: botID))??.name
+        }
+        if workspaceExecutionCwd(forThread: threadID) != nil {
+            vm.handoffHost = { [weak self, weak router] oldID, actor in
+                do {
+                    try router?.startBotHandoff(from: oldID, actor: actor)
+                } catch {
+                    self?.errorMessage = String(describing: error)
+                }
+            }
+        }
         vm.markThreadRead = { [weak router] id in
             try router?.markAgentThreadRead(thread: id)
         }
@@ -10014,6 +10031,14 @@ public final class BotsViewModel: ObservableObject {
         AppCommandRouter.wireTokenSaverThreadFooter(on: vm, context: context)
         deskAgentKey = key
         deskAgentVM = vm
+    }
+
+    /// Workspace-linked threads keep running in their workspace (or worktree), not the bot home.
+    private func workspaceExecutionCwd(forThread threadID: AgentThreadID) -> String? {
+        guard let thread = (try? context.threadRepo.get(id: threadID)) ?? nil,
+              let workspaceID = thread.workspaceId else { return nil }
+        if let worktree = thread.worktreePath, !worktree.isEmpty { return worktree }
+        return context.state.workspaces[workspaceID]?.cwd
     }
 
     /// Queue-drained follow-ups bypass the embedded composer, so the router asks
