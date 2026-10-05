@@ -247,7 +247,7 @@ final class ManualActionCardTests: XCTestCase {
         XCTAssertEqual(f.vm.resolvedManualActions.first?.state, .continued)
     }
 
-    func test_manualAction_8_unwritableStoreDoesNotContinueOrFollowUp() async throws {
+    func test_manualActionStore_unwritableStoreDoesNotContinueOrFollowUp() async throws {
         // WHY: continuing without a durable resolve would resend the follow-up after restart.
         let f = try makeFixture()
         let control = BotComputerControl()
@@ -271,7 +271,7 @@ final class ManualActionCardTests: XCTestCase {
         XCTAssertEqual(broken.open(threadID: f.thread.id)?.state, .open, "request stays open on disk")
     }
 
-    func test_manualAction_9_staleSecondSurfaceTakeIsRefusedAfterContinue() async throws {
+    func test_manualActionStore_staleSecondSurfaceTakeIsRefusedAfterContinue() async throws {
         // WHY: a stale card on another surface must not revive a continued request or add a follow-up.
         let f = try makeFixture()
         let control = BotComputerControl()

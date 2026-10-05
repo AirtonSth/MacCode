@@ -36,7 +36,7 @@ final class ManualActionTests: XCTestCase {
         XCTAssertEqual(control.openRequest(bot)?.kind, .login)
     }
 
-    func test_expireWithStaleIdDoesNotCloseNewerRequest() {
+    func test_manualAction_6_expireWithStaleIdDoesNotCloseNewerRequest() {
         // WHY: an old timer must never close a request the bot opened later (spec test 6).
         let control = BotComputerControl()
         let bot = BotID()

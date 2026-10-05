@@ -77,7 +77,7 @@ final class BotComputerControlHostTests: XCTestCase {
         )
     }
 
-    func test_actAndExecRefusedWhileUserControlsThenRunAfterRelease() throws {
+    func test_manualAction_3_actAndExecRefusedWhileUserControlsThenRunAfterRelease() throws {
         // WHY: while the user drives the VM the bot must not touch it; nothing is queued or replayed (spec test 3).
         let control = BotComputerControl()
         let (service, docker, support) = try makeService(control: control)
