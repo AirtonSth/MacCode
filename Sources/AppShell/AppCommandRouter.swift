@@ -498,6 +498,59 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         self.sshCommandRunner = sshCommandRunner
         self.botSecretStore = secretStore
         self.agentAppReadGateway = AgentAppReadGateway(db: context.db)
+        installBotHostObservers()
+    }
+
+    lazy var manualActionStore: ManualActionRequestStore = {
+        ManualActionRequestStore(appSupportDirectory: context?.appSupportDirectory ?? AppPaths.appSupportDirectory(for: .debug, override: nil))
+    }()
+    private var botHostObservers: [NSObjectProtocol] = []
+
+    deinit {
+        for token in botHostObservers { NotificationCenter.default.removeObserver(token) }
+    }
+
+    /// Notifications arrive on the poster's thread; the store is thread-safe, UI work hops to MainActor.
+    private func installBotHostObservers() {
+        let center = NotificationCenter.default
+        botHostObservers.append(center.addObserver(forName: .botManualActionRequested, object: nil, queue: nil) { [weak self] note in
+            guard let request = note.userInfo?[BotHostNotificationKey.request] as? ManualActionRequest else { return }
+            Task { @MainActor [weak self] in self?.handleManualActionRequested(request) }
+        })
+        botHostObservers.append(center.addObserver(forName: .botScreenshotPosted, object: nil, queue: nil) { [weak self] note in
+            guard let info = note.userInfo,
+                  let threadID = info[BotHostNotificationKey.threadID] as? AgentThreadID,
+                  let jpeg = info[BotHostNotificationKey.jpeg] as? Data else { return }
+            let reason = info[BotHostNotificationKey.reason] as? String ?? ""
+            Task { @MainActor [weak self] in self?.handleBotScreenshotPosted(threadID: threadID, jpeg: jpeg, reason: reason) }
+        })
+    }
+
+    private func handleManualActionRequested(_ request: ManualActionRequest) {
+        guard let threadID = request.threadID else { return }
+        manualActionStore.upsert(request)
+        guard let ctx = context else { return }
+        // The pausing turn may already have ended; a fresh run id still passes the nested-worker check.
+        let runID = (try? ctx.runRepo.latestActive(for: threadID))?.id ?? AgentRunID()
+        ctx.postAgentUserActionPushIfNeeded(
+            threadId: threadID,
+            runId: runID,
+            requestId: request.id.uuidString,
+            actionTitle: "Aguardando você"
+        )
+    }
+
+    private func handleBotScreenshotPosted(threadID: AgentThreadID, jpeg: Data, reason: String) {
+        guard let ctx = context else { return }
+        do {
+            let attachment = try agentAttachmentStore().stage(
+                data: jpeg, displayName: "screenshot.jpg", kind: .image, mimeType: "image/jpeg"
+            )
+            try ctx.messageRepo.append(AgentMessage(
+                threadId: threadID, role: .assistant, content: "📷 \(reason)", attachments: [attachment]
+            ))
+            refreshAgentSurfaces(thread: threadID, reloadTranscriptIfSelected: true)
+        } catch {}
     }
 
     private func publishAgentThreadUpdated(_ thread: AgentThread) {
