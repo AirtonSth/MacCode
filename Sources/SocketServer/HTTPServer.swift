@@ -981,7 +981,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
         "events.replay", "snapshot.v3",
         "snapshot.incremental", "resume.v1",
         SnapshotChunkCapability.wireName,
+        sequenceOmissionsCapability,
     ]
+
+    /// Every WS filter (including the default `.full`) may skip sequences:
+    /// provider_runtime events are filtered and same-item deltas coalesce.
+    /// Real loss is reported by the host (1012 eventGap / baselineRequired), so
+    /// clients must not treat a sequence hole as a gap when this is advertised.
+    public static let sequenceOmissionsCapability = "sequence.omissions.v1"
 
     /// Wire name for mid-session interest control (iOS sends `rc2.interest` only
     /// after seeing this capability on welcome).
