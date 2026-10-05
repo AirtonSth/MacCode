@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public enum BotComputerGuestSpec {
     public static let imageTag = "remotecode/computer:local"
@@ -37,6 +38,40 @@ public enum BotComputerGuestSpec {
         guestHomeURL(appSupport: appSupport, botID: botID)
     }
 
+    /// Persisted workspace bind list for a bot's container.
+    public static func workspacesURL(appSupport: URL, botID: BotID) -> URL {
+        guestBotRootURL(appSupport: appSupport, botID: botID)
+            .appendingPathComponent("workspaces.json")
+    }
+
+    public static let workspacesLabelKey = "remotecode.workspaces"
+
+    /// SHA-256 hex of the sorted paths joined by newline. Empty list hashes the empty string.
+    public static func workspacesLabel(_ workspaces: [String]) -> String {
+        let joined = workspaces.sorted().joined(separator: "\n")
+        return SHA256.hash(data: Data(joined.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func assertWorkspaceMountPath(
+        _ path: String,
+        registeredWorkspaces: Set<String>? = nil,
+        userHome: String = NSHomeDirectory()
+    ) throws {
+        let components = path.split(separator: "/", omittingEmptySubsequences: false).dropFirst()
+        guard path.hasPrefix("/"),
+              path != "/",
+              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." })
+        else { throw BotComputerGuestError.invalidWorkspacePath(path) }
+        var home = userHome
+        while home.count > 1, home.hasSuffix("/") { home.removeLast() }
+        guard path != home, !home.hasPrefix(path + "/") else {
+            throw BotComputerGuestError.invalidWorkspacePath(path)
+        }
+        if let registeredWorkspaces, !registeredWorkspaces.contains(path) {
+            throw BotComputerGuestError.invalidWorkspacePath(path)
+        }
+    }
+
     public static func botImageTag(botID: BotID) -> String {
         "remotecode/computer:bot-\(botID.value.uuidString.lowercased())"
     }
@@ -66,9 +101,19 @@ public enum BotComputerGuestSpec {
         appSupport: URL,
         viewerToken: String,
         image: String = imageTag,
-        name: String? = nil
+        name: String? = nil,
+        workspaces: [String] = [],
+        registeredWorkspaces: Set<String>? = nil,
+        userHome: String = NSHomeDirectory()
     ) throws -> BotComputerContainerCreateOptions {
         try assertGuestHomePath(guestHome, appSupport: appSupport, botID: botID)
+        for workspace in workspaces {
+            try assertWorkspaceMountPath(
+                workspace,
+                registeredWorkspaces: registeredWorkspaces,
+                userHome: userHome
+            )
+        }
         guard viewerToken.range(of: #"^[a-zA-Z0-9-]{32,128}$"#, options: .regularExpression) != nil else {
             throw BotComputerGuestError.invalidScreenURL
         }
@@ -78,9 +123,10 @@ public enum BotComputerGuestSpec {
             labels: [
                 "remotecode.managed": "1",
                 "remotecode.botId": botID.value.uuidString.lowercased(),
+                workspacesLabelKey: workspacesLabel(workspaces),
             ],
             environment: ["REMOTECODE_VIEWER_TOKEN": viewerToken],
-            binds: ["\(guestHome):\(guestUserHome)"],
+            binds: ["\(guestHome):\(guestUserHome)"] + workspaces.map { "\($0):\($0)" },
             hostIP: "127.0.0.1",
             hostPort: 0,
             containerPort: screenPort,
@@ -173,6 +219,7 @@ public enum BotComputerGuestError: Error, Equatable, LocalizedError, CustomStrin
     case dockerUnavailable
     case observeFailed
     case notReady
+    case invalidWorkspacePath(String)
 
     public var description: String {
         switch self {
@@ -186,6 +233,8 @@ public enum BotComputerGuestError: Error, Equatable, LocalizedError, CustomStrin
             return "Could not capture the Linux desktop."
         case .notReady:
             return "Docker desktop is not ready."
+        case .invalidWorkspacePath(let path):
+            return "Workspace path cannot be mounted into the guest: \(path)"
         }
     }
 

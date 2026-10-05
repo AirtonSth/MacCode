@@ -26,6 +26,16 @@ public struct BotComputerGuestFrameEvidence: Equatable, Sendable {
     public var pngHash: String
 }
 
+public struct GitIdentity: Equatable, Sendable {
+    public var name: String
+    public var email: String
+
+    public init(name: String, email: String) {
+        self.name = name
+        self.email = email
+    }
+}
+
 public enum BotComputerGuestServiceError: Error, Equatable, Sendable, CustomStringConvertible {
     case screenshotTooLarge(actualBytes: Int, maximumBytes: Int)
     case screenshotResultTooLarge(actualBytes: Int, maximumBytes: Int)
@@ -102,7 +112,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
                 botID: botID,
                 guestHome: home.path,
                 appSupport: appSupport,
-                viewerToken: viewerToken
+                viewerToken: viewerToken,
+                workspaces: loadWorkspaces(botID: botID)
             )
             options.name = name
             options.network = nil
@@ -144,8 +155,11 @@ public final class BotComputerGuestService: @unchecked Sendable {
         let name = BotComputerGuestSpec.containerName(botID: botID)
         let network = try availableNetwork(botID: botID)
         let image = try resolvedImage(botID: botID)
+        let workspaces = loadWorkspaces(botID: botID)
         if let existing = try? docker.inspect(name: name) {
-            if imageMatches(existing, tag: image), networkMatches(existing, network: network) {
+            if imageMatches(existing, tag: image),
+               networkMatches(existing, network: network),
+               currentWorkspacesLabel(existing) == BotComputerGuestSpec.workspacesLabel(workspaces) {
                 if existing.running == false {
                     try docker.start(name: name)
                 }
@@ -159,12 +173,85 @@ public final class BotComputerGuestService: @unchecked Sendable {
             guestHome: home.path,
             appSupport: appSupport,
             viewerToken: viewerToken,
-            image: image
+            image: image,
+            workspaces: workspaces
         )
         options.network = network
         _ = try docker.create(options: options)
         try docker.start(name: name)
         return try readyState(name: name, botID: botID, resumed: false)
+    }
+
+    /// Mounts `workspace` at the same path in the bot container. The old container
+    /// stays as `<name>-backup` until the replacement is running.
+    public func ensureWorkspaceMounted(botID: BotID, workspace: String, registered: Set<String>) throws {
+        try BotComputerGuestSpec.assertWorkspaceMountPath(workspace, registeredWorkspaces: registered)
+        let stored = loadWorkspaces(botID: botID)
+        let wanted = Array(Set(stored).union([workspace])).sorted()
+        let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
+        let canonical = BotComputerGuestSpec.containerName(botID: botID)
+        guard let existing = try? docker.inspect(name: canonical) else {
+            try saveWorkspaces(wanted, botID: botID)
+            _ = try provision(botID: botID)
+            return
+        }
+        if stored.contains(workspace),
+           existing.labels[BotComputerGuestSpec.workspacesLabelKey] == BotComputerGuestSpec.workspacesLabel(wanted) {
+            return
+        }
+        let backup = canonical + "-backup"
+        let network = try availableNetwork(botID: botID)
+        var options = try BotComputerGuestSpec.containerCreateOptions(
+            botID: botID,
+            guestHome: home.path,
+            appSupport: appSupport,
+            viewerToken: try viewerToken(botID: botID),
+            image: try resolvedImage(botID: botID),
+            workspaces: wanted,
+            registeredWorkspaces: registered.union(stored)
+        )
+        options.network = network
+        if (try? docker.containerExists(name: backup)) == true {
+            try? docker.remove(name: backup)
+        }
+        var renamed = false
+        do {
+            try docker.stop(name: canonical)
+            try docker.rename(from: canonical, to: backup)
+            renamed = true
+            _ = try docker.create(options: options)
+            try docker.start(name: canonical)
+        } catch {
+            if renamed {
+                try? docker.remove(name: canonical)
+                try? docker.rename(from: backup, to: canonical)
+            }
+            try? docker.start(name: canonical)
+            throw error
+        }
+        try? docker.remove(name: backup)
+        try saveWorkspaces(wanted, botID: botID)
+    }
+
+    private func currentWorkspacesLabel(_ existing: BotComputerContainerInspect) -> String {
+        existing.labels[BotComputerGuestSpec.workspacesLabelKey] ?? BotComputerGuestSpec.workspacesLabel([])
+    }
+
+    private func loadWorkspaces(botID: BotID) -> [String] {
+        let url = BotComputerGuestSpec.workspacesURL(appSupport: appSupport, botID: botID)
+        guard let data = try? Data(contentsOf: url),
+              let paths = try? JSONDecoder().decode([String].self, from: data)
+        else { return [] }
+        return paths.sorted()
+    }
+
+    private func saveWorkspaces(_ paths: [String], botID: BotID) throws {
+        let url = BotComputerGuestSpec.workspacesURL(appSupport: appSupport, botID: botID)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try JSONEncoder().encode(paths.sorted()).write(to: url, options: .atomic)
     }
 
     /// Makes the bot's editable build recipe visible without starting Docker.
@@ -190,6 +277,64 @@ public final class BotComputerGuestService: @unchecked Sendable {
         )
         if data.count <= 32_768 { return data }
         return data.prefix(32_768)
+    }
+
+    /// Runs inside a mounted workspace as the host user's uid:gid ("0" for root commands).
+    /// Only git identity is injected; no host credentials reach the guest.
+    public func exec(
+        botID: BotID,
+        command: String,
+        workspace: String,
+        user: String,
+        gitIdentity: GitIdentity?
+    ) throws -> Data {
+        let trimmed = try BotComputerGuestSpec.assertExecCommand(command)
+        try BotComputerGuestSpec.assertWorkspaceMountPath(workspace)
+        _ = try provision(botID: botID)
+        var environment: [String: String] = [:]
+        if let gitIdentity {
+            environment = [
+                "GIT_AUTHOR_NAME": gitIdentity.name,
+                "GIT_AUTHOR_EMAIL": gitIdentity.email,
+                "GIT_COMMITTER_NAME": gitIdentity.name,
+                "GIT_COMMITTER_EMAIL": gitIdentity.email,
+            ]
+        }
+        let data = try docker.exec(
+            name: BotComputerGuestSpec.containerName(botID: botID),
+            command: ["bash", "-lc", trimmed],
+            user: BotComputerGuestSpec.execUsesRoot(trimmed) ? "0" : user,
+            detach: false,
+            workdir: workspace,
+            environment: environment
+        )
+        if data.count <= 32_768 { return data }
+        return data.prefix(32_768)
+    }
+
+    /// `run` receives git arguments and returns trimmed stdout, or nil on failure.
+    public static func gitIdentity(
+        run: ([String]) -> String? = BotComputerGuestService.runGit
+    ) -> GitIdentity? {
+        guard let name = run(["config", "--get", "user.name"]), !name.isEmpty,
+              let email = run(["config", "--get", "user.email"]), !email.isEmpty
+        else { return nil }
+        return GitIdentity(name: name, email: email)
+    }
+
+    public static func runGit(_ arguments: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = arguments
+        let stdout = Pipe()
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public func openTerminal(botID: BotID) throws {
@@ -220,7 +365,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
             appSupport: appSupport,
             viewerToken: viewerToken,
             image: tag,
-            name: next
+            name: next,
+            workspaces: loadWorkspaces(botID: botID)
         )
         options.network = network
         _ = try docker.create(options: options)
