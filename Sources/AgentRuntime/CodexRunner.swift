@@ -399,6 +399,9 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         if serverName == BotComputerMCPAdmit.serverName {
             keys.append(BotComputerCatalog.threadEnvironmentKey)
         }
+        if serverName == BotBrowserMCPAdmit.serverName {
+            keys.append(BotBrowserCatalog.threadEnvironmentKey)
+        }
         if serverName == BotSelfConfigMCPAdmit.serverName {
             keys += [
                 BotPeerDelegation.threadEnvironmentKey,

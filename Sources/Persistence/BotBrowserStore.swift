@@ -22,6 +22,7 @@ public enum BotBrowserCatalog: Sendable {
     public static let serverName = "remotecode-bot-browser"
     public static let cliArgument = "bot-browser"
     public static let callerEnvironmentKey = "RC_REMOTE_CODE_BOT_ID"
+    public static let threadEnvironmentKey = "RC_REMOTE_CODE_SUBAGENT_THREAD_ID"
 
     public static let open = "bot_browser_open"
     public static let get = "bot_browser_get"
@@ -302,6 +303,8 @@ public struct BotBrowserPendingAction: Codable, Equatable, Sendable {
     public var text: String
     public var url: String
     public var title: String
+    /// Calling thread (`RC_REMOTE_CODE_SUBAGENT_THREAD_ID`), when the run has one.
+    public var threadID: String?
 
     public init(
         id: String,
@@ -311,7 +314,8 @@ public struct BotBrowserPendingAction: Codable, Equatable, Sendable {
         ref: String,
         text: String,
         url: String = "",
-        title: String = ""
+        title: String = "",
+        threadID: String? = nil
     ) {
         self.id = id
         self.botID = botID
@@ -321,10 +325,11 @@ public struct BotBrowserPendingAction: Codable, Equatable, Sendable {
         self.text = text
         self.url = url
         self.title = title
+        self.threadID = threadID
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, botID, kind, action, ref, text, url, title
+        case id, botID, kind, action, ref, text, url, title, threadID
     }
 
     // url/title arrived after ship; queued JSON without them must still decode.
@@ -338,6 +343,7 @@ public struct BotBrowserPendingAction: Codable, Equatable, Sendable {
         text = try container.decode(String.self, forKey: .text)
         url = try container.decodeIfPresent(String.self, forKey: .url) ?? ""
         title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+        threadID = try container.decodeIfPresent(String.self, forKey: .threadID)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -350,6 +356,7 @@ public struct BotBrowserPendingAction: Codable, Equatable, Sendable {
         try container.encode(text, forKey: .text)
         try container.encode(url, forKey: .url)
         try container.encode(title, forKey: .title)
+        try container.encodeIfPresent(threadID, forKey: .threadID)
     }
 }
 
@@ -455,10 +462,12 @@ public enum BotBrowserHost: Sendable {
 public struct BotBrowserService: Sendable {
     public let callerBotID: BotID
     public let store: BotBrowserStore
+    public let callerThreadID: String?
 
-    public init(callerBotID: BotID, store: BotBrowserStore) {
+    public init(callerBotID: BotID, store: BotBrowserStore, callerThreadID: String? = nil) {
         self.callerBotID = callerBotID
         self.store = store
+        self.callerThreadID = callerThreadID
     }
 
     public static func make(environment: [String: String], store: BotBrowserStore) throws -> BotBrowserService {
@@ -467,7 +476,13 @@ public struct BotBrowserService: Sendable {
               let uuid = UUID(uuidString: raw) else {
             throw BotBrowserError.callerMissing
         }
-        return BotBrowserService(callerBotID: BotID(uuid), store: store)
+        let thread = environment[BotBrowserCatalog.threadEnvironmentKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return BotBrowserService(
+            callerBotID: BotID(uuid),
+            store: store,
+            callerThreadID: (thread?.isEmpty == false) ? thread : nil
+        )
     }
 
     public func assertOwn(_ requested: BotID?) throws {
@@ -511,7 +526,8 @@ public struct BotBrowserService: Sendable {
             ref: ref,
             text: text,
             url: url,
-            title: title
+            title: title,
+            threadID: callerThreadID
         )
         try BotBrowserHost.requestAction(store: store, action: pending)
         let deadline = Date().addingTimeInterval(max(0.2, timeoutMS / 1000))
@@ -576,41 +592,17 @@ public struct BotBrowserService: Sendable {
                 "website_data_keys": Array(data.keys).sorted(),
             ]
         case BotBrowserCatalog.waitLogin:
-            let timeout = (arguments["timeout_ms"] as? Double)
-                ?? (arguments["timeout_ms"] as? NSNumber)?.doubleValue
-                ?? BotBrowserLoginWait.defaultTimeoutMS
-            let url = try current()?.url ?? ""
-            // The Playwright lanes feed no cookies, so login detection rides
-            // the leftLoginPage URL change polled LIVE through the host. Each
-            // poll is a full host round-trip — 2s cadence, not the 100ms
-            // store default. Host errors fall back to the persisted state
-            // (legacy restored tabs still persist cookies there).
-            let result = try BotBrowserLoginWait.pollUntilLoggedIn(
-                url: url,
-                timeoutMS: timeout,
-                pollIntervalMS: 2_000,
-                loadPage: {
-                    let cookies = (try? self.store.readWebsiteData(botID: self.callerBotID)) ?? [:]
-                    if let payload = try? self.performHostAction(
-                        kind: BotBrowserCatalog.stateKind,
-                        action: BotBrowserCatalog.waitLoginAction,
-                        ref: "",
-                        text: "",
-                        timeoutMS: 10_000
-                    ) {
-                        return BotBrowserPageState(
-                            url: payload["url"] as? String ?? "",
-                            title: payload["title"] as? String ?? "",
-                            cookies: cookies
-                        )
-                    }
-                    return try self.store.loadPageState(botID: self.callerBotID) ?? BotBrowserPageState(url: url)
-                }
+            // One host call opens the login ManualAction; the run must end, not poll.
+            _ = try performHostAction(
+                kind: BotBrowserCatalog.stateKind,
+                action: BotBrowserCatalog.waitLoginAction,
+                ref: "",
+                text: "",
+                timeoutMS: 10_000
             )
             return [
-                "complete": result.isComplete,
-                "user_message": result.userMessage ?? "",
-                "url": result.url,
+                "status": "paused",
+                "message": ManualActionRequest.pauseReply,
             ]
         case BotBrowserCatalog.snapshot:
             return try performHostAction(

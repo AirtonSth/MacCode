@@ -402,6 +402,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     var botComputerControl: BotComputerControl = .shared
     /// Overrides the bot -> thread lookup for manual-action cards (tests). Default: newest linked conversation thread.
     var botActiveThreadResolverForTesting: (@Sendable (BotID) -> AgentThreadID?)?
+    /// Runs on the background queue after guest provisioning, right before the bridge act (tests).
+    var botBrowserBeforeBridgeActForTesting: (@Sendable () -> Void)?
     public private(set) var lastAgentAppHopTextForTesting: String?
     var destinationWindowIsKeyForTests: ((NSWindow) -> Bool)?
     var providerSignInTerminalInputSenderForTests: ((SurfaceID, String) -> TerminalInputStatus)?
@@ -2804,7 +2806,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             await self?.resolveMacExecution(thread: threadID, approve: approve)
         }
         agent.viewModel.openBotScreen = { [weak self] botID in self?.openBotGuestDesktopInNewWindow(botID) }
-        agent.viewModel.botVMPreflight = { [weak self] botID in await self?.botVMPreflight(botID) }
+        agent.viewModel.botVMPreflight = { [weak self] botID, workspace in
+            await self?.botVMPreflight(botID, workspace: workspace)
+        }
         agent.viewModel.botVMProvision = { [weak self] botID in await self?.provisionBotVM(botID) }
         agent.viewModel.pendingMacExecutionByThread = pendingMacExecution
     }
@@ -8025,7 +8029,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             ManualActionHost.request(
                 control: botComputerControl,
                 botID: botID,
-                threadID: botActiveThreadResolverForTesting?(botID)
+                threadID: action.threadID.flatMap { UUID(uuidString: $0) }.map { AgentThreadID($0) }
+                    ?? botActiveThreadResolverForTesting?(botID)
                     ?? ((try? ctx.botStore.listConversations(botID: botID)) ?? []).lazy
                         .compactMap(\.linkedAgentThreadID).first,
                 kind: .login,
@@ -8040,12 +8045,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         let bridge = botBrowserBridge
         let ensureGuest = botBrowserGuestEnsure(route: route, botID: botID, appSupport: appSupport)
+        let control = botComputerControl
+        let beforeAct = botBrowserBeforeBridgeActForTesting
         // Guest provisioning (docker CLI) and child-process IO must never run
         // on MainActor — hop to a utility queue and await the result.
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 do {
                     try ensureGuest?()
+                    beforeAct?()
+                    // Provisioning can take seconds; the user may have taken control meanwhile.
+                    if action.kind == BotBrowserCatalog.act, control.isControlledByUser(botID) {
+                        continuation.resume(returning: Self.botBrowserRefusalPayload)
+                        return
+                    }
                     let payload = try bridge.perform(
                         botID: botID,
                         route: route,
