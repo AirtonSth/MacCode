@@ -5,6 +5,51 @@ import Persistence
 import Surfaces
 import SwiftUI
 
+// MARK: - Active surface projection
+
+public struct ActiveSurfaceItem: Identifiable, Equatable, Sendable {
+    public let id: UUID
+    public let workspaceID: WorkspaceID
+    public let workspaceName: String
+    public let surfaceID: SurfaceID
+    public let title: String
+    public let type: SurfaceType
+}
+
+/// Busy terminal surfaces across workspaces. Agent App surfaces are excluded:
+/// their runs already appear as active threads and there is no cheap dedupe.
+public enum ActiveSurfaceProjector {
+    public static func items(
+        workspaces: [Workspace],
+        isBusy: (SurfaceDescriptor) -> Bool
+    ) -> [ActiveSurfaceItem] {
+        var result: [ActiveSurfaceItem] = []
+        for workspace in workspaces {
+            for paneID in workspace.layout.paneIDs() {
+                for descriptor in workspace.layout.find(paneID: paneID)?.surfaces ?? []
+                where descriptor.type == .terminal && isBusy(descriptor) {
+                    result.append(ActiveSurfaceItem(
+                        id: descriptor.id.value,
+                        workspaceID: workspace.id,
+                        workspaceName: workspace.name,
+                        surfaceID: descriptor.id,
+                        title: descriptor.title.isEmpty ? "Terminal" : descriptor.title,
+                        type: descriptor.type
+                    ))
+                }
+            }
+        }
+        return result
+    }
+
+    @MainActor
+    static func currentItems(context: AppContext) -> [ActiveSurfaceItem] {
+        items(workspaces: context.state.window.workspaces.compactMap { context.state.workspaces[$0] }) {
+            SurfaceRegistry.shared.surface($0.id)?.isBusy == true
+        }
+    }
+}
+
 // MARK: - View model
 
 @MainActor
@@ -24,6 +69,7 @@ public final class ActiveThreadsViewModel: ObservableObject {
     }
 
     @Published public private(set) var activeItems: [PetActiveThreadItem] = []
+    @Published public private(set) var activeSurfaces: [ActiveSurfaceItem] = []
     @Published public private(set) var finishedItems: [FinishedThreadItem] = []
     @Published public var selectedTab: Tab = .active
     @Published public var errorMessage: String?
@@ -31,6 +77,7 @@ public final class ActiveThreadsViewModel: ObservableObject {
     private let context: AppContext
     private let router: AppCommandRouter
     private var startedAtByThread: [AgentThreadID: Date] = [:]
+    private var lastActiveThreadIDs: Set<AgentThreadID> = []
     private var freshnessTask: Task<Void, Never>?
     private var tabRefreshTask: Task<Void, Never>?
     private var navigationTask: Task<Void, Never>?
@@ -81,7 +128,7 @@ public final class ActiveThreadsViewModel: ObservableObject {
         }
     }
 
-    public var activeCount: Int { activeItems.count }
+    public var activeCount: Int { activeItems.count + activeSurfaces.count }
     public var finishedCount: Int { finishedItems.count }
 
     public var footerLine: String {
@@ -94,11 +141,14 @@ public final class ActiveThreadsViewModel: ObservableObject {
         switch selectedTab {
         case .active:
             if activeCount == 0 {
-                return "No agents running right now"
+                return "No agents or terminals running right now"
             }
-            return activeCount == 1
-                ? "1 agent thread is running"
-                : "\(activeCount) agent threads are running"
+            let threads = activeItems.count
+            let terminals = activeSurfaces.count
+            var parts: [String] = []
+            if threads > 0 { parts.append(threads == 1 ? "1 agent thread" : "\(threads) agent threads") }
+            if terminals > 0 { parts.append(terminals == 1 ? "1 terminal" : "\(terminals) terminals") }
+            return parts.joined(separator: " and ") + (activeCount == 1 ? " is running" : " are running")
         case .lastFinished:
             return "Recent completed, failed, cancelled, and interrupted runs"
         }
@@ -111,8 +161,10 @@ public final class ActiveThreadsViewModel: ObservableObject {
 
     public func reloadActive() {
         // Primary threads only — delegated bot-peer runs show under Subagents.
+        reloadActiveSurfaces()
         let threadIDs = Array(context.coordinator.primaryActiveThreadIdsSnapshot())
         let activeSet = Set(threadIDs)
+        lastActiveThreadIDs = activeSet
         startedAtByThread = startedAtByThread.filter { activeSet.contains($0.key) }
 
         let missingStartedAt = threadIDs.filter { startedAtByThread[$0] == nil }
@@ -147,6 +199,31 @@ public final class ActiveThreadsViewModel: ObservableObject {
                 startedAt: self.startedAtByThread[threadID],
                 lastUpdatePreview: nil
             )
+        }
+    }
+
+    public func reloadActiveSurfaces() {
+        let next = ActiveSurfaceProjector.currentItems(context: context)
+        if next != activeSurfaces { activeSurfaces = next }
+    }
+
+    /// Cheap live pass: surfaces always, thread repo reads only when the
+    /// active thread set changed.
+    public func refreshLive() {
+        if Set(context.coordinator.primaryActiveThreadIdsSnapshot()) != lastActiveThreadIDs {
+            reloadActive()
+        } else {
+            reloadActiveSurfaces()
+        }
+    }
+
+    public func openSurface(_ item: ActiveSurfaceItem) {
+        router.windowController?.presentWorkspaceContent()
+        do {
+            try router.selectWorkspace(item.workspaceID)
+            try router.focusSurface(workspace: item.workspaceID, surface: item.surfaceID)
+        } catch {
+            errorMessage = "Could not open terminal: \(error.localizedDescription)"
         }
     }
 
@@ -417,11 +494,11 @@ public struct ActiveThreadsRootView: View {
 
     private var activeList: some View {
         Group {
-            if vm.activeItems.isEmpty {
+            if vm.activeItems.isEmpty && vm.activeSurfaces.isEmpty {
                 DSEmptyState(
                     icon: "bolt.horizontal.circle",
                     title: "No active threads",
-                    subtitle: "Agent runs in progress will show up here with workspace and provider context."
+                    subtitle: "Agent runs and busy terminals will show up here with workspace context."
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -430,6 +507,11 @@ public struct ActiveThreadsRootView: View {
                         ForEach(vm.activeItems) { item in
                             ActiveThreadCard(item: item) {
                                 vm.openActive(item)
+                            }
+                        }
+                        ForEach(vm.activeSurfaces) { item in
+                            ActiveTerminalCard(item: item) {
+                                vm.openSurface(item)
                             }
                         }
                     }
@@ -497,6 +579,33 @@ private struct ActiveThreadCard: View {
             onOpen: onOpen
         ) {
             DSPill("Running", tone: .warning)
+        } meta: {
+            EmptyView()
+        } trailing: {
+            Image(systemName: "chevron.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(DS.Palette.textTertiary)
+        }
+    }
+}
+
+private struct ActiveTerminalCard: View {
+    let item: ActiveSurfaceItem
+    let onOpen: () -> Void
+
+    var body: some View {
+        AgentOverviewCard(
+            icon: "terminal",
+            iconColor: Color.blue,
+            title: item.title,
+            subtitle: item.workspaceName,
+            identifier: "activeThreads.terminal.\(item.id.uuidString.lowercased())",
+            onOpen: onOpen
+        ) {
+            HStack(spacing: DS.Space.sm) {
+                ProgressView().controlSize(.small)
+                DSPill("Running", tone: .warning)
+            }
         } meta: {
             EmptyView()
         } trailing: {

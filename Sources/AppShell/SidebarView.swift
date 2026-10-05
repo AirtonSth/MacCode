@@ -667,14 +667,21 @@ public final class SidebarViewModel: ObservableObject {
         }
         // Live Active Threads badge: host projection count, same source as Pet.
         // Primary threads only — delegated bot-peer runs show under Subagents.
-        let nextActiveCount = ctx.coordinator.primaryActiveThreadIdsSnapshot().count
-        if nextActiveCount != activeThreadCount {
-            activeThreadCount = nextActiveCount
-        }
+        refreshActiveCount()
         // PF-13: the account blob is peeked once at mount. Later rereads are
         // driven by `.rc2PrivateAccountChanged`, not every refreshFromState.
         if !didPeekPrivateAccountJSON {
             reloadPrivateAccount()
+        }
+    }
+
+    /// Active threads plus busy terminals; cheap, no repository reads.
+    func refreshActiveCount() {
+        guard let ctx = context else { return }
+        let next = ctx.coordinator.primaryActiveThreadIdsSnapshot().count
+            + ActiveSurfaceProjector.currentItems(context: ctx).count
+        if next != activeThreadCount {
+            activeThreadCount = next
         }
     }
 
@@ -5839,6 +5846,10 @@ public final class SidebarView: NSObject {
             viewModel.selectedWorkspaceIDs.removeAll()
             viewModel.clearSelectionAnchorForShellDestination()
         }
+    }
+
+    func refreshActiveCount() {
+        viewModel.refreshActiveCount()
     }
 
     public func setActiveThreadsSelected(_ selected: Bool) {

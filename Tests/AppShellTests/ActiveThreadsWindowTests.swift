@@ -2,6 +2,7 @@ import XCTest
 @testable import AppShell
 @testable import Persistence
 import CoreModel
+@testable import Surfaces
 
 final class ActiveThreadsWindowTests: XCTestCase {
     private func sourceURL(_ relative: String) -> URL {
@@ -313,5 +314,69 @@ final class ActiveThreadsWindowTests: XCTestCase {
             5.0,
             "batched listChrome must beat N durable gets by ≥5% (got \(improvement)%; chrome=\(chromeMed)ms get=\(getMed)ms)"
         )
+    }
+    private func workspace(_ name: String, _ surfaces: [SurfaceDescriptor]) -> Workspace {
+        Workspace(name: name, cwd: "/tmp", layout: .pane(PaneNode(surfaces: surfaces)))
+    }
+
+    func test_projectorListsOnlyBusyTerminals_inWorkspaceThenLayoutOrder() {
+        let busyA = SurfaceDescriptor(type: .terminal, title: "build")
+        let idle = SurfaceDescriptor(type: .terminal, title: "idle")
+        let busyBrowser = SurfaceDescriptor(type: .browser, title: "page")
+        let busyAgentApp = SurfaceDescriptor(type: .agentApp, title: "agent")
+        let busyUntitled = SurfaceDescriptor(type: .terminal, title: "")
+        let first = workspace("One", [busyA, idle, busyBrowser, busyAgentApp])
+        let second = workspace("Two", [busyUntitled])
+        let busy: Set<SurfaceID> = [busyA.id, busyBrowser.id, busyAgentApp.id, busyUntitled.id]
+
+        let items = ActiveSurfaceProjector.items(workspaces: [first, second]) { busy.contains($0.id) }
+
+        XCTAssertEqual(items.map(\.surfaceID), [busyA.id, busyUntitled.id],
+                       "only busy terminals count, ordered by workspace then layout")
+        XCTAssertEqual(items.map(\.title), ["build", "Terminal"])
+        XCTAssertEqual(items.map(\.workspaceName), ["One", "Two"])
+        XCTAssertEqual(items.first?.workspaceID, first.id)
+    }
+
+    func test_projectorDropsTerminalWhenItGoesIdle() {
+        let terminal = SurfaceDescriptor(type: .terminal, title: "run")
+        let ws = workspace("W", [terminal])
+        XCTAssertEqual(ActiveSurfaceProjector.items(workspaces: [ws]) { _ in true }.count, 1)
+        XCTAssertTrue(ActiveSurfaceProjector.items(workspaces: [ws]) { _ in false }.isEmpty,
+                      "busy -> idle must remove the row so the screen stops listing finished work")
+    }
+
+    @MainActor
+    func test_openSurfaceSelectsWorkspaceAndFocusesTerminal() throws {
+        let directory = NSTemporaryDirectory() + "rc-active-open-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        defer {
+            for surface in SurfaceRegistry.shared.all() {
+                surface.close()
+                SurfaceRegistry.shared.unregister(surface.descriptor.id)
+            }
+        }
+        let first = try router.createWorkspace(name: "first", cwd: NSTemporaryDirectory())
+        _ = try router.createWorkspace(name: "second", cwd: NSTemporaryDirectory())
+        XCTAssertNotEqual(context.state.window.selectedWorkspaceID, first.id)
+        let target = try XCTUnwrap(
+            context.state.workspaces[first.id]?.layout.paneIDs()
+                .compactMap { context.state.workspaces[first.id]?.layout.find(paneID: $0)?.surfaces.first }
+                .first
+        )
+        let item = ActiveSurfaceItem(
+            id: target.id.value, workspaceID: first.id, workspaceName: "first",
+            surfaceID: target.id, title: target.title, type: target.type
+        )
+        let viewModel = ActiveThreadsViewModel(context: context, router: router, loadImmediately: false)
+
+        viewModel.openSurface(item)
+
+        XCTAssertNil(viewModel.errorMessage)
+        XCTAssertEqual(context.state.window.selectedWorkspaceID, first.id,
+                       "opening a busy terminal must switch to its workspace")
     }
 }

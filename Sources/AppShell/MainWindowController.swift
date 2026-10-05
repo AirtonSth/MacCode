@@ -326,6 +326,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     /// agent event burst) share one scheduled async flush instead of each
     /// triggering a full sidebar reload + signature walk.
     private var hasPendingRefresh = false
+    private var hasPendingActiveThreadsChange = false
     private let collapsedHeaderHeight: CGFloat = 34
     private var columnsTopConstraint: NSLayoutConstraint?
     private var workspaceContentTopConstraint: NSLayoutConstraint?
@@ -921,8 +922,22 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         restoreProtectedFocus(focusedInput)
     }
 
+    /// Busy terminals / agent runs changed: refresh badge and Active Threads
+    /// screen, coalesced to one pass per runloop turn.
+    public func activeThreadsDidChange() {
+        guard !hasPendingActiveThreadsChange else { return }
+        hasPendingActiveThreadsChange = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.hasPendingActiveThreadsChange = false
+            self.sidebar.refreshActiveCount()
+            self.activeThreadsViewModel?.refreshLive()
+        }
+    }
+
     public func refreshSurfaceRuntimeState() {
         sidebar.refresh()
+        activeThreadsDidChange()
         for controller in paneControllers {
             controller.refreshBusyStates()
         }

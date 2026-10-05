@@ -7579,6 +7579,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         terminal.onBusyStateChanged = { [weak self] _ in
             guard let self else { return }
             self.publishWorkspaceUpdated(workspace, metadata: Self.workspaceBusyMetadata(self.isWorkspaceBusy(workspace)))
+            self.windowController?.activeThreadsDidChange()
         }
         terminal.onBecameFocused = { [weak self, weak terminal] in
             guard let self, let terminal else { return }
