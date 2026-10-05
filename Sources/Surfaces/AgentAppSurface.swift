@@ -18876,6 +18876,10 @@ public struct AgentAppView: View {
             onSelect: { vm.setRunAsUser($0) },
             onSelectActor: { vm.setRunActor($0) },
             onContinueWithoutBot: { continueWithoutBot() },
+            onHandoffToBot: { botID in
+                guard let id = vm.selectedThreadId else { return }
+                vm.startHandoffThread(from: id, actor: .bot(botID))
+            },
             onAppear: { vm.refreshAvailableRunAsUsers() }
         )
     }

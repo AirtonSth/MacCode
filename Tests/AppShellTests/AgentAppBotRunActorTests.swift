@@ -253,6 +253,22 @@ final class AgentAppBotRunActorTests: XCTestCase {
         XCTAssertNil(newStored.actorLockedAt)
     }
 
+    func test_handoffToAnotherBotOpensUnlockedThreadForNewBotAndKeepsOldBotLock() async throws {
+        // WHY: switching bots must never rewrite the locked thread; it forks a fresh one.
+        let f = try makeFixture()
+        try await runFirstBotTurn(f)
+        let other = try f.botsVM.create(name: "Rhea", title: "Scout", soul: "other soul")
+        let newId = try XCTUnwrap(f.vm.startHandoffThread(from: f.thread.id, actor: .bot(other.id)))
+        XCTAssertEqual(f.vm.selectedThreadId, newId)
+        XCTAssertEqual(f.vm.selectedRunActor, .bot(other.id))
+        XCTAssertFalse(f.vm.runActorLocked, "new thread locks only on first send")
+        XCTAssertTrue(f.vm.prompt.contains("Actor thread"))
+        XCTAssertTrue(f.vm.prompt.contains(f.thread.id.value.uuidString.lowercased()))
+        let oldRow = try XCTUnwrap(f.vm.threads.first(where: { $0.id == f.thread.id }))
+        XCTAssertEqual(oldRow.actor, .bot(f.bot.id))
+        XCTAssertNotNil(oldRow.actorLockedAt)
+    }
+
     func test_handoffSummaryIsDeterministicLastSixTurnsTruncated() {
         let tid = AgentThreadID()
         var messages: [AgentMessage] = []
