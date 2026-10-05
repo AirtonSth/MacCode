@@ -17048,6 +17048,102 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try context.threadRepo.list().count, threadsBefore + 1)
     }
 
+    private func makeWorkspaceLinkedDesk() throws -> (
+        context: AppContext, router: AppCommandRouter, vm: BotsViewModel, bot: BotDefinition,
+        thread: AgentThread, workspaceDir: String, runner: ControlledBotHandoffRunner
+    ) {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.grok, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .grok,
+                models: [AgentModelDescriptor(id: "grok-4.6", label: "Grok 4.6", provider: .grok)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "grok"
+            ),
+        ])
+        let workspaceDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BotDeskWS-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        let workspace = try router.createWorkspace(name: "desk-ws", cwd: workspaceDir.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "Workspace thread",
+            provider: .grok,
+            model: "grok-4.6",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .grok, model: "grok-4.6")
+        let conversation = BotConversation(
+            botID: bot.id, title: thread.title, linkedAgentThreadID: thread.id
+        )
+        try context.botStore.upsertConversation(conversation)
+        return (context, router, vm, bot, thread, workspaceDir.path, runner)
+    }
+
+    func test_workspaceLinkedConversationSentFromDeskRunsInWorkspaceCwd_becauseBotHomeIsOnlyForWorkspacelessThreads() async throws {
+        let f = try makeWorkspaceLinkedDesk()
+        let homeRoot = BotHome(appSupportDirectory: f.context.appSupportDirectory, bot: f.bot).root
+        try? FileManager.default.removeItem(at: homeRoot)
+        f.vm.openDesk(f.bot)
+        f.vm.selectDeskThread(try XCTUnwrap(f.context.botStore.conversationLinked(to: f.thread.id)).id)
+        let agent = try XCTUnwrap(f.vm.deskAgentVM)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: homeRoot.path),
+                       "workspace-linked desk must not create the bot home")
+        agent.prompt = "run in workspace"
+        await agent.send()
+        for _ in 0..<500 where f.runner.requests.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
+        let request = try XCTUnwrap(f.runner.requests.first, "status: \(agent.statusMessage ?? "none")")
+        XCTAssertEqual(
+            URL(fileURLWithPath: request.cwd).resolvingSymlinksInPath().path,
+            URL(fileURLWithPath: f.workspaceDir).resolvingSymlinksInPath().path
+        )
+        XCTAssertTrue(request.prompt.contains("Piper"), "bot brain still reaches the prompt")
+    }
+
+    func test_embeddedDeskHandoffCreatesThreadInSourceWorkspaceWithSummaryDraft_becauseDeskWorkspaceIsSynthetic() async throws {
+        let f = try makeWorkspaceLinkedDesk()
+        try f.context.messageRepo.append(AgentMessage(threadId: f.thread.id, role: .user, content: "desk question"))
+        f.vm.openDesk(f.bot)
+        f.vm.selectDeskThread(try XCTUnwrap(f.context.botStore.conversationLinked(to: f.thread.id)).id)
+        let agent = try XCTUnwrap(f.vm.deskAgentVM)
+        XCTAssertNotNil(agent.handoffHost, "workspace-linked desk offers the hand-off")
+        let oldBefore = try XCTUnwrap(try f.context.threadRepo.get(id: f.thread.id))
+        let created = try f.router.createBotHandoffThread(from: f.thread.id, actor: .none)
+        XCTAssertNotEqual(created.id, f.thread.id)
+        XCTAssertEqual(created.workspaceId, f.thread.workspaceId)
+        XCTAssertNotEqual(created.workspaceId, BotsViewModel.botDeskWorkspaceID)
+        XCTAssertNil(created.actorLockedAt)
+        let draft = try XCTUnwrap(try AgentThreadDraftRepository(db: f.context.db).get(
+            threadId: created.id, providerInstanceId: created.providerInstanceId ?? created.provider.rawValue
+        ))
+        XCTAssertTrue(draft.text.hasPrefix("Continuação da thread \"Workspace thread\""))
+        XCTAssertTrue(draft.text.contains("desk question"))
+        let oldAfter = try XCTUnwrap(try f.context.threadRepo.get(id: f.thread.id))
+        XCTAssertEqual(oldAfter.actor, oldBefore.actor)
+        XCTAssertEqual(oldAfter.actorLockedAt, oldBefore.actorLockedAt)
+        XCTAssertEqual(oldAfter.title, oldBefore.title)
+    }
+
+    func test_embeddedDeskWithoutHandoffHostHidesContinueWithoutBot() throws {
+        let f = try makeWorkspaceLinkedDesk()
+        let bare = AgentAppViewModel(
+            workspaceID: BotsViewModel.botDeskWorkspaceID,
+            cwd: "/tmp",
+            coordinator: f.context.coordinator,
+            threadRepo: f.context.threadRepo,
+            messageRepo: f.context.messageRepo,
+            embedding: AgentAppEmbedding(pinnedThreadId: f.thread.id)
+        )
+        XCTAssertFalse(bare.canContinueWithoutBot)
+    }
+
     func test_botDesk2000DeltaDistillReplyPaintsThroughEmbeddedAgentAppWithoutDeskRepublish() async throws {
         // WHY (Distill terminal parity for Bots): a 2,000-token reply in the bot
         // desk must reach the embedded Agent App with bounded publishes and no

@@ -419,6 +419,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var botIsAvailable: (BotID) -> Bool = { _ in true }
     /// Display name used in refusal messages; nil when unknown.
     public var botNameProvider: (BotID) -> String? = { _ in nil }
+    /// Embedded desk only: opens the hand-off thread in the source thread's workspace
+    /// (the desk's synthetic workspace cannot hold it). Nil hides "Continuar sem bot".
+    public var handoffHost: ((AgentThreadID, RunActor) -> Void)?
+    /// A hand-off needs a host when this VM is an embedded desk.
+    public var canContinueWithoutBot: Bool { embedding == nil || handoffHost != nil }
     /// Links the workspace thread to a bot conversation (single thread, no copy) on the first bot send.
     public var botThreadLinker: (@MainActor (BotID, AgentThreadID) throws -> Void)?
     /// Compiles the bot brain into the provider prompt for a bot-run workspace thread.
@@ -6179,7 +6184,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     static let handoffMessageCount = 6
 
     /// Deterministic continuation draft: header plus the last user/assistant messages, truncated.
-    static func handoffSummary(title: String, threadId: AgentThreadID, messages: [AgentMessage]) -> String {
+    public static func handoffSummary(title: String, threadId: AgentThreadID, messages: [AgentMessage]) -> String {
         var lines = ["Continuação da thread \"\(title)\" (id \(threadId.value.uuidString.lowercased()))"]
         let turns = messages.filter { $0.role == .user || $0.role == .assistant }.suffix(handoffMessageCount)
         for message in turns {
@@ -6195,6 +6200,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// The old thread (actor, lock) is untouched.
     @discardableResult
     public func startHandoffThread(from oldThreadId: AgentThreadID, actor: RunActor) -> AgentThreadID? {
+        if embedding != nil {
+            handoffHost?(oldThreadId, actor)
+            return nil
+        }
         let old = threads.first(where: { $0.id == oldThreadId })
         let recent = (try? messageRepo.listRecent(threadId: oldThreadId, limit: 50)) ?? []
         let summary = Self.handoffSummary(
@@ -18735,12 +18744,14 @@ public struct AgentAppView: View {
                 .font(.system(size: 11))
                 .foregroundColor(DS.Palette.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            Button("Continuar sem bot") {
-                continueWithoutBot()
+            if vm.canContinueWithoutBot {
+                Button("Continuar sem bot") {
+                    continueWithoutBot()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("agent.deletedBot.continueWithoutBot")
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .accessibilityIdentifier("agent.deletedBot.continueWithoutBot")
         }
         .padding(.horizontal, DS.Space.lg)
         .padding(.vertical, DS.Space.sm)
@@ -18988,6 +18999,8 @@ public struct AgentAppView: View {
             accessibilityIdentifier: "agent.runAsUser.menu",
             actor: vm.selectedRunActor,
             botsProvider: { vm.mentionableBotsProvider() },
+            botName: { vm.botNameProvider($0) },
+            canContinueWithoutBot: vm.canContinueWithoutBot,
             executionTarget: { vm.executionTarget(for: $0) },
             onSelect: { vm.setRunAsUser($0) },
             onSelectActor: { vm.setRunActor($0) },
