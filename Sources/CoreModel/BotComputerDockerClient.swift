@@ -91,10 +91,13 @@ public protocol BotComputerDockerClienting: Sendable {
     func removeNetwork(name: String) throws
     func remove(name: String) throws
     func removeMatching(namePrefix: String) throws
+    func top(name: String) throws -> String
 }
 
 public extension BotComputerDockerClienting {
     func removeNetwork(name: String) throws {}
+
+    func top(name: String) throws -> String { "" }
 
     func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data {
         try exec(name: name, command: command, user: user, detach: detach, workdir: nil, environment: [:])
@@ -341,6 +344,10 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
 
     public func removeNetwork(name: String) throws {
         _ = try run(["network", "rm", name])
+    }
+
+    public func top(name: String) throws -> String {
+        String(data: try run(["top", name]), encoding: .utf8) ?? ""
     }
 
     public func removeMatching(namePrefix: String) throws {

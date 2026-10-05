@@ -164,13 +164,17 @@ public final class BotComputerGuestService: @unchecked Sendable {
     }
 
     public func provision(botID: BotID) throws -> BotComputerGuestReady {
+        try provision(botID: botID, keeping: [])
+    }
+
+    private func provision(botID: BotID, keeping: Set<String>) throws -> BotComputerGuestReady {
         let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
         try seedRecipe(botID: botID)
         try ensureCurrentImage()
         let name = BotComputerGuestSpec.containerName(botID: botID)
         let network = try availableNetwork(botID: botID)
         let image = try resolvedImage(botID: botID)
-        let workspaces = loadWorkspaces(botID: botID)
+        let workspaces = prunedWorkspaces(botID: botID, keeping: keeping)
         if let existing = try? docker.inspect(name: name) {
             if imageMatches(existing, tag: image),
                networkMatches(existing, network: network),
@@ -201,13 +205,13 @@ public final class BotComputerGuestService: @unchecked Sendable {
     /// stays as `<name>-backup` until the replacement is running.
     public func ensureWorkspaceMounted(botID: BotID, workspace: String, registered: Set<String>) throws {
         try BotComputerGuestSpec.assertWorkspaceMountPath(workspace, registeredWorkspaces: registered)
-        let stored = loadWorkspaces(botID: botID)
+        let stored = prunedWorkspaces(botID: botID, keeping: [workspace])
         let wanted = Array(Set(stored).union([workspace])).sorted()
         let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
         let canonical = BotComputerGuestSpec.containerName(botID: botID)
         guard let existing = try? docker.inspect(name: canonical) else {
             try saveWorkspaces(wanted, botID: botID)
-            _ = try provision(botID: botID)
+            _ = try provision(botID: botID, keeping: [workspace])
             return
         }
         if stored.contains(workspace),
@@ -250,6 +254,14 @@ public final class BotComputerGuestService: @unchecked Sendable {
 
     private func currentWorkspacesLabel(_ existing: BotComputerContainerInspect) -> String {
         existing.labels[BotComputerGuestSpec.workspacesLabelKey] ?? BotComputerGuestSpec.workspacesLabel([])
+    }
+
+    /// Drops stored binds whose host path no longer exists, so a removed workspace cannot break container create.
+    private func prunedWorkspaces(botID: BotID, keeping: Set<String>) -> [String] {
+        let stored = loadWorkspaces(botID: botID)
+        let live = stored.filter { keeping.contains($0) || FileManager.default.fileExists(atPath: $0) }
+        if live.count != stored.count { try? saveWorkspaces(live, botID: botID) }
+        return live
     }
 
     private func loadWorkspaces(botID: BotID) -> [String] {

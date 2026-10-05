@@ -505,6 +505,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ManualActionRequestStore(appSupportDirectory: context?.appSupportDirectory ?? AppPaths.appSupportDirectory(for: .debug, override: nil))
     }()
     private var botHostObservers: [NSObjectProtocol] = []
+    /// Mac-execution approvals awaiting the user, per thread (reason text). Never auto-approved.
+    var pendingMacExecution: [AgentThreadID: String] = [:]
+    var botVMDocker: any BotComputerDockerClienting = BotComputerDockerCLI()
+    var botVMProvisionServiceForTesting: BotComputerGuestService?
 
     deinit {
         for token in botHostObservers { NotificationCenter.default.removeObserver(token) }
@@ -516,6 +520,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         botHostObservers.append(center.addObserver(forName: .botManualActionRequested, object: nil, queue: nil) { [weak self] note in
             guard let request = note.userInfo?[BotHostNotificationKey.request] as? ManualActionRequest else { return }
             Task { @MainActor [weak self] in self?.handleManualActionRequested(request) }
+        })
+        botHostObservers.append(center.addObserver(forName: .botMacExecutionRequested, object: nil, queue: nil) { [weak self] note in
+            guard let info = note.userInfo,
+                  let threadID = info[BotHostNotificationKey.threadID] as? AgentThreadID else { return }
+            let reason = info[BotHostNotificationKey.reason] as? String ?? ""
+            Task { @MainActor [weak self] in self?.handleMacExecutionRequested(threadID: threadID, reason: reason) }
         })
         botHostObservers.append(center.addObserver(forName: .botScreenshotPosted, object: nil, queue: nil) { [weak self] note in
             guard let info = note.userInfo,
@@ -2790,6 +2800,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         agent.viewModel.botBusyMessage = { botID, threadID in
             BotVMRunRegistry.shared.busyMessage(botID: botID, threadID: threadID)
         }
+        agent.viewModel.botMacExecutionResolver = { [weak self] threadID, approve in
+            await self?.resolveMacExecution(thread: threadID, approve: approve)
+        }
+        agent.viewModel.botVMPreflight = { [weak self] botID in await self?.botVMPreflight(botID) }
+        agent.viewModel.botVMProvision = { [weak self] botID in await self?.provisionBotVM(botID) }
+        agent.viewModel.pendingMacExecutionByThread = pendingMacExecution
     }
 
     private struct BotWorkspaceRunUnavailable: LocalizedError {
