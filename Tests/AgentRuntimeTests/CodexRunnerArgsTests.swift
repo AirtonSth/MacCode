@@ -192,6 +192,31 @@ final class CodexRunnerArgsTests: XCTestCase {
         }
     }
 
+    /// WHY: Codex gives up on any MCP tool call after 60 s by default, while a
+    /// bot_computer_exec may run for minutes and a rebuild for longer. Without a
+    /// per-server tool_timeout_sec above the host wait, Codex reports a failure
+    /// while the guest command is still running (Claude and Grok default far
+    /// above these waits).
+    func test_botComputerMCPToolTimeoutOutlastsTheHostWait() {
+        let command = "/tmp/RemoteCodeDistillService"
+        let botEnvironment = [BotSelfConfigCatalog.callerEnvironmentKey: "bot-proof"]
+        let timeoutKey = "mcp_servers.\(BotComputerMCPAdmit.serverName).tool_timeout_sec="
+        for argv in [
+            CodexRunner.botCatalogMCPOverrides(command: command, environment: botEnvironment),
+            CodexRunner.appServerArguments(command: command, environment: botEnvironment),
+        ] {
+            let value = argv.first { $0.hasPrefix(timeoutKey) }.flatMap { Int($0.dropFirst(timeoutKey.count)) }
+            XCTAssertEqual(value, BotComputerMCPAdmit.toolTimeoutSeconds)
+        }
+        let seconds = TimeInterval(BotComputerMCPAdmit.toolTimeoutSeconds)
+        XCTAssertGreaterThan(seconds, BotComputerGuestSpec.execResultWaitSeconds)
+        XCTAssertGreaterThan(seconds, BotComputerGuestSpec.rebuildResultWaitSeconds)
+        XCTAssertTrue(
+            BotComputerMCPAdmit.admitCodexTOML(existing: "", command: command)
+                .contains("tool_timeout_sec = \(BotComputerMCPAdmit.toolTimeoutSeconds)")
+        )
+    }
+
     /// WHY: bot-computer/-browser/-web answer every call with callerMissing
     /// without RC_REMOTE_CODE_BOT_ID, so a non-bot Agent App Codex run must not
     /// be offered them. bot-self-config stays: Agent App runs use it for

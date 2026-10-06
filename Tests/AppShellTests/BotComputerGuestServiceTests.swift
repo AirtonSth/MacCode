@@ -21,6 +21,9 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     var execFailuresRemaining = 0
     var execError: Error?
     var lastExec: (name: String, command: [String], user: String?, detach: Bool)?
+    var lastExecAt: Date?
+    /// Stands in for a cold `docker start` + desktop boot during provisioning.
+    var startDelay: TimeInterval = 0
     var networks: [String] = []
     var removedNetworks: [String] = []
     var networkError: Error?
@@ -54,6 +57,7 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
         return options.name
     }
     func start(name: String) throws {
+        if startDelay > 0 { Thread.sleep(forTimeInterval: startDelay) }
         started.append(name)
         containers[name] = BotComputerContainerInspect(running: true, imageID: "img", hostPort: 49152)
     }
@@ -71,6 +75,7 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     func exec(name: String, command: [String], user: String?, detach: Bool, workdir: String?, environment: [String: String]) throws -> Data {
         execCalls += 1
         lastExec = (name, command, user, detach)
+        lastExecAt = Date()
         if execFailuresRemaining > 0 {
             execFailuresRemaining -= 1
             throw BotComputerGuestError.observeFailed
@@ -969,6 +974,65 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertEqual(rebuilt.screenURL.host, "127.0.0.1")
         XCTAssertTrue(fake.builds.contains(BotComputerGuestSpec.recipeURL(appSupport: support, botID: botID)))
         XCTAssertFalse(fake.renamed.isEmpty)
+        service.teardown(botID: botID)
+    }
+
+    func test_execAfterSlowProvisioningStillAnswersBeforeTheCallerStopsWaiting() throws {
+        // WHY: the MCP caller's wait starts at enqueue; provisioning a cold
+        // container eats into it. The guest limit is sized at exec start so the
+        // host's own deadline (guest + kill grace + docker slack + result margin)
+        // still lands before the caller's deadline.
+        let support = makeSupport("rc-guest-exec-budget")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.startDelay = 1.2
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            recipeContext: AppShellResourceBundle.computerGuestRecipeURL(),
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let botID = BotID()
+        let deadline = Date().addingTimeInterval(30)
+        _ = try service.exec(botID: botID, command: "make", deadline: deadline)
+        let command = try XCTUnwrap(fake.lastExec?.command)
+        let guest = try XCTUnwrap(BotComputerGuestSpec.execGuestSeconds(inExecArguments: command))
+        let issuedAt = try XCTUnwrap(fake.lastExecAt)
+        XCTAssertLessThan(guest, BotComputerGuestSpec.execGuestDeadlineSeconds)
+        XCTAssertLessThanOrEqual(
+            issuedAt.addingTimeInterval(
+                BotComputerGuestSpec.execHostDeadline(guestSeconds: guest)
+                    + TimeInterval(BotComputerGuestSpec.execResultMarginSeconds)
+            ),
+            deadline
+        )
+        service.teardown(botID: botID)
+    }
+
+    func test_execWithNoBudgetLeftAfterProvisioningIsRefusedWithoutRunning() throws {
+        // WHY: starting a command the caller can no longer hear about is the
+        // failure this guards against; say so instead of running it blind.
+        let support = makeSupport("rc-guest-exec-no-budget")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            recipeContext: AppShellResourceBundle.computerGuestRecipeURL(),
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let botID = BotID()
+        XCTAssertThrowsError(
+            try service.exec(botID: botID, command: "make", deadline: Date().addingTimeInterval(8))
+        ) { error in
+            XCTAssertEqual(error as? BotComputerError, .invalid(BotComputerGuestService.execBudgetExhaustedMessage))
+        }
+        XCTAssertNil(
+            fake.lastExec.flatMap { BotComputerGuestSpec.execGuestSeconds(inExecArguments: $0.command) },
+            "the agent command never reached docker"
+        )
         service.teardown(botID: botID)
     }
 

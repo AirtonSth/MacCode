@@ -309,14 +309,17 @@ public final class BotComputerGuestService: @unchecked Sendable {
         try docker.stop(name: BotComputerGuestSpec.containerName(botID: botID))
     }
 
-    public func exec(botID: BotID, command: String) throws -> Data {
+    /// `deadline` is when the MCP caller stops waiting; the guest limit is sized
+    /// from what is left of it after provisioning (see `execGuestBudgetSeconds`).
+    public func exec(botID: BotID, command: String, deadline: Date? = nil) throws -> Data {
         let trimmed = try BotComputerGuestSpec.assertExecCommand(command)
         _ = try provision(botID: botID)
+        let guestSeconds = try Self.execGuestSeconds(deadline: deadline)
         let name = BotComputerGuestSpec.containerName(botID: botID)
         let user = BotComputerGuestSpec.execUsesRoot(trimmed) ? "0" : nil
         let data = try docker.exec(
             name: name,
-            command: BotComputerGuestSpec.deadlineExecCommand(trimmed),
+            command: BotComputerGuestSpec.deadlineExecCommand(trimmed, guestSeconds: guestSeconds),
             user: user,
             detach: false
         )
@@ -331,11 +334,13 @@ public final class BotComputerGuestService: @unchecked Sendable {
         command: String,
         workspace: String,
         user: String,
-        gitIdentity: GitIdentity?
+        gitIdentity: GitIdentity?,
+        deadline: Date? = nil
     ) throws -> Data {
         let trimmed = try BotComputerGuestSpec.assertExecCommand(command)
         try BotComputerGuestSpec.assertWorkspaceMountPath(workspace)
         _ = try provision(botID: botID)
+        let guestSeconds = try Self.execGuestSeconds(deadline: deadline)
         var environment: [String: String] = [:]
         if let gitIdentity {
             environment = [
@@ -347,7 +352,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
         }
         let data = try docker.exec(
             name: BotComputerGuestSpec.containerName(botID: botID),
-            command: BotComputerGuestSpec.deadlineExecCommand(trimmed),
+            command: BotComputerGuestSpec.deadlineExecCommand(trimmed, guestSeconds: guestSeconds),
             user: BotComputerGuestSpec.execUsesRoot(trimmed) ? "0" : user,
             detach: false,
             workdir: workspace,
@@ -355,6 +360,17 @@ public final class BotComputerGuestService: @unchecked Sendable {
         )
         if data.count <= 32_768 { return data }
         return data.prefix(32_768)
+    }
+
+    public static let execBudgetExhaustedMessage =
+        "The command was not run: starting the Linux desktop used up the time this "
+        + "bot_computer_exec call had. Call bot_computer_exec again."
+
+    private static func execGuestSeconds(deadline: Date?) throws -> Int {
+        guard let seconds = BotComputerGuestSpec.execGuestBudgetSeconds(deadline: deadline, now: Date()) else {
+            throw BotComputerError.invalid(execBudgetExhaustedMessage)
+        }
+        return seconds
     }
 
     /// `run` receives git arguments and returns trimmed stdout, or nil on failure.
@@ -463,10 +479,11 @@ public final class BotComputerGuestService: @unchecked Sendable {
                     command: action.command,
                     workspace: run.workspace,
                     user: "\(getuid()):\(getgid())",
-                    gitIdentity: Self.gitIdentity(run: gitRun)
+                    gitIdentity: Self.gitIdentity(run: gitRun),
+                    deadline: action.deadline
                 )
             } else {
-                output = try exec(botID: botID, command: action.command)
+                output = try exec(botID: botID, command: action.command, deadline: action.deadline)
             }
             return [
                 "ok": true,
@@ -624,7 +641,13 @@ public final class BotComputerGuestService: @unchecked Sendable {
         return name
     }
 
+    /// Bots now provision on their own lanes; keep one base-image check/build
+    /// at a time instead of racing `docker build` of the same tag.
+    private static let baseImageLock = NSLock()
+
     private func ensureCurrentImage() throws {
+        Self.baseImageLock.lock()
+        defer { Self.baseImageLock.unlock() }
         let tag = BotComputerGuestSpec.imageTag
         let label = (try? docker.imageLabel(tag: tag, key: BotComputerGuestSpec.recipeLabelKey)) ?? ""
         if try docker.imageExists(tag: tag), label == BotComputerGuestSpec.recipeRevision {

@@ -336,7 +336,10 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
                     serverName: $0.name,
                     cliArgument: $0.argument,
                     command: resolved,
-                    environment: $0.environment
+                    environment: $0.environment,
+                    toolTimeoutSeconds: $0.name == BotComputerMCPAdmit.serverName
+                        ? BotComputerMCPAdmit.toolTimeoutSeconds
+                        : nil
                 )
             }
     }
@@ -378,13 +381,17 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         serverName: String,
         cliArgument: String,
         command: String,
-        environment: [String: String] = [:]
+        environment: [String: String] = [:],
+        toolTimeoutSeconds: Int? = nil
     ) -> [String] {
         let prefix = "mcp_servers.\(serverName)"
         var overrides = [
             "-c", "\(prefix).command=\"\(tomlBasicString(command))\"",
             "-c", "\(prefix).args=[\"\(tomlBasicString(cliArgument))\"]",
         ]
+        if let toolTimeoutSeconds {
+            overrides += ["-c", "\(prefix).tool_timeout_sec=\(toolTimeoutSeconds)"]
+        }
         for (key, value) in environment.sorted(by: { $0.key < $1.key }) {
             overrides += [
                 "-c", "\(prefix).env.\(key)=\"\(tomlBasicString(value))\"",

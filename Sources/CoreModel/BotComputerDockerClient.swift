@@ -51,8 +51,9 @@ public enum BotComputerDockerError: Error, Equatable, LocalizedError, CustomStri
     case networkAddressPoolExhausted
     case networkSubnetUnavailable
     case provisioningFailed
-    /// A bot_computer_exec command outlived `BotComputerGuestSpec.execGuestDeadlineSeconds`.
-    case guestCommandTimedOut
+    /// A bot_computer_exec command outlived its guest limit (`seconds`, at most
+    /// `BotComputerGuestSpec.execGuestDeadlineSeconds`) and was stopped.
+    case guestCommandTimedOut(seconds: Int)
 
     public var recovery: BotComputerDockerRecovery {
         switch self {
@@ -67,9 +68,9 @@ public enum BotComputerDockerError: Error, Equatable, LocalizedError, CustomStri
     }
 
     public var description: String {
-        guard self == .guestCommandTimedOut else { return recovery.message }
+        guard case .guestCommandTimedOut(let seconds) = self else { return recovery.message }
         // The desktop is fine; the agent needs to know its command was stopped.
-        return "The command ran longer than \(BotComputerGuestSpec.execGuestDeadlineSeconds) s "
+        return "The command ran longer than \(seconds) s "
             + "inside the Linux container and was stopped. Run long jobs in the background "
             + "(nohup <command> > /tmp/job.log 2>&1 &) and check the log in later calls."
     }
@@ -374,6 +375,7 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         let executable = try BotComputerDockerResolver.shared.resolveHealthyExecutable()
         let timeout = timeoutForArguments(args)
         let result: (data: Data, errorData: Data, terminationStatus: Int32, timedOut: Bool)
+        let started = ProcessInfo.processInfo.systemUptime
         do {
             result = try runProcess(
                 executableURL: URL(fileURLWithPath: executable),
@@ -390,8 +392,12 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         if result.timedOut {
             throw timeoutError(for: args)
         }
-        if isGuestDeadlineExit(args, status: result.terminationStatus) {
-            throw BotComputerDockerError.guestCommandTimedOut
+        if isGuestDeadlineExit(
+            args,
+            status: result.terminationStatus,
+            elapsed: ProcessInfo.processInfo.systemUptime - started
+        ), let seconds = BotComputerGuestSpec.execGuestSeconds(inExecArguments: args) {
+            throw BotComputerDockerError.guestCommandTimedOut(seconds: seconds)
         }
         if result.terminationStatus != 0 {
             BotComputerDockerResolver.shared.invalidateIfMatches(executable)
@@ -416,29 +422,34 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
     static func timeoutForArguments(_ args: [String]) -> TimeInterval {
         switch args.first {
         case "info": return 5
-        case "build": return 600
-        case "exec" where isGuestDeadlineExec(args): return BotComputerGuestSpec.execHostDeadlineSeconds
+        case "build": return BotComputerGuestSpec.imageBuildDeadlineSeconds
+        case "exec":
+            guard let seconds = guestDeadlineSeconds(args) else { return 15 }
+            return BotComputerGuestSpec.execHostDeadline(guestSeconds: seconds)
         default: return 15
         }
     }
 
     static func timeoutError(for args: [String]) -> BotComputerDockerError {
-        if isGuestDeadlineExec(args) { return .guestCommandTimedOut }
+        if let seconds = guestDeadlineSeconds(args) { return .guestCommandTimedOut(seconds: seconds) }
         return args.first == "info" ? .probeTimedOut : .provisioningFailed
     }
 
-    /// An agent command wrapped by `BotComputerGuestSpec.deadlineExecCommand`.
-    static func isGuestDeadlineExec(_ args: [String]) -> Bool {
-        let prefix = BotComputerGuestSpec.execDeadlinePrefix
-        guard args.first == "exec", args.count > prefix.count else { return false }
-        return (1...(args.count - prefix.count)).contains { start in
-            Array(args[start..<(start + prefix.count)]) == prefix
-        }
+    /// The guest limit of an agent command wrapped by
+    /// `BotComputerGuestSpec.deadlineExecCommand`, nil for any other docker call.
+    static func guestDeadlineSeconds(_ args: [String]) -> Int? {
+        guard args.first == "exec" else { return nil }
+        return BotComputerGuestSpec.execGuestSeconds(inExecArguments: args)
     }
 
-    /// GNU `timeout` exits 124 when TERM stopped the command, 137 when it had to KILL.
-    static func isGuestDeadlineExit(_ args: [String], status: Int32) -> Bool {
-        isGuestDeadlineExec(args) && (status == 124 || status == 137)
+    /// GNU `timeout` exits 124 when TERM stopped the command, 137 when it had to
+    /// KILL. The command itself can exit 124/137 too (its own `timeout N curl`,
+    /// an OOM kill), so only a run that actually lasted the guest limit counts.
+    static func isGuestDeadlineExit(_ args: [String], status: Int32, elapsed: TimeInterval) -> Bool {
+        guard let seconds = guestDeadlineSeconds(args), status == 124 || status == 137 else {
+            return false
+        }
+        return elapsed >= TimeInterval(seconds)
     }
 
     static func stdoutLimit(for args: [String]) -> Int {

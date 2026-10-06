@@ -523,7 +523,10 @@ final class BotComputerDockerClientTests: XCTestCase {
         XCTAssertEqual(BotComputerDockerCLI.timeoutForArguments(observe), 15)
         XCTAssertEqual(BotComputerDockerCLI.timeoutForArguments(["ps", "-aq", "--filter", "name=x"]), 15)
         XCTAssertEqual(BotComputerDockerCLI.timeoutForArguments(["info"]), 5)
-        XCTAssertEqual(BotComputerDockerCLI.timeoutForArguments(["build", "."]), 600)
+        XCTAssertEqual(
+            BotComputerDockerCLI.timeoutForArguments(["build", "."]),
+            BotComputerGuestSpec.imageBuildDeadlineSeconds
+        )
         // A bare `bash -lc` exec (unbounded in the guest) gets no long host deadline.
         XCTAssertEqual(
             BotComputerDockerCLI.timeoutForArguments(["exec", "remotecode-bot-x", "bash", "-lc", "sleep 60"]),
@@ -531,18 +534,50 @@ final class BotComputerDockerClientTests: XCTestCase {
         )
     }
 
+    func test_shortenedGuestBudgetShortensTheHostDeadlineToMatch() {
+        // WHY: an exec that waited for provisioning gets a smaller guest limit;
+        // the host docker deadline must follow that limit, not the full one, or
+        // the host would still be waiting after the MCP caller gave up.
+        let agentExec = ["exec", "remotecode-bot-x"]
+            + BotComputerGuestSpec.deadlineExecCommand("make", guestSeconds: 40)
+        XCTAssertEqual(
+            BotComputerDockerCLI.timeoutForArguments(agentExec),
+            BotComputerGuestSpec.execHostDeadline(guestSeconds: 40)
+        )
+        XCTAssertEqual(BotComputerDockerCLI.timeoutError(for: agentExec), .guestCommandTimedOut(seconds: 40))
+    }
+
     func test_agentExecTimeoutIsReportedAsACommandTimeoutNotADesktopFailure() {
         // WHY: "Could not start the Linux desktop" sends the agent chasing Docker
         // when its own command simply ran too long.
+        let full = BotComputerGuestSpec.execGuestDeadlineSeconds
         let agentExec = ["exec", "remotecode-bot-x"] + BotComputerGuestSpec.deadlineExecCommand("make")
-        XCTAssertEqual(BotComputerDockerCLI.timeoutError(for: agentExec), .guestCommandTimedOut)
-        XCTAssertTrue(BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 124), "timeout sent TERM")
-        XCTAssertTrue(BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 137), "timeout had to KILL")
-        XCTAssertFalse(BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 1))
-        XCTAssertFalse(BotComputerDockerCLI.isGuestDeadlineExit(["exec", "x", "false"], status: 124))
-        let message = BotComputerDockerError.guestCommandTimedOut.description
-        XCTAssertTrue(message.contains("\(BotComputerGuestSpec.execGuestDeadlineSeconds) s"))
+        let ranTheFullLimit = TimeInterval(full) + 0.4
+        XCTAssertEqual(BotComputerDockerCLI.timeoutError(for: agentExec), .guestCommandTimedOut(seconds: full))
+        XCTAssertTrue(
+            BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 124, elapsed: ranTheFullLimit),
+            "timeout sent TERM"
+        )
+        XCTAssertTrue(
+            BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 137, elapsed: ranTheFullLimit),
+            "timeout had to KILL"
+        )
+        XCTAssertFalse(BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 1, elapsed: ranTheFullLimit))
+        XCTAssertFalse(
+            BotComputerDockerCLI.isGuestDeadlineExit(["exec", "x", "false"], status: 124, elapsed: ranTheFullLimit)
+        )
+        let message = BotComputerDockerError.guestCommandTimedOut(seconds: full).description
+        XCTAssertTrue(message.contains("\(full) s"))
         XCTAssertNotEqual(message, BotComputerDockerError.provisioningFailed.description)
+    }
+
+    func test_ownTimeoutOrOOMExitBeforeTheGuestLimitIsNotReportedAsTheGuestDeadline() {
+        // WHY: agents run `timeout 10 curl ...` (exit 124 after 10 s) and an
+        // OOM-killed command exits 137 within seconds. Telling the agent "ran
+        // longer than 165 s and was stopped" for those is false.
+        let agentExec = ["exec", "remotecode-bot-x"] + BotComputerGuestSpec.deadlineExecCommand("timeout 10 curl x")
+        XCTAssertFalse(BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 124, elapsed: 10.2))
+        XCTAssertFalse(BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 137, elapsed: 3))
     }
 }
 

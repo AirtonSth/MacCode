@@ -8151,6 +8151,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
+    nonisolated private static let botComputerActionLanes = BotComputerActionLanes(
+        label: "io.remotecode.bot-computer-action"
+    )
+
     nonisolated private static func reconcileBotComputerActions(appSupport: URL, botStore: BotStore) {
         let store = BotComputerStore(appSupportDirectory: appSupport)
         let service = BotComputerGuestService(
@@ -8158,8 +8162,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             docker: BotComputerDockerCLI(),
             recipeContext: AppShellResourceBundle.computerGuestRecipeURL()
         )
+        // The drain only hands actions to per-bot lanes and returns; a bot's
+        // long exec or rebuild runs on that bot's lane alone.
         while true {
-            let count = (try? BotComputerHost.applyPending(store: store) { action in
+            let count = (try? BotComputerHost.dispatchPending(store: store, lanes: botComputerActionLanes) { action in
                 guard let uuid = UUID(uuidString: action.botID) else {
                     throw BotComputerError.invalid("Invalid bot id.")
                 }

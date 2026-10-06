@@ -157,4 +157,50 @@ final class BotComputerGuestSpecTests: XCTestCase {
         XCTAssertTrue(dockerfile.contains("nodejs"))
         XCTAssertTrue(dockerfile.contains("npm"))
     }
+
+    func test_execGuestBudgetFitsTheCallersRemainingWait() {
+        // WHY: the MCP caller's wait starts when it queues the exec; queueing and
+        // provisioning eat into it. The guest limit must leave room for the kill
+        // grace, docker teardown and the result write, so the host still answers
+        // before the caller gives up.
+        let now = Date(timeIntervalSince1970: 1_000)
+        let fresh = now.addingTimeInterval(BotComputerGuestSpec.execResultWaitSeconds)
+        XCTAssertEqual(
+            BotComputerGuestSpec.execGuestBudgetSeconds(deadline: fresh, now: now),
+            BotComputerGuestSpec.execGuestDeadlineSeconds,
+            "a warm exec keeps the full advertised limit"
+        )
+        XCTAssertEqual(
+            BotComputerGuestSpec.execGuestBudgetSeconds(deadline: nil, now: now),
+            BotComputerGuestSpec.execGuestDeadlineSeconds
+        )
+
+        for remaining in [17.0, 40.0, 100.5, 179.9] {
+            let deadline = now.addingTimeInterval(remaining)
+            guard let seconds = BotComputerGuestSpec.execGuestBudgetSeconds(deadline: deadline, now: now) else {
+                XCTFail("remaining \(remaining) s should still run the command")
+                continue
+            }
+            XCTAssertGreaterThanOrEqual(seconds, BotComputerGuestSpec.execMinimumGuestSeconds)
+            let answeredBy = BotComputerGuestSpec.execHostDeadline(guestSeconds: seconds)
+                + TimeInterval(BotComputerGuestSpec.execResultMarginSeconds)
+            XCTAssertLessThanOrEqual(answeredBy, remaining, "remaining \(remaining) s")
+        }
+
+        XCTAssertNil(
+            BotComputerGuestSpec.execGuestBudgetSeconds(deadline: now.addingTimeInterval(16.9), now: now),
+            "too little left to run anything: refuse instead of starting a doomed command"
+        )
+        XCTAssertNil(BotComputerGuestSpec.execGuestBudgetSeconds(deadline: now.addingTimeInterval(-1), now: now))
+    }
+
+    func test_execGuestSecondsReadsOnlyWrappedAgentCommands() {
+        let wrapped = ["exec", "-u", "0", "c"] + BotComputerGuestSpec.deadlineExecCommand("ls", guestSeconds: 42)
+        XCTAssertEqual(BotComputerGuestSpec.execGuestSeconds(inExecArguments: wrapped), 42)
+        XCTAssertNil(BotComputerGuestSpec.execGuestSeconds(inExecArguments: ["exec", "c", "bash", "-lc", "ls"]))
+        XCTAssertNil(
+            BotComputerGuestSpec.execGuestSeconds(inExecArguments: ["exec", "c", "timeout", "-k", "5", "9", "curl", "x"]),
+            "the agent's own timeout is not the guest deadline wrapper"
+        )
+    }
 }

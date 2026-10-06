@@ -165,27 +165,86 @@ public enum BotComputerGuestSpec {
     public static let screenWidth = 1280
     public static let screenHeight = 800
 
-    /// How long the bot's MCP child waits for an exec/rebuild result from the host.
+    /// How long the bot's MCP child waits for an exec result, counted from the
+    /// moment it queues the action. Everything the host does for that exec
+    /// (queueing, provisioning, the command itself) must fit in this window.
     public static let execResultWaitSeconds: TimeInterval = 180
     /// Guest-side limit for bot_computer_exec. `timeout` stops the whole command
     /// group inside the guest (TERM, then KILL after the grace); killing only the
     /// host docker exec client would leave e.g. apt-get holding the dpkg lock.
     public static let execGuestDeadlineSeconds = 165
     public static let execGuestKillGraceSeconds = 5
-    /// Host docker exec deadline: guest deadline + grace + docker teardown slack,
-    /// kept below `execResultWaitSeconds` so the host reports the timeout itself
-    /// instead of the MCP child giving up first.
+    /// Host-side time for `docker exec` to return after the guest KILL.
+    public static let execDockerSlackSeconds = 5
+    /// Time for the host to write the result and the child to poll it.
+    public static let execResultMarginSeconds = 2
+    /// Below this, an exec is refused instead of being started with a budget
+    /// too small to do anything useful.
+    public static let execMinimumGuestSeconds = 5
+
+    /// `docker build` deadline (base image and bot_computer_rebuild).
+    public static let imageBuildDeadlineSeconds: TimeInterval = 600
+    /// Create, start and screen-ready the rebuilt container, then swap it in.
+    public static let rebuildReadyBudgetSeconds: TimeInterval = 180
+    /// How long the bot's MCP child waits for a rebuild result: the build
+    /// deadline plus the time to bring the rebuilt desktop up.
+    public static var rebuildResultWaitSeconds: TimeInterval {
+        imageBuildDeadlineSeconds + rebuildReadyBudgetSeconds
+    }
+
+    /// Host docker exec deadline for a guest limit: guest seconds + kill grace +
+    /// docker teardown slack.
+    public static func execHostDeadline(guestSeconds: Int) -> TimeInterval {
+        TimeInterval(guestSeconds + execGuestKillGraceSeconds + execDockerSlackSeconds)
+    }
+
+    /// Host docker exec deadline for an exec that starts with its full budget.
     public static var execHostDeadlineSeconds: TimeInterval {
-        TimeInterval(execGuestDeadlineSeconds + execGuestKillGraceSeconds + 5)
+        execHostDeadline(guestSeconds: execGuestDeadlineSeconds)
+    }
+
+    /// Guest seconds an exec may run so its result still reaches a caller that
+    /// stops waiting at `deadline`: what is left after provisioning and queueing,
+    /// minus kill grace, docker slack and the result margin, capped at the guest
+    /// deadline. nil when less than `execMinimumGuestSeconds` would be left.
+    /// No deadline (a host-side caller) gets the full guest deadline.
+    public static func execGuestBudgetSeconds(deadline: Date?, now: Date) -> Int? {
+        guard let deadline else { return execGuestDeadlineSeconds }
+        let remaining = Int(deadline.timeIntervalSince(now).rounded(.down))
+        let budget = remaining - execGuestKillGraceSeconds - execDockerSlackSeconds - execResultMarginSeconds
+        guard budget >= execMinimumGuestSeconds else { return nil }
+        return min(budget, execGuestDeadlineSeconds)
+    }
+
+    public static func execDeadlinePrefix(guestSeconds: Int) -> [String] {
+        ["timeout", "-k", "\(execGuestKillGraceSeconds)", "\(guestSeconds)"]
     }
 
     public static var execDeadlinePrefix: [String] {
-        ["timeout", "-k", "\(execGuestKillGraceSeconds)", "\(execGuestDeadlineSeconds)"]
+        execDeadlinePrefix(guestSeconds: execGuestDeadlineSeconds)
     }
 
-    /// Guest argv for an agent shell command, bounded by the guest deadline.
-    public static func deadlineExecCommand(_ command: String) -> [String] {
-        execDeadlinePrefix + ["bash", "-lc", command]
+    /// Guest argv for an agent shell command, bounded by `guestSeconds`.
+    public static func deadlineExecCommand(
+        _ command: String,
+        guestSeconds: Int = execGuestDeadlineSeconds
+    ) -> [String] {
+        execDeadlinePrefix(guestSeconds: guestSeconds) + ["bash", "-lc", command]
+    }
+
+    /// The guest limit of an argv built by `deadlineExecCommand`, or nil when the
+    /// argv is not a wrapped agent command.
+    public static func execGuestSeconds(inExecArguments args: [String]) -> Int? {
+        let lead = ["timeout", "-k", "\(execGuestKillGraceSeconds)"]
+        guard args.count >= lead.count + 3 else { return nil }
+        for start in 0...(args.count - lead.count - 3) {
+            guard Array(args[start..<(start + lead.count)]) == lead,
+                  let seconds = Int(args[start + lead.count]), seconds > 0,
+                  args[start + lead.count + 1] == "bash",
+                  args[start + lead.count + 2] == "-lc" else { continue }
+            return seconds
+        }
+        return nil
     }
 
     public static func execUsesRoot(_ command: String) -> Bool {
