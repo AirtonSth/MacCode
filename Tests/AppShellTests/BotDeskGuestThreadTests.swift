@@ -234,6 +234,112 @@ final class BotDeskGuestThreadTests: XCTestCase {
         await finishAll(f)
     }
 
+    func test_deskGateAsksDockerInsteadOfTrustingACachedRunningDesktop() async throws {
+        // WHY (D11): the cached "desktop running" flag only knows the app's own
+        // launches and stops. A container stopped outside the app (`docker stop`,
+        // OrbStack quit, a crash) still reads running; trusting it let the send
+        // through to fail inside the guest resolver, with no banner and no way
+        // to recover. The gate must ask Docker, and fail fast without
+        // provisioning inline (AGENTS.md loading rules).
+        let f = try makeFixture()
+        let bot = try makeBot(f, docker: true)
+        let thread = try await firstSend(f, bot: bot, provider: .distill)
+        await finishAll(f)
+        let conversationID = try XCTUnwrap(f.vm.selectedConversation?.id)
+        XCTAssertTrue(f.vm.createDeskThread())
+        f.vm.selectDeskThread(conversationID)
+        let agent = try XCTUnwrap(f.vm.deskAgentVM)
+        XCTAssertEqual(agent.selectedThreadId, thread.id)
+        agent.providerSnapshots = f.snapshots
+        agent.providerLaunchConfig = { _, _ in ("/usr/bin/true", [:]) }
+        let runsBefore = f.distill.requests.count
+
+        // The real machine state: the app once started this desktop; Docker now
+        // reports the container stopped.
+        let docker = ScriptedDocker(containerRunning: false)
+        f.vm.computerGuestService = BotComputerGuestService(
+            appSupport: f.ctx.appSupportDirectory,
+            docker: BotComputerDockerCLI(run: { try docker.run($0) })
+        )
+        f.vm.dockerGuestReadyOverrideForTesting = nil
+        f.vm.desktopKindOverrideForTesting = .dockerDesktop
+        f.vm.guestRunningByBot[bot.id.value] = true
+
+        agent.prompt = "after docker stop"
+        await agent.send()
+        XCTAssertEqual(agent.vmUnavailableBotID, bot.id, agent.statusMessage)
+        XCTAssertTrue(agent.statusMessage.hasPrefix("VM indisponível"), agent.statusMessage)
+        XCTAssertTrue(docker.calls.contains { $0.first == "inspect" }, "the gate must ask Docker: \(docker.calls)")
+        XCTAssertFalse(f.vm.isGuestRunning(bot.id), "the desk stops claiming a desktop Docker says is down")
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(f.distill.requests.count, runsBefore, "no run while the container is down")
+
+        // The background start the gate kicked fails too (Docker refuses it).
+        let settled = await waitUntil {
+            if case .failed = f.vm.guestLaunchState(for: bot.id) { return true }
+            return false
+        }
+        XCTAssertTrue(settled)
+        // Positive control: Docker reports it running, the same send goes through.
+        docker.containerRunning = true
+        f.vm.guestRunningByBot[bot.id.value] = true
+        agent.prompt = "container up"
+        await agent.send()
+        let started = await waitUntil { f.distill.requests.contains { $0.prompt.contains("container up") } }
+        XCTAssertTrue(started, agent.statusMessage)
+        XCTAssertNil(agent.vmUnavailableBotID)
+        await finishAll(f)
+    }
+
+    func test_aDeskConversationRunAsAnotherMacUserIsNotLockedToTheGuest() async throws {
+        // WHY (M9): the guest only ever gets the app user's own accounts, and the
+        // guest resolver refuses a run meant for another macOS user. Locking such a
+        // conversation to the guest would make every send fail with no way out,
+        // so it stays an unlocked Mac thread run as that user.
+        let f = try makeFixture()
+        let bot = try makeBot(f, docker: true)
+        f.vm.openDesk(bot)
+        XCTAssertTrue(f.vm.createDeskThread())
+        f.vm.setDeskProvider(.distill)
+        var other = AgentRunAsUser.current()
+        other.uid = getuid() + 1
+        other.generatedUID = "other-\(other.uid)"
+        other.shortName = "someoneelse"
+        f.vm.setDeskRunAsUser(other)
+        XCTAssertTrue(f.vm.send("as another user"), f.vm.errorMessage ?? "")
+        let threadID = try XCTUnwrap(f.vm.selectedConversation?.linkedAgentThreadID)
+        let thread = try XCTUnwrap(try f.ctx.threadRepo.get(id: threadID))
+        XCTAssertEqual(thread.runAsUser?.uid, other.uid)
+        XCTAssertNil(thread.actorLockedAt)
+        XCTAssertNil(thread.executionTarget)
+        XCTAssertNil(try f.ctx.threadRepo.guestPlacement(of: threadID)?.guestRuntime)
+        let started = await waitUntil { f.distill.requests.contains { $0.prompt.contains("as another user") } }
+        XCTAssertTrue(started, f.vm.errorMessage ?? "no run")
+        await finishAll(f)
+    }
+
+    /// `docker` stand-in for the desk gate: `inspect` reports the bot container's
+    /// state; every other call fails as when the daemon cannot start it.
+    private final class ScriptedDocker: @unchecked Sendable {
+        private let lock = NSLock()
+        private var running: Bool
+        private var recorded: [[String]] = []
+        init(containerRunning: Bool) { running = containerRunning }
+        var containerRunning: Bool {
+            get { lock.withLock { running } }
+            set { lock.withLock { running = newValue } }
+        }
+        var calls: [[String]] { lock.withLock { recorded } }
+        func run(_ args: [String]) throws -> Data {
+            let running = lock.withLock { () -> Bool in
+                recorded.append(args)
+                return self.running
+            }
+            guard args.first == "inspect" else { throw BotComputerGuestError.dockerUnavailable }
+            return Data("\(running) sha256:img 6080 bridge, {}".utf8)
+        }
+    }
+
     func test_vmRulesFollowTheBrainButNeverARawDistillSlashCommand() {
         let rules = BotStandingInstructions.vmThreadRules
         XCTAssertEqual(

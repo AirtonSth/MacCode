@@ -360,6 +360,12 @@ public final class BotComputerGuestService: @unchecked Sendable {
         try docker.stop(name: BotComputerGuestSpec.containerName(botID: botID))
     }
 
+    /// What Docker says right now (one `docker inspect`): false when the
+    /// container is stopped or gone, or Docker does not answer.
+    public func isContainerRunning(botID: BotID) -> Bool {
+        (try? docker.inspect(name: BotComputerGuestSpec.containerName(botID: botID)))?.running == true
+    }
+
     /// `deadline` is when the MCP caller stops waiting; the guest limit is sized
     /// from what is left of it after provisioning (see `execGuestBudgetSeconds`).
     public func exec(botID: BotID, command: String, deadline: Date? = nil) throws -> Data {

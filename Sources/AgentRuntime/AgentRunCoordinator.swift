@@ -1898,13 +1898,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         )
     }
 
-    /// The first run of a guest thread the user moved to the Mac
-    /// (`macHandoffPending`) opens a new Mac session: the guest's session
-    /// cannot load on the Mac. It clears the thread's cursor, the provider
-    /// session's resume cursor and the marker, and opens the provider prompt
-    /// with the recent transcript; the transcript keeps the user's own words.
-    /// Legacy `.vm` threads (no marker) keep their Mac sessions untouched.
-    /// Returns the handed-off request, or nil when no handoff is pending.
+    /// Every run of a guest thread the user moved to the Mac
+    /// (`macHandoffPending`) opens a new Mac session until the provider
+    /// accepts one: the guest's session cannot load on the Mac. It clears the
+    /// thread's cursor and the provider session's resume cursor (idempotent),
+    /// and opens the provider prompt with the recent transcript; the
+    /// transcript keeps the user's own words. The marker stays until
+    /// `completeMacHandoff`, so a start that fails or is stopped before the
+    /// provider took the turn hands off again on the next send instead of
+    /// opening a Mac session with no context. Legacy `.vm` threads (no
+    /// marker) keep their Mac sessions untouched. Returns the handed-off
+    /// request, or nil when no handoff is pending.
     func pendingMacHandoff(
         _ request: AgentRunRequest, placement: AgentThreadGuestPlacement?
     ) throws -> AgentRunRequest? {
@@ -1913,8 +1917,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let title = try threadRepo.get(id: request.threadId)?.title ?? ""
         try providerSessionRepo?.clearResumeCursor(threadId: request.threadId)
         try threadRepo.updateProviderThreadId(id: request.threadId, providerThreadId: nil)
-        // Last, so a failure above leaves the handoff pending for the next start.
-        try threadRepo.setGuestRuntime(id: request.threadId, nil)
         agentRunLog.info(
             "bot.guest.mac_handoff thread=\(request.threadId.value.uuidString, privacy: .public)"
         )
@@ -1951,6 +1953,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // the displayed text, so it is the prompt that goes out.
         handed.tokenSaverCompressesPrompt = request.tokenSaverCompressesPrompt || summary != nil
         return handed
+    }
+
+    /// The provider took the handed-off turn (a Mac session now carries the
+    /// summary): the thread stops handing off. A failure to clear only means
+    /// the next send hands off once more; it is reported, never thrown.
+    private func completeMacHandoff(runId: AgentRunID, threadId: AgentThreadID) {
+        do {
+            try threadRepo.setGuestRuntime(id: threadId, nil)
+        } catch {
+            emitPersistenceIssue("agent_threads.guest_runtime.mac_handoff", error: error, runId: runId, threadId: threadId)
+        }
     }
 
     @discardableResult
@@ -2641,6 +2654,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         let terminalStatus = (try? runRepo.status(of: runId)).flatMap { status -> AgentRunStatus? in
             status == .running || status == .pending ? nil : status
+        }
+        // A turn that already failed did not take the handoff; the next send retries it.
+        if macHandoff != nil, terminalStatus != .failed, terminalStatus != .interrupted {
+            completeMacHandoff(runId: runId, threadId: effectiveRequest.threadId)
         }
         if terminalStatus == .cancelled {
             handle.cancel()

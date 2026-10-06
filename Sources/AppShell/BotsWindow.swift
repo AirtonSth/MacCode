@@ -10073,8 +10073,9 @@ public final class BotsViewModel: ObservableObject {
         vm.manualActionStore = router.manualActionStore
         // Desk threads locked to the bot's VM get the same gate, queue and
         // D11 banner as Agent App tabs. A workspace-less desk thread's gate
-        // starts the desktop through the desk's own launch, so the desktop
-        // pane and the send admission see the VM the gate brought up.
+        // asks Docker and never provisions inline (the send fails fast with
+        // the banner); "Iniciar VM" starts the desktop through the desk's own
+        // launch, so the desktop pane and the send admission see that VM.
         router.configureBotVMHooks(on: vm)
         vm.botVMPreflight = { [weak self, weak router] botID, workspace in
             if let workspace {
@@ -10082,7 +10083,7 @@ public final class BotsViewModel: ObservableObject {
                 return await router.botVMPreflight(botID, workspace: workspace)
             }
             guard let self else { return "Bot indisponível." }
-            return await self.deskGuestDesktopFailure(botID)
+            return await self.deskGuestDesktopPreflight(botID)
         }
         vm.botVMProvision = { [weak self] botID in
             guard let self else { return "Bot indisponível." }
@@ -10109,13 +10110,40 @@ public final class BotsViewModel: ObservableObject {
         deskAgentVM = vm
     }
 
-    /// nil once the bot's Linux desktop is up (starting it when it is not);
-    /// otherwise the user-facing failure. Same readiness `admitDesktopSend` uses.
+    /// Desk send gate: nil when Docker reports the bot's container running.
+    /// `guestRunningByBot` only knows the app's own launches and stops; a
+    /// container stopped outside the app (`docker stop`, OrbStack quit, a
+    /// crash) would still read running, so a cached "running" is confirmed
+    /// with one `docker inspect`. A desktop that is down is started in the
+    /// background, as `admitDesktopSend` does, and the send fails at once
+    /// with the D11 banner instead of waiting on a provision.
+    private func deskGuestDesktopPreflight(_ botID: BotID) async -> String? {
+        if let dockerGuestReadyOverrideForTesting {
+            return dockerGuestReadyOverrideForTesting ? nil : "Docker desktop is not ready."
+        }
+        guard let service = computerGuestService else { return BotComputerDockerError.cliMissing.description }
+        if isGuestRunning(botID) {
+            let running = await Task.detached(priority: .userInitiated) {
+                service.isContainerRunning(botID: botID)
+            }.value
+            if running { return nil }
+            guestRunningByBot[botID.value] = false
+            guestLaunchStateByBot[botID.value] = .idle
+            objectWillChange.send()
+        }
+        presentGuestDesktop(botID: botID)
+        if case .failed(let message) = guestLaunchState(for: botID) { return message }
+        return "Linux desktop is starting. Try again when it is ready."
+    }
+
+    /// "Iniciar VM": nil once the bot's Linux desktop is up, starting it
+    /// through the desk's own launch (a real provision, never the cached
+    /// flag, like the Agent App tabs' `provisionBotVM`); otherwise the
+    /// user-facing failure.
     private func deskGuestDesktopFailure(_ botID: BotID) async -> String? {
         if let dockerGuestReadyOverrideForTesting {
             return dockerGuestReadyOverrideForTesting ? nil : "Docker desktop is not ready."
         }
-        if isGuestRunning(botID) { return nil }
         let ready = await withCheckedContinuation { continuation in
             presentGuestDesktop(botID: botID) { continuation.resume(returning: $0) }
         }
@@ -10464,7 +10492,7 @@ public final class BotsViewModel: ObservableObject {
             )
             createdThread.reasoningModel = routing.reasoningModel
             try context.threadRepo.upsert(createdThread)
-            try lockNewDeskThreadToGuestIfDistill(&createdThread, bot: bot, provider: routing.provider)
+            try lockNewDeskThreadToGuestIfDistill(&createdThread, bot: bot, routing: routing)
             thread = createdThread
             liveConversation.linkedAgentThreadID = thread.id
             try botStore.upsertConversation(liveConversation)
@@ -10481,13 +10509,16 @@ public final class BotsViewModel: ObservableObject {
     /// and carries the guest marker from creation, before its first run. Other
     /// providers and other desktops keep today's unlocked desk thread on the Mac,
     /// and so does every desk thread created before this (D5): reused threads
-    /// never reach here.
+    /// never reach here. So does a conversation run as another macOS user
+    /// (M9): the guest only ever gets the app user's own accounts, and the
+    /// guest resolver refuses such a run, so locking it would fail every send.
     private func lockNewDeskThreadToGuestIfDistill(
         _ thread: inout AgentThread,
         bot: BotDefinition,
-        provider: AgentProvider
+        routing: BotDeskRouting
     ) throws {
-        guard provider == .distill,
+        guard routing.provider == .distill,
+              routing.runAsUser.uid == getuid(),
               BotExecutionDefault.target(for: try currentRevision(for: bot)) == .vm else { return }
         let lockedAt = Date()
         // Marker first: on its own (no `.vm` target yet) it routes nothing.

@@ -83,10 +83,12 @@ public struct AgentThreadGuestPlacement: Equatable, Sendable {
     }
 
     /// A guest thread the user moved to the Mac ("Rodar esta thread no Mac",
-    /// an approved Mac-execution request) keeps its marker until its next
-    /// run starts: that run drops the guest session, which the Mac cannot
-    /// load, and carries a handoff summary instead. Deferred to the run start
-    /// because a guest run still finishing would write its session back.
+    /// an approved Mac-execution request) keeps its marker until the provider
+    /// accepts a Mac run: each run until then drops the guest session, which
+    /// the Mac cannot load, and carries a handoff summary instead. Deferred to
+    /// the run start because a guest run still finishing would write its
+    /// session back, and kept past a failed or stopped start so no Mac
+    /// session ever opens without the conversation.
     public var macHandoffPending: Bool {
         executionTarget == .mac && guestRuntime?.isEmpty == false
     }

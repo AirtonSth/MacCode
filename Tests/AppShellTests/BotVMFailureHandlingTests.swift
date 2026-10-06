@@ -290,6 +290,54 @@ final class BotVMFailureHandlingTests: XCTestCase {
         XCTAssertNil(try f.ctx.threadRepo.guestPlacement(of: f.thread.id)?.guestRuntime)
     }
 
+    func test_aHandoffStartThatFailsBeforeTheProviderTookItHandsOffAgainOnTheNextSend() async throws {
+        // WHY (M10): the handoff summary exists only in that run's request. If the
+        // marker went with a start that then failed before the provider took the
+        // turn (admission, a Stop during preparation, a Mac sign-in error), the next
+        // send would open a Mac session with none of the guest conversation.
+        let f = try makeFixture()
+        try makeGuestThreadWithHistory(f, guestSession: "guest-session-1")
+        f.vm.botVMPreflight = { _, _ in "docker parado" }
+        f.vm.prompt = "continua"
+        await f.vm.send()
+        f.vm.runSelectedThreadOnMac()
+        let attempts = AttemptCounter()
+        f.ctx.coordinator.providerAdmissionCheck = { _, _ in
+            if attempts.next() == 1 {
+                throw NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "Mac Distill not signed in"])
+            }
+        }
+        f.vm.prompt = "primeira tentativa"
+        await f.vm.send()
+        _ = await waitUntil { attempts.count == 1 }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(f.runner.requests.isEmpty, "the first start failed before the provider")
+        XCTAssertEqual(
+            try f.ctx.threadRepo.guestPlacement(of: f.thread.id)?.macHandoffPending, true,
+            "a failed start must leave the handoff pending"
+        )
+
+        f.vm.prompt = "segunda tentativa"
+        await f.vm.send()
+        let sent = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(sent, f.vm.statusMessage)
+        let request = try XCTUnwrap(f.runner.requests.last)
+        XCTAssertNil(request.providerThreadId, "still a new Mac session, never the guest's")
+        XCTAssertTrue(request.prompt.hasPrefix("Continuação da thread"), request.prompt)
+        XCTAssertTrue(request.prompt.contains("Assistente: feito na VM"), "the guest conversation reaches the Mac")
+        XCTAssertNil(
+            try f.ctx.threadRepo.guestPlacement(of: f.thread.id)?.guestRuntime,
+            "once the provider took the turn, the thread stops handing off"
+        )
+    }
+
+    private final class AttemptCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        var count: Int { lock.withLock { value } }
+        func next() -> Int { lock.withLock { value += 1; return value } }
+    }
+
     func test_removedWorkspaceRefusesBotSend() async throws {
         let f = try makeFixture()
         try FileManager.default.removeItem(at: f.workspaceDir)
