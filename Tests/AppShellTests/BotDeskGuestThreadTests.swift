@@ -358,6 +358,67 @@ final class BotDeskGuestThreadTests: XCTestCase {
         XCTAssertNil(f.vm.deskRuntimeLabel, "only a Docker bot has two places to run")
     }
 
+    func test_aGuestThreadSwitchedOffDistillIsNeverLabeledAsRunningOnTheMac() async throws {
+        // WHY (plan A S11, D11): the guest marker, not the provider, decides
+        // where a thread runs. A guest thread switched to another provider
+        // still never runs on the Mac (every send fails closed until it is
+        // back on Distill), so "Running on this Mac" would tell the user the
+        // opposite of what happens.
+        let f = try makeFixture()
+        let bot = try makeBot(f, docker: true)
+        let thread = try await firstSend(f, bot: bot, provider: .distill)
+        await finishAll(f)
+        let agent = try XCTUnwrap(f.vm.deskAgentVM)
+        XCTAssertEqual(f.vm.deskRuntimeLabel, BotDesktopKind.guestRuntimeLabel(botName: "Piper"), "precondition")
+
+        // What the embedded picker persists, then repaints.
+        XCTAssertTrue(try f.ctx.threadRepo.setPickerConfig(
+            of: thread.id,
+            provider: .claude,
+            providerInstanceId: "claude",
+            runAsUser: thread.runAsUser,
+            model: "opus",
+            permissionMode: thread.permissionMode,
+            reasoningEffort: thread.reasoningEffort,
+            serviceTier: thread.serviceTier,
+            modelSelection: thread.modelSelection,
+            interactionMode: thread.effectiveInteractionMode
+        ))
+        agent.reloadThreads()
+        XCTAssertEqual(agent.threads.first { $0.id == thread.id }?.provider, .claude, "the switch reached the desk")
+        XCTAssertTrue(try XCTUnwrap(f.ctx.threadRepo.guestPlacement(of: thread.id)).runsInGuest, "still a guest thread")
+        XCTAssertEqual(f.vm.deskRuntimeLabel, BotDesktopKind.guestNeedsDistillRuntimeLabel(botName: "Piper"))
+        XCTAssertNotEqual(f.vm.deskRuntimeLabel, BotDesktopKind.macRuntimeLabel)
+    }
+
+    func test_brainPreviewOfADockerDeskConversationSaysWhereItsRunWillRun() async throws {
+        // WHY (plan A S11): before a conversation's first run the Source
+        // inspector shows a preview of the brain. A new Distill conversation of
+        // a Docker bot will run inside the guest and be told the guest Desktop
+        // and tools; a preview showing the Mac text and the Mac relays would
+        // contradict both the pane label and the run.
+        let f = try makeFixture()
+        let bot = try makeBot(f, docker: true)
+        f.vm.openDesk(bot)
+        XCTAssertTrue(f.vm.createDeskThread())
+        f.vm.setDeskProvider(.distill)
+        let guest = try XCTUnwrap(f.vm.previewBrain()).compiledPayload
+        XCTAssertTrue(guest.contains(BotDesktopKind.dockerDesktopGuestRunHonestyLabel))
+        XCTAssertTrue(guest.contains(BotStandingInstructions.generatedInGuestComputerLine))
+        XCTAssertFalse(guest.contains(BotStandingInstructions.computerObserveTool), "a guest run is never served it")
+
+        f.vm.setDeskProvider(.claude)
+        let mac = try XCTUnwrap(f.vm.previewBrain()).compiledPayload
+        XCTAssertTrue(mac.contains(BotDesktopKind.dockerDesktopMacRunHonestyLabel), "the cached guest preview is not reused")
+        XCTAssertTrue(mac.contains(BotStandingInstructions.computerObserveTool))
+
+        let thread = try await firstSend(f, bot: bot, provider: .distill)
+        await finishAll(f)
+        XCTAssertEqual(f.vm.selectedConversation?.linkedAgentThreadID, thread.id)
+        let linked = try XCTUnwrap(f.vm.previewBrain()).compiledPayload
+        XCTAssertTrue(linked.contains(BotDesktopKind.dockerDesktopGuestRunHonestyLabel), "a guest thread's preview reads its placement")
+    }
+
     func test_aGuestRunIsToldOnlyTheToolsItHasAndAMacRunKeepsItsOwn() async throws {
         // WHY (plan A S11): a guest run has its own shell, linux-use, Playwright
         // and the bot tools the host gateway serves. bot_computer_* and

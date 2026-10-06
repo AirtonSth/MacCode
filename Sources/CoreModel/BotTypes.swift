@@ -98,6 +98,12 @@ public enum BotDesktopKind: String, Codable, Sendable, CaseIterable {
 
     public static let macRuntimeLabel = "Running on this Mac"
 
+    /// A guest thread whose provider changed: it still runs only in the guest,
+    /// which runs only Distill, so it does not run until switched back.
+    public static func guestNeedsDistillRuntimeLabel(botName: String) -> String {
+        "Runs only inside \(botName)'s Linux VM · switch back to Distill to run it"
+    }
+
     /// Decode-only leftover. Display and publish resolve to Logical execution space.
     public static let dedicatedLocalVMHonestyLabel =
         "Guest is not running yet. Work still uses this Mac account; not isolated."

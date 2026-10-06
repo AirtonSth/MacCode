@@ -277,10 +277,17 @@ public final class BotGuestMCPGateway: @unchecked Sendable {
         guard let finished else {
             return revoked ? Self.runEndedResponse(id: id) : nil
         }
-        guard let reply = finished, let data = reply.data(using: .utf8) else {
+        guard let reply = finished, let data = Self.guestFacing(reply).data(using: .utf8) else {
             return Self.errorResponse(id: id, code: -32603, message: "RemoteCode returned no reply.")
         }
         return .json(filtered(data, method: method, route: route))
+    }
+
+    /// The Mac handlers' text sends website writes to `bot_browser_open` (the
+    /// `bot_set_settings` description and its website rejection), a Mac relay
+    /// this gateway never serves; a guest run opens sites with Playwright.
+    static func guestFacing(_ reply: String) -> String {
+        reply.replacingOccurrences(of: BotBrainCompiler.websiteHonesty, with: BotBrainCompiler.guestWebsiteHonesty)
     }
 
     private func filtered(_ data: Data, method: String, route: Route) -> Data {

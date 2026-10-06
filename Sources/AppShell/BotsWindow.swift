@@ -3501,23 +3501,43 @@ public final class BotsViewModel: ObservableObject {
         displayedDesktopKind.honestyLabel
     }
 
-    /// Desk desktop pane of a Docker bot: where the selected conversation's
-    /// agent runs. A linked thread reads its stored placement; a conversation
-    /// with no thread yet says where its first send will put it (the same
-    /// rule as `lockNewDeskThreadToGuestIfDistill`). nil while the placement
-    /// of the selected thread is not known, never another thread's answer.
-    public var deskRuntimeLabel: String? {
+    /// Where the selected desk conversation of a Docker bot runs its agent.
+    private enum DeskRunPlace: Equatable {
+        case guest
+        case mac
+        /// A guest thread whose provider is no longer Distill: the guest runs
+        /// only Distill and the thread never falls back to the Mac, so every
+        /// send fails closed until the user switches back.
+        case guestNeedsDistill
+    }
+
+    /// A linked thread reads its stored placement (the guest marker decides,
+    /// not the provider); a conversation with no thread yet says where its
+    /// first send will put it (the same rule as
+    /// `lockNewDeskThreadToGuestIfDistill`). nil off a Docker bot's desk and
+    /// while the selected thread's placement is not known, never another
+    /// thread's answer.
+    private var deskRunPlace: DeskRunPlace? {
         guard screen == .desk, displayedDesktopKind == .dockerDesktop,
               let bot = selectedBot,
               let conversation = selectedConversation, conversation.botID == bot.id else { return nil }
-        let inGuest: Bool
-        if let threadID = conversation.linkedAgentThreadID {
-            guard let runtime = deskThreadRuntime, runtime.threadID == threadID else { return nil }
-            inGuest = runtime.runsInGuest
-        } else {
-            inGuest = deskRouting.provider == .distill && deskRouting.runAsUser.uid == getuid()
+        guard let threadID = conversation.linkedAgentThreadID else {
+            return deskRouting.provider == .distill && deskRouting.runAsUser.uid == getuid() ? .guest : .mac
         }
-        return inGuest ? BotDesktopKind.guestRuntimeLabel(botName: bot.name) : BotDesktopKind.macRuntimeLabel
+        guard let runtime = deskThreadRuntime, runtime.threadID == threadID else { return nil }
+        guard runtime.placementInGuest else { return .mac }
+        return runtime.provider == .distill ? .guest : .guestNeedsDistill
+    }
+
+    /// Desk desktop pane of a Docker bot: where the selected conversation's
+    /// agent runs (`deskRunPlace`).
+    public var deskRuntimeLabel: String? {
+        guard let place = deskRunPlace, let bot = selectedBot else { return nil }
+        switch place {
+        case .guest: return BotDesktopKind.guestRuntimeLabel(botName: bot.name)
+        case .mac: return BotDesktopKind.macRuntimeLabel
+        case .guestNeedsDistill: return BotDesktopKind.guestNeedsDistillRuntimeLabel(botName: bot.name)
+        }
     }
 
     public var desktopStatusPill: String {
@@ -6794,6 +6814,10 @@ public final class BotsViewModel: ObservableObject {
         let memoryFiles = memoryFileTexts(for: bot)
         let previewProvider = deskRouting.provider
         let previewModel = deskRouting.resolvedModel(defaultModel: Self.defaultModel(for:))
+        // The run of the selected desk conversation compiles the guest
+        // Desktop and tools text when its agent runs inside the guest; the
+        // preview says the same.
+        let previewInGuest = deskRunPlace == .guest
         let key = [
             bot.id.value.uuidString,
             revision.digest,
@@ -6811,6 +6835,7 @@ public final class BotsViewModel: ObservableObject {
             selectedConversation?.id.value.uuidString ?? "",
             bot.notificationsEnabled ? "n1" : "n0",
             turnDirective ?? "",
+            previewInGuest ? "g1" : "g0",
         ].joined(separator: "\u{1f}")
         if cachedPreviewBrainKey == key, let cached = cachedPreviewBrain {
             return cached
@@ -6829,7 +6854,8 @@ public final class BotsViewModel: ObservableObject {
             conversationID: selectedConversation?.id,
             runProvider: previewProvider,
             runModel: previewModel,
-            turnDirective: turnDirective
+            turnDirective: turnDirective,
+            runsInGuest: previewInGuest
         )
         cachedPreviewBrainKey = key
         cachedPreviewBrain = receipt
@@ -9997,7 +10023,10 @@ public final class BotsViewModel: ObservableObject {
     private var deskAgentKey: DeskAgentKey?
     private struct DeskThreadRuntime: Equatable {
         let threadID: AgentThreadID
-        let runsInGuest: Bool
+        /// The stored guest placement (marker on a `.vm` thread), whatever
+        /// the provider.
+        let placementInGuest: Bool
+        let provider: AgentProvider?
     }
     /// The embedded desk thread's placement, for `deskRuntimeLabel`.
     @Published private var deskThreadRuntime: DeskThreadRuntime?
@@ -10325,10 +10354,10 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func refreshDeskThreadRuntime(_ threadID: AgentThreadID) {
-        let provider = ((try? context.threadRepo.get(id: threadID)) ?? nil)?.provider
         let next = DeskThreadRuntime(
             threadID: threadID,
-            runsInGuest: provider.map { runsInGuest(threadID: threadID, provider: $0) } ?? false
+            placementInGuest: ((try? context.threadRepo.guestPlacement(of: threadID)) ?? nil)?.runsInGuest == true,
+            provider: ((try? context.threadRepo.get(id: threadID)) ?? nil)?.provider
         )
         if next != deskThreadRuntime { deskThreadRuntime = next }
     }

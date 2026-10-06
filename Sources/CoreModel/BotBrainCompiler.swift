@@ -254,6 +254,12 @@ public enum BotBrainCompiler {
     public static let websiteHonesty =
         "Website: call \(BotStandingInstructions.openBrowserTool). Same path as last website. Not a set_settings write."
 
+    /// `websiteHonesty` as a run inside the bot's Linux guest gets it from the
+    /// host gateway: that run is never served `bot_browser_open` and opens
+    /// sites with the Playwright tools on the guest's Chromium.
+    public static let guestWebsiteHonesty =
+        "Website: open sites with the Playwright tool browser_navigate in this Linux VM. Not a set_settings write."
+
     /// Studio dest title already says User request. Compile already
     /// labels User request. A leftover user_request write on
     /// set_settings used to return an empty success, so first-chat

@@ -225,6 +225,53 @@ final class BotGuestMCPGatewayTests: XCTestCase {
         XCTAssertNotNil(web["instructions"])
     }
 
+    func test_textTheGatewayServesNeverSendsAGuestRunToAMacRelayTool() throws {
+        // WHY (plan A S11): a guest run is never served bot_computer_* or
+        // bot_browser_*. Tool descriptions and errors it reads through the
+        // gateway that name them send its agent to tools that do not exist;
+        // the website text must point at the guest's Playwright instead.
+        let relays = [
+            BotStandingInstructions.computerObserveTool, BotStandingInstructions.computerActTool,
+            BotStandingInstructions.computerExecTool, BotStandingInstructions.computerRebuildTool,
+            BotStandingInstructions.openBrowserTool, BotStandingInstructions.getBrowserTool,
+            BotStandingInstructions.waitLoginTool, BotStandingInstructions.snapshotBrowserTool,
+            BotStandingInstructions.actBrowserTool,
+        ]
+        let gateway = makeGateway()
+        let token = try issue(gateway)
+        let initialize = #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#
+        var served = ""
+        for route in BotGuestMCPGateway.defaultRoutes {
+            for body in [listTools, initialize] {
+                let response = try XCTUnwrap(gateway.respond(to: post(route.name, body, token: token), isClientGone: neverGone))
+                served += String(decoding: response.body, as: UTF8.self) + "\n"
+            }
+        }
+        XCTAssertTrue(served.contains(BotSelfConfigCatalog.setSettings), "positive control: the catalogs were read")
+        XCTAssertTrue(served.contains(BotBrainCompiler.guestWebsiteHonesty), "bot_set_settings says where websites open")
+        for relay in relays {
+            XCTAssertFalse(served.contains(relay), "served text names \(relay)")
+        }
+
+        // The website rejection of bot_set_settings, as the Mac handler words it.
+        let server = BotSelfConfigCatalog.serverName
+        let spy = Spy()
+        let rejecting = makeGateway([spyRoute(server, spy: spy) { line in
+            let id = (try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])?["id"] ?? 0
+            let object: [String: Any] = ["jsonrpc": "2.0", "id": id, "result": [
+                "content": [["type": "text", "text": String(describing: BotSelfConfigError.invalid(BotBrainCompiler.websiteHonesty))]],
+                "isError": true,
+            ]]
+            return String(data: try! JSONSerialization.data(withJSONObject: object), encoding: .utf8)
+        }])
+        let rejectingToken = try issue(rejecting)
+        let response = try XCTUnwrap(rejecting.respond(to: post(server, call(5, BotSelfConfigCatalog.setSettings), token: rejectingToken), isClientGone: neverGone))
+        let error = String(decoding: response.body, as: UTF8.self)
+        XCTAssertEqual(spy.callCount, 1)
+        XCTAssertTrue(error.contains(BotBrainCompiler.guestWebsiteHonesty), error)
+        XCTAssertFalse(error.contains(BotStandingInstructions.openBrowserTool), error)
+    }
+
     func test_unknownServerIs404AndNoDistillerOrComputerUseIsRouted() throws {
         let gateway = makeGateway()
         let token = try issue(gateway)
