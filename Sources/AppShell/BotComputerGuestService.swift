@@ -26,16 +26,6 @@ public struct BotComputerGuestFrameEvidence: Equatable, Sendable {
     public var pngHash: String
 }
 
-public struct GitIdentity: Equatable, Sendable {
-    public var name: String
-    public var email: String
-
-    public init(name: String, email: String) {
-        self.name = name
-        self.email = email
-    }
-}
-
 public enum BotComputerGuestServiceError: Error, Equatable, Sendable, CustomStringConvertible {
     case screenshotTooLarge(actualBytes: Int, maximumBytes: Int)
     case screenshotResultTooLarge(actualBytes: Int, maximumBytes: Int)
