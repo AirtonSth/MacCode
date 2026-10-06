@@ -133,14 +133,11 @@ SCHEDULED_TASK_AGENT="$BIN_DIR/RemoteCodeScheduledTaskAgent"
 CLI="$BIN_DIR/rc2"
 DISTILL_SERVICE="$BIN_DIR/RemoteCodeDistillService"
 RUN_AS_USER_HELPER="$BIN_DIR/RemoteCodeRunAsUserHelper"
-MLX_METALLIB="$BIN_DIR/mlx.metallib"
 if [ ! -x "$BIN" ]; then echo "missing $BIN"; exit 1; fi
 if [ ! -x "$SCHEDULED_TASK_AGENT" ]; then echo "missing $SCHEDULED_TASK_AGENT"; exit 1; fi
 if [ ! -x "$CLI" ]; then echo "missing $CLI"; exit 1; fi
 if [ ! -x "$DISTILL_SERVICE" ]; then echo "missing $DISTILL_SERVICE"; exit 1; fi
 if [ ! -x "$RUN_AS_USER_HELPER" ]; then echo "missing $RUN_AS_USER_HELPER"; exit 1; fi
-scripts/build-mlx-metallib.sh "$MLX_METALLIB"
-if [ ! -f "$MLX_METALLIB" ]; then echo "missing $MLX_METALLIB"; exit 1; fi
 
 APP_PATH="${RC2_PACKAGE_APP_OUTPUT:-$DIST/$BUNDLE}"
 APP_EXECUTABLE="$APP_PATH/Contents/MacOS/RemoteCode"
@@ -188,7 +185,6 @@ cp "$DISTILL_SERVICE" "$STAGING_APP/Contents/MacOS/RemoteCodeDistillService"
 # Privileged trampoline for shared-helper agent execution. Not setuid in the
 # bundle; install to /Library/PrivilegedHelperTools with root ownership for use.
 cp "$RUN_AS_USER_HELPER" "$STAGING_APP/Contents/MacOS/RemoteCodeRunAsUserHelper"
-cp "$MLX_METALLIB" "$STAGING_APP/Contents/MacOS/mlx.metallib"
 cp "$CLI" "$STAGING_APP/Contents/MacOS/rc2"
 # Canonical location only. Do NOT copy resource bundles to the .app root:
 # codesign rejects that as "unsealed contents present in the bundle root".

@@ -38,11 +38,6 @@ public enum BotComputerCatalog: Sendable {
         [observe, act, exec, rebuild, requestUserAction, postScreenshot, requestMacExecution]
     }
 
-    /// Read-only content tools whose (large) results are safe to route through
-    /// the Token Saver distill lane. `observe`/`act` results carry coordinates
-    /// and screen state the bot acts on verbatim — never compressed.
-    public static var distillableToolNames: Set<String> { [exec] }
-
     public static func toolCatalog() -> [[String: Any]] {
         toolNames.map { name in
             [

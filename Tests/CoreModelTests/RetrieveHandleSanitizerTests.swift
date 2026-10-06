@@ -1,5 +1,5 @@
 import XCTest
-@testable import DistillCore
+@testable import CoreModel
 
 final class RetrieveHandleSanitizerTests: XCTestCase {
     func test_stripsHandleMarker() {

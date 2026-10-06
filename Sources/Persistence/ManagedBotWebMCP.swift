@@ -3,42 +3,29 @@ import Foundation
 public struct ManagedBotWebMCP: Sendable {
     public static let serverName = BotWebCatalog.serverName
 
-    /// Optional Token Saver seam: given (toolName, resultText) returns the
-    /// compressed replacement text, or nil to keep the original (fail-open).
-    public typealias ToolResultDistiller = @Sendable (String, String) async -> String?
-
     private let environment: [String: String]
     private let serviceFactory: @Sendable ([String: String]) throws -> BotWebService
-    private let distillToolResult: ToolResultDistiller?
 
     public init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         serviceFactory: @escaping @Sendable ([String: String]) throws -> BotWebService = {
             try BotWebService.make(environment: $0)
-        },
-        distillToolResult: ToolResultDistiller? = nil
+        }
     ) {
         self.environment = environment
         self.serviceFactory = serviceFactory
-        self.distillToolResult = distillToolResult
     }
 
     public func handle(_ line: String) async -> String? {
         switch respond(to: line) {
         case .reply(let reply):
             return reply
-        case .toolResult(let id, let name, let object):
-            var text = encodeJSON(object) ?? "{}"
-            if let distillToolResult,
-               BotWebCatalog.distillableToolNames.contains(name),
-               let compressed = await distillToolResult(name, text) {
-                text = compressed
-            }
-            return toolReply(id: id, text: text)
+        case .toolResult(let id, let object):
+            return toolReply(id: id, text: encodeJSON(object) ?? "{}")
         }
     }
 
-    /// `handle` on the caller's thread, without the tool-result distiller. The
+    /// `handle` on the caller's thread. The
     /// in-app guest gateway calls this from its own threads: search and fetch
     /// block on the network, and that wait must never run on Swift's
     /// cooperative pool inside the app.
@@ -46,14 +33,14 @@ public struct ManagedBotWebMCP: Sendable {
         switch respond(to: line) {
         case .reply(let reply):
             return reply
-        case .toolResult(let id, _, let object):
+        case .toolResult(let id, let object):
             return toolReply(id: id, text: encodeJSON(object) ?? "{}")
         }
     }
 
     private enum Response {
         case reply(String?)
-        case toolResult(id: Any?, name: String, object: [String: Any])
+        case toolResult(id: Any?, object: [String: Any])
     }
 
     private func respond(to line: String) -> Response {
@@ -88,7 +75,7 @@ public struct ManagedBotWebMCP: Sendable {
             do {
                 let service = try serviceFactory(environment)
                 let object = try service.call(name: name, arguments: arguments)
-                return .toolResult(id: id, name: name, object: object)
+                return .toolResult(id: id, object: object)
             } catch {
                 return .reply(reply(id: id, result: [
                     "content": [["type": "text", "text": String(describing: error)]],

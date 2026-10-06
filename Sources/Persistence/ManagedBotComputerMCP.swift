@@ -3,45 +3,29 @@ import Foundation
 public struct ManagedBotComputerMCP: Sendable {
     public static let serverName = BotComputerCatalog.serverName
 
-    /// Optional Token Saver seam: given (toolName, resultText) returns the
-    /// compressed replacement text, or nil to keep the original (fail-open).
-    public typealias ToolResultDistiller = @Sendable (String, String) async -> String?
-
     private let environment: [String: String]
     private let storeFactory: @Sendable ([String: String]) throws -> BotComputerStore
-    private let distillToolResult: ToolResultDistiller?
 
     public init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         storeFactory: @escaping @Sendable ([String: String]) throws -> BotComputerStore = {
             try BotComputerStore.open(environment: $0)
-        },
-        distillToolResult: ToolResultDistiller? = nil
+        }
     ) {
         self.environment = environment
         self.storeFactory = storeFactory
-        self.distillToolResult = distillToolResult
     }
 
     public func handle(_ line: String) async -> String? {
         switch respond(to: line) {
         case .reply(let reply):
             return reply
-        case .toolResult(let id, let name, let object):
-            var text = encodeJSON(object) ?? "{}"
-            // Screenshot payloads are delivered as an image block; their JSON
-            // envelope must stay verbatim, so only image-free results distill.
-            if let distillToolResult,
-               BotComputerCatalog.distillableToolNames.contains(name),
-               (object["png_base64"] as? String ?? "").isEmpty,
-               let compressed = await distillToolResult(name, text) {
-                text = compressed
-            }
-            return toolReply(id: id, object: object, text: text)
+        case .toolResult(let id, let object):
+            return toolReply(id: id, object: object, text: encodeJSON(object) ?? "{}")
         }
     }
 
-    /// `handle` on the caller's thread, without the tool-result distiller. The
+    /// `handle` on the caller's thread. The
     /// in-app guest gateway calls this from its own threads: every tool here
     /// blocks on the host's pending-action channel, and that wait must never
     /// run on Swift's cooperative pool inside the app.
@@ -49,14 +33,14 @@ public struct ManagedBotComputerMCP: Sendable {
         switch respond(to: line) {
         case .reply(let reply):
             return reply
-        case .toolResult(let id, _, let object):
+        case .toolResult(let id, let object):
             return toolReply(id: id, object: object, text: encodeJSON(object) ?? "{}")
         }
     }
 
     private enum Response {
         case reply(String?)
-        case toolResult(id: Any?, name: String, object: [String: Any])
+        case toolResult(id: Any?, object: [String: Any])
     }
 
     private func respond(to line: String) -> Response {
@@ -103,7 +87,7 @@ public struct ManagedBotComputerMCP: Sendable {
                         "isError": false,
                     ]))
                 }
-                return .toolResult(id: id, name: name, object: object)
+                return .toolResult(id: id, object: object)
             } catch {
                 return .reply(reply(id: id, result: [
                     "content": [["type": "text", "text": String(describing: error)]],
