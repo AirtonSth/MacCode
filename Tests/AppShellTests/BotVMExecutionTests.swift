@@ -33,6 +33,26 @@ final class BotVMExecutionTests: XCTestCase {
         XCTAssertNil(registry.tryBegin(botID: botID, entry: sameThread))
     }
 
+    func test_anUnstartedSecondClaimOfTheSameThreadNeverFreesTheVMUnderTheRunThatStarted() {
+        // WHY (D12): two starts on one thread (router + tab, iOS + Mac) both
+        // claim. Whichever does not start releases its claim; that must not free
+        // the VM (and hand it to a waiter) while the other run is still running.
+        for startedFirst in [true, false] {
+            let registry = BotVMRunRegistry()
+            let first = entry()
+            let second = BotVMRunRegistry.Entry(threadID: threadA, runID: AgentRunID(), title: "A", workspace: workspace)
+            XCTAssertNil(registry.tryBegin(botID: botID, entry: first))
+            XCTAssertNil(registry.tryBegin(botID: botID, entry: second))
+            registry.addWaiting(botID: botID, threadID: threadB)
+            let (started, unstarted) = startedFirst ? (first, second) : (second, first)
+            XCTAssertNil(registry.releaseAndNextWaiting(runID: unstarted.runID), "no hand-off while a run holds the VM")
+            XCTAssertEqual(registry.busyMessage(botID: botID, threadID: threadB) != nil, true)
+            XCTAssertNil(registry.popWaitingIfFree(botID: botID))
+            XCTAssertEqual(registry.releaseAndNextWaiting(runID: started.runID), threadB)
+            XCTAssertNil(registry.active(botID: botID))
+        }
+    }
+
     func test_releaseAndNextWaitingFreesBotAndPopsFirstWaiterOnce() {
         // WHY: the first queued thread must resume when the VM frees, in order, exactly once.
         let registry = BotVMRunRegistry()

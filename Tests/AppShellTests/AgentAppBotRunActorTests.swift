@@ -1,6 +1,7 @@
 import XCTest
 import AgentRuntime
 import CoreModel
+import SocketServer
 @testable import AppShell
 @testable import Persistence
 @testable import Surfaces
@@ -485,7 +486,9 @@ final class AgentAppBotRunActorTests: XCTestCase {
         XCTAssertEqual(request.runId, AgentRunID(try XCTUnwrap(queued.first).id.value))
         XCTAssertEqual(BotVMRunRegistry.shared.active(botID: f.bot.id)?.threadID, f.thread.id)
         XCTAssertEqual(BotVMRunRegistry.shared.active(botID: f.bot.id)?.runID, request.runId)
-        XCTAssertTrue(try f.ctx.queuedMessageRepo.list(threadId: f.thread.id).isEmpty)
+        // The row is acknowledged after the provider accepted the start.
+        let drained = await waitUntil { (try? f.ctx.queuedMessageRepo.list(threadId: f.thread.id).isEmpty) == true }
+        XCTAssertTrue(drained)
         f.runner.finish(runID: request.runId, status: .completed, reply: "done")
     }
 
@@ -539,6 +542,9 @@ final class AgentAppBotRunActorTests: XCTestCase {
         let started = await waitUntil { f.runner.requests.count == 1 }
         XCTAssertTrue(started, "the hand-off drains the never-run thread")
         let request = try XCTUnwrap(f.runner.requests.first)
+        XCTAssertEqual(request.prompt.components(separatedBy: Self.soulMarker).count - 1, 1,
+                       "the raw queued text is compiled into the bot brain exactly once, at drain")
+        XCTAssertEqual(request.userMessageContent, "router task", "the transcript keeps what the user typed")
         XCTAssertEqual(BotVMRunRegistry.shared.active(botID: f.bot.id)?.runID, request.runId)
         f.runner.finish(runID: request.runId, status: .completed, reply: "done")
         let freed = await waitUntil { BotVMRunRegistry.shared.active(botID: f.bot.id) == nil }
@@ -567,4 +573,166 @@ final class AgentAppBotRunActorTests: XCTestCase {
         XCTAssertEqual(claimDuringDispatch?.threadID, f.thread.id, "the drain claimed the VM for the dispatch")
         XCTAssertNil(BotVMRunRegistry.shared.active(botID: f.bot.id), "an unstarted dispatch frees its claim")
     }
+
+    // MARK: - T3a review fixes
+
+    func test_deskOrPeerSendWithACompiledPromptToABusyVMIsRefusedWithoutQueueingIt() async throws {
+        // WHY: desk, peer and hop sends carry the compiled bot brain. Queued, it
+        // showed as the user's message (Mac and iOS) and was compiled a second
+        // time at drain; the caller also took the queued result for a started run.
+        let f = try makeFixture()
+        try lockThreadToVM(f)
+        let holder = otherThreadHolder(f, title: "Tarefa A")
+        XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: f.bot.id, entry: holder))
+        defer { BotVMRunRegistry.shared.endRun(runID: holder.runID) }
+
+        do {
+            _ = try await f.router.sendAgentMessage(
+                thread: f.thread.id, text: "COMPILED BRAIN + user words", provider: .codex, model: "fake-model",
+                permissionMode: .supervised, reasoningEffort: .medium, requestedRunID: AgentRunID()
+            )
+            XCTFail("a compiled send to a busy VM must be refused")
+        } catch {
+            XCTAssertEqual(String(describing: error), "bot ocupado em Tarefa A", "the desk shows the notice")
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(f.runner.requests.isEmpty, "no overlapping run on the VM")
+        XCTAssertTrue(try f.ctx.queuedMessageRepo.list(threadId: f.thread.id).isEmpty, "the compiled text is never queued")
+        XCTAssertTrue(BotVMRunRegistry.shared.waitingThreads(botID: f.bot.id).isEmpty)
+        XCTAssertEqual(BotVMRunRegistry.shared.active(botID: f.bot.id)?.runID, holder.runID, "holder keeps the VM")
+    }
+
+    func test_aNeverRunThreadQueuedBehindTheVMStartsOnceAfterARelaunch() async throws {
+        // WHY: the wait list lives in memory. After a relaunch, launch recovery
+        // must start the never-run thread's first message, or it sits queued
+        // until the user sends again and then runs out of order.
+        let f = try makeFixture()
+        try lockThreadToVM(f)
+        let holder = otherThreadHolder(f, title: "Tarefa A")
+        XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: f.bot.id, entry: holder))
+        let result = try await f.router.sendAgentMessage(
+            thread: f.thread.id, text: "first task", provider: .codex, model: "fake-model",
+            permissionMode: .supervised, reasoningEffort: .medium
+        )
+        XCTAssertEqual(result.status, .queued)
+        // Simulated relaunch: the holder is gone and so is the in-memory wait.
+        XCTAssertEqual(BotVMRunRegistry.shared.releaseAndNextWaiting(runID: holder.runID), f.thread.id)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(f.runner.requests.isEmpty)
+
+        await f.router.reconcileQueuedAgentMessagesOnLaunch()
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started, "launch recovery starts the never-run thread")
+        await f.router.reconcileQueuedAgentMessagesOnLaunch()
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(f.runner.requests.count, 1, "exactly once")
+        let request = try XCTUnwrap(f.runner.requests.first)
+        XCTAssertEqual(request.userMessageContent, "first task")
+        let drained = await waitUntil { (try? f.ctx.queuedMessageRepo.list(threadId: f.thread.id).isEmpty) == true }
+        XCTAssertTrue(drained)
+        f.runner.finish(runID: request.runId, status: .completed, reply: "done")
+        let freed = await waitUntil { BotVMRunRegistry.shared.active(botID: f.bot.id) == nil }
+        XCTAssertTrue(freed)
+    }
+
+    func test_switchingThreadsWhileTheVMIsTakenQueuesOnTheSentThreadOnly() async throws {
+        // WHY (destination safety): the VM refusal arrives after awaits. The
+        // message belongs to the thread it was sent from; the thread the user
+        // switched to must not get it, lose its draft, or be locked to the bot.
+        let f = try makeFixture()
+        f.vm.botExecutionTargetProvider = { _ in .vm }
+        let other = try f.router.createAgentThread(
+            workspace: f.vm.workspaceID, title: "Other thread", provider: .codex,
+            model: "fake-model", permissionMode: .supervised, reasoningEffort: .medium
+        )
+        let holder = otherThreadHolder(f, title: "Tarefa B")
+        defer { BotVMRunRegistry.shared.endRun(runID: holder.runID) }
+        let vm = f.vm
+        vm.botVMPreflight = { botID, _ in
+            XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: botID, entry: holder))
+            vm.selectThread(other.id)
+            vm.prompt = "draft on the other thread"
+            return nil
+        }
+        vm.setRunActor(.bot(f.bot.id))
+        vm.prompt = "racing task"
+        await vm.send()
+
+        XCTAssertTrue(f.runner.requests.isEmpty)
+        XCTAssertEqual(try f.ctx.queuedMessageRepo.list(threadId: f.thread.id).map(\.text), ["racing task"])
+        XCTAssertTrue(try f.ctx.queuedMessageRepo.list(threadId: other.id).isEmpty, "nothing queued on the other thread")
+        let storedOther = try XCTUnwrap(try f.ctx.threadRepo.get(id: other.id))
+        XCTAssertNil(storedOther.actorLockedAt, "the other thread is not locked to the bot")
+        XCTAssertEqual(vm.prompt, "draft on the other thread", "the other thread's draft is untouched")
+        XCTAssertEqual(BotVMRunRegistry.shared.waitingThreads(botID: f.bot.id), [f.thread.id])
+        XCTAssertFalse(vm.statusMessage.contains("bot ocupado"), "the notice is not painted on the other thread")
+        let storedSent = try XCTUnwrap(try f.ctx.threadRepo.get(id: f.thread.id))
+        XCTAssertEqual(storedSent.actor, .bot(f.bot.id), "the sent thread is the one locked to the bot")
+    }
+
+    func test_aHandOffTheNextThreadDoesNotTakePassesTheVMOnAndQueueEventsSayWhy() async throws {
+        // WHY: a hand-off to a waiter that does not start (its queue emptied)
+        // left the VM free and every later waiter stranded. iOS must see why a
+        // queued message is not starting.
+        let f = try makeFixture()
+        try lockThreadToVM(f)
+        let holder = otherThreadHolder(f, title: "Tarefa A")
+        XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: f.bot.id, entry: holder))
+        defer { BotVMRunRegistry.shared.endRun(runID: holder.runID) }
+        let threadID = f.thread.id.value.uuidString
+        let payloads = LockedPayloads()
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "agent.message.queued" || event.kind == "agent.message.queue.updated",
+                  let object = event.payload.objectValue,
+                  object["thread_id"]?.stringValue == threadID else { return }
+            payloads.append(object["waiting_for_bot_vm"]?.objectValue)
+        }
+        defer { EventBus.shared.unsubscribe(subscription) }
+
+        BotVMRunRegistry.shared.addWaiting(botID: f.bot.id, threadID: AgentThreadID()) // gone thread, first in line
+        _ = try await f.router.sendAgentMessage(
+            thread: f.thread.id, text: "router task", provider: .codex, model: "fake-model",
+            permissionMode: .supervised, reasoningEffort: .medium
+        )
+        let reported = await waitUntil { payloads.values.contains { $0 != nil } }
+        XCTAssertTrue(reported, "the queued row carries the wait reason")
+        let wait = try XCTUnwrap(payloads.values.compactMap { $0 }.first)
+        XCTAssertEqual(wait["bot_id"]?.stringValue, f.bot.id.value.uuidString)
+        XCTAssertEqual(wait["holder_thread_id"]?.stringValue, holder.threadID.value.uuidString)
+        XCTAssertEqual(wait["holder_title"]?.stringValue, "Tarefa A")
+        XCTAssertEqual(wait["notice"]?.stringValue, "bot ocupado em Tarefa A")
+
+        f.router.releaseBotVMRun(holder.runID)
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started, "the VM passes past the waiter that did not take it")
+        let request = try XCTUnwrap(f.runner.requests.first)
+        f.runner.finish(runID: request.runId, status: .completed, reply: "done")
+        let freed = await waitUntil { BotVMRunRegistry.shared.active(botID: f.bot.id) == nil }
+        XCTAssertTrue(freed)
+    }
+
+    func test_autoContinuationClaimIsRefusedWhileAnotherThreadHoldsTheVM() throws {
+        // WHY (D12): the coordinator's auto-nudge starts a run after the VM was
+        // handed on; it must not overlap the other thread's run.
+        let f = try makeFixture()
+        try lockThreadToVM(f)
+        let holder = otherThreadHolder(f, title: "Tarefa A")
+        XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: f.bot.id, entry: holder))
+        XCTAssertFalse(f.router.claimBotVMForAutoContinuation(thread: f.thread.id, runID: AgentRunID()))
+        BotVMRunRegistry.shared.endRun(runID: holder.runID)
+        let runID = AgentRunID()
+        XCTAssertTrue(f.router.claimBotVMForAutoContinuation(thread: f.thread.id, runID: runID))
+        XCTAssertEqual(BotVMRunRegistry.shared.active(botID: f.bot.id)?.runID, runID)
+        f.router.releaseBotVMRun(runID)
+        XCTAssertNil(BotVMRunRegistry.shared.active(botID: f.bot.id))
+        XCTAssertTrue(f.router.claimBotVMForAutoContinuation(thread: AgentThreadID(), runID: AgentRunID()),
+                      "a thread not on a bot VM is not gated")
+    }
+}
+
+private final class LockedPayloads: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [[String: JSONValue]?] = []
+    func append(_ value: [String: JSONValue]?) { lock.withLock { stored.append(value) } }
+    var values: [[String: JSONValue]?] { lock.withLock { stored } }
 }

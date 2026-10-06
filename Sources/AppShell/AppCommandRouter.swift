@@ -540,10 +540,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         })
         // Same drain a finished run triggers (AppContext.onRunFinished) for the send that queued behind a rebuild.
         botHostObservers.append(center.addObserver(forName: .botVMRebuildReleased, object: nil, queue: nil) { [weak self] note in
-            guard let threadID = note.userInfo?[BotHostNotificationKey.threadID] as? AgentThreadID else { return }
-            Task { @MainActor [weak self] in
-                try? await self?.drainNextQueuedAgentMessage(thread: threadID, botVMHandOff: true)
-            }
+            guard let threadID = note.userInfo?[BotHostNotificationKey.threadID] as? AgentThreadID,
+                  let botID = note.userInfo?[BotHostNotificationKey.botID] as? BotID else { return }
+            Task { @MainActor [weak self] in await self?.handOffBotVM(botID: botID, to: threadID) }
         })
     }
 
@@ -720,7 +719,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         publishAgentThreadLifecycle(.deleted(ids))
     }
 
-    private func publishQueuedMessage(kind: String, _ message: AgentQueuedMessage) {
+    func publishQueuedMessage(kind: String, _ message: AgentQueuedMessage) {
         guard let eventKind = RemoteCodeEventKind(rawValue: kind) else {
             assertionFailure("Unknown productive Agent queue event kind: \(kind)")
             return
@@ -745,6 +744,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // reorder republishes every queued row.
         if let workspaceId = try? context?.threadRepo.workspaceId(of: message.threadId) {
             payload["workspace_id"] = .string(workspaceId.value.uuidString)
+        }
+        // iOS parity: the reason a queued message is not starting (D12).
+        if let wait = BotVMRunRegistry.shared.waitingHolder(threadID: message.threadId) {
+            payload["waiting_for_bot_vm"] = .object([
+                "bot_id": .string(wait.botID.value.uuidString),
+                "holder_thread_id": .string(wait.holder.threadID.value.uuidString),
+                "holder_title": .string(wait.holder.title),
+                "notice": .string(Self.botVMBusyNotice(holderTitle: wait.holder.title))
+            ])
         }
         EventBus.shared.publish(kind: eventKind, payload: .object(payload))
     }
@@ -2856,8 +2864,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         viewModel.botBusyMessage = { botID, threadID in
             BotVMRunRegistry.shared.busyMessage(botID: botID, threadID: threadID)
         }
-        viewModel.botWaitForVM = { botID, threadID in
+        viewModel.botWaitForVM = { [weak self] botID, threadID in
             BotVMRunRegistry.shared.addWaiting(botID: botID, threadID: threadID)
+            self?.publishBotVMWait(thread: threadID)
         }
         viewModel.botClaimVM = { botID, entry in
             BotVMRunRegistry.shared.tryBegin(botID: botID, entry: entry)
@@ -5044,7 +5053,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             requestedRunID: requestedRunID,
             orchestrationRoutingSnapshot: orchestrationRoutingSnapshot,
             executionCwdOverride: executionCwdOverride,
-            allowProviderCatalogListingDuringPreflight: allowProviderCatalogListingDuringPreflight
+            allowProviderCatalogListingDuringPreflight: allowProviderCatalogListingDuringPreflight,
+            // Desk, peer and hop callers send an already compiled bot prompt:
+            // queued, it would show as the user's message and compile again at drain.
+            queueBehindBusyBotVM: false
         )
     }
 
@@ -5169,7 +5181,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true, preflightRejectionIsDefinite: Bool = false) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true, preflightRejectionIsDefinite: Bool = false, queueBehindBusyBotVM: Bool = true) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         // Status + permission + provider identity only. A leftover 26-column
         // + routing `get` hitchs every send before configureAgentThread loads
@@ -5242,6 +5254,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let startRunID = requestedRunID ?? queueMessageId.map { AgentRunID($0.value) } ?? AgentRunID()
         let vmClaim = claimBotVMRun(thread: thread, runID: startRunID, firstMessage: text)
         if let vmClaim, let holder = vmClaim.holder {
+            // Nothing was written: the caller keeps its text and shows the notice.
+            guard queueBehindBusyBotVM else { throw BotVMBusyError(holder: holder) }
             let notice = waitForBotVM(botID: vmClaim.botID, thread: thread, holder: holder)
             if queueMessageId != nil { throw JSONRPCError(code: -32000, message: notice) }
             return try enqueueBehindActiveRun()
@@ -5515,13 +5529,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // `get` hitchs MainActor before the next queued follow-up can start.
         // A D12 hand-off also drains a thread that never ran (still `.pending`
         // by default) when no start is in flight: its first send queued
-        // behind the bot's VM.
+        // behind the bot's VM. Launch recovery does the same for a VM-bot
+        // thread, whose in-memory wait did not survive the relaunch.
         guard let ctx = context,
               ctx.queueDrainAllowsWork(threadId: thread),
               !Task.isCancelled,
               let status = try ctx.threadRepo.status(of: thread),
               status != .running,
-              try status != .pending || (botVMHandOff
+              try status != .pending || (
+                  (botVMHandOff || (recoverPreparedFromPriorProcess && botIDOfVMThread(thread) != nil))
                   && !ctx.coordinator.hasPendingProviderStart(threadId: thread)
                   && ctx.runRepo.latestActive(for: thread) == nil),
               !ctx.coordinator.hasProviderSession(threadId: thread) else { return }

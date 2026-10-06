@@ -444,8 +444,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var botClaimVM: ((BotID, BotVMRunRegistry.Entry) -> BotVMRunRegistry.Entry?)?
     /// Frees a VM claim whose run never started.
     public var botReleaseVM: ((AgentRunID) -> Void)?
-    /// Set when the last start was refused because another thread holds the bot's VM.
-    private var botVMClaimRefusal: (botID: BotID, notice: String)?
+    /// Set when the last start was refused because another thread holds the bot's VM;
+    /// `threadId` is the thread that start was for.
+    private var botVMClaimRefusal: (botID: BotID, notice: String, threadId: AgentThreadID)?
     /// Pending Mac-execution approvals pushed by the host, per thread (reason text).
     @Published public var pendingMacExecutionByThread: [AgentThreadID: String] = [:]
     /// Approves or declines a pending Mac-execution request; wired by the host.
@@ -6415,7 +6416,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // its own (no `.vm` target yet) the marker routes nothing.
         let thread = try threadRepo.get(id: tid)
         let hasMacDistillSession = thread?.provider == .distill && thread?.providerThreadId?.isEmpty == false
-        let runsInGuest = target == .vm && provider == .distill && !hasMacDistillSession
+        // The composer's provider belongs to the selected thread only.
+        let threadProvider = selectedThreadId == tid ? provider : (thread?.provider ?? provider)
+        let runsInGuest = target == .vm && threadProvider == .distill && !hasMacDistillSession
         try threadRepo.setGuestRuntime(id: tid, runsInGuest ? BotGuestRuntime.distillV1 : nil)
         guard try threadRepo.setActor(
             id: tid, actor: .bot(botID), lockedAt: lockedAt, executionTarget: target
@@ -8637,7 +8640,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
            let busy = botBusyMessage?(botID, sendThreadId ?? AgentThreadID()) {
             await queueBehindBusyBotVM(
                 botID: botID, busy: busy, text: text, attached: attachedForSend,
-                originalPrompt: originalPrompt, sendThreadId: sendThreadId
+                originalPrompt: originalPrompt, sendThreadId: sendThreadId, threadId: sendThreadId
             )
             return
         }
@@ -8657,7 +8660,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 botVMClaimRefusal = nil
                 await queueBehindBusyBotVM(
                     botID: refusal.botID, busy: refusal.notice, text: text, attached: attachedForSend,
-                    originalPrompt: originalPrompt, sendThreadId: sendThreadId
+                    originalPrompt: originalPrompt, sendThreadId: sendThreadId, threadId: refusal.threadId
                 )
                 return
             }
@@ -8665,33 +8668,43 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    /// One run per bot VM: the send waits in the thread's queue behind the
-    /// holder. A fresh thread is created and its bot actor locked first so the
-    /// drained message runs as the bot.
+    /// One run per bot VM: the send waits in the queue of the thread it was
+    /// sent for (`threadId`; nil = a fresh thread) behind the holder, even when
+    /// the user switched threads meanwhile. A fresh thread is created and its
+    /// bot actor locked first so the drained message runs as the bot.
     private func queueBehindBusyBotVM(
         botID: BotID,
         busy: String,
         text: String,
         attached: [AgentAttachment],
         originalPrompt: String,
-        sendThreadId: AgentThreadID?
+        sendThreadId: AgentThreadID?,
+        threadId: AgentThreadID?
     ) async {
-        if selectedThreadId == nil { createThread(title: "New thread") }
-        if let tid = selectedThreadId {
+        // A fresh-thread send whose composer moved to another thread meanwhile
+        // has no thread of its own to queue on.
+        var target = threadId
+        if target == nil, selectedThreadId == nil {
+            createThread(title: "New thread")
+            target = selectedThreadId
+        }
+        if let tid = target {
             if threads.first(where: { $0.id == tid })?.actorLockedAt == nil {
                 do { try lockBotActor(botID: botID, threadId: tid) } catch {
-                    statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                    if selectedThreadId == tid {
+                        statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                    }
                     restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
                     return
                 }
             }
-            if await enqueuePromptWhileRunning(text: text, attached: attached) {
+            if await enqueuePromptWhileRunning(text: text, attached: attached, threadId: tid) {
                 botWaitForVM?(botID, tid)
-                statusMessage = busy
+                if selectedThreadId == tid { statusMessage = busy }
                 return
             }
         }
-        statusMessage = busy
+        if selectedThreadId == sendThreadId { statusMessage = busy }
         restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
     }
 
@@ -8935,16 +8948,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         routingConfigurationForSend(threadId: threadId)
     }
 
+    /// `threadId` (default: the selected thread) is the thread whose queue takes
+    /// the message; the composer, timeline and queue chrome are touched only
+    /// while that thread is still the selected one.
     private func enqueuePromptWhileRunning(
         text: String,
         attached: [AgentAttachment],
-        interactionMode: AgentInteractionMode? = nil
+        interactionMode: AgentInteractionMode? = nil,
+        threadId: AgentThreadID? = nil
     ) async -> Bool {
         guard !refuseLegacyProviderThreadRun() else { return false }
-        guard let selectedThreadId, let queuedMessageRepo else { return false }
+        guard let targetThreadId = threadId ?? selectedThreadId, let queuedMessageRepo else { return false }
+        let isSelected = targetThreadId == selectedThreadId
+        let draftProviderInstanceId = isSelected
+            ? providerInstanceId
+            : (threads.first(where: { $0.id == targetThreadId })?.providerInstanceId ?? providerInstanceId)
         let mode = interactionMode ?? self.interactionMode
         do {
-            let routing = routingConfigurationForSend(threadId: selectedThreadId)
+            let routing = routingConfigurationForSend(threadId: targetThreadId)
             if routing.mode == .auto {
                 _ = try orchestrationRuntime.route(
                     configuration: routing,
@@ -8959,8 +8980,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 )
             }
             let queued = try queuedMessageRepo.enqueueConsumingDraft(
-                threadId: selectedThreadId,
-                providerInstanceId: providerInstanceId,
+                threadId: targetThreadId,
+                providerInstanceId: draftProviderInstanceId,
                 text: text,
                 attachments: attached,
                 interactionMode: mode,
@@ -8972,27 +8993,29 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // queued id = future run id on drain (AgentRunID(queued.id)), so the
             // bubble appears once via startProviderRun when the turn actually starts.
             // Still clear the prior Active plan: the user has superseded it.
-            timeline.clearActivePlan()
-            suppressStaleActivePlanUpdates = true
-            resetTimelineUpdateTick()
-            prompt = ""
-            attachments = []
-            clearComposerDraftMemory(threadId: selectedThreadId, providerInstanceId: providerInstanceId)
+            if isSelected {
+                timeline.clearActivePlan()
+                suppressStaleActivePlanUpdates = true
+                resetTimelineUpdateTick()
+                prompt = ""
+                attachments = []
+            }
+            clearComposerDraftMemory(threadId: targetThreadId, providerInstanceId: draftProviderInstanceId)
             // UX-MAC_AGENT-019: a run is in flight, so this message was queued,
             // not sent now — confirm that explicitly near the composer.
-            reloadQueuedMessages()
+            if isSelected { reloadQueuedMessages() }
             setQueueStatus(
                 "Queued — will run after the current turn.",
-                threadId: selectedThreadId
+                threadId: targetThreadId
             )
             // QA-MAC_AGENT-010: track queue depth for diagnostics.
-            agentSurfaceLog.info("queue.enqueued thread=\(selectedThreadId.value.uuidString, privacy: .public) depth=\(self.queuedMessages.count, privacy: .public)")
+            agentSurfaceLog.info("queue.enqueued thread=\(targetThreadId.value.uuidString, privacy: .public) depth=\(self.queuedMessages.count, privacy: .public)")
             onQueuedMessageEvent?(AgentQueueEventKinds.queued, queued)
             return true
         } catch {
             setQueueStatus(
                 "Queue send failed: \(error)",
-                threadId: selectedThreadId
+                threadId: targetThreadId
             )
             return false
         }
@@ -9198,8 +9221,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 )
                 if let holder = claimVM(botID, entry) {
                     let notice = "bot ocupado em \(holder.title)"
-                    botVMClaimRefusal = (botID, notice)
-                    statusMessage = notice
+                    botVMClaimRefusal = (botID, notice, tid)
+                    if selectedThreadId == tid { statusMessage = notice }
                     return nil
                 }
                 vmClaimRunId = runId

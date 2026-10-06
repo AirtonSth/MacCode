@@ -3,6 +3,14 @@ import AgentRuntime
 import CoreModel
 import Surfaces
 
+/// A desk, peer or hop send found the bot's VM busy in another thread. Nothing
+/// was written: the caller keeps its text and shows the notice.
+struct BotVMBusyError: LocalizedError, CustomStringConvertible {
+    let holder: BotVMRunRegistry.Entry
+    var description: String { AppCommandRouter.botVMBusyNotice(holderTitle: holder.title) }
+    var errorDescription: String? { description }
+}
+
 extension AppCommandRouter {
     static let macExecutionApprovedFollowUp = "Execução no Mac aprovada pelo usuário. Continue."
     static let macExecutionDeclinedFollowUp = "O usuário recusou a execução no Mac. Continue na VM ou pare e explique."
@@ -28,16 +36,8 @@ extension AppCommandRouter {
         firstMessage: String? = nil
     ) -> (botID: BotID, holder: BotVMRunRegistry.Entry?)? {
         guard let ctx = context,
-              (try? ctx.threadRepo.guestPlacement(of: thread))??.executionTarget == .vm,
-              let row = (try? ctx.threadRepo.get(id: thread)) ?? nil else { return nil }
-        let botID: BotID
-        if case .bot(let id) = row.actor {
-            botID = id
-        } else if let conversation = (try? ctx.botStore.conversationLinked(to: thread)) ?? nil {
-            botID = conversation.botID
-        } else {
-            return nil
-        }
+              let row = (try? ctx.threadRepo.get(id: thread)) ?? nil,
+              let botID = botIDOfVMThread(thread, row: row) else { return nil }
         let untitled = AgentThreadTitle.isPlaceholder(row.title)
             && (try? ctx.messageRepo.hasAny(threadId: thread)) != true
         let title = untitled ? firstMessage.map(AgentThreadTitle.titleFromFirstMessage) ?? row.title : row.title
@@ -50,11 +50,35 @@ extension AppCommandRouter {
         return (botID, holder)
     }
 
+    /// The bot whose VM runs `thread`; nil unless the thread is locked to a bot's VM.
+    func botIDOfVMThread(_ thread: AgentThreadID, row: AgentThread? = nil) -> BotID? {
+        guard let ctx = context,
+              (try? ctx.threadRepo.guestPlacement(of: thread))??.executionTarget == .vm,
+              let row = row ?? ((try? ctx.threadRepo.get(id: thread)) ?? nil) else { return nil }
+        if case .bot(let id) = row.actor { return id }
+        return ((try? ctx.botStore.conversationLinked(to: thread)) ?? nil)?.botID
+    }
+
     /// Frees a claim whose run never started and hands the VM to the next
     /// queued thread, as the run-finished callback does for a started run.
     func releaseBotVMRun(_ runID: AgentRunID) {
-        guard let next = BotVMRunRegistry.shared.releaseAndNextWaiting(runID: runID) else { return }
-        Task { @MainActor [weak self] in try? await self?.drainNextQueuedAgentMessage(thread: next, botVMHandOff: true) }
+        guard let next = BotVMRunRegistry.shared.releaseAndNextWaiter(runID: runID) else { return }
+        Task { @MainActor [weak self] in await self?.handOffBotVM(botID: next.botID, to: next.threadID) }
+    }
+
+    /// Starts the thread the free VM was handed to. When that thread does not
+    /// take the VM (its queue emptied, it is running, its drain is not
+    /// allowed), the VM passes to the next waiter instead of staying idle.
+    func handOffBotVM(botID: BotID, to thread: AgentThreadID) async {
+        var next: AgentThreadID? = thread
+        while let current = next {
+            try? await drainNextQueuedAgentMessage(thread: current, botVMHandOff: true)
+            next = BotVMRunRegistry.shared.popWaitingIfFree(botID: botID)
+        }
+    }
+
+    nonisolated static func botVMBusyNotice(holderTitle: String) -> String {
+        "bot ocupado em \(holderTitle)"
     }
 
     /// Queues `thread` behind the run holding the bot's VM and shows the
@@ -62,11 +86,25 @@ extension AppCommandRouter {
     @discardableResult
     func waitForBotVM(botID: BotID, thread: AgentThreadID, holder: BotVMRunRegistry.Entry) -> String {
         BotVMRunRegistry.shared.addWaiting(botID: botID, threadID: thread)
-        let notice = "bot ocupado em \(holder.title)"
+        let notice = Self.botVMBusyNotice(holderTitle: holder.title)
         for viewModel in botThreadViewModels where viewModel.selectedThreadId == thread {
             viewModel.statusMessage = notice
         }
+        publishBotVMWait(thread: thread)
         return notice
+    }
+
+    /// iOS parity: republishes the thread's head queued message, whose
+    /// `waiting_for_bot_vm` field says which thread holds the bot's VM.
+    func publishBotVMWait(thread: AgentThreadID) {
+        guard let head = (try? context?.queuedMessageRepo.first(threadId: thread)) ?? nil else { return }
+        publishQueuedMessage(kind: "agent.message.queue.updated", head)
+    }
+
+    /// D12 for the coordinator's auto-continuation: false when another
+    /// thread's run holds the bot's VM (the continuation is skipped).
+    func claimBotVMForAutoContinuation(thread: AgentThreadID, runID: AgentRunID) -> Bool {
+        claimBotVMRun(thread: thread, runID: runID)?.holder == nil
     }
 
     func handleMacExecutionRequested(threadID: AgentThreadID, reason: String) {

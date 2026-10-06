@@ -1287,6 +1287,14 @@ public final class AppContext {
             ) { _, new in new }
             return environment
         }
+        self.coordinator.autoContinuationClaimsBotVM = { [weak self] threadId, runId in
+            await MainActor.run {
+                self?.router?.claimBotVMForAutoContinuation(thread: threadId, runID: runId) ?? true
+            }
+        }
+        self.coordinator.autoContinuationReleasesBotVM = { [weak self] runId in
+            await MainActor.run { self?.router?.releaseBotVMRun(runId) }
+        }
         self.coordinator.onRunPrepared = { [weak self] request, originalPrompt in
             await MainActor.run { [weak self] in
                 self?.recordTokenSaverPreparedObservation(request: request, originalPrompt: originalPrompt)
@@ -1652,11 +1660,11 @@ public final class AppContext {
             }
         }
         coordinator.onRunFinished = { [weak self] tid, rid, status in
-            let nextWaiting = BotVMRunRegistry.shared.releaseAndNextWaiting(runID: rid)
+            let nextWaiting = BotVMRunRegistry.shared.releaseAndNextWaiter(runID: rid)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if let nextWaiting {
-                    try? await self.router?.drainNextQueuedAgentMessage(thread: nextWaiting, botVMHandOff: true)
+                    await self.router?.handOffBotVM(botID: nextWaiting.botID, to: nextWaiting.threadID)
                 }
                 let kind: RemoteCodeEventKind = status == .completed
                     ? .agentRunCompleted

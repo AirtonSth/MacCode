@@ -1460,6 +1460,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public var onRunStarted: ((AgentThreadID, AgentRunID) -> Void)?
     public var onAssistantEvent: ((AssistantEvent, AgentThreadID, AgentRunID) -> Void)?
     public var onRunFinished: ((AgentThreadID, AgentRunID, AgentRunStatus) -> Void)?
+    /// D12: claims the bot VM an auto-continuation runs on; false (another
+    /// thread holds it) skips the continuation. The release frees a claim
+    /// whose continuation did not start.
+    public var autoContinuationClaimsBotVM: (@Sendable (AgentThreadID, AgentRunID) async -> Bool)?
+    public var autoContinuationReleasesBotVM: (@Sendable (AgentRunID) async -> Void)?
     /// Provider-native terminal acknowledgement used to wake queued work
     /// causally instead of polling resident adapter sessions.
     public var onProviderIdle: ((AgentThreadID) -> Void)?
@@ -5002,7 +5007,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 try? await Task.sleep(nanoseconds: UInt64((delay * 1_000_000_000).rounded()))
             }
             guard self.backgroundAwaitContinuationStillValid(threadId: threadId, token: token) else { return }
-            _ = try? await self.startRun(request, isAutoContinuation: true)
+            if let claim = self.autoContinuationClaimsBotVM {
+                guard await claim(threadId, request.runId) else { return }
+            }
+            do {
+                _ = try await self.startRun(request, isAutoContinuation: true)
+            } catch {
+                await self.autoContinuationReleasesBotVM?(request.runId)
+            }
         }
     }
 
