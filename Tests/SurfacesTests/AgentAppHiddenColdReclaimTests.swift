@@ -36,6 +36,8 @@ final class AgentAppHiddenColdReclaimTests: XCTestCase {
             workspaceID: WorkspaceID(), cwd: tmp,
             coordinator: coord, threadRepo: threadRepo, messageRepo: messageRepo
         )
+        // Fixture transcripts are small; the size gate has its own test.
+        vm.hiddenArchiveMinimumHotTextBytes = 0
         return Fixture(vm: vm, threadRepo: threadRepo, runRepo: runRepo)
     }
 
@@ -129,6 +131,45 @@ final class AgentAppHiddenColdReclaimTests: XCTestCase {
         )
     }
 
+    /// Reveal acknowledges at once; the archived tree lands off-main.
+    private func revealAndRestore(_ vm: AgentAppViewModel) async {
+        vm.setVisibility(.visible)
+        await vm.waitForColdRestoreForTesting()
+    }
+
+    private func hideAndArchive(_ vm: AgentAppViewModel) async {
+        vm.hiddenReclaimDelayForTesting = .seconds(3_600)
+        vm.setVisibility(.hidden)
+        await vm.reclaimHiddenStateForTesting()
+        XCTAssertTrue(vm.hiddenTimelineIsArchivedForTesting, "precondition: the hidden tab is archived")
+    }
+
+    private func persistEvents(
+        _ fixture: Fixture,
+        run: AgentRun,
+        threadId: AgentThreadID,
+        turnIds: [String],
+        firstSeq: Int
+    ) throws {
+        let encoder = JSONEncoder()
+        var writes: [AgentRunRepository.StreamWriteIntent] = []
+        for (offset, turnId) in turnIds.enumerated() {
+            let event = AssistantEvent.turnStarted(turnId: turnId)
+            writes.append(.init(
+                seq: firstSeq + offset,
+                kind: event.debugDescription,
+                payloadJSON: String(decoding: try encoder.encode(event), as: UTF8.self),
+                providerEvent: nil
+            ))
+        }
+        try fixture.runRepo.persistStreamBatch(
+            runId: run.id,
+            threadId: threadId,
+            items: writes,
+            shouldPruneStreamEvents: false
+        )
+    }
+
     private func waitUntil(_ condition: () -> Bool) async {
         for _ in 0..<400 {
             if condition() { return }
@@ -185,6 +226,12 @@ final class AgentAppHiddenColdReclaimTests: XCTestCase {
         XCTAssertEqual(vm.paintedTimelineCountForTesting, 0, "painted caches of idle threads must be released")
 
         vm.setVisibility(.visible)
+        // Immediate path: the reveal is acknowledged on this turn and never
+        // decodes on the main actor; the session stays restoring until then.
+        XCTAssertFalse(vm.isHiddenFromSurface)
+        XCTAssertEqual(vm.visibilitySessionForTesting.state, .restoring)
+        XCTAssertTrue(vm.coldRestoreIsInFlightForTesting, "the decode must run off-main, after the reveal")
+        await vm.waitForColdRestoreForTesting()
         XCTAssertEqual(vm.timeline, before, "reveal must restore the exact timeline")
         XCTAssertFalse(vm.hiddenTimelineIsArchivedForTesting)
         XCTAssertEqual(vm.visibilitySessionForTesting.state, .visible)
@@ -209,7 +256,7 @@ final class AgentAppHiddenColdReclaimTests: XCTestCase {
         await waitUntil { vm.hiddenTimelineIsArchivedForTesting }
         XCTAssertTrue(vm.hiddenTimelineIsArchivedForTesting)
 
-        vm.setVisibility(.visible)
+        await revealAndRestore(vm)
         XCTAssertEqual(vm.timeline, before)
     }
 
@@ -236,7 +283,7 @@ final class AgentAppHiddenColdReclaimTests: XCTestCase {
         XCTAssertFalse(vm.hiddenTimelineIsArchivedForTesting, "a reclaim from an earlier hide must be rejected")
         await vm.reclaimHiddenStateForTesting()
         XCTAssertTrue(vm.hiddenTimelineIsArchivedForTesting, "the current hide's reclaim still lands")
-        vm.setVisibility(.visible)
+        await revealAndRestore(vm)
         XCTAssertEqual(vm.timeline, before)
     }
 
@@ -253,7 +300,7 @@ final class AgentAppHiddenColdReclaimTests: XCTestCase {
         vm.setVisibility(.hidden)
 
         XCTAssertTrue(vm.hiddenTimelineIsArchivedForTesting, "a second hide must not stash the emptied timeline")
-        vm.setVisibility(.visible)
+        await revealAndRestore(vm)
         XCTAssertEqual(vm.timeline, before)
     }
 
@@ -306,7 +353,10 @@ final class AgentAppHiddenColdReclaimTests: XCTestCase {
         XCTAssertEqual(vm.timeline, before)
     }
 
-    func test_corruptArchive_revealsTheDurableReplayInsteadOfAnEmptyConversation() async throws {
+    func test_corruptArchive_takesTheNormalFullOpenInsteadOfAnEmptyConversation() async throws {
+        // WHY: a restore failure must not reveal an empty conversation, and
+        // must not replay the hot window on the main actor either: it takes
+        // the same off-main full open a thread switch takes.
         let fixture = try makeFixture()
         let vm = fixture.vm
         let thread = try makeFinishedThread(fixture, title: "corrupt", turns: 3)
@@ -315,13 +365,235 @@ final class AgentAppHiddenColdReclaimTests: XCTestCase {
         vm.setVisibility(.hidden)
         vm.setHiddenTimelineArchiveForTesting(Data([0, 1, 2, 3]))
 
-        vm.setVisibility(.visible)
+        await revealAndRestore(vm)
+        await vm.waitForSelectThreadHydrationForTesting()
 
-        // The durable replay is the honest fallback, not an exact restore: turn
-        // start times are re-stamped on replay, which is why the archive exists.
         let durable = AgentAppViewModel.timelineByReplaying(vm.coordinator.latestStreamEvents(threadId: thread.id))
         XCTAssertEqual(vm.timeline.turns.map(\.turnId), (0..<3).map { "corrupt-turn-\($0)" })
         XCTAssertEqual(vm.timeline.turns.map(\.items), durable.turns.map(\.items))
         XCTAssertFalse(vm.hiddenTimelineIsArchivedForTesting)
+        XCTAssertEqual(vm.visibilitySessionForTesting.state, .visible)
+    }
+
+    // MARK: - Review follow-ups (M-S9)
+
+    func test_hiddenTreeWrittenDuringEncode_rejectsTheArchive() async throws {
+        // WHY: the encode runs off-main on a snapshot. A stream event that
+        // extends the hidden tree meanwhile must win; committing the stale
+        // snapshot would silently drop the streamed turn until a full open.
+        let fixture = try makeFixture()
+        let vm = fixture.vm
+        let thread = try makeFinishedThread(fixture, title: "encode", turns: 3)
+        await open(vm, thread)
+        let before = vm.timeline
+        vm.hiddenReclaimDelayForTesting = .seconds(3_600)
+        vm.hiddenTimelinePublishIntervalForTesting = 0
+        vm.setVisibility(.hidden)
+        // The hook runs after the detached encode returned and before the
+        // commit guard: the stream commit lands inside the encode window.
+        vm.beforeHiddenArchiveCommitForTesting = { [weak vm] in
+            guard let vm else { return }
+            vm.beforeHiddenArchiveCommitForTesting = nil
+            let publishes = vm.hiddenTimelinePublishCountForTesting
+            self.pump(vm, threadId: thread.id, run: AgentRunID(), turnId: "encode-race")
+            await self.waitUntil { vm.hiddenTimelinePublishCountForTesting > publishes }
+        }
+        await vm.reclaimHiddenStateForTesting()
+
+        XCTAssertFalse(vm.hiddenTimelineIsArchivedForTesting, "a tree written during the encode must not be archived")
+        vm.setVisibility(.visible)
+        XCTAssertEqual(vm.timeline.turns.map(\.turnId), before.turns.map(\.turnId) + ["encode-race"])
+    }
+
+    func test_disposeDuringReclaimEncode_leavesNoArchive() async throws {
+        let fixture = try makeFixture()
+        let vm = fixture.vm
+        let thread = try makeFinishedThread(fixture, title: "dispose", turns: 3)
+        await open(vm, thread)
+        vm.hiddenReclaimDelayForTesting = .seconds(3_600)
+        vm.setVisibility(.hidden)
+        vm.beforeHiddenArchiveCommitForTesting = { [weak vm] in vm?.dispose() }
+
+        await vm.reclaimHiddenStateForTesting()
+
+        XCTAssertFalse(vm.hiddenTimelineIsArchivedForTesting, "a disposed surface must not keep an archive")
+        XCTAssertFalse(vm.coldRestoreIsInFlightForTesting)
+    }
+
+    func test_smallTimeline_isNotArchivedButIdleCachesAreStillReleased() async throws {
+        // WHY: below the size gate the archive saves little and every reveal
+        // would still pay a restore; the painted caches still go.
+        let fixture = try makeFixture()
+        let vm = fixture.vm
+        vm.hiddenArchiveMinimumHotTextBytes = 1 << 20
+        let other = try makeFinishedThread(fixture, title: "small-other", turns: 2)
+        let thread = try makeFinishedThread(fixture, title: "small", turns: 3)
+        await open(vm, other)
+        await open(vm, thread)
+        let before = vm.timeline
+        XCTAssertLessThan(before.aggregateHotTextByteCount, 1 << 20)
+        vm.hiddenReclaimDelayForTesting = .seconds(3_600)
+        vm.setVisibility(.hidden)
+
+        await vm.reclaimHiddenStateForTesting()
+
+        XCTAssertFalse(vm.hiddenTimelineIsArchivedForTesting)
+        XCTAssertEqual(vm.paintedTimelineCountForTesting, 0)
+        vm.setVisibility(.visible)
+        XCTAssertEqual(vm.visibilitySessionForTesting.state, .visible, "no restore: reveal completes on the same turn")
+        XCTAssertEqual(vm.timeline, before)
+    }
+
+    func test_hideBeforeRevealRestoreLands_keepsTheTreeAndRestoresOnNextReveal() async throws {
+        // WHY (A→B race): a reveal that is hidden again before its restore
+        // lands must neither lose the archive nor paint onto the hidden tab.
+        let fixture = try makeFixture()
+        let vm = fixture.vm
+        let thread = try makeFinishedThread(fixture, title: "flip", turns: 4)
+        await open(vm, thread)
+        let before = vm.timeline
+        await hideAndArchive(vm)
+
+        vm.setVisibility(.visible)
+        vm.setVisibility(.hidden)
+        XCTAssertEqual(vm.visibilitySessionForTesting.state, .hidden)
+        await vm.waitForColdRestoreForTesting()
+        XCTAssertTrue(vm.timeline.turns.isEmpty, "a hidden tab must not publish the restored tree")
+
+        await revealAndRestore(vm)
+        XCTAssertEqual(vm.timeline, before)
+        XCTAssertEqual(vm.visibilitySessionForTesting.state, .visible)
+    }
+
+    func test_timelineWrittenBeforeRevealRestoreLands_isNotOverwritten() async throws {
+        // WHY: the restore is stale once anything wrote the revealed timeline.
+        // It must not overwrite that write; the tab takes the normal full open.
+        let fixture = try makeFixture()
+        let vm = fixture.vm
+        let thread = try makeFinishedThread(fixture, title: "write", turns: 3)
+        await open(vm, thread)
+        await hideAndArchive(vm)
+
+        // A newer turn that is durable and already painted on the revealed
+        // stand-in before the restore lands.
+        let newer = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .completed)
+        try fixture.runRepo.upsert(newer)
+        try persistEvents(fixture, run: newer, threadId: thread.id, turnIds: ["newer-write"], firstSeq: 100)
+        vm.setVisibility(.visible)
+        vm.timeline.apply(.turnStarted(turnId: "newer-write"))
+        await vm.waitForColdRestoreForTesting()
+        await vm.waitForSelectThreadHydrationForTesting()
+
+        XCTAssertFalse(vm.hiddenTimelineIsArchivedForTesting)
+        XCTAssertEqual(vm.visibilitySessionForTesting.state, .visible)
+        XCTAssertEqual(
+            vm.timeline.turns.map(\.turnId),
+            (0..<3).map { "write-turn-\($0)" } + ["newer-write"],
+            "the stale archive must not erase the newer turn"
+        )
+    }
+
+    func test_streamDuringRevealRestore_extendsTheRestoredTimeline() async throws {
+        let fixture = try makeFixture()
+        let vm = fixture.vm
+        let thread = try makeFinishedThread(fixture, title: "reveal-stream", turns: 3)
+        await open(vm, thread)
+        let before = vm.timeline
+        await hideAndArchive(vm)
+
+        vm.setVisibility(.visible)
+        pump(vm, threadId: thread.id, run: AgentRunID(), turnId: "reveal-stream-live")
+        await vm.waitForColdRestoreForTesting()
+        await waitUntil { vm.timeline.turns.contains { $0.turnId == "reveal-stream-live" } }
+
+        XCTAssertEqual(vm.timeline.turns.map(\.turnId), before.turns.map(\.turnId) + ["reveal-stream-live"])
+        XCTAssertEqual(Array(vm.timeline.turns.prefix(before.turns.count)), before.turns)
+    }
+
+    func test_hostSelectsAnotherThreadWhileArchived_revealShowsTheNewThread() async throws {
+        // WHY: the archive belongs to the thread that was selected at hide. A
+        // host selectThread while hidden must never reveal that old tree.
+        let fixture = try makeFixture()
+        let vm = fixture.vm
+        let other = try makeFinishedThread(fixture, title: "next", turns: 2)
+        let archived = try makeFinishedThread(fixture, title: "archived", turns: 4)
+        await open(vm, archived)
+        await hideAndArchive(vm)
+
+        await open(vm, other)
+        XCTAssertFalse(vm.hiddenTimelineIsArchivedForTesting, "a thread switch drops the old thread's archive")
+        await revealAndRestore(vm)
+
+        XCTAssertEqual(vm.timeline.turns.map(\.turnId), (0..<2).map { "next-turn-\($0)" })
+        XCTAssertEqual(vm.visibilitySessionForTesting.state, .visible)
+    }
+
+    func test_revealRestorePendingThenThreadSwitch_showsOnlyTheNewThread() async throws {
+        let fixture = try makeFixture()
+        let vm = fixture.vm
+        let other = try makeFinishedThread(fixture, title: "dest", turns: 2)
+        let archived = try makeFinishedThread(fixture, title: "src", turns: 4)
+        await open(vm, archived)
+        await hideAndArchive(vm)
+
+        vm.setVisibility(.visible)
+        await open(vm, other)
+        await vm.waitForColdRestoreForTesting()
+
+        XCTAssertEqual(vm.timeline.turns.map(\.turnId), (0..<2).map { "dest-turn-\($0)" })
+        XCTAssertEqual(vm.visibilitySessionForTesting.state, .visible)
+        XCTAssertFalse(vm.hiddenTimelineIsArchivedForTesting)
+    }
+
+    func test_scheduledSuffixOnArchivedTab_extendsTheRestoredTimeline() async throws {
+        // WHY: a LaunchAgent-owned scheduled run can start on a reclaimed tab.
+        // Its suffix must extend the restored transcript, and the restore must
+        // not run on the poll's main-actor turn.
+        let fixture = try makeFixture()
+        let vm = fixture.vm
+        let thread = try makeFinishedThread(fixture, title: "sched", turns: 3)
+        await open(vm, thread)
+        let before = vm.timeline
+        await hideAndArchive(vm)
+
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .running)
+        try fixture.runRepo.upsert(run)
+        // Sequences above the finished run's keep this run the stream cursor
+        // even when both runs share a started_at second.
+        try persistEvents(fixture, run: run, threadId: thread.id, turnIds: ["sched-seed"], firstSeq: 101)
+        vm.isScheduledThreadRunning = { $0 == thread.id }
+        vm.selectThread(thread.id, markRead: false)  // host reselect binds the scheduled poll
+        XCTAssertTrue(vm.hiddenTimelineIsArchivedForTesting)
+        try persistEvents(fixture, run: run, threadId: thread.id, turnIds: ["sched-1", "sched-2"], firstSeq: 102)
+
+        vm.tickScheduledLivePollForTesting()
+        XCTAssertEqual(vm.scheduledLiveApplyCountForTesting, 0, "the poll must not apply onto the archived stand-in")
+        XCTAssertTrue(vm.coldRestoreIsInFlightForTesting)
+        await vm.waitForColdRestoreForTesting()
+        vm.tickScheduledLivePollForTesting()
+        XCTAssertEqual(vm.scheduledLiveApplyCountForTesting, 2, "the next tick applies the same attested suffix")
+
+        await revealAndRestore(vm)
+        XCTAssertEqual(vm.timeline.turns.map(\.turnId), before.turns.map(\.turnId) + ["sched-1", "sched-2"])
+        XCTAssertEqual(Array(vm.timeline.turns.prefix(before.turns.count)), before.turns)
+    }
+
+    func test_hiddenThaw_rearmsReclaimSoTheTabCompactsAgain() async throws {
+        let fixture = try makeFixture()
+        let vm = fixture.vm
+        let thread = try makeFinishedThread(fixture, title: "rearm", turns: 3)
+        await open(vm, thread)
+        let before = vm.timeline
+        await hideAndArchive(vm)
+        vm.hiddenTimelinePublishIntervalForTesting = 0
+        vm.hiddenReclaimDelayForTesting = .milliseconds(10)
+
+        pump(vm, threadId: thread.id, run: AgentRunID(), turnId: "rearm-live")
+        await waitUntil { vm.hiddenTimelinePublishCountForTesting > 0 }
+        await waitUntil { vm.hiddenTimelineIsArchivedForTesting }
+        XCTAssertTrue(vm.hiddenTimelineIsArchivedForTesting, "an idle thawed tab must compact again")
+
+        await revealAndRestore(vm)
+        XCTAssertEqual(vm.timeline.turns.map(\.turnId), before.turns.map(\.turnId) + ["rearm-live"])
     }
 }
