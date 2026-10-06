@@ -316,7 +316,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
         let user = BotComputerGuestSpec.execUsesRoot(trimmed) ? "0" : nil
         let data = try docker.exec(
             name: name,
-            command: ["bash", "-lc", trimmed],
+            command: BotComputerGuestSpec.deadlineExecCommand(trimmed),
             user: user,
             detach: false
         )
@@ -347,7 +347,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
         }
         let data = try docker.exec(
             name: BotComputerGuestSpec.containerName(botID: botID),
-            command: ["bash", "-lc", trimmed],
+            command: BotComputerGuestSpec.deadlineExecCommand(trimmed),
             user: BotComputerGuestSpec.execUsesRoot(trimmed) ? "0" : user,
             detach: false,
             workdir: workspace,

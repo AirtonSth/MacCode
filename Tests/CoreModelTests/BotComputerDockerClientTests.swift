@@ -498,6 +498,52 @@ final class BotComputerDockerClientTests: XCTestCase {
         XCTAssertEqual(BotComputerDockerCLI.timeoutError(for: ["build"]), .provisioningFailed)
         XCTAssertEqual(BotComputerDockerCLI.timeoutError(for: ["start"]), .provisioningFailed)
     }
+
+    func test_agentExecGetsTheGuestDeadlineWhileShortDockerCommandsStayShort() {
+        // WHY: bot_computer_exec runs apt-get/builds that take minutes. A 15 s host
+        // timeout failed them as "could not start the desktop". The host deadline
+        // must cover the guest deadline yet stay under the MCP child's wait, so the
+        // host reports the timeout instead of the child timing out blind.
+        let wrapped = BotComputerGuestSpec.deadlineExecCommand("apt-get install -y sl")
+        let agentExec = ["exec", "-u", "0", "remotecode-bot-x"] + wrapped
+        let workspaceExec = ["exec", "-u", "501:20", "-w", "/Users/ada/repo",
+                             "-e", "GIT_AUTHOR_NAME=Ada", "remotecode-bot-x"] + wrapped
+        let hostDeadline = BotComputerGuestSpec.execHostDeadlineSeconds
+        XCTAssertEqual(BotComputerDockerCLI.timeoutForArguments(agentExec), hostDeadline)
+        XCTAssertEqual(BotComputerDockerCLI.timeoutForArguments(workspaceExec), hostDeadline)
+        XCTAssertGreaterThan(
+            hostDeadline,
+            TimeInterval(BotComputerGuestSpec.execGuestDeadlineSeconds + BotComputerGuestSpec.execGuestKillGraceSeconds),
+            "the guest `timeout` must fire (and kill) before the host abandons docker exec"
+        )
+        XCTAssertLessThan(hostDeadline, BotComputerGuestSpec.execResultWaitSeconds)
+
+        // Screenshot/act execs and other docker commands keep failing fast.
+        let observe = ["exec", "remotecode-bot-x", "env", "DISPLAY=:1", "import", "-window", "root", "png:-"]
+        XCTAssertEqual(BotComputerDockerCLI.timeoutForArguments(observe), 15)
+        XCTAssertEqual(BotComputerDockerCLI.timeoutForArguments(["ps", "-aq", "--filter", "name=x"]), 15)
+        XCTAssertEqual(BotComputerDockerCLI.timeoutForArguments(["info"]), 5)
+        XCTAssertEqual(BotComputerDockerCLI.timeoutForArguments(["build", "."]), 600)
+        // A bare `bash -lc` exec (unbounded in the guest) gets no long host deadline.
+        XCTAssertEqual(
+            BotComputerDockerCLI.timeoutForArguments(["exec", "remotecode-bot-x", "bash", "-lc", "sleep 60"]),
+            15
+        )
+    }
+
+    func test_agentExecTimeoutIsReportedAsACommandTimeoutNotADesktopFailure() {
+        // WHY: "Could not start the Linux desktop" sends the agent chasing Docker
+        // when its own command simply ran too long.
+        let agentExec = ["exec", "remotecode-bot-x"] + BotComputerGuestSpec.deadlineExecCommand("make")
+        XCTAssertEqual(BotComputerDockerCLI.timeoutError(for: agentExec), .guestCommandTimedOut)
+        XCTAssertTrue(BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 124), "timeout sent TERM")
+        XCTAssertTrue(BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 137), "timeout had to KILL")
+        XCTAssertFalse(BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 1))
+        XCTAssertFalse(BotComputerDockerCLI.isGuestDeadlineExit(["exec", "x", "false"], status: 124))
+        let message = BotComputerDockerError.guestCommandTimedOut.description
+        XCTAssertTrue(message.contains("\(BotComputerGuestSpec.execGuestDeadlineSeconds) s"))
+        XCTAssertNotEqual(message, BotComputerDockerError.provisioningFailed.description)
+    }
 }
 
 private final class DockerNetworkRunRecorder: @unchecked Sendable {

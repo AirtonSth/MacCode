@@ -956,7 +956,12 @@ final class BotComputerGuestServiceTests: XCTestCase {
         let botID = BotID()
         _ = try service.exec(botID: botID, command: "apt-get install -y sl")
         XCTAssertEqual(fake.lastExec?.user, "0")
-        XCTAssertEqual(Array(fake.lastExec?.command.prefix(2) ?? []), ["bash", "-lc"])
+        // The agent's shell runs under the guest deadline so a long apt-get is
+        // stopped inside the guest, not orphaned when the host gives up.
+        XCTAssertEqual(
+            fake.lastExec?.command,
+            BotComputerGuestSpec.execDeadlinePrefix + ["bash", "-lc", "apt-get install -y sl"]
+        )
         try service.openTerminal(botID: botID)
         XCTAssertEqual(fake.lastExec?.detach, true)
         XCTAssertEqual(fake.lastExec?.command, BotComputerGuestSpec.terminalCommand())

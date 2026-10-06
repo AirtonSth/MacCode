@@ -1,4 +1,5 @@
 import XCTest
+import CoreModel
 
 final class BotComputerGuestRecipeTests: XCTestCase {
     func test_recipeIsFirstPartyLinuxDesktop_notAlpineSleep() throws {
@@ -20,6 +21,18 @@ final class BotComputerGuestRecipeTests: XCTestCase {
         XCTAssertTrue(browser.contains("--no-sandbox"))
         XCTAssertTrue(embed.contains("token"))
         XCTAssertTrue(embed.contains("view_only=0"))
+    }
+
+    func test_xvfbGeometryMatchesTheActCoordinateBounds() throws {
+        // WHY: bot_computer_act bounds clicks/drags by BotComputerGuestSpec's screen
+        // size. If start.sh's Xvfb geometry drifts, valid on-screen points get
+        // rejected or off-screen points get clamped onto the wrong control.
+        let start = try String(
+            contentsOf: sourceURL("Sources/AppShell/Resources/ComputerGuest/start.sh"),
+            encoding: .utf8
+        )
+        let geometry = "\(BotComputerGuestSpec.screenWidth)x\(BotComputerGuestSpec.screenHeight)x24"
+        XCTAssertTrue(start.contains("Xvfb :1 -screen 0 \(geometry) "), "start.sh must start Xvfb at \(geometry)")
     }
 
     private func sourceURL(_ relative: String) -> URL {

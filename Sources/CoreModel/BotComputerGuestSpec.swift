@@ -160,6 +160,34 @@ public enum BotComputerGuestSpec {
         ]
     }
 
+    /// Guest framebuffer size. start.sh starts `Xvfb :1 -screen 0 1280x800x24`
+    /// (pinned by BotComputerGuestRecipeTests); act coordinates are bounded by it.
+    public static let screenWidth = 1280
+    public static let screenHeight = 800
+
+    /// How long the bot's MCP child waits for an exec/rebuild result from the host.
+    public static let execResultWaitSeconds: TimeInterval = 180
+    /// Guest-side limit for bot_computer_exec. `timeout` stops the whole command
+    /// group inside the guest (TERM, then KILL after the grace); killing only the
+    /// host docker exec client would leave e.g. apt-get holding the dpkg lock.
+    public static let execGuestDeadlineSeconds = 165
+    public static let execGuestKillGraceSeconds = 5
+    /// Host docker exec deadline: guest deadline + grace + docker teardown slack,
+    /// kept below `execResultWaitSeconds` so the host reports the timeout itself
+    /// instead of the MCP child giving up first.
+    public static var execHostDeadlineSeconds: TimeInterval {
+        TimeInterval(execGuestDeadlineSeconds + execGuestKillGraceSeconds + 5)
+    }
+
+    public static var execDeadlinePrefix: [String] {
+        ["timeout", "-k", "\(execGuestKillGraceSeconds)", "\(execGuestDeadlineSeconds)"]
+    }
+
+    /// Guest argv for an agent shell command, bounded by the guest deadline.
+    public static func deadlineExecCommand(_ command: String) -> [String] {
+        execDeadlinePrefix + ["bash", "-lc", command]
+    }
+
     public static func execUsesRoot(_ command: String) -> Bool {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.hasPrefix("apt") || trimmed.hasPrefix("apt-get")

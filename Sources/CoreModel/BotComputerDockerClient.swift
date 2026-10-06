@@ -51,6 +51,8 @@ public enum BotComputerDockerError: Error, Equatable, LocalizedError, CustomStri
     case networkAddressPoolExhausted
     case networkSubnetUnavailable
     case provisioningFailed
+    /// A bot_computer_exec command outlived `BotComputerGuestSpec.execGuestDeadlineSeconds`.
+    case guestCommandTimedOut
 
     public var recovery: BotComputerDockerRecovery {
         switch self {
@@ -58,12 +60,19 @@ public enum BotComputerDockerError: Error, Equatable, LocalizedError, CustomStri
         case .daemonUnavailable: return .startDaemon
         case .probeTimedOut: return .retryTimedOutProbe
         case .outputTooLarge: return .retryProvisioning
-        case .networkAddressPoolExhausted, .networkSubnetUnavailable, .provisioningFailed:
+        case .networkAddressPoolExhausted, .networkSubnetUnavailable, .provisioningFailed,
+             .guestCommandTimedOut:
             return .retryProvisioning
         }
     }
 
-    public var description: String { recovery.message }
+    public var description: String {
+        guard self == .guestCommandTimedOut else { return recovery.message }
+        // The desktop is fine; the agent needs to know its command was stopped.
+        return "The command ran longer than \(BotComputerGuestSpec.execGuestDeadlineSeconds) s "
+            + "inside the Linux container and was stopped. Run long jobs in the background "
+            + "(nohup <command> > /tmp/job.log 2>&1 &) and check the log in later calls."
+    }
     public var errorDescription: String? { description }
 }
 
@@ -381,6 +390,9 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         if result.timedOut {
             throw timeoutError(for: args)
         }
+        if isGuestDeadlineExit(args, status: result.terminationStatus) {
+            throw BotComputerDockerError.guestCommandTimedOut
+        }
         if result.terminationStatus != 0 {
             BotComputerDockerResolver.shared.invalidateIfMatches(executable)
             throw failureError(for: args, stderr: result.errorData)
@@ -405,12 +417,28 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         switch args.first {
         case "info": return 5
         case "build": return 600
+        case "exec" where isGuestDeadlineExec(args): return BotComputerGuestSpec.execHostDeadlineSeconds
         default: return 15
         }
     }
 
     static func timeoutError(for args: [String]) -> BotComputerDockerError {
-        args.first == "info" ? .probeTimedOut : .provisioningFailed
+        if isGuestDeadlineExec(args) { return .guestCommandTimedOut }
+        return args.first == "info" ? .probeTimedOut : .provisioningFailed
+    }
+
+    /// An agent command wrapped by `BotComputerGuestSpec.deadlineExecCommand`.
+    static func isGuestDeadlineExec(_ args: [String]) -> Bool {
+        let prefix = BotComputerGuestSpec.execDeadlinePrefix
+        guard args.first == "exec", args.count > prefix.count else { return false }
+        return (1...(args.count - prefix.count)).contains { start in
+            Array(args[start..<(start + prefix.count)]) == prefix
+        }
+    }
+
+    /// GNU `timeout` exits 124 when TERM stopped the command, 137 when it had to KILL.
+    static func isGuestDeadlineExit(_ args: [String], status: Int32) -> Bool {
+        isGuestDeadlineExec(args) && (status == 124 || status == 137)
     }
 
     static func stdoutLimit(for args: [String]) -> Int {

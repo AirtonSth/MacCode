@@ -58,7 +58,9 @@ public enum BotComputerCatalog: Sendable {
         case observe:
             return "Screenshot the Docker Linux desktop on 127.0.0.1. Returns a PNG. Do not use macos-harness."
         case act:
-            return "Click, type, or press a key on the Docker Linux desktop. Batch at most 24 steps."
+            return "Click, drag, type, or press a key on the Docker Linux desktop "
+                + "(\(BotComputerGuestSpec.screenWidth)x\(BotComputerGuestSpec.screenHeight) pixels). "
+                + "Batch at most 24 steps."
         case exec:
             return "Run a command inside this bot's Linux container. Use this to install packages (apt-get) or edit files. Do not run host docker."
         case rebuild:
@@ -134,13 +136,19 @@ public enum BotComputerCatalog: Sendable {
                 "properties": botID.merging([
                     "steps": [
                         "type": "array",
-                        "description": "Ordered click/type/key steps.",
+                        "description": "Ordered click/drag/type/key steps.",
                         "items": [
                             "type": "object",
                             "properties": [
-                                "action": ["type": "string", "description": "click, type, or key"],
-                                "x": ["type": "integer"],
-                                "y": ["type": "integer"],
+                                "action": [
+                                    "type": "string",
+                                    "enum": ["click", "drag", "type", "key"],
+                                    "description": "click (x, y), drag (x, y to toX, toY), type (text), or key (key).",
+                                ],
+                                "x": ["type": "integer", "description": "Pixels from the left, 0..<\(BotComputerGuestSpec.screenWidth)."],
+                                "y": ["type": "integer", "description": "Pixels from the top, 0..<\(BotComputerGuestSpec.screenHeight)."],
+                                "toX": ["type": "integer", "description": "Drag end x."],
+                                "toY": ["type": "integer", "description": "Drag end y."],
                                 "text": ["type": "string"],
                                 "key": ["type": "string"],
                             ],
@@ -489,6 +497,8 @@ public struct BotComputerService: Sendable {
                 action: action,
                 x: item["x"] as? Int,
                 y: item["y"] as? Int,
+                toX: item["toX"] as? Int,
+                toY: item["toY"] as? Int,
                 text: item["text"] as? String,
                 key: item["key"] as? String
             )
@@ -505,7 +515,7 @@ public struct BotComputerService: Sendable {
         subkind: String = ""
     ) throws -> [String: Any] {
         let waitMS = (kind == BotComputerCatalog.exec || kind == BotComputerCatalog.rebuild)
-            ? max(timeoutMS, 180_000)
+            ? max(timeoutMS, BotComputerGuestSpec.execResultWaitSeconds * 1000)
             : timeoutMS
         let pending = BotComputerPendingAction(
             id: UUID().uuidString.lowercased(),
