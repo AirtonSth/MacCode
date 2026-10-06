@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 import CoreModel
 import Persistence
 @testable import AgentRuntime
@@ -57,7 +58,6 @@ final class LegacyTokenSaverLaunchPurgeTests: XCTestCase {
         XCTAssertFalse(settings.tokenSaverEnabled, "a persisted ON must come up OFF")
         XCTAssertEqual(settings.tokenSaverAPIToken, "", "the removed feature's API token must not be kept")
         XCTAssertEqual(settings.terminalFontSize, 15, "unrelated settings must survive the force-off")
-        XCTAssertFalse(context.isTokenSaverRuntimeActive())
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: installer.skillDirectory(provider: .codex, skillID: "distill").path
         ))
@@ -68,11 +68,12 @@ final class LegacyTokenSaverLaunchPurgeTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: training.path), "saved training prompts are kept")
     }
 
-    func test_tokenSaverLifecycleCannotTurnTheFeatureBackOn() throws {
-        // WHY: the remaining Settings / sidebar / account callers still ask for
-        // ON; the removed feature must answer OFF and persist OFF every time.
-        let appSupport = tempURL("RC2LegacyTSLifecycle")
-        let home = tempURL("RC2LegacyTSLifecycleHome")
+    func test_accountChangeWithLegacyPreferenceOnNeverReinstallsTokenSaver() throws {
+        // WHY: an account change used to re-admit Token Saver for a stored ON
+        // preference. The removed feature must stay off: no managed distill CLI
+        // and no Token Saver keys in an agent's environment.
+        let appSupport = tempURL("RC2LegacyTSAccountChange")
+        let home = tempURL("RC2LegacyTSAccountChangeHome")
         defer {
             try? FileManager.default.removeItem(at: appSupport)
             try? FileManager.default.removeItem(at: home)
@@ -82,6 +83,7 @@ final class LegacyTokenSaverLaunchPurgeTests: XCTestCase {
             appSupportOverride: appSupport.path,
             agentSkillsHomeOverrideForTesting: home
         )
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
         PrivateAccountSessionStore(repo: context.settingsRepo).save(PrivateAccountSession(
             accessToken: "tok",
             refreshToken: "ref",
@@ -93,18 +95,107 @@ final class LegacyTokenSaverLaunchPurgeTests: XCTestCase {
                 subscribed: true
             )
         ))
+        NotificationCenter.default.post(name: .rc2PrivateAccountChanged, object: nil)
 
-        let outcome = context.applyTokenSaverLifecycle(
-            requestedEnabled: true,
-            modelValidation: .installed,
-            persistPreference: true
-        )
-
-        XCTAssertEqual(outcome, .disabled)
-        XCTAssertFalse(SettingsStore(db: context.db).load().tokenSaverEnabled)
-        XCTAssertFalse(context.isTokenSaverRuntimeActive())
+        let thread = AgentThread(title: "legacy", provider: .codex, model: "test")
+        try context.threadRepo.upsert(thread)
+        let env = AppCommandRouter(context: context)
+            .providerEnvironment(provider: .codex, instanceId: nil, threadId: thread.id)
+        XCTAssertNil(env["RC_TOKEN_SAVER_DISTILL_HINT"])
+        XCTAssertTrue(env.keys.filter { $0.hasPrefix("RC_TOKEN_SAVER_") }.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: home.appendingPathComponent(".remote-code/bin/distill").path
-        ), "asking for ON must never install the managed distill CLI")
+        ), "an account change must never install the managed distill CLI")
     }
+
+    private func managedDistillSkillURLs(home: URL) -> (codex: URL, claude: URL) {
+        (
+            codex: home.appendingPathComponent(".codex/skills/distill/SKILL.md"),
+            claude: home.appendingPathComponent(".claude/skills/distill/SKILL.md")
+        )
+    }
+
+    private func managedDistillConfigURLs(home: URL) -> (codex: URL, claude: URL) {
+        (
+            codex: home.appendingPathComponent(".codex/AGENTS.md"),
+            claude: home.appendingPathComponent(".claude/CLAUDE.md")
+        )
+    }
+
+    func test_appContextLaunchRemovesManagedDistillStateWhenPersistedTokenSaverDisabled() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2ManagedSkillsLaunchOff-" + UUID().uuidString
+        let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2ManagedSkillsLaunchOffHome-" + UUID().uuidString, isDirectory: true)
+        let skillURLs = managedDistillSkillURLs(home: home)
+        let configURLs = managedDistillConfigURLs(home: home)
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        _ = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
+        _ = try installer.installDistillSkill(for: .claude, sourceRevision: "rev-a")
+        try installer.installDistillInstructions(for: .codex)
+        try installer.installDistillInstructions(for: .claude)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: skillURLs.codex.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: skillURLs.claude.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: configURLs.codex.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: configURLs.claude.path))
+
+        let seedContext = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: seedContext.db).save(AppSettings(tokenSaverEnabled: false))
+
+        let launchedContext = try AppContext(
+            channel: .debug,
+            appSupportOverride: appSupport,
+            agentSkillsHomeOverrideForTesting: home
+        )
+        await launchedContext.legacyTokenSaverPurgeTask?.value
+
+        // Launch with Token Saver off scrubs legacy provider-home skill copies and
+        // does not install Distill economy hooks (paid feature).
+        XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.codex.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.claude.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.codex.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.claude.path))
+    }
+
+    func test_applicationWillTerminatePurgesLegacyHomeAndAppPrivateDistill() async throws {
+        // WHY: Token Saver was removed. Quit must finish the purge (provider-home
+        // skills and the app-private Distill package) and never reinstall either.
+        let appSupport = NSTemporaryDirectory() + "RC2ManagedSkillsClose-" + UUID().uuidString
+        let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2ManagedSkillsCloseHome-" + UUID().uuidString, isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(atPath: appSupport)
+            try? FileManager.default.removeItem(at: home)
+        }
+        let skillURLs = managedDistillSkillURLs(home: home)
+        let configURLs = managedDistillConfigURLs(home: home)
+        let context = try AppContext(
+            channel: .debug,
+            appSupportOverride: appSupport,
+            agentSkillsHomeOverrideForTesting: home
+        )
+        await context.legacyTokenSaverPurgeTask?.value
+        // An older build left these behind after this launch's purge ran.
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        _ = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
+        _ = try installer.installDistillSkill(for: .claude, sourceRevision: "rev-a")
+        let appPrivate = URL(fileURLWithPath: appSupport, isDirectory: true)
+            .appendingPathComponent("AgentSkills/distill/SKILL.md")
+        try FileManager.default.createDirectory(
+            at: appPrivate.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("legacy".utf8).write(to: appPrivate)
+
+        let delegate = AppDelegate()
+        delegate.context = context
+        delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.codex.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.claude.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.codex.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.claude.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: appPrivate.path),
+                       "quit removes the app-private Distill package of the removed feature")
+    }
+
 }

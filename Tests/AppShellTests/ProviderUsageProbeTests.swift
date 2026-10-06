@@ -3,11 +3,11 @@ import CoreModel
 import Persistence
 @testable import AppShell
 
-/// WHY: Token Saver usage ticks compiled the 10-column agent_runs row
+/// WHY: provider usage ticks compiled the 10-column agent_runs row
 /// (including error_message) on every token event just to copy provider/status.
 @MainActor
-final class TokenSaverUsageProviderProbeTests: XCTestCase {
-    func test_recordTokenSaverUsage_sourceUsesStatusAndProviderProbes() throws {
+final class ProviderUsageProbeTests: XCTestCase {
+    func test_recordProviderTokenUsage_sourceUsesStatusAndProviderProbes() throws {
         let source = try String(
             contentsOf: URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent()
@@ -16,8 +16,8 @@ final class TokenSaverUsageProviderProbeTests: XCTestCase {
                 .appendingPathComponent("Sources/AppShell/AppContext.swift"),
             encoding: .utf8
         )
-        let start = try XCTUnwrap(source.range(of: "private func recordTokenSaverUsage("))
-        let end = try XCTUnwrap(source.range(of: "private func beginTokenSaverAttempt("))
+        let start = try XCTUnwrap(source.range(of: "private func recordProviderTokenUsage("))
+        let end = try XCTUnwrap(source.range(of: "private func schedulePendingUsageFlush("))
         let body = String(source[start.lowerBound..<end.lowerBound])
         XCTAssertTrue(body.contains("runRepo.status(of: runId)"))
         XCTAssertTrue(body.contains("runRepo.provider(of: runId)"))
@@ -26,7 +26,6 @@ final class TokenSaverUsageProviderProbeTests: XCTestCase {
 
     func test_usageTicks_useProbesWithoutDurableGet() throws {
         let ctx = try makeContext("usage-ticks")
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
         let thread = AgentThread(title: "usage", provider: .codex, model: "fake-model")
         try ctx.threadRepo.upsert(thread)
         let run = AgentRun(

@@ -155,7 +155,7 @@ final class InsomniaSidebarTests: XCTestCase {
         // fabricated 276). usage.json must therefore show zero "saved".
         XCTAssertEqual(vm.accountUsageSnapshot.measuredSavedTokens, 0,
                        "token-usage events must not fabricate savings from an assumed compression ratio")
-        XCTAssertEqual(try ctx.tokenSaverSavingsRepo.summary().totalRuns, 0,
+        XCTAssertEqual(try TokenSaverSavingsRepository(db: ctx.db).summary().totalRuns, 0,
                        "normal provider usage must not create Saved rows unless the thread is in /distill mode or prompt compression actually ran")
     }
 

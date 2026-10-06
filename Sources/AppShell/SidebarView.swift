@@ -10,12 +10,13 @@ import DesignSystemKit
 import SocketServer
 
 public extension Notification.Name {
-    static let rc2TokenSaverUsageChanged = Notification.Name("rc2TokenSaverUsageChanged")
+    /// Account or provider usage in usage.json changed (throttled by AppContext).
+    static let rc2AccountUsageChanged = Notification.Name("rc2AccountUsageChanged")
     /// Posted by AppContext only when the provider-account usage refresh reaches
-    /// its terminal state. `rc2TokenSaverUsageChanged` is too broad for that
-    /// job: local paths (enable toggle, `savings_recorded`) post it without
-    /// querying any provider, so it can never prove the probe finished.
-    static let rc2TokenSaverAccountUsageSettled = Notification.Name("rc2TokenSaverAccountUsageSettled")
+    /// its terminal state. `rc2AccountUsageChanged` is too broad for that job:
+    /// local provider-usage writes post it without querying any provider, so it
+    /// can never prove the probe finished.
+    static let rc2AccountUsageRefreshSettled = Notification.Name("rc2AccountUsageRefreshSettled")
 }
 
 @MainActor
@@ -330,7 +331,7 @@ public final class SidebarViewModel: ObservableObject {
             Task { @MainActor in viewModel.applyTailcatRuntimeStatus(status) }
         }
         self.accountUsageObserver = NotificationCenter.default.addObserver(
-            forName: .rc2TokenSaverUsageChanged,
+            forName: .rc2AccountUsageChanged,
             object: nil,
             queue: .main
         ) { [weak self] _ in
@@ -567,7 +568,7 @@ public final class SidebarViewModel: ObservableObject {
         guard !accountUsageIsRefreshing else { return }
         guard privateAccountUser != nil else { return }
         accountUsageIsRefreshing = true
-        context?.publishTokenSaverWidgetDigestFromDisk(isRefreshing: true)
+        context?.publishAccountUsageDigestFromDisk(isRefreshing: true)
         // Fire-and-forget: kick the refresh, then observe the settle
         // notification to detect completion.  A 90-second timeout ensures the
         // spinner stops even when the CLI probe hangs or the notification is
@@ -578,7 +579,7 @@ public final class SidebarViewModel: ObservableObject {
             let done = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
                 // One-shot notification observer -- resumes with true on completion.
                 observer = NotificationCenter.default.addObserver(
-                    forName: .rc2TokenSaverAccountUsageSettled,
+                    forName: .rc2AccountUsageRefreshSettled,
                     object: nil,
                     queue: .main
                 ) { _ in
@@ -586,7 +587,7 @@ public final class SidebarViewModel: ObservableObject {
                     observer = nil
                     continuation.resume(returning: true)
                 }
-                self.context?.refreshTokenSaverAccountUsage(reason: "details")
+                self.context?.refreshAccountUsage(reason: "details")
                 // Schedule a timeout: if no notification arrives within 90 s,
                 // resume with false so the spinner stops.
                 Task { @MainActor in
@@ -601,7 +602,7 @@ public final class SidebarViewModel: ObservableObject {
             if done { self.accountUsageLastUpdated = Date() }
             // The settle path already publishes isRefreshing: false; the
             // timeout path does not, so clear the iOS refreshing state here.
-            if !done { self.context?.publishTokenSaverWidgetDigestFromDisk(isRefreshing: false) }
+            if !done { self.context?.publishAccountUsageDigestFromDisk(isRefreshing: false) }
         }
     }
 

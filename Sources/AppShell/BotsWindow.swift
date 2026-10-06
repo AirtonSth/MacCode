@@ -10465,17 +10465,11 @@ public final class BotsViewModel: ObservableObject {
             if selectedBotID == bot.id, screen == .desk {
                 startDeskLiveTurnWatch(botID: bot.id, threadID: prepared.thread.id)
             }
-            let compressedUser = await context.tokenSaverCompress(
-                prompt: userText,
-                provider: routing.provider,
-                threadId: prepared.thread.id,
-                runId: prepared.runID
-            )
             let inGuest = runsInGuest(threadID: prepared.thread.id, provider: routing.provider)
             let receipt = BotBrainCompiler.assemble(
                 bot: bot,
                 revision: revision,
-                userText: compressedUser,
+                userText: userText,
                 memoryFiles: memoryFiles,
                 skills: skills,
                 ownedSkills: ownedSkillTexts(for: bot),

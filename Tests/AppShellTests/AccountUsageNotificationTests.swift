@@ -6,7 +6,7 @@ import AgentRuntime
 
 /// WHY: live `.accountUsage` is delivered on the provider parse queue
 /// (`remotecode.codex-app-server.parse` → coordinator →
-/// `AppContext.recordTokenSaverAccountUsage`). A synchronous
+/// `AppContext.recordAccountUsage`). A synchronous
 /// `NotificationCenter.post` waits for OperationQueue observers (UI reloads
 /// registered with `queue: .main`) via `-[NSOperation waitUntilFinished]`.
 /// That blocks the parse path while main/mirror work waits on locks held by
@@ -14,10 +14,10 @@ import AgentRuntime
 /// if account-usage recording reintroduces a synchronous observer wait, and
 /// prove delivery still reaches MainActor-safe observers asynchronously.
 @MainActor
-final class TokenSaverAccountUsageNotificationTests: XCTestCase {
+final class AccountUsageNotificationTests: XCTestCase {
 
     /// Regression for the parse-queue hang: a slow OperationQueue observer must
-    /// not keep `recordTokenSaverAccountUsage` from returning.
+    /// not keep `recordAccountUsage` from returning.
     func test_accountUsageRecording_doesNotSynchronouslyWaitForNotificationObservers() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2AccountUsageNotifyAsync-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
@@ -43,7 +43,7 @@ final class TokenSaverAccountUsageNotificationTests: XCTestCase {
 
         let delivered = expectation(description: "usage-changed eventually delivered")
         let observer = NotificationCenter.default.addObserver(
-            forName: .rc2TokenSaverUsageChanged,
+            forName: .rc2AccountUsageChanged,
             object: nil,
             queue: blockingQueue
         ) { _ in
@@ -70,7 +70,7 @@ final class TokenSaverAccountUsageNotificationTests: XCTestCase {
         XCTAssertLessThan(
             elapsed,
             observerWorkDuration * 0.5,
-            "recordTokenSaverAccountUsage must return without waiting for NotificationCenter observers; elapsed=\(elapsed)s (sync post would wait ~\(observerWorkDuration)s)"
+            "recordAccountUsage must return without waiting for NotificationCenter observers; elapsed=\(elapsed)s (sync post would wait ~\(observerWorkDuration)s)"
         )
 
         let stored = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
@@ -114,7 +114,7 @@ final class TokenSaverAccountUsageNotificationTests: XCTestCase {
         var observedIsMainThread = false
 
         let observer = NotificationCenter.default.addObserver(
-            forName: .rc2TokenSaverUsageChanged,
+            forName: .rc2AccountUsageChanged,
             object: nil,
             queue: .main
         ) { _ in
@@ -137,7 +137,7 @@ final class TokenSaverAccountUsageNotificationTests: XCTestCase {
         XCTAssertEqual(
             observerCallCount,
             0,
-            "usage-changed must not run inline inside recordTokenSaverAccountUsage (sync post would invoke queue:.main observers before return on MainActor)"
+            "usage-changed must not run inline inside recordAccountUsage (sync post would invoke queue:.main observers before return on MainActor)"
         )
 
         await fulfillment(of: [delivered], timeout: 3.0)
@@ -145,7 +145,7 @@ final class TokenSaverAccountUsageNotificationTests: XCTestCase {
         XCTAssertEqual(observerCallCount, 1)
         XCTAssertTrue(
             observedIsMainThread,
-            "rc2TokenSaverUsageChanged UI observers must run on the main thread, not a provider parse queue"
+            "rc2AccountUsageChanged UI observers must run on the main thread, not a provider parse queue"
         )
     }
 }

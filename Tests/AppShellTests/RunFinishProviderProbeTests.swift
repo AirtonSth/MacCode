@@ -3,11 +3,11 @@ import CoreModel
 import Persistence
 @testable import AppShell
 
-/// WHY: run-finish Token Saver still compiled the 10-column agent_runs row
+/// WHY: run finish still compiled the 10-column agent_runs row
 /// (including error_message) just to copy provider for Grok refresh and
 /// usage tombstones.
 @MainActor
-final class TokenSaverFinishProviderProbeTests: XCTestCase {
+final class RunFinishProviderProbeTests: XCTestCase {
     func test_runFinishPaths_sourceUsesProviderProbe() throws {
         let source = try String(
             contentsOf: URL(fileURLWithPath: #filePath)
@@ -22,8 +22,8 @@ final class TokenSaverFinishProviderProbeTests: XCTestCase {
         let finish = String(source[finishStart.lowerBound..<finishEnd.lowerBound])
         XCTAssertTrue(finish.contains("runRepo.provider(of: rid)"))
         XCTAssertFalse(finish.contains("runRepo.get(id: rid)"))
-        let pendingStart = try XCTUnwrap(source.range(of: "private func finishPendingTokenSaverUsage("))
-        let pendingEnd = try XCTUnwrap(source.range(of: "private func completeTokenSaverUsageWrite("))
+        let pendingStart = try XCTUnwrap(source.range(of: "private func finishPendingProviderUsage("))
+        let pendingEnd = try XCTUnwrap(source.range(of: "private func completeProviderUsageWrite("))
         let pending = String(source[pendingStart.lowerBound..<pendingEnd.lowerBound])
         XCTAssertTrue(pending.contains("runRepo.provider(of: runId)"))
         XCTAssertFalse(pending.contains("runRepo.get(id: runId)"))
@@ -31,7 +31,6 @@ final class TokenSaverFinishProviderProbeTests: XCTestCase {
 
     func test_runFinished_usesProviderProbeWithoutDurableGet() async throws {
         let ctx = try makeContext("finish")
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
         let thread = AgentThread(title: "finish", provider: .grok, model: "fake-model")
         try ctx.threadRepo.upsert(thread)
         let run = AgentRun(

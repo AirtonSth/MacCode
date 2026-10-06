@@ -3,7 +3,6 @@ import XCTest
 import SwiftUI
 import CoreModel
 @testable import AgentRuntime
-@testable import DistillCore
 @testable import AppShell
 @testable import Persistence
 import SocketServer
@@ -394,11 +393,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(human.contains("[Image #2]"))
     }
 
-    func test_deskSendFailOpenLeavesOriginalPrompt_whenTokenSaverIsOff() async throws {
-        // WHY: Token Saver off must not inject Distill into a Bot turn. The
-        // compiled payload is the original provider input.
+    func test_deskSendLeavesOriginalPromptWithoutTokenSaverKeys() async throws {
+        // WHY: Token Saver was removed; a Bot turn must carry the original
+        // provider input and no Distill admission.
         let context = try makeContext()
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = false }
         context.reconcileManagedIntegration()
         let router = AppCommandRouter(context: context)
         context.router = router
@@ -430,7 +428,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(request.prompt.contains("FAIL-OPEN-BOT-PROMPT"))
         XCTAssertNil(
             request.environment["RC_TOKEN_SAVER_DISTILL_HINT"],
-            "Token Saver off must not admit Distill on a bot provider turn"
+            "a bot provider turn must not admit Distill"
         )
         XCTAssertNil(request.environment["RC_TOKEN_SAVER_POST_TOOL_USE"])
     }
@@ -17303,87 +17301,6 @@ private final class BlockingAcceptanceRunner: AgentProviderRunner, @unchecked Se
             onEvent(.finished(.cancelled, finalMessage: nil, providerThreadId: nil))
             return AgentRunHandle(runId: request.runId, process: nil) {}
         }.value
-    }
-}
-
-private final class DeskTokenSaverRecoveryStore: TokenSaverScopedRecoveryStoring, @unchecked Sendable {
-    private let store: TokenSaverScopedRecoveryStore
-
-    init(db: SQLiteDB) {
-        store = TokenSaverScopedRecoveryStore(db: db)
-    }
-
-    private func scope(_ context: TokenSaverRecoveryRequestContext) -> TokenSaverPersistentScope {
-        .init(
-            workspaceID: context.workspaceID,
-            projectID: context.projectID,
-            threadID: context.threadID,
-            provider: context.provider,
-            attemptID: context.attemptID
-        )
-    }
-
-    func prepareOriginal(
-        _ data: Data,
-        context: TokenSaverRecoveryRequestContext,
-        lane: String
-    ) throws -> TokenSaverScopedPreparation {
-        let prepared = try store.prepare(
-            data,
-            scope: scope(context),
-            operationID: context.operationID,
-            lane: lane,
-            expiresAt: Date().addingTimeInterval(7 * 86_400),
-            disk: .init(
-                freeBytes: 40 * 1_024 * 1_024 * 1_024,
-                totalBytes: 100 * 1_024 * 1_024 * 1_024
-            )
-        )
-        return .init(
-            capability: prepared.capability,
-            idempotencyKey: prepared.idempotencyKey,
-            readBackVerified: prepared.readBackVerified
-        )
-    }
-
-    func retrieveOriginal(
-        capability: String,
-        context: TokenSaverRecoveryRequestContext
-    ) throws -> Data? {
-        try store.retrieve(capability: capability, scope: scope(context))
-    }
-
-    func markDelivered(
-        capability: String,
-        idempotencyKey: String,
-        context: TokenSaverRecoveryRequestContext,
-        outcome: TokenSaverScopedDeliveryOutcome
-    ) throws -> Bool {
-        let mapped: TokenSaverRecoveryTransportOutcome
-        switch outcome {
-        case .notSent: mapped = .notSent
-        case .sentUnknown: mapped = .sentUnknown
-        case .acked: mapped = .acked
-        case .failed: mapped = .failed
-        }
-        return try store.markDelivered(
-            capability: capability,
-            scope: scope(context),
-            idempotencyKey: idempotencyKey,
-            outcome: mapped
-        )
-    }
-
-    func ack(
-        capability: String,
-        idempotencyKey: String,
-        context: TokenSaverRecoveryRequestContext
-    ) throws -> Bool {
-        try store.ack(
-            capability: capability,
-            scope: scope(context),
-            idempotencyKey: idempotencyKey
-        )
     }
 }
 

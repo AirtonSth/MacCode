@@ -3,47 +3,10 @@ import CoreModel
 import Persistence
 @testable import AppShell
 
-/// WHY: Token Saver run-id observation/admission compiled the 10-column
-/// agent_runs row (including error_message) just to recover thread_id.
+/// WHY: run-id lookups compiled the 10-column agent_runs row (including
+/// error_message) just to recover thread_id.
 @MainActor
-final class TokenSaverRunThreadIdProbeTests: XCTestCase {
-    func test_runIdHelpers_sourceUsesThreadIdProbe() throws {
-        let source = try String(
-            contentsOf: URL(fileURLWithPath: #filePath)
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .appendingPathComponent("Sources/AppShell/AppContext.swift"),
-            encoding: .utf8
-        )
-        let obsStart = try XCTUnwrap(source.range(of: "private func tokenSaverProjectObservation(runId: AgentRunID"))
-        let admStart = try XCTUnwrap(source.range(of: "private func tokenSaverProjectAdmission(\n        runId: AgentRunID"))
-        let end = try XCTUnwrap(source.range(of: "/// task-08:", range: admStart.lowerBound..<source.endIndex))
-        let obs = String(source[obsStart.lowerBound..<admStart.lowerBound])
-        let adm = String(source[admStart.lowerBound..<end.lowerBound])
-        for body in [obs, adm] {
-            XCTAssertTrue(body.contains("runRepo.threadId(of: runId)"))
-            XCTAssertFalse(body.contains("runRepo.get(id: runId)"))
-        }
-    }
-
-    func test_missingRun_usesThreadIdProbeWithoutDurableGet() throws {
-        let ctx = try makeContext("missing")
-        SettingsStore(db: ctx.db).update {
-            $0.tokenSaverEnabled = true
-            $0.sessionLearnEnabled = true
-        }
-        let getsBefore = ctx.runRepo.durableGetCountForTesting
-        let probesBefore = ctx.runRepo.threadIdProbeCountForTesting
-        ctx.recordSessionLearnFromRun(runId: AgentRunID(), status: .failed)
-        XCTAssertEqual(ctx.runRepo.threadIdProbeCountForTesting, probesBefore + 1)
-        XCTAssertEqual(
-            ctx.runRepo.durableGetCountForTesting,
-            getsBefore,
-            "missing-run Token Saver lookup must not compile a full 10-column get"
-        )
-    }
-
+final class RunThreadIdProbeTests: XCTestCase {
     func test_threadIdProbe_matchesStoredThreadWithoutDurableGet() throws {
         let ctx = try makeContext("match")
         let thread = AgentThread(

@@ -2568,9 +2568,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor {
-        let descriptor = try createSurface(workspace: workspace, type: .agentApp, paneID: nil, title: "Agent App")
-        softGraphifyPreflight(workspace: workspace)
-        return descriptor
+        try createSurface(workspace: workspace, type: .agentApp, paneID: nil, title: "Agent App")
     }
 
     /// Legacy helper: open + focus an Agent App tab for a workspace.
@@ -2769,13 +2767,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         destinationWindowIsKeyForTests?(window) ?? window.isKeyWindow
     }
 
+    /// `token_saver.digest.get` stays until iOS bumps its treaty pin. Token
+    /// Saver is gone, so it answers `enabled: false` plus the cached account
+    /// usage the iOS rings still read.
     public func tokenSaverDigest() -> JSONValue? {
         guard let context else { return nil }
-        // Rebuild from durable disk state before returning so RPC never serves
-        // a stale process cache after usage writes.
-        context.publishTokenSaverWidgetDigestFromDisk()
-        guard let body = TokenSaverWidgetDigest.lastCachedBody() else { return nil }
-        return .object(body)
+        // Refresh from durable disk state so the RPC never keeps serving a
+        // stale process cache after usage writes.
+        context.publishAccountUsageDigestFromDisk()
+        return .object(AccountUsageWidgetDigest.lastCachedBody() ?? ["enabled": .bool(false)])
     }
 
     public func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread] {
@@ -4135,7 +4135,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // subscribers (including Agent App surfaces that listen for thread.*)
         // see scheduled / RPC-created threads immediately.
         EventBus.shared.publish(kind: .agentThreadCreated, payload: agentThreadPayload(t))
-        softGraphifyPreflight(workspace: resolvedWorkspace)
         return t
     }
 
@@ -5252,23 +5251,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         } else {
             cwd = try prepareAgentExecutionCwd(thread: &t)
         }
-        // Provider-instance + host Token Saver injects for the Source provider.
-        // Same-host Auto never switches provider. The previous empty Auto base
-        // dropped instance config (HOME/CODEX_HOME/GROK_HOME, custom env) from the
-        // request shell; Token Saver receipt/DISTILL_HINT still arrived later via
-        // runEnvironmentProvider, but nested CLI children could miss instance
-        // homes and any early host injects. Always stamp the full base here.
-        let hostTokenSaverBase = providerEnvironment(
+        // Provider-instance host environment for the Source provider. Same-host
+        // Auto never switches provider. The previous empty Auto base dropped
+        // instance config (HOME/CODEX_HOME/GROK_HOME, custom env) from the
+        // request shell, so nested CLI children could miss instance homes.
+        // Always stamp the full base here.
+        let hostProviderBase = providerEnvironment(
             provider: prov,
             instanceId: t.providerInstanceId,
             threadId: thread
-        )
-        // Graphify: authoritative resolve after cwd is known. Fail-open; never blocks the run.
-        let graphifyEnv = await applyGraphifyOnSend(
-            thread: t,
-            cwd: cwd,
-            attachments: resolvedAttachments,
-            baseEnvironment: hostTokenSaverBase
         )
         let acceptancePermit = queueMessageId.map { _ in
             queueAcceptancePermit ?? AgentRunAcceptancePermit()
@@ -5281,7 +5272,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 ctx.unregisterQueueDispatchAcceptancePermit(acceptancePermit, threadId: thread)
             }
         }
-        var providerRunEnvironment = graphifyEnv
+        var providerRunEnvironment = hostProviderBase
         providerRunEnvironment.removeValue(
             forKey: AgentAppRuntimeProfile.environmentKey
         )
@@ -5359,15 +5350,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     childCapability: childCapability,
                     requestedPermissionMode: t.permissionMode
                 )
-                // Rebuild host Token Saver for the *child* thread so every
-                // orchestrated worker gets the full technique surface (receipt,
-                // DISTILL_HINT, managed PATH wrappers, Distill state, Graphify)
-                // — not a thinned parent/Auto shell.
-                providerRunEnvironment = await completeOrchestratedWorkerEnvironment(
+                // Rebuild the host environment for the *child* thread so every
+                // orchestrated worker gets the full surface, not a thinned
+                // parent/Auto shell.
+                providerRunEnvironment = completeOrchestratedWorkerEnvironment(
                     thread: t,
                     provider: prov,
-                    cwd: cwd,
-                    attachments: resolvedAttachments,
                     childCapability: childCapability,
                     runtimeProfile: nestedRunContext.runtimeProfile
                 )
@@ -5771,86 +5759,30 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
-    /// Soft Graphify preflight on Agent App open / create.
-    /// Single-repo: ensure that root. Multi-repo: sticky/pin/auto-bootstrap one child (never parent).
-    private func softGraphifyPreflight(workspace: WorkspaceID?) {
-        guard let ctx = context, let workspace else { return }
-        let settings = SettingsStore(db: ctx.db).load()
-        // Token Saver is the paid gate; Graphify is a sub-capability under it.
-        guard ctx.isTokenSaverRuntimeActive(settings: settings),
-              settings.isGraphifyRuntimeActive else { return }
-        configureGraphifyService(from: settings)
-        let cwd = ctx.state.workspaces[workspace]?.cwd ?? FileManager.default.currentDirectoryPath
-        let pinnedRoots = settings.graphifyPinnedRoots
-        // Thread creation is an acknowledgement boundary for local RPC. Binary
-        // ensure and repository probing can take seconds and must not hold the
-        // MainActor or the Unix request open after the thread is durable.
-        Task.detached(priority: .utility) { [weak self] in
-            let set = GraphifyWorkspaceService.shared.softPreflight(
-                workspaceCwd: cwd,
-                pinnedRoots: pinnedRoots
-            )
-            await MainActor.run {
-                self?.publishGraphifyWorkingSet(set, threadId: nil)
-            }
-        }
-    }
-
-    private func configureGraphifyService(from settings: AppSettings) {
-        let svc = GraphifyWorkspaceService.shared
-        let active = context?.isTokenSaverRuntimeActive(settings: settings) == true
-            && settings.isGraphifyRuntimeActive
-        let wasActive = svc.enabled
-        svc.enabled = active
-        svc.autoEnsure = active && settings.graphifyAutoEnsure
-        svc.writeInRepo = settings.graphifyWriteInRepo
-        svc.pinnedRoots = settings.graphifyPinnedRoots
-        let path = settings.graphifyBinaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        svc.binaryPathOverride = path.isEmpty ? nil : path
-        if !active {
-            svc.stopWatchingAll()
-        } else if !wasActive {
-            // Transition-only: inactive → active. Do not dirty every hot send.
-            svc.resumeAfterDisable()
-        }
-    }
-
     /// Full host environment for an orchestrated Agent App worker (nested child).
     ///
-    /// Product rule: every worker / orchestrated agent must receive the same Token
-    /// Saver technique surface as a user-started primary turn — execution receipt,
-    /// `RC_TOKEN_SAVER_DISTILL_HINT`, managed PATH wrappers (`| distill` / proxies),
-    /// Distill state path (Claude PostToolUse), Graphify when active, and Subagents
-    /// lifecycle keys. Rebuilds from the child thread identity after nested
-    /// admission so cross-provider children are not stuck with a parent-only or
-    /// Auto-thinned shell.
+    /// Every worker gets the same host environment as a user-started primary
+    /// turn (instance homes, managed PATH proxies, Subagents lifecycle keys).
+    /// Rebuilds from the child thread identity after nested admission so
+    /// cross-provider children are not stuck with a parent-only or Auto-thinned
+    /// shell.
     private func completeOrchestratedWorkerEnvironment(
         thread: AgentThread,
         provider: AgentProvider,
-        cwd: String,
-        attachments: [AgentAttachment],
         childCapability: String,
         runtimeProfile: AgentAppRuntimeProfile?
-    ) async -> [String: String] {
-        let hostBase = providerEnvironment(
+    ) -> [String: String] {
+        var env = providerEnvironment(
             provider: provider,
             instanceId: thread.providerInstanceId,
             threadId: thread.id
-        )
-        var env = await applyGraphifyOnSend(
-            thread: thread,
-            cwd: cwd,
-            attachments: attachments,
-            baseEnvironment: hostBase
         )
         env.removeValue(forKey: AgentAppRuntimeProfile.environmentKey)
         if let runtimeProfile {
             env[AgentAppRuntimeProfile.environmentKey] = runtimeProfile.rawValue
         }
         env[AgentDelegationCapabilityTransport.environmentKey] = childCapability
-        // providerEnvironment already stamped Token Saver when admitted. Re-assert
-        // managed wrappers first so nested PATH proxies stay in front after any
-        // Graphify merge.
+        // Re-assert managed wrappers first so nested PATH proxies stay in front.
         if let managedBin = env["RC_REMOTE_CODE_MANAGED_BIN"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !managedBin.isEmpty,
@@ -5861,67 +5793,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             )
         }
         return env
-    }
-
-    /// Authoritative Graphify resolve on send (RPC path). Agent App UI uses the same
-    /// `GraphifyWorkspaceService.applyToAgentEnvironment` from AgentAppSurface.
-    private func applyGraphifyOnSend(
-        thread: AgentThread,
-        cwd: String,
-        attachments: [AgentAttachment],
-        baseEnvironment: [String: String]
-    ) async -> [String: String] {
-        guard let ctx = context else { return baseEnvironment }
-        let settings = SettingsStore(db: ctx.db).load()
-        guard ctx.isTokenSaverRuntimeActive(settings: settings),
-              settings.isGraphifyRuntimeActive else { return baseEnvironment }
-        // Bots Desk is workspace-less Local. Walking process cwd is the
-        // git-rev-parse beachball Agent App already pulled off send.
-        guard thread.workspaceId != nil else {
-            return GraphifyWorkspaceService.stripGraphifyKeys(from: baseEnvironment)
-        }
-        configureGraphifyService(from: settings)
-
-        let workspaceCwd = ctx.state.workspaces.first { $0.value.id == thread.workspaceId }?.value.cwd ?? cwd
-        // Root resolution blocks on `git rev-parse` subprocesses (two per
-        // candidate directory, whole-tree walk when the workspace root is not a
-        // repo). Must not run on the MainActor — same beachball the Agent App
-        // composer path had. Awaited, so the run environment is unchanged.
-        let graphifyThreadId = thread.id.value
-        let graphifyWorktreePath = thread.worktreePath
-        let graphifyAttachmentPaths = attachments.map(\.path)
-        let applied = await Task.detached(priority: .userInitiated) {
-            GraphifyWorkspaceService.shared.applyToAgentEnvironment(
-                base: baseEnvironment,
-                threadId: graphifyThreadId,
-                threadCwd: cwd,
-                worktreePath: graphifyWorktreePath,
-                workspaceCwd: workspaceCwd,
-                attachmentPaths: graphifyAttachmentPaths
-            )
-        }.value
-        publishGraphifyWorkingSet(applied.workingSet, threadId: thread.id)
-        return applied.environment
-    }
-
-    private func publishGraphifyWorkingSet(_ set: GraphifyThreadWorkingSet, threadId: AgentThreadID?) {
-        var payload: [String: JSONValue] = [
-            "workspace_kind": .string(set.workspaceKind),
-            "ambiguous": .bool(set.ambiguous),
-            "roots": .array(set.roots.map { binding in
-                .object([
-                    "display_root": .string(binding.checkout.displayRoot),
-                    "common_dir": .string(binding.checkout.key.commonDir),
-                    "status": .string(binding.status.rawValue),
-                    "reason": .string(binding.reason),
-                    "artifact_root": binding.artifactRoot.map { .string($0) } ?? .null
-                ])
-            })
-        ]
-        if let threadId {
-            payload["thread_id"] = .string(threadId.value.uuidString)
-        }
-        EventBus.shared.publish(kind: .graphifyThreadRoots, payload: .object(payload))
     }
 
     func effectiveAgentExecutionCwd(for thread: AgentThread) throws -> String {
@@ -7375,9 +7246,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 env["DISTILL_HOME"] = env["DISTILL_HOME"] ?? home
             }
         }
-        // VITAL for the savings report: tag the agent's environment with the provider so the
-        // local `distill` CLI attributes command-output savings to claude/codex/grok
-        // instead of "unknown". Set unconditionally — even with no instance config.
+        // Tag the agent's environment with the provider so child tooling (provider
+        // proxies, subagent telemetry) attributes work to claude/codex/grok instead
+        // of "unknown". Set unconditionally — even with no instance config.
         env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
         if let context, let threadId {
             let telemetryEnv = context.subagentTelemetryEnvironment(
@@ -7386,40 +7257,23 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 baseEnvironment: env
             )
             env.merge(telemetryEnv) { _, new in new }
-            // Nested provider proxies (`grok`/`claude`/`codex` in managed bin) must resolve
-            // for every thread-scoped provider environment — not only when Token Saver is on.
-            // Token Saver command-compression wrappers remain gated by admission below.
+            // Nested provider proxies (`grok`/`claude`/`codex` in managed bin) must
+            // resolve for every thread-scoped provider environment.
             let managedBin = env["RC_REMOTE_CODE_MANAGED_BIN"]
                 ?? AgentSkillInstaller.defaultManagedCLIBinDirectory().path
             let basePath = env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
-            env["PATH"] = Self.providerPathWithManagedWrappers(
-                currentPath: basePath,
+            // Drop any optimization keys an older build left in the inherited
+            // environment, then put managed bin back first on PATH so nested
+            // provider proxies + Subagents telemetry work.
+            var cleaned = Self.scrubProviderEnvironment(env)
+            cleaned["PATH"] = Self.providerPathWithManagedWrappers(
+                currentPath: cleaned["PATH"] ?? basePath,
                 managedBin: managedBin
             )
-            // task-08: Token Saver PATH/hint only when same-user admission allows.
-            let tokenSaverEnv = context.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
-            if tokenSaverEnv.isEmpty {
-                // Cross-user / raw-only: scrub Token Saver optimization keys, but keep
-                // managed bin on PATH so nested provider proxies + Subagents telemetry work.
-                var cleaned = TokenSaverExecutionReceiptSeam.scrub(env)
-                cleaned["PATH"] = Self.providerPathWithManagedWrappers(
-                    currentPath: cleaned["PATH"] ?? basePath,
-                    managedBin: managedBin
-                )
-                return applyDesktopChildEnvironment(cleaned, threadId: threadId, context: context)
-            }
-            env.merge(tokenSaverEnv) { _, new in new }
-            // Re-assert managed bin first after any Token Saver PATH rewrite.
-            if let path = env["PATH"] {
-                env["PATH"] = Self.providerPathWithManagedWrappers(
-                    currentPath: path,
-                    managedBin: managedBin
-                )
-            }
-            return applyDesktopChildEnvironment(env, threadId: threadId, context: context)
+            return applyDesktopChildEnvironment(cleaned, threadId: threadId, context: context)
         } else {
-            // No thread context: keep provider tag only; scrub any residual TS keys.
-            return Self.scrubTokenSaverEnvironment(env)
+            // No thread context: keep provider tag only; no managed bin on PATH.
+            return Self.scrubProviderEnvironment(env)
         }
     }
 
@@ -7446,11 +7300,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
-    /// Removes Token Saver env keys. For no-thread contexts also drops managed bin from
-    /// PATH (no nested provider interception without thread scope). Thread-scoped paths
-    /// re-apply managed bin after scrub so provider proxies stay available.
-    nonisolated static func scrubTokenSaverEnvironment(_ env: [String: String]) -> [String: String] {
-        var cleaned = TokenSaverExecutionReceiptSeam.scrub(env)
+    /// Drops the keys the removed Token Saver / Graphify / Distill compression
+    /// lanes read (nothing sets them any more, but a value inherited from an
+    /// older build's environment must never reach a provider) and the managed
+    /// bin from PATH. No-thread contexts use it as is (no nested provider
+    /// interception without thread scope); thread-scoped paths put managed bin
+    /// back first so provider proxies stay available.
+    nonisolated static func scrubProviderEnvironment(_ env: [String: String]) -> [String: String] {
+        var cleaned = env
+        for key in env.keys
+        where key.hasPrefix("RC_GRAPHIFY_")
+            || key.hasPrefix("RC_TOKEN_SAVER_")
+            || key.hasPrefix("RC_DISTILL_")
+            || key == "REMOTE_CODE_DISTILL_STATE_PATH" {
+            cleaned.removeValue(forKey: key)
+        }
         let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
         if let path = cleaned["PATH"] {
             // PERF: single pass avoids the map + filter intermediates on the
@@ -7465,8 +7329,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     /// Prepends the managed CLI bin (`~/.remote-code/bin`) so nested provider proxies
-    /// and (when Token Saver is on) command-compression wrappers win PATH lookup inside
-    /// the provider process. Host top-level launches use absolute binaries via
+    /// win PATH lookup inside the provider process. Host top-level launches use absolute binaries via
     /// `ProcessLocator` and skip provider proxy shims.
     static func providerPathWithManagedWrappers(currentPath: String, managedBin: String) -> String {
         let trimmed = managedBin.trimmingCharacters(in: .whitespacesAndNewlines)

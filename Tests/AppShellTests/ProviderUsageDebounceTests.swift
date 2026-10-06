@@ -9,14 +9,13 @@ import Persistence
 /// publish cumulative snapshots. Debouncing must preserve both without loss,
 /// duplication, or advancing a baseline before a write succeeds.
 @MainActor
-final class TokenSaverUsageDebounceTests: XCTestCase {
+final class ProviderUsageDebounceTests: XCTestCase {
 
     // MARK: - accumulator coalesces cumulative snapshots
 
     func test_multipleTokenUsageSnapshotsKeepLatestCumulativeTotal() throws {
         let appSupport = NSTemporaryDirectory() + "RC2UsageDebounce-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
 
         let thread = AgentThread(title: "t", provider: .codex, model: "m")
         try context.threadRepo.upsert(thread)
@@ -46,7 +45,6 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
     func test_flushEmitsCorrectSumAndResetsAccumulator() throws {
         let appSupport = NSTemporaryDirectory() + "RC2UsageFlush-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
 
         let thread = AgentThread(title: "t", provider: .codex, model: "m")
         try context.threadRepo.upsert(thread)
@@ -64,7 +62,7 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
         }
 
         // Explicit flush must write the latest 125-token snapshot once.
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
 
         // Give the background writer a moment to finish.
         let deadline = Date().addingTimeInterval(2)
@@ -80,7 +78,7 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
                        "flush must not add cumulative provider snapshots together")
 
         // A second flush with the same runId must be a no-op (accumulator was reset).
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
         Thread.sleep(forTimeInterval: 0.05)
         let afterSecondFlush = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
         let codexAfter = afterSecondFlush.providers.first { $0.provider == .codex }
@@ -93,7 +91,6 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
     func test_globalFlushDrainsAllPendingRuns() throws {
         let appSupport = NSTemporaryDirectory() + "RC2UsageGlobalFlush-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
 
         let threadA = AgentThread(title: "a", provider: .claude, model: "m")
         let threadB = AgentThread(title: "b", provider: .codex, model: "m")
@@ -116,7 +113,7 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
         )
 
         // Global flush (nil runId) must drain both runs.
-        context.flushPendingTokenSaverUsage()
+        context.flushPendingProviderUsage()
 
         let deadline = Date().addingTimeInterval(2)
         var snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
@@ -139,7 +136,6 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
     func test_runEndFlushPreservesTokensFromDebounceWindow() throws {
         let appSupport = NSTemporaryDirectory() + "RC2UsageRunEnd-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
 
         let thread = AgentThread(title: "t", provider: .codex, model: "m")
         try context.threadRepo.upsert(thread)
@@ -157,7 +153,7 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
         }
 
         // Force-flush as the run-end path would -- debounce window must not be required.
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
 
         let deadline = Date().addingTimeInterval(2)
         var snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
@@ -175,7 +171,6 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
     func test_debounceFlushThenLaterSnapshotPersistsOnlyGrowth() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2UsageGrowth-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
 
         let thread = AgentThread(title: "t", provider: .codex, model: "m")
         try context.threadRepo.upsert(thread)
@@ -187,28 +182,27 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
             .tokenUsage(.init(inputTokens: 100, totalTokens: 100)),
             thread.id, run.id
         )
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
         await waitForProviderTokens(100, provider: .codex, appSupport: context.appSupportDirectory)
 
         context.coordinator.onAssistantEvent?(
             .tokenUsage(.init(inputTokens: 300, totalTokens: 300)),
             thread.id, run.id
         )
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
         await waitForProviderTokens(300, provider: .codex, appSupport: context.appSupportDirectory)
 
         let codex = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
             .load().providers.first { $0.provider == .codex }
         XCTAssertEqual(codex?.actualProviderTokens, 300,
                        "a post-flush cumulative snapshot must add only 200 new tokens")
-        XCTAssertEqual(codex?.eligibleRuns, 1,
-                       "one run stays one eligible run across multiple flushes")
+        XCTAssertEqual(codex?.eligibleRuns, 0,
+                       "Token Saver was removed: provider usage counts no eligible runs")
     }
 
     func test_incrementalClaudeRequestsReconcileWithFinalCumulativeReceipt() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2UsageMixedClaude-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
         let thread = AgentThread(title: "claude mixed usage", provider: .claude, model: "m")
         try context.threadRepo.upsert(thread)
         let run = AgentRun(threadId: thread.id, provider: .claude, model: "m",
@@ -226,7 +220,7 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
                 run.id
             )
         }
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
         await waitForProviderTokens(250, provider: .claude, appSupport: context.appSupportDirectory)
 
         // The final modelUsage receipt covers both requests and is authoritative.
@@ -240,7 +234,7 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
             thread.id,
             run.id
         )
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
         await waitForProviderTokens(260, provider: .claude, appSupport: context.appSupportDirectory)
 
         // An older cumulative receipt arriving late cannot subtract or duplicate.
@@ -253,12 +247,12 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
             thread.id,
             run.id
         )
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
         try await Task.sleep(for: .milliseconds(50))
         let claude = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
             .load().providers.first { $0.provider == .claude }
         XCTAssertEqual(claude?.actualProviderTokens, 260)
-        XCTAssertEqual(claude?.eligibleRuns, 1)
+        XCTAssertEqual(claude?.eligibleRuns, 0)
     }
 
     func test_failedWriteRetriesWithoutLosingOrDoubleCountingUsage() async throws {
@@ -266,7 +260,6 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
 
         let appSupport = NSTemporaryDirectory() + "RC2UsageRetry-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
         let thread = AgentThread(title: "retry usage", provider: .grok, model: "m")
         try context.threadRepo.upsert(thread)
         let run = AgentRun(threadId: thread.id, provider: .grok, model: "m",
@@ -274,7 +267,7 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
         try context.runRepo.upsert(run)
 
         let attempted = expectation(description: "first usage write attempted")
-        context.beforeTokenSaverUsageWriteForTesting = {
+        context.beforeProviderUsageWriteForTesting = {
             attempted.fulfill()
             throw ForcedWriteFailure.expected
         }
@@ -283,9 +276,9 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
             thread.id,
             run.id
         )
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
         await fulfillment(of: [attempted], timeout: 2)
-        context.beforeTokenSaverUsageWriteForTesting = nil
+        context.beforeProviderUsageWriteForTesting = nil
 
         await waitForProviderTokens(100, provider: .grok, appSupport: context.appSupportDirectory)
 
@@ -295,73 +288,17 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
             thread.id,
             run.id
         )
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
         try await Task.sleep(for: .milliseconds(50))
         let grok = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
             .load().providers.first { $0.provider == .grok }
         XCTAssertEqual(grok?.actualProviderTokens, 100)
-        XCTAssertEqual(grok?.eligibleRuns, 1)
-    }
-
-    func test_eligibilityIsCapturedWhenUsageEventArrivesNotWhenFlushRuns() async throws {
-        let enabledSupport = NSTemporaryDirectory() + "RC2UsageEligibilityOn-" + UUID().uuidString
-        let enabledContext = try AppContext(channel: .debug, appSupportOverride: enabledSupport)
-        SettingsStore(db: enabledContext.db).update { $0.tokenSaverEnabled = true }
-        let enabledThread = AgentThread(title: "enabled at event", provider: .codex, model: "m")
-        try enabledContext.threadRepo.upsert(enabledThread)
-        let enabledRun = AgentRun(threadId: enabledThread.id, provider: .codex, model: "m",
-                                  status: .running, startedAt: Date())
-        try enabledContext.runRepo.upsert(enabledRun)
-        enabledContext.coordinator.onAssistantEvent?(
-            .tokenUsage(.init(totalTokens: 50, semantics: .cumulative)),
-            enabledThread.id,
-            enabledRun.id
-        )
-        SettingsStore(db: enabledContext.db).update { $0.tokenSaverEnabled = false }
-        enabledContext.flushPendingTokenSaverUsage(runId: enabledRun.id)
-        await waitForProviderTokens(
-            50,
-            provider: .codex,
-            appSupport: enabledContext.appSupportDirectory
-        )
-        XCTAssertEqual(
-            TokenSaverUsageStore(appSupportDirectory: enabledContext.appSupportDirectory)
-                .load().providers.first { $0.provider == .codex }?.eligibleRuns,
-            1,
-            "turning Token Saver off after the event must not erase that event's eligibility"
-        )
-
-        let disabledSupport = NSTemporaryDirectory() + "RC2UsageEligibilityOff-" + UUID().uuidString
-        let disabledContext = try AppContext(channel: .debug, appSupportOverride: disabledSupport)
-        let disabledThread = AgentThread(title: "disabled at event", provider: .grok, model: "m")
-        try disabledContext.threadRepo.upsert(disabledThread)
-        let disabledRun = AgentRun(threadId: disabledThread.id, provider: .grok, model: "m",
-                                   status: .running, startedAt: Date())
-        try disabledContext.runRepo.upsert(disabledRun)
-        disabledContext.coordinator.onAssistantEvent?(
-            .tokenUsage(.init(totalTokens: 70, semantics: .cumulative)),
-            disabledThread.id,
-            disabledRun.id
-        )
-        SettingsStore(db: disabledContext.db).update { $0.tokenSaverEnabled = true }
-        disabledContext.flushPendingTokenSaverUsage(runId: disabledRun.id)
-        await waitForProviderTokens(
-            70,
-            provider: .grok,
-            appSupport: disabledContext.appSupportDirectory
-        )
-        XCTAssertEqual(
-            TokenSaverUsageStore(appSupportDirectory: disabledContext.appSupportDirectory)
-                .load().providers.first { $0.provider == .grok }?.eligibleRuns,
-            0,
-            "enabling Token Saver after the event must not retroactively make it eligible"
-        )
+        XCTAssertEqual(grok?.eligibleRuns, 0)
     }
 
     func test_lateCumulativeEventAfterRunFinishPersistsOnlyGrowth() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2UsageLate-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
         let thread = AgentThread(title: "late receipt", provider: .codex, model: "m")
         try context.threadRepo.upsert(thread)
         let run = AgentRun(threadId: thread.id, provider: .codex, model: "m",
@@ -373,7 +310,7 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
             thread.id,
             run.id
         )
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
         await waitForProviderTokens(100, provider: .codex, appSupport: context.appSupportDirectory)
         context.coordinator.onRunFinished?(thread.id, run.id, .completed)
         await Task.yield()
@@ -383,19 +320,18 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
             thread.id,
             run.id
         )
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
         await waitForProviderTokens(150, provider: .codex, appSupport: context.appSupportDirectory)
         XCTAssertEqual(
             TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
                 .load().providers.first { $0.provider == .codex }?.eligibleRuns,
-            1
+            0
         )
     }
 
     func test_lateIncrementalReplayAfterRunFinishIsIgnored() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2UsageLateIncrement-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
         let thread = AgentThread(title: "late increment", provider: .claude, model: "m")
         try context.threadRepo.upsert(thread)
         var run = AgentRun(threadId: thread.id, provider: .claude, model: "m",
@@ -407,7 +343,7 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
             thread.id,
             run.id
         )
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
         await waitForProviderTokens(100, provider: .claude, appSupport: context.appSupportDirectory)
         run.status = .completed
         run.finishedAt = Date()
@@ -423,7 +359,7 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
             thread.id,
             run.id
         )
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
         try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(
             TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
@@ -435,8 +371,7 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
     func test_completedUsageTombstonesAreBoundedAndEvictedRunsFailClosed() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2UsageTombstones-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        context.tokenSaverUsageTombstoneLimitForTesting = 2
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        context.providerUsageTombstoneLimitForTesting = 2
         let thread = AgentThread(title: "bounded tombstones", provider: .codex, model: "m")
         try context.threadRepo.upsert(thread)
         var runs: [AgentRun] = []
@@ -450,7 +385,7 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
                 thread.id,
                 run.id
             )
-            context.flushPendingTokenSaverUsage(runId: run.id)
+            context.flushPendingProviderUsage(runId: run.id)
             await waitForProviderTokens(
                 index * 10,
                 provider: .codex,
@@ -476,7 +411,7 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
             thread.id,
             evicted.id
         )
-        context.flushPendingTokenSaverUsage(runId: evicted.id)
+        context.flushPendingProviderUsage(runId: evicted.id)
         try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(
             TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
@@ -513,12 +448,12 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
         line: UInt = #line
     ) async {
         let deadline = Date().addingTimeInterval(2)
-        while context.tokenSaverUsageConsecutiveWriteFailuresForTesting < expected,
+        while context.providerUsageConsecutiveWriteFailuresForTesting < expected,
               Date() < deadline {
             try? await Task.sleep(for: .milliseconds(10))
         }
         XCTAssertGreaterThanOrEqual(
-            context.tokenSaverUsageConsecutiveWriteFailuresForTesting,
+            context.providerUsageConsecutiveWriteFailuresForTesting,
             expected,
             "expected \(expected) failed usage writes",
             file: file,
@@ -547,7 +482,6 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
     func test_providerUsageFlushPersistsCacheWeightedBillingUnits() throws {
         let appSupport = NSTemporaryDirectory() + "RC2UsageBilling-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
 
         let thread = AgentThread(title: "t", provider: .claude, model: "m")
         try context.threadRepo.upsert(thread)
@@ -567,7 +501,7 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
             thread.id,
             run.id
         )
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
 
         let deadline = Date().addingTimeInterval(2)
         var snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
@@ -595,14 +529,13 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
 
         let appSupport = NSTemporaryDirectory() + "RC2UsageBackoff-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
         let thread = AgentThread(title: "usage backoff", provider: .codex, model: "m")
         try context.threadRepo.upsert(thread)
         let run = AgentRun(threadId: thread.id, provider: .codex, model: "m",
                            status: .running, startedAt: Date())
         try context.runRepo.upsert(run)
 
-        context.beforeTokenSaverUsageWriteForTesting = { throw ForcedWriteFailure.expected }
+        context.beforeProviderUsageWriteForTesting = { throw ForcedWriteFailure.expected }
         context.coordinator.onAssistantEvent?(
             .tokenUsage(.init(totalTokens: 100, semantics: .cumulative)),
             thread.id,
@@ -610,11 +543,11 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
         )
 
         for failures in 1...3 {
-            context.flushPendingTokenSaverUsage(runId: run.id)
+            context.flushPendingProviderUsage(runId: run.id)
             await waitForUsageWriteFailures(failures, in: context)
         }
 
-        let scheduled = Array(context.tokenSaverUsageRetryDelaysForTesting.prefix(3))
+        let scheduled = Array(context.providerUsageRetryDelaysForTesting.prefix(3))
         XCTAssertEqual(scheduled.count, 3, "three failed writes must schedule three retries")
         for (index, expected) in [0.75, 1.5, 3.0].enumerated() where index < scheduled.count {
             XCTAssertEqual(
@@ -624,22 +557,22 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
         }
 
         // A successful write restores the prompt retry window.
-        context.beforeTokenSaverUsageWriteForTesting = nil
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.beforeProviderUsageWriteForTesting = nil
+        context.flushPendingProviderUsage(runId: run.id)
         await waitForProviderTokens(100, provider: .codex, appSupport: context.appSupportDirectory)
-        XCTAssertEqual(context.tokenSaverUsageConsecutiveWriteFailuresForTesting, 0)
+        XCTAssertEqual(context.providerUsageConsecutiveWriteFailuresForTesting, 0)
 
         // A fresh delta failing again starts the backoff over at the window.
-        let scheduledBeforeFinalFailure = context.tokenSaverUsageRetryDelaysForTesting.count
-        context.beforeTokenSaverUsageWriteForTesting = { throw ForcedWriteFailure.expected }
+        let scheduledBeforeFinalFailure = context.providerUsageRetryDelaysForTesting.count
+        context.beforeProviderUsageWriteForTesting = { throw ForcedWriteFailure.expected }
         context.coordinator.onAssistantEvent?(
             .tokenUsage(.init(totalTokens: 200, semantics: .cumulative)),
             thread.id,
             run.id
         )
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.flushPendingProviderUsage(runId: run.id)
         await waitForUsageWriteFailures(1, in: context)
-        let restartedRetry = context.tokenSaverUsageRetryDelaysForTesting
+        let restartedRetry = context.providerUsageRetryDelaysForTesting
             .dropFirst(scheduledBeforeFinalFailure)
             .first ?? -1
         XCTAssertEqual(restartedRetry, 0.75, accuracy: 0.0001)
@@ -647,33 +580,33 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
         // The backoff must not drop or duplicate the pending delta: the tokens
         // parked across the failed attempts land exactly once when the store
         // becomes writable again.
-        context.beforeTokenSaverUsageWriteForTesting = nil
-        context.flushPendingTokenSaverUsage(runId: run.id)
+        context.beforeProviderUsageWriteForTesting = nil
+        context.flushPendingProviderUsage(runId: run.id)
         await waitForProviderTokens(200, provider: .codex, appSupport: context.appSupportDirectory)
         try await Task.sleep(for: .milliseconds(50))
         let codex = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
             .load().providers.first { $0.provider == .codex }
         XCTAssertEqual(codex?.actualProviderTokens, 200)
-        XCTAssertEqual(codex?.eligibleRuns, 1)
+        XCTAssertEqual(codex?.eligibleRuns, 0)
     }
 
     func test_usageWriteRetryDelayDoublesAndSaturatesAtTheCap() {
-        let window = AppContext.tokenSaverUsageRetryDelay(consecutiveFailures: 1)
+        let window = AppContext.providerUsageRetryDelay(consecutiveFailures: 1)
         XCTAssertEqual(window, 0.75, accuracy: 0.0001,
                        "the first retry keeps the debounce window")
         XCTAssertEqual(
-            AppContext.tokenSaverUsageRetryDelay(consecutiveFailures: 0),
+            AppContext.providerUsageRetryDelay(consecutiveFailures: 0),
             window,
             accuracy: 0.0001
         )
         XCTAssertEqual(
-            AppContext.tokenSaverUsageRetryDelay(consecutiveFailures: -3),
+            AppContext.providerUsageRetryDelay(consecutiveFailures: -3),
             window,
             accuracy: 0.0001
         )
         for (failures, expected) in [(2, 1.5), (3, 3.0), (7, 48.0), (8, 60.0), (1_000, 60.0)] {
             XCTAssertEqual(
-                AppContext.tokenSaverUsageRetryDelay(consecutiveFailures: failures),
+                AppContext.providerUsageRetryDelay(consecutiveFailures: failures),
                 expected,
                 accuracy: 0.0001,
                 "\(failures) consecutive failures"
