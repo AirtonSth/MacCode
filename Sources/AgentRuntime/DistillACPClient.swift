@@ -543,6 +543,8 @@ public final class DistillACPClient: @unchecked Sendable {
     private var stopped = false
     private let foreignUserUID: uid_t?
     private let mcpEnvironment: [String: String]
+    /// Set when this client drives an in-guest run through `docker exec`.
+    private let guest: DistillGuestLaunchPlan?
     private static let stderrLimit = 8_192
 
     public var notificationHandler: NotificationHandler?
@@ -607,7 +609,7 @@ public final class DistillACPClient: @unchecked Sendable {
         ]
     }
 
-    public init(
+    public convenience init(
         binary: String = DistillProvisioner.binaryName,
         cwd: String,
         environment: [String: String] = [:],
@@ -624,13 +626,9 @@ public final class DistillACPClient: @unchecked Sendable {
         guard let path = ProcessLocator.resolveDistillAgentForRunAsUser(resolved, runAsUser: runAsUser) else {
             throw DistillACPError.missingBinary(resolved)
         }
-        self.notificationHandler = notificationHandler
-        self.serverRequestHandler = serverRequestHandler
-        self.foreignUserUID = runAsUser.flatMap { $0.uid == getuid() ? nil : $0.uid }
-        self.mcpEnvironment = environment
-        parseQueue.setSpecific(key: parseQueueKey, value: 1)
+        let process: Process
         do {
-            self.process = try ProviderSubprocessLauncher.makeProcess(
+            process = try ProviderSubprocessLauncher.makeProcess(
                 provider: .distill,
                 executablePath: path,
                 arguments: launchArguments,
@@ -642,6 +640,57 @@ public final class DistillACPClient: @unchecked Sendable {
         } catch {
             throw DistillACPError.spawnFailed(error.localizedDescription)
         }
+        try self.init(
+            process: process,
+            foreignUserUID: runAsUser.flatMap { $0.uid == getuid() ? nil : $0.uid },
+            mcpEnvironment: environment,
+            guest: nil,
+            tagProcess: tagProcess,
+            notificationHandler: notificationHandler,
+            serverRequestHandler: serverRequestHandler
+        )
+    }
+
+    /// In-guest run: the child is the docker CLI (`plan.dockerArguments`), a
+    /// same-user process with the app's own environment, which the CLI needs to
+    /// reach the daemon. The run's environment is only in the env file.
+    public convenience init(
+        guest plan: DistillGuestLaunchPlan,
+        notificationHandler: NotificationHandler? = nil,
+        serverRequestHandler: ServerRequestHandler? = nil
+    ) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: plan.dockerExecutable)
+        process.arguments = plan.dockerArguments
+        process.currentDirectoryURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        process.environment = ProcessInfo.processInfo.environment
+        try self.init(
+            process: process,
+            foreignUserUID: nil,
+            mcpEnvironment: [:],
+            guest: plan,
+            tagProcess: true,
+            notificationHandler: notificationHandler,
+            serverRequestHandler: serverRequestHandler
+        )
+    }
+
+    private init(
+        process: Process,
+        foreignUserUID: uid_t?,
+        mcpEnvironment: [String: String],
+        guest: DistillGuestLaunchPlan?,
+        tagProcess: Bool,
+        notificationHandler: NotificationHandler?,
+        serverRequestHandler: ServerRequestHandler?
+    ) throws {
+        self.process = process
+        self.notificationHandler = notificationHandler
+        self.serverRequestHandler = serverRequestHandler
+        self.foreignUserUID = foreignUserUID
+        self.mcpEnvironment = mcpEnvironment
+        self.guest = guest
+        parseQueue.setSpecific(key: parseQueueKey, value: 1)
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
@@ -787,6 +836,19 @@ public final class DistillACPClient: @unchecked Sendable {
         return home
     }
 
+    /// A guest run's cwd is a guest path (checked by the resolver against the
+    /// guest's mounts); the Mac `fileExists` fallback would turn it into the
+    /// Mac home.
+    private func sessionCwd(_ cwd: String) -> String {
+        guest?.guestCwd ?? Self.resolvedSessionCwd(cwd)
+    }
+
+    /// A guest run's MCP servers are its `config.toml` (in-guest tools and the
+    /// host gateway); the Mac stdio servers cannot run inside the guest.
+    private func sessionMCPServers() -> [Any] {
+        guest == nil ? Self.sessionMCPServers(environment: mcpEnvironment) : []
+    }
+
     /// Prefix-aware sam-grok-worker admission: grok-4.5 and grok-4.6 only,
     /// with effort taken from `DistillReasoningPolicy.supportedEfforts(for:)`.
     public static func admitsSamGrokWorker(model: String, effort: AgentReasoningEffort) -> Bool {
@@ -851,8 +913,8 @@ public final class DistillACPClient: @unchecked Sendable {
         let result = try await requestJSONObject(
             method: "session/new",
             params: Self.sessionOpenParams(
-                cwd: Self.resolvedSessionCwd(cwd),
-                mcpServers: Self.sessionMCPServers(environment: mcpEnvironment),
+                cwd: sessionCwd(cwd),
+                mcpServers: sessionMCPServers(),
                 yoloMode: yoloMode,
                 modelId: modelId,
                 reasoningEffort: reasoningEffort
@@ -916,8 +978,8 @@ public final class DistillACPClient: @unchecked Sendable {
         reasoningModelSelectionSupported: Bool = true
     ) async throws -> DistillACPSessionOpenResult {
         let params = Self.sessionOpenParams(
-            cwd: Self.resolvedSessionCwd(cwd),
-            mcpServers: Self.sessionMCPServers(environment: mcpEnvironment),
+            cwd: sessionCwd(cwd),
+            mcpServers: sessionMCPServers(),
             sessionId: sessionId,
             yoloMode: yoloMode,
             noReplay: noReplay,
@@ -1194,7 +1256,8 @@ public final class DistillACPClient: @unchecked Sendable {
             params: ["sessionId": sessionId, "prompt": try Self.promptBlocks(
                 for: request,
                 capabilities: capabilities,
-                contextHandoff: contextHandoff
+                contextHandoff: contextHandoff,
+                guest: guest != nil
             )],
             timeout: nil,
             acceptancePermit: request.acceptancePermit,
@@ -1243,6 +1306,10 @@ public final class DistillACPClient: @unchecked Sendable {
                 foreignUserUID: foreignUserUID
             )
         }
+        // The guest process outlives its docker exec client.
+        if let guest {
+            Task.detached { await guest.killGuest() }
+        }
     }
 
     public func stopImmediatelyForAppTermination() {
@@ -1259,15 +1326,19 @@ public final class DistillACPClient: @unchecked Sendable {
                 foreignUserUID: foreignUserUID
             )
         }
+        guest?.killGuestDetached()
     }
 
     /// `contextHandoff` seeds the first prompt of a replacement session with the
     /// app's own record of the earlier conversation. It rides in its own block so
     /// a `/command` prompt stays the first block Distill parses.
+    /// A `guest` run gets no RemoteCode host-catalog paragraph: the guest
+    /// gateway does not offer the `rc_*` tools it names.
     public static func promptBlocks(
         for request: AgentRunRequest,
         capabilities: DistillACPInitializeResult,
-        contextHandoff: String? = nil
+        contextHandoff: String? = nil,
+        guest: Bool = false
     ) throws -> [JSONObject] {
         var blocks: [JSONObject] = []
         let handoff = contextHandoff?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -1279,7 +1350,7 @@ public final class DistillACPClient: @unchecked Sendable {
         // are Claude-CLI-specific).
         let alwaysOn = BotPeerDelegation.appendingTurnContext(
             to: BackgroundAwaitContinuation.systemPromptDirective
-                + "\n\n" + BotPeerDelegation.providerDirective,
+                + "\n\n" + (guest ? BotPeerDelegation.peerDirective : BotPeerDelegation.providerDirective),
             environment: request.environment
         )
         if providerPrompt.drop(while: { $0.isWhitespace }).hasPrefix("/") {

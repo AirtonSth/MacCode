@@ -135,6 +135,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         let threadId: AgentThreadID
         let providerThreadId: String
         let client: DistillACPClient
+        /// In-guest run: the session lives for one turn, then the run finishes.
+        let guestPlan: DistillGuestLaunchPlan?
         let capabilities: DistillACPInitializeResult
         let mapper: DistillACPEventMapper
         var model: String
@@ -195,6 +197,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             threadId: AgentThreadID,
             providerThreadId: String,
             client: DistillACPClient,
+            guestPlan: DistillGuestLaunchPlan? = nil,
             capabilities: DistillACPInitializeResult,
             mapper: DistillACPEventMapper,
             model: String,
@@ -216,6 +219,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             self.threadId = threadId
             self.providerThreadId = providerThreadId
             self.client = client
+            self.guestPlan = guestPlan
             self.capabilities = capabilities
             self.mapper = mapper
             self.model = model
@@ -264,6 +268,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     private static let discoveryCacheLock = NSLock()
     private static var sharedDiscoveryCache: [String: (result: DistillACPDiscoveryResult, fetchedAt: Date)] = [:]
     private var sessions: [AgentThreadID: Session] = [:]
+    /// Set by AppShell after the adapter is built; nil runs everything on the Mac.
+    private var guestLaunchResolver: DistillGuestLaunchResolving?
     /// Provider sessions whose history the model rejected. A Retry (or a resume
     /// after the live process ended) must open a new session instead of
     /// replaying the same history into the same 400.
@@ -306,6 +312,14 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         self.modelCacheTTL = max(0, modelCacheTTL)
         self.maxReadableEvents = max(1, maxReadableEvents)
         self.maxReadableBytes = max(1, maxReadableBytes)
+    }
+
+    public func setGuestLaunchResolver(_ resolver: DistillGuestLaunchResolving?) {
+        synchronized { guestLaunchResolver = resolver }
+    }
+
+    private func isGuestThread(_ threadId: AgentThreadID) -> Bool {
+        synchronized { guestLaunchResolver }?.isGuestThread(threadId) == true
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
@@ -867,6 +881,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         for request in pending {
             request.continuation.resume(throwing: AgentProviderAdapterError.sessionNotFound(threadId))
         }
+        // Before the client stops: its exit would otherwise finish the run first.
+        session.guestPlan?.finish(.cancelled)
         // Hard teardown must never queue behind the cooperative cancel write.
         // The first Stop already enqueued session/cancel; a second Stop owns
         // transport termination and goes straight to the process tree.
@@ -880,6 +896,10 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         guard request.providerThreadId?.isEmpty == false else {
             throw AgentProviderAdapterError.unsupported("Distill ACP recovery requires providerThreadId")
         }
+        // A guest run holds the bot's guest, credentials and lease; none is
+        // started to reopen a thread. The next send loads the session in the
+        // guest, and the transcript comes from the app's own record.
+        if isGuestThread(request.threadId) { return }
         _ = try await openSession(request, loadExisting: true, onEvent: onEvent, startPrompt: false)
     }
 
@@ -901,10 +921,10 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     }
 
     public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
-        try synchronized {
-            guard let session = sessions[threadId] else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
-            return session.history.readableEvents
-        }
+        if let events = synchronized({ sessions[threadId]?.history.readableEvents }) { return events }
+        // recoverSession opens nothing for a guest thread.
+        if isGuestThread(threadId) { return [] }
+        throw AgentProviderAdapterError.sessionNotFound(threadId)
     }
 
     public func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {
@@ -920,7 +940,10 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         }
         sessions.removeAll()
         lock.unlock()
-        all.forEach { $0.client.stop() }
+        all.forEach {
+            $0.guestPlan?.finish(.cancelled)
+            $0.client.stop()
+        }
     }
 
     public func stopAllForAppTermination() {
@@ -958,27 +981,40 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             ? request.providerBinary!
             : (binaryNameOverride ?? DistillProvisioner.binaryName)
         let bufferedNotifications = NotificationBuffer()
+        // Never falls back to the Mac: a guest thread that cannot run in its
+        // guest fails here.
+        let guestPlan = try await synchronized { guestLaunchResolver }?.prepare(request)
         let client: DistillACPClient
         do {
-            let launchArguments = try DistillACPClient.launchArguments(for: request)
-            let isForeignUser = request.runAsUser.map { $0.uid != getuid() } == true
-            let askpass = isForeignUser
-                ? RunAsUserProcessBootstrap.materializeAskpass(
-                    targetUser: request.runAsUser!.shortName
+            if let guestPlan {
+                client = try DistillACPClient(
+                    guest: guestPlan,
+                    notificationHandler: { method, params in
+                        bufferedNotifications.append(method: method, params: params)
+                    }
                 )
-                : nil
-            client = try DistillACPClient(
-                binary: binary,
-                cwd: request.cwd,
-                environment: request.environment,
-                launchArguments: launchArguments,
-                runAsUser: request.runAsUser,
-                askpassPath: askpass,
-                notificationHandler: { method, params in
-                    bufferedNotifications.append(method: method, params: params)
-                }
-            )
+            } else {
+                let launchArguments = try DistillACPClient.launchArguments(for: request)
+                let isForeignUser = request.runAsUser.map { $0.uid != getuid() } == true
+                let askpass = isForeignUser
+                    ? RunAsUserProcessBootstrap.materializeAskpass(
+                        targetUser: request.runAsUser!.shortName
+                    )
+                    : nil
+                client = try DistillACPClient(
+                    binary: binary,
+                    cwd: request.cwd,
+                    environment: request.environment,
+                    launchArguments: launchArguments,
+                    runAsUser: request.runAsUser,
+                    askpassPath: askpass,
+                    notificationHandler: { method, params in
+                        bufferedNotifications.append(method: method, params: params)
+                    }
+                )
+            }
         } catch {
+            guestPlan?.finish(.failed)
             throw DistillACPFailureTaxonomy.normalize(
                 error,
                 context: loadExisting ? .resume : .start
@@ -986,6 +1022,10 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         }
         do {
             let capabilities = try await client.initialize()
+            if let guestPlan {
+                // The docker CLI read it before the guest could answer.
+                unlink(guestPlan.envFileURL.path)
+            }
             let opened: DistillACPSessionOpenResult
             let mainEffort = request.distillMainEffortSelection.map(\.effort) ?? request.reasoningEffort
             if loadExisting {
@@ -1039,6 +1079,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 threadId: request.threadId,
                 providerThreadId: opened.sessionId,
                 client: client,
+                guestPlan: guestPlan,
                 capabilities: capabilities,
                 mapper: mapper,
                 model: opened.currentModelId ?? request.model,
@@ -1127,6 +1168,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     sessions.removeValue(forKey: request.threadId)
                 }
             }
+            guestPlan?.finish(.failed)
             client.stop()
             if error is AgentProviderAdapterError { throw error }
             throw DistillACPFailureTaxonomy.normalize(
@@ -1591,6 +1633,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             distillAcpLog.info(
                 "grok.turn.termination.stale thread=\(session.threadId.value.uuidString, privacy: .public) generation=\(generation, privacy: .public)"
             )
+            // No-op when the turn or Stop already finished the run.
+            session.guestPlan?.finish(.failed)
             return
         }
         let terminal = DistillACPTerminalClassifier.status(
@@ -1710,7 +1754,10 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         session.turnWatchdogSynthesisInProgress = false
         session.inFlight = false
         session.status = status
-        let shouldStopOwnedTree = status == .cancelled && session.cancelRequested
+        // A guest run ends with its turn: no idle guest process keeps the
+        // bot's credentials. The next turn loads the session in a new one.
+        let endsGuestRun = session.guestPlan != nil
+        let shouldStopOwnedTree = (status == .cancelled && session.cancelRequested) || endsGuestRun
         if shouldStopOwnedTree {
             if sessions[session.threadId] === session {
                 sessions.removeValue(forKey: session.threadId)
@@ -1730,9 +1777,13 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         for request in pending {
             request.continuation.resume(throwing: AgentProviderAdapterError.unsupported("Distill ACP turn ended before permission response"))
         }
+        // Started before the client stops, so this status (not the docker
+        // client's exit) is the run's; teardown runs in the background under
+        // the bot's lease, and the callbacks below are not delayed by it.
+        session.guestPlan?.finish(status)
         if shouldStopOwnedTree {
             distillAcpLog.info(
-                "distill.cancel.ack.tree_stop thread=\(session.threadId.value.uuidString, privacy: .public)"
+                "distill.cancel.ack.tree_stop thread=\(session.threadId.value.uuidString, privacy: .public) guest=\(endsGuestRun, privacy: .public)"
             )
             session.client.stop()
         }
