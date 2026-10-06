@@ -714,6 +714,13 @@ public struct ProviderRuntimeEvent: Codable, Sendable, Equatable, Identifiable {
         return fromJSONObject(obj, provider: provider, source: source, receivedAtMs: receivedAtMs)
     }
 
+    /// Host bookkeeping from the Distill adapter: `{sessionId, acceptedModel}` when a
+    /// Distill session accepts a prompt, `{sessionId, historyRejected: true}` when
+    /// the provider rejected that session's history. The coordinator persists it in
+    /// the provider session runtime payload so a restart knows the session's model
+    /// family and never re-loads a rejected session.
+    public static let distillSessionStateMethod = "remotecode.distill.session_state"
+
     /// Token-stream methods already render as Thought / answer prose. Emitting them
     /// into the Work log rewrites a strip *above* the user message on every token
     /// (Grok `thought`/`text`, Claude `content_block_delta`, …).
@@ -722,7 +729,8 @@ public struct ProviderRuntimeEvent: Codable, Sendable, Equatable, Identifiable {
         case "thought", "text",
              "content_block_delta", "content_block_start", "content_block_stop",
              "message_start", "message_delta", "message_stop",
-             "ping", "input_json_delta":
+             "ping", "input_json_delta",
+             Self.distillSessionStateMethod:
             return false
         default:
             return true

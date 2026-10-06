@@ -182,6 +182,14 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         var promptFailureDetail: (generation: UInt64, text: String)?
         /// The provider rejected this session's own history; never prompt it again.
         var historyIncompatible = false
+        /// A replacement session publishes its id (the resume cursor) only once
+        /// a prompt carrying the handoff is accepted. Until then the persisted
+        /// cursor stays on the old session, so a failed switch is retried as a
+        /// switch (with the handoff) instead of resuming an empty session.
+        var holdsThreadStartedUntilPromptAccepted = false
+        var heldThreadStarted = false
+        /// Main model last reported in a session-state event for this session.
+        var reportedAcceptedModel: String?
 
         init(
             threadId: AgentThreadID,
@@ -506,7 +514,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         let existing = synchronized { sessions[request.threadId] }
         guard let existing else {
             if let resumeId = request.providerThreadId, !resumeId.isEmpty {
-                let retired = synchronized { retiredProviderThreadIds.contains(resumeId) }
+                let retired = request.priorProviderSessionRetired
+                    || synchronized { retiredProviderThreadIds.contains(resumeId) }
                 let previousModel = request.priorProviderSessionModel
                 let reason: FreshSessionReason?
                 if retired {
@@ -583,15 +592,28 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
 
     static let modelFamilySwitchNotice = "Switched model family — started a new Distill session"
     static let incompatibleHistoryNotice = "The model rejected the previous Distill session's history — started a new Distill session"
+    /// Appended to the notice: the new session got a compact summary of the
+    /// conversation (the row renders as a compaction), or nothing at all.
+    static let handoffCarriedNoticeSuffix = " with a summary of this conversation"
+    static let handoffMissingNoticeSuffix = "; the earlier conversation could not be carried over"
     static let handoffMaxCharacters = 16_000
     static let handoffMaxItemCharacters = 2_000
+    /// Newest prior messages the coordinator reads for a handoff.
+    static let handoffMaxMessages = 60
+
+    struct HandoffMessage: Equatable {
+        let isUser: Bool
+        let text: String
+    }
 
     /// Compact handoff of the app's own transcript for the first prompt of a
-    /// replacement session. Most recent messages win the budget.
+    /// replacement session. `history` is oldest first; the newest messages win
+    /// the budget. `olderHistoryExists` says messages before `history` exist.
     static func freshSessionHandoff(
         reason: FreshSessionReason,
         newModel: String,
-        snapshot: TokenSaverCanonicalConversationSnapshot?
+        history: [HandoffMessage],
+        olderHistoryExists: Bool = false
     ) -> String {
         var header = "[RemoteCode context handoff] This conversation started in an earlier Distill session"
         switch reason {
@@ -601,16 +623,15 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             header += " whose history \(newModel) rejected, so it continues in a new session."
         }
         header += " Earlier tool results and files read are not loaded here; re-read anything you need."
-        let items = snapshot?.items ?? []
+        let items = history.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !items.isEmpty else {
             return header + " The earlier conversation is not available; ask the user for any detail you need from it."
         }
         var budget = handoffMaxCharacters
         var kept: [String] = []
         for item in items.reversed() {
-            let speaker = item.role == .user ? "User" : "Assistant"
-            var text = item.canonicalText.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { continue }
+            let speaker = item.isUser ? "User" : "Assistant"
+            var text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if text.count > handoffMaxItemCharacters {
                 text = String(text.prefix(handoffMaxItemCharacters)) + "…"
             }
@@ -619,15 +640,31 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             budget -= line.count
             kept.append(line)
         }
-        let omitted = items.count - kept.count
         var body = header + " Earlier conversation, oldest first:"
-        if omitted > 0 {
-            body += "\n\n(\(omitted) earlier message\(omitted == 1 ? "" : "s") omitted)"
+        if olderHistoryExists || kept.count < items.count {
+            body += "\n\n(earlier messages omitted)"
         }
         for line in kept.reversed() {
             body += "\n\n" + line
         }
         return body + "\n\n[End of handoff. The user's new message follows.]"
+    }
+
+    /// The coordinator's newest-first tail (no size ceiling) wins; the RCSEED
+    /// snapshot, which is nil for long threads, is only a fallback.
+    static func handoffHistory(for request: AgentRunRequest) -> (messages: [HandoffMessage], olderHistoryExists: Bool) {
+        if let tail = request.priorConversationTail {
+            let messages = tail.compactMap { message -> HandoffMessage? in
+                switch message.role {
+                case .user: return HandoffMessage(isUser: true, text: message.content)
+                case .assistant: return HandoffMessage(isUser: false, text: message.content)
+                case .system: return nil
+                }
+            }
+            return (Array(messages.suffix(handoffMaxMessages)), messages.count > handoffMaxMessages)
+        }
+        let items = request.contextSnapshot?.items ?? []
+        return (items.map { HandoffMessage(isUser: $0.role == .user, text: $0.canonicalText) }, false)
     }
 
     private func openFreshSession(
@@ -645,8 +682,12 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             reasonLabel = "incompatible_history"
             notice = Self.incompatibleHistoryNotice
         }
+        let history = Self.handoffHistory(for: request)
+        let carried = history.messages.contains {
+            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
         distillAcpLog.info(
-            "distill.session.fresh thread=\(request.threadId.value.uuidString, privacy: .public) reason=\(reasonLabel, privacy: .public)"
+            "distill.session.fresh thread=\(request.threadId.value.uuidString, privacy: .public) reason=\(reasonLabel, privacy: .public) handoff_messages=\(history.messages.count, privacy: .public)"
         )
         return try await openSession(
             request,
@@ -657,9 +698,10 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 handoff: Self.freshSessionHandoff(
                     reason: reason,
                     newModel: request.model,
-                    snapshot: request.contextSnapshot
+                    history: history.messages,
+                    olderHistoryExists: history.olderHistoryExists
                 ),
-                notice: notice
+                notice: notice + (carried ? Self.handoffCarriedNoticeSuffix : Self.handoffMissingNoticeSuffix)
             )
         )
     }
@@ -1018,6 +1060,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 maxReadableBytes: maxReadableBytes,
                 onEvent: onEvent
             )
+            session.holdsThreadStartedUntilPromptAccepted = freshSession != nil
             client.notificationHandler = { [weak self, weak session] method, params in
                 guard let self, let session else { return }
                 self.handleNotification(method: method, params: params, session: session)
@@ -1313,7 +1356,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                                 guard let self, let session else {
                                     throw AgentProviderAdapterError.sessionNotFound(request.threadId)
                                 }
-                                try self.synchronized {
+                                let (releaseThreadStarted, reportModel) = try self.synchronized {
                                     guard self.sessions[request.threadId] === session,
                                           session.isLive else {
                                         throw AgentProviderAdapterError.sessionNotFound(request.threadId)
@@ -1321,9 +1364,28 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                                     session.promptAccepted = true
                                     session.status = .running
                                     self.promptWriteAcceptanceCountForTestingStorage += 1
+                                    let release = session.heldThreadStarted
+                                    session.holdsThreadStartedUntilPromptAccepted = false
+                                    session.heldThreadStarted = false
+                                    let model = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    let report = !model.isEmpty && session.reportedAcceptedModel != model
+                                    if report { session.reportedAcceptedModel = model }
+                                    return (release, report ? model : nil)
+                                }
+                                if releaseThreadStarted {
+                                    self.emit(
+                                        .threadStarted(threadId: session.providerThreadId, providerThreadId: session.providerThreadId),
+                                        session: session
+                                    )
                                 }
                                 for event in session.mapper.beginTurn() {
                                     self.emit(event, session: session)
+                                }
+                                if let reportModel {
+                                    self.emit(Self.sessionStateEvent([
+                                        "sessionId": session.providerThreadId,
+                                        "acceptedModel": reportModel
+                                    ]), session: session)
                                 }
                                 if let notice = freshSession?.notice {
                                     self.emitFreshSessionNotice(notice, session: session)
@@ -1592,13 +1654,23 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             session.historyIncompatible = true
             retiredProviderThreadIds.insert(session.providerThreadId)
         }
+        // Persisted by the coordinator, so Retry after a restart still opens a
+        // new session instead of loading this one into the same 400.
+        emit(Self.sessionStateEvent([
+            "sessionId": session.providerThreadId,
+            "historyRejected": true
+        ]), session: session)
         distillAcpLog.info(
             "distill.session.retired thread=\(session.threadId.value.uuidString, privacy: .public) reason=incompatible_history"
         )
     }
 
     /// Visible transcript row for a replacement session (Agent App, bot desk
-    /// and the iOS mirror all render the persisted item).
+    /// and the iOS mirror all render the persisted item). `.contextCompaction`
+    /// is the closest item type both decoders know (a new case would fail the
+    /// iOS mirror's decode); the row's copy says what happened. No
+    /// `.contextCompaction(summary:)` event: the context meter and the iOS
+    /// compaction signal must not report a provider-side compaction.
     private func emitFreshSessionNotice(_ notice: String, session: Session) {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let itemId = "distill-fresh-session-\(session.providerThreadId)"
@@ -1614,7 +1686,17 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             finishedAtMs: now
         )), session: session)
         emit(.itemCompleted(itemId: itemId, finalState: .completed), session: session)
-        emit(.contextCompaction(summary: notice), session: session)
+    }
+
+    private static func sessionStateEvent(_ state: [String: Any]) -> AssistantEvent {
+        let data = (try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys])) ?? Data()
+        return .providerRuntime(ProviderRuntimeEvent(
+            provider: .distill,
+            source: "remotecode.distill",
+            method: ProviderRuntimeEvent.distillSessionStateMethod,
+            payloadJSON: String(data: data, encoding: .utf8) ?? "{}",
+            receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+        ))
     }
 
     private func finishTurn(session: Session, status: AgentRunStatus) {
@@ -1766,6 +1848,11 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         // events were re-entering the coordinator with a cleared seq counter and
         // colliding on durable seq 1 (servers_updated vs turnStarted).
         if session.turnTerminalEmitted {
+            lock.unlock()
+            return
+        }
+        if session.holdsThreadStartedUntilPromptAccepted, case .threadStarted = event {
+            session.heldThreadStarted = true
             lock.unlock()
             return
         }

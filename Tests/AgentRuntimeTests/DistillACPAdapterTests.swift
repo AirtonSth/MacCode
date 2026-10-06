@@ -561,6 +561,10 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                 model = (params.get("_meta") or {}).get("modelId")
                 session = params.get("sessionId") or next_session()
                 record({"method":method,"sessionId":session,"modelId":model})
+                if method == "session/new":
+                    # Real Distill announces commands before the first prompt; the
+                    # mapper turns that into threadStarted for the new session.
+                    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"available_commands_update","availableCommands":[]}}})
                 send({"jsonrpc":"2.0","id":message["id"],"result":{"sessionId":session,"models":{"availableModels":[],"currentModelId":model}}})
             elif method == "session/set_model":
                 record({"method":method,"sessionId":params.get("sessionId"),"modelId":params.get("modelId")})
@@ -713,8 +717,14 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(seeded.contains("User: First request") && seeded.contains("Assistant: reply from distill-session-1"),
                       "the new session must carry the earlier conversation forward")
         XCTAssertTrue(seeded.contains("Second request"))
-        XCTAssertEqual(secondEvents.noticeSummaries, [DistillACPAdapter.modelFamilySwitchNotice],
-                       "the transcript must say a new Distill session was started")
+        XCTAssertEqual(secondEvents.noticeSummaries,
+                       [DistillACPAdapter.modelFamilySwitchNotice + DistillACPAdapter.handoffCarriedNoticeSuffix],
+                       "the transcript must say a new Distill session was started and got the conversation")
+        XCTAssertTrue(secondEvents.contextCompactionSummaries.isEmpty,
+                      "a new session is not a provider compaction; the context meter and iOS must not report one")
+        XCTAssertEqual(secondEvents.acceptedSessionModels.map(\.sessionId), ["distill-session-2"])
+        XCTAssertEqual(secondEvents.acceptedSessionModels.map(\.model), ["claude/claude-opus-5-5"],
+                       "the coordinator records the model the new session really accepted")
 
         // After an app restart the live session is gone; session/load would
         // replay the same foreign history, so the persisted cursor is not loaded.
@@ -737,6 +747,9 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         let unseeded = try XCTUnwrap(afterRestart.last { $0["method"] as? String == "session/prompt" }?["text"] as? String)
         XCTAssertTrue(unseeded.contains("The earlier conversation is not available"),
                       "without a transcript snapshot the model must be told earlier context is not loaded")
+        XCTAssertEqual(resumedEvents.noticeSummaries,
+                       [DistillACPAdapter.modelFamilySwitchNotice + DistillACPAdapter.handoffMissingNoticeSuffix],
+                       "the row must not claim a summary was carried over when none was")
     }
 
     func test_sameFamilySwitchStillUsesSetModelAndRestartStillLoads() async throws {
@@ -813,9 +826,130 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         let retried = try await retry.waitForFinish()
         XCTAssertEqual(retried.status, .completed)
         XCTAssertEqual(retried.providerThreadId, "distill-session-2")
-        XCTAssertEqual(retry.noticeSummaries, [DistillACPAdapter.incompatibleHistoryNotice])
+        XCTAssertEqual(retry.noticeSummaries,
+                       [DistillACPAdapter.incompatibleHistoryNotice + DistillACPAdapter.handoffMissingNoticeSuffix])
+        XCTAssertEqual(failed.rejectedSessionIds, ["distill-session-1"],
+                       "the coordinator persists the rejection so Retry after a restart opens a new session too")
         let prompts = try recordedRequests(requestsURL).filter { $0["method"] as? String == "session/prompt" }
         XCTAssertEqual(prompts.map { $0["sessionId"] as? String }, ["distill-session-1", "distill-session-2"])
+    }
+
+    func test_longThreadHandoffCarriesNewestMessagesBeyondRCSEEDLimits() async throws {
+        // WHY: the RCSEED snapshot is nil past 100 messages / 64 KB, which is
+        // exactly the long bot desk thread most likely to switch families. The
+        // coordinator's tail has no such ceiling; the newest messages must win.
+        let root = try makeTempRoot("distill-acp-long-handoff")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeFailureHarness(root: root)
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let thread = AgentThreadID()
+        let history = (0..<150).map { index in
+            AgentMessage(
+                threadId: thread,
+                role: index.isMultiple(of: 2) ? .user : .assistant,
+                content: "history-\(index)-marker " + String(repeating: "y", count: 1_000)
+            )
+        }
+        XCTAssertNil(TokenSaverCanonicalConversationSnapshot.capture(
+            messages: history, persistedRCW1ByMessageId: [:], excludingCurrentUserText: nil
+        ), "precondition: this history is past the RCSEED limits")
+
+        var request = distillRequest(thread: thread, model: "claude/claude-opus-5-5", prompt: "Continue please",
+                                     root: root, providerThreadId: "muse-session")
+        request.priorProviderSessionModel = "muse-spark-1.3-contributor"
+        request.priorConversationTail = Array(history.suffix(DistillACPAdapter.handoffMaxMessages + 1))
+        let events = DistillACPAdapterEventBox()
+        _ = try await adapter.sendTurn(request) { events.append($0) }
+        _ = try await events.waitForFinish()
+
+        let seeded = try XCTUnwrap(try recordedRequests(requestsURL)
+            .last { $0["method"] as? String == "session/prompt" }?["text"] as? String)
+        XCTAssertTrue(seeded.contains("history-149-marker"), "the newest prior message must reach the new session")
+        XCTAssertTrue(seeded.contains("(earlier messages omitted)"))
+        XCTAssertFalse(seeded.contains("history-0-marker "), "the budget is spent on the newest messages")
+        XCTAssertEqual(events.noticeSummaries,
+                       [DistillACPAdapter.modelFamilySwitchNotice + DistillACPAdapter.handoffCarriedNoticeSuffix])
+    }
+
+    func test_switchThatFailsBeforeAcceptanceKeepsOldCursorAndRetriesWithHandoff() async throws {
+        // WHY: if Stop (or a set_mode failure) ends the switch turn before Distill
+        // accepts the seeded prompt, persisting the new session's id would make
+        // the next send resume an empty session with no handoff. The cursor must
+        // stay on the old session so the retry is again a switch with handoff.
+        let root = try makeTempRoot("distill-acp-switch-pre-accept")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeFailureHarness(root: root)
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let thread = AgentThreadID()
+
+        let first = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            distillRequest(thread: thread, model: "muse-spark-1.3-contributor", prompt: "First request", root: root)
+        ) { first.append($0) }
+        _ = try await first.waitForFinish()
+
+        var stopOnce = true
+        adapter.beforePromptWriteForTesting = { [weak adapter] in
+            guard stopOnce else { return }
+            stopOnce = false
+            try? adapter?.stopSession(threadId: thread)
+        }
+        var switchRequest = distillRequest(thread: thread, model: "claude/claude-opus-5-5", prompt: "Switch request",
+                                           root: root, providerThreadId: "distill-session-1")
+        switchRequest.priorProviderSessionModel = "muse-spark-1.3-contributor"
+        switchRequest.priorConversationTail = [
+            AgentMessage(threadId: thread, role: .user, content: "First request"),
+            AgentMessage(threadId: thread, role: .assistant, content: "reply from distill-session-1")
+        ]
+        let aborted = DistillACPAdapterEventBox()
+        do {
+            _ = try await adapter.sendTurn(switchRequest) { aborted.append($0) }
+            XCTFail("the stopped switch turn must fail")
+        } catch {}
+        XCTAssertTrue(try recordedRequests(requestsURL).contains {
+            $0["method"] as? String == "session/new" && $0["sessionId"] as? String == "distill-session-2"
+        }, "precondition: the replacement session was opened and announced commands")
+        XCTAssertFalse(aborted.threadStartedIds.contains("distill-session-2"),
+                       "an unseeded session must not become the persisted resume cursor")
+        XCTAssertTrue(aborted.acceptedSessionModels.isEmpty, "nothing was accepted, so nothing may be recorded")
+
+        let retried = DistillACPAdapterEventBox()
+        _ = try await adapter.sendTurn(switchRequest) { retried.append($0) }
+        let finished = try await retried.waitForFinish()
+        XCTAssertEqual(finished.status, .completed)
+        XCTAssertEqual(finished.providerThreadId, "distill-session-3")
+        XCTAssertTrue(retried.threadStartedIds.contains("distill-session-3"))
+        let requests = try recordedRequests(requestsURL)
+        XCTAssertFalse(requests.contains { $0["method"] as? String == "session/load" })
+        let seeded = try XCTUnwrap(requests.last { $0["method"] as? String == "session/prompt" }?["text"] as? String)
+        XCTAssertTrue(seeded.contains("[RemoteCode context handoff]") && seeded.contains("User: First request"),
+                      "the retry must carry the conversation the failed attempt never delivered")
+        XCTAssertEqual(retried.noticeSummaries,
+                       [DistillACPAdapter.modelFamilySwitchNotice + DistillACPAdapter.handoffCarriedNoticeSuffix])
+    }
+
+    func test_persistedRetirementOpensNewSessionAfterRestart() async throws {
+        // WHY: the in-memory retirement set is empty after a restart; the
+        // coordinator's persisted flag must still keep Retry off `session/load`.
+        let root = try makeTempRoot("distill-acp-retired-restart")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeFailureHarness(root: root)
+        let restarted = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { restarted.stopAll() }
+        var request = distillRequest(thread: AgentThreadID(), model: "claude/claude-opus-5-5", prompt: "Retry request",
+                                     root: root, providerThreadId: "rejected-session")
+        request.priorProviderSessionModel = "claude/claude-opus-5-5"
+        request.priorProviderSessionRetired = true
+        let events = DistillACPAdapterEventBox()
+        _ = try await restarted.sendTurn(request) { events.append($0) }
+        let finished = try await events.waitForFinish()
+        XCTAssertEqual(finished.status, .completed)
+        XCTAssertNotEqual(finished.providerThreadId, "rejected-session")
+        XCTAssertFalse(try recordedRequests(requestsURL).contains { $0["method"] as? String == "session/load" })
+        XCTAssertEqual(events.noticeSummaries,
+                       [DistillACPAdapter.incompatibleHistoryNotice + DistillACPAdapter.handoffMissingNoticeSuffix])
     }
 
     func test_modelFamilyIsDerivedFromDistillClaudePrefix() {
@@ -850,6 +984,45 @@ private final class DistillACPAdapterEventBox: @unchecked Sendable {
         return values.compactMap { event in
             guard case .event(.itemStarted(let item)) = event, item.type == .contextCompaction else { return nil }
             return item.summary
+        }
+    }
+
+    var contextCompactionSummaries: [String?] {
+        lock.lock(); defer { lock.unlock() }
+        return values.compactMap { event in
+            guard case .event(.contextCompaction(let summary)) = event else { return nil }
+            return .some(summary)
+        }
+    }
+
+    var threadStartedIds: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return values.compactMap { event in
+            guard case .event(.threadStarted(_, let providerThreadId)) = event else { return nil }
+            return providerThreadId
+        }
+    }
+
+    private var sessionStates: [[String: Any]] {
+        lock.lock(); defer { lock.unlock() }
+        return values.compactMap { event in
+            guard case .event(.providerRuntime(let runtime)) = event,
+                  runtime.method == ProviderRuntimeEvent.distillSessionStateMethod,
+                  let data = runtime.payloadJSON.data(using: .utf8) else { return nil }
+            return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        }
+    }
+
+    var acceptedSessionModels: [(sessionId: String, model: String)] {
+        sessionStates.compactMap { state in
+            guard let id = state["sessionId"] as? String, let model = state["acceptedModel"] as? String else { return nil }
+            return (id, model)
+        }
+    }
+
+    var rejectedSessionIds: [String] {
+        sessionStates.compactMap { state in
+            state["historyRejected"] as? Bool == true ? state["sessionId"] as? String : nil
         }
     }
 

@@ -1010,6 +1010,78 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         )
     }
 
+    /// Distill must not `session/load` a session whose history the new Main
+    /// model cannot accept (another model family's unsigned reasoning, or a
+    /// history the provider already rejected). Fills the request with what the
+    /// persisted session actually ran and, when the adapter will open a new
+    /// session, the newest conversation tail for its handoff. Returns the
+    /// runtime payload for the pending upsert.
+    private func prepareDistillSessionContinuity(
+        _ request: inout AgentRunRequest,
+        resumeCursor: String,
+        runtimePayloadJSON: String?,
+        currentUserMessageID: AgentMessageID,
+        repo: ProviderSessionRuntimeRepository
+    ) -> String? {
+        let threadLogId = request.threadId.value.uuidString
+        var payload = ProviderSessionRuntimePayload.decode(runtimePayloadJSON)
+        var nextPayloadJSON = runtimePayloadJSON
+        if payload.distillSessionId != resumeCursor {
+            // No accepted prompt recorded for this cursor yet (rows written
+            // before acceptance was recorded). The `model` column is the only
+            // evidence, and only until this send's pending upsert replaces it
+            // with the requested model, so carry it into the payload once.
+            do {
+                if let model = try repo.sessionModel(of: request.threadId, resumeCursor: resumeCursor) {
+                    payload.distillSessionId = resumeCursor
+                    payload.distillSessionModel = model
+                    nextPayloadJSON = payload.encoded()
+                }
+            } catch {
+                agentRunLog.error(
+                    "distill.session_model.probe_failed thread=\(threadLogId, privacy: .public) error=\(String(describing: error), privacy: .public)"
+                )
+                emitPersistenceIssue(
+                    "provider_session.distill_session_model.read",
+                    error: error,
+                    runId: request.runId,
+                    threadId: request.threadId
+                )
+            }
+        }
+        if payload.distillSessionId == resumeCursor {
+            request.priorProviderSessionModel = payload.distillSessionModel
+        }
+        request.priorProviderSessionRetired = payload.distillRetiredSessionIds?.contains(resumeCursor) == true
+        guard request.priorProviderSessionRetired
+                || DistillACPAdapter.isCrossModelFamilySwitch(
+                    from: request.priorProviderSessionModel,
+                    to: request.model
+                ) else {
+            return nextPayloadJSON
+        }
+        do {
+            // +2: the current prompt is already persisted, and one more row
+            // tells the handoff that older messages exist.
+            request.priorConversationTail = try messageRepo.listRecent(
+                threadId: request.threadId,
+                limit: DistillACPAdapter.handoffMaxMessages + 2
+            ).filter { $0.id != currentUserMessageID && $0.role != .system }
+        } catch {
+            // The adapter falls back to `contextSnapshot` for the handoff.
+            agentRunLog.error(
+                "distill.handoff_tail.read_failed thread=\(threadLogId, privacy: .public) error=\(String(describing: error), privacy: .public)"
+            )
+            emitPersistenceIssue(
+                "agent_messages.distill_handoff_tail.read",
+                error: error,
+                runId: request.runId,
+                threadId: request.threadId
+            )
+        }
+        return nextPayloadJSON
+    }
+
     static func normalizedProviderReasoningEffort(
         provider: AgentProvider,
         model: String,
@@ -2295,21 +2367,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             hasUnread: false
         )
         if let repo = providerSessionRepo {
-            // Read before the pending upsert below overwrites `model`: Distill
-            // must not `session/load` another model family's history (Anthropic
-            // rejects foreign unsigned reasoning as an invalid thinking block).
-            if effectiveRequest.provider == .distill,
-               let resumeCursor = effectiveRequest.providerThreadId, !resumeCursor.isEmpty {
-                effectiveRequest.priorProviderSessionModel = try? repo.sessionModel(
-                    of: effectiveRequest.threadId,
-                    resumeCursor: resumeCursor
-                )
-            }
             // Payload JSON only. A leftover 16-column session `get`
             // (including cwd/model/status/error) hitchs every send just
             // to copy `runtime_payload_json` into the pending upsert.
             let existingPayload = try repo.runtimePayloadJSON(of: effectiveRequest.threadId)
-            let runtimePayloadJSON: String?
+            var runtimePayloadJSON: String?
             if let existingPayload {
                 runtimePayloadJSON = existingPayload
             } else {
@@ -2318,6 +2380,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     nextRuntimePayload.wireProtocolVersion = RCWireProtocol.version
                 }
                 runtimePayloadJSON = nextRuntimePayload.encoded()
+            }
+            if effectiveRequest.provider == .distill,
+               let resumeCursor = effectiveRequest.providerThreadId, !resumeCursor.isEmpty {
+                runtimePayloadJSON = prepareDistillSessionContinuity(
+                    &effectiveRequest,
+                    resumeCursor: resumeCursor,
+                    runtimePayloadJSON: runtimePayloadJSON,
+                    currentUserMessageID: currentUserMessageID,
+                    repo: repo
+                )
             }
             try repo.upsert(ProviderSessionRuntime(
                 threadId: effectiveRequest.threadId,
@@ -6077,6 +6149,26 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         threadId: AgentThreadID,
         runId: AgentRunID
     ) -> DeferredPersistenceIssue? {
+        if event.provider == .distill, event.method == ProviderRuntimeEvent.distillSessionStateMethod {
+            guard let data = event.payloadJSON.data(using: .utf8),
+                  let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let sessionId = state["sessionId"] as? String, !sessionId.isEmpty else {
+                return nil
+            }
+            return updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                if let model = state["acceptedModel"] as? String, !model.isEmpty {
+                    payload.distillSessionId = sessionId
+                    payload.distillSessionModel = model
+                }
+                let retired = payload.distillRetiredSessionIds ?? []
+                if state["historyRejected"] as? Bool == true, !retired.contains(sessionId) {
+                    payload.distillRetiredSessionIds = Array(
+                        (retired + [sessionId]).suffix(ProviderSessionRuntimePayload.distillRetiredSessionLimit)
+                    )
+                }
+                payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+            }
+        }
         guard event.provider == .claude,
               event.method == "claude.session.snapshot",
               let data = event.payloadJSON.data(using: .utf8),
@@ -9578,9 +9670,19 @@ private struct ProviderSessionRuntimePayload: Codable, Equatable {
     var claudeInFlightToolIds: [String] = []
     var wireProtocolVersion: String?
     var updatedAtMs: Int64?
+    /// Distill: the provider session that last accepted a prompt and the Main
+    /// model that prompt ran. Written on acceptance (not from the pending
+    /// upsert's requested `model`), so a failed or abandoned attempt cannot
+    /// relabel the session's history.
+    var distillSessionId: String?
+    var distillSessionModel: String?
+    /// Distill: sessions whose history the provider rejected. Survives restart
+    /// so Retry opens a new session instead of loading the rejected one.
+    var distillRetiredSessionIds: [String]?
+    static let distillRetiredSessionLimit = 8
 
     private enum CodingKeys: String, CodingKey {
-        case providerThreadId, lastCompletedTurnId, turnCount, model, serviceTier, runtimeMode, interactionMode, activeTurnId, activePlan, pendingApprovalRequestIds, pendingUserInputRequestIds, claudeResumeSessionAt, claudeInFlightToolIds, wireProtocolVersion, updatedAtMs
+        case providerThreadId, lastCompletedTurnId, turnCount, model, serviceTier, runtimeMode, interactionMode, activeTurnId, activePlan, pendingApprovalRequestIds, pendingUserInputRequestIds, claudeResumeSessionAt, claudeInFlightToolIds, wireProtocolVersion, updatedAtMs, distillSessionId, distillSessionModel, distillRetiredSessionIds
     }
 
     init(turnCount: Int = 0) {
@@ -9604,6 +9706,9 @@ private struct ProviderSessionRuntimePayload: Codable, Equatable {
         claudeInFlightToolIds = try container.decodeIfPresent([String].self, forKey: .claudeInFlightToolIds) ?? []
         wireProtocolVersion = try container.decodeIfPresent(String.self, forKey: .wireProtocolVersion)
         updatedAtMs = try container.decodeIfPresent(Int64.self, forKey: .updatedAtMs)
+        distillSessionId = try container.decodeIfPresent(String.self, forKey: .distillSessionId)
+        distillSessionModel = try container.decodeIfPresent(String.self, forKey: .distillSessionModel)
+        distillRetiredSessionIds = try container.decodeIfPresent([String].self, forKey: .distillRetiredSessionIds)
     }
 
     // PERF: turn lifecycle paths decode/encode this payload repeatedly (start,

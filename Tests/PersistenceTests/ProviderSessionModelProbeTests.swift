@@ -40,9 +40,13 @@ final class ProviderSessionModelProbeTests: XCTestCase {
                 .appendingPathComponent("Sources/AgentRuntime/AgentRunCoordinator.swift"),
             encoding: .utf8
         )
-        let probe = try XCTUnwrap(source.range(of: "effectiveRequest.priorProviderSessionModel = try? repo.sessionModel("))
+        // The probe lives in prepareDistillSessionContinuity; the send path must
+        // call it (and so read `model`) before the pending upsert replaces it.
+        let probeCall = try XCTUnwrap(source.range(of: "runtimePayloadJSON = prepareDistillSessionContinuity("))
         let pendingUpsert = try XCTUnwrap(source.range(of: "lastEventKind: \"run.pending\""))
-        XCTAssertLessThan(probe.lowerBound, pendingUpsert.lowerBound,
+        XCTAssertLessThan(probeCall.lowerBound, pendingUpsert.lowerBound,
                           "the prior model must be read before this send's pending upsert replaces it")
+        XCTAssertNil(source.range(of: "try? repo.sessionModel("),
+                     "a failed probe must be logged, not silently treated as an unknown model")
     }
 }

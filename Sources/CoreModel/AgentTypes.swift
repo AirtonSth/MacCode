@@ -691,10 +691,19 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     public var contextSnapshot: TokenSaverCanonicalConversationSnapshot?
     /// Prepared RCSEED1 document for a confirmed fresh-fallback destination.
     public var preparedContextSeed: TokenSaverPreparedContextSeed?
-    /// Model the persisted provider session (`providerThreadId`) last ran.
-    /// Runtime-only. Lets Distill detect a cross-family Main switch when it
-    /// must `session/load` that session after an app restart.
+    /// Main model of the last prompt the persisted provider session
+    /// (`providerThreadId`) accepted. Runtime-only. Lets Distill detect a
+    /// cross-family Main switch when it must `session/load` that session after
+    /// an app restart.
     public var priorProviderSessionModel: String?
+    /// The provider rejected the persisted session's history. Runtime-only.
+    /// Distill opens a new session instead of loading it, after a restart too.
+    public var priorProviderSessionRetired: Bool = false
+    /// Newest prior user/assistant messages, oldest first, excluding the current
+    /// prompt. Runtime-only. Set only when Distill must replace the provider
+    /// session; unlike `contextSnapshot` it has no all-or-nothing size limit, so
+    /// a long thread still hands its most recent context to the new session.
+    public var priorConversationTail: [AgentMessage]?
 
     public init(
         runId: AgentRunID = AgentRunID(),
