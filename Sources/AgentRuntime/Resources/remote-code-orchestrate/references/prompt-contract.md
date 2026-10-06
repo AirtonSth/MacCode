@@ -8,9 +8,6 @@ State: 3–6 task-local facts (no full transcript)
 Objective: one bounded outcome
 Ownership: exact writable paths or read-only surface
 Runtime: host, role, model, effort (matrix-bound; do not rechoose)
-Distill: only eligible ordinary tool/command output when Token Saver is active;
-  never Distill skill content; skill bodies must stay complete; do not restate
-  Distill rules in every worker prompt (host/runtime owns that policy)
 No-go: forbidden paths, mutations, unrelated cleanup
 Dependencies: completed task IDs only
 Actions: ordered steps
@@ -27,9 +24,8 @@ Coordination: other agents may share the workspace; never revert their work
 - Do **not** include secrets, hidden context, or a reviewer’s expected answer.
 - State assumptions and residual ambiguity in one short bullet list.
 - Require inspect-before-edit and surgical changes matching repo conventions.
-- Distill only eligible ordinary noisy output when Token Saver is active; never
-  Distill skill/Skill tool content or SKILL bodies — requested/returned skill
-  content must stay complete. Do not require every worker to restate Distill.
+- Never summarize or truncate skill/Skill tool content or SKILL bodies —
+  requested/returned skill content must stay complete.
 - Separate proof the worker runs from proof the controller must re-check.
 - Never ask the worker to expand scope without returning to the controller.
 - Prefer proof: scope diff + one focused command. Summarize logs; never dump them.

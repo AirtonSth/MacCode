@@ -14,21 +14,12 @@ matrix.
 proof, selective review. Spend tokens on verification of artifacts — not on
 re-reading this skill or re-prompting full history into every worker.
 
-**Host Token Saver inheritance:** nested workers inherit the host-provided
-`RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1` and its provider-neutral capability/lane
-environment. Workers never reconstruct or widen admission, disabled lanes,
-Graphify, Distill, recovery scope, or provider attribution. Missing, malformed,
-denied, cross-user, or mismatched receipts remain raw. Prompts, transcripts,
-tool output, and secrets never enter the receipt; Skills and exact-output
-commands remain lossless.
-
 **Use the Agent App middleware for controlled provider workers.** When a worker
 contract can run as a normal Agent App turn, launch it with
 `remote-code agent-app <codex|claude|grok> --prompt-file <path>` (plus the
 required workspace/model/permission/reasoning flags). This creates a real Agent App thread, so the
-child uses the same admitted prompt processing, recovery, eligible command
-output lanes, provider-usage accounting, and live Token Saver refresh as a
-user-started thread. The command is installed beside RemoteCode's own service;
+child uses the same persistence, provider-usage accounting, and live Subagents
+UI as a user-started thread. The command is installed beside RemoteCode's own service;
 do not install a proxy server, SDK, Python, Rust, or another provider runtime.
 
 Bare `grok`, `claude`, or `codex` names still resolve through the host-managed
@@ -37,33 +28,28 @@ contract (Grok 4.5, prompt file, permitted effort, JSON output, workspace
 sandbox, always approve, and its memory/subagent/tool/update guards) is upgraded
 automatically to `remote-code agent-app grok`. Its stdout remains a JSON object
 with the worker report in `text`, while the real Agent App thread/run owns
-persistence, Token Saver processing, provider usage, and the live Subagents UI.
+persistence, provider usage, and the live Subagents UI.
 Any missing, duplicated, aliased, reordered-with-unknown, or additional CLI
 member fails closed to the raw Grok ABI instead of receiving a partial rewrite.
 Other explicit provider CLI contracts remain raw: RemoteCode keeps their
 provider/output ABI, records supported lifecycle and provider-usage telemetry,
 and adds documented runtime-guidance options only for recognized provider
-turns. That raw path does not provide Agent App persistence or prompt
-compression, and telemetry alone is not evidence of token savings. Keep
+turns. That raw path does not provide Agent App persistence. Keep
 specialized read-only/tool-allowlisted contracts raw when the Agent App flags
-cannot express the same boundary. Skills must not invent or widen Token Saver
-admission.
+cannot express the same boundary.
 
 Provider-native collaboration whose child prompt is hidden inside a provider
 SDK cannot be rewritten by a Skill. RemoteCode records its live lifecycle and
-provider-reported usage when available, while eligible shell output continues
-to inherit the parent's admitted runtime. Never label a lifecycle-only child as
-measured savings.
+provider-reported usage when available.
 
 For controlled nested workers that are **not** a bare provider CLI (custom
 scripts, non-provider tools), use the provider-neutral telemetry command around
-the actual lifetime: `${REMOTE_CODE_SUBAGENT_TELEMETRY_COMMAND:-distill}
-subagent begin --node <stable-id>` before spawn and the matching `subagent end
---run-id <id> --status <completed|failed|cancelled>` on terminal exit. The app
-sets `REMOTE_CODE_SUBAGENT_TELEMETRY_COMMAND` to its co-located service even
-when Token Saver is off, so telemetry does not depend on an optimization lane.
-The bridge is provider-neutral and receipt-bound; if it is unavailable, keep the
-worker raw and report that the Subagents row is unproven.
+the actual lifetime: `"$REMOTE_CODE_SUBAGENT_TELEMETRY_COMMAND" subagent begin
+--node <stable-id>` before spawn and the matching `subagent end --run-id <id>
+--status <completed|failed|cancelled>` on terminal exit. The app sets
+`REMOTE_CODE_SUBAGENT_TELEMETRY_COMMAND` to its co-located service. The bridge
+is provider-neutral; if the variable is unset or the bridge is unavailable, keep
+the worker raw and report that the Subagents row is unproven.
 
 ## Non-Negotiable Contract
 
@@ -75,10 +61,8 @@ worker raw and report that the Subagents row is unproven.
   dependencies, pass criteria, required proof, and a bound runtime receipt.
 - Tell every worker that other agents may share the workspace and that it must
   not revert or overwrite unrelated work.
-- Distill applies only to eligible ordinary tool/command output when Token Saver
-  is active. Never Distill skill content: requested/returned skill bodies must
-  stay complete. Do not require every worker prompt to restate Distill rules
-  (host/runtime carries the ordinary-output policy).
+- Never summarize or truncate skill content: requested/returned skill bodies
+  must stay complete.
 - Treat every returned claim as unverified until the controller checks its
   artifact, scope, and proof (diff vs writable paths; one real TARGET proof).
 - Select capability by task risk first. Bind model/effort only from

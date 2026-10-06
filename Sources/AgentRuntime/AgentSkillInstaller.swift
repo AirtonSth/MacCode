@@ -199,10 +199,10 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         skillID: "remote-code-orchestrate",
         sourceURL: "https://github.com/samuelfaj/sam-skills/tree/main/sam-orchestrate",
         // Upstream base revision; tree digest is recomputed from the embedded package
-        // after local contract edits (skill content must stay complete / no Distill-in-skills).
+        // after local contract edits (skill content must stay complete).
         sourceRevision: "2c77fa48431bc20e5dc841652079594a3ea918c9",
-        sourceTreeSHA256: "9d0d615bae2bca280edebfe0ca15bcaf02f2758fbcb8ebd07ee633a988e180b7",
-        localVersion: "9",
+        sourceTreeSHA256: "7819153677e56c9bb9533c5eaa6d6bb420a162bac95267e9bff2fd0a9af907c8",
+        localVersion: "10",
         allowedPaths: [
             "SKILL.md",
             "agents/openai.yaml",
