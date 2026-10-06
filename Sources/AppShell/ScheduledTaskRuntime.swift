@@ -603,54 +603,97 @@ public final class ScheduledTaskExecutor {
 
 }
 
+/// What the scheduler's maintenance pass reads and writes, captured once so the
+/// 30 s tick can run it off the main thread (S-F6). SQLiteDB serializes every
+/// statement behind its operation lock, and the run repository and coordinator
+/// are lock-protected, so the pass may use them from the maintenance queue.
+struct ScheduledTaskSchedulerContext: @unchecked Sendable {
+    let db: SQLiteDB
+    let runRepo: AgentRunRepository
+    let coordinator: AgentRunCoordinator
+}
+
 @MainActor
 public final class ScheduledTaskScheduler {
     /// Legacy name retained for tests; catch-up of missed fires is intentionally disabled.
     public nonisolated static let catchUpWindow: TimeInterval = 0
-    private let store: ScheduledTaskStore
-    private let context: AppContext
+    private nonisolated let store: ScheduledTaskStore
+    private nonisolated let context: ScheduledTaskSchedulerContext
     private let executor: ScheduledTaskExecutor
-    private let owner = UUID().uuidString.lowercased()
+    private nonisolated let owner = UUID().uuidString.lowercased()
     private var tickTask: Task<Void, Never>?
     /// First tick after process start skips every past-due occurrence so reopening
     /// the app never replays work that fired while RemoteCode was closed.
     private var didSkipMissedOnLaunch = false
+    /// Serial queue for the tick's SQLite work. A write can wait out a busy
+    /// writer (busy_timeout plus retries), which must never stall the main thread.
+    private nonisolated static let maintenanceQueue = DispatchQueue(
+        label: "io.remotecode.scheduled-tasks.maintenance",
+        qos: .utility
+    )
 
     public init(context: AppContext, router: AppCommandRouter) {
-        self.context = context
+        self.context = ScheduledTaskSchedulerContext(
+            db: context.db,
+            runRepo: context.runRepo,
+            coordinator: context.coordinator
+        )
         self.store = ScheduledTaskStore(db: context.db)
         self.executor = ScheduledTaskExecutor(context: context, router: router)
     }
 
+    /// The tick in flight, so tests can await its exact completion.
+    var tickTaskForTesting: Task<Void, Never>? { tickTask }
+
     public func tick(now: Date = Date()) {
         guard tickTask == nil else { return }
+        let skipMissedOnLaunch = !didSkipMissedOnLaunch
         tickTask = Task { [weak self] in
             guard let self else { return }
             defer { tickTask = nil }
-            do {
-                if !didSkipMissedOnLaunch {
-                    // Before any heartbeat: finish prior-process orphans and skip
-                    // past-due fires so relaunch cannot pin a lease forever.
-                    try reclaimOrphanedActiveRuns(now: now)
-                    try skipMissedOccurrencesOnLaunch(now: now)
-                    didSkipMissedOnLaunch = true
+            // Every read and write of the pass runs on the maintenance queue;
+            // the main actor only records the launch skip and starts the
+            // claimed runs, because the executor drives the router.
+            let pass = await withCheckedContinuation { continuation in
+                Self.maintenanceQueue.async {
+                    continuation.resume(returning: self.maintain(now: now, skipMissedOnLaunch: skipMissedOnLaunch))
                 }
-                try observeRunning(now: now)
-                _ = try store.recoverStaleLeases(now: now)
-                try reconcileNextRunDates(now: now)
-                // Global travel kill switch — still observe/finish live runs, but
-                // do not claim new automatic occurrences while inactive.
-                let settings = SettingsStore(db: context.db).load()
-                guard settings.scheduledTasksActive else {
-                    scheduledTaskLog.debug("scheduler.tick_skipped global_active=false")
-                    return
-                }
-                let claims = try store.claimDue(now: now, owner: owner)
-                for claim in claims { await execute(claim) }
-            } catch {
-                scheduledTaskLog.error("scheduler.tick_failed error=\(error.localizedDescription, privacy: .public)")
             }
+            if pass.skippedMissedOnLaunch { didSkipMissedOnLaunch = true }
+            for claim in pass.claims { await execute(claim) }
         }
+    }
+
+    private struct MaintenancePass: Sendable {
+        var skippedMissedOnLaunch = false
+        var claims: [ScheduledTaskClaim] = []
+    }
+
+    nonisolated private func maintain(now: Date, skipMissedOnLaunch: Bool) -> MaintenancePass {
+        var pass = MaintenancePass()
+        do {
+            if skipMissedOnLaunch {
+                // Before any heartbeat: finish prior-process orphans and skip
+                // past-due fires so relaunch cannot pin a lease forever.
+                try reclaimOrphanedActiveRuns(now: now)
+                try skipMissedOccurrencesOnLaunch(now: now)
+                pass.skippedMissedOnLaunch = true
+            }
+            try observeRunning(now: now)
+            _ = try store.recoverStaleLeases(now: now)
+            try reconcileNextRunDates(now: now)
+            // Global travel kill switch — still observe/finish live runs, but
+            // do not claim new automatic occurrences while inactive.
+            let settings = SettingsStore(db: context.db).load()
+            guard settings.scheduledTasksActive else {
+                scheduledTaskLog.debug("scheduler.tick_skipped global_active=false")
+                return pass
+            }
+            pass.claims = try store.claimDue(now: now, owner: owner)
+        } catch {
+            scheduledTaskLog.error("scheduler.tick_failed error=\(error.localizedDescription, privacy: .public)")
+        }
+        return pass
     }
 
     public func runNow(
@@ -733,7 +776,7 @@ public final class ScheduledTaskScheduler {
 
     /// Finish scheduled runs left from a previous process (force-quit / crash).
     /// In-process ownership means there is no foreign LaunchAgent to preserve.
-    private func reclaimOrphanedActiveRuns(now: Date) throws {
+    nonisolated private func reclaimOrphanedActiveRuns(now: Date) throws {
         for run in try store.listActiveRuns() {
             if let threadID = run.threadID {
                 let hasLocalSession = context.coordinator.hasProviderSession(threadId: threadID)
@@ -794,7 +837,7 @@ public final class ScheduledTaskScheduler {
     /// On cold start / reopen: advance every past-due `next_run_at` to the next
     /// future occurrence without creating a run. Missed fires are intentionally
     /// ignored — schedules only run while RemoteCode is open.
-    private func skipMissedOccurrencesOnLaunch(now: Date) throws {
+    nonisolated private func skipMissedOccurrencesOnLaunch(now: Date) throws {
         for task in try store.list() where task.isEnabled {
             guard let due = task.nextRunAt, due < now else { continue }
             let future = task.calculatedNextRun(after: now)
@@ -810,7 +853,7 @@ public final class ScheduledTaskScheduler {
         }
     }
 
-    private func observeRunning(now: Date) throws {
+    nonisolated private func observeRunning(now: Date) throws {
         for run in try store.listActiveRuns() where run.status == .running {
             try store.heartbeat(runID: run.id, at: now)
             guard let agentRunID = run.agentRunID else { continue }
@@ -846,12 +889,12 @@ public final class ScheduledTaskScheduler {
         }
     }
 
-    private func notifyFailure(for run: ScheduledTaskRun) {
+    nonisolated private func notifyFailure(for run: ScheduledTaskRun) {
         let title = (try? store.get(id: run.taskID))?.title ?? "Scheduled task"
         SystemNotifier.shared.post(title: "Scheduled task failed", body: title, category: nil)
     }
 
-    private func reconcileNextRunDates(now: Date) throws {
+    nonisolated private func reconcileNextRunDates(now: Date) throws {
         for task in try store.list() where task.isEnabled {
             let reconciled = Self.reconciledDueDate(task: task, now: now)
             if reconciled != task.nextRunAt {

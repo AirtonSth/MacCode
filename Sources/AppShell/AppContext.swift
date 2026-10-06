@@ -6282,6 +6282,68 @@ public final class AppContext {
 
     @discardableResult
     public func reapIdleProviderSessions(now: Date = Date(), idleAge: TimeInterval = 6 * 60 * 60) throws -> ProviderSessionReaperResult {
+        try Self.reapIdleProviderSessions(
+            threadRepo: threadRepo,
+            providerSessionRuntimeRepo: providerSessionRuntimeRepo,
+            providerPendingCallbackRepo: providerPendingCallbackRepo,
+            coordinator: coordinator,
+            now: now,
+            idleAge: idleAge
+        )
+    }
+
+    /// Serial queue for the 30 s idle-session reaper (S-F6). Its SQLite reads
+    /// and writes can wait out a busy writer, and releasing a session tears down
+    /// a provider process tree, so none of it may run on the main thread.
+    let providerSessionReaperQueue = DispatchQueue(
+        label: "io.remotecode.app.provider-session-reaper",
+        qos: .utility
+    )
+    private var providerSessionReapInFlight = false
+
+    /// Runs the reap on `providerSessionReaperQueue` and hops back to the main
+    /// actor only to hand over the result. A tick that lands while the previous
+    /// reap is still running is dropped (returns false): the next tick rescans
+    /// everything, so nothing is lost and two reaps never race each other.
+    @discardableResult
+    public func reapIdleProviderSessionsOffMain(
+        now: Date = Date(),
+        idleAge: TimeInterval,
+        completion: @escaping @MainActor (Result<ProviderSessionReaperResult, Error>) -> Void
+    ) -> Bool {
+        guard !providerSessionReapInFlight else { return false }
+        providerSessionReapInFlight = true
+        let threadRepo = threadRepo
+        let sessionRepo = providerSessionRuntimeRepo
+        let pendingCallbackRepo = providerPendingCallbackRepo
+        let coordinator = coordinator
+        providerSessionReaperQueue.async {
+            let result = Result {
+                try Self.reapIdleProviderSessions(
+                    threadRepo: threadRepo,
+                    providerSessionRuntimeRepo: sessionRepo,
+                    providerPendingCallbackRepo: pendingCallbackRepo,
+                    coordinator: coordinator,
+                    now: now,
+                    idleAge: idleAge
+                )
+            }
+            Task { @MainActor in
+                self.providerSessionReapInFlight = false
+                completion(result)
+            }
+        }
+        return true
+    }
+
+    nonisolated private static func reapIdleProviderSessions(
+        threadRepo: AgentThreadRepository,
+        providerSessionRuntimeRepo: ProviderSessionRuntimeRepository,
+        providerPendingCallbackRepo: ProviderPendingCallbackRepository,
+        coordinator: AgentRunCoordinator,
+        now: Date,
+        idleAge: TimeInterval
+    ) throws -> ProviderSessionReaperResult {
         let cutoff = now.addingTimeInterval(-idleAge)
         let activeThreadIds = try threadRepo.runningThreadIds()
         let liveSessions = coordinator.liveProviderSessions()

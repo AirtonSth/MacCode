@@ -1027,16 +1027,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         windowController?.repairSelectedTerminalFocus(reason: "app_active")
     }
 
+    /// S-F6: the scan, the DB writes and the process teardown run on the
+    /// reaper queue; the main thread only logs the outcome.
     private func reapIdleProviderSessions() {
-        do {
-            let result = try context.reapIdleProviderSessions(
-                idleAge: managedProcessMemoryProfile.idleReleaseAge
-            )
-            if !result.stoppedThreadIds.isEmpty || !result.cappedThreadIds.isEmpty {
-                NSLog("Stopped \(result.stoppedThreadIds.count) idle provider session runtime(s); released \(result.cappedThreadIds.count) over the resident cap of \(ProviderSessionReaper.providerRootCap).")
+        context.reapIdleProviderSessionsOffMain(
+            idleAge: managedProcessMemoryProfile.idleReleaseAge
+        ) { outcome in
+            switch outcome {
+            case .success(let result):
+                if !result.stoppedThreadIds.isEmpty || !result.cappedThreadIds.isEmpty {
+                    NSLog("Stopped \(result.stoppedThreadIds.count) idle provider session runtime(s); released \(result.cappedThreadIds.count) over the resident cap of \(ProviderSessionReaper.providerRootCap).")
+                }
+            case .failure(let error):
+                NSLog("Failed to reap idle provider sessions: \(error)")
             }
-        } catch {
-            NSLog("Failed to reap idle provider sessions: \(error)")
         }
     }
 
