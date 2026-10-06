@@ -142,6 +142,22 @@ public enum DistillGuestConfig {
         return Rendered(toml: out, secretEnvironment: secrets, droppedModels: droppedModels)
     }
 
+    /// `[models] default` of a host config.
+    static func defaultModel(hostConfig: String) -> String? {
+        parse(hostConfig).first { $0.path == ["models"] }?
+            .entries.first { $0.key == ["default"] }
+            .flatMap { stringValue($0.text) }
+    }
+
+    /// The `base_url` of a host `[model.<id>]` table and whether the table
+    /// names its own key; nil when the config defines no such model.
+    static func modelEndpoint(id: String, hostConfig: String) -> (baseURL: String?, hasOwnKey: Bool)? {
+        guard let table = parse(hostConfig).first(where: { $0.path == ["model", id] }) else { return nil }
+        let baseURL = table.entries.first { $0.key == ["base_url"] }.flatMap { stringValue($0.text) }
+        let hasOwnKey = table.entries.contains { $0.key == ["api_key"] || $0.key == ["env_key"] }
+        return (baseURL, hasOwnKey)
+    }
+
     // MARK: - Which tables survive
 
     private enum Group: Hashable {
