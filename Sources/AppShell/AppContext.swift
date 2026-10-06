@@ -1,6 +1,5 @@
 import Foundation
 import AppKit
-import NaturalLanguage
 import CoreModel
 import Persistence
 import AgentRuntime
@@ -4706,38 +4705,6 @@ public final class AppContext {
         }
     }
 
-    /// One-sentence Live Activity description, generated on-device.
-    ///
-    /// Returns nil whenever the local model cannot be used or does not produce
-    /// usable prose — the caller then keeps its deterministic preview, so the
-    /// Lock Screen never degrades because the model was busy, gated, or slow.
-    /// Uses the local natural-language mode; wire rendering is reserved for
-    /// provider responses that carry the exact RCW1 sentinel.
-    ///
-    /// No provider tokens are spent: this is the local Token Saver sidecar.
-    func liveActivityDescriptionSummary(
-        source: LiveActivitySummary.Source,
-        threadId: AgentThreadID?
-    ) async -> String? {
-        guard isTokenSaverRuntimeActive() else { return nil }
-        guard let client = currentDistillClient() else { return nil }
-
-        let targetLanguage = threadId.map { inferredUserLanguageIdentifier(threadId: $0) } ?? "en"
-        let request = DistillRequest(
-            mode: .naturalLanguage,
-            priority: .background,
-            input: LiveActivitySummary.prompt(source: source, targetLanguage: targetLanguage),
-            maxOutputCharacters: LiveActivitySummary.maximumCharacters * 2
-        )
-        do {
-            let output = try await client.distill(request).output
-            return LiveActivitySummary.sanitized(output, source: source)
-        } catch {
-            NSLog("RemoteCode Live Activity summary skipped: \(error)")
-            return nil
-        }
-    }
-
     func tokenSaverRenderWireResponse(_ response: String, provider _: AgentProvider, threadId _: AgentThreadID, runId _: AgentRunID? = nil) async -> String {
         guard RCWireProtocol.isWire(response) else {
             return response
@@ -4772,41 +4739,7 @@ public final class AppContext {
         }
     }
 
-    private func inferredUserLanguageIdentifier(threadId: AgentThreadID) -> String {
-        let recent = (try? messageRepo.listRecent(threadId: threadId, limit: 20)) ?? []
-        let latestUserText = recent.last(where: { $0.role == .user })?.content ?? ""
-        return Self.inferredUserLanguageIdentifier(
-            text: latestUserText,
-            preferredLanguages: Locale.preferredLanguages
-        )
-    }
-
-    static func inferredUserLanguageIdentifier(
-        text: String,
-        preferredLanguages: [String]
-    ) -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if looksPortuguese(trimmed) { return "pt-BR" }
-        if looksSpanish(trimmed) { return "es" }
-        if !trimmed.isEmpty,
-           let language = NLLanguageRecognizer.dominantLanguage(for: trimmed),
-           language != .undetermined {
-            return language.rawValue
-        }
-        if let preferred = preferredLanguages.first?
-            .replacingOccurrences(of: "_", with: "-")
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !preferred.isEmpty,
-           preferred.utf8.count <= 35,
-           preferred.unicodeScalars.allSatisfy({
-               CharacterSet.alphanumerics.contains($0) || $0.value == 45
-           }) {
-            return preferred
-        }
-        return "en"
-    }
-
-    // PERF: language sniff for wire rendering/Live Activity recompiled character-class
+    // PERF: language sniff for wire rendering recompiled character-class
     // regexes per call. CharacterSet membership is O(n) over scalars without
     // regex compile (same accent/marker contract as before).
     private static let portugueseAccentScalars = CharacterSet(charactersIn: "áàâãçéêíóôõú")

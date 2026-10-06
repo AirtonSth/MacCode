@@ -31,10 +31,11 @@ final class AgentChatPeerChromeTests: XCTestCase {
         let row = source.range(of: "private func messageRow")
         let slice = String(source[row!.lowerBound...])
         let parse = slice.range(of: "BotPeerTranscript.parse(msg.content)")
-        let badge = slice.range(of: "showsTokenSaverOptimizedBadge")
+        let plainFallback = slice.range(of: "BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content)")
         XCTAssertNotNil(parse)
-        XCTAssertNotNil(badge)
-        XCTAssertLessThan(parse!.lowerBound, badge!.lowerBound)
+        XCTAssertNotNil(plainFallback)
+        XCTAssertLessThan(parse!.lowerBound, plainFallback!.lowerBound,
+                          "peer replies must be parsed before the plain assistant fallback paints them")
     }
 
     func test_resolvedPeerAvatarUsesLiveBotWhenEncodedSymbolIsEmpty() {

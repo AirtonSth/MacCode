@@ -255,27 +255,26 @@ final class ToolRowPresentationTests: XCTestCase {
         )
     }
 
-    func test_toolCommandSummary_prefersLastCommandAndStripsDistill() {
-        // WHY: collapsed L2 must show the intent (`git push`), not cd + distill wrapper —
-        // and must advertise elision (`+N more`) without claiming that syntax alone
-        // proves Token Saver actually transformed the output.
+    func test_toolCommandSummary_prefersLastCommandAndShowsLegacyDistillPipe() {
+        // WHY: collapsed L2 must show the intent (`git push`), not the `cd` setup,
+        // and must advertise elision (`+N more`). Token Saver was removed, so a
+        // `| distill` pipe in an old transcript is no longer hidden: the row shows
+        // the command that actually ran.
         let item = toolItem(
             body: #"{"command":"cd /Users/samuelfajreldines/dev/pamela-studio && git push origin production 2>&1 | distill \"push success or failure reason\""}"#,
             summary: "Bash"
         )
         let summary = AgentTimelineItemPresentation.toolCommandSummary(for: item)
-        XCTAssertEqual(summary, "git push origin production · +2 more")
-        XCTAssertFalse(AgentTimelineItemPresentation.toolCommandWasDistilled(for: item),
-                       "an explicit pipe is intent, not proof that Distill applied")
+        XCTAssertEqual(summary, "git push origin production 2>&1 | distill \"push success or failure reason\" · +1 more")
         let full = AgentTimelineItemPresentation.rawShellCommand(for: item)
         XCTAssertTrue(full?.contains("distill") == true,
                       "full preview retains the real command for expand/copy")
         XCTAssertNotEqual(summary, full)
     }
 
-    func test_toolCommandWasDistilled_requiresHostTruthAndHidesTrustedReceipt() {
-        // WHY: output is provider-controlled. A syntactically valid receipt may
-        // only affect UI after the host verifier has persisted explicit truth.
+    func test_cappedDetail_stripsAppliedReceiptOnlyWithHostTruth() {
+        // WHY: output is provider-controlled. A syntactically valid receipt from an
+        // older build may only be hidden when the host persisted explicit truth.
         let receipt = DistillAppliedReceipt.makeMarker()
         let rawOutput = "important lines\n\(receipt)"
         let spoofed = toolItem(
@@ -283,7 +282,6 @@ final class ToolRowPresentationTests: XCTestCase {
             summary: "Bash",
             output: rawOutput
         )
-        XCTAssertFalse(AgentTimelineItemPresentation.toolCommandWasDistilled(for: spoofed))
         XCTAssertEqual(AgentTimelineItemPresentation.cappedDetail(rawOutput, for: spoofed), rawOutput,
                        "untrusted protocol-looking text must remain visible")
 
@@ -294,16 +292,14 @@ final class ToolRowPresentationTests: XCTestCase {
             distillApplied: true
         )
 
-        XCTAssertFalse(item.body.contains("| distill"))
-        XCTAssertTrue(AgentTimelineItemPresentation.toolCommandWasDistilled(for: item))
         XCTAssertEqual(item.output, rawOutput, "the canonical tool output must retain its receipt")
         let rendered = AgentTimelineItemPresentation.cappedDetail(rawOutput, for: item)
         XCTAssertEqual(rendered, "important lines")
         XCTAssertFalse(rendered.contains(receipt), "the applied marker is protocol metadata, not transcript copy")
     }
 
-    func test_toolCommandWasDistilled_ignoresMalformedAppliedReceipt() {
-        // WHY: arbitrary or truncated output must not spoof the user-visible badge.
+    func test_cappedDetail_keepsMalformedAppliedReceiptVisible() {
+        // WHY: arbitrary or truncated output must not be silently consumed.
         let malformed = String(DistillAppliedReceipt.makeMarker().dropLast())
         let item = toolItem(
             body: #"{"command":"printf hello"}"#,
@@ -311,7 +307,6 @@ final class ToolRowPresentationTests: XCTestCase {
             output: "hello\n\(malformed)"
         )
 
-        XCTAssertFalse(AgentTimelineItemPresentation.toolCommandWasDistilled(for: item))
         XCTAssertEqual(
             AgentTimelineItemPresentation.cappedDetail(item.output ?? "", for: item),
             item.output,
@@ -319,7 +314,7 @@ final class ToolRowPresentationTests: XCTestCase {
         )
     }
 
-    func test_toolCommandWasDistilled_doesNotTrustScopedRecoveryHandle() {
+    func test_cappedDetail_keepsUntrustedRecoveryHandleVisible() {
         // WHY: recovery handles are provider-visible text, not host attestation.
         let item = toolItem(
             body: #"{"command":"ls -la /usr/bin"}"#,
@@ -327,7 +322,6 @@ final class ToolRowPresentationTests: XCTestCase {
             output: "important lines\n[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]"
         )
 
-        XCTAssertFalse(AgentTimelineItemPresentation.toolCommandWasDistilled(for: item))
         XCTAssertEqual(
             AgentTimelineItemPresentation.cappedDetail(item.output ?? "", for: item),
             item.output,
@@ -335,31 +329,9 @@ final class ToolRowPresentationTests: XCTestCase {
         )
     }
 
-    func test_toolCommandWasDistilled_ignoresMalformedRecoveryMarker() {
-        // WHY: arbitrary tool output must not be able to spoof the Distilled badge.
-        let item = toolItem(
-            body: #"{"command":"printf hello"}"#,
-            summary: "Bash",
-            output: "hello [[rc:rcv1.not-a-capability]]"
-        )
-
-        XCTAssertFalse(AgentTimelineItemPresentation.toolCommandWasDistilled(for: item))
-    }
-
-    func test_toolCommandWasDistilled_ignoresUnscopedLegacyRecoveryHandle() {
-        // WHY: old unscoped handles are sanitized from final prose but are not
-        // trustworthy evidence that this specific tool invocation was distilled.
-        let item = toolItem(
-            body: #"{"command":"printf hello"}"#,
-            summary: "Bash",
-            output: "hello [[rc:deadbeef]]"
-        )
-
-        XCTAssertFalse(AgentTimelineItemPresentation.toolCommandWasDistilled(for: item))
-    }
-
-    func test_toolCommandWasDistilled_survivesAssistantItemCodableReplay() throws {
-        // WHY: persisted host truth, not provider output parsing, must survive relaunch.
+    func test_appliedReceiptStripSurvivesAssistantItemCodableReplay() throws {
+        // WHY: persisted host truth from an older build, not provider output
+        // parsing, must keep its legacy receipt hidden after relaunch.
         let receipt = DistillAppliedReceipt.makeMarker()
         let rawOutput = "replayed output\n\(receipt)"
         let original = toolItem(
@@ -373,13 +345,12 @@ final class ToolRowPresentationTests: XCTestCase {
         let replayed = try JSONDecoder().decode(AssistantItem.self, from: data)
 
         XCTAssertEqual(replayed.output, rawOutput)
-        XCTAssertTrue(AgentTimelineItemPresentation.toolCommandWasDistilled(for: replayed))
         XCTAssertEqual(AgentTimelineItemPresentation.cappedDetail(rawOutput, for: replayed), "replayed output")
     }
 
-    func test_trustedLongCompletedOutputKeepsBadgeAfterLiveHeadCapDropsReceipt() {
+    func test_liveRenderableCopyKeepsHostTruthAfterHeadCapDropsReceipt() {
         // WHY: completed output is head-capped for live paint, so a trailing
-        // receipt disappears. The badge must ride host metadata, not visible text.
+        // receipt disappears. The strip decision must ride host metadata, not visible text.
         let receipt = DistillAppliedReceipt.makeMarker()
         let output = String(repeating: "x", count: AgentAppView.liveTurnOutputCharacterLimit + 100)
             + "\n\(receipt)"
@@ -394,7 +365,6 @@ final class ToolRowPresentationTests: XCTestCase {
         XCTAssertFalse(live.output?.contains(receipt) == true,
                        "fixture must exercise the completed-output head cap")
         XCTAssertEqual(live.distillApplied, true)
-        XCTAssertTrue(AgentTimelineItemPresentation.toolCommandWasDistilled(for: live))
     }
 
     func test_toolCommandPreview_humanizesTaskTimeoutPayload() {

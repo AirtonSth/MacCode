@@ -44,8 +44,7 @@ public enum AgentChatTranscriptChrome {
 
     /// User-visible transcript line. Image attachments always render as
     /// `[Image #1]`, `[Image #2]`, … — the same marker Agent App and Desk
-    /// must show, including after Token Saver Human/RCW1 toggles. Non-image
-    /// files keep the 📎 name suffix.
+    /// must show. Non-image files keep the 📎 name suffix.
     public static func displayUserLine(text: String, attachments: [AgentAttachment]) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let decorations = attachmentDecorations(attachments)
@@ -90,18 +89,6 @@ public enum AgentChatTranscriptChrome {
         return result
     }
 
-    /// Keep `[Image #N]` visible when Token Saver RCW1 replaces the human body
-    /// with wire bytes that never carried the marker.
-    public static func preservingImageMarkers(in display: String, source: String) -> String {
-        let markers = imageMarkers(in: source)
-        guard !markers.isEmpty else { return display }
-        var result = display
-        for marker in markers where !result.contains(marker) {
-            result = result.isEmpty ? marker : result + "\n\n" + marker
-        }
-        return result
-    }
-
     public static func isImageAttachment(_ attachment: AgentAttachment) -> Bool {
         if attachment.kind == .image { return true }
         return isImagePath(attachment.path) || isImagePath(attachment.displayName)
@@ -127,23 +114,6 @@ public enum AgentChatTranscriptChrome {
             decorations.append("📎 " + fileNames.joined(separator: ", "))
         }
         return decorations
-    }
-
-    static func imageMarkers(in text: String) -> [String] {
-        guard text.contains("[Image #") else { return [] }
-        var markers: [String] = []
-        var search = text.startIndex
-        while search < text.endIndex,
-              let start = text[search...].range(of: "[Image #") {
-            let after = start.upperBound
-            guard let close = text[after...].firstIndex(of: "]") else { break }
-            let number = text[after..<close]
-            if !number.isEmpty, number.allSatisfy(\.isNumber) {
-                markers.append(String(text[start.lowerBound...close]))
-            }
-            search = text.index(after: close)
-        }
-        return markers
     }
 
     public static func admitsSend(text: String, attachmentCount: Int) -> Bool {
@@ -310,7 +280,6 @@ public struct AgentChatUserBubble: View, Equatable {
     public var roleIdentifier: String = "bots.desk.role.user"
     public var copyIdentifier: String? = nil
     public var header: AnyView? = nil
-    public var belowBubble: AnyView? = nil
 
     public init(
         text: String,
@@ -320,8 +289,7 @@ public struct AgentChatUserBubble: View, Equatable {
         accessibilityIdentifier: String = "agent.userMessageBubble",
         roleIdentifier: String = "bots.desk.role.user",
         copyIdentifier: String? = nil,
-        header: AnyView? = nil,
-        belowBubble: AnyView? = nil
+        header: AnyView? = nil
     ) {
         self.text = text
         self.createdAt = createdAt
@@ -331,7 +299,6 @@ public struct AgentChatUserBubble: View, Equatable {
         self.roleIdentifier = roleIdentifier
         self.copyIdentifier = copyIdentifier
         self.header = header
-        self.belowBubble = belowBubble
     }
 
     public var body: some View {
@@ -349,10 +316,6 @@ public struct AgentChatUserBubble: View, Equatable {
                 bubbleLabel(textWidth: textWidth)
                     .frame(maxWidth: bubbleMax, alignment: .trailing)
                     .accessibilityIdentifier(accessibilityIdentifier)
-                if let belowBubble {
-                    belowBubble
-                        .frame(maxWidth: bubbleMax, alignment: .trailing)
-                }
                 HStack(spacing: DS.Space.xs) {
                     Button {
                         AgentChatTranscriptChrome.copyToPasteboard(text)
@@ -394,7 +357,6 @@ public struct AgentChatUserBubble: View, Equatable {
             && lhs.roleIdentifier == rhs.roleIdentifier
             && lhs.copyIdentifier == rhs.copyIdentifier
             && (lhs.header != nil) == (rhs.header != nil)
-            && (lhs.belowBubble != nil) == (rhs.belowBubble != nil)
     }
 
     private func bubbleLabel(textWidth: CGFloat) -> some View {

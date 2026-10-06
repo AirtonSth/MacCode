@@ -20,20 +20,6 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         func stop() {}
     }
 
-    func test_localUsageLabelNamesProvidersAndMeasuredTokenDeltas() {
-        let now = Date()
-        let update = SidebarViewModel.TokenSaverLocalUsageUpdate(
-            providerTokenDeltas: [.grok: 1_200, .codex: 800],
-            updatedAt: now
-        )
-
-        XCTAssertEqual(
-            SidebarRootView.localUsageUpdateLabel(update, now: now),
-            "Local usage · Codex +800, Grok +1.2K tokens · just now",
-            "WHY: cross-provider work must remain visible even when rounded account percentages do not move"
-        )
-    }
-
     func test_accountRefreshLabelCannotBeMistakenForLocalRunActivity() {
         let now = Date()
 
@@ -48,11 +34,10 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         )
     }
 
-    func test_usageChangedNotificationPublishesProviderLocalDeltaWithoutClaimingSavings() async throws {
+    func test_usageChangedNotificationRefreshesLocalUsageWithoutStampingAccountRefresh() async throws {
         let (context, viewModel, appSupport) = try makeViewModel()
         defer { try? FileManager.default.removeItem(at: appSupport) }
-        await viewModel.reloadTokenSaverAndWait()
-        XCTAssertNil(viewModel.tokenSaverLocalUsageUpdate)
+        await viewModel.reloadAccountUsageAndWait()
 
         _ = try TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).record(
             provider: .grok,
@@ -63,22 +48,23 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
 
         let refreshed = await waitUntil {
-            viewModel.tokenSaverLocalUsageUpdate?.totalTokenDelta == 321
+            viewModel.accountUsageSnapshot.providers
+                .first(where: { $0.provider == .grok })?
+                .actualProviderTokens == 321
         }
-        XCTAssertTrue(refreshed)
-        XCTAssertEqual(viewModel.tokenSaverLocalUsageUpdate?.providerTokenDeltas[.grok], 321)
-        XCTAssertEqual(viewModel.tokenSaverUsageSnapshot.measuredSavedTokens, 0)
+        XCTAssertTrue(refreshed, "WHY: the sidebar's \"Used …\" figure must follow local provider usage")
+        XCTAssertEqual(viewModel.accountUsageSnapshot.usedTokens, 321)
         XCTAssertNil(
-            viewModel.tokenSaverAccountUsageLastUpdated,
+            viewModel.accountUsageLastUpdated,
             "WHY: a local provider token event must not masquerade as a completed account-usage refresh"
         )
     }
 
-    /// WHY: opening the Token Saver details popover stamps "Account usage
+    /// WHY: opening the account-usage details popover stamps "Account usage
     /// updated just now" when the provider probe finishes. The probe used to
     /// treat ANY `rc2TokenSaverUsageChanged` as that completion, but local
     /// paths post the same notification (`savings_recorded` during a run, the
-    /// enable/disable toggle) without querying a provider — so the popover
+    /// enable/disable toggle of older builds) without querying a provider — so the popover
     /// asserted a fresh account query that was still in flight.
     func test_detailsProbe_ignoresLocalUsageNotificationWhileProbeIsInFlight() async throws {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -111,39 +97,39 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         )
         viewModel.reload()
         XCTAssertNotNil(viewModel.privateAccountUser, "probe precondition: a signed-in account")
-        XCTAssertNil(viewModel.tokenSaverAccountUsageLastUpdated, "probe precondition: nothing stamped yet")
+        XCTAssertNil(viewModel.accountUsageLastUpdated, "probe precondition: nothing stamped yet")
 
-        viewModel.refreshTokenSaverAccountUsageForDetails()
-        XCTAssertTrue(viewModel.tokenSaverAccountUsageIsRefreshing)
+        viewModel.refreshAccountUsageForDetails()
+        XCTAssertTrue(viewModel.accountUsageIsRefreshing)
         // The probe registers its one-shot observer from a MainActor Task, so
         // wait for the gated provider call before posting: a notification sent
         // before registration would be missed and prove nothing.
         let probeInFlight = await waitUntilAsync { await refresher.hasStarted() }
         XCTAssertTrue(probeInFlight, "the provider probe must be running before the local event is posted")
 
-        // A local savings_recorded event (or the enable toggle) posts the same
+        // A local usage event posts the same
         // notification the probe used to accept as completion.
         NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
         try? await Task.sleep(nanoseconds: 300_000_000)
 
         XCTAssertNil(
-            viewModel.tokenSaverAccountUsageLastUpdated,
+            viewModel.accountUsageLastUpdated,
             "WHY: a local usage event must not stamp the account-usage timestamp while the provider probe is still running"
         )
 
         await refresher.release()
-        let settled = await waitUntil { viewModel.tokenSaverAccountUsageLastUpdated != nil }
+        let settled = await waitUntil { viewModel.accountUsageLastUpdated != nil }
         XCTAssertTrue(settled, "the probe must stamp freshness once the real provider refresh finishes")
         XCTAssertFalse(
-            viewModel.tokenSaverAccountUsageIsRefreshing,
+            viewModel.accountUsageIsRefreshing,
             "the spinner must stop on the real settle, not on a local usage event"
         )
     }
 
-    func test_accountOnlyNotificationDoesNotInventLocalProviderActivity() async throws {
+    func test_accountUsageNotificationRefreshesProviderPercentages() async throws {
         let (context, viewModel, appSupport) = try makeViewModel()
         defer { try? FileManager.default.removeItem(at: appSupport) }
-        await viewModel.reloadTokenSaverAndWait()
+        await viewModel.reloadAccountUsageAndWait()
 
         _ = try TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).recordAccountUsage(
             provider: .claude,
@@ -152,24 +138,24 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
 
         let refreshed = await waitUntil {
-            viewModel.tokenSaverUsageSnapshot.providers
+            viewModel.accountUsageSnapshot.providers
                 .first(where: { $0.provider == .claude })?
                 .weeklyUsedPercent == 27
         }
-        XCTAssertTrue(refreshed)
-        XCTAssertNil(
-            viewModel.tokenSaverLocalUsageUpdate,
+        XCTAssertTrue(refreshed, "WHY: a provider account refresh must reach the sidebar without reopening it")
+        XCTAssertEqual(
+            viewModel.accountUsageSnapshot.usedTokens,
+            0,
             "WHY: an account percentage refresh changes no locally observed provider-token total"
         )
     }
 
-    /// WHY: usage-changed fires during agent runs. Rewriting equal
-    /// tokenSaverEnabled / snapshot @Published values rebuilt the always-on
-    /// sidebar and pushed a widget digest with a new timestamp.
+    /// WHY: usage-changed fires during agent runs. Rewriting an equal
+    /// snapshot @Published value rebuilt the always-on sidebar.
     func test_unchangedUsageReload_doesNotPublishSidebar() async throws {
         let (_, viewModel, appSupport) = try makeViewModel()
         defer { try? FileManager.default.removeItem(at: appSupport) }
-        await viewModel.reloadTokenSaverAndWait()
+        await viewModel.reloadAccountUsageAndWait()
 
         var publishes = 0
         let sub = viewModel.objectWillChange.sink { publishes += 1 }
@@ -181,7 +167,7 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
         XCTAssertEqual(
             publishes,
             0,
-            "equal flags/snapshot must not invalidate the sidebar on a usage notification"
+            "an equal snapshot must not invalidate the sidebar on a usage notification"
         )
     }
 
@@ -280,35 +266,6 @@ final class TokenSaverLocalUsageSignalTests: XCTestCase {
             context.tokenSaverDailyEconomySharedSnapshotLoadsForTesting,
             1,
             "7-day heal must share one settings+usage.json snapshot, not load per day"
-        )
-    }
-
-    /// WHY: AppContext already recomputes today before posting usage-changed.
-    /// Reloading the sidebar snapshot must not stall MainActor on another
-    /// 7-day settings+usage walk — historical days are unchanged by this event.
-    func test_usageChangedNotification_doesNotRehealSevenDayWindow() async throws {
-        let (context, viewModel, appSupport) = try makeViewModel()
-        defer { try? FileManager.default.removeItem(at: appSupport) }
-        let healsAfterInit = viewModel.tokenSaverEconomyWindowHealCountForTesting
-        XCTAssertGreaterThanOrEqual(healsAfterInit, 1, "boot must heal the week once")
-
-        _ = try TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).record(
-            provider: .claude,
-            actualProviderTokens: 10,
-            estimatedRawTokens: 10,
-            eligibleRuns: 1
-        )
-        NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
-
-        let refreshed = await waitUntil {
-            viewModel.tokenSaverUsageSnapshot.providers
-                .contains(where: { $0.provider == .claude && $0.actualProviderTokens >= 10 })
-        }
-        XCTAssertTrue(refreshed)
-        XCTAssertEqual(
-            viewModel.tokenSaverEconomyWindowHealCountForTesting,
-            healsAfterInit,
-            "usage notification must not re-run the 7-day economy heal"
         )
     }
 

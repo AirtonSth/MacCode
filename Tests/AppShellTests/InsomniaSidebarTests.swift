@@ -52,19 +52,12 @@ final class InsomniaSidebarTests: XCTestCase {
         }
     }
 
-    private final class DownloadProbe {
-        var started = false
-    }
-
     private func make(
         dir: String = NSTemporaryDirectory() + "RC2Insomnia-" + UUID().uuidString,
         seedSettings: AppSettings? = nil,
         power: FakeInsomniaPowerManager = FakeInsomniaPowerManager(),
         powerMonitor: ExternalPowerMonitoring = FakeExternalPowerMonitor(),
         insomniaBatteryPrompt: @escaping SidebarViewModel.InsomniaBatteryPrompt = { .keepEnabled },
-        tokenSaverModelValidationProvider: SidebarViewModel.TokenSaverModelValidationProvider? = nil,
-        tokenSaverModelDownloadHandler: SidebarViewModel.TokenSaverModelDownloadHandler? = nil,
-        tokenSaverDownloadConfirmProvider: SidebarViewModel.TokenSaverDownloadConfirmProvider? = { _, _ in true },
         operationErrorPresenter: @escaping SidebarViewModel.OperationErrorPresenter = { _, _ in }
     ) throws -> (AppContext, AppCommandRouter, SidebarViewModel, FakeInsomniaPowerManager) {
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
@@ -79,9 +72,6 @@ final class InsomniaSidebarTests: XCTestCase {
             insomniaPower: power,
             powerMonitor: powerMonitor,
             insomniaBatteryPrompt: insomniaBatteryPrompt,
-            tokenSaverModelValidationProvider: tokenSaverModelValidationProvider,
-            tokenSaverModelDownloadHandler: tokenSaverModelDownloadHandler,
-            tokenSaverDownloadConfirmProvider: tokenSaverDownloadConfirmProvider,
             operationErrorPresenter: operationErrorPresenter
         )
         return (ctx, router, vm, power)
@@ -99,63 +89,14 @@ final class InsomniaSidebarTests: XCTestCase {
         return condition()
     }
 
-    private func savePrivateSession(in ctx: AppContext, subscribed: Bool) {
-        let user = PrivateAccountUser(
-            daysRemaing: nil,
-            daysRemaining: 30,
-            email: subscribed ? "paid@example.com" : "unpaid@example.com",
-            id: subscribed ? "paid-user" : "unpaid-user",
-            subscribed: subscribed
-        )
-        PrivateAccountSessionStore(repo: ctx.settingsRepo).save(PrivateAccountSession(
-            accessToken: "access-token",
-            refreshToken: "refresh-token",
-            user: user
-        ))
-    }
-
     func test_defaultInactiveWhenUserHasNotChangedToggle() throws {
         let (ctx, _, vm, power) = try make()
 
         XCTAssertFalse(vm.insomniaEnabled)
-        XCTAssertFalse(vm.tokenSaverEnabled)
         XCTAssertFalse(SettingsStore(db: ctx.db).load().insomniaEnabled,
                        "a user with no saved Insomnia choice must launch macOS without asking for an admin password")
         XCTAssertTrue(power.activateReasons.isEmpty,
                       "default inactive Insomnia must not acquire macOS keep-awake assertions on launch")
-    }
-
-    func test_tokenSaverCannotBeTurnedOnAfterRemoval() async throws {
-        // WHY: Token Saver was removed. Even a subscribed account must not turn
-        // it back on, persist ON, or start the multi-GB model download — with
-        // or without a model already on disk.
-        let validations: [TokenSaverModelValidation] = [
-            TokenSaverModelValidation(state: .missing, reason: "manifest missing"),
-            .installed,
-        ]
-        for validation in validations {
-            let probe = DownloadProbe()
-            let (ctx, _, vm, _) = try make(
-                seedSettings: AppSettings(tokenSaverEnabled: false),
-                tokenSaverModelValidationProvider: { validation },
-                tokenSaverModelDownloadHandler: { _ in
-                    probe.started = true
-                    throw CancellationError()
-                }
-            )
-            savePrivateSession(in: ctx, subscribed: true)
-            vm.reload()
-
-            vm.setTokenSaverEnabled(true)
-
-            XCTAssertFalse(vm.tokenSaverEnabled, "\(validation.state)")
-            XCTAssertFalse(SettingsStore(db: ctx.db).load().tokenSaverEnabled,
-                           "a removed feature must never persist ON (\(validation.state))")
-            XCTAssertFalse(vm.showsTokenSaverModelDownload,
-                           "turning Token Saver on must not open the model download (\(validation.state))")
-            let started = await waitUntil(timeout: 0.3) { probe.started }
-            XCTAssertFalse(started, "no model download may start (\(validation.state))")
-        }
     }
 
     func test_tokenSaverModelDownloadProgressFractionIsSafeForSwiftUIProgressView() throws {
@@ -178,9 +119,9 @@ final class InsomniaSidebarTests: XCTestCase {
                      "unknown or zero download totals must use the indeterminate progress view instead of an invalid value")
     }
 
-    func test_tokenSaverUsageRefreshesFromProviderTokenUsageEvents() async throws {
-        let (ctx, router, vm, _) = try make(seedSettings: AppSettings(tokenSaverEnabled: true))
-        let workspaceDir = NSTemporaryDirectory() + "RC2TokenSaverUsageWorkspace-" + UUID().uuidString
+    func test_accountUsageRefreshesFromProviderTokenUsageEvents() async throws {
+        let (ctx, router, vm, _) = try make()
+        let workspaceDir = NSTemporaryDirectory() + "RC2AccountUsageWorkspace-" + UUID().uuidString
         try FileManager.default.createDirectory(atPath: workspaceDir, withIntermediateDirectories: true)
         let workspace = try router.createWorkspace(name: "usage", cwd: workspaceDir)
         let thread = AgentThread(
@@ -205,60 +146,17 @@ final class InsomniaSidebarTests: XCTestCase {
             run.id
         )
 
-        let refreshed = await waitUntil { vm.tokenSaverUsageSnapshot.usedTokens == 200 }
+        let refreshed = await waitUntil { vm.accountUsageSnapshot.usedTokens == 200 }
         XCTAssertTrue(refreshed,
-                      "sidebar Token Saver indicator must refresh when Claude/Codex provider usage is recorded")
+                      "sidebar account-usage figure must refresh when Claude/Codex provider usage is recorded")
         // Provider token-usage events record REAL provider spend only. Savings
         // are measured at compression time and live in the DB ledger — they are
         // never synthesised here from a fixed ratio (the old behavior reported a
         // fabricated 276). usage.json must therefore show zero "saved".
-        XCTAssertEqual(vm.tokenSaverUsageSnapshot.measuredSavedTokens, 0,
+        XCTAssertEqual(vm.accountUsageSnapshot.measuredSavedTokens, 0,
                        "token-usage events must not fabricate savings from an assumed compression ratio")
         XCTAssertEqual(try ctx.tokenSaverSavingsRepo.summary().totalRuns, 0,
                        "normal provider usage must not create Saved rows unless the thread is in /distill mode or prompt compression actually ran")
-        XCTAssertEqual(vm.tokenSaverUsageSnapshot.eligibleRuns, 1)
-    }
-
-    func test_tokenSaverActivityRingsRenderCodexUsedProgress() throws {
-        let oneThirdBluePixels = try renderedBluePixelCount(codexUsedProgress: 0.33)
-        let twoThirdsBluePixels = try renderedBluePixelCount(codexUsedProgress: 0.66)
-
-        XCTAssertGreaterThan(oneThirdBluePixels, 80,
-                             "Codex used percentage has data, so the Token Saver chart must render a visible blue used arc")
-        XCTAssertGreaterThan(twoThirdsBluePixels, oneThirdBluePixels + 120,
-                             "Codex ring must fill from used percentage; 66% used should visibly render more blue arc than 33% used")
-    }
-
-    private func renderedBluePixelCount(codexUsedProgress: Double) throws -> Int {
-        let view = SidebarRootView.TokenSaverActivityRings(values: .init(
-            tokenSaverProgress: 0.2,
-            claudeUsedProgress: 0.42,
-            codexUsedProgress: codexUsedProgress,
-            grokUsedProgress: 0
-        ))
-            .frame(width: 104, height: 104)
-        let renderer = ImageRenderer(content: view)
-        renderer.scale = 1
-        guard let image = renderer.nsImage,
-              let data = image.tiffRepresentation,
-              let rep = NSBitmapImageRep(data: data)
-        else {
-            throw XCTSkip("Token Saver activity rings could not render into an image for visual verification")
-        }
-
-        var bluePixels = 0
-        for y in 0..<rep.pixelsHigh {
-            for x in 0..<rep.pixelsWide {
-                guard let color = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
-                if color.alphaComponent > 0.6,
-                   color.blueComponent > 0.65,
-                   color.blueComponent > color.redComponent + 0.28,
-                   color.blueComponent > color.greenComponent + 0.12 {
-                    bluePixels += 1
-                }
-            }
-        }
-        return bluePixels
     }
 
     func test_toggleOffPersistsAndReloadsOff() throws {

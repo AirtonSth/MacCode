@@ -437,33 +437,6 @@ final class TokenSaverAppContextTests: XCTestCase {
         )
     }
 
-    func test_distillInstallStatusMappingDistinguishesFailedFromOff() {
-        // A reconcile failure must surface as .failed (visible), never collapse into
-        // .inactive. Installed only when Token Saver is on and package is present.
-        XCTAssertEqual(
-            DistillInstallStatus.from(error: "no service binary", enabled: true, installedCount: 0),
-            .failed("no service binary"),
-            "an install failure must be visible, not swallowed as inactive")
-        XCTAssertEqual(
-            DistillInstallStatus.from(error: "no service binary", enabled: false, installedCount: 0),
-            .failed("no service binary"),
-            "a recorded error wins even if the toggle reads off")
-        XCTAssertEqual(
-            DistillInstallStatus.from(error: nil, enabled: true, installedCount: 1),
-            .installed)
-        XCTAssertEqual(
-            DistillInstallStatus.from(error: nil, enabled: false, installedCount: 1),
-            .inactive,
-            "Token Saver off → Distill status is inactive even if files linger on disk")
-        XCTAssertEqual(
-            DistillInstallStatus.from(error: nil, enabled: true, installedCount: 0),
-            .inactive,
-            "nothing installed yet is inactive, not a false 'installed'")
-        XCTAssertEqual(
-            DistillInstallStatus.from(error: nil, enabled: false, installedCount: 0),
-            .inactive)
-    }
-
     func test_managedDistillCLIUsesLocalMacDistillService() async throws {
         let appSupportURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2ManagedDistillCLI-\(UUID().uuidString)", isDirectory: true)
@@ -2945,23 +2918,6 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertNil(
             capturedRequest,
             "the canonical Human view must be deterministic even when a local prose renderer is available"
-        )
-    }
-
-    func test_wireLanguageDetectionSupportsNonLatinPrompts() {
-        XCTAssertEqual(
-            AppContext.inferredUserLanguageIdentifier(
-                text: "エラーの原因を説明してください。",
-                preferredLanguages: ["en-US"]
-            ),
-            "ja"
-        )
-        XCTAssertEqual(
-            AppContext.inferredUserLanguageIdentifier(
-                text: "اشرح سبب الخطأ بالتفصيل.",
-                preferredLanguages: ["en-US"]
-            ),
-            "ar"
         )
     }
 

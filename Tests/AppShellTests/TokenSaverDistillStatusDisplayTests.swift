@@ -137,67 +137,6 @@ struct TokenSaverDistillStatusDisplayTests {
         #expect(!TokenSaverDistillServiceStatus.running(ready).isOperationallyBlocked)
     }
 
-    // MARK: - sidecarStatusLabel (popover visibility seam)
-
-    @Test("sidecarStatusLabel(.blocked) returns non-empty label containing the reason")
-    func blockedSidecarLabel() {
-        // WHY: a blocked sidecar that shows no label leaves the user believing Token
-        // Saver works when the local model is not running (Rule 6 fail-loud violation).
-        let label = SidebarRootView.sidecarStatusLabel(.blocked("subscription required"))
-        #expect(label != nil, "blocked must produce a visible label")
-        #expect(label?.isEmpty == false, "label must not be empty")
-        #expect(label?.contains("subscription required") == true, "label must carry the reason")
-    }
-
-    @Test("sidecarStatusLabel(.failed) returns non-empty label containing the reason")
-    func failedSidecarLabel() {
-        let label = SidebarRootView.sidecarStatusLabel(.failed("RemoteCodeDistillService exited; restarting"))
-        #expect(label != nil, "failed must produce a visible label")
-        #expect(label?.isEmpty == false, "label must not be empty")
-        #expect(label?.contains("RemoteCodeDistillService exited; restarting") == true, "label must carry the reason")
-    }
-
-    @Test("sidecarStatusLabel(.starting) returns non-empty label distinct from blocked and failed")
-    func startingSidecarLabel() {
-        let startingLabel = SidebarRootView.sidecarStatusLabel(.starting)
-        let blockedLabel  = SidebarRootView.sidecarStatusLabel(.blocked("x"))
-        let failedLabel   = SidebarRootView.sidecarStatusLabel(.failed("y"))
-        #expect(startingLabel != nil, "starting must produce a visible label")
-        #expect(startingLabel?.isEmpty == false, "label must not be empty")
-        #expect(startingLabel != blockedLabel, "starting label must differ from blocked label")
-        #expect(startingLabel != failedLabel,  "starting label must differ from failed label")
-    }
-
-    @Test("sidecarStatusLabel(.running) returns nil -- no banner when healthy")
-    func runningSidecarLabel() {
-        // WHY: showing a warning when the sidecar is healthy confuses the user.
-        // Nil -> the status row is hidden entirely.
-        let ready = TokenSaverDistillStatusDisplayTests.makeReady()
-        #expect(SidebarRootView.sidecarStatusLabel(.running(ready)) == nil,
-                "running must return nil so the popover row is hidden")
-    }
-
-    @Test("sidecarStatusLabel(.notStarted) returns nil -- no banner before first launch")
-    func notStartedSidecarLabel() {
-        #expect(SidebarRootView.sidecarStatusLabel(.notStarted) == nil,
-                "notStarted must return nil so the popover row is hidden")
-    }
-
-    @Test("sidecarStatusLabel labels are ASCII-only")
-    func sidecarLabelsAreASCII() {
-        // WHY: labels may be piped to log output; must not contain smart quotes or em-dashes.
-        let candidates: [TokenSaverDistillServiceStatus] = [
-            .blocked("no model"), .failed("crash"), .starting
-        ]
-        for status in candidates {
-            if let label = SidebarRootView.sidecarStatusLabel(status) {
-                for scalar in label.unicodeScalars {
-                    #expect(scalar.value < 128,
-                            "non-ASCII U+\(String(scalar.value, radix: 16)) in sidecarStatusLabel for \(status)")
-                }
-            }
-        }
-    }
 
     // MARK: - Helpers
 

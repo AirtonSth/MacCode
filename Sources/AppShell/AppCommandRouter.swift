@@ -988,7 +988,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                         wireQueueDrainControl(on: agent.viewModel, context: ctx)
                         wireBotPeerHandoffDeletion(on: agent.viewModel, context: ctx)
-                        Self.wireTokenSaverThreadFooter(on: agent.viewModel, context: ctx)
                         configureAgentAppBotMentions(agent)
                         agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
                             self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
@@ -3971,31 +3970,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 terminalStatus: terminalStatus
             )
         }
-    }
-
-    /// Bind the cumulative Token Saver "saved in this thread" footer to the shared ledger.
-    static func wireTokenSaverThreadFooter(on viewModel: AgentAppViewModel, context: AppContext) {
-        let savingsRepo = context.tokenSaverSavingsRepo
-        let db = context.db
-        let settingsRepo = context.settingsRepo
-        viewModel.bindTokenSaverThreadFooter(
-            savingsRepo: savingsRepo,
-            isEligible: {
-                // B-6: match sidebar paid claims — enabled AND subscribed.
-                // No teaser footer for free/lapsed accounts.
-                let settings = SettingsStore(db: db).load()
-                guard settings.tokenSaverEnabled else { return false }
-                return PrivateAccountSessionStore(repo: settingsRepo).load()?.user.subscribed == true
-            },
-            isGraphifyActive: {
-                SettingsStore(db: db).load().isGraphifyRuntimeActive
-            },
-            graphifySignalCount: {
-                TokenSaverThreadFooterReload.currentDayGraphifySignalCount(
-                    repo: context.graphifyUsageRepo
-                )
-            }
-        )
     }
 
     private func wireQueueDrainControl(on viewModel: AgentAppViewModel, context: AppContext) {
@@ -8915,7 +8889,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                 wireQueueDrainControl(on: agent.viewModel, context: ctx)
                 wireBotPeerHandoffDeletion(on: agent.viewModel, context: ctx)
-                Self.wireTokenSaverThreadFooter(on: agent.viewModel, context: ctx)
                 configureAgentAppBotMentions(agent)
                 agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
                     self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)

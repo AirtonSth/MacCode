@@ -153,22 +153,6 @@ final class PerfMainThreadHogsTests: XCTestCase {
 
     // MARK: PL-02 / PL-04 source pins
 
-    func test_tokenSaverFooterReloadsAreDetachedFromTheMainActor() throws {
-        // WHY: `Task { }` inside a @MainActor view model inherits the actor. Both
-        // footer reloads claimed to read settings/ledger "off-main" but ran on
-        // main on every `.rc2TokenSaverUsageChanged` (107 samples in 8 s).
-        for (file, anchor) in [
-            ("Sources/AppShell/BotsWindow.swift", "func reloadTokenSaverThreadSavings() {"),
-            ("Sources/Surfaces/AgentAppSurface.swift", "public func reloadTokenSaverThreadSavings() {")
-        ] {
-            let source = try String(contentsOf: sourceURL(file), encoding: .utf8)
-            let start = try XCTUnwrap(source.range(of: anchor), file)
-            let slice = String(source[start.upperBound...].prefix(4_000))
-            XCTAssertTrue(slice.contains("tokenSaverFooterReloadTask = Task.detached("), "\(file): reload must run detached")
-            XCTAssertFalse(slice.contains("tokenSaverFooterReloadTask = Task {"), "\(file): actor-inheriting Task is the bug")
-        }
-    }
-
     func test_petDockPlacementCacheHasNoPeriodicRevalidationLoop() throws {
         // WHY: a 30 s loop hit-tested the Dock against the WindowServer for every
         // screen on the main thread (~130 ms per tick). The screen/Dock

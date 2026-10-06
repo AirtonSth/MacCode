@@ -66,14 +66,8 @@ final class TokenSaverWidgetDigestTests: XCTestCase {
     }
 
     func testSavingsProgressUsesFixedGoals() {
-        XCTAssertEqual(
-            TokenSaverWidgetDigest.savingsGoalTokens(scope: .today),
-            SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: true)
-        )
-        XCTAssertEqual(
-            TokenSaverWidgetDigest.savingsGoalTokens(scope: .week),
-            SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: false)
-        )
+        XCTAssertEqual(TokenSaverWidgetDigest.savingsGoalTokens(scope: .today), 100_000_000)
+        XCTAssertEqual(TokenSaverWidgetDigest.savingsGoalTokens(scope: .week), 700_000_000)
         XCTAssertEqual(
             TokenSaverWidgetDigest.savingsProgress(savedTokens: 100_000_000, scope: .today),
             1.0,
