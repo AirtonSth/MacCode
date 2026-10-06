@@ -6284,9 +6284,11 @@ public final class AppContext {
     public func reapIdleProviderSessions(now: Date = Date(), idleAge: TimeInterval = 6 * 60 * 60) throws -> ProviderSessionReaperResult {
         let cutoff = now.addingTimeInterval(-idleAge)
         let activeThreadIds = try threadRepo.runningThreadIds()
+        let liveSessions = coordinator.liveProviderSessions()
         let reaper = ProviderSessionReaper(
             sessionRepo: providerSessionRuntimeRepo,
-            pendingCallbackRepo: providerPendingCallbackRepo
+            pendingCallbackRepo: providerPendingCallbackRepo,
+            liveSessions: { liveSessions }
         ) {
             activeThreadIds
         }
@@ -6298,9 +6300,7 @@ public final class AppContext {
         // through stopRun(threadId:) broadcast a spurious "Thread cancelled"
         // for threads that finished hours ago and could even respawn a provider
         // process for a dead thread via the recover-then-interrupt fallback.
-        for threadId in result.stoppedThreadIds {
-            coordinator.releaseProviderSession(threadId: threadId)
-        }
+        coordinator.releaseReapedProviderSessions(result)
         return result
     }
 

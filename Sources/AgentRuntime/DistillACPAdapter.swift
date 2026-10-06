@@ -1782,7 +1782,11 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         // bot's credentials. The next turn loads the session in a new one.
         let endsGuestRun = session.guestPlan != nil
         let stopRequested = status == .cancelled && session.cancelRequested
-        let shouldStopOwnedTree = stopRequested || endsGuestRun
+        // A failed turn's process is not reused for the next send, which loads
+        // the session in a new one (as after a restart). Left resident, it and
+        // its MCP sidecars idled until the app quit.
+        let releasesFailedSession = status == .failed
+        let shouldStopOwnedTree = stopRequested || endsGuestRun || releasesFailedSession
         if shouldStopOwnedTree {
             if sessions[session.threadId] === session {
                 sessions.removeValue(forKey: session.threadId)
@@ -1828,7 +1832,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         }
         if shouldStopOwnedTree {
             distillAcpLog.info(
-                "distill.cancel.ack.tree_stop thread=\(session.threadId.value.uuidString, privacy: .public) guest=\(endsGuestRun, privacy: .public)"
+                "distill.cancel.ack.tree_stop thread=\(session.threadId.value.uuidString, privacy: .public) guest=\(endsGuestRun, privacy: .public) failed=\(releasesFailedSession, privacy: .public)"
             )
             if !gracefulGuestEnd { session.client.stop() }
         }

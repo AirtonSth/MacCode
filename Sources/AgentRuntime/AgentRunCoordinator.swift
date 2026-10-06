@@ -3582,8 +3582,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// finished long ago, so routing the release through stopRun/markStopRequested
     /// broadcast a spurious `.cancelled` ("Thread cancelled" notification, status
     /// pill flip, queued-message drain) for a thread nobody stopped. No-op when the
-    /// thread still has an active run or no live session.
-    public func releaseProviderSession(threadId: AgentThreadID) {
+    /// thread still has an active run or no live session. `markCompleted: false`
+    /// keeps the durable session status (a failed, cancelled or interrupted row).
+    public func releaseProviderSession(threadId: AgentThreadID, markCompleted: Bool = true) {
         lock.lock()
         let hasActiveRun = activeThreads[threadId] != nil
         lock.unlock()
@@ -3596,7 +3597,28 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.unlock()
         // Preserve resume eligibility: default `.cancelled` removes Continue (plan-final W2).
         // Completed is the honest session status when the turn already finished.
-        try? providerSessionRepo?.markStopped(threadId: threadId, status: .completed)
+        if markCompleted {
+            try? providerSessionRepo?.markStopped(threadId: threadId, status: .completed)
+        }
+    }
+
+    /// Every resident adapter session across providers, for the idle reaper.
+    public func liveProviderSessions() -> [AgentProviderSessionSummary] {
+        lock.lock()
+        let adapters = Array(providers.values)
+        lock.unlock()
+        return adapters.flatMap { $0.listSessions() }
+    }
+
+    /// Marking a session stopped in the DB does not free its provider process:
+    /// release every thread the reaper picked, keeping the statuses it says to keep.
+    public func releaseReapedProviderSessions(_ result: ProviderSessionReaperResult) {
+        for threadId in result.stoppedThreadIds + result.cappedThreadIds {
+            releaseProviderSession(
+                threadId: threadId,
+                markCompleted: !result.statusPreservedThreadIds.contains(threadId)
+            )
+        }
     }
 
     /// Retires process-local ownership only after a thread DELETE has committed.

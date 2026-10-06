@@ -1032,8 +1032,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             let result = try context.reapIdleProviderSessions(
                 idleAge: managedProcessMemoryProfile.idleReleaseAge
             )
-            if !result.stoppedThreadIds.isEmpty {
-                NSLog("Stopped \(result.stoppedThreadIds.count) idle provider session runtime(s).")
+            if !result.stoppedThreadIds.isEmpty || !result.cappedThreadIds.isEmpty {
+                NSLog("Stopped \(result.stoppedThreadIds.count) idle provider session runtime(s); released \(result.cappedThreadIds.count) over the resident cap of \(ProviderSessionReaper.providerRootCap).")
             }
         } catch {
             NSLog("Failed to reap idle provider sessions: \(error)")

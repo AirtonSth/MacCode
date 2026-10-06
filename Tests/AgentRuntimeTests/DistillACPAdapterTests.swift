@@ -952,6 +952,52 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                        [DistillACPAdapter.incompatibleHistoryNotice + DistillACPAdapter.handoffMissingNoticeSuffix])
     }
 
+    func test_failedTurnReleasesItsSession_completedTurnKeepsItWarm() async throws {
+        // WHY (S-F3): the next send after a failed turn loads the session in a new
+        // process, so the failed one was never reused; it and its MCP sidecars
+        // idled until the app quit. A completed turn's process is reused by the
+        // follow-up, so it must stay.
+        let root = try makeTempRoot("distill-acp-failed-release")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeFailureHarness(root: root)
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+
+        let healthy = AgentThreadID()
+        let ok = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            distillRequest(thread: healthy, model: "muse-spark-1.3-contributor", prompt: "First request", root: root)
+        ) { ok.append($0) }
+        let okFinished = try await ok.waitForFinish()
+        XCTAssertEqual(okFinished.status, .completed)
+        XCTAssertTrue(adapter.hasSession(threadId: healthy))
+
+        let thread = AgentThreadID()
+        let failed = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            distillRequest(thread: thread, model: "claude/claude-opus-5-5", prompt: "FAIL_DATA", root: root)
+        ) { failed.append($0) }
+        let failedFinished = try await failed.waitForFinish()
+        XCTAssertEqual(failedFinished.status, .failed)
+        XCTAssertFalse(adapter.hasSession(threadId: thread),
+                       "a failed turn must release its provider process, not leave it resident")
+        XCTAssertFalse(adapter.listSessions().contains { $0.threadId == thread })
+        XCTAssertTrue(adapter.hasSession(threadId: healthy), "only the failed thread's session is released")
+
+        let retry = DistillACPAdapterEventBox()
+        _ = try await adapter.sendTurn(
+            distillRequest(thread: thread, model: "claude/claude-opus-5-5", prompt: "Retry request", root: root,
+                           providerThreadId: failedFinished.providerThreadId)
+        ) { retry.append($0) }
+        let retried = try await retry.waitForFinish()
+        XCTAssertEqual(retried.status, .completed, "Retry after the release must still work")
+        XCTAssertEqual(retried.providerThreadId, failedFinished.providerThreadId,
+                       "Retry resumes the same Distill session in a new process")
+        XCTAssertTrue(try recordedRequests(requestsURL).contains {
+            $0["method"] as? String == "session/load" && $0["sessionId"] as? String == failedFinished.providerThreadId
+        }, "the new process must load the failed session, not start an empty one")
+    }
+
     func test_modelFamilyIsDerivedFromDistillClaudePrefix() {
         XCTAssertTrue(DistillACPAdapter.isCrossModelFamilySwitch(from: "muse-spark-1.3-contributor", to: "claude/claude-opus-5-5"))
         XCTAssertTrue(DistillACPAdapter.isCrossModelFamilySwitch(from: "claude/claude-opus-5-5", to: "gpt-6-luna"))
