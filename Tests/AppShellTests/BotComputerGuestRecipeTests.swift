@@ -35,6 +35,21 @@ final class BotComputerGuestRecipeTests: XCTestCase {
         XCTAssertTrue(start.contains("Xvfb :1 -screen 0 \(geometry) "), "start.sh must start Xvfb at \(geometry)")
     }
 
+    func test_startClearsTheChromiumProfileLockBeforeLaunchingTheBrowser() throws {
+        // WHY: the profile is on the persisted home bind, and a recreated
+        // container has a new hostname. Chromium then reads the old lock as "in
+        // use on another computer" and never opens (proved on r4 and r5), which
+        // also leaves nothing on CDP 9222 for the in-guest Playwright MCP.
+        let start = try String(
+            contentsOf: sourceURL("Sources/AppShell/Resources/ComputerGuest/start.sh"),
+            encoding: .utf8
+        )
+        let clear = try XCTUnwrap(start.range(of: "\"$HOME/.browser-profiles/chromium/SingletonLock\""))
+        let launch = try XCTUnwrap(start.range(of: "/opt/remotecode-computer/launch-browser.sh"))
+        XCTAssertTrue(start[..<clear.lowerBound].hasSuffix("rm -f "))
+        XCTAssertLessThan(clear.lowerBound, launch.lowerBound)
+    }
+
     private func sourceURL(_ relative: String) -> URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

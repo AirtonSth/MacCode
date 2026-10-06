@@ -141,21 +141,76 @@ final class BotComputerGuestSpecTests: XCTestCase {
         )
     }
 
-    func test_recipeRevision4ShipsNodeForGuestPlaywrightMCP() throws {
-        // WHY: playwrightMCPCommand needs npx inside the guest, and only the
-        // revision bump makes existing guests rebuild (a stale label rebuilds
-        // the image) — Dockerfile content and revision must move together.
-        XCTAssertEqual(BotComputerGuestSpec.recipeRevision, "4")
-        let dockerfile = try String(
-            contentsOf: URL(fileURLWithPath: #filePath)
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .appendingPathComponent("Sources/AppShell/Resources/ComputerGuest/Dockerfile"),
-            encoding: .utf8
+    func test_recipeRevision5ShipsTheInGuestAgentToolchain() throws {
+        // WHY: the bot's agent runs inside this image. It needs git and ps for
+        // its own shell, wmctrl + xwd for linux-use, and a pinned Playwright MCP
+        // that only runs on Node >= 20 (bookworm's apt node is 18). Only the
+        // revision bump makes existing guests pick the recipe up, and the tag
+        // carries the revision so another app build on r4 never rebuilds it.
+        XCTAssertEqual(BotComputerGuestSpec.recipeRevision, "5")
+        XCTAssertEqual(BotComputerGuestSpec.imageTag, "remotecode/computer:r5")
+        let recipe = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/AppShell/Resources/ComputerGuest")
+        let dockerfile = try String(contentsOf: recipe.appendingPathComponent("Dockerfile"), encoding: .utf8)
+        for package in ["git", "procps", "wmctrl", "x11-apps", "xdotool", "imagemagick", "python3", "fluxbox"] {
+            XCTAssertTrue(dockerfile.contains("        \(package) \\\n"), "missing apt package \(package)")
+        }
+        XCTAssertFalse(dockerfile.contains("        nodejs \\\n"), "apt nodejs is 18; Playwright refuses to start on it")
+        XCTAssertTrue(dockerfile.contains("node-v24.21.0-linux-${node_arch}.tar.xz"))
+        XCTAssertTrue(dockerfile.contains("sha256sum -c -"), "the Node download must be checksum-verified")
+        XCTAssertTrue(dockerfile.contains("npm install -g @playwright/mcp@0.0.83"))
+        XCTAssertTrue(dockerfile.contains("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1"))
+        XCTAssertFalse(dockerfile.contains("@playwright/mcp@latest"))
+
+        let browser = try String(contentsOf: recipe.appendingPathComponent("launch-browser.sh"), encoding: .utf8)
+        XCTAssertTrue(browser.contains("--remote-debugging-port=9222"),
+            "Playwright MCP attaches to the visible browser so viewer logins are the bot's session")
+        XCTAssertTrue(browser.contains("--remote-debugging-address=127.0.0.1"),
+            "CDP must stay on the guest loopback")
+    }
+
+    func test_createOptionsMountTheAgentKitReadOnlyAndRunAnInitWithTheHostAlias() throws {
+        // WHY: the in-guest agent runs from /opt/remotecode-agent, which the guest
+        // must not be able to rewrite; --init reaps the agent's orphans; the
+        // agent reaches host loopback services as host.docker.internal on every
+        // Docker runtime. The runtime label lets older containers be replaced.
+        let botID = BotID()
+        let support = URL(fileURLWithPath: "/tmp/rc-app-support-spec")
+        let options = try BotComputerGuestSpec.containerCreateOptions(
+            botID: botID,
+            guestHome: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: botID).path,
+            appSupport: support,
+            viewerToken: String(repeating: "a", count: 32)
         )
-        XCTAssertTrue(dockerfile.contains("nodejs"))
-        XCTAssertTrue(dockerfile.contains("npm"))
+        XCTAssertEqual(
+            options.binds.last,
+            "/tmp/rc-app-support-spec/guest-tools:/opt/remotecode-agent:ro"
+        )
+        XCTAssertTrue(options.initProcess)
+        XCTAssertEqual(options.extraHosts, ["host.docker.internal:host-gateway"])
+        XCTAssertEqual(options.labels[BotComputerGuestSpec.runtimeLabelKey], BotComputerGuestSpec.runtimeRevision)
+    }
+
+    func test_enforcedDockerIgnoreKeepsSecretsOutEvenAfterAGuestEdit() {
+        // WHY: the build context is the guest-writable home, which holds the
+        // agent's credentials (.distill), run leases (.rc-*) and browser cookies.
+        // Docker applies the last matching line, so the exclusions must always
+        // come last: a guest-written "!.distill/..." above them cannot win.
+        let hostile = "node_modules\n!.distill/claude-auth.json\n.distill\n# RemoteCode: always excluded (rewritten before every build)\n.rc-*\n"
+        let enforced = BotComputerGuestSpec.enforcedDockerIgnore(hostile)
+        let lines = enforced.split(separator: "\n").map(String.init)
+        XCTAssertEqual(Array(lines.suffix(3)), BotComputerGuestSpec.requiredDockerIgnorePatterns)
+        XCTAssertTrue(lines.contains("node_modules"), "the user's own exclusions stay")
+        XCTAssertEqual(lines.filter { $0 == ".distill" }.count, 1)
+        XCTAssertEqual(BotComputerGuestSpec.enforcedDockerIgnore(enforced), enforced,
+            "already-enforced content is left unchanged, so it is not rewritten on every provision")
+        XCTAssertEqual(
+            BotComputerGuestSpec.enforcedDockerIgnore(nil),
+            "# RemoteCode: always excluded (rewritten before every build)\n.distill\n.rc-*\n.browser-profiles\n"
+        )
     }
 
     func test_execGuestBudgetFitsTheCallersRemainingWait() {

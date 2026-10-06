@@ -2,10 +2,21 @@ import Foundation
 import CryptoKit
 
 public enum BotComputerGuestSpec {
-    public static let imageTag = "remotecode/computer:local"
-    public static let recipeLabelKey = "remotecode.recipe"
     /// Bump when start.sh / Dockerfile change. Missing label rebuilds the image.
-    public static let recipeRevision = "4"
+    public static let recipeRevision = "5"
+    /// Versioned so two app builds on different revisions sharing one Docker
+    /// daemon (e.g. the debug sandbox and the installed app) never rebuild the
+    /// same tag back and forth.
+    public static let imageTag = "remotecode/computer:r\(recipeRevision)"
+    public static let recipeLabelKey = "remotecode.recipe"
+    /// Bump when the container create options change. A container whose label
+    /// differs is recreated, but only while the bot has no active run.
+    public static let runtimeRevision = "2"
+    public static let runtimeLabelKey = "remotecode.runtime"
+    /// Read-only agent kit (guest Distill binary, scripts) shared by every bot.
+    public static let agentKitMountPoint = "/opt/remotecode-agent"
+    /// Lets the guest reach host loopback services by name on any Docker runtime.
+    public static let hostGatewayAlias = "host.docker.internal:host-gateway"
     public static let guestUserHome = "/home/remotecode"
     public static let screenPort = 6080
     public static let minimumShmBytes: Int = 256 * 1024 * 1024
@@ -26,6 +37,36 @@ public enum BotComputerGuestSpec {
     public static func guestHomeURL(appSupport: URL, botID: BotID) -> URL {
         guestBotRootURL(appSupport: appSupport, botID: botID)
             .appendingPathComponent("home", isDirectory: true)
+    }
+
+    /// Host side of `agentKitMountPoint`; bound read-only into every bot container.
+    public static func guestToolsURL(appSupport: URL) -> URL {
+        appSupport.appendingPathComponent("guest-tools", isDirectory: true)
+    }
+
+    /// Kept out of every per-bot image build. The recipe lives in the guest home,
+    /// which the guest can edit, and that home holds credentials and run state.
+    public static let requiredDockerIgnorePatterns = [".distill", ".rc-*", ".browser-profiles"]
+    static let dockerIgnoreEnforcedHeader = "# RemoteCode: always excluded (rewritten before every build)"
+
+    /// The bot's `.dockerignore` with the required patterns moved to the end.
+    /// Docker applies the last matching line, so a `!` re-include written
+    /// anywhere above cannot bring these paths back into the build context.
+    public static func enforcedDockerIgnore(_ existing: String?) -> String {
+        let required = Set(requiredDockerIgnorePatterns)
+        let kept = (existing ?? "")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+            .filter { line in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                return !required.contains(trimmed) && trimmed != dockerIgnoreEnforcedHeader
+            }
+        var lines = kept
+        while let last = lines.last, last.trimmingCharacters(in: .whitespaces).isEmpty { lines.removeLast() }
+        if !lines.isEmpty { lines.append("") }
+        lines.append(dockerIgnoreEnforcedHeader)
+        lines += requiredDockerIgnorePatterns
+        return lines.joined(separator: "\n") + "\n"
     }
 
     public static func viewerTokenURL(appSupport: URL, botID: BotID) -> URL {
@@ -130,14 +171,19 @@ public enum BotComputerGuestSpec {
                 "remotecode.managed": "1",
                 "remotecode.botId": botID.value.uuidString.lowercased(),
                 workspacesLabelKey: workspacesLabel(workspaces),
+                runtimeLabelKey: runtimeRevision,
             ],
             environment: ["REMOTECODE_VIEWER_TOKEN": viewerToken],
-            binds: ["\(guestHome):\(guestUserHome)"] + workspaces.map { "\($0):\($0)" },
+            binds: ["\(guestHome):\(guestUserHome)"]
+                + workspaces.map { "\($0):\($0)" }
+                + ["\(guestToolsURL(appSupport: appSupport).path):\(agentKitMountPoint):ro"],
             hostIP: "127.0.0.1",
             hostPort: 0,
             containerPort: screenPort,
             shmSize: minimumShmBytes,
-            network: networkName(botID: botID)
+            network: networkName(botID: botID),
+            initProcess: true,
+            extraHosts: [hostGatewayAlias]
         )
     }
 
@@ -304,6 +350,10 @@ public struct BotComputerContainerCreateOptions: Equatable, Sendable {
     public var containerPort: Int
     public var shmSize: Int
     public var network: String?
+    /// `--init`: an init process reaps orphans and forwards signals to start.sh.
+    public var initProcess: Bool = false
+    /// `--add-host` entries.
+    public var extraHosts: [String] = []
 }
 
 public enum BotComputerGuestError: Error, Equatable, LocalizedError, CustomStringConvertible {

@@ -205,6 +205,12 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         if let network = options.network, !network.isEmpty {
             args += ["--network", network]
         }
+        if options.initProcess {
+            args.append("--init")
+        }
+        for host in options.extraHosts {
+            args += ["--add-host", host]
+        }
         for (key, value) in options.labels.sorted(by: { $0.key < $1.key }) {
             args += ["--label", "\(key)=\(value)"]
         }

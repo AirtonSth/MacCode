@@ -39,6 +39,7 @@ public struct GitIdentity: Equatable, Sendable {
 public enum BotComputerGuestServiceError: Error, Equatable, Sendable, CustomStringConvertible {
     case screenshotTooLarge(actualBytes: Int, maximumBytes: Int)
     case screenshotResultTooLarge(actualBytes: Int, maximumBytes: Int)
+    case rebuildWhileRunActive(threadTitle: String)
 
     public var description: String {
         switch self {
@@ -46,6 +47,9 @@ public enum BotComputerGuestServiceError: Error, Equatable, Sendable, CustomStri
             return "Guest screenshot is too large: \(actualBytes) bytes (maximum \(maximumBytes))."
         case .screenshotResultTooLarge(let actualBytes, let maximumBytes):
             return "Guest screenshot result is too large: \(actualBytes) bytes (maximum \(maximumBytes))."
+        case .rebuildWhileRunActive(let threadTitle):
+            return "The Linux desktop was not rebuilt: \(threadTitle) is running on it. "
+                + "Rebuild after that run finishes."
         }
     }
 }
@@ -55,8 +59,26 @@ public final class BotComputerGuestService: @unchecked Sendable {
     public static let maxScreenshotBytes = 8 * 1_024 * 1_024
     public static let maxScreenshotBase64Bytes = ((maxScreenshotBytes + 2) / 3) * 4
     private static let viewerTokenLock = NSLock()
-    private static let legacyUnauthenticatedStartScriptSHA256 =
-        "fc19d6b61e02c4ee713dde41886f4dfbae6d8631ce990dbd045f36eced478d8e"
+    /// SHA-256 of every recipe file version earlier releases seeded into a bot's
+    /// home. A per-bot copy still equal to one of them was never edited, so it is
+    /// replaced with the current file; an edited copy stays the user's choice.
+    static let previouslyShippedRecipeSHA256: [String: Set<String>] = [
+        "Dockerfile": [
+            "28da84d0e980c6862d74f1a55c4010e9e450ca718ea3931e19e02b5c7a781ef5",
+            "f76708fdeadee4b8c2b970e6bcb0d1cf0143ed57331d14a14941406fbc438bb6", // revision 4
+        ],
+        "start.sh": [
+            "3ee4664d5865f5316a2cf5b0bb8550dbe893d952c6ef71d4ae82f78d6451d840",
+            "fc19d6b61e02c4ee713dde41886f4dfbae6d8631ce990dbd045f36eced478d8e", // unauthenticated viewer
+            "7479a3389036155ed694292fcafeefb683a6dd79fbf8fa0a0e7e588f8fe69950", // revision 4
+        ],
+        "launch-browser.sh": [
+            "875c894932c673d7fdf66391eb38cb82002ea0ccc077b91108c486b9512419a3", // revision 4
+        ],
+        "embed.html": [
+            "343261436d1a1b8d6f1f714cd9c517c3cf7032c296853bb720bc4b371f82d35c",
+        ],
+    ]
 
     private let appSupport: URL
     private let docker: any BotComputerDockerClienting
@@ -135,7 +157,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
             )
             options.name = name
             options.network = nil
-            _ = try docker.create(options: options)
+            _ = try createContainer(options)
             try docker.start(name: name)
             let png = try waitForPNG(name: name)
             let hash = try BotComputerGuestObserve.validatePNG(png)
@@ -181,7 +203,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
         if let existing = try? docker.inspect(name: name) {
             if imageMatches(existing, tag: image),
                networkMatches(existing, network: network),
-               currentWorkspacesLabel(existing) == BotComputerGuestSpec.workspacesLabel(workspaces) {
+               currentWorkspacesLabel(existing) == BotComputerGuestSpec.workspacesLabel(workspaces),
+               runtimeIsCurrentOrBusy(existing, botID: botID) {
                 if existing.running == false {
                     try docker.start(name: name)
                 }
@@ -199,7 +222,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
             workspaces: workspaces
         )
         options.network = network
-        _ = try docker.create(options: options)
+        _ = try createContainer(options)
         try docker.start(name: name)
         return try readyState(name: name, botID: botID, resumed: false)
     }
@@ -218,7 +241,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
             return
         }
         if stored.contains(workspace),
-           existing.labels[BotComputerGuestSpec.workspacesLabelKey] == BotComputerGuestSpec.workspacesLabel(wanted) {
+           existing.labels[BotComputerGuestSpec.workspacesLabelKey] == BotComputerGuestSpec.workspacesLabel(wanted),
+           runtimeIsCurrentOrBusy(existing, botID: botID) {
             return
         }
         let backup = canonical + "-backup"
@@ -241,7 +265,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
             try docker.stop(name: canonical)
             try docker.rename(from: canonical, to: backup)
             renamed = true
-            _ = try docker.create(options: options)
+            _ = try createContainer(options)
             try docker.start(name: canonical)
         } catch {
             if renamed {
@@ -268,6 +292,23 @@ public final class BotComputerGuestService: @unchecked Sendable {
             throw error
         }
         try? docker.remove(name: backup)
+    }
+
+    /// A container from older create options is only replaced while no run
+    /// holds the bot: recreating it would kill whatever that run has inside.
+    private func runtimeIsCurrentOrBusy(_ existing: BotComputerContainerInspect, botID: BotID) -> Bool {
+        existing.labels[BotComputerGuestSpec.runtimeLabelKey] == BotComputerGuestSpec.runtimeRevision
+            || vmRuns.active(botID: botID) != nil
+    }
+
+    /// Every container binds the shared agent kit; its host directory must
+    /// exist first or Docker would create it owned by the daemon.
+    private func createContainer(_ options: BotComputerContainerCreateOptions) throws -> String {
+        try FileManager.default.createDirectory(
+            at: BotComputerGuestSpec.guestToolsURL(appSupport: appSupport),
+            withIntermediateDirectories: true
+        )
+        return try docker.create(options: options)
     }
 
     private func currentWorkspacesLabel(_ existing: BotComputerContainerInspect) -> String {
@@ -409,7 +450,13 @@ public final class BotComputerGuestService: @unchecked Sendable {
         )
     }
 
-    public func rebuild(botID: BotID) throws -> BotComputerGuestReady {
+    /// Refused while another thread's run holds the bot: the rebuild replaces
+    /// the container that run is using. `requestingThreadID` is the thread whose
+    /// own agent asked for the rebuild (nil for the user's Rebuild button).
+    public func rebuild(botID: BotID, requestingThreadID: AgentThreadID? = nil) throws -> BotComputerGuestReady {
+        if let active = vmRuns.active(botID: botID), active.threadID != requestingThreadID {
+            throw BotComputerGuestServiceError.rebuildWhileRunActive(threadTitle: active.title)
+        }
         try seedRecipe(botID: botID)
         let recipe = BotComputerGuestSpec.recipeURL(appSupport: appSupport, botID: botID)
         let tag = BotComputerGuestSpec.botImageTag(botID: botID)
@@ -430,7 +477,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
             workspaces: loadWorkspaces(botID: botID)
         )
         options.network = network
-        _ = try docker.create(options: options)
+        _ = try createContainer(options)
         do {
             try docker.start(name: next)
             _ = try readyState(name: next, botID: botID, resumed: false)
@@ -490,7 +537,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
                 "output": String(data: output, encoding: .utf8) ?? "",
             ]
         case BotComputerCatalog.rebuild:
-            let ready = try rebuild(botID: botID)
+            let ready = try rebuild(botID: botID, requestingThreadID: threadID)
             return [
                 "ok": true,
                 "host": ready.screenURL.host ?? "127.0.0.1",
@@ -682,8 +729,9 @@ public final class BotComputerGuestService: @unchecked Sendable {
         for name in names {
             let target = dest.appendingPathComponent(name)
             if fileManager.fileExists(atPath: target.path) {
-                if name == "start.sh", let recipeContext {
-                    try refreshLegacyStartScriptIfNeeded(
+                if let recipeContext {
+                    try refreshUneditedRecipeFileIfNeeded(
+                        name: name,
                         at: target,
                         from: recipeContext.appendingPathComponent(name)
                     )
@@ -705,6 +753,21 @@ public final class BotComputerGuestService: @unchecked Sendable {
            (try fileManager.contentsOfDirectory(atPath: legacy.path)).isEmpty {
             try fileManager.removeItem(at: legacy)
         }
+        try enforceDockerIgnore(in: dest)
+    }
+
+    /// The build context is the guest-writable home; re-assert the exclusions
+    /// every time the recipe is prepared, so a guest edit cannot pull
+    /// credentials or run state into a rebuilt image. A home without a
+    /// Dockerfile is not a build context and is left untouched.
+    private func enforceDockerIgnore(in recipe: URL) throws {
+        guard FileManager.default.fileExists(atPath: recipe.appendingPathComponent("Dockerfile").path) else { return }
+        let url = recipe.appendingPathComponent(".dockerignore")
+        let existing = (try? Data(contentsOf: url)).map { String(decoding: $0, as: UTF8.self) }
+        let enforced = BotComputerGuestSpec.enforcedDockerIgnore(existing)
+        guard enforced != existing else { return }
+        // .atomic replaces a guest-planted symlink instead of writing through it.
+        try Data(enforced.utf8).write(to: url, options: .atomic)
     }
 
     private func viewerToken(botID: BotID) throws -> String {
@@ -735,10 +798,11 @@ public final class BotComputerGuestService: @unchecked Sendable {
         return String(bytes: out, encoding: .utf8) ?? ""
     }
 
-    private func refreshLegacyStartScriptIfNeeded(at target: URL, from source: URL) throws {
+    private func refreshUneditedRecipeFileIfNeeded(name: String, at target: URL, from source: URL) throws {
+        guard let shipped = Self.previouslyShippedRecipeSHA256[name] else { return }
         let existing = try Data(contentsOf: target, options: .mappedIfSafe)
         let digest = Self.hexString(SHA256.hash(data: existing))
-        guard digest == Self.legacyUnauthenticatedStartScriptSHA256,
+        guard shipped.contains(digest),
               FileManager.default.fileExists(atPath: source.path)
         else { return }
         try Data(contentsOf: source, options: .mappedIfSafe).write(to: target, options: .atomic)

@@ -11141,9 +11141,13 @@ public final class BotsViewModel: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.guestRebuildingByBot[botID.value] = false
-                    self.errorMessage = wasRunning
-                        ? "Could not rebuild the Linux desktop. The current desktop is still running."
-                        : "Could not rebuild the Linux desktop."
+                    if case .rebuildWhileRunActive? = error as? BotComputerGuestServiceError {
+                        self.errorMessage = String(describing: error)
+                    } else {
+                        self.errorMessage = wasRunning
+                            ? "Could not rebuild the Linux desktop. The current desktop is still running."
+                            : "Could not rebuild the Linux desktop."
+                    }
                     onSettled?(nil)
                 }
             }

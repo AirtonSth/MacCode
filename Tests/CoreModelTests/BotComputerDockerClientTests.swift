@@ -20,6 +20,33 @@ final class BotComputerDockerClientTests: XCTestCase {
         XCTAssertThrowsError(try unknown.containerExists(name: "remotecode-bot-exact"))
     }
 
+    func test_createPassesInitHostAliasAndTheReadOnlyAgentKitBind() throws {
+        // WHY: create options only matter if they reach `docker create`; without
+        // --init the agent's orphans are never reaped, without --add-host the
+        // guest cannot name the host, and a writable kit bind would let the guest
+        // rewrite the agent binary it runs.
+        var calls: [[String]] = []
+        let cli = BotComputerDockerCLI { args in
+            calls.append(args)
+            return Data("cid\n".utf8)
+        }
+        let botID = BotID()
+        let support = URL(fileURLWithPath: "/tmp/rc-docker-create-args")
+        let options = try BotComputerGuestSpec.containerCreateOptions(
+            botID: botID,
+            guestHome: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: botID).path,
+            appSupport: support,
+            viewerToken: String(repeating: "a", count: 32)
+        )
+        XCTAssertEqual(try cli.create(options: options), "cid")
+        let args = try XCTUnwrap(calls.first)
+        XCTAssertTrue(args.contains("--init"))
+        let host = try XCTUnwrap(args.firstIndex(of: "--add-host"))
+        XCTAssertEqual(args[host + 1], "host.docker.internal:host-gateway")
+        XCTAssertTrue(args.contains("/tmp/rc-docker-create-args/guest-tools:/opt/remotecode-agent:ro"))
+        XCTAssertEqual(args.last, BotComputerGuestSpec.imageTag, "the image stays the final argument")
+    }
+
     func test_runProcessReturnsOutputLargerThanPipeCapacity() throws {
         // WHY: a real guest PNG is often larger than the OS pipe capacity, so
         // the runner must consume all bytes while the child is still writing.
