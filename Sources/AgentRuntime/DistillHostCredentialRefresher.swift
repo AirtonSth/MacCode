@@ -178,7 +178,9 @@ public struct DistillHostCredentialRefresher: Sendable {
             return Date(timeIntervalSince1970: exp).timeIntervalSince(now()) > Self.refreshWindow
         }
         guard let lastRefresh = (store["last_refresh"] as? String).flatMap(Self.parseDate) else { return false }
-        return now().timeIntervalSince(lastRefresh) < Self.codexUnknownExpiryDays
+        // The guest applies Distill's 8-day rule to its blank-refresh copy, so
+        // the Mac renews within the same window it uses for a known `exp`.
+        return now().timeIntervalSince(lastRefresh) < Self.codexUnknownExpiryDays - Self.refreshWindow
     }
 
     static func codexAccountID(_ idToken: String) -> String? {

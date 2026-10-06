@@ -321,6 +321,38 @@ final class DistillHostCredentialRefresherTests: XCTestCase {
         XCTAssertEqual(lastRefresh.timeIntervalSince(now), 0, accuracy: 1)
     }
 
+    func test_codexWithoutAReadableExpiryIsRenewedBeforeTheGuestsEightDayRuleTrips() async throws {
+        // An opaque access token: Distill falls back to last_refresh + 8 days.
+        // The guest copy applies that rule moments after the Mac checks it, so
+        // a Mac at 7.99 days must renew, not hand the guest a token it will
+        // try (and fail) to refresh.
+        func write(lastRefreshAgo: TimeInterval) throws {
+            try writeHost("codex-auth.json", [
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": NSNull(),
+                "tokens": [
+                    "id_token": idToken(account: "acct-1"),
+                    "access_token": "opaque-access-token",
+                    "refresh_token": codexRefresh,
+                    "account_id": "acct-1",
+                ],
+                "last_refresh": iso(now.addingTimeInterval(-lastRefreshAgo)),
+            ] as [String: Any])
+        }
+        let endpoint = TokenEndpoint()
+        endpoint.respond(status: 200, ["access_token": "AT-CODEX-NEW", "refresh_token": "RT-CODEX-ROTATED"])
+
+        try write(lastRefreshAgo: 7 * 86_400)
+        try await refresher(endpoint).prepare(provider: .chatgpt)
+        XCTAssertEqual(endpoint.requests.count, 0, "a day left is fresh")
+
+        try write(lastRefreshAgo: 8 * 86_400 - 60)
+        try await refresher(endpoint).prepare(provider: .chatgpt)
+        XCTAssertEqual(endpoint.requests.count, 1, "inside the refresh window of the 8-day rule")
+        let tokens = try XCTUnwrap(try hostJSON("codex-auth.json")["tokens"] as? [String: Any])
+        XCTAssertEqual(tokens["access_token"] as? String, "AT-CODEX-NEW")
+    }
+
     func test_codexRenewalForAnotherAccountIsRefusedAndTheFileKept() async throws {
         try writeCodex(accessExpiresIn: 60)
         let before = try snapshot("codex-auth.json")

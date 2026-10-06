@@ -214,6 +214,56 @@ final class DistillGuestCredentialsTests: XCTestCase {
         XCTAssertEqual(try guestJSON("claude-auth.json")["refresh_token"] as? String, "")
     }
 
+    /// Runs `body` off the test thread; false when it has not returned in time.
+    private func returnsPromptly(within seconds: TimeInterval = 3, _ body: @escaping @Sendable () -> Void) -> Bool {
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            body()
+            done.signal()
+        }
+        return done.wait(timeout: .now() + seconds) == .success
+    }
+
+    func test_aGuestFIFOOrHugeSparseFileInPlaceOfACopyCannotStallTheSync() throws {
+        // The guest agent can plant either at a copy's name. Every sync of
+        // every bot runs on one queue, and begin/end block their caller on it,
+        // so a blocking open or a 64 GiB read would freeze all of them.
+        try writeHost("claude-auth.json", Self.claudeStore())
+        try writeHost("codex-auth.json", Self.codexStore)
+        try FileManager.default.createDirectory(at: guestHome, withIntermediateDirectories: true)
+        XCTAssertEqual(mkfifo(guestHome.appendingPathComponent("claude-auth.json").path, 0o644), 0)
+        let sparse = guestHome.appendingPathComponent("codex-auth.json")
+        XCTAssertTrue(FileManager.default.createFile(atPath: sparse.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: sparse)
+        try handle.truncate(atOffset: 64 << 30)
+        try handle.close()
+
+        let hostHome = hostHome!
+        let guestHome = guestHome!
+        nonisolated(unsafe) var result: DistillGuestCredentials.SyncResult?
+        XCTAssertTrue(returnsPromptly {
+            result = try? DistillGuestCredentials.sync(hostHome: hostHome, guestDistillHome: guestHome)
+        }, "sync must not block on a guest FIFO or read a huge guest file")
+
+        XCTAssertEqual(Set(result?.written ?? []), [.claude, .chatgpt], "both are replaced by real copies")
+        for name in ["claude-auth.json", "codex-auth.json"] {
+            let attributes = try FileManager.default.attributesOfItem(atPath: guestHome.appendingPathComponent(name).path)
+            XCTAssertEqual(attributes[.type] as? FileAttributeType, .typeRegular, name)
+        }
+        XCTAssertEqual(try guestJSON("claude-auth.json")["access_token"] as? String, "AT-CLAUDE-1")
+        XCTAssertEqual((try guestJSON("codex-auth.json")["tokens"] as? [String: Any])?["refresh_token"] as? String, "")
+    }
+
+    func test_anEmptyGuestDirectoryInPlaceOfACopyIsReplaced() throws {
+        try writeHost("claude-auth.json", Self.claudeStore())
+        try FileManager.default.createDirectory(
+            at: guestHome.appendingPathComponent("claude-auth.json"), withIntermediateDirectories: true)
+
+        try DistillGuestCredentials.sync(hostHome: hostHome, guestDistillHome: guestHome)
+
+        XCTAssertEqual(try guestJSON("claude-auth.json")["refresh_token"] as? String, "")
+    }
+
     func test_cleanupRemovesCredentialsLocksAndTempsButKeepsTheRestOfTheHome() throws {
         try FileManager.default.createDirectory(
             at: guestHome.appendingPathComponent("sessions"), withIntermediateDirectories: true)
@@ -299,13 +349,13 @@ final class DistillGuestCredentialsTests: XCTestCase {
 
     func test_mirrorFollowsMacRenewalsDuringARunAndCleansUpAfterTheLastRun() throws {
         try writeHost("claude-auth.json", Self.claudeStore())
-        let mirror = DistillGuestCredentialMirror(hostHome: hostHome, debounce: 0.05)
+        let mirror = DistillGuestCredentialMirror(hostHome: hostHome, refresh: { _ in }, debounce: 0.05)
         let runA = UUID().uuidString
         let runB = UUID().uuidString
 
-        let first = try mirror.begin(runID: runA, guestDistillHome: guestHome)
+        let first = try mirror.begin(runID: runA, guestDistillHome: guestHome, provider: .claude)
         XCTAssertEqual(first.written, [.claude], "the pre-run sync happens before begin returns")
-        try mirror.begin(runID: runB, guestDistillHome: guestHome)
+        try mirror.begin(runID: runB, guestDistillHome: guestHome, provider: .claude)
 
         // A Mac Distill process renews the token (temp + rename).
         try writeHost("claude-auth.json", Self.claudeStore(access: "AT-CLAUDE-RENEWED"))
@@ -330,5 +380,119 @@ final class DistillGuestCredentialsTests: XCTestCase {
         try writeHost("claude-auth.json", Self.claudeStore(access: "AT-CLAUDE-3"))
         RunLoop.current.run(until: Date().addingTimeInterval(0.3))
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: guestHome.path), [])
+    }
+
+    /// Records which providers the mirror asks to renew, and can fail one.
+    final class RefreshRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _calls: [DistillAccountProvider] = []
+        private var _failures: [([String], DistillGuestCredentialError?)] = []
+        var failing: Set<DistillAccountProvider> = []
+        var onRefresh: (@Sendable (DistillAccountProvider) throws -> Void)?
+
+        var calls: [DistillAccountProvider] { lock.lock(); defer { lock.unlock() }; return _calls }
+        var failures: [([String], DistillGuestCredentialError?)] { lock.lock(); defer { lock.unlock() }; return _failures }
+
+        var refresh: DistillGuestCredentialMirror.Refresh {
+            { provider in
+                let (fails, onRefresh) = self.record(provider)
+                if fails { throw DistillGuestCredentialError.grokLoginExpiring(expiresAt: Date()) }
+                try onRefresh?(provider)
+            }
+        }
+
+        private func record(_ provider: DistillAccountProvider) -> (Bool, (@Sendable (DistillAccountProvider) throws -> Void)?) {
+            lock.lock(); defer { lock.unlock() }
+            _calls.append(provider)
+            return (failing.contains(provider), onRefresh)
+        }
+
+        var report: DistillGuestCredentialMirror.RefreshFailure {
+            { runIDs, error in
+                self.lock.lock()
+                self._failures.append((runIDs, error as? DistillGuestCredentialError))
+                self.lock.unlock()
+            }
+        }
+    }
+
+    func test_aRunThatOutlivesItsTokenGetsItRenewedOnTheMacWhileItRuns() throws {
+        // A Claude run started with 46 minutes left and no Mac Distill thread
+        // in use: only the mirror's own periodic renewal keeps it working.
+        try writeHost("claude-auth.json", Self.claudeStore())
+        let recorder = RefreshRecorder()
+        let hostHome = hostHome!
+        recorder.onRefresh = { provider in
+            guard provider == .claude else { return }
+            let data = try JSONSerialization.data(withJSONObject: Self.claudeStore(access: "AT-CLAUDE-PERIODIC"))
+            try data.write(to: hostHome.appendingPathComponent("claude-auth.json"), options: .atomic)
+        }
+        let mirror = DistillGuestCredentialMirror(
+            hostHome: hostHome, refresh: recorder.refresh, debounce: 0.05, refreshInterval: 0.1)
+        let keyRun = UUID().uuidString
+        let claudeRun = UUID().uuidString
+        try mirror.begin(runID: keyRun, guestDistillHome: guestHome, provider: nil)
+        try mirror.begin(runID: claudeRun, guestDistillHome: guestHome, provider: .claude)
+
+        XCTAssertTrue(waitUntil {
+            (try? self.guestJSON("claude-auth.json")["access_token"] as? String) == "AT-CLAUDE-PERIODIC"
+        }, "the periodic renewal must reach the live run's copy")
+        XCTAssertEqual(try guestJSON("claude-auth.json")["refresh_token"] as? String, "")
+        XCTAssertEqual(Set(recorder.calls), [.claude], "only the accounts live runs use are renewed")
+
+        mirror.end(runID: claudeRun)
+        mirror.end(runID: keyRun)
+        let callsAtEnd = recorder.calls.count
+        RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+        XCTAssertLessThanOrEqual(recorder.calls.count, callsAtEnd + 1, "no renewal once no run is live")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: guestHome.path), [])
+    }
+
+    func test_aPeriodicRenewalFailureIsReportedForTheRunsThatUseThatAccount() throws {
+        try writeHost("auth.json", Self.grokStore)
+        try writeHost("claude-auth.json", Self.claudeStore())
+        let recorder = RefreshRecorder()
+        recorder.failing = [.grok]
+        let mirror = DistillGuestCredentialMirror(
+            hostHome: hostHome, refresh: recorder.refresh, onRefreshFailure: recorder.report,
+            debounce: 0.05, refreshInterval: 0.1)
+        let grokRun = UUID().uuidString
+        try mirror.begin(runID: grokRun, guestDistillHome: guestHome, provider: .grok)
+        try mirror.begin(runID: UUID().uuidString, guestDistillHome: guestHome, provider: .claude)
+
+        XCTAssertTrue(waitUntil { !recorder.failures.isEmpty }, "a failed renewal must not be silent")
+        let failure = try XCTUnwrap(recorder.failures.first)
+        XCTAssertEqual(failure.0, [grokRun], "only the run that needs the Grok sign-in is affected")
+        if case .grokLoginExpiring = failure.1 {} else { XCTFail("the refresher's own error reaches the caller") }
+    }
+
+    func test_aFailedBeginRegistersNothingAndLeavesNoCopyBehind() throws {
+        try writeAllHostAccounts()
+        // auth.json (Grok) is written first; a non-empty directory planted at
+        // the Claude copy's name then makes the sync fail part-way.
+        let planted = guestHome.appendingPathComponent("claude-auth.json/keep", isDirectory: true)
+        try FileManager.default.createDirectory(at: planted, withIntermediateDirectories: true)
+        let mirror = DistillGuestCredentialMirror(hostHome: hostHome, refresh: { _ in })
+
+        XCTAssertThrowsError(try mirror.begin(runID: "run-1", guestDistillHome: guestHome, provider: .claude)) { error in
+            guard case .writeFailed(_, let code)? = error as? DistillGuestCredentialError else {
+                return XCTFail("unexpected \(error)")
+            }
+            XCTAssertEqual(code, EISDIR)
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: guestHome.path), ["claude-auth.json"],
+                       "the Grok copy written before the failure must not outlive the failed begin")
+    }
+
+    func test_beginFailsLoudWhenTheMacSignInsCannotBeWatched() throws {
+        // A ~/.distill that is not a directory cannot be watched: without the
+        // watcher a Mac renewal would not reach the run until the next tick.
+        try FileManager.default.removeItem(at: hostHome)
+        XCTAssertTrue(FileManager.default.createFile(atPath: hostHome.path, contents: Data()))
+        let mirror = DistillGuestCredentialMirror(hostHome: hostHome, refresh: { _ in })
+
+        XCTAssertThrowsError(try mirror.begin(runID: "run-1", guestDistillHome: guestHome, provider: nil)) { error in
+            XCTAssertEqual(error as? DistillGuestCredentialError, .watchFailed(path: self.hostHome.path, errno: ENOTDIR))
+        }
     }
 }

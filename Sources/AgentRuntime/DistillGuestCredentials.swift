@@ -17,6 +17,7 @@ public enum DistillGuestCredentialError: LocalizedError, Equatable {
     case grokLoginExpiring(expiresAt: Date)
     case unsafeDirectory(path: String)
     case writeFailed(path: String, errno: Int32)
+    case watchFailed(path: String, errno: Int32)
 
     public var errorDescription: String? {
         switch self {
@@ -46,6 +47,8 @@ public enum DistillGuestCredentialError: LocalizedError, Equatable {
             return "\(path) is not a plain directory, so the Linux agent's sign-in copies were not written there."
         case .writeFailed(let path, let code):
             return "Could not write \(path): \(String(cString: strerror(code)))."
+        case .watchFailed(let path, let code):
+            return "Could not watch \(path) for sign-in changes (\(String(cString: strerror(code)))), so the Linux agent's sign-in copies could not be kept fresh. The Linux agent was not started."
         }
     }
 
@@ -208,63 +211,116 @@ public enum DistillGuestCredentials {
 /// Keeps the guest copies of every live guest run fresh while it runs: a Mac
 /// Distill process (or the pre-run refresh) renewing a token rewrites
 /// `~/.distill/*.json` by rename, which changes the directory and re-syncs
-/// every registered guest home after a short debounce. The copies of a guest
-/// home are deleted when its last run ends.
+/// every registered guest home after a short debounce. A run can outlive its
+/// access token (Claude 8 h, Grok 6 h) with no Mac Distill renewing it, so
+/// every `refreshInterval` the mirror also asks `refresh` to renew the
+/// providers live runs use (a no-op unless the token is inside the refresh
+/// window) and re-syncs. The copies of a guest home are deleted when its last
+/// run ends.
 public final class DistillGuestCredentialMirror: @unchecked Sendable {
+    /// Renews the Mac sign-in of one provider when it is close to expiry;
+    /// production passes `DistillHostCredentialRefresher.prepare(provider:)`.
+    public typealias Refresh = @Sendable (DistillAccountProvider) async throws -> Void
+    /// A periodic renewal failed: these runs keep copies that stop working
+    /// when their access token expires. Called on the mirror's queue.
+    public typealias RefreshFailure = @Sendable (_ runIDs: [String], _ error: Error) -> Void
+
+    private struct Run {
+        var home: URL
+        var provider: DistillAccountProvider?
+    }
+
     private let hostHome: URL
+    private let refresh: Refresh
+    private let onRefreshFailure: RefreshFailure?
     private let debounce: TimeInterval
+    private let refreshInterval: TimeInterval
     // Every mutable member below is touched only on this queue.
     private let queue = DispatchQueue(label: "io.remotecode.distill.guest-credentials")
-    private var runs: [String: URL] = [:]
+    private var runs: [String: Run] = [:]
     private var source: DispatchSourceFileSystemObject?
     private var pending: DispatchWorkItem?
+    private var timer: DispatchSourceTimer?
+    private var refreshing = false
 
-    public init(hostHome: URL, debounce: TimeInterval = 0.5) {
+    public init(
+        hostHome: URL,
+        refresh: @escaping Refresh,
+        onRefreshFailure: RefreshFailure? = nil,
+        debounce: TimeInterval = 0.5,
+        refreshInterval: TimeInterval = 5 * 60
+    ) {
         self.hostHome = hostHome
+        self.refresh = refresh
+        self.onRefreshFailure = onRefreshFailure
         self.debounce = debounce
+        self.refreshInterval = refreshInterval
     }
 
     deinit {
         source?.cancel()
+        timer?.cancel()
     }
 
     /// Copies the sign-ins into `guestDistillHome` now (the pre-run sync) and
-    /// keeps them fresh until `end(runID:)`.
+    /// keeps them fresh until `end(runID:)`. `provider` is the account the
+    /// run's model is served with (nil for an API key): the one renewed
+    /// periodically. On a throw nothing is registered and no copy this call
+    /// wrote is left behind.
     @discardableResult
-    public func begin(runID: String, guestDistillHome: URL) throws -> DistillGuestCredentials.SyncResult {
+    public func begin(
+        runID: String, guestDistillHome: URL, provider: DistillAccountProvider?
+    ) throws -> DistillGuestCredentials.SyncResult {
         try queue.sync {
             let home = guestDistillHome.standardizedFileURL
-            let result = try DistillGuestCredentials.sync(hostHome: hostHome, guestDistillHome: home)
-            runs[runID] = home
-            if source == nil { startWatching() }
-            return result
+            do {
+                let result = try DistillGuestCredentials.sync(hostHome: hostHome, guestDistillHome: home)
+                if source == nil { try startWatching() }
+                runs[runID] = Run(home: home, provider: provider)
+                if timer == nil { startTimer() }
+                return result
+            } catch {
+                if !runs.values.contains(where: { $0.home == home }) { removeCopies(home, runID: runID) }
+                if runs.isEmpty { stopAll() }
+                throw error
+            }
         }
     }
 
     public func end(runID: String) {
         queue.sync {
-            guard let home = runs.removeValue(forKey: runID) else { return }
-            if !runs.values.contains(home) {
-                do {
-                    try DistillGuestCredentials.removeCopies(guestDistillHome: home)
-                } catch {
-                    guestCredentialLog.error("bot.guest.credentials.cleanup_failed run=\(runID, privacy: .public)")
-                }
-            }
-            if runs.isEmpty {
-                pending?.cancel()
-                pending = nil
-                source?.cancel()
-                source = nil
-            }
+            guard let run = runs.removeValue(forKey: runID) else { return }
+            if !runs.values.contains(where: { $0.home == run.home }) { removeCopies(run.home, runID: runID) }
+            if runs.isEmpty { stopAll() }
         }
     }
 
-    private func startWatching() {
+    private func removeCopies(_ home: URL, runID: String) {
+        do {
+            try DistillGuestCredentials.removeCopies(guestDistillHome: home)
+        } catch {
+            guestCredentialLog.error("bot.guest.credentials.cleanup_failed run=\(runID, privacy: .public)")
+        }
+    }
+
+    private func stopAll() {
+        pending?.cancel()
+        pending = nil
+        source?.cancel()
+        source = nil
+        timer?.cancel()
+        timer = nil
+    }
+
+    /// Throws when `~/.distill` exists but cannot be watched. A missing one
+    /// (no sign-in at all) is retried on every refresh tick.
+    private func startWatching() throws {
         let descriptor = open(hostHome.path, O_EVTONLY | O_DIRECTORY | O_CLOEXEC)
         guard descriptor >= 0 else {
-            guestCredentialLog.error("bot.guest.credentials.watch_failed errno=\(errno, privacy: .public)")
-            return
+            let code = errno
+            guestCredentialLog.error("bot.guest.credentials.watch_failed errno=\(code, privacy: .public)")
+            if code == ENOENT { return }
+            throw DistillGuestCredentialError.watchFailed(path: hostHome.path, errno: code)
         }
         let source = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: descriptor, eventMask: [.write, .rename, .delete], queue: queue)
@@ -274,13 +330,52 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
             if !source.data.isDisjoint(with: [.rename, .delete]) {
                 source.cancel()
                 self.source = nil
-                self.startWatching()
+                try? self.startWatching()
             }
             self.scheduleResync()
         }
         source.setCancelHandler { close(descriptor) }
         self.source = source
         source.resume()
+    }
+
+    private func startTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + refreshInterval, repeating: refreshInterval)
+        timer.setEventHandler { [weak self] in self?.refreshTick() }
+        self.timer = timer
+        timer.resume()
+    }
+
+    private func refreshTick() {
+        if source == nil { try? startWatching() }
+        guard !refreshing else { return }
+        refreshing = true
+        let providers = DistillAccountProvider.allCases.filter { provider in
+            runs.values.contains { $0.provider == provider }
+        }
+        let refresh = self.refresh
+        Task { [weak self] in
+            var failures: [(DistillAccountProvider, Error)] = []
+            for provider in providers {
+                do { try await refresh(provider) } catch { failures.append((provider, error)) }
+            }
+            guard let self else { return }
+            self.queue.async { self.finishRefresh(failures) }
+        }
+    }
+
+    private func finishRefresh(_ failures: [(DistillAccountProvider, Error)]) {
+        refreshing = false
+        for (provider, error) in failures {
+            let affected = runs.filter { $0.value.provider == provider }.map(\.key).sorted()
+            guard !affected.isEmpty else { continue }
+            guestCredentialLog.error(
+                "bot.guest.credentials.refresh_failed provider=\(provider.rawValue, privacy: .public) runs=\(affected.count, privacy: .public)")
+            onRefreshFailure?(affected, error)
+        }
+        // Also covers a renewal the watcher missed.
+        resyncAll()
     }
 
     private func scheduleResync() {
@@ -292,7 +387,7 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
 
     private func resyncAll() {
         pending = nil
-        for home in Set(runs.values) {
+        for home in Set(runs.values.map(\.home)) {
             do {
                 try DistillGuestCredentials.sync(hostHome: hostHome, guestDistillHome: home)
             } catch {
@@ -331,14 +426,20 @@ struct PrivateDirectory {
 
     func close() { Darwin.close(descriptor) }
 
-    /// Nil when missing, unreadable or not a regular file (a symlink included).
+    /// Far above any credential file; a bigger one is treated as differing.
+    static let readLimit = 1 << 20
+
+    /// Nil when missing, unreadable, larger than `readLimit` or not a regular
+    /// file (a symlink included). The guest owns this directory: a FIFO there
+    /// would block a plain open and a sparse 64 GiB file would be read whole.
     func read(_ name: String) -> Data? {
-        let fd = openat(descriptor, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let fd = openat(descriptor, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { return nil }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         var info = stat()
-        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return nil }
-        return try? handle.readToEnd() ?? Data()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_size <= Self.readLimit else { return nil }
+        return try? handle.read(upToCount: Int(info.st_size)) ?? Data()
     }
 
     /// Temp file at 0600 + fsync + rename, so a reader sees the old file or
@@ -362,7 +463,14 @@ struct PrivateDirectory {
         }
         if failure == 0, fsync(fd) != 0 { failure = errno }
         Darwin.close(fd)
-        if failure == 0, renameat(descriptor, temp, descriptor, name) != 0 { failure = errno }
+        if failure == 0, renameat(descriptor, temp, descriptor, name) != 0 {
+            failure = errno
+            // An empty directory in the way is removed; a non-empty one fails.
+            if failure == EISDIR, unlinkat(descriptor, name, AT_REMOVEDIR) == 0,
+               renameat(descriptor, temp, descriptor, name) == 0 {
+                failure = 0
+            }
+        }
         if failure != 0 {
             unlinkat(descriptor, temp, 0)
             throw DistillGuestCredentialError.writeFailed(path: "\(path)/\(name)", errno: failure)
