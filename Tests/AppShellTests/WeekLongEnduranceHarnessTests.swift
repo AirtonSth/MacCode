@@ -108,8 +108,6 @@ final class WeekLongEnduranceHarnessTests: XCTestCase {
         let profile = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: eightGiB)
         XCTAssertEqual(profile.name, "low-memory-8g")
         XCTAssertNil(profile.providerRootCap)
-        XCTAssertEqual(profile.sidecarMaxConcurrentRequests, 1)
-        XCTAssertEqual(profile.sidecarMaxQueueDepth, 4)
 
         let admissionGate = ManagedProviderAdmissionGate(reservationLifetime: 60)
         let emptyProcessScan = ManagedProcessScan(

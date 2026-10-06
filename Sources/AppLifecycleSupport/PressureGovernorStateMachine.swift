@@ -38,8 +38,6 @@ public enum PressureLevel: String, Sendable, Codable, Equatable, Comparable {
 public enum PressureActionKind: String, Sendable, Codable, Equatable, CaseIterable {
     case reclaimHiddenRecomputableUI
     case shortenCompletedIdleProviderSessions
-    case releaseDistillIdleModelGPU
-    case pauseGraphifyEnsureAndWatchCallbacks
     case deferMaintenancePrune
     case resumeOptionalWorkUnit
     /// Explicit non-actions preserved as documentation of the cut features.
@@ -181,8 +179,6 @@ public enum PressureGovernorStateMachine {
     public static let warningActions: [PressureActionKind] = [
         .reclaimHiddenRecomputableUI,
         .shortenCompletedIdleProviderSessions,
-        .releaseDistillIdleModelGPU,
-        .pauseGraphifyEnsureAndWatchCallbacks,
         .deferMaintenancePrune,
     ]
 
