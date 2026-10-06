@@ -439,6 +439,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var botBusyMessage: ((BotID, AgentThreadID) -> String?)?
     /// Registers a thread queued behind another thread's run on the bot's VM.
     public var botWaitForVM: ((BotID, AgentThreadID) -> Void)?
+    /// Claims the bot's VM for a run about to start; returns the other thread's
+    /// run when it holds the VM (nothing claimed then).
+    public var botClaimVM: ((BotID, BotVMRunRegistry.Entry) -> BotVMRunRegistry.Entry?)?
+    /// Frees a VM claim whose run never started.
+    public var botReleaseVM: ((AgentRunID) -> Void)?
+    /// Set when the last start was refused because another thread holds the bot's VM.
+    private var botVMClaimRefusal: (botID: BotID, notice: String)?
     /// Pending Mac-execution approvals pushed by the host, per thread (reason text).
     @Published public var pendingMacExecutionByThread: [AgentThreadID: String] = [:]
     /// Approves or declines a pending Mac-execution request; wired by the host.
@@ -8628,23 +8635,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if case .bot(let botID) = sendActor,
            (sendThread?.actorLockedAt != nil ? sendThread?.executionTarget : nil) ?? botExecutionTargetProvider(botID) == .vm,
            let busy = botBusyMessage?(botID, sendThreadId ?? AgentThreadID()) {
-            if selectedThreadId == nil { createThread(title: "New thread") }
-            if let tid = selectedThreadId {
-                if threads.first(where: { $0.id == tid })?.actorLockedAt == nil {
-                    do { try lockBotActor(botID: botID, threadId: tid) } catch {
-                        statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-                        restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
-                        return
-                    }
-                }
-                if await enqueuePromptWhileRunning(text: text, attached: attachedForSend) {
-                    botWaitForVM?(botID, tid)
-                    statusMessage = busy
-                    return
-                }
-            }
-            statusMessage = busy
-            restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
+            await queueBehindBusyBotVM(
+                botID: botID, busy: busy, text: text, attached: attachedForSend,
+                originalPrompt: originalPrompt, sendThreadId: sendThreadId
+            )
             return
         }
         if selectedThreadCanQueuePrompt,
@@ -8658,8 +8652,47 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             interactionMode: interactionMode,
             recoveryDisplayText: originalPrompt
         ) == nil {
+            // Another thread took the bot's VM after the check above: queue too.
+            if let refusal = botVMClaimRefusal {
+                botVMClaimRefusal = nil
+                await queueBehindBusyBotVM(
+                    botID: refusal.botID, busy: refusal.notice, text: text, attached: attachedForSend,
+                    originalPrompt: originalPrompt, sendThreadId: sendThreadId
+                )
+                return
+            }
             restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
         }
+    }
+
+    /// One run per bot VM: the send waits in the thread's queue behind the
+    /// holder. A fresh thread is created and its bot actor locked first so the
+    /// drained message runs as the bot.
+    private func queueBehindBusyBotVM(
+        botID: BotID,
+        busy: String,
+        text: String,
+        attached: [AgentAttachment],
+        originalPrompt: String,
+        sendThreadId: AgentThreadID?
+    ) async {
+        if selectedThreadId == nil { createThread(title: "New thread") }
+        if let tid = selectedThreadId {
+            if threads.first(where: { $0.id == tid })?.actorLockedAt == nil {
+                do { try lockBotActor(botID: botID, threadId: tid) } catch {
+                    statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                    restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
+                    return
+                }
+            }
+            if await enqueuePromptWhileRunning(text: text, attached: attached) {
+                botWaitForVM?(botID, tid)
+                statusMessage = busy
+                return
+            }
+        }
+        statusMessage = busy
+        restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
     }
 
     @discardableResult
@@ -9028,6 +9061,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         /// Provider still receives `text`; omit for non-send callers.
         recoveryDisplayText: String? = nil
     ) async -> AgentRunID? {
+        botVMClaimRefusal = nil
         guard !refuseLegacyProviderThreadRun() else { return nil }
         guard !refuseUnavailableBotThreadRun() else { return nil }
         let baseRouting = queuedRoutingSnapshot?.configuration
@@ -9137,6 +9171,39 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
            embedding == nil || (actorThread?.actorLockedAt != nil && actorThread?.executionTarget == .vm),
            await botVMGateBlocksRun(botID: botID, thread: actorThread) {
             return nil
+        }
+        // D12: claim the bot's VM before any visible start effect. When another
+        // thread's run holds it, refuse so `send()` queues behind that run.
+        var vmClaimRunId: AgentRunID?
+        var vmRunStarted = false
+        defer {
+            if let vmClaimRunId, !vmRunStarted { botReleaseVM?(vmClaimRunId) }
+        }
+        if case .bot(let botID) = runActor, let claimVM = botClaimVM {
+            let vmTarget = actorThread?.actorLockedAt != nil
+                ? actorThread?.executionTarget
+                : (embedding == nil ? botExecutionTargetProvider(botID) : nil)
+            if vmTarget == .vm {
+                // The title the thread gets from this message (B5 below).
+                let title = actorThread.map {
+                    AgentThreadTitle.isPlaceholder($0.title) && !((try? messageRepo.hasAny(threadId: tid)) ?? false)
+                        ? Self.deriveTitle(from: text)
+                        : $0.title
+                } ?? Self.deriveTitle(from: text)
+                let entry = BotVMRunRegistry.Entry(
+                    threadID: tid,
+                    runID: runId,
+                    title: title,
+                    workspace: actorThread?.worktreePath ?? embedding?.executionCwd ?? cwd
+                )
+                if let holder = claimVM(botID, entry) {
+                    let notice = "bot ocupado em \(holder.title)"
+                    botVMClaimRefusal = (botID, notice)
+                    statusMessage = notice
+                    return nil
+                }
+                vmClaimRunId = runId
+            }
         }
         if embedding == nil, case .bot(let botID) = runActor {
             do {
@@ -9400,6 +9467,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 routingSnapshot: routingSnapshot,
                 recordUserMessage: !resumeInterrupted
             )
+            vmRunStarted = true
             coordinator.releaseProviderStartReservation(threadId: tid, runId: runId)
             // Surface claim consumed the permit; coordinator owns the live run.
             // Terminalize *this* generation so a second send can accept again.

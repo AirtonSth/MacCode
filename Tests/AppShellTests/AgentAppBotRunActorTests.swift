@@ -408,4 +408,163 @@ final class AgentAppBotRunActorTests: XCTestCase {
         try await Task.sleep(nanoseconds: 200_000_000)
         XCTAssertTrue(f.runner.requests.isEmpty, "no provider request without a provider snapshot")
     }
+
+    // MARK: - D12: the VM claim is taken before the start and its result honoured
+
+    private func otherThreadHolder(_ f: Fixture, title: String) -> BotVMRunRegistry.Entry {
+        BotVMRunRegistry.Entry(
+            threadID: AgentThreadID(), runID: AgentRunID(), title: title, workspace: f.workspaceCwd
+        )
+    }
+
+    /// Links and locks the fixture thread to the bot's VM, as a VM-bot thread is stored.
+    private func lockThreadToVM(_ f: Fixture) throws {
+        try XCTUnwrap(f.vm.botThreadLinker)(f.bot.id, f.thread.id)
+        XCTAssertTrue(try f.ctx.threadRepo.setActor(
+            id: f.thread.id, actor: .bot(f.bot.id), lockedAt: Date(), executionTarget: .vm
+        ))
+    }
+
+    func test_vmBotRunHoldsTheVMFromBeforeItsStartUntilItFinishes() async throws {
+        // WHY (D12): a claim taken only after the provider started leaves a window
+        // where a second thread starts on the same VM; a claim never freed keeps
+        // the bot "busy" forever.
+        let f = try makeFixture()
+        f.vm.botExecutionTargetProvider = { _ in .vm }
+        f.vm.botVMPreflight = { _, _ in nil }
+        let compile = try XCTUnwrap(f.vm.botPromptTransform)
+        var claimBeforeStart: BotVMRunRegistry.Entry?
+        f.vm.botPromptTransform = { botID, text, threadID, runID in
+            claimBeforeStart = BotVMRunRegistry.shared.active(botID: botID)
+            return try await compile(botID, text, threadID, runID)
+        }
+        f.vm.setRunActor(.bot(f.bot.id))
+        f.vm.prompt = "vm task"
+        await f.vm.send()
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started, f.vm.statusMessage)
+        let request = try XCTUnwrap(f.runner.requests.first)
+        XCTAssertEqual(claimBeforeStart?.threadID, f.thread.id, "claimed before the provider start")
+        XCTAssertEqual(claimBeforeStart?.runID, request.runId)
+        XCTAssertEqual(BotVMRunRegistry.shared.active(botID: f.bot.id)?.runID, request.runId)
+
+        XCTAssertTrue(f.runner.finish(runID: request.runId, status: .completed, reply: "done"))
+        let freed = await waitUntil { BotVMRunRegistry.shared.active(botID: f.bot.id) == nil }
+        XCTAssertTrue(freed, "the run's finish frees the VM")
+    }
+
+    func test_vmTakenAfterTheBusyCheckQueuesThenStartsWhenTheHolderFinishes() async throws {
+        // WHY: the busy check in send() and the start are separated by awaits
+        // (VM preflight). A thread that takes the VM in between must win: this
+        // send queues with the notice, and starts once the holder is done.
+        let f = try makeFixture()
+        f.vm.botExecutionTargetProvider = { _ in .vm }
+        let holder = otherThreadHolder(f, title: "Tarefa B")
+        defer { BotVMRunRegistry.shared.endRun(runID: holder.runID) }
+        f.vm.botVMPreflight = { botID, _ in
+            XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: botID, entry: holder))
+            return nil
+        }
+        f.vm.setRunActor(.bot(f.bot.id))
+        f.vm.prompt = "racing task"
+        await f.vm.send()
+        XCTAssertTrue(f.runner.requests.isEmpty, "no overlapping run on the VM")
+        XCTAssertTrue(f.vm.statusMessage.contains("bot ocupado em Tarefa B"), f.vm.statusMessage)
+        XCTAssertEqual(BotVMRunRegistry.shared.active(botID: f.bot.id)?.runID, holder.runID, "holder keeps the VM")
+        XCTAssertEqual(BotVMRunRegistry.shared.waitingThreads(botID: f.bot.id), [f.thread.id])
+        let queued = try f.ctx.queuedMessageRepo.list(threadId: f.thread.id)
+        XCTAssertEqual(queued.map(\.text), ["racing task"])
+        XCTAssertEqual(f.vm.prompt, "", "queued, so the composer is not refilled")
+
+        // Eventual completion: freeing the holder's claim hands the VM to this
+        // (never-run) thread and starts its queued message.
+        f.router.releaseBotVMRun(holder.runID)
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started, f.vm.statusMessage)
+        let request = try XCTUnwrap(f.runner.requests.first)
+        XCTAssertEqual(request.runId, AgentRunID(try XCTUnwrap(queued.first).id.value))
+        XCTAssertEqual(BotVMRunRegistry.shared.active(botID: f.bot.id)?.threadID, f.thread.id)
+        XCTAssertEqual(BotVMRunRegistry.shared.active(botID: f.bot.id)?.runID, request.runId)
+        XCTAssertTrue(try f.ctx.queuedMessageRepo.list(threadId: f.thread.id).isEmpty)
+        f.runner.finish(runID: request.runId, status: .completed, reply: "done")
+    }
+
+    func test_vmClaimIsFreedWhenTheStartFailsBeforeTheProvider() async throws {
+        // WHY: a send that fails after claiming (bot brain failed) must not keep
+        // the VM, or every other thread of the bot queues behind a run that never ran.
+        let f = try makeFixture()
+        f.vm.botExecutionTargetProvider = { _ in .vm }
+        f.vm.botVMPreflight = { _, _ in nil }
+        var claimDuringStart: BotVMRunRegistry.Entry?
+        f.vm.botPromptTransform = { botID, _, _, _ in
+            claimDuringStart = BotVMRunRegistry.shared.active(botID: botID)
+            throw NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "brain failed"])
+        }
+        f.vm.setRunActor(.bot(f.bot.id))
+        f.vm.prompt = "doomed task"
+        await f.vm.send()
+        XCTAssertTrue(f.runner.requests.isEmpty)
+        XCTAssertTrue(f.vm.statusMessage.contains("brain failed"), f.vm.statusMessage)
+        XCTAssertEqual(claimDuringStart?.threadID, f.thread.id, "the VM was claimed for the start")
+        XCTAssertNil(BotVMRunRegistry.shared.active(botID: f.bot.id), "an unstarted run frees its claim")
+    }
+
+    func test_routerSendToABusyVMBotThreadQueuesWithTheNoticeThenStarts() async throws {
+        // WHY: desk, peer and remote sends reach a VM bot thread through the
+        // router. Before, they started at once and claimed the VM after the fact
+        // (result discarded), so two threads ran on one VM.
+        let f = try makeFixture()
+        try lockThreadToVM(f)
+        SurfaceRegistry.shared.register(f.surface)
+        defer { SurfaceRegistry.shared.unregister(f.surface.descriptor.id) }
+        let holder = otherThreadHolder(f, title: "Tarefa A")
+        XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: f.bot.id, entry: holder))
+        defer { BotVMRunRegistry.shared.endRun(runID: holder.runID) }
+
+        let result = try await f.router.sendAgentMessage(
+            thread: f.thread.id, text: "router task", provider: .codex, model: "fake-model",
+            permissionMode: .supervised, reasoningEffort: .medium
+        )
+        XCTAssertEqual(result.status, .queued)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(f.runner.requests.isEmpty, "no overlapping run on the VM")
+        XCTAssertEqual(BotVMRunRegistry.shared.waitingThreads(botID: f.bot.id), [f.thread.id])
+        XCTAssertEqual(BotVMRunRegistry.shared.active(botID: f.bot.id)?.runID, holder.runID)
+        XCTAssertTrue(f.vm.statusMessage.contains("bot ocupado em Tarefa A"), f.vm.statusMessage)
+        let queued = try f.ctx.queuedMessageRepo.list(threadId: f.thread.id)
+        XCTAssertEqual(queued.map(\.text), ["router task"])
+        XCTAssertEqual(queued.first?.durableState, .queued, "the drain left it queued, not prepared")
+
+        f.router.releaseBotVMRun(holder.runID)
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started, "the hand-off drains the never-run thread")
+        let request = try XCTUnwrap(f.runner.requests.first)
+        XCTAssertEqual(BotVMRunRegistry.shared.active(botID: f.bot.id)?.runID, request.runId)
+        f.runner.finish(runID: request.runId, status: .completed, reply: "done")
+        let freed = await waitUntil { BotVMRunRegistry.shared.active(botID: f.bot.id) == nil }
+        XCTAssertTrue(freed)
+    }
+
+    func test_routerQueuedDispatchThatFailsBeforeTheProviderFreesTheVM() async throws {
+        // WHY: the drain claims the VM before preparing the dispatch; a dispatch
+        // that never reaches the provider must hand the VM back.
+        let f = try makeFixture()
+        try lockThreadToVM(f)
+        var claimDuringDispatch: BotVMRunRegistry.Entry?
+        let botID = f.bot.id
+        f.router.botThreadPromptTransform = { _, _, _ in
+            claimDuringDispatch = BotVMRunRegistry.shared.active(botID: botID)
+            throw NSError(domain: "test", code: 2, userInfo: [NSLocalizedDescriptionKey: "brain failed"])
+        }
+        _ = try f.ctx.queuedMessageRepo.enqueue(
+            threadId: f.thread.id, text: "doomed queued task", attachments: [], interactionMode: .default
+        )
+        do {
+            try await f.router.drainNextQueuedAgentMessage(thread: f.thread.id, botVMHandOff: true)
+            XCTFail("the failed dispatch must surface its error")
+        } catch {}
+        XCTAssertTrue(f.runner.requests.isEmpty)
+        XCTAssertEqual(claimDuringDispatch?.threadID, f.thread.id, "the drain claimed the VM for the dispatch")
+        XCTAssertNil(BotVMRunRegistry.shared.active(botID: f.bot.id), "an unstarted dispatch frees its claim")
+    }
 }

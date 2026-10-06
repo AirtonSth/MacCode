@@ -18,6 +18,57 @@ extension AppCommandRouter {
         return models
     }
 
+    /// D12 before a router start: claims the bot's VM for `runID` on a thread
+    /// locked to the bot's VM. nil for any other thread. `holder` is the other
+    /// thread's run when the VM is busy (nothing was claimed then).
+    /// `firstMessage` names a never-used thread as the send will rename it.
+    func claimBotVMRun(
+        thread: AgentThreadID,
+        runID: AgentRunID,
+        firstMessage: String? = nil
+    ) -> (botID: BotID, holder: BotVMRunRegistry.Entry?)? {
+        guard let ctx = context,
+              (try? ctx.threadRepo.guestPlacement(of: thread))??.executionTarget == .vm,
+              let row = (try? ctx.threadRepo.get(id: thread)) ?? nil else { return nil }
+        let botID: BotID
+        if case .bot(let id) = row.actor {
+            botID = id
+        } else if let conversation = (try? ctx.botStore.conversationLinked(to: thread)) ?? nil {
+            botID = conversation.botID
+        } else {
+            return nil
+        }
+        let untitled = AgentThreadTitle.isPlaceholder(row.title)
+            && (try? ctx.messageRepo.hasAny(threadId: thread)) != true
+        let title = untitled ? firstMessage.map(AgentThreadTitle.titleFromFirstMessage) ?? row.title : row.title
+        let holder = BotVMRunRegistry.shared.tryBegin(
+            botID: botID,
+            entry: BotVMRunRegistry.Entry(
+                threadID: thread, runID: runID, title: title, workspace: row.worktreePath ?? ""
+            )
+        )
+        return (botID, holder)
+    }
+
+    /// Frees a claim whose run never started and hands the VM to the next
+    /// queued thread, as the run-finished callback does for a started run.
+    func releaseBotVMRun(_ runID: AgentRunID) {
+        guard let next = BotVMRunRegistry.shared.releaseAndNextWaiting(runID: runID) else { return }
+        Task { @MainActor [weak self] in try? await self?.drainNextQueuedAgentMessage(thread: next, botVMHandOff: true) }
+    }
+
+    /// Queues `thread` behind the run holding the bot's VM and shows the
+    /// notice on the surfaces showing it. Returns the notice.
+    @discardableResult
+    func waitForBotVM(botID: BotID, thread: AgentThreadID, holder: BotVMRunRegistry.Entry) -> String {
+        BotVMRunRegistry.shared.addWaiting(botID: botID, threadID: thread)
+        let notice = "bot ocupado em \(holder.title)"
+        for viewModel in botThreadViewModels where viewModel.selectedThreadId == thread {
+            viewModel.statusMessage = notice
+        }
+        return notice
+    }
+
     func handleMacExecutionRequested(threadID: AgentThreadID, reason: String) {
         pendingMacExecution[threadID] = reason
         for viewModel in botThreadViewModels {

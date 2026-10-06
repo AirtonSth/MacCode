@@ -1655,7 +1655,9 @@ public final class AppContext {
             let nextWaiting = BotVMRunRegistry.shared.releaseAndNextWaiting(runID: rid)
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if let nextWaiting { try? await self.router?.drainNextQueuedAgentMessage(thread: nextWaiting) }
+                if let nextWaiting {
+                    try? await self.router?.drainNextQueuedAgentMessage(thread: nextWaiting, botVMHandOff: true)
+                }
                 let kind: RemoteCodeEventKind = status == .completed
                     ? .agentRunCompleted
                     : .agentRunFailed

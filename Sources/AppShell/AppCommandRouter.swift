@@ -541,7 +541,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // Same drain a finished run triggers (AppContext.onRunFinished) for the send that queued behind a rebuild.
         botHostObservers.append(center.addObserver(forName: .botVMRebuildReleased, object: nil, queue: nil) { [weak self] note in
             guard let threadID = note.userInfo?[BotHostNotificationKey.threadID] as? AgentThreadID else { return }
-            Task { @MainActor [weak self] in try? await self?.drainNextQueuedAgentMessage(thread: threadID) }
+            Task { @MainActor [weak self] in
+                try? await self?.drainNextQueuedAgentMessage(thread: threadID, botVMHandOff: true)
+            }
         })
     }
 
@@ -2835,21 +2837,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             guard let hooks = self?.botWorkspaceRunHooks else { throw BotWorkspaceRunUnavailable() }
             return try await hooks.promptTransform(botID, text, threadID, runID)
         }
-        agent.viewModel.botRunStarted = { [weak self, weak viewModel = agent.viewModel] botID, runID, threadID in
+        // The VM claim (D12) is taken before the start (`botClaimVM`).
+        agent.viewModel.botRunStarted = { [weak self] botID, runID, threadID in
             self?.botWorkspaceRunHooks?.runStarted(botID, runID, threadID)
-            if let viewModel,
-               let thread = viewModel.threads.first(where: { $0.id == threadID }),
-               thread.executionTarget == .vm {
-                _ = BotVMRunRegistry.shared.tryBegin(
-                    botID: botID,
-                    entry: BotVMRunRegistry.Entry(
-                        threadID: threadID,
-                        runID: runID,
-                        title: thread.title,
-                        workspace: thread.worktreePath ?? viewModel.cwd
-                    )
-                )
-            }
         }
         agent.viewModel.openBotScreen = { [weak self] botID in self?.openBotGuestDesktopInNewWindow(botID) }
     }
@@ -2869,6 +2859,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         viewModel.botWaitForVM = { botID, threadID in
             BotVMRunRegistry.shared.addWaiting(botID: botID, threadID: threadID)
         }
+        viewModel.botClaimVM = { botID, entry in
+            BotVMRunRegistry.shared.tryBegin(botID: botID, entry: entry)
+        }
+        viewModel.botReleaseVM = { [weak self] runID in self?.releaseBotVMRun(runID) }
         viewModel.botMacExecutionResolver = { [weak self] threadID, approve in
             await self?.resolveMacExecution(thread: threadID, approve: approve)
         }
@@ -5217,12 +5211,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if Task.isCancelled {
             throw CancellationError()
         }
-        if admission.status == .running
-            || ctx.coordinator.hasPendingProviderStart(threadId: thread)
-            || ctx.coordinator.hasProviderSession(threadId: thread) {
-            if queueMessageId != nil {
-                throw JSONRPCError(code: -32000, message: "Thread became active before queued dispatch started.")
-            }
+        func enqueueBehindActiveRun() throws -> AgentMessageSendResult {
             let queued = try ctx.queuedMessageRepo.enqueue(
                 id: requestedRunID.map { AgentQueuedMessageID($0.value) },
                 threadId: thread,
@@ -5238,6 +5227,28 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             refreshAgentSurfaces(thread: thread)
             ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread)
             return AgentMessageSendResult(status: .queued, runId: requestedRunID, queuedMessage: queued)
+        }
+        if admission.status == .running
+            || ctx.coordinator.hasPendingProviderStart(threadId: thread)
+            || ctx.coordinator.hasProviderSession(threadId: thread) {
+            if queueMessageId != nil {
+                throw JSONRPCError(code: -32000, message: "Thread became active before queued dispatch started.")
+            }
+            return try enqueueBehindActiveRun()
+        }
+        // D12: one run per bot VM. A VM busy in another thread queues this send
+        // behind that run (its run-finished drain starts it); a queued dispatch
+        // was already claimed by the drain. Unstarted claims are freed below.
+        let startRunID = requestedRunID ?? queueMessageId.map { AgentRunID($0.value) } ?? AgentRunID()
+        let vmClaim = claimBotVMRun(thread: thread, runID: startRunID, firstMessage: text)
+        if let vmClaim, let holder = vmClaim.holder {
+            let notice = waitForBotVM(botID: vmClaim.botID, thread: thread, holder: holder)
+            if queueMessageId != nil { throw JSONRPCError(code: -32000, message: notice) }
+            return try enqueueBehindActiveRun()
+        }
+        var vmRunStarted = false
+        defer {
+            if vmClaim != nil, !vmRunStarted { releaseBotVMRun(startRunID) }
         }
         // A message-send is not a provider-change gesture. The provider INSTANCE
         // is immutable once the thread has started (A1 parity), so never forward it
@@ -5326,7 +5337,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             providerRunEnvironment[AgentAppRuntimeProfile.environmentKey] =
                 runtimeProfile.rawValue
         }
-        let requestedRunID = requestedRunID ?? queueMessageId.map { AgentRunID($0.value) } ?? AgentRunID()
+        let requestedRunID = startRunID
         // Prefer a full orchestration snapshot (scheduled Path B / Auto admit)
         // so launch binary+catalog match preflight. Queued messages only carry
         // the lightweight admission fields and refill provider snapshots at start.
@@ -5470,6 +5481,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let runId: AgentRunID
         do {
             runId = try await ctx.coordinator.startRun(req, routingSnapshot: coordinatorSnapshot)
+            vmRunStarted = true
         } catch {
             if nestedReceiptRegistered {
                 try? ctx.orchestrationRuntime.finalizeReceipt(
@@ -5496,16 +5508,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func drainNextQueuedAgentMessage(
         thread: AgentThreadID,
-        recoverPreparedFromPriorProcess: Bool = false
+        recoverPreparedFromPriorProcess: Bool = false,
+        botVMHandOff: Bool = false
     ) async throws {
         // This gate only needs durable run-state. A full 26-column + routing
         // `get` hitchs MainActor before the next queued follow-up can start.
+        // A D12 hand-off also drains a thread that never ran (still `.pending`
+        // by default) when no start is in flight: its first send queued
+        // behind the bot's VM.
         guard let ctx = context,
               ctx.queueDrainAllowsWork(threadId: thread),
               !Task.isCancelled,
               let status = try ctx.threadRepo.status(of: thread),
               status != .running,
-              status != .pending,
+              try status != .pending || (botVMHandOff
+                  && !ctx.coordinator.hasPendingProviderStart(threadId: thread)
+                  && ctx.runRepo.latestActive(for: thread) == nil),
               !ctx.coordinator.hasProviderSession(threadId: thread) else { return }
         if let head = try ctx.queuedMessageRepo.first(threadId: thread),
            let dispatch = try ctx.queuedMessageRepo.dispatch(id: head.id),
@@ -5553,6 +5571,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         let queued = lease.message
         let dispatchRunId = AgentRunID(queued.id.value)
+        // D12: a VM busy in another thread keeps the message queued; the
+        // holder's run-finished drain starts it. A claim whose run never
+        // started is freed on every exit.
+        let vmClaim = claimBotVMRun(thread: thread, runID: dispatchRunId)
+        if let vmClaim, let holder = vmClaim.holder {
+            _ = try? ctx.queuedMessageRepo.release(lease)
+            waitForBotVM(botID: vmClaim.botID, thread: thread, holder: holder)
+            return
+        }
+        defer {
+            if vmClaim != nil {
+                let runStatus = (try? ctx.runRepo.status(of: dispatchRunId)) ?? nil
+                if runStatus != .running, runStatus != .pending { releaseBotVMRun(dispatchRunId) }
+            }
+        }
         guard try ctx.queuedMessageRepo.prepareDispatch(lease, runId: dispatchRunId) else {
             _ = try? ctx.queuedMessageRepo.release(lease)
             throw JSONRPCError(code: -32000, message: "Queued message dispatch could not be prepared.")

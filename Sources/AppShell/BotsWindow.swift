@@ -10288,19 +10288,9 @@ public final class BotsViewModel: ObservableObject {
             return AppCommandRouter.BotThreadQueuedPrompt(prompt: prompt, cwd: cwd)
         }
         router.botThreadRunStarted = { [weak self] runID, threadID in
+            // The VM claim (D12) is taken before the start, in the router's send.
             guard let self,
                   let conversation = try? self.botStore.conversationLinked(to: threadID) else { return }
-            if let thread = (try? self.context.threadRepo.get(id: threadID)) ?? nil, thread.executionTarget == .vm {
-                _ = BotVMRunRegistry.shared.tryBegin(
-                    botID: conversation.botID,
-                    entry: BotVMRunRegistry.Entry(
-                        threadID: threadID,
-                        runID: runID,
-                        title: thread.title,
-                        workspace: thread.worktreePath ?? ""
-                    )
-                )
-            }
             self.deskAgentRunStarted(
                 botID: conversation.botID,
                 conversationID: conversation.id,
