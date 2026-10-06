@@ -606,7 +606,9 @@ final class FakeRunnerTests: XCTestCase {
         XCTFail("coordinator must write a recoverable provider session runtime row")
     }
 
-    func test_coordinatorPersistsTrustedWireCapabilityForFollowUpAdmission() async throws {
+    func test_coordinatorNeverPersistsAWireProtocolVersionEvenWithALegacyCapabilityKey() async throws {
+        // WHY: Token Saver's RCW1 wire protocol was removed. A capability key an
+        // older build left in the environment must not mark a new session as wire.
         let tmp = NSTemporaryDirectory() + "rc2-coordinator-wire-capability-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -626,7 +628,7 @@ final class FakeRunnerTests: XCTestCase {
         )
         coordinator.runEnvironmentProvider = { _, _, base in
             var environment = base
-            environment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] = "1"
+            environment["RC_TOKEN_SAVER_WIRE_CAPABILITY"] = "1"
             return environment
         }
 
@@ -638,10 +640,11 @@ final class FakeRunnerTests: XCTestCase {
             prompt: "short plaintext seed"
         ))
 
-        try await waitUntil("trusted wire capability persisted for a later follow-up") {
+        try await waitUntil("the provider turn completes without a wire protocol version") {
             guard let session = try? sessionRepo.get(threadId: thread.id),
+                  session.status == .completed,
                   let payload = Self.runtimePayload(session.runtimePayloadJSON) else { return false }
-            return payload["wireProtocolVersion"] as? String == RCWireProtocol.version
+            return payload["wireProtocolVersion"] == nil
         }
     }
 
@@ -674,7 +677,7 @@ final class FakeRunnerTests: XCTestCase {
         )
         coordinator.runEnvironmentProvider = { _, _, base in
             var environment = base
-            environment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] = "1"
+            environment["RC_TOKEN_SAVER_WIRE_CAPABILITY"] = "1"
             return environment
         }
 

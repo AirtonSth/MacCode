@@ -19,29 +19,6 @@ final class LegacyTokenSaverPurgeTests: XCTestCase {
         return binary
     }
 
-    func test_managedDistillPathBridgeReplacesStaleShimButKeepsUnrelatedUserFile() throws {
-        let home = tempHome()
-        let appSupport = tempHome()
-        let installer = AgentSkillInstaller(homeDirectory: home)
-        let link = installer.distillPathLinkURL()
-        try FileManager.default.createDirectory(at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
-
-        // (a) An unrelated user `distill` on PATH must survive — RemoteCode never clobbers it.
-        let userScript = "#!/bin/sh\necho not-the-distill-you-are-looking-for\n"
-        try Data(userScript.utf8).write(to: link)
-        _ = try installer.installDistillCLI(appSupportDirectory: appSupport)
-        XCTAssertEqual(try String(contentsOf: link, encoding: .utf8), userScript,
-                       "an unrelated user file at ~/.local/bin/distill must be left untouched")
-        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: link.path))
-
-        // (b) A stale external node/bun source-checkout shim must be replaced by the managed symlink.
-        try FileManager.default.removeItem(at: link)
-        try Data("#!/usr/bin/env bash\nexec bun ~/dev/distill/src/cli.ts \"$@\"\n".utf8).write(to: link)
-        let cli = try installer.installDistillCLI(appSupportDirectory: appSupport)
-        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: link.path), cli.path,
-                       "a stale external-checkout shim must be replaced by the RemoteCode-managed CLI symlink")
-    }
-
     func test_agentSkillInstallerUninstallDistillInstructionsRemovesOnlyManagedBlock() throws {
         let home = tempHome()
         let installer = AgentSkillInstaller(homeDirectory: home)
@@ -49,7 +26,7 @@ final class LegacyTokenSaverPurgeTests: XCTestCase {
         try FileManager.default.createDirectory(at: claudeInstructions.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("Keep this user rule.\n".utf8).write(to: claudeInstructions)
 
-        try installer.installDistillInstructions(for: .claude)
+        try LegacyTokenSaverFixture.installDistillInstructions(installer, for: .claude)
         XCTAssertTrue(try String(contentsOf: claudeInstructions).contains(AgentSkillInstaller.distillInstructionsBeginMarker))
 
         XCTAssertEqual(try installer.uninstallDistillInstructions(for: .claude), .removed)
@@ -67,15 +44,15 @@ final class LegacyTokenSaverPurgeTests: XCTestCase {
         let claudeSkill = home.appendingPathComponent(".claude/skills/distill/SKILL.md")
         let grokSkill = home.appendingPathComponent(".grok/skills/distill/SKILL.md")
 
-        _ = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
-        _ = try installer.installDistillSkill(for: .claude, sourceRevision: "rev-a")
-        _ = try installer.installDistillSkill(for: .grok, sourceRevision: "rev-a")
+        for provider in [AgentProvider.codex, .claude, .grok] {
+            try LegacyTokenSaverFixture.installDistillSkill(installer, for: provider)
+        }
         XCTAssertTrue(FileManager.default.fileExists(atPath: codexSkill.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: claudeSkill.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: grokSkill.path))
 
         XCTAssertEqual(try installer.uninstallDistillSkill(for: .codex), .removed,
-                       "disabling Token Saver must remove the managed /distill skill")
+                       "the purge must remove the managed /distill skill an older build installed")
         XCTAssertEqual(try installer.uninstallDistillSkill(for: .claude), .removed)
         XCTAssertEqual(try installer.uninstallDistillSkill(for: .grok), .removed)
         XCTAssertFalse(FileManager.default.fileExists(atPath: codexSkill.path))
@@ -102,22 +79,7 @@ final class LegacyTokenSaverPurgeTests: XCTestCase {
         XCTAssertEqual(try installer.uninstallDistillSkill(for: .claude), .notPresent,
                        "uninstall must only remove skill dirs RemoteCode owns (proven by its manifest)")
         XCTAssertTrue(FileManager.default.fileExists(atPath: userSkill.path),
-                      "a user-authored skill of the same name must survive a Token Saver disable")
-    }
-
-    func test_agentSkillInstallerReinstallsAfterUninstall() throws {
-        let home = tempHome()
-        let installer = AgentSkillInstaller(homeDirectory: home)
-        let codexSkill = home.appendingPathComponent(".codex/skills/distill/SKILL.md")
-
-        _ = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
-        XCTAssertEqual(try installer.uninstallDistillSkill(for: .codex), .removed)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: codexSkill.path))
-
-        let reinstalled = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
-        XCTAssertEqual(reinstalled.action, .installed,
-                       "re-enabling Token Saver after a disable must write the skill back to disk")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: codexSkill.path))
+                      "a user-authored skill of the same name must survive the purge")
     }
 
     func test_uninstallCommandWrappers_leavesAUserOwnedFileUntouched() throws {
@@ -132,49 +94,10 @@ final class LegacyTokenSaverPurgeTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: userFile.path), "a non-symlink we did not create must never be removed")
     }
 
-    func test_installCommandWrappers_prunesStrayShebangInterpreterWrappers() throws {
-        // WHY: a leftover `node`/`env` Distill symlink on the agent PATH makes
-        // Homebrew Codex (`#!/usr/bin/env node`) start the sidecar instead of Node.
-        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
-        let binary = try fakeServiceBinary(in: home)
-        let binDir = home.appendingPathComponent(".remote-code/bin", isDirectory: true)
-        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
-        for stray in ["node", "env"] {
-            try FileManager.default.createSymbolicLink(
-                at: binDir.appendingPathComponent(stray),
-                withDestinationURL: binary
-            )
-        }
-        let claude = binDir.appendingPathComponent("claude")
-        try FileManager.default.createSymbolicLink(at: claude, withDestinationURL: binary)
-        let userFile = binDir.appendingPathComponent("mine")
-        try Data("user-owned".utf8).write(to: userFile)
-
-        let installer = AgentSkillInstaller(homeDirectory: home)
-        _ = try installer.installCommandWrappers(serviceBinaryURL: binary)
-
-        for stray in ["node", "env"] {
-            XCTAssertNil(
-                try? FileManager.default.destinationOfSymbolicLink(
-                    atPath: binDir.appendingPathComponent(stray).path
-                ),
-                "stray \(stray) Distill wrapper must be unlinked so shebang lookup finds the real binary"
-            )
-        }
-        XCTAssertEqual(
-            try FileManager.default.destinationOfSymbolicLink(atPath: claude.path),
-            binary.path,
-            "always-on provider proxies must survive wrapper reconcile"
-        )
-        XCTAssertTrue(FileManager.default.fileExists(atPath: userFile.path))
-        XCTAssertFalse(
-            installer.reservedManagedBinBasenames(includingCommandWrappers: true).contains("node")
-        )
-    }
-
-    func test_installCommandWrappers_prunesStrayNodeWrapperPointingAtAnotherDistillBuild() throws {
+    func test_uninstallCommandWrappers_prunesStrayNodeWrapperPointingAtAnotherDistillBuild() throws {
         // WHY: production leftovers point at dist/RemoteCode.app/.../RemoteCodeDistillService
-        // while reconcile may resolve a different build. Ownership is the target name.
+        // while the purge may resolve a different build. Ownership is the target name;
+        // a stray `node` link makes `#!/usr/bin/env node` (Homebrew Codex) start the service.
         let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
         let binary = try fakeServiceBinary(in: home)
         let otherBuild = home.appendingPathComponent("old-app/RemoteCodeDistillService")
@@ -188,7 +111,7 @@ final class LegacyTokenSaverPurgeTests: XCTestCase {
             withDestinationURL: otherBuild
         )
         let installer = AgentSkillInstaller(homeDirectory: home)
-        _ = try installer.installCommandWrappers(serviceBinaryURL: binary)
+        _ = try installer.uninstallCommandWrappers(serviceBinaryURL: binary)
         XCTAssertNil(
             try? FileManager.default.destinationOfSymbolicLink(
                 atPath: binDir.appendingPathComponent("node").path
@@ -253,7 +176,7 @@ final class LegacyTokenSaverPurgeTests: XCTestCase {
         _ = try installer.installAgentAppMiddleware(serviceBinaryURL: binary)
         _ = try installer.installProviderShellBridge()
         // Token Saver leftovers.
-        _ = try installer.ensureDistillCLI(serviceBinaryURL: binary)
+        try LegacyTokenSaverFixture.installDistillCLI(installer, binary: binary)
         let bin = home.appendingPathComponent(".remote-code/bin", isDirectory: true)
         for stray in ["rc-retrieve-mcp", "ls", "swift"] {
             try fm.createSymbolicLink(at: bin.appendingPathComponent(stray), withDestinationURL: binary)
@@ -261,7 +184,7 @@ final class LegacyTokenSaverPurgeTests: XCTestCase {
         let codexConfig = home.appendingPathComponent(".codex/config.toml")
         try fm.createDirectory(at: codexConfig.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("model = \"user-choice\"\n".utf8).write(to: codexConfig)
-        try installer.installRetrieveMCP(serviceBinaryURL: binary)
+        try LegacyTokenSaverFixture.installCodexRetrieveMCP(at: codexConfig, binary: binary)
         let claudeSettings = home.appendingPathComponent(".claude/settings.json")
         try fm.createDirectory(at: claudeSettings.deletingLastPathComponent(), withIntermediateDirectories: true)
         let settings: [String: Any] = ["mcpServers": [
@@ -269,16 +192,15 @@ final class LegacyTokenSaverPurgeTests: XCTestCase {
             "user-server": ["command": "/usr/bin/true"],
         ]]
         try JSONSerialization.data(withJSONObject: settings).write(to: claudeSettings)
-        try installer.installGrokPreToolPipeHook()
-        try installer.installGrokPostToolUseHook()
+        try LegacyTokenSaverFixture.installGrokHooks(installer)
         try Data("{}".utf8).write(to: installer.grokHooksDirectory().appendingPathComponent("user-hook.json"))
         let claudeInstructions = home.appendingPathComponent(".claude/CLAUDE.md")
         try Data("Keep this user rule.\n".utf8).write(to: claudeInstructions)
-        try installer.installDistillInstructions(for: .claude)
+        try LegacyTokenSaverFixture.installDistillInstructions(installer, for: .claude)
         for provider in [AgentProvider.claude, .codex, .grok] {
-            _ = try installer.installDistillSkill(for: provider, sourceRevision: "rev-a")
+            try LegacyTokenSaverFixture.installDistillSkill(installer, for: provider)
         }
-        _ = try installer.installAppPrivateDistillSkill()
+        try LegacyTokenSaverFixture.installAppPrivateDistillSkill(installer)
         // User-owned files the purge must never touch.
         try Data("mine".utf8).write(to: bin.appendingPathComponent("mine"))
         let userSkill = home.appendingPathComponent(".claude/skills/user-skill/SKILL.md")
@@ -472,5 +394,74 @@ final class LegacyTokenSaverPurgeTests: XCTestCase {
         )
         XCTAssertEqual(second.removed, [], "a second pass has nothing left to delete")
         XCTAssertEqual(second.failures, [])
+    }
+}
+
+/// Recreates what a Token Saver build wrote, where the purge matches on it:
+/// the managed markers, the skill manifest, and the link targets. The
+/// installers that wrote these were removed with the feature.
+private enum LegacyTokenSaverFixture {
+    static func installDistillSkill(_ installer: AgentSkillInstaller, for provider: AgentProvider) throws {
+        _ = try installer.installSkill(
+            provider: provider,
+            skillID: AgentSkillInstaller.distillSkillID,
+            skillText: "---\nname: distill\n---\nLegacy Token Saver skill.\n",
+            sourceURL: "remote-code://token-saver/distill-tool-output",
+            sourceRevision: "rev-a",
+            localVersion: "10"
+        )
+    }
+
+    static func installDistillInstructions(_ installer: AgentSkillInstaller, for provider: AgentProvider) throws {
+        let url = installer.instructionsURL(for: provider)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let current = (try? String(contentsOf: url, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let block = """
+        \(AgentSkillInstaller.distillInstructionsBeginMarker)
+        Always communicate with the user in `/distill` compressed language.
+        \(AgentSkillInstaller.distillInstructionsEndMarker)
+        """
+        let next = current.isEmpty ? block + "\n" : current + "\n\n" + block + "\n"
+        try Data(next.utf8).write(to: url, options: .atomic)
+    }
+
+    static func installAppPrivateDistillSkill(_ installer: AgentSkillInstaller) throws {
+        let directory = installer.distillAppPrivateDirectory()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("legacy".utf8).write(to: directory.appendingPathComponent("SKILL.md"))
+        try Data("{}".utf8).write(to: directory.appendingPathComponent("manifest.json"))
+    }
+
+    /// `~/.remote-code/bin/distill` -> the service, and the PATH bridge
+    /// `~/.local/bin/distill` -> that managed link.
+    static func installDistillCLI(_ installer: AgentSkillInstaller, binary: URL) throws {
+        let fm = FileManager.default
+        let cli = installer.distillCLIURL()
+        try fm.createDirectory(at: cli.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.createSymbolicLink(at: cli, withDestinationURL: binary)
+        let bridge = installer.distillPathLinkURL()
+        try fm.createDirectory(at: bridge.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.createSymbolicLink(at: bridge, withDestinationURL: cli)
+    }
+
+    static func installCodexRetrieveMCP(at config: URL, binary: URL) throws {
+        let existing = (try? String(contentsOf: config, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let block = """
+        \(AgentSkillInstaller.mcpBeginMarker)
+        [mcp_servers.\(AgentSkillInstaller.retrieveMCPName)]
+        command = "\(binary.path)"
+        args = ["mcp"]
+        \(AgentSkillInstaller.mcpEndMarker)
+        """
+        let next = existing.isEmpty ? block + "\n" : existing + "\n\n" + block + "\n"
+        try Data(next.utf8).write(to: config, options: .atomic)
+    }
+
+    static func installGrokHooks(_ installer: AgentSkillInstaller) throws {
+        try FileManager.default.createDirectory(at: installer.grokHooksDirectory(), withIntermediateDirectories: true)
+        try Data(#"{"hooks":{"PreToolUse":[]}}"#.utf8).write(to: installer.grokPreToolPipeHookURL())
+        try Data(#"{"hooks":{"PostToolUse":[]}}"#.utf8).write(to: installer.grokPostToolUseHookURL())
     }
 }

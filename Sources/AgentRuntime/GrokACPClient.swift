@@ -500,7 +500,6 @@ public final class GrokACPClient: @unchecked Sendable {
     private var pending: [Int: Pending] = [:]
     private var stderrBuffer = Data()
     private var stopped = false
-    private let tokenSaverCensusAllowed: Bool
     private let foreignUserUID: uid_t?
     private let mcpEnvironment: [String: String]
     private static let stderrLimit = 8_192
@@ -576,14 +575,12 @@ public final class GrokACPClient: @unchecked Sendable {
         askpassPath: String? = nil,
         tagProcess: Bool = true,
         notificationHandler: NotificationHandler? = nil,
-        serverRequestHandler: ServerRequestHandler? = nil,
-        tokenSaverCensusAllowed: Bool = false
+        serverRequestHandler: ServerRequestHandler? = nil
     ) throws {
         let resolved = binary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "grok" : binary
         guard let path = ProcessLocator.resolve(resolved) else { throw GrokACPError.missingBinary(resolved) }
         self.notificationHandler = notificationHandler
         self.serverRequestHandler = serverRequestHandler
-        self.tokenSaverCensusAllowed = tokenSaverCensusAllowed
         self.foreignUserUID = runAsUser.flatMap { $0.uid == getuid() ? nil : $0.uid }
         self.mcpEnvironment = environment
         parseQueue.setSpecific(key: parseQueueKey, value: 1)
@@ -691,23 +688,13 @@ public final class GrokACPClient: @unchecked Sendable {
                 environment: environment
             )
             : withBrowser
-        // The librarian MCP is Token Saver surface: admitted only while the
-        // run carries the Token Saver hint, matching Claude (--mcp-config /
-        // SDK mcp_servers) and Codex (-c mcp_servers.<name>.* per process).
-        let withDistill = DistillMCPAdmit.isEnabled(environment: environment)
-            ? DistillMCPAdmit.admitGrokACP(
+        let withComputer = isBotRun
+            ? BotComputerMCPAdmit.admitGrokACP(
                 existing: withWeb,
                 command: resolved,
                 environment: environment
             )
             : withWeb
-        let withComputer = isBotRun
-            ? BotComputerMCPAdmit.admitGrokACP(
-                existing: withDistill,
-                command: resolved,
-                environment: environment
-            )
-            : withDistill
         guard environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" else {
             return withComputer
         }
@@ -1017,7 +1004,7 @@ public final class GrokACPClient: @unchecked Sendable {
 
     public static func promptBlocks(for request: AgentRunRequest, capabilities: GrokACPInitializeResult) throws -> [JSONObject] {
         var blocks: [JSONObject] = []
-        let providerPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
+        let providerPrompt = AgentSkillInstaller.nestedAgentProviderPrompt(
             request.providerPrompt,
             environment: request.environment
         )
@@ -1305,29 +1292,10 @@ public final class GrokACPClient: @unchecked Sendable {
         )
         var line = data
         line.append(0x0A)
-        let toWrite: Data
-        if tokenSaverCensusAllowed, object["method"] as? String == "session/prompt" {
-            let binding = TokenSaverCensusSeam.defaultBinding(
-                trigger: "provider_outbound_user",
-                provider: "grok",
-                providerAdapterVersion: "acp-jsonrpc",
-                toolShape: "session_prompt_jsonrpc_line"
-            )
-            toWrite = TokenSaverCensusSeam.observeProviderVisiblePayload(
-                line,
-                binding: binding,
-                control: .noChange,
-                streamKind: .completedTranscript,
-                toolKind: .builtin,
-                isSameUser: true
-            )
-        } else {
-            toWrite = line
-        }
         return try writeQueue.sync {
             guard admittedBy?() ?? true else { return false }
             try GuardedStdinWrite.write(
-                toWrite, to: stdinPipe.fileHandleForWriting, process: process,
+                line, to: stdinPipe.fileHandleForWriting, process: process,
                 notFound: { GrokACPError.processExited(reason: .exit, status: -1, stderrTail: "") }
             )
             return true

@@ -650,43 +650,26 @@ final class GrokACPProtocolTests: XCTestCase {
         )
     }
 
-    func test_promptBlocksInjectTokenSaverSafetyABIExactlyOnceForGrokACP() throws {
-        let request = AgentRunRequest(
-            threadId: AgentThreadID(),
-            provider: .grok,
-            model: "grok-4.5",
-            cwd: "/tmp",
-            prompt: "inspect",
-            environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
-        )
-        let blocks = try GrokACPClient.promptBlocks(
-            for: request,
-            capabilities: .init(protocolVersion: 1, loadSession: true, embeddedContext: true)
-        )
-        let prompt = try XCTUnwrap(blocks.first?["text"] as? String)
-        XCTAssertEqual(prompt.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1)
-        XCTAssertEqual(
-            (AgentSkillInstaller.distillAgentInstructionsTemplate + "\n\n" + prompt)
-                .components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
-            1,
-            "Grok ACP effective disk plus runtime context receives the safety ABI exactly once"
-        )
-
-        // Token Saver off → no Distill / safety ABI on Grok ACP.
-        let emptyEnvRequest = AgentRunRequest(
-            threadId: AgentThreadID(),
-            provider: .grok,
-            model: "grok-4.5",
-            cwd: "/tmp",
-            prompt: "inspect"
-        )
-        let emptyEnvBlocks = try GrokACPClient.promptBlocks(
-            for: emptyEnvRequest,
-            capabilities: .init(protocolVersion: 1, loadSession: true, embeddedContext: true)
-        )
-        let emptyEnvPrompt = try XCTUnwrap(emptyEnvBlocks.first?["text"] as? String)
-        XCTAssertFalse(emptyEnvPrompt.contains(TokenSaverProviderSafetyABI.block))
-        XCTAssertFalse(emptyEnvPrompt.contains("| distill"))
+    func test_promptBlocksNeverInjectDistillOrTheSafetyABIEvenWithALegacyHint() throws {
+        // WHY: Token Saver was removed. A hint an older build left in the
+        // environment must not bring back the Distill rules on Grok ACP.
+        for environment in [[:], ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]] {
+            let request = AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .grok,
+                model: "grok-4.5",
+                cwd: "/tmp",
+                prompt: "inspect",
+                environment: environment
+            )
+            let blocks = try GrokACPClient.promptBlocks(
+                for: request,
+                capabilities: .init(protocolVersion: 1, loadSession: true, embeddedContext: true)
+            )
+            let prompt = try XCTUnwrap(blocks.first?["text"] as? String)
+            XCTAssertFalse(prompt.contains("TOKEN_SAVER_SAFETY_ABI"))
+            XCTAssertFalse(prompt.contains("| distill"))
+        }
     }
 
     func test_promptBlocksInjectBackgroundAwaitDirectiveNotClaudeMCP() throws {
@@ -1991,28 +1974,18 @@ final class GrokACPProtocolTests: XCTestCase {
         )
     }
 
-    /// WHY: the Distill librarian MCP (rc_* / 01-catalogo.html) is Token Saver
-    /// surface. It must ride Grok sessions only while the run carries the Token
-    /// Saver hint — the same gate Claude (--mcp-config) and Codex (config.toml
-    /// lifecycle) apply — instead of unconditionally on every session.
-    func test_sessionMCPServersAdmitDistillLibrarianOnlyWithTokenSaver() {
-        func names(_ environment: [String: String]) -> [String] {
-            GrokACPClient.sessionMCPServers(
-                existing: [],
-                command: "/tmp/RemoteCodeDistillService",
-                environment: environment
-            ).compactMap { ($0 as? [String: Any])?["name"] as? String }
-        }
-
-        let on = names([DistillMCPAdmit.tokenSaverHintEnvironmentKey: "1"])
-        XCTAssertTrue(on.contains(DistillMCPAdmit.serverName),
-                      "Token Saver on must admit the librarian MCP into the Grok session")
-
-        let off = names([:])
-        XCTAssertFalse(off.contains(DistillMCPAdmit.serverName),
-                       "Token Saver off must not expose the librarian MCP to Grok")
-        XCTAssertTrue(off.contains(BotSelfConfigMCPAdmit.serverName),
-                      "the gate is librarian-only: bot servers stay admitted either way")
+    /// WHY: the Token Saver librarian MCP was removed. A hint an older build
+    /// left in the environment must not bring it back into Grok sessions.
+    func test_sessionMCPServersNeverAdmitTheRemovedLibrarian() {
+        let names = GrokACPClient.sessionMCPServers(
+            existing: [],
+            command: "/tmp/RemoteCodeDistillService",
+            environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
+        ).compactMap { ($0 as? [String: Any])?["name"] as? String }
+        XCTAssertFalse(names.contains("remotecode-distill"),
+                       "the removed librarian MCP must not reach the Grok session")
+        XCTAssertTrue(names.contains(BotSelfConfigMCPAdmit.serverName),
+                      "bot servers stay admitted")
     }
 
     /// WHY: workspace-less bot threads fall through to currentDirectoryPath,

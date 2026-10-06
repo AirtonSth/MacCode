@@ -3,11 +3,6 @@ import XCTest
 import CoreModel
 
 final class GrokACPAdapterTests: ProviderProcessTestCase {
-    override func tearDown() {
-        TokenSaverCensusSeam.sharedStore = TokenSaverCensusStore()
-        super.tearDown()
-    }
-
     func test_newSessionStreamsPermissionAndSettlesApprovedTurn() async throws {
         let peer = try FakeGrokACPPeer(mode: .permission)
         defer { peer.remove() }
@@ -172,37 +167,6 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         try await Task.sleep(nanoseconds: 400_000_000)
         XCTAssertEqual(box.finishedCount, 1,
                        "emit during synthesis must not re-enter fire / double-terminate")
-    }
-
-    func test_foreignRunAsDoesNotRecordTokenSaverCensus() async throws {
-        let peer = try FakeGrokACPPeer(mode: .permission)
-        defer { peer.remove() }
-        let census = TokenSaverCensusStore()
-        TokenSaverCensusSeam.sharedStore = census
-        let adapter = GrokACPAdapter(binaryNameOverride: peer.path, cancellationGracePeriod: 0.05)
-        let foreign = AgentRunAsUser(
-            generatedUID: "foreign",
-            shortName: "foreign",
-            uid: getuid() &+ 1,
-            gid: getgid(),
-            homePath: "/tmp"
-        )
-        let censusAllowed = GrokACPAdapter.tokenSaverCensusAllowed(runAsUser: foreign)
-        XCTAssertFalse(censusAllowed)
-        // Exercise the actual ACP census gate without invoking sudo or relying
-        // on a second local account existing on the CI machine.
-        adapter.tokenSaverCensusAllowedOverrideForTesting = censusAllowed
-        let request = makeRequest()
-        let box = GrokACPEventBox()
-        _ = try await adapter.startSession(request) { box.append($0) }
-        let pending = try await box.waitForRequest(timeout: 3)
-        try await adapter.respondToRequest(
-            threadId: request.threadId,
-            requestId: pending.id,
-            response: .approve
-        )
-        _ = try await box.waitFinished(timeout: 3)
-        XCTAssertTrue(census.snapshot().isEmpty)
     }
 
     func test_cancelUsesACPNotificationAndReturnsProviderIdentity() async throws {

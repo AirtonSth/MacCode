@@ -77,7 +77,7 @@ final class AccountUsageNotificationTests: XCTestCase {
             "recordAccountUsage must return without waiting for NotificationCenter observers; elapsed=\(elapsed)s (sync post would wait ~\(observerWorkDuration)s)"
         )
 
-        let stored = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+        let stored = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory)
             .load()
             .providers
             .first { $0.provider == .codex }

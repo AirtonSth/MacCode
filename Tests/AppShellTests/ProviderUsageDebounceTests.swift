@@ -34,7 +34,7 @@ final class ProviderUsageDebounceTests: XCTestCase {
         }
 
         // Snapshot on disk must still be zero because the debounce timer has not fired.
-        let beforeFlush = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+        let beforeFlush = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).load()
         let codexBefore = beforeFlush.providers.first { $0.provider == .codex }
         XCTAssertEqual(codexBefore?.actualProviderTokens ?? 0, 0,
                        "tokens must not be written to disk before the debounce window fires")
@@ -66,11 +66,11 @@ final class ProviderUsageDebounceTests: XCTestCase {
 
         // Give the background writer a moment to finish.
         let deadline = Date().addingTimeInterval(2)
-        var snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+        var snapshot = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).load()
         while snapshot.providers.first(where: { $0.provider == .codex })?.actualProviderTokens == 0,
               Date() < deadline {
             Thread.sleep(forTimeInterval: 0.02)
-            snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+            snapshot = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).load()
         }
 
         let codex = snapshot.providers.first { $0.provider == .codex }
@@ -80,7 +80,7 @@ final class ProviderUsageDebounceTests: XCTestCase {
         // A second flush with the same runId must be a no-op (accumulator was reset).
         context.flushPendingProviderUsage(runId: run.id)
         Thread.sleep(forTimeInterval: 0.05)
-        let afterSecondFlush = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+        let afterSecondFlush = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).load()
         let codexAfter = afterSecondFlush.providers.first { $0.provider == .codex }
         XCTAssertEqual(codexAfter?.actualProviderTokens, 125,
                        "second flush with empty accumulator must not double-count or corrupt the total")
@@ -116,11 +116,11 @@ final class ProviderUsageDebounceTests: XCTestCase {
         context.flushPendingProviderUsage()
 
         let deadline = Date().addingTimeInterval(2)
-        var snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+        var snapshot = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).load()
         while (snapshot.providers.first(where: { $0.provider == .claude })?.actualProviderTokens ?? 0) == 0,
               Date() < deadline {
             Thread.sleep(forTimeInterval: 0.02)
-            snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+            snapshot = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).load()
         }
 
         let claude = snapshot.providers.first { $0.provider == .claude }
@@ -156,11 +156,11 @@ final class ProviderUsageDebounceTests: XCTestCase {
         context.flushPendingProviderUsage(runId: run.id)
 
         let deadline = Date().addingTimeInterval(2)
-        var snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+        var snapshot = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).load()
         while (snapshot.providers.first(where: { $0.provider == .codex })?.actualProviderTokens ?? 0) == 0,
               Date() < deadline {
             Thread.sleep(forTimeInterval: 0.02)
-            snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+            snapshot = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).load()
         }
 
         let codex = snapshot.providers.first { $0.provider == .codex }
@@ -192,7 +192,7 @@ final class ProviderUsageDebounceTests: XCTestCase {
         context.flushPendingProviderUsage(runId: run.id)
         await waitForProviderTokens(300, provider: .codex, appSupport: context.appSupportDirectory)
 
-        let codex = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+        let codex = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory)
             .load().providers.first { $0.provider == .codex }
         XCTAssertEqual(codex?.actualProviderTokens, 300,
                        "a post-flush cumulative snapshot must add only 200 new tokens")
@@ -249,7 +249,7 @@ final class ProviderUsageDebounceTests: XCTestCase {
         )
         context.flushPendingProviderUsage(runId: run.id)
         try await Task.sleep(for: .milliseconds(50))
-        let claude = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+        let claude = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory)
             .load().providers.first { $0.provider == .claude }
         XCTAssertEqual(claude?.actualProviderTokens, 260)
         XCTAssertEqual(claude?.eligibleRuns, 0)
@@ -290,7 +290,7 @@ final class ProviderUsageDebounceTests: XCTestCase {
         )
         context.flushPendingProviderUsage(runId: run.id)
         try await Task.sleep(for: .milliseconds(50))
-        let grok = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+        let grok = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory)
             .load().providers.first { $0.provider == .grok }
         XCTAssertEqual(grok?.actualProviderTokens, 100)
         XCTAssertEqual(grok?.eligibleRuns, 0)
@@ -323,7 +323,7 @@ final class ProviderUsageDebounceTests: XCTestCase {
         context.flushPendingProviderUsage(runId: run.id)
         await waitForProviderTokens(150, provider: .codex, appSupport: context.appSupportDirectory)
         XCTAssertEqual(
-            TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+            ProviderUsageStore(appSupportDirectory: context.appSupportDirectory)
                 .load().providers.first { $0.provider == .codex }?.eligibleRuns,
             0
         )
@@ -362,7 +362,7 @@ final class ProviderUsageDebounceTests: XCTestCase {
         context.flushPendingProviderUsage(runId: run.id)
         try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(
-            TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+            ProviderUsageStore(appSupportDirectory: context.appSupportDirectory)
                 .load().providers.first { $0.provider == .claude }?.actualProviderTokens,
             100
         )
@@ -414,7 +414,7 @@ final class ProviderUsageDebounceTests: XCTestCase {
         context.flushPendingProviderUsage(runId: evicted.id)
         try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(
-            TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+            ProviderUsageStore(appSupportDirectory: context.appSupportDirectory)
                 .load().providers.first { $0.provider == .codex }?.actualProviderTokens,
             30
         )
@@ -471,7 +471,7 @@ final class ProviderUsageDebounceTests: XCTestCase {
         let deadline = Date().addingTimeInterval(2)
         var actual = 0
         repeat {
-            actual = TokenSaverUsageStore(appSupportDirectory: appSupport)
+            actual = ProviderUsageStore(appSupportDirectory: appSupport)
                 .load().providers.first { $0.provider == provider }?.actualProviderTokens ?? 0
             if actual == expected { return }
             try? await Task.sleep(for: .milliseconds(20))
@@ -504,11 +504,11 @@ final class ProviderUsageDebounceTests: XCTestCase {
         context.flushPendingProviderUsage(runId: run.id)
 
         let deadline = Date().addingTimeInterval(2)
-        var snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+        var snapshot = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).load()
         while (snapshot.providers.first(where: { $0.provider == .claude })?.actualProviderTokens ?? 0) == 0,
               Date() < deadline {
             Thread.sleep(forTimeInterval: 0.02)
-            snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+            snapshot = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).load()
         }
 
         let claude = snapshot.providers.first { $0.provider == .claude }
@@ -584,7 +584,7 @@ final class ProviderUsageDebounceTests: XCTestCase {
         context.flushPendingProviderUsage(runId: run.id)
         await waitForProviderTokens(200, provider: .codex, appSupport: context.appSupportDirectory)
         try await Task.sleep(for: .milliseconds(50))
-        let codex = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+        let codex = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory)
             .load().providers.first { $0.provider == .codex }
         XCTAssertEqual(codex?.actualProviderTokens, 200)
         XCTAssertEqual(codex?.eligibleRuns, 0)

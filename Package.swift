@@ -204,7 +204,7 @@ let package = Package(
         ),
         .testTarget(
             name: "AgentRuntimeTests",
-            // DistillCore: still imported by Token Saver tests that are removed with the feature.
+            // DistillCore: DistillServiceLaunchTests still imports it; both go in S5.
             dependencies: ["AgentRuntime", "CoreModel", "GitTestSupport", "DistillCore"],
             path: "Tests/AgentRuntimeTests",
             resources: [

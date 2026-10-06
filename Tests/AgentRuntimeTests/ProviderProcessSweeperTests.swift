@@ -352,26 +352,19 @@ final class ProviderProcessSweeperTests: XCTestCase {
         ), "provider cleanup depends on matching full command paths that contain spaces")
     }
 
-    func test_distillServerPolicy_classifiesServerVersusMCP() {
+    func test_distillMCPModes_classifyPerRunSidecarsButNotTheOldHTTPServer() {
         let server = "/App/RemoteCodeDistillService --auth-token ABC --host 127.0.0.1 --port 0"
         let mcp = "/App/RemoteCodeDistillService mcp"
         XCTAssertTrue(ProviderProcessSweeper.isRemoteCodeDistillService(server))
-        XCTAssertTrue(ProviderProcessSweeper.isRemoteCodeDistillServerCommand(server),
-                      "MLX HTTP sidecar is the singleton server role")
-        XCTAssertFalse(ProviderProcessSweeper.isRemoteCodeDistillMCPCommand(server))
+        XCTAssertFalse(ProviderProcessSweeper.isRemoteCodeDistillMCPCommand(server),
+                       "the old HTTP sidecar argv is not a per-run MCP sidecar")
         XCTAssertTrue(ProviderProcessSweeper.isRemoteCodeDistillMCPCommand(mcp),
-                      "managed | distill helper is mcp mode")
-        XCTAssertFalse(ProviderProcessSweeper.isRemoteCodeDistillServerCommand(mcp),
-                       "mcp helpers must not be swept by the single-server policy")
+                      "an orphaned librarian from an older build must still be reaped as an MCP sidecar")
         for mode in ["bot-self-config", "bot-web", "bot-browser", "bot-computer"] {
             let command = "/App/RemoteCodeDistillService \(mode)"
             XCTAssertTrue(
                 ProviderProcessSweeper.isRemoteCodeDistillMCPCommand(command),
                 "\(mode) is a per-run MCP sidecar and must be classified with mcp helpers"
-            )
-            XCTAssertFalse(
-                ProviderProcessSweeper.isRemoteCodeDistillServerCommand(command),
-                "\(mode) must not be treated as the singleton MLX HTTP server"
             )
         }
     }

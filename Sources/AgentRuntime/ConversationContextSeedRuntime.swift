@@ -3,7 +3,10 @@ import Foundation
 import CoreModel
 import Persistence
 
-/// Prepares a host-owned RCSEED1 document and content-free slot receipts.
+/// Prepares a host-owned RCSEED1 document and content-free slot receipts that
+/// carry the prior conversation into a fresh provider session. Not Token Saver:
+/// only the Human format is produced. The CoreModel types keep their historical
+/// names until they move.
 public protocol TokenSaverContextSeedPreparing: Sendable {
     func prepare(
         snapshot: TokenSaverCanonicalConversationSnapshot,
@@ -74,85 +77,6 @@ public struct TokenSaverHumanContextSeedPreparer: TokenSaverContextSeedPreparing
                     resolvedModel: request.model
                 ))
             }
-        }
-        guard receipts.count == snapshot.items.count else { return nil }
-        return TokenSaverPreparedContextSeed(
-            encoded: prepared.encoded,
-            document: prepared.seed,
-            receipts: receipts
-        )
-    }
-}
-
-public struct TokenSaverExactContextSeedPreparer: TokenSaverContextSeedPreparing {
-    private let target: TokenSaverBestOfThreeSelector.Target
-    private let counter: TokenSaverBestOfThreeSelector.CounterCapability
-    private let project: @Sendable (
-        TokenSaverBestOfThreeSelector.Format,
-        String
-    ) -> TokenSaverContextSeedBuilder.ProjectedEnvelope?
-
-    package init(
-        target: TokenSaverBestOfThreeSelector.Target,
-        counter: TokenSaverBestOfThreeSelector.CounterCapability,
-        project: @escaping @Sendable (
-            TokenSaverBestOfThreeSelector.Format,
-            String
-        ) -> TokenSaverContextSeedBuilder.ProjectedEnvelope?
-    ) {
-        self.target = target
-        self.counter = counter
-        self.project = project
-    }
-
-    public func prepare(
-        snapshot: TokenSaverCanonicalConversationSnapshot,
-        request: AgentRunRequest,
-        destinationProviderThreadId: String
-    ) async -> TokenSaverPreparedContextSeed? {
-        let requestTarget = TokenSaverBestOfThreeSelector.Target(
-            provider: request.provider.rawValue,
-            resolvedModel: request.model,
-            counterID: target.counterID,
-            counterRevision: target.counterRevision,
-            encoding: target.encoding
-        )
-        guard let prepared = await TokenSaverContextSeedBuilder.prepare(
-            snapshot: snapshot,
-            target: requestTarget,
-            counter: requestTarget == target ? counter : nil,
-            project: project
-        ) else {
-            return nil
-        }
-        var receipts: [TokenSaverContextSelectionReceipt.Record] = []
-        var decisionIndex = 0
-        for item in snapshot.items {
-            if item.role == .user {
-                receipts.append(TokenSaverContextSelectionReceipt.humanUserSlot(
-                    runId: request.runId.value.uuidString,
-                    destinationProviderThreadId: destinationProviderThreadId,
-                    snapshotDigest: snapshot.digest,
-                    sourceMessageId: item.messageId,
-                    ordinal: item.ordinal,
-                    provider: request.provider.rawValue,
-                    resolvedModel: request.model
-                ))
-                continue
-            }
-            guard decisionIndex < prepared.decisions.count else { return nil }
-            receipts.append(TokenSaverContextSelectionReceipt.project(
-                decision: prepared.decisions[decisionIndex],
-                runId: request.runId.value.uuidString,
-                destinationProviderThreadId: destinationProviderThreadId,
-                snapshotDigest: snapshot.digest,
-                sourceMessageId: item.messageId,
-                role: .assistant,
-                ordinal: item.ordinal,
-                provider: request.provider.rawValue,
-                resolvedModel: request.model
-            ))
-            decisionIndex += 1
         }
         guard receipts.count == snapshot.items.count else { return nil }
         return TokenSaverPreparedContextSeed(

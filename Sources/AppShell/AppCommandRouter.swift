@@ -5424,7 +5424,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             runAsUser: t.runAsUser,
             acceptancePermit: acceptancePermit
         )
-        req.tokenSaverCompressesPrompt = botPromptApplied
+        req.providerPromptOverridesDisplay = botPromptApplied
         let runId: AgentRunID
         do {
             runId = try await ctx.coordinator.startRun(req, routingSnapshot: coordinatorSnapshot)
@@ -7307,25 +7307,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// interception without thread scope); thread-scoped paths put managed bin
     /// back first so provider proxies stay available.
     nonisolated static func scrubProviderEnvironment(_ env: [String: String]) -> [String: String] {
-        var cleaned = env
-        for key in env.keys
-        where key.hasPrefix("RC_GRAPHIFY_")
-            || key.hasPrefix("RC_TOKEN_SAVER_")
-            || key.hasPrefix("RC_DISTILL_")
-            || key == "REMOTE_CODE_DISTILL_STATE_PATH" {
-            cleaned.removeValue(forKey: key)
-        }
-        let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
-        if let path = cleaned["PATH"] {
-            // PERF: single pass avoids the map + filter intermediates on the
-            // scrub path; joined PATH identical.
-            var kept: [String] = []
-            for part in path.split(separator: ":") where part != managedBin {
-                kept.append(String(part))
-            }
-            cleaned["PATH"] = kept.joined(separator: ":")
-        }
-        return cleaned
+        AgentHostEnvironmentMerge.scrubLegacyOptimizationKeys(env)
     }
 
     /// Prepends the managed CLI bin (`~/.remote-code/bin`) so nested provider proxies

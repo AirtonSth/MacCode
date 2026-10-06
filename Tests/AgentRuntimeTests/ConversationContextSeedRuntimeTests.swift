@@ -6,42 +6,7 @@ import XCTest
 /// WHY: a failed Codex resume must reconstruct prior turns once on the fresh
 /// destination. Seeding a successful resume, an empty snapshot, or a retry
 /// would either duplicate provider-native history or invent a second conversation.
-final class TokenSaverContextSeedRuntimeTests: XCTestCase {
-    func test_rcs1WinsAndIsSentOnceOnFreshFallback() async throws {
-        // WHY: the cheaper exact RCS1 assistant item must ride the seed once,
-        // and decode must recover the stored Human for the destination.
-        let human = String(repeating: "ABCDEFGH", count: 16)
-        let snapshot = try XCTUnwrap(makeSnapshot(user: "prior user", assistant: human))
-        let (adapter, destClient) = fallbackAdapter()
-        let store = try makeReceiptStore()
-        adapter.contextSeedReceipts = store.repo
-        adapter.contextSeedPreparer = exactPreparer(human: human, rcs1Cheaper: true)
-        var request = AgentRunRequest(
-            runId: store.run.id,
-            threadId: store.thread.id,
-            provider: .codex,
-            model: "gpt-test",
-            cwd: "/tmp/context-seed",
-            prompt: "current prompt",
-            providerThreadId: "old-thread"
-        )
-        request.contextSnapshot = snapshot
-
-        _ = try await adapter.sendTurn(request) { _ in }
-
-        XCTAssertEqual(destClient.startedTurns.count, 1)
-        let seeded = try XCTUnwrap(destClient.startedTurns.first?.request.preparedContextSeed)
-        XCTAssertEqual(seeded.document.items.count, 2)
-        XCTAssertEqual(seeded.document.items[0].payload, "prior user")
-        XCTAssertEqual(seeded.document.items[1].format, TokenSaverBestOfThreeSelector.Format.rcs1)
-        XCTAssertEqual(RemoteCodeCompactSpan.decode(seeded.document.items[1].payload), human)
-        XCTAssertTrue(seeded.encoded.hasPrefix("RCSEED1/1\n"))
-        XCTAssertEqual(destClient.startedTurns.first?.request.prompt, "current prompt")
-        let records = try store.repo.list(runId: request.runId)
-        XCTAssertEqual(records.count, 2)
-        XCTAssertTrue(records.allSatisfy { $0.winner.lifecycle == .delivered })
-    }
-
+final class ConversationContextSeedRuntimeTests: XCTestCase {
     func test_successfulResumeDoesNotSeedOrDuplicateHistory() async throws {
         // WHY: provider-native resume already has the conversation. Host seed
         // would replay history into a live session.
@@ -725,45 +690,6 @@ final class TokenSaverContextSeedRuntimeTests: XCTestCase {
         let run = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-test", status: .pending)
         try AgentRunRepository(db: db).upsert(run)
         return (db, TokenSaverContextSelectionReceiptRepository(db: db), thread, run)
-    }
-
-    private func exactPreparer(human: String, rcs1Cheaper: Bool) -> TokenSaverContextSeedPreparing {
-        let rcs1 = TokenSaverContextItemSelector.rcs1Candidate(
-            canonicalHuman: human,
-            abi: "RCS1 ABI",
-            effectiveEnvelope: "RCS1 ABI\n" + (RemoteCodeCompactSpan.encode(human) ?? "")
-        )
-        let target = TokenSaverBestOfThreeSelector.Target(
-            provider: "codex",
-            resolvedModel: "gpt-test",
-            counterID: "fixture-counter",
-            counterRevision: "1",
-            encoding: "fixture-exact"
-        )
-        return TokenSaverExactContextSeedPreparer(
-            target: target,
-            counter: .init(
-                counter: .init(
-                    id: "fixture-counter",
-                    revision: "1",
-                    encoding: "fixture-exact",
-                    provider: "codex",
-                    resolvedModel: "gpt-test",
-                    quality: .exactLocalTokenizer
-                )
-            ) { text in
-                if text.contains(rcs1.payload) || text == rcs1.effectiveEnvelope { return rcs1Cheaper ? 20 : 80 }
-                if text.contains(human) { return rcs1Cheaper ? 80 : 20 }
-                return 10
-            },
-            project: { format, payload in
-                TokenSaverContextSeedBuilder.ProjectedEnvelope(
-                    payload: payload,
-                    abi: "\(format.rawValue.uppercased()) ABI",
-                    effectiveEnvelope: "\(format.rawValue.uppercased()) ABI\n\(payload)"
-                )
-            }
-        )
     }
 }
 

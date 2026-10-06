@@ -239,7 +239,7 @@ public final class SidebarViewModel: ObservableObject {
     @Published public private(set) var insomniaAllowSystemSleepWhenDisplayClosed: Bool = false
     @Published public private(set) var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true
     /// Provider account usage (Claude + Codex + Grok) for the sidebar card.
-    @Published public private(set) var accountUsageSnapshot: TokenSaverUsageSnapshot = .empty()
+    @Published public private(set) var accountUsageSnapshot: ProviderUsageSnapshot = .empty()
     /// True while a background account-usage refresh (CLI probe) is in flight.
     @Published public private(set) var accountUsageIsRefreshing: Bool = false
     /// Timestamp of the last completed account-usage refresh, or nil when never refreshed.
@@ -339,7 +339,7 @@ public final class SidebarViewModel: ObservableObject {
             Task { @MainActor in viewModel.reloadAccountUsage() }
         }
         self.accountUsageDistributedObserver =
-            TokenSaverUsageCrossProcess.observeStoreChanged { [weak self] in
+            ProviderUsageCrossProcess.observeStoreChanged { [weak self] in
                 guard let viewModel = self else { return }
                 Task { @MainActor in viewModel.reloadAccountUsage() }
             }
@@ -369,7 +369,7 @@ public final class SidebarViewModel: ObservableObject {
             NotificationCenter.default.removeObserver(accountUsageObserver)
         }
         if let accountUsageDistributedObserver {
-            TokenSaverUsageCrossProcess.removeObserver(accountUsageDistributedObserver)
+            ProviderUsageCrossProcess.removeObserver(accountUsageDistributedObserver)
         }
         accountUsageReloadTask?.cancel()
         powerMonitor.stop()
@@ -550,7 +550,7 @@ public final class SidebarViewModel: ObservableObject {
 
     /// Publish only a changed snapshot so equal usage notifications do not
     /// rebuild the sidebar body.
-    private func applyAccountUsageSnapshot(_ snapshot: TokenSaverUsageSnapshot) {
+    private func applyAccountUsageSnapshot(_ snapshot: ProviderUsageSnapshot) {
         if accountUsageSnapshot != snapshot {
             accountUsageSnapshot = snapshot
         }
@@ -558,9 +558,9 @@ public final class SidebarViewModel: ObservableObject {
 
     private static func loadAccountUsageSnapshot(
         appSupportDirectory: URL
-    ) async -> TokenSaverUsageSnapshot {
+    ) async -> ProviderUsageSnapshot {
         await Task.detached {
-            TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load()
+            ProviderUsageStore(appSupportDirectory: appSupportDirectory).load()
         }.value
     }
 

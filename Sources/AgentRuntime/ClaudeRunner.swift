@@ -197,26 +197,15 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         ]
     }
 
-    /// Env gate for CLI PostToolUse tool-output compression via the managed
-    /// `distill hook post-tool-use` command. Host sets this for Claude runs
-    /// when Token Saver is on; absent means no hook registration (fail open).
-    static let tokenSaverPostToolUseEnvKey = "RC_TOKEN_SAVER_POST_TOOL_USE"
-
     /// Builds a single `--settings <json>` pair (never two) for the Claude CLI.
     ///
     /// - Every effort injects thinking enablement + visible summaries.
     /// - Ultracode effort also injects `ultracode` + `enableWorkflows`.
-    /// - When `RC_TOKEN_SAVER_POST_TOOL_USE=1`, also registers a PostToolUse
-    ///   command hook pointing at the managed `distill` CLI
-    ///   (`hook post-tool-use`, timeout 10s).
-    /// - Both sources merge into ONE JSON payload so argv never carries two
-    ///   `--settings` flags.
     /// Shape is always `["--settings", "<json>"]` so consumers that
     /// take `.last` (SDK bridge payload) still receive the JSON string alone.
     static func ultracodeSettingsArgs(
         _ effort: AgentReasoningEffort?,
-        environment: [String: String] = [:],
-        cwd: String? = nil
+        environment: [String: String] = [:]
     ) -> [String] {
         let wantsUltracode = effort == .ultracode
         var settings: [String: Any] = [
@@ -228,130 +217,12 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             settings["ultracode"] = true
             settings["enableWorkflows"] = true
         }
-        if let distillHooks = tokenSaverDistillHookSettings(environment: environment) {
-            // `--settings` replaces any key it sets. Merge filesystem hooks so
-            // Distill does not wipe user/project/local Stop/PreToolUse/etc.
-            let filesystem = filesystemHookSettings(cwd: cwd, environment: environment)
-            settings["hooks"] = appendingDistillHooks(filesystem, distillHooks)
-        }
         guard let data = try? JSONSerialization.data(withJSONObject: settings, options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else {
             // Fail open: drop settings rather than emit invalid JSON.
             return []
         }
         return ["--settings", json]
-    }
-
-    /// Distill-only CLI command hooks (PostToolUse + Bash PreToolUse).
-    /// Nested proxy merge uses this map without loading filesystem hooks.
-    static func tokenSaverDistillHookSettings(environment: [String: String]) -> [String: Any]? {
-        guard environment[tokenSaverPostToolUseEnvKey] == "1" else { return nil }
-        let managedOverride = environment["RC_REMOTE_CODE_MANAGED_BIN"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let binDirectory: URL
-        if let managedOverride, !managedOverride.isEmpty {
-            binDirectory = URL(fileURLWithPath: managedOverride, isDirectory: true)
-        } else {
-            binDirectory = AgentSkillInstaller.defaultManagedCLIBinDirectory()
-        }
-        let distillPath = binDirectory.appendingPathComponent("distill").path
-        let command = "\(distillPath) hook post-tool-use"
-        let prePipe = "\(distillPath) hook pre-tool-pipe"
-        return [
-            "PostToolUse": [
-                [
-                    "matcher": "*",
-                    "hooks": [
-                        [
-                            "type": "command",
-                            "command": command,
-                            "timeout": 45
-                        ] as [String: Any]
-                    ]
-                ] as [String: Any]
-            ],
-            "PreToolUse": [
-                [
-                    "matcher": "Bash",
-                    "hooks": [
-                        [
-                            "type": "command",
-                            "command": prePipe,
-                            "timeout": 5
-                        ] as [String: Any]
-                    ]
-                ] as [String: Any]
-            ]
-        ]
-    }
-
-    static func filesystemHookSettings(
-        cwd: String?,
-        environment: [String: String]
-    ) -> [String: Any] {
-        var merged: [String: Any] = [:]
-        var paths: [String] = []
-        if let home = environment["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !home.isEmpty {
-            paths.append(
-                URL(fileURLWithPath: home, isDirectory: true)
-                    .appendingPathComponent(".claude", isDirectory: true)
-                    .appendingPathComponent("settings.json").path
-            )
-        } else {
-            paths.append(
-                FileManager.default.homeDirectoryForCurrentUser
-                    .appendingPathComponent(".claude", isDirectory: true)
-                    .appendingPathComponent("settings.json").path
-            )
-        }
-        if let cwd, !cwd.isEmpty {
-            let claudeDir = URL(fileURLWithPath: cwd, isDirectory: true)
-                .appendingPathComponent(".claude", isDirectory: true)
-            paths.append(claudeDir.appendingPathComponent("settings.json").path)
-            paths.append(claudeDir.appendingPathComponent("settings.local.json").path)
-        }
-        for path in paths {
-            guard let data = FileManager.default.contents(atPath: path),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let hooks = object["hooks"] as? [String: Any] else { continue }
-            merged = mergingHookMaps(merged, hooks)
-        }
-        return merged
-    }
-
-    static func mergingHookMaps(_ base: [String: Any], _ extra: [String: Any]) -> [String: Any] {
-        var out = base
-        for (event, value) in extra {
-            let extraEntries = value as? [[String: Any]] ?? []
-            let existing = out[event] as? [[String: Any]] ?? []
-            if extraEntries.isEmpty { continue }
-            out[event] = existing + extraEntries
-        }
-        return out
-    }
-
-    static func appendingDistillHooks(
-        _ filesystem: [String: Any],
-        _ distill: [String: Any]
-    ) -> [String: Any] {
-        var out = filesystem
-        for (event, value) in distill {
-            let required = value as? [[String: Any]] ?? []
-            let existing = out[event] as? [[String: Any]] ?? []
-            let existingJSON = (try? JSONSerialization.data(
-                withJSONObject: existing,
-                options: [.sortedKeys]
-            )).flatMap { String(data: $0, encoding: .utf8) } ?? ""
-            let marker: String
-            switch event {
-            case "PostToolUse": marker = "distill hook post-tool-use"
-            case "PreToolUse": marker = "distill hook pre-tool-pipe"
-            default: marker = "distill hook"
-            }
-            out[event] = existingJSON.contains(marker) ? existing : existing + required
-        }
-        return out
     }
 
     /// RemoteCode owns the single settings payload that configures thinking
@@ -388,7 +259,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         let prompt = request.providerPrompt
         let effort = normalizedReasoningEffort(request.reasoningEffort, model: request.model)
         args.append(contentsOf: effortArgs(effort, model: request.model))
-        args.append(contentsOf: ultracodeSettingsArgs(effort, environment: request.environment, cwd: request.cwd))
+        args.append(contentsOf: ultracodeSettingsArgs(effort, environment: request.environment))
         // Resume the prior session so the model keeps full context.
         if let ptid = request.providerThreadId, !ptid.isEmpty {
             args.append(contentsOf: ["--resume", ptid])
@@ -431,7 +302,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         args.append(contentsOf: ["--model", request.model])
         let effort = normalizedReasoningEffort(request.reasoningEffort, model: request.model)
         args.append(contentsOf: effortArgs(effort, model: request.model))
-        args.append(contentsOf: ultracodeSettingsArgs(effort, environment: request.environment, cwd: request.cwd))
+        args.append(contentsOf: ultracodeSettingsArgs(effort, environment: request.environment))
         if let source = sourceProviderThreadId?.trimmingCharacters(in: .whitespacesAndNewlines),
            !source.isEmpty,
            let child = request.providerThreadId, !child.isEmpty {
@@ -461,13 +332,12 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         // Also carries the MCP-tool-availability rule so the agent does not preemptively
         // refuse a connected MCP tool as "unauthenticated" in a non-interactive run
         // (both live via `alwaysOnClaudeDirectives`).
-        // Background-await + MCP rules always; Distill only when Token Saver hint is set.
         // `--append-system-prompt` adds to the CLI's default prompt, so it stays additive.
         let providerDirectives = BotPeerDelegation.appendingTurnContext(
             to: BackgroundAwaitContinuation.alwaysOnClaudeDirectives,
             environment: request.environment
         )
-        let appendedSystemPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
+        let appendedSystemPrompt = AgentSkillInstaller.nestedAgentProviderPrompt(
             providerDirectives,
             environment: request.environment
         )
@@ -500,27 +370,17 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     }
 
     /// Claude Code does not discover `mcpServers` from settings.json. Admit the
-    /// managed peer server AND — while Token Saver is enabled — the Distill
-    /// librarian server (rc_stats/rc_search/rc_ask/rc_retrieve/rc_compress —
-    /// the 01-catalogo.html surface) through the documented per-process
-    /// `--mcp-config` input so every CLI turn gets the exact run context
-    /// authored by the host. Codex admits the same server per process via
-    /// `-c mcp_servers.<name>.*` (CodexRunner.distillMCPOverrides) and Grok per
-    /// ACP session, all under the same Token Saver gate; without this entry
-    /// Claude was the only provider that never saw the catalog tools.
+    /// managed peer server through the documented per-process `--mcp-config`
+    /// input so every CLI turn gets the exact run context authored by the host.
     /// User/project MCP sources remain enabled because this is not strict mode.
     /// Provider tool names auto-approved for supervised Claude runs: the bot
-    /// peer tools always, plus the librarian tools while Token Saver is on
-    /// (matching the servers actually admitted for the run).
+    /// peer tools always (matching the servers actually admitted for the run).
     static func automaticallyAllowedTools(environment: [String: String]) -> [String] {
         var tools = BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools
         if environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" {
             tools += ManagedComputerUseMCP.advertisedToolNames.map {
                 "mcp__\(ComputerUseMCPAdmit.serverName)__\($0)"
             }
-        }
-        if DistillMCPAdmit.isEnabled(environment: environment) {
-            tools += DistillMCPAdmit.claudeAutomaticallyAllowedTools
         }
         return tools
     }
@@ -540,12 +400,6 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         ]
         if environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" {
             servers[ComputerUseMCPAdmit.serverName] = ComputerUseMCPAdmit.stdioConfig(command: resolved)
-        }
-        if DistillMCPAdmit.isEnabled(environment: environment) {
-            servers[DistillMCPAdmit.serverName] = DistillMCPAdmit.claudeServer(
-                command: resolved,
-                environment: environment
-            )
         }
         let object: [String: Any] = ["mcpServers": servers]
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),

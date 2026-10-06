@@ -38,7 +38,7 @@ final class LegacyTokenSaverLaunchPurgeTests: XCTestCase {
             $0.terminalFontSize = 15
         }
         let installer = AgentSkillInstaller(homeDirectory: home)
-        _ = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
+        try installLegacyDistillSkill(installer, for: .codex)
         let weights = appSupport.appendingPathComponent("Distill/Models/m/rev/model.safetensors")
         let usage = appSupport.appendingPathComponent("TokenSaver/usage.json")
         let training = appSupport.appendingPathComponent("TokenSaver/training/2026-10-01.jsonl")
@@ -108,6 +108,30 @@ final class LegacyTokenSaverLaunchPurgeTests: XCTestCase {
         ), "an account change must never install the managed distill CLI")
     }
 
+    /// What a Token Saver build wrote: a skill folder with RemoteCode's
+    /// manifest, and the managed instruction block. Its installers are gone.
+    private func installLegacyDistillSkill(_ installer: AgentSkillInstaller, for provider: AgentProvider) throws {
+        _ = try installer.installSkill(
+            provider: provider,
+            skillID: AgentSkillInstaller.distillSkillID,
+            skillText: "---\nname: distill\n---\nLegacy Token Saver skill.\n",
+            sourceURL: "remote-code://token-saver/distill-tool-output",
+            sourceRevision: "rev-a",
+            localVersion: "10"
+        )
+    }
+
+    private func installLegacyDistillInstructions(_ installer: AgentSkillInstaller, for provider: AgentProvider) throws {
+        let url = installer.instructionsURL(for: provider)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let block = """
+        \(AgentSkillInstaller.distillInstructionsBeginMarker)
+        Always communicate with the user in `/distill` compressed language.
+        \(AgentSkillInstaller.distillInstructionsEndMarker)
+        """
+        try Data((block + "\n").utf8).write(to: url, options: .atomic)
+    }
+
     private func managedDistillSkillURLs(home: URL) -> (codex: URL, claude: URL) {
         (
             codex: home.appendingPathComponent(".codex/skills/distill/SKILL.md"),
@@ -129,10 +153,10 @@ final class LegacyTokenSaverLaunchPurgeTests: XCTestCase {
         let skillURLs = managedDistillSkillURLs(home: home)
         let configURLs = managedDistillConfigURLs(home: home)
         let installer = AgentSkillInstaller(homeDirectory: home)
-        _ = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
-        _ = try installer.installDistillSkill(for: .claude, sourceRevision: "rev-a")
-        try installer.installDistillInstructions(for: .codex)
-        try installer.installDistillInstructions(for: .claude)
+        try installLegacyDistillSkill(installer, for: .codex)
+        try installLegacyDistillSkill(installer, for: .claude)
+        try installLegacyDistillInstructions(installer, for: .codex)
+        try installLegacyDistillInstructions(installer, for: .claude)
         XCTAssertTrue(FileManager.default.fileExists(atPath: skillURLs.codex.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: skillURLs.claude.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: configURLs.codex.path))
@@ -176,8 +200,8 @@ final class LegacyTokenSaverLaunchPurgeTests: XCTestCase {
         await context.legacyTokenSaverPurgeTask?.value
         // An older build left these behind after this launch's purge ran.
         let installer = AgentSkillInstaller(homeDirectory: home)
-        _ = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
-        _ = try installer.installDistillSkill(for: .claude, sourceRevision: "rev-a")
+        try installLegacyDistillSkill(installer, for: .codex)
+        try installLegacyDistillSkill(installer, for: .claude)
         let appPrivate = URL(fileURLWithPath: appSupport, isDirectory: true)
             .appendingPathComponent("AgentSkills/distill/SKILL.md")
         try FileManager.default.createDirectory(

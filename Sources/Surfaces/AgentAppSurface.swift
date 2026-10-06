@@ -628,8 +628,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var queuedMessageDraft: String = ""
     /// When the active run started — drives the "Working for Xs" line.
     @Published public var runStartedAt: Date?
-    /// Thread whose turn is being prepared: transcript load, Graphify root
-    /// resolution, prompt compression, provider spawn — all before a run id
+    /// Thread whose turn is being prepared: transcript load, preflight,
+    /// provider spawn — all before a run id
     /// exists to track. Without this the transcript sits silent for seconds
     /// after the user bubble appears, which read as the app having hung.
     /// Drives the "Loading…" line; `workingStatus` takes over the instant the
@@ -638,10 +638,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Thread whose turn is being prepared for the *selected* thread UI (Loading…).
     /// Backed by `preparingRunThreads` so multi-thread prep is not a singleton race.
     @Published public private(set) var preparingRunThreadId: AgentThreadID?
-    /// S5: all threads currently in surface preparation (Graphify/preflight).
+    /// S5: all threads currently in surface preparation (preflight).
     /// Stop/Escape must target the selected/owning thread, not a single global slot.
     private var preparingRunThreads: Set<AgentThreadID> = []
-    /// S5: generation-owned surface preparation (accept → Graphify/preflight →
+    /// S5: generation-owned surface preparation (accept → preflight →
     /// coordinator start). Stop/Escape applies `.stopRequested` so a late
     /// claim cannot call `coordinator.startRun`.
     private var surfacePreparationStates: [AgentThreadID: ProviderPreparationState] = [:]
@@ -8372,7 +8372,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         }
         // Everything from here to the tracked run below is preparation the user
-        // cannot see (Graphify roots, prompt compression, provider spawn). Show
+        // cannot see (preflight, provider spawn). Show
         // "Loading…" for it; the defer covers the failure exits so a thread can
         // never be left permanently loading.
         // Run identity is fixed at acceptance so Stop can cancel this generation.
@@ -8383,7 +8383,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             liveBackgroundShellCount = 0
             liveBackgroundTasks = []
         }
-        // S5: accept surface-owned preparation generation before any Graphify work.
+        // S5: accept surface-owned preparation generation before any preparation work.
         // Capture the generation for this startProviderRun invocation — never
         // re-read state.generation after await (Stop + resend can advance it).
         let surfaceAccept = ProviderPreparationStateMachine.apply(
@@ -8396,8 +8396,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         surfacePreparationStates[tid] = surfaceAccept.state
         let acceptedGeneration = surfaceAccept.state.generation
         beginSurfacePreparation(threadId: tid, generation: acceptedGeneration, runId: runId)
-        // Coordinator-owned reservation before Graphify await so RPC/iOS Stop
-        // during root resolution can cancel this run (not only local UI Stop).
+        // Coordinator-owned reservation before preparation so RPC/iOS Stop
+        // during it can cancel this run (not only local UI Stop).
         coordinator.reserveProviderStart(threadId: tid, runId: runId)
         defer {
             endSurfacePreparationIfOwned(threadId: tid, generation: acceptedGeneration)
@@ -8443,30 +8443,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let providerThreadId = persistedThread?.provider == runProvider
             ? persistedThread?.providerThreadId
             : nil
-        // Graphify: same host path as AppCommandRouter RPC send — resolve roots,
-        // kick refresh, inject RC_GRAPHIFY_* into provider environment (fail-open).
-        // Root resolution shells out to `git rev-parse` twice per candidate
-        // directory (blocking Process + waitUntilExit). When the workspace root
-        // is not itself a repo, classify() walks the tree to depth 2, so that is
-        // hundreds of spawns — measured at 2.7s of blocked MainActor on send,
-        // i.e. the macOS spinner before the run started. Resolve off the main
-        // actor; send still awaits it, so the run environment is unchanged.
-        let graphifyBase = launchConfig?.environment ?? [:]
-        let graphifyThreadId = tid.value
-        let graphifyCwd = cwd
-        let graphifyWorktreePath = persistedThread?.worktreePath
-        let graphifyAttachmentPaths = attached.map(\.path)
-        let graphifyEnv = await Task.detached(priority: .userInitiated) {
-            GraphifyWorkspaceService.shared.applyToAgentEnvironment(
-                base: graphifyBase,
-                threadId: graphifyThreadId,
-                threadCwd: graphifyCwd,
-                worktreePath: graphifyWorktreePath,
-                workspaceCwd: graphifyCwd,
-                attachmentPaths: graphifyAttachmentPaths
-            ).environment
-        }.value
-        // S5: claim spawn immediately after Graphify, *before* durable pending /
+        // Leftover Graphify keys in a launch config never reach a provider.
+        let launchEnvironment = (launchConfig?.environment ?? [:])
+            .filter { !$0.key.hasPrefix("RC_GRAPHIFY_") }
+        // S5: claim spawn immediately after preparation, *before* durable pending /
         // currentRunId/runThreads. A late cancelled generation must not leave
         // surface ownership that poisons trackedRunId for a newer send.
         let surfacePrep = surfacePreparationStates[tid] ?? ProviderPreparationState()
@@ -8498,7 +8478,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return nil
         }
         surfacePreparationStates[tid] = claimedState
-        // Reservation already published before Graphify; keep it until startRun
+        // Reservation already published before preparation; keep it until startRun
         // registers or failure paths release it.
         let mentionedBots = BotMentionParser.mentionedBots(
             in: text,
@@ -8506,7 +8486,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             excluding: nil
         )
         let providerEnvironment = BotPeerDelegation.environment(
-            addingTurnContextTo: graphifyEnv,
+            addingTurnContextTo: launchEnvironment,
             mentionedBots: mentionedBots
         )
         var transformFailure: Error?
@@ -8542,7 +8522,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             environment: providerEnvironment,
             runAsUser: threadRunAsUser
         )
-        req.tokenSaverCompressesPrompt = runPrompt != text
+        req.providerPromptOverridesDisplay = runPrompt != text
         do {
             // Status + unread + updated_at only. A leftover 26-column + routing
             // `get` then `upsert` hitchs every composer send and rewrites routing
@@ -8984,7 +8964,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return tid.flatMap { trackedRunId(for: $0) }
         }()
         // S5: cancel generation-owned surface preparation even when no run is
-        // tracked yet (Graphify / preflight window before coordinator.startRun).
+        // tracked yet (preflight window before coordinator.startRun).
         if let tid, preparingRunThreads.contains(tid) {
             cancelSurfacePreparation(threadId: tid)
             // Only fall through to stopRun when the coordinator already owns a

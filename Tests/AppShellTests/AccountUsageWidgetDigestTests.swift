@@ -8,9 +8,9 @@ final class AccountUsageWidgetDigestTests: XCTestCase {
         // WHY (EV-25): every account-usage cycle republished a structurally
         // identical digest (only updated_at_ms moved) — 155 persisted events and
         // fan-outs per 10 min. Only a rendered field change may publish.
-        func snapshot(claudeWeekly: Double) -> TokenSaverUsageSnapshot {
-            TokenSaverUsageSnapshot(period: .sevenDays, providers: [
-                TokenSaverProviderUsage(
+        func snapshot(claudeWeekly: Double) -> ProviderUsageSnapshot {
+            ProviderUsageSnapshot(period: .sevenDays, providers: [
+                ProviderTokenUsage(
                     provider: .claude,
                     weeklyUsedPercent: claudeWeekly,
                     weeklyWindowDurationMinutes: 10_080,

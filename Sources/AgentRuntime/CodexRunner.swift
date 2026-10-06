@@ -128,14 +128,20 @@ public enum ProcessLocator {
         )
     }
 
+    /// True for RemoteCode's own `distill` (the managed link, or anything that
+    /// resolves to the `RemoteCodeDistillService` binary, such as a leftover
+    /// `~/.local/bin/distill` from the removed Token Saver), which is never
+    /// the Distill agent.
     private static func isManagedDistillShim(_ path: String, homeDirectory: String) -> Bool {
         let managedURL = URL(fileURLWithPath: "\(homeDirectory)/.remote-code/bin/distill")
         let managedPath = managedURL.standardizedFileURL.path
         let managedTarget = managedURL.resolvingSymlinksInPath().standardizedFileURL.path
         let candidateURL = URL(fileURLWithPath: path)
         let candidatePath = candidateURL.standardizedFileURL.path
-        let candidateTarget = candidateURL.resolvingSymlinksInPath().standardizedFileURL.path
-        return candidatePath == managedPath || candidateTarget == managedTarget
+        let candidateTarget = candidateURL.resolvingSymlinksInPath().standardizedFileURL
+        return candidatePath == managedPath
+            || candidateTarget.path == managedTarget
+            || candidateTarget.lastPathComponent == "RemoteCodeDistillService"
     }
 
     private static func normalizedDirectory(_ path: String) -> String {
@@ -249,7 +255,6 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         }
         args += botCatalogMCPOverrides(environment: request.environment)
         args += computerUseMCPOverrides(environment: request.environment)
-        args += distillMCPOverrides(environment: request.environment)
         if !resuming {
             let model = request.model.trimmingCharacters(in: .whitespaces)
             if !model.isEmpty, model.lowercased() != "default" {
@@ -344,27 +349,6 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             }
     }
 
-    /// The Distill librarian MCP (`RemoteCodeDistillService mcp`, the
-    /// 01-catalogo.html surface), admitted per process under the same Token
-    /// Saver gate as Claude (`--mcp-config` / SDK `mcp_servers`) and Grok
-    /// (ACP `session/new`). Carries the run's recovery scope so `rc_retrieve`
-    /// and `rc_ask` resolve against this exact workspace/thread.
-    public static func distillMCPOverrides(
-        command: String? = nil,
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> [String] {
-        guard DistillMCPAdmit.isEnabled(environment: environment) else { return [] }
-        let resolved = command
-            ?? AgentSkillInstaller.resolveServiceBinary()?.path
-            ?? DistillMCPAdmit.fallbackCommand
-        return stdioMCPServerOverrides(
-            serverName: DistillMCPAdmit.codexServerName,
-            cliArgument: DistillMCPAdmit.cliArgument,
-            command: resolved,
-            environment: DistillMCPAdmit.recoveryEnvironment(environment)
-        )
-    }
-
     /// `codex app-server` accepts the same `-c` overrides as `exec`. Keep the
     /// subcommand first so fork-protocol probing can still recognize production
     /// app-server argv (`arguments.first == "app-server"`).
@@ -374,7 +358,6 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
     ) -> [String] {
         ["app-server"]
             + botCatalogMCPOverrides(command: command, environment: environment)
-            + distillMCPOverrides(command: command, environment: environment)
     }
 
     static func stdioMCPServerOverrides(
@@ -697,9 +680,9 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             }
         }
 
-        // Token Saver/Graphify admission belongs to the exact host request, not
-        // the RemoteCode process' inherited GUI/login environment. This keeps a
-        // parent shell receipt from leaking into support or cross-user launches.
+        // Host-injected keys belong to the exact host request, not the
+        // RemoteCode process' inherited GUI/login environment. This keeps a
+        // parent shell value from leaking into support or cross-user launches.
         base = AgentHostEnvironmentMerge.stripHostInjects(from: base)
         var env = base.merging(overrides) { _, override in override }
 
@@ -716,19 +699,17 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         if let provider = purpose.provider {
             env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
         }
-        // Central Token Saver receipt seam for every controlled nested agent spawn
-        // (Codex/Claude/Grok). Support/probe processes stay raw (no re-stamp).
-        // Re-applies discrete RC_TOKEN_SAVER_* + compact receipt from host overrides;
-        // never invents admission when the host left Token Saver off.
-        if case .agentTurn(let provider) = purpose {
-            env = TokenSaverExecutionReceiptSeam.propagate(into: env, provider: provider)
+        // Agent turns drop any leftover Token Saver / Graphify keys and the
+        // managed bin (re-asserted below when the host set it). Support/probe
+        // processes drop every host-injected key.
+        if case .agentTurn = purpose {
+            env = AgentHostEnvironmentMerge.scrubLegacyOptimizationKeys(env)
         } else {
             env = AgentHostEnvironmentMerge.stripHostInjects(from: env)
         }
         // Re-assert managed bin first on PATH after login-shell / expandedPath merges.
         // Host sets RC_REMOTE_CODE_MANAGED_BIN for thread-scoped provider launches so
-        // nested provider proxies and (when Token Saver is on) command wrappers win
-        // lookup. Without this, a login PATH overlay can bury or drop the managed dir
+        // nested provider proxies win lookup. Without this, a login PATH overlay can bury or drop the managed dir
         // before the child process starts (shell bridge re-prepends for zsh tools, but
         // the provider process itself must also start with a correct PATH).
         if case .agentTurn = purpose,

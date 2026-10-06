@@ -4,11 +4,6 @@ import Darwin
 @testable import AgentRuntime
 
 final class CodexAppServerClientTests: ProviderProcessTestCase {
-    override func tearDown() {
-        TokenSaverCensusSeam.sharedStore = TokenSaverCensusStore()
-        super.tearDown()
-    }
-
     func test_productionCodexLaunchForwardsRequestedRunAsIdentity() throws {
         // WHY: the persisted thread user must be the OS identity of the real
         // app-server process, including ownership tagging and foreign-UID reap.
@@ -31,46 +26,12 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertTrue(client.contains("foreignUserUID: foreignUserUID"))
     }
 
-    func test_turnStartCensus_preservesCodexWireBytesAndDoesNotInventTokens() async throws {
-        let script = try makeFakeAppServerPeer()
-        let store = TokenSaverCensusStore()
-        TokenSaverCensusSeam.sharedStore = store
-        let client = try CodexAppServerClient(
-            binary: script,
-            arguments: [],
-            cwd: FileManager.default.temporaryDirectory.path,
-            tokenSaverCensusAllowed: true
-        )
-        defer { client.stop() }
-        _ = try await client.initialize()
-        let request = AgentRunRequest(
-            threadId: AgentThreadID(),
-            provider: .codex,
-            model: "test-model",
-            cwd: FileManager.default.temporaryDirectory.path,
-            prompt: "census payload"
-        )
-
-        _ = try await client.startTurn(providerThreadId: "thread-1", for: request)
-
-        let observations = store.snapshot()
-        XCTAssertEqual(observations.count, 1, "only provider-bound turn/start is census eligible")
-        XCTAssertEqual(observations[0].bindingDimensions["provider"], "codex")
-        XCTAssertEqual(observations[0].bindingDimensions["tool_shape"], "turn_start_json_line")
-        XCTAssertGreaterThan(observations[0].eligibleBytes, 0)
-        XCTAssertFalse(observations[0].hasMeasuredEligibleTokens)
-        XCTAssertFalse(store.aggregates()[0].isValidForGate)
-    }
-
     func test_invalidatedAcceptancePermitBlocksTurnStartBeforeWireWrite() async throws {
         let script = try makeFakeAppServerPeer()
-        let store = TokenSaverCensusStore()
-        TokenSaverCensusSeam.sharedStore = store
         let client = try CodexAppServerClient(
             binary: script,
             arguments: [],
-            cwd: FileManager.default.temporaryDirectory.path,
-            tokenSaverCensusAllowed: true
+            cwd: FileManager.default.temporaryDirectory.path
         )
         defer { client.stop() }
         _ = try await client.initialize()
@@ -89,9 +50,6 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             _ = try await client.startTurn(providerThreadId: "thread-1", for: request)
             XCTFail("suppression must win before the Codex turn/start write")
         } catch is AgentRunAcceptanceError {}
-
-        XCTAssertTrue(store.snapshot().isEmpty,
-                      "the provider-visible census proves no turn/start bytes were written")
     }
 
     func test_rpcDeadlineFailsWithoutStoppingSilentAppServer() async throws {
@@ -330,8 +288,8 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(params["approvalPolicy"] as? String, "never")
         XCTAssertEqual(params["sandbox"] as? String, "danger-full-access")
         let instructions = try XCTUnwrap(params["developerInstructions"] as? String)
-        XCTAssertTrue(instructions.contains("| distill"),
-                      "fallback thread/start must preserve current Token Saver admission")
+        XCTAssertFalse(instructions.contains("| distill"),
+                       "a leftover Token Saver hint must not bring back the removed Distill guidance")
         XCTAssertTrue(instructions.contains("Plan only"),
                       "fallback thread/start must preserve the current interaction mode")
         XCTAssertTrue(instructions.contains("@fallback is Fallback"),
@@ -348,7 +306,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         defer { client.stop() }
 
         _ = try await client.initialize()
-        let tokenSaverRequest = AgentRunRequest(
+        let legacyHintRequest = AgentRunRequest(
             threadId: AgentThreadID(),
             provider: .codex,
             model: "gpt-5.3-codex",
@@ -363,24 +321,24 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                 BotPeerDelegation.turnContextEnvironmentKey: "REMOTE CODE RESOLVED IDENTITY ONLY: @before is Before"
             ]
         )
-        let enabled = try await client.openThread(for: tokenSaverRequest)
+        let enabled = try await client.openThread(for: legacyHintRequest)
         XCTAssertEqual(enabled.providerThreadId, "live-thread")
         XCTAssertEqual(enabled.response["lastMethod"] as? String, "thread/resume")
         XCTAssertFalse(enabled.resumeFellBackToStart)
         let enabledParams = try XCTUnwrap(enabled.response["lastParams"] as? [String: Any])
         let enabledInstructions = try XCTUnwrap(enabledParams["developerInstructions"] as? String)
-        XCTAssertTrue(enabledInstructions.contains("| distill"),
-                      "Token Saver admission must reach an already-open Codex thread")
+        XCTAssertFalse(enabledInstructions.contains("| distill"),
+                       "a leftover Token Saver hint must not bring back the removed Distill guidance")
         XCTAssertTrue(enabledInstructions.contains("Plan only"),
                       "interaction mode changes must update an already-open Codex thread")
         XCTAssertTrue(enabledInstructions.contains("@before is Before"),
                       "current delegation context must reach thread/resume")
 
         let disabledRequest = AgentRunRequest(
-            threadId: tokenSaverRequest.threadId,
+            threadId: legacyHintRequest.threadId,
             provider: .codex,
-            model: tokenSaverRequest.model,
-            cwd: tokenSaverRequest.cwd,
+            model: legacyHintRequest.model,
+            cwd: legacyHintRequest.cwd,
             prompt: "continue",
             providerThreadId: "live-thread",
             permissionMode: .fullAccess,
@@ -392,7 +350,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(Set(disabledParams.keys), ["threadId", "developerInstructions"])
         let disabledInstructions = try XCTUnwrap(disabledParams["developerInstructions"] as? String)
         XCTAssertFalse(disabledInstructions.contains("| distill"),
-                       "Token Saver off must replace previously admitted paid guidance")
+                       "no Distill guidance is ever sent")
         XCTAssertFalse(disabledInstructions.contains("Plan only"),
                        "the current interaction mode must replace the previous mode")
         XCTAssertTrue(disabledInstructions.contains("@after is After"),
@@ -584,7 +542,8 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual(settings["reasoning_effort"] as? String, "high")
         let planInstructions = try XCTUnwrap(settings["developer_instructions"] as? String)
         XCTAssertTrue(planInstructions.contains("Plan only"))
-        XCTAssertTrue(planInstructions.contains("| distill"), "Token Saver instructions must reach the real turn/start payload")
+        XCTAssertFalse(planInstructions.contains("| distill"),
+                       "a leftover Token Saver hint must not bring back the removed Distill guidance")
         XCTAssertEqual(params["serviceTier"] as? String, "fast")
         XCTAssertEqual(params["effort"] as? String, "high")
         XCTAssertEqual((params["sandboxPolicy"] as? [String: Any])?["type"] as? String, "workspaceWrite")
@@ -643,7 +602,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertFalse(followUpInstructions.contains("Plan only"))
         XCTAssertFalse(
             followUpInstructions.contains("| distill"),
-            "A reused thread must stop receiving Token Saver instructions after the feature is disabled"
+            "no Distill guidance is ever sent"
         )
     }
 
@@ -796,74 +755,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertEqual((params["sandboxPolicy"] as? [String: Any])?["type"] as? String, "dangerFullAccess")
     }
 
-    func test_startTurnTokenSaverActiveSupervisedAddsNetworkAccessToReadOnlySandbox() async throws {
-        // WHY: Codex's seatbelt denies all network by default under readOnly/workspaceWrite,
-        // blocking the Token Saver ledger POST. When Token Saver is admitted for this run,
-        // networkAccess is added so the ledger POST can succeed; filesystem restrictions from
-        // readOnly are unaffected. This must apply the SAME way to a primary run, a
-        // same-provider subagent, and a cross-provider nested run — the gate is "is Token
-        // Saver active", never "what kind of run is this".
-        let script = try makeFakeAppServerPeer()
-        let client = try CodexAppServerClient(
-            binary: script,
-            arguments: [],
-            cwd: FileManager.default.temporaryDirectory.path
-        )
-        defer { client.stop() }
-
-        _ = try await client.initialize()
-        let response = try await client.startTurn(
-            providerThreadId: "thread-app-server-1",
-            for: AgentRunRequest(
-                threadId: AgentThreadID(),
-                provider: .codex,
-                model: "gpt-5.5",
-                cwd: "/tmp/remotecode-app-server-test",
-                prompt: "token saver active supervised",
-                permissionMode: .supervised,
-                environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
-            )
-        )
-
-        let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
-        let sandboxPolicy = try XCTUnwrap(params["sandboxPolicy"] as? [String: Any])
-        XCTAssertEqual(sandboxPolicy["type"] as? String, "readOnly")
-        XCTAssertEqual(sandboxPolicy["networkAccess"] as? Bool, true)
-    }
-
-    func test_startTurnTokenSaverActiveAutoAcceptEditsAddsNetworkAccessToWorkspaceWriteSandbox() async throws {
-        let script = try makeFakeAppServerPeer()
-        let client = try CodexAppServerClient(
-            binary: script,
-            arguments: [],
-            cwd: FileManager.default.temporaryDirectory.path
-        )
-        defer { client.stop() }
-
-        _ = try await client.initialize()
-        let response = try await client.startTurn(
-            providerThreadId: "thread-app-server-1",
-            for: AgentRunRequest(
-                threadId: AgentThreadID(),
-                provider: .codex,
-                model: "gpt-5.5",
-                cwd: "/tmp/remotecode-app-server-test",
-                prompt: "token saver active workspace write",
-                permissionMode: .autoAcceptEdits,
-                environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
-            )
-        )
-
-        let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
-        let sandboxPolicy = try XCTUnwrap(params["sandboxPolicy"] as? [String: Any])
-        XCTAssertEqual(sandboxPolicy["type"] as? String, "workspaceWrite")
-        XCTAssertEqual(sandboxPolicy["networkAccess"] as? Bool, true)
-        XCTAssertEqual(sandboxPolicy["writableRoots"] as? [String], [])
-        XCTAssertEqual(sandboxPolicy["excludeTmpdirEnvVar"] as? Bool, false)
-        XCTAssertEqual(sandboxPolicy["excludeSlashTmp"] as? Bool, false)
-    }
-
-    func test_startTurnTokenSaverActiveFullAccessNeverGetsNetworkAccessKey() async throws {
+    func test_startTurnFullAccessNeverGetsNetworkAccessKey() async throws {
         // WHY: Full Access has no seatbelt at all (already unrestricted). It must stay exactly
         // {"type": "dangerFullAccess"} — adding networkAccess there would be meaningless and
         // could mask a future protocol change silently.
@@ -883,7 +775,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                 provider: .codex,
                 model: "gpt-5.5",
                 cwd: "/tmp/remotecode-app-server-test",
-                prompt: "token saver active full access",
+                prompt: "full access with a leftover Token Saver hint",
                 permissionMode: .fullAccess,
                 environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
             )
@@ -893,17 +785,18 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         let sandboxPolicy = try XCTUnwrap(params["sandboxPolicy"] as? [String: Any])
         XCTAssertEqual(sandboxPolicy["type"] as? String, "dangerFullAccess")
         XCTAssertNil(sandboxPolicy["networkAccess"], "dangerFullAccess must never carry a networkAccess key")
-        XCTAssertEqual(sandboxPolicy.count, 1, "dangerFullAccess sandbox policy must stay exactly {type} even with Token Saver active")
+        XCTAssertEqual(sandboxPolicy.count, 1, "dangerFullAccess sandbox policy must stay exactly {type}")
     }
 
-    func test_turnStartParams_sandboxPolicyIsCompleteWithAndWithoutTokenSaver() throws {
+    func test_turnStartParams_sandboxPolicyIsCompleteAndNetworkStaysOffEvenWithALegacyHint() throws {
         // WHY: Codex 0.146 SandboxPolicy requires complete objects (networkAccess on
         // readOnly; writableRoots/networkAccess/exclude* on workspaceWrite). Token Saver
-        // only flips networkAccess true/false — it must not omit required keys when off.
+        // used to flip networkAccess on; it was removed, so a hint an older build left in
+        // the environment must not lift the sandbox either.
         // Uses static turnStartParams so this is independent of the fake peer process.
-        func policy(mode: AgentPermissionMode, tokenSaver: Bool) throws -> [String: Any] {
+        func policy(mode: AgentPermissionMode, legacyHint: Bool) throws -> [String: Any] {
             var env: [String: String] = ["RC_REMOTE_CODE_SUBAGENT_THREAD_ID": UUID().uuidString]
-            if tokenSaver { env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1" }
+            if legacyHint { env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1" }
             let params = CodexAppServerClient.turnStartParams(
                 providerThreadId: "thread-app-server-1",
                 for: AgentRunRequest(
@@ -911,7 +804,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                     provider: .codex,
                     model: "gpt-5.5",
                     cwd: "/tmp/remotecode-app-server-test",
-                    prompt: "sandbox \(mode) ts=\(tokenSaver)",
+                    prompt: "sandbox \(mode) hint=\(legacyHint)",
                     permissionMode: mode,
                     environment: env
                 )
@@ -919,40 +812,24 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             return try XCTUnwrap(params["sandboxPolicy"] as? [String: Any])
         }
 
-        // Token Saver off — complete policies with networkAccess: false.
-        let supervisedOff = try policy(mode: .supervised, tokenSaver: false)
-        XCTAssertEqual(supervisedOff["type"] as? String, "readOnly")
-        XCTAssertEqual(supervisedOff["networkAccess"] as? Bool, false,
-                       "TS off: networkAccess must be explicit false, not omitted")
+        for legacyHint in [false, true] {
+            let supervised = try policy(mode: .supervised, legacyHint: legacyHint)
+            XCTAssertEqual(supervised["type"] as? String, "readOnly")
+            XCTAssertEqual(supervised["networkAccess"] as? Bool, false,
+                           "networkAccess must be explicit false, not omitted (hint: \(legacyHint))")
 
-        let workspaceOff = try policy(mode: .autoAcceptEdits, tokenSaver: false)
-        XCTAssertEqual(workspaceOff["type"] as? String, "workspaceWrite")
-        XCTAssertEqual(workspaceOff["networkAccess"] as? Bool, false)
-        XCTAssertEqual(workspaceOff["writableRoots"] as? [String], [])
-        XCTAssertEqual(workspaceOff["excludeTmpdirEnvVar"] as? Bool, false)
-        XCTAssertEqual(workspaceOff["excludeSlashTmp"] as? Bool, false)
+            let workspace = try policy(mode: .autoAcceptEdits, legacyHint: legacyHint)
+            XCTAssertEqual(workspace["type"] as? String, "workspaceWrite")
+            XCTAssertEqual(workspace["networkAccess"] as? Bool, false)
+            XCTAssertEqual(workspace["writableRoots"] as? [String], [])
+            XCTAssertEqual(workspace["excludeTmpdirEnvVar"] as? Bool, false)
+            XCTAssertEqual(workspace["excludeSlashTmp"] as? Bool, false)
 
-        let fullOff = try policy(mode: .fullAccess, tokenSaver: false)
-        XCTAssertEqual(fullOff["type"] as? String, "dangerFullAccess")
-        XCTAssertNil(fullOff["networkAccess"])
-        XCTAssertEqual(fullOff.count, 1)
-
-        // Token Saver on — same complete shape, networkAccess true for sandboxed modes.
-        let supervisedOn = try policy(mode: .supervised, tokenSaver: true)
-        XCTAssertEqual(supervisedOn["type"] as? String, "readOnly")
-        XCTAssertEqual(supervisedOn["networkAccess"] as? Bool, true)
-
-        let workspaceOn = try policy(mode: .autoAcceptEdits, tokenSaver: true)
-        XCTAssertEqual(workspaceOn["type"] as? String, "workspaceWrite")
-        XCTAssertEqual(workspaceOn["networkAccess"] as? Bool, true)
-        XCTAssertEqual(workspaceOn["writableRoots"] as? [String], [])
-        XCTAssertEqual(workspaceOn["excludeTmpdirEnvVar"] as? Bool, false)
-        XCTAssertEqual(workspaceOn["excludeSlashTmp"] as? Bool, false)
-
-        let fullOn = try policy(mode: .fullAccess, tokenSaver: true)
-        XCTAssertEqual(fullOn["type"] as? String, "dangerFullAccess")
-        XCTAssertNil(fullOn["networkAccess"])
-        XCTAssertEqual(fullOn.count, 1)
+            let full = try policy(mode: .fullAccess, legacyHint: legacyHint)
+            XCTAssertEqual(full["type"] as? String, "dangerFullAccess")
+            XCTAssertNil(full["networkAccess"])
+            XCTAssertEqual(full.count, 1)
+        }
     }
 
     func test_turnStartParams_textInputIncludesEmptyTextElements() throws {
@@ -986,77 +863,25 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                        "must refuse attestation opt-in so Codex does not send attestation/generate")
     }
 
-    func test_tokenSaverHint_drivesFullDistillSpecInDeveloperInstructions() async throws {
-        let script = try makeFakeAppServerPeer()
-        let client = try CodexAppServerClient(
-            binary: script,
-            arguments: [],
-            cwd: FileManager.default.temporaryDirectory.path
-        )
-        defer { client.stop() }
-        _ = try await client.initialize()
-
-        // WHY: Distill is paid (Token Saver). Instructions carry language + `| distill`
-        // only when RC_TOKEN_SAVER_DISTILL_HINT=1 — never via ~/.codex/skills.
-        let withHintRequest = AgentRunRequest(
-            threadId: AgentThreadID(),
-            provider: .codex,
-            model: "gpt-5.5",
-            cwd: "/tmp/remotecode-app-server-test",
-            prompt: "explore",
-            environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
-        )
-        _ = try await client.startTurn(
-            providerThreadId: "thread-app-server-1",
-            for: withHintRequest
-        )
-        let hintInstructions = try XCTUnwrap(
-            CodexAppServerClient.threadStartParams(for: withHintRequest)["developerInstructions"] as? String
-        )
-        XCTAssertTrue(
-            hintInstructions.contains("| distill"),
-            "Token Saver on: Codex developer_instructions must instruct `| distill`"
-        )
-        // The tool-output hint must stay separate from the conversation wire ABI.
-        XCTAssertTrue(
-            !hintInstructions.contains("RCW1"),
-            "the output-distill hint alone must not teach the conversation wire protocol"
-        )
-        XCTAssertEqual(
-            hintInstructions.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
-            1,
-            "Codex receives the versioned Token Saver safety ABI exactly once"
-        )
-        XCTAssertEqual(
-            (AgentSkillInstaller.distillAgentInstructionsTemplate + "\n\n" + hintInstructions)
-                .components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
-            1,
-            "Codex effective disk plus runtime context receives the safety ABI exactly once"
-        )
-
-        // Token Saver off → base mode instructions only, no Distill.
-        let withoutHintRequest = AgentRunRequest(
-            threadId: AgentThreadID(),
-            provider: .codex,
-            model: "gpt-5.5",
-            cwd: "/tmp/remotecode-app-server-test",
-            prompt: "explore"
-        )
-        _ = try await client.startTurn(
-            providerThreadId: "thread-app-server-1",
-            for: withoutHintRequest
-        )
-        let emptyEnvInstructions = try XCTUnwrap(
-            CodexAppServerClient.threadStartParams(for: withoutHintRequest)["developerInstructions"] as? String
-        )
-        XCTAssertFalse(
-            emptyEnvInstructions.contains("| distill"),
-            "Token Saver off must not inject Distill into Codex"
-        )
-        XCTAssertFalse(
-            emptyEnvInstructions.contains(TokenSaverProviderSafetyABI.block),
-            "Token Saver off must not inject safety ABI"
-        )
+    func test_legacyTokenSaverHint_neverAddsDistillToDeveloperInstructions() throws {
+        // WHY: Token Saver was removed. A hint an older build left in the
+        // environment must not bring back the `| distill` rules or the safety ABI.
+        for environment in [[:], ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]] {
+            let request = AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-test",
+                prompt: "explore",
+                environment: environment
+            )
+            let instructions = try XCTUnwrap(
+                CodexAppServerClient.threadStartParams(for: request)["developerInstructions"] as? String
+            )
+            XCTAssertFalse(instructions.contains("| distill"), "no Distill rule may reach Codex")
+            XCTAssertFalse(instructions.contains("TOKEN_SAVER_SAFETY_ABI"), "no Token Saver safety ABI may reach Codex")
+            XCTAssertFalse(instructions.contains("RCW1"), "no conversation wire protocol may reach Codex")
+        }
     }
 
     func test_developerInstructions_includeBackgroundAwaitDirectiveNotClaudeMCP() async throws {

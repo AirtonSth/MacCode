@@ -138,7 +138,7 @@ final class AccountUsageSidebarTests: XCTestCase {
     func test_emptyUsageSnapshot_includesEveryListedProvider() {
         // WHY: empty state must reserve a row for each provider before its first
         // run or account-usage refresh.
-        let providers = Set(TokenSaverUsageSnapshot.empty().providers.map(\.provider))
+        let providers = Set(ProviderUsageSnapshot.empty().providers.map(\.provider))
         for provider in AccountUsageDisplay.providers {
             XCTAssertTrue(providers.contains(provider), "missing \(provider)")
         }

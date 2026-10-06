@@ -226,7 +226,6 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     /// with continuous app-server activity can run long, while wedged deferrals
     /// still release (and unblock follow-up sends).
     private let pendingFinishInactivityTimeout: TimeInterval
-    public var contextSeedPreparer: TokenSaverContextSeedPreparing?
     public var contextSeedReceipts: TokenSaverContextSelectionReceiptRepository?
     private var appliedContextSeeds: Set<String> = []
 
@@ -286,8 +285,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 runAsUser: request.runAsUser,
                 askpassPath: askpass,
                 notificationHandler: notificationHandler,
-                serverRequestHandler: serverRequestHandler,
-                tokenSaverCensusAllowed: request.runAsUser?.uid == nil || request.runAsUser?.uid == getuid()
+                serverRequestHandler: serverRequestHandler
             )
         }
     }
@@ -1114,7 +1112,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         )) == true {
             return request
         }
-        let preparer = contextSeedPreparer ?? TokenSaverHumanContextSeedPreparer()
+        let preparer = TokenSaverHumanContextSeedPreparer()
         guard let prepared = await preparer.prepare(
             snapshot: snapshot,
             request: request,

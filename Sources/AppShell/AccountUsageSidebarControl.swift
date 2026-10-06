@@ -163,7 +163,7 @@ struct AccountUsageSidebarControl: View {
 
     private func providerRow(_ provider: AgentProvider) -> some View {
         let usage = vm.accountUsageSnapshot.providers.first { $0.provider == provider }
-            ?? TokenSaverProviderUsage(provider: provider)
+            ?? ProviderTokenUsage(provider: provider)
         return VStack(alignment: .leading, spacing: 2) {
             Text(AccountUsageDisplay.providerTitle(provider))
                 .font(DS.Font.captionStrong)

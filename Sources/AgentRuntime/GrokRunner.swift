@@ -97,15 +97,8 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
     }
 
     /// Builds `grok` argv for a one-shot headless turn. Pure + static for tests.
-    ///
-    /// Token Saver compresses Grok tool output on two lanes: PATH wrappers /
-    /// PreToolUse `| distill` rewrite for `run_terminal_command`, and the managed
-    /// PostToolUse `updatedToolOutput` hook for built-in `read_file` / `list_dir` /
-    /// `web_fetch` results (see `AgentSkillInstaller.installGrokPostToolUseHook`).
-    /// Grok ≥ 1.0.34 delivers a settings-file hook's replacement after validating
-    /// it against the ran tool's own output shape.
     public static func buildArgs(_ request: AgentRunRequest, newSessionId: String? = nil) -> [String] {
-        let providerPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
+        let providerPrompt = AgentSkillInstaller.nestedAgentProviderPrompt(
             request.providerPrompt,
             environment: request.environment
         )

@@ -39,7 +39,7 @@ final class AccountUsageLocalSignalTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: appSupport) }
         await viewModel.reloadAccountUsageAndWait()
 
-        _ = try TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).record(
+        _ = try ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).record(
             provider: .grok,
             actualProviderTokens: 321,
             estimatedRawTokens: 321,
@@ -131,7 +131,7 @@ final class AccountUsageLocalSignalTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: appSupport) }
         await viewModel.reloadAccountUsageAndWait()
 
-        _ = try TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).recordAccountUsage(
+        _ = try ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).recordAccountUsage(
             provider: .claude,
             weeklyUsedPercent: 27
         )

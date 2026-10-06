@@ -3,11 +3,11 @@ import XCTest
 import CoreModel
 
 /// Token Saver empty snapshot must reserve a slot for every managed agent provider.
-final class TokenSaverUsageSnapshotTests: XCTestCase {
+final class ProviderUsageSnapshotTests: XCTestCase {
     func test_emptySnapshotIncludesGrokProviderSlot() {
         // WHY: Grok has a purple usage ring in the Token Saver card. Without a
         // reserved provider row, the UI only appears after the first Grok run.
-        let providers = Set(TokenSaverUsageSnapshot.empty().providers.map(\.provider))
+        let providers = Set(ProviderUsageSnapshot.empty().providers.map(\.provider))
         XCTAssertTrue(providers.contains(.grok),
                       "empty usage snapshot must include .grok for the purple Token Saver ring")
         XCTAssertTrue(providers.contains(.claude))
@@ -17,11 +17,11 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
     func test_ensuringManagedProviders_addsMissingGrokToLegacySnapshot() {
         // WHY: usage.json written before Grok support only has claude/codex;
         // load must backfill Grok so the UI never treats it as absent.
-        let legacy = TokenSaverUsageSnapshot(period: .sevenDays, providers: [
-            TokenSaverProviderUsage(provider: .claude, actualProviderTokens: 10, weeklyUsedPercent: 50),
-            TokenSaverProviderUsage(provider: .codex, actualProviderTokens: 20, weeklyUsedPercent: 30)
+        let legacy = ProviderUsageSnapshot(period: .sevenDays, providers: [
+            ProviderTokenUsage(provider: .claude, actualProviderTokens: 10, weeklyUsedPercent: 50),
+            ProviderTokenUsage(provider: .codex, actualProviderTokens: 20, weeklyUsedPercent: 30)
         ])
-        let fixed = TokenSaverUsageStore.ensuringManagedProviders(legacy)
+        let fixed = ProviderUsageStore.ensuringManagedProviders(legacy)
         let byProvider = Dictionary(uniqueKeysWithValues: fixed.providers.map { ($0.provider, $0) })
         XCTAssertNotNil(byProvider[.grok], "legacy snapshots must gain a Grok row")
         XCTAssertEqual(byProvider[.claude]?.actualProviderTokens, 10,
@@ -34,7 +34,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
     func test_effectiveWeeklyUsedPercent_expiresWhenResetIsPast() {
         let now = Date(timeIntervalSince1970: 2_000_000)
         XCTAssertEqual(
-            TokenSaverProviderUsage.effectiveWeeklyUsedPercent(
+            ProviderTokenUsage.effectiveWeeklyUsedPercent(
                 weeklyUsedPercent: 45,
                 weeklyResetsAt: Date(timeIntervalSince1970: 1_999_000),
                 now: now
@@ -43,7 +43,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
             "a past weekly reset must read as 0% so the ring cannot stay locked mid-window"
         )
         XCTAssertEqual(
-            TokenSaverProviderUsage.effectiveWeeklyUsedPercent(
+            ProviderTokenUsage.effectiveWeeklyUsedPercent(
                 weeklyUsedPercent: 45,
                 weeklyResetsAt: Date(timeIntervalSince1970: 2_100_000),
                 now: now
@@ -54,13 +54,13 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
     }
 
     func test_providersMissingFromAccountUsageRefresh_listsInactiveProviders() {
-        let missing = TokenSaverUsageStore.providersMissingFromAccountUsageRefresh(
+        let missing = ProviderUsageStore.providersMissingFromAccountUsageRefresh(
             returned: [.codex, .grok]
         )
         XCTAssertEqual(missing, [.claude],
                        "Claude omitted from a partial refresh must be cleared as inactive")
         XCTAssertTrue(
-            TokenSaverUsageStore.providersMissingFromAccountUsageRefresh(returned: []).isEmpty == false,
+            ProviderUsageStore.providersMissingFromAccountUsageRefresh(returned: []).isEmpty == false,
             "empty returned set marks all managed providers missing (caller must not clear on full timeout)"
         )
     }
@@ -71,18 +71,18 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
     func test_providersToClearAfterPartialRefresh_keepsUnexpiredGrokWindow() {
         let now = Date(timeIntervalSince1970: 2_000_000)
         let existing = [
-            TokenSaverProviderUsage(
+            ProviderTokenUsage(
                 provider: .grok,
                 weeklyUsedPercent: 65,
                 weeklyResetsAt: Date(timeIntervalSince1970: 2_500_000)
             ),
-            TokenSaverProviderUsage(
+            ProviderTokenUsage(
                 provider: .claude,
                 weeklyUsedPercent: 45,
                 weeklyResetsAt: nil
             )
         ]
-        let toClear = TokenSaverUsageStore.providersToClearAfterPartialAccountUsageRefresh(
+        let toClear = ProviderUsageStore.providersToClearAfterPartialAccountUsageRefresh(
             returned: [.codex],
             existing: existing,
             now: now
@@ -96,13 +96,13 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
     func test_providersToClearAfterPartialRefresh_clearsExpiredGrokWindow() {
         let now = Date(timeIntervalSince1970: 2_000_000)
         let existing = [
-            TokenSaverProviderUsage(
+            ProviderTokenUsage(
                 provider: .grok,
                 weeklyUsedPercent: 65,
                 weeklyResetsAt: Date(timeIntervalSince1970: 1_500_000)
             )
         ]
-        let toClear = TokenSaverUsageStore.providersToClearAfterPartialAccountUsageRefresh(
+        let toClear = ProviderUsageStore.providersToClearAfterPartialAccountUsageRefresh(
             returned: [.codex],
             existing: existing,
             now: now
@@ -117,7 +117,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        let store = TokenSaverUsageStore(appSupportDirectory: dir)
+        let store = ProviderUsageStore(appSupportDirectory: dir)
         _ = try store.record(
             provider: .claude,
             actualProviderTokens: 1_000,
@@ -139,19 +139,19 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
 
     func test_expiringStaleWeeklyUsage_zerosPastWindows() {
         let now = Date(timeIntervalSince1970: 5_000)
-        let snap = TokenSaverUsageSnapshot(period: .sevenDays, providers: [
-            TokenSaverProviderUsage(
+        let snap = ProviderUsageSnapshot(period: .sevenDays, providers: [
+            ProviderTokenUsage(
                 provider: .claude,
                 weeklyUsedPercent: 45,
                 weeklyResetsAt: Date(timeIntervalSince1970: 4_000)
             ),
-            TokenSaverProviderUsage(
+            ProviderTokenUsage(
                 provider: .codex,
                 weeklyUsedPercent: 23,
                 weeklyResetsAt: Date(timeIntervalSince1970: 6_000)
             )
         ])
-        let fixed = TokenSaverUsageStore.expiringStaleWeeklyUsage(snap, now: now)
+        let fixed = ProviderUsageStore.expiringStaleWeeklyUsage(snap, now: now)
         let by = Dictionary(uniqueKeysWithValues: fixed.providers.map { ($0.provider, $0) })
         XCTAssertEqual(by[.claude]?.weeklyUsedPercent, 0)
         XCTAssertEqual(by[.codex]?.weeklyUsedPercent, 23)
@@ -166,7 +166,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let fixedNow = Date(timeIntervalSince1970: 1_784_000_000)
-        let store = TokenSaverUsageStore(
+        let store = ProviderUsageStore(
             appSupportDirectory: dir,
             calendar: Calendar(identifier: .gregorian),
             now: { fixedNow }
@@ -190,14 +190,6 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         let day = try XCTUnwrap(store.load().daily.first)
         XCTAssertEqual(day.actualProviderTokens, 10_000)
         XCTAssertEqual(day.actualProviderBilledTokenUnits ?? -1, 1_250, accuracy: 0.001)
-        XCTAssertEqual(
-            TokenSaverBareUserEstimator.todayProviderBilledTokenUnits(
-                daily: store.load().daily,
-                now: fixedNow
-            ) ?? -1,
-            1_250,
-            accuracy: 0.001
-        )
     }
 
     func test_record_unknownBilledContribution_makesDayBilledNil() throws {
@@ -209,7 +201,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let fixedNow = Date(timeIntervalSince1970: 1_784_000_000)
-        let store = TokenSaverUsageStore(
+        let store = ProviderUsageStore(
             appSupportDirectory: dir,
             calendar: Calendar(identifier: .gregorian),
             now: { fixedNow }
@@ -231,18 +223,12 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         let day = try XCTUnwrap(store.load().daily.first)
         XCTAssertEqual(day.actualProviderTokens, 10_000)
         XCTAssertNil(day.actualProviderBilledTokenUnits)
-        XCTAssertNil(
-            TokenSaverBareUserEstimator.todayProviderBilledTokenUnits(
-                daily: store.load().daily,
-                now: fixedNow
-            )
-        )
     }
 
     func test_dayUsage_decodeMissingBilledKey_yieldsNilNotRaw() throws {
         // WHY: historical usage.json without the billed key must stay UNKNOWN
         // (nil), never decode as raw-derived billed and silently re-inflate.
-        let seed = TokenSaverDayUsage(
+        let seed = ProviderDayUsage(
             dayStart: Date(timeIntervalSince1970: 1_784_000_000),
             actualProviderTokens: 8_000,
             estimatedRawTokens: 8_000,
@@ -253,7 +239,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         object.removeValue(forKey: "actualProviderBilledTokenUnits")
         let stripped = try JSONSerialization.data(withJSONObject: object)
-        let decoded = try JSONDecoder().decode(TokenSaverDayUsage.self, from: stripped)
+        let decoded = try JSONDecoder().decode(ProviderDayUsage.self, from: stripped)
         XCTAssertEqual(decoded.actualProviderTokens, 8_000)
         XCTAssertNil(
             decoded.actualProviderBilledTokenUnits,
@@ -267,7 +253,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
     func test_effectiveSessionUsedPercent_ignoresBareZeroWithoutLiveWindow() {
         let now = Date(timeIntervalSince1970: 2_000_000)
         XCTAssertNil(
-            TokenSaverProviderUsage.effectiveSessionUsedPercent(
+            ProviderTokenUsage.effectiveSessionUsedPercent(
                 currentSessionUsedPercent: 0,
                 currentSessionResetsAt: nil,
                 now: now
@@ -275,7 +261,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
             "bare 0 without a session reset window must not paint Today as 0% used"
         )
         XCTAssertNil(
-            TokenSaverProviderUsage.effectiveSessionUsedPercent(
+            ProviderTokenUsage.effectiveSessionUsedPercent(
                 currentSessionUsedPercent: 0,
                 currentSessionResetsAt: Date(timeIntervalSince1970: 1_500_000),
                 now: now
@@ -283,7 +269,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
             "expired session window must not keep a frozen 0%"
         )
         XCTAssertEqual(
-            TokenSaverProviderUsage.effectiveSessionUsedPercent(
+            ProviderTokenUsage.effectiveSessionUsedPercent(
                 currentSessionUsedPercent: 0,
                 currentSessionResetsAt: Date(timeIntervalSince1970: 2_500_000),
                 now: now
@@ -292,7 +278,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
             "true mid-window 0% with a future reset must still display as 0%"
         )
         XCTAssertEqual(
-            TokenSaverProviderUsage.effectiveSessionUsedPercent(
+            ProviderTokenUsage.effectiveSessionUsedPercent(
                 currentSessionUsedPercent: 37,
                 currentSessionResetsAt: nil,
                 now: now
@@ -305,12 +291,12 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
     func test_providerBilledProvenance_roundTripPreservesUnknownAndMeasured() throws {
         // WHY: the stored raw-token fallback must not become a provider-billed
         // measurement merely because JSONEncoder wrote its numeric value.
-        let unknown = TokenSaverProviderUsage(
+        let unknown = ProviderTokenUsage(
             provider: .claude,
             actualProviderTokens: 1_000,
             estimatedRawTokens: 1_200
         )
-        let measured = TokenSaverProviderUsage(
+        let measured = ProviderTokenUsage(
             provider: .codex,
             actualProviderTokens: 1_000,
             estimatedRawTokens: 1_200,
@@ -329,7 +315,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         )
 
         let decoded = try JSONDecoder().decode(
-            [TokenSaverProviderUsage].self,
+            [ProviderTokenUsage].self,
             from: encoded
         )
 
@@ -363,7 +349,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         """
 
         let decoded = try JSONDecoder().decode(
-            TokenSaverProviderUsage.self,
+            ProviderTokenUsage.self,
             from: Data(legacy.utf8)
         )
 
@@ -383,7 +369,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
-        let store = TokenSaverUsageStore(appSupportDirectory: directory)
+        let store = ProviderUsageStore(appSupportDirectory: directory)
         _ = try store.recordAccountUsage(provider: .grok, weeklyUsedPercent: 12)
         let accountOnly = try XCTUnwrap(store.load().providers.first { $0.provider == .grok })
         XCTAssertNil(
@@ -465,7 +451,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
-        let store = TokenSaverUsageStore(appSupportDirectory: directory)
+        let store = ProviderUsageStore(appSupportDirectory: directory)
         let file = directory
             .appendingPathComponent("TokenSaver", isDirectory: true)
             .appendingPathComponent("usage.json", isDirectory: false)
@@ -538,7 +524,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
-        let store = TokenSaverUsageStore(appSupportDirectory: directory)
+        let store = ProviderUsageStore(appSupportDirectory: directory)
         let file = directory
             .appendingPathComponent("TokenSaver", isDirectory: true)
             .appendingPathComponent("usage.json", isDirectory: false)
@@ -578,7 +564,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
-        let store = TokenSaverUsageStore(appSupportDirectory: directory)
+        let store = ProviderUsageStore(appSupportDirectory: directory)
         let file = directory
             .appendingPathComponent("TokenSaver", isDirectory: true)
             .appendingPathComponent("usage.json", isDirectory: false)
@@ -603,7 +589,7 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
-        let store = TokenSaverUsageStore(appSupportDirectory: directory)
+        let store = ProviderUsageStore(appSupportDirectory: directory)
         let file = directory
             .appendingPathComponent("TokenSaver", isDirectory: true)
             .appendingPathComponent("usage.json", isDirectory: false)
@@ -647,9 +633,9 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
-        let store = TokenSaverUsageStore(appSupportDirectory: directory)
-        try store.save(TokenSaverUsageSnapshot(period: .sevenDays, providers: [
-            TokenSaverProviderUsage(
+        let store = ProviderUsageStore(appSupportDirectory: directory)
+        try store.save(ProviderUsageSnapshot(period: .sevenDays, providers: [
+            ProviderTokenUsage(
                 provider: .grok,
                 actualProviderTokens: 10,
                 estimatedRawTokens: 10
@@ -725,19 +711,112 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         XCTAssertEqual(grok.actualProviderTokens, 17)
         XCTAssertEqual(grok.weeklyUsedPercent, 0)
         let usageURL = lockURL.deletingLastPathComponent().appendingPathComponent("usage.json")
-        _ = try JSONDecoder().decode(TokenSaverUsageSnapshot.self, from: Data(contentsOf: usageURL))
+        _ = try JSONDecoder().decode(ProviderUsageSnapshot.self, from: Data(contentsOf: usageURL))
 
         let permissions = try XCTUnwrap(
             FileManager.default.attributesOfItem(atPath: lockURL.path)[.posixPermissions] as? NSNumber
         )
         XCTAssertEqual(permissions.intValue & 0o777, 0o600, "the stable sibling lock must be owner-only")
     }
+
+    // Moved from the deleted TokenSaverInstallTests: the usage.json store backs
+    // the account usage feature, which stays.
+
+    func test_usageStoreAggregatesProviderTokenEventsWithoutRawText() throws {
+        let store = ProviderUsageStore(appSupportDirectory: tempDir())
+
+        _ = try store.record(provider: .claude, actualProviderTokens: 420, estimatedRawTokens: 1_000)
+        let updated = try store.record(provider: .claude, actualProviderTokens: 80, estimatedRawTokens: 120)
+
+        let claude = try XCTUnwrap(updated.providers.first { $0.provider == .claude })
+        XCTAssertEqual(claude.actualProviderTokens, 500)
+    }
+
+    func test_usageStorePersistsCurrentSessionLimitTelemetryWithoutRawText() throws {
+        let store = ProviderUsageStore(appSupportDirectory: tempDir())
+
+        _ = try store.record(
+            provider: .codex,
+            actualProviderTokens: 740,
+            estimatedRawTokens: 1_100,
+            currentSessionTokens: 740,
+            currentSessionLimitTokens: 1_000
+        )
+        let updated = try store.record(
+            provider: .codex,
+            actualProviderTokens: 20,
+            estimatedRawTokens: 40,
+            currentSessionTokens: 120,
+            currentSessionLimitTokens: 1_000
+        )
+
+        let codex = try XCTUnwrap(updated.providers.first { $0.provider == .codex })
+        XCTAssertEqual(codex.currentSessionTokens, 740,
+                       "account usage rings must preserve the highest current-session pressure so the UI can switch at 70%")
+        XCTAssertEqual(codex.currentSessionLimitTokens, 1_000)
+        XCTAssertEqual(store.load().providers.first { $0.provider == .codex }?.currentSessionLimitTokens, 1_000)
+    }
+
+    func test_usageStorePersistsWeeklyAccountLimitPercentagesWithoutRawText() throws {
+        let store = ProviderUsageStore(appSupportDirectory: tempDir())
+
+        _ = try store.record(provider: .claude, actualProviderTokens: 400, estimatedRawTokens: 1_000)
+        let updated = try store.recordAccountUsage(
+            provider: .claude,
+            weeklyUsedPercent: 57,
+            weeklyWindowDurationMinutes: 10_080,
+            weeklyResetsAt: Date().addingTimeInterval(10_080 * 60)
+        )
+
+        let claude = try XCTUnwrap(updated.providers.first { $0.provider == .claude })
+        XCTAssertEqual(claude.actualProviderTokens, 400,
+                       "account usage refresh must not double-count prompt tokens")
+        XCTAssertEqual(claude.weeklyUsedPercent, 57)
+        XCTAssertEqual(claude.weeklyRemainingPercent, 43)
+        XCTAssertEqual(claude.weeklyWindowDurationMinutes, 10_080)
+        XCTAssertEqual(store.load().providers.first { $0.provider == .claude }?.weeklyUsedPercent, 57)
+    }
+
+    func test_usageStoreRecordsSevenDayChartBucketsWithoutRawText() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let clock = UsageTestClock(Date(timeIntervalSince1970: 1_783_036_800))
+        let store = ProviderUsageStore(
+            appSupportDirectory: tempDir(),
+            calendar: calendar,
+            now: { clock.value }
+        )
+
+        _ = try store.record(provider: .claude, actualProviderTokens: 100, estimatedRawTokens: 250)
+        _ = try store.record(provider: .codex, actualProviderTokens: 40, estimatedRawTokens: 100)
+        clock.value = calendar.date(byAdding: .day, value: 1, to: clock.value)!
+        let updated = try store.record(provider: .claude, actualProviderTokens: 80, estimatedRawTokens: 200)
+
+        XCTAssertEqual(updated.daily.count, 2,
+                       "the account usage chart needs real daily buckets, not a text-only aggregate")
+        XCTAssertEqual(updated.daily[0].actualProviderTokens, 140)
+        XCTAssertEqual(updated.daily[1].actualProviderTokens, 80)
+        XCTAssertEqual(store.load().daily, updated.daily)
+    }
+
+    private func tempDir() -> URL {
+        URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("ProviderUsageStore-\(UUID().uuidString)", isDirectory: true)
+    }
+}
+
+private final class UsageTestClock: @unchecked Sendable {
+    var value: Date
+
+    init(_ value: Date) {
+        self.value = value
+    }
 }
 
 private final class UsageMutationResult: @unchecked Sendable {
     private let lock = NSLock()
     private var storedError: Error?
-    private var storedSnapshot: TokenSaverUsageSnapshot?
+    private var storedSnapshot: ProviderUsageSnapshot?
 
     var error: Error? {
         lock.lock()
@@ -745,7 +824,7 @@ private final class UsageMutationResult: @unchecked Sendable {
         return storedError
     }
 
-    var snapshot: TokenSaverUsageSnapshot? {
+    var snapshot: ProviderUsageSnapshot? {
         lock.lock()
         defer { lock.unlock() }
         return storedSnapshot
@@ -757,7 +836,7 @@ private final class UsageMutationResult: @unchecked Sendable {
         lock.unlock()
     }
 
-    func setSnapshot(_ snapshot: TokenSaverUsageSnapshot) {
+    func setSnapshot(_ snapshot: ProviderUsageSnapshot) {
         lock.lock()
         storedSnapshot = snapshot
         lock.unlock()
@@ -809,7 +888,7 @@ private final class ExternalUsageLockHolder {
             process.waitUntilExit()
             try? FileManager.default.removeItem(at: markerDirectory)
             throw NSError(
-                domain: "TokenSaverUsageSnapshotTests.ExternalUsageLockHolder",
+                domain: "ProviderUsageSnapshotTests.ExternalUsageLockHolder",
                 code: Int(process.terminationStatus)
             )
         }

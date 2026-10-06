@@ -187,7 +187,7 @@ final class AccountUsageAppContextTests: XCTestCase {
         context.refreshAccountUsage(reason: "test")
 
         let didPersist = await waitUntil {
-            let snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+            let snapshot = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).load()
             let claude = snapshot.providers.first { $0.provider == .claude }
             let codex = snapshot.providers.first { $0.provider == .codex }
             return claude?.weeklyUsedPercent == 57
@@ -208,7 +208,7 @@ final class AccountUsageAppContextTests: XCTestCase {
     /// partial refresh still succeeds for Codex/Grok.
     func test_appContextClearsMissingProviderAccountUsageOnPartialRefresh() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2AccountUsageClearMissing-" + UUID().uuidString
-        let store = TokenSaverUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
+        let store = ProviderUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
         try FileManager.default.createDirectory(
             at: URL(fileURLWithPath: appSupport).appendingPathComponent("TokenSaver", isDirectory: true),
             withIntermediateDirectories: true
@@ -230,7 +230,7 @@ final class AccountUsageAppContextTests: XCTestCase {
         context.refreshAccountUsage(reason: "test")
 
         let didClear = await waitUntil {
-            let snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+            let snapshot = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).load()
             let claude = snapshot.providers.first { $0.provider == .claude }
             let codex = snapshot.providers.first { $0.provider == .codex }
             let grok = snapshot.providers.first { $0.provider == .grok }
@@ -247,7 +247,7 @@ final class AccountUsageAppContextTests: XCTestCase {
     /// log miss must keep the last live percent until the window expires.
     func test_appContextKeepsUnexpiredGrokPercentWhenMissingFromPartialRefresh() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2AccountUsageKeepGrok-" + UUID().uuidString
-        let store = TokenSaverUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
+        let store = ProviderUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
         try FileManager.default.createDirectory(
             at: URL(fileURLWithPath: appSupport).appendingPathComponent("TokenSaver", isDirectory: true),
             withIntermediateDirectories: true
@@ -274,7 +274,7 @@ final class AccountUsageAppContextTests: XCTestCase {
         context.refreshAccountUsage(reason: "test")
 
         let didKeep = await waitUntil {
-            let snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+            let snapshot = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).load()
             let grok = snapshot.providers.first { $0.provider == .grok }
             let codex = snapshot.providers.first { $0.provider == .codex }
             return grok?.weeklyUsedPercent == 65 && codex?.weeklyUsedPercent == 71
@@ -329,7 +329,7 @@ final class AccountUsageAppContextTests: XCTestCase {
             "a changed percentage must reach usage.json"
         )
         XCTAssertEqual(
-            TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+            ProviderUsageStore(appSupportDirectory: context.appSupportDirectory)
                 .load().providers.first { $0.provider == .claude }?.weeklyUsedPercent,
             58
         )
@@ -398,7 +398,7 @@ final class AccountUsageAppContextTests: XCTestCase {
         // WHY: Grok often finishes before the full refresh. A new timer tick must
         // not orphan the successful full result that proves a Grok miss may clear.
         let appSupport = NSTemporaryDirectory() + "RC2AccountUsageCrossTickUsage-" + UUID().uuidString
-        let store = TokenSaverUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
+        let store = ProviderUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
         try FileManager.default.createDirectory(
             at: URL(fileURLWithPath: appSupport).appendingPathComponent("TokenSaver", isDirectory: true),
             withIntermediateDirectories: true
@@ -449,7 +449,7 @@ final class AccountUsageAppContextTests: XCTestCase {
         // WHY: a second full refresh can start while the first Grok probe is
         // still running. A third tick must not orphan that healthier full result.
         let appSupport = NSTemporaryDirectory() + "RC2AccountUsageCrossTickFull-" + UUID().uuidString
-        let store = TokenSaverUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
+        let store = ProviderUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
         try FileManager.default.createDirectory(
             at: URL(fileURLWithPath: appSupport).appendingPathComponent("TokenSaver", isDirectory: true),
             withIntermediateDirectories: true
@@ -563,7 +563,7 @@ final class AccountUsageAppContextTests: XCTestCase {
 
         context.refreshPeriodicAccountUsage()
         let didFinish = await waitUntil {
-            TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+            ProviderUsageStore(appSupportDirectory: context.appSupportDirectory)
                 .load().providers.first { $0.provider == .codex }?.weeklyUsedPercent == 23
         }
 
@@ -581,7 +581,7 @@ final class AccountUsageAppContextTests: XCTestCase {
         // WHY: omitting the duplicate Grok probe must not make the partial-result
         // cleanup interpret Grok as signed out before the dedicated probe returns.
         let appSupport = NSTemporaryDirectory() + "RC2AccountUsagePeriodicKeepGrok-" + UUID().uuidString
-        let store = TokenSaverUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
+        let store = ProviderUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
         try FileManager.default.createDirectory(
             at: URL(fileURLWithPath: appSupport).appendingPathComponent("TokenSaver", isDirectory: true),
             withIntermediateDirectories: true
@@ -617,7 +617,7 @@ final class AccountUsageAppContextTests: XCTestCase {
         // WHY: a completely empty refresh is noise, not proof Grok signed out.
         // Removing the duplicate probe must preserve that baseline contract.
         let appSupport = NSTemporaryDirectory() + "RC2AccountUsageGrokMissUsage-" + UUID().uuidString
-        let store = TokenSaverUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
+        let store = ProviderUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
         try FileManager.default.createDirectory(
             at: URL(fileURLWithPath: appSupport).appendingPathComponent("TokenSaver", isDirectory: true),
             withIntermediateDirectories: true
@@ -646,7 +646,7 @@ final class AccountUsageAppContextTests: XCTestCase {
         // WHY: when Codex/Claude prove the refresh is healthy but the one Grok
         // probe misses, preserve the old clear-if-no-live-window behavior.
         let appSupport = NSTemporaryDirectory() + "RC2AccountUsageGrokPartialUsage-" + UUID().uuidString
-        let store = TokenSaverUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
+        let store = ProviderUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
         try FileManager.default.createDirectory(
             at: URL(fileURLWithPath: appSupport).appendingPathComponent("TokenSaver", isDirectory: true),
             withIntermediateDirectories: true
@@ -699,7 +699,7 @@ final class AccountUsageAppContextTests: XCTestCase {
         context.refreshGrokAccountUsage(reason: "run_finished")
         try? await Task.sleep(nanoseconds: 250_000_000)
 
-        let usage = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+        let usage = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory)
             .load().providers.first { $0.provider == .grok }
         XCTAssertEqual(usage?.weeklyUsedPercent, 80,
                        "an older periodic response must not overwrite the newer run-finished snapshot")
@@ -727,7 +727,7 @@ final class AccountUsageAppContextTests: XCTestCase {
         context.refreshGrokAccountUsage(reason: "run_finished")
         try? await Task.sleep(nanoseconds: 250_000_000)
 
-        let usage = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory)
+        let usage = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory)
             .load().providers.first { $0.provider == .grok }
         XCTAssertEqual(usage?.weeklyUsedPercent, 80,
                        "an older full-refresh result must not overwrite newer Grok usage")
@@ -756,7 +756,7 @@ final class AccountUsageAppContextTests: XCTestCase {
         context.refreshGrokAccountUsage(reason: "run_finished", billingLogURL: log)
 
         let didPersist = await waitUntil {
-            let snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+            let snapshot = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).load()
             return snapshot.providers.first(where: { $0.provider == .grok })?.weeklyUsedPercent == 61
         }
         XCTAssertTrue(didPersist,
@@ -777,7 +777,7 @@ final class AccountUsageAppContextTests: XCTestCase {
         context.refreshGrokAccountUsage(reason: "run_finished", billingLogURL: log)
         try? await Task.sleep(nanoseconds: 80_000_000)
 
-        let snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+        let snapshot = ProviderUsageStore(appSupportDirectory: context.appSupportDirectory).load()
         XCTAssertNil(snapshot.providers.first(where: { $0.provider == .grok })?.weeklyUsedPercent,
                      "signed-out sessions must not probe or persist Grok billing usage")
     }

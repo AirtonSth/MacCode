@@ -697,11 +697,6 @@ public final class AppContext {
                 .launchReconciliation
             )
         }
-        // The coordinator still picks the provider-bound text (and applies the
-        // Auto orchestration wrapper) only when a prompt hook is installed. The
-        // identity hook keeps that choice exactly as it was before Token Saver
-        // compression was removed.
-        self.coordinator.promptCompressor = { prompt, _, _, _ in prompt }
         self.coordinator.recoveryEnvironmentProvider = { [weak self] provider, threadId in
             guard let self else { return [:] }
             return await MainActor.run {
@@ -718,10 +713,6 @@ public final class AppContext {
                 )
             }
         }
-        // T-003 Wave -1: persisted-history compaction used global raw-hash CCR
-        // markers. Keep the stored event verbatim until scoped capabilities,
-        // durable read-back, lifecycle limits, and an authorized reader ship.
-        self.coordinator.streamPayloadCompactor = nil
         _ = try providerPendingCallbackRepo.markOpenStale(
             reason: "Provider callback state does not survive app restarts or recovered sessions. Restart the turn to continue."
         )
@@ -1890,7 +1881,7 @@ public final class AppContext {
 
     private func recordAccountUsage(_ usage: AssistantAccountUsage) {
         do {
-            _ = try TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).recordAccountUsage(
+            _ = try ProviderUsageStore(appSupportDirectory: appSupportDirectory).recordAccountUsage(
                 provider: usage.provider,
                 weeklyUsedPercent: usage.weeklyUsedPercent,
                 weeklyWindowDurationMinutes: usage.weeklyWindowDurationMinutes,
@@ -1974,9 +1965,9 @@ public final class AppContext {
                 // Full empty/timeout leaves the cache alone — that is noise, not
                 // proof every provider is inactive.
                 if !acceptedUsages.isEmpty {
-                    let store = TokenSaverUsageStore(appSupportDirectory: self.appSupportDirectory)
+                    let store = ProviderUsageStore(appSupportDirectory: self.appSupportDirectory)
                     let existing = store.load().providers
-                    let toClear = TokenSaverUsageStore.providersToClearAfterPartialAccountUsageRefresh(
+                    let toClear = ProviderUsageStore.providersToClearAfterPartialAccountUsageRefresh(
                         returned: acceptedUsages.map(\.provider),
                         existing: existing
                     ).filter { acceptsGrok || $0 != .grok }
@@ -2033,8 +2024,8 @@ public final class AppContext {
               !cycle.grokSucceeded,
               cycle.otherProvidersSucceeded,
               !cycle.reconciledMiss else { return false }
-        let store = TokenSaverUsageStore(appSupportDirectory: appSupportDirectory)
-        let shouldClearGrok = TokenSaverUsageStore.providersToClearAfterPartialAccountUsageRefresh(
+        let store = ProviderUsageStore(appSupportDirectory: appSupportDirectory)
+        let shouldClearGrok = ProviderUsageStore.providersToClearAfterPartialAccountUsageRefresh(
             returned: [],
             existing: store.load().providers,
             managed: [.grok]
@@ -2049,7 +2040,7 @@ public final class AppContext {
 
     private func clearAccountUsagePercentages(_ provider: AgentProvider) {
         do {
-            _ = try TokenSaverUsageStore(appSupportDirectory: appSupportDirectory)
+            _ = try ProviderUsageStore(appSupportDirectory: appSupportDirectory)
                 .clearAccountUsagePercentages(provider: provider)
             // Same non-blocking path as recordAccountUsage — account-
             // usage store mutations must not wait on NotificationCenter observers.
@@ -2411,7 +2402,7 @@ public final class AppContext {
                     try beforeWrite?()
                     // usage.json still carries the old savings columns; the raw
                     // estimate equals the actual count, so nothing is "saved".
-                    _ = try TokenSaverUsageStore(appSupportDirectory: appSupportDir).record(
+                    _ = try ProviderUsageStore(appSupportDirectory: appSupportDir).record(
                         provider: snapshot.provider,
                         actualProviderTokens: snapshot.delta.totalTokens,
                         estimatedRawTokens: snapshot.delta.totalTokens,

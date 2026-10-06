@@ -3997,7 +3997,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
 
         ctx.prepareForApplicationTermination()
 
-        let usage = TokenSaverUsageStore(appSupportDirectory: ctx.appSupportDirectory).load()
+        let usage = ProviderUsageStore(appSupportDirectory: ctx.appSupportDirectory).load()
         XCTAssertEqual(
             usage.providers.first { $0.provider == .claude }?.actualProviderTokens,
             321,

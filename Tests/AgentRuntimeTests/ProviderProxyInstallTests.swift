@@ -440,7 +440,7 @@ final class ProviderProxyInstallTests: XCTestCase {
 
     func test_runtimePromptAlwaysRoutesGenericCrossProviderDelegationThroughAgentApp() {
         let command = "/tmp/managed/remote-code"
-        let prompt = AgentSkillInstaller.tokenSaverProviderPrompt(
+        let prompt = AgentSkillInstaller.nestedAgentProviderPrompt(
             "base",
             environment: [
                 "RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE": "1",
@@ -451,8 +451,8 @@ final class ProviderProxyInstallTests: XCTestCase {
         XCTAssertTrue(prompt.contains("REMOTE_CODE_SUBAGENT_ROUTING_V1"))
         XCTAssertTrue(prompt.contains(command))
         XCTAssertTrue(prompt.contains("agent-app <codex|claude|grok>"))
-        XCTAssertFalse(prompt.contains(TokenSaverProviderSafetyABI.block),
-                       "always-on subagent routing must not enable paid Token Saver lanes")
+        XCTAssertFalse(prompt.contains("TOKEN_SAVER_SAFETY_ABI"),
+                       "subagent routing carries no Token Saver text")
     }
 
     func test_providerProxyInjectsRuntimeIntoAllProvidersWithoutDroppingSkillABI() {
@@ -494,7 +494,10 @@ final class ProviderProxyInstallTests: XCTestCase {
         XCTAssertEqual(Array(codex.prefix(1)), ["--config"])
         for arguments in [grok, claude, codex] {
             XCTAssertTrue(arguments.joined(separator: "\n").contains("REMOTE_CODE_SUBAGENT_ROUTING_V1"))
-            XCTAssertTrue(arguments.joined(separator: "\n").contains("TOKEN_SAVER_SAFETY_ABI_V1"))
+            XCTAssertFalse(arguments.joined(separator: "\n").contains("TOKEN_SAVER_SAFETY_ABI_V1"),
+                           "a leftover Token Saver hint must not bring back the safety ABI")
+            XCTAssertFalse(arguments.joined(separator: "\n").contains("| distill"),
+                           "a leftover Token Saver hint must not bring back the Distill rules")
         }
     }
 

@@ -11,8 +11,8 @@ public enum ProviderAgentAppOutputFormat: String, Sendable, Equatable {
 /// Lossless bridge from a nested provider CLI into `remote-code agent-app`.
 ///
 /// `runtimeProfile` is set only for the closed `sam-grok-worker-v1` ABI. General
-/// nested Claude/Codex/Grok turns omit it so the host Agent App path owns Token
-/// Saver (PATH wrappers, dialect, Claude PostToolUse) like a UI subagent.
+/// nested Claude/Codex/Grok turns omit it so the host Agent App path owns them
+/// like a UI subagent.
 public struct ProviderAgentAppDelegation: Sendable, Equatable {
     public let provider: AgentProvider
     public let promptFile: String
@@ -399,18 +399,11 @@ public enum ProviderProxyPolicy {
         return decoder.append(chunk)
     }
 
-    public static func rawUsageEligibleRuns(
-        tokenSaverAdmitted: Bool,
-        candidate: Int
-    ) -> Int {
-        tokenSaverAdmitted ? max(0, candidate) : 0
-    }
-
     // MARK: - telemetry scope (content-free)
 
-    /// Upgrade the legacy Token Saver thread key into the always-on lifecycle
-    /// key before paid-lane scrubbing. This keeps hierarchy visible when Token
-    /// Saver is disabled without preserving any paid capability.
+    /// Upgrade the legacy Token Saver thread key (an older build may still set
+    /// it, kept for one release) into the always-on lifecycle key before the
+    /// legacy keys are dropped.
     public static func alwaysOnTelemetryEnvironment(
         _ environment: [String: String]
     ) -> [String: String] {
@@ -425,7 +418,7 @@ public enum ProviderProxyPolicy {
     }
 
     /// Thread-scoped Subagents telemetry is present when the host injected the
-    /// always-on scope keys. Token Saver lanes are orthogonal and not required.
+    /// always-on scope keys.
     public static func hasTelemetryScope(environment: [String: String]) -> Bool {
         let thread = (environment["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"]
             ?? environment["RC_TOKEN_SAVER_THREAD_ID"]
@@ -435,29 +428,16 @@ public enum ProviderProxyPolicy {
         return !thread.isEmpty && UUID(uuidString: thread) != nil && AgentProvider(rawValue: provider) != nil
     }
 
-    /// Apply the live host gate to inherited paid-lane variables. The managed
-    /// bin and `RC_REMOTE_CODE_*` routing stay intact because provider proxies
-    /// and explicit Agent App delegation are always-on lifecycle plumbing.
-    public static func paidRuntimeEnvironment(
-        environment: [String: String],
-        tokenSaverRuntimeActive: Bool,
-        graphifyRuntimeActive: Bool
+    /// Drops the variables the removed Token Saver / Graphify / Distill
+    /// compression lanes read. The managed bin and `RC_REMOTE_CODE_*` routing
+    /// stay intact because provider proxies and explicit Agent App delegation
+    /// are always-on lifecycle plumbing.
+    public static func removingLegacyOptimizationKeys(
+        _ environment: [String: String]
     ) -> [String: String] {
         var updated = environment
-        if !tokenSaverRuntimeActive {
-            for key in environment.keys
-            where key.hasPrefix("RC_TOKEN_SAVER_")
-                || key.hasPrefix("RC_DISTILL_")
-                || key.hasPrefix("RC_GRAPHIFY_")
-                || key == "REMOTE_CODE_DISTILL_STATE_PATH" {
-                updated.removeValue(forKey: key)
-            }
-            return updated
-        }
-        if !graphifyRuntimeActive {
-            for key in environment.keys where key.hasPrefix("RC_GRAPHIFY_") {
-                updated.removeValue(forKey: key)
-            }
+        for key in environment.keys where AgentHostEnvironmentMerge.isLegacyOptimizationKey(key) {
+            updated.removeValue(forKey: key)
         }
         return updated
     }
@@ -465,16 +445,11 @@ public enum ProviderProxyPolicy {
     /// Retarget one raw provider process to its recorded external child. This
     /// is what makes a provider that launches another provider form a real
     /// generation chain instead of attributing every descendant to the root.
-    ///
-    /// `tokenSaverEnvironment` must be rebuilt from a host-validated receipt
-    /// for `targetProvider`. When it is absent (or the child was not recorded),
-    /// paid lanes fail open while always-on routing remains.
     public static func childScopedEnvironment(
         environment: [String: String],
         targetProvider: AgentProvider,
         childRunId: String?,
-        childDelegationCapability: String?,
-        tokenSaverEnvironment: [String: String]?
+        childDelegationCapability: String?
     ) -> [String: String] {
         var updated = environment
         updated["REMOTE_CODE_AGENT_PROVIDER"] = targetProvider.rawValue
@@ -488,11 +463,7 @@ public enum ProviderProxyPolicy {
         guard let childRunId,
               UUID(uuidString: childRunId) != nil else {
             updated.removeValue(forKey: "RC_REMOTE_CODE_ROOT_RUN_ID")
-            return paidRuntimeEnvironment(
-                environment: updated,
-                tokenSaverRuntimeActive: false,
-                graphifyRuntimeActive: false
-            )
+            return removingLegacyOptimizationKeys(updated)
         }
 
         updated["RC_REMOTE_CODE_ROOT_RUN_ID"] = childRunId
@@ -503,41 +474,7 @@ public enum ProviderProxyPolicy {
             updated[AgentDelegationCapabilityTransport.environmentKey] =
                 childDelegationCapability
         }
-        guard let tokenSaverEnvironment else {
-            return paidRuntimeEnvironment(
-                environment: updated,
-                tokenSaverRuntimeActive: false,
-                graphifyRuntimeActive: false
-            )
-        }
-        for key in updated.keys where key.hasPrefix("RC_TOKEN_SAVER_") {
-            updated.removeValue(forKey: key)
-        }
-        // Never inherit a parent's lease path implicitly. Every admitted child
-        // receives the host-validated path in tokenSaverEnvironment, regardless
-        // of provider; only the PostToolUse capability itself is Claude-only.
-        updated.removeValue(forKey: "REMOTE_CODE_DISTILL_STATE_PATH")
-        updated.merge(tokenSaverEnvironment) { _, receiptValue in receiptValue }
-        // Root and attempt are deliberately the same external-child identity:
-        // there is one raw provider process and one lifecycle receipt.
-        updated["RC_TOKEN_SAVER_ROOT_RUN_ID"] = childRunId
-        updated["RC_TOKEN_SAVER_ATTEMPT_ID"] = childRunId
-        return updated
-    }
-
-    /// Claude exposes the PostToolUse lane; Codex and Grok do not. Recompute
-    /// this capability at every provider boundary instead of copying the
-    /// parent's provider-specific shape.
-    public static func childPostToolUseCapability(
-        targetProvider: AgentProvider,
-        distillAvailable: Bool
-    ) -> Bool? {
-        switch targetProvider {
-        case .claude:
-            return distillAvailable
-        case .codex, .grok, .distill:
-            return nil
-        }
+        return removingLegacyOptimizationKeys(updated)
     }
 
     // MARK: - raw provider permission ceiling
@@ -1201,10 +1138,9 @@ public enum ProviderProxyPolicy {
     /// Promote a nested shell-launched provider CLI into Agent App when the turn
     /// ABI is agent-shaped and a host-materialized absolute `promptFile` is ready.
     ///
-    /// Fail closed (return nil → raw provider proxy with Token Saver) for:
-    /// administrative subcommands, version/help, relative prompt paths, or
-    /// unknown option shapes. Does not invent Token Saver admission — the host
-    /// Agent App pipeline applies its own receipt.
+    /// Fail closed (return nil → raw provider proxy) for: administrative
+    /// subcommands, version/help, relative prompt paths, or unknown option
+    /// shapes. The host Agent App pipeline applies its own receipt.
     ///
     /// Callers must materialize stdin / inline prompts into `promptFile` first.
     public static func nestedCLIAgentAppDelegation(
@@ -1354,8 +1290,8 @@ public enum ProviderProxyPolicy {
             return false
         }
         // Agent App cannot honor a restricted tool allowlist (`--tools Read,Glob,Grep`
-        // on sam-claude-advisor). Keep those turns on the raw proxy so PostToolUse
-        // still compresses without elevating plan-only advisors to full tools.
+        // on sam-claude-advisor). Keep those turns on the raw proxy so plan-only
+        // advisors are never elevated to full tools.
         if let tools = scan.optionValues["--tools"]?.last
             ?? scan.optionValues["--allowed-tools"]?.last
             ?? scan.optionValues["--allowedTools"]?.last {

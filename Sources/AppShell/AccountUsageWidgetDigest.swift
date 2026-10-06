@@ -62,7 +62,7 @@ public enum AccountUsageWidgetDigest {
     /// percent) so the iOS surfaces can flip scope without another round-trip.
     public static func publish(
         subscribed: Bool,
-        snapshot: TokenSaverUsageSnapshot,
+        snapshot: ProviderUsageSnapshot,
         isRefreshing: Bool,
         updatedAt: Date = Date()
     ) {
@@ -110,7 +110,7 @@ public enum AccountUsageWidgetDigest {
     ) {
         publish(
             subscribed: subscribed,
-            snapshot: TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load(),
+            snapshot: ProviderUsageStore(appSupportDirectory: appSupportDirectory).load(),
             isRefreshing: isRefreshing,
             updatedAt: updatedAt
         )
@@ -178,11 +178,11 @@ public enum AccountUsageWidgetDigest {
     }
 
     private static func provider(
-        from snapshot: TokenSaverUsageSnapshot,
+        from snapshot: ProviderUsageSnapshot,
         _ provider: AgentProvider
-    ) -> TokenSaverProviderUsage {
+    ) -> ProviderTokenUsage {
         snapshot.providers.first { $0.provider == provider }
-            ?? TokenSaverProviderUsage(provider: provider)
+            ?? ProviderTokenUsage(provider: provider)
     }
 
     private static func clampedPercent(_ value: Double) -> Double {
