@@ -356,6 +356,9 @@ public final class AppContext {
     public let tokenSaverProjectDataRepo: TokenSaverProjectDataRepository
     public let tokenSaverAuditEventsRepo: TokenSaverAuditEventRepository
     public let botStore: BotStore
+    /// Host MCP servers for bot agents running inside their Linux guest. Binds
+    /// 127.0.0.1 on the first issued run bearer; stopped at app termination.
+    public let botGuestMCPGateway = BotGuestMCPGateway()
     /// Shared orchestration receipt runtime for the coordinator and every
     /// Agent App surface. Subagent activity must read the same SQLite-backed
     /// receipts that provider launches write.

@@ -624,6 +624,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // barrier above. Drain them before the process exits.
         context?.flushEventPersistence()
         socketServer?.stop()
+        context?.botGuestMCPGateway.stop()
         directAccessSupervisor?.shutdown()
         directAccessSupervisor = nil
         let tailcat = tailcatSupervisor

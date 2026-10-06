@@ -24,33 +24,69 @@ public struct ManagedBotComputerMCP: Sendable {
     }
 
     public func handle(_ line: String) async -> String? {
+        switch respond(to: line) {
+        case .reply(let reply):
+            return reply
+        case .toolResult(let id, let name, let object):
+            var text = encodeJSON(object) ?? "{}"
+            // Screenshot payloads are delivered as an image block; their JSON
+            // envelope must stay verbatim, so only image-free results distill.
+            if let distillToolResult,
+               BotComputerCatalog.distillableToolNames.contains(name),
+               (object["png_base64"] as? String ?? "").isEmpty,
+               let compressed = await distillToolResult(name, text) {
+                text = compressed
+            }
+            return toolReply(id: id, object: object, text: text)
+        }
+    }
+
+    /// `handle` on the caller's thread, without the tool-result distiller. The
+    /// in-app guest gateway calls this from its own threads: every tool here
+    /// blocks on the host's pending-action channel, and that wait must never
+    /// run on Swift's cooperative pool inside the app.
+    public func handleSynchronously(_ line: String) -> String? {
+        switch respond(to: line) {
+        case .reply(let reply):
+            return reply
+        case .toolResult(let id, _, let object):
+            return toolReply(id: id, object: object, text: encodeJSON(object) ?? "{}")
+        }
+    }
+
+    private enum Response {
+        case reply(String?)
+        case toolResult(id: Any?, name: String, object: [String: Any])
+    }
+
+    private func respond(to line: String) -> Response {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               let data = trimmed.data(using: .utf8),
               let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let method = message["method"] as? String else {
-            return nil
+            return .reply(nil)
         }
         let id = message["id"]
         if id == nil || method.hasPrefix("notifications/") {
-            return nil
+            return .reply(nil)
         }
         switch method {
         case "initialize":
-            return reply(id: id, result: [
+            return .reply(reply(id: id, result: [
                 "protocolVersion": "2024-11-05",
                 "capabilities": ["tools": [String: Any]()],
                 "serverInfo": ["name": Self.serverName, "version": "1"],
                 "instructions": "Linux desktop in Docker on 127.0.0.1. Use bot_computer_observe, bot_computer_act, bot_computer_exec, and bot_computer_rebuild. Do not run macos-harness. Do not run host docker.",
-            ])
+            ]))
         case "tools/list":
-            return reply(id: id, result: ["tools": BotComputerCatalog.toolCatalog()])
+            return .reply(reply(id: id, result: ["tools": BotComputerCatalog.toolCatalog()]))
         case "tools/call":
             let params = message["params"] as? [String: Any]
             let name = params?["name"] as? String ?? ""
             let arguments = params?["arguments"] as? [String: Any] ?? [:]
             guard BotComputerCatalog.toolNames.contains(name) else {
-                return errorReply(id: id, code: -32602, message: "unknown tool: \(name)")
+                return .reply(errorReply(id: id, code: -32602, message: "unknown tool: \(name)"))
             }
             do {
                 let store = try storeFactory(environment)
@@ -62,42 +98,37 @@ public struct ManagedBotComputerMCP: Sendable {
                 let object = try service.call(name: name, arguments: arguments)
                 // Host refusal is a normal result carrying the fixed phrase (nothing ran).
                 if let refusal = object["refusal"] as? String {
-                    return reply(id: id, result: [
+                    return .reply(reply(id: id, result: [
                         "content": [["type": "text", "text": refusal]],
                         "isError": false,
-                    ])
+                    ]))
                 }
-                var text = encodeJSON(object) ?? "{}"
-                // Screenshot payloads are delivered as an image block; their JSON
-                // envelope must stay verbatim, so only image-free results distill.
-                if let distillToolResult,
-                   BotComputerCatalog.distillableToolNames.contains(name),
-                   (object["png_base64"] as? String ?? "").isEmpty,
-                   let compressed = await distillToolResult(name, text) {
-                    text = compressed
-                }
-                var content: [[String: Any]] = [
-                    ["type": "text", "text": text]
-                ]
-                if let b64 = object["png_base64"] as? String, !b64.isEmpty {
-                    content.insert(
-                        ["type": "image", "mimeType": "image/png", "data": b64],
-                        at: 0
-                    )
-                }
-                return reply(id: id, result: [
-                    "content": content,
-                    "isError": false,
-                ])
+                return .toolResult(id: id, name: name, object: object)
             } catch {
-                return reply(id: id, result: [
+                return .reply(reply(id: id, result: [
                     "content": [["type": "text", "text": String(describing: error)]],
                     "isError": true,
-                ])
+                ]))
             }
         default:
-            return errorReply(id: id, code: -32601, message: "method not found: \(method)")
+            return .reply(errorReply(id: id, code: -32601, message: "method not found: \(method)"))
         }
+    }
+
+    private func toolReply(id: Any?, object: [String: Any], text: String) -> String? {
+        var content: [[String: Any]] = [
+            ["type": "text", "text": text]
+        ]
+        if let b64 = object["png_base64"] as? String, !b64.isEmpty {
+            content.insert(
+                ["type": "image", "mimeType": "image/png", "data": b64],
+                at: 0
+            )
+        }
+        return reply(id: id, result: [
+            "content": content,
+            "isError": false,
+        ])
     }
 
     private func reply(id: Any?, result: [String: Any]) -> String? {
