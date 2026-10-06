@@ -10,15 +10,35 @@ final class AppLifecycleRecorderTests: XCTestCase {
         return (AppLifecycleRecorder(directory: dir), dir)
     }
 
-    func test_uncleanExitIsDetectableOnNextLaunch() {
-        let (first, dir) = makeRecorder()
-        first.beginRun()
-        // No endRunCleanly: simulates the app vanishing (SIGTERM/SIGKILL/crash)
-        // before applicationWillTerminate could run.
+    /// Starts a real process, records the marker it would have written, then
+    /// kills it without a clean shutdown — the shape of a silent death.
+    private func writeMarkerForKilledProcess(in dir: URL, fileName: String? = nil) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        process.arguments = ["30"]
+        try process.run()
+        let pid = process.processIdentifier
+        let start = try XCTUnwrap(AppLifecycleRecorder.processStartTime(pid: pid))
+        let contents = "pid=\(pid) startedAt=2026-10-05T22:00:00Z procStart=\(start)"
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data(contents.utf8).write(to: dir.appendingPathComponent(fileName ?? "running.\(pid).marker"))
+        kill(pid, SIGKILL)
+        process.waitUntilExit()
+        return contents
+    }
 
-        let next = AppLifecycleRecorder(directory: dir)
-        XCTAssertNotNil(
-            next.consumeStaleRunMarker(),
+    private func markerFiles(in dir: URL) -> [String] {
+        ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+            .filter { $0.hasPrefix("running.") && $0.hasSuffix(".marker") }
+    }
+
+    func test_uncleanExitIsDetectableOnNextLaunch() throws {
+        let (next, dir) = makeRecorder()
+        let dead = try writeMarkerForKilledProcess(in: dir)
+
+        XCTAssertEqual(
+            next.consumeStaleRunMarkers(),
+            [dead],
             "a run that ends without a clean shutdown must leave a forensic marker so the next launch can prove the app died silently — this is the only on-disk evidence when there is no crash report"
         )
     }
@@ -28,10 +48,65 @@ final class AppLifecycleRecorderTests: XCTestCase {
         first.beginRun()
         first.endRunCleanly(reason: "applicationWillTerminate")
 
+        XCTAssertEqual(markerFiles(in: dir), [], "a clean shutdown must remove this run's marker file")
         let next = AppLifecycleRecorder(directory: dir)
-        XCTAssertNil(
-            next.consumeStaleRunMarker(),
+        XCTAssertEqual(
+            next.consumeStaleRunMarkers(),
+            [],
             "a clean applicationWillTerminate must clear the marker so an expected shutdown is not misreported as a silent death"
+        )
+    }
+
+    func test_liveRunMarkerIsNotConsumedByAnotherLaunch() {
+        // S-F8 evidence: a debug build on the same App Support flagged a LIVE
+        // stable run (82210, 60220) as unclean and deleted its marker, so when
+        // 60220 really died with exit(1) the next launch reported nothing.
+        let (live, dir) = makeRecorder()
+        live.beginRun()
+
+        let other = AppLifecycleRecorder(directory: dir)
+        XCTAssertEqual(
+            other.consumeStaleRunMarkers(),
+            [],
+            "a marker whose pid is alive with the same start time belongs to a running app and must not be reported as an unclean exit"
+        )
+        XCTAssertEqual(
+            markerFiles(in: dir),
+            ["running.\(getpid()).marker"],
+            "the live run's marker must stay on disk so its later silent death is still detected"
+        )
+    }
+
+    func test_reusedPidDoesNotHideAnUncleanExit() throws {
+        // The pid is alive (this test process) but it is not the process that
+        // wrote the marker: a different start time means the writer is dead.
+        let (next, dir) = makeRecorder()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let contents = "pid=\(getpid()) startedAt=2020-01-01T00:00:00Z procStart=1.000000"
+        try Data(contents.utf8).write(to: dir.appendingPathComponent("running.\(getpid()).marker"))
+
+        XCTAssertEqual(
+            next.consumeStaleRunMarkers(),
+            [contents],
+            "pid reuse must not make a dead run look alive; liveness needs both kill(pid,0) and a matching start time"
+        )
+    }
+
+    func test_legacyMarkerFromOlderBuildIsStillJudgedByLiveness() throws {
+        let (next, dir) = makeRecorder()
+        let dead = try writeMarkerForKilledProcess(in: dir, fileName: "running.marker")
+        XCTAssertEqual(
+            next.consumeStaleRunMarkers(),
+            [dead],
+            "the single running.marker left by a build before per-pid markers must still be reported when its process is gone"
+        )
+
+        let liveLegacy = "pid=\(getpid()) startedAt=\(AppLifecycleRecorder.timestamp(from: Date()))"
+        try Data(liveLegacy.utf8).write(to: dir.appendingPathComponent("running.marker"))
+        XCTAssertEqual(
+            next.consumeStaleRunMarkers(),
+            [],
+            "a legacy marker written by a still-running older build (no procStart) must not be consumed"
         )
     }
 
@@ -56,14 +131,14 @@ final class AppLifecycleRecorderTests: XCTestCase {
 #endif
     }
 
-    func test_consumingStaleMarkerIsIdempotent() {
-        let (first, dir) = makeRecorder()
-        first.beginRun()
+    func test_consumingStaleMarkerIsIdempotent() throws {
+        let (next, dir) = makeRecorder()
+        _ = try writeMarkerForKilledProcess(in: dir)
 
-        let next = AppLifecycleRecorder(directory: dir)
-        XCTAssertNotNil(next.consumeStaleRunMarker())
-        XCTAssertNil(
-            AppLifecycleRecorder(directory: dir).consumeStaleRunMarker(),
+        XCTAssertEqual(next.consumeStaleRunMarkers().count, 1)
+        XCTAssertEqual(
+            AppLifecycleRecorder(directory: dir).consumeStaleRunMarkers(),
+            [],
             "consuming the stale marker must clear it so the same unclean exit is reported once, not on every subsequent launch"
         )
     }

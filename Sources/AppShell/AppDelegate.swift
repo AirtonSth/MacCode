@@ -812,7 +812,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let directory = AppPaths.appSupportDirectory(for: channel, override: appSupportOverride)
             .appendingPathComponent("diagnostics", isDirectory: true)
         let recorder = AppLifecycleRecorder(directory: directory)
-        if let stale = recorder.consumeStaleRunMarker() {
+        for stale in recorder.consumeStaleRunMarkers() {
             // The previous run never reached applicationWillTerminate: it was
             // killed (SIGTERM/SIGKILL) or died abruptly with no crash report.
             // This is the on-disk evidence for the "app silently vanished" report.
