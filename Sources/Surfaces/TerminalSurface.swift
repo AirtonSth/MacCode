@@ -614,11 +614,23 @@ private final class TerminalReaderWillPublishHook: @unchecked Sendable {
 final class TerminalMemoryBudgetAuthority {
     static let shared = TerminalMemoryBudgetAuthority(maxRetainedBytes: 64 * 1024 * 1024)
 
+    /// What OS memory-pressure relief may do with an owner. Only the normal
+    /// budget (`enforceBudget`) may take an already compacted owner further,
+    /// to dormant; pressure relief stops at the compact stage.
+    enum PressureState {
+        case reclaimable
+        /// A program is running in the foreground. Spared on a warning.
+        case liveForegroundJob
+        /// Already compacted or dormant. Never reclaimed again by pressure.
+        case compacted
+    }
+
     private final class Entry {
         weak var owner: AnyObject?
         let retainedBytes: () -> Int
         let priority: () -> Int
         let reclaim: () -> Void
+        let pressureState: () -> PressureState
         var lastTouched: UInt64
 
         init(
@@ -626,12 +638,14 @@ final class TerminalMemoryBudgetAuthority {
             retainedBytes: @escaping () -> Int,
             priority: @escaping () -> Int,
             reclaim: @escaping () -> Void,
+            pressureState: @escaping () -> PressureState,
             lastTouched: UInt64
         ) {
             self.owner = owner
             self.retainedBytes = retainedBytes
             self.priority = priority
             self.reclaim = reclaim
+            self.pressureState = pressureState
             self.lastTouched = lastTouched
         }
     }
@@ -649,7 +663,8 @@ final class TerminalMemoryBudgetAuthority {
         owner: AnyObject,
         retainedBytes: @escaping () -> Int,
         priority: @escaping () -> Int,
-        reclaim: @escaping () -> Void
+        reclaim: @escaping () -> Void,
+        pressureState: @escaping () -> PressureState = { .reclaimable }
     ) -> UUID {
         purgeReleasedOwners()
         clock &+= 1
@@ -659,6 +674,7 @@ final class TerminalMemoryBudgetAuthority {
             retainedBytes: retainedBytes,
             priority: priority,
             reclaim: reclaim,
+            pressureState: pressureState,
             lastTouched: clock
         )
         return token
@@ -709,12 +725,14 @@ final class TerminalMemoryBudgetAuthority {
 
     /// OS memory-pressure relief. Reclaims owners whose priority is at most
     /// `maxPriority`, least recently used first, until retained bytes are at or
-    /// below `ceiling`. Unlike `enforceBudget`, each owner takes at most one
-    /// reclaim step per call, so a single pressure event compacts a hidden
-    /// terminal once instead of walking it down to dormant. Returns how many
+    /// below `ceiling`. Unlike `enforceBudget`, it only ever takes the compact
+    /// step: owners already compacted are skipped, on this event and on every
+    /// later one, so repeated warnings or criticals never make a hidden
+    /// terminal dormant and blank its mirror. With `spareLiveForegroundJobs`,
+    /// owners running a foreground program are skipped too. Returns how many
     /// owners actually shrank.
     @discardableResult
-    func relieveMemoryPressure(ceiling: Int, maxPriority: Int) -> Int {
+    func relieveMemoryPressure(ceiling: Int, maxPriority: Int, spareLiveForegroundJobs: Bool) -> Int {
         purgeReleasedOwners()
         let candidates = entries.values
             .filter { $0.owner != nil && $0.priority() <= maxPriority }
@@ -723,6 +741,14 @@ final class TerminalMemoryBudgetAuthority {
         for entry in candidates {
             guard retainedBytesForTesting > max(0, ceiling) else { break }
             guard entry.owner != nil else { continue }
+            switch entry.pressureState() {
+            case .compacted:
+                continue
+            case .liveForegroundJob where spareLiveForegroundJobs:
+                continue
+            case .reclaimable, .liveForegroundJob:
+                break
+            }
             let before = max(0, entry.retainedBytes())
             entry.reclaim()
             if max(0, entry.retainedBytes()) < before { reclaimed += 1 }
@@ -1107,6 +1133,11 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         if historyReplayBackpressureActive { return 3 }
         guard isVisible else { return 0 }
         return view.window?.firstResponder === ghosttyView ? 2 : 1
+    }
+
+    private var terminalMemoryPressureState: TerminalMemoryBudgetAuthority.PressureState {
+        if terminalMemoryWasReclaimed || terminalMemoryIsDormant { return .compacted }
+        return foregroundJobAlive ? .liveForegroundJob : .reclaimable
     }
 
     /// Reclaims a terminal according to its visibility. Hidden terminals can
@@ -1954,7 +1985,8 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
             owner: self,
             retainedBytes: { [weak self] in self?.terminalMemoryRetainedBytes ?? 0 },
             priority: { [weak self] in self?.terminalMemoryReclaimPriority ?? 0 },
-            reclaim: { [weak self] in self?.reclaimTerminalMemoryUnderPressure() }
+            reclaim: { [weak self] in self?.reclaimTerminalMemoryUnderPressure() },
+            pressureState: { [weak self] in self?.terminalMemoryPressureState ?? .compacted }
         )
         applyTerminalSize(TerminalViewportGeometry.fallbackSize, sendToPTY: false, force: true)
         replayPersistedHistoryIfNeeded()

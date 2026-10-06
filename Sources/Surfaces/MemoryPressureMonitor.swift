@@ -1,4 +1,5 @@
 import Dispatch
+import Foundation
 
 /// S-F4a: reacts to the OS memory-pressure notifications the app used to
 /// ignore. On a warning or critical event it lowers the process-wide terminal
@@ -6,7 +7,11 @@ import Dispatch
 /// ANSI mirror is compacted and their native Ghostty surface, with its Metal
 /// swapchain, is released until the tab is revealed. Visible and focused
 /// terminals are left to the normal budget so what the user is looking at
-/// never rebuilds under them.
+/// never rebuilds under them. A terminal is compacted at most once: later
+/// events skip it, so pressure never makes a tab dormant. A warning also
+/// spares hidden terminals running a foreground program (TUIs, agent CLIs),
+/// because a released surface answers no terminal queries; only a critical
+/// event releases those.
 ///
 /// NSCache-backed memos (markdown, diff, tool-input) are not touched here:
 /// NSCache already evicts on system memory pressure by itself.
@@ -20,6 +25,7 @@ public final class MemoryPressureMonitor {
     struct Relief: Equatable {
         let ceiling: Int
         let maxPriority: Int
+        let spareLiveForegroundJobs: Bool
     }
 
     /// Hidden terminals have reclaim priority 0 (see
@@ -29,9 +35,9 @@ public final class MemoryPressureMonitor {
     static func relief(for level: Level, budget: Int) -> Relief {
         switch level {
         case .warning:
-            Relief(ceiling: max(0, budget) / 2, maxPriority: hiddenTerminalPriority)
+            Relief(ceiling: max(0, budget) / 2, maxPriority: hiddenTerminalPriority, spareLiveForegroundJobs: true)
         case .critical:
-            Relief(ceiling: 0, maxPriority: hiddenTerminalPriority)
+            Relief(ceiling: 0, maxPriority: hiddenTerminalPriority, spareLiveForegroundJobs: false)
         }
     }
 
@@ -83,15 +89,19 @@ public final class MemoryPressureMonitor {
 
     func handle(_ level: Level) {
         let relief = Self.relief(for: level, budget: authority.maxRetainedBytes)
+        let start = DispatchTime.now().uptimeNanoseconds
         let before = authority.retainedBytesForTesting
         let reclaimed = authority.relieveMemoryPressure(
             ceiling: relief.ceiling,
-            maxPriority: relief.maxPriority
+            maxPriority: relief.maxPriority,
+            spareLiveForegroundJobs: relief.spareLiveForegroundJobs
         )
         let after = authority.retainedBytesForTesting
+        let durationMs = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
         log(
             "memory_pressure level=\(level.rawValue) ceilingBytes=\(relief.ceiling) "
-                + "terminalsReclaimed=\(reclaimed) terminalBytesBefore=\(before) terminalBytesAfter=\(after)"
+                + "terminalsReclaimed=\(reclaimed) terminalBytesBefore=\(before) terminalBytesAfter=\(after) "
+                + "durationMs=\(String(format: "%.1f", durationMs))"
         )
     }
 }
