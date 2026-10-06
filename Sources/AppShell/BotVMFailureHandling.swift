@@ -121,6 +121,8 @@ extension AppCommandRouter {
 }
 
 /// A restart leaves `bash -lc` execs running inside bot containers with no run owning them.
+/// Only `BotGuestLaunchSweep` reaps them, before guest runs are admitted: a guest run's own
+/// tool shells are `bash -lc` too.
 enum BotVMOrphanScan {
     static func orphans(docker: any BotComputerDockerClienting, names: [String]) -> [String] {
         names.filter { name in
@@ -137,23 +139,5 @@ enum BotVMOrphanScan {
             _ = try? docker.exec(name: name, command: ["pkill", "-f", "bash -lc"], user: "root", detach: false)
         }
         return found
-    }
-}
-
-extension AppCommandRouter {
-    /// Scans Docker-desktop bot containers off the main thread; Docker being down is not an error.
-    func scanBotVMOrphansOnLaunch() {
-        guard let store = context?.botStore else { return }
-        let docker = botVMDocker
-        DispatchQueue.global(qos: .utility).async {
-            let bots = (try? store.list()) ?? []
-            let names = bots.compactMap { bot -> String? in
-                guard let revisionID = bot.currentRevisionID,
-                      let revision = (try? store.getRevision(id: revisionID)) ?? nil,
-                      revision.desktopKind == .dockerDesktop else { return nil }
-                return BotComputerGuestSpec.containerName(botID: bot.id)
-            }
-            BotVMOrphanScan.reap(docker: docker, names: names)
-        }
     }
 }

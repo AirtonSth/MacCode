@@ -541,9 +541,20 @@ extension AppContext {
             let sweepDocker: (any BotComputerDockerClienting)? = AppContext.isRunningUnitTests ? nil : docker
             let store = botStore
             DispatchQueue.global(qos: .utility).async {
-                let bots = sweepDocker == nil ? [] : (try? store.list(includeHidden: true, includeDeleted: true)) ?? []
+                var botIDs: [BotID] = []
+                if sweepDocker != nil {
+                    do {
+                        botIDs = try store.list(includeHidden: true, includeDeleted: true).map(\.id)
+                    } catch {
+                        // Fail open: the barrier still opens; a leftover
+                        // agent then ends only by its lease reaper (~50 s).
+                        guestResolverLog.error(
+                            "bot.guest.launch_sweep skipped=bot_list_failed error=\(String(describing: error), privacy: .public)"
+                        )
+                    }
+                }
                 BotGuestLaunchSweep.run(
-                    docker: sweepDocker, appSupport: appSupport, botIDs: bots.map(\.id), barrier: barrier
+                    docker: sweepDocker, appSupport: appSupport, botIDs: botIDs, barrier: barrier
                 )
             }
         }
@@ -586,10 +597,11 @@ extension AppContext {
 /// App launch: no guest run survives a quit, so nothing a previous run left
 /// is live. Quit runs `removeLeftovers` too.
 enum BotGuestLaunchSweep {
-    /// The launch cleanup, blocking: ends leftover in-guest agents, then
-    /// deletes the Mac-side leftovers (sign-in copies, env files, leases),
-    /// then opens `barrier`, so no guest run starts before its bot's
-    /// leftovers are gone and the cleanup never touches a new run.
+    /// The launch cleanup, blocking: ends leftover in-guest agents and stray
+    /// `bash -lc` shells, then deletes the Mac-side leftovers (sign-in
+    /// copies, env files, leases), then opens `barrier`, so no guest run
+    /// starts before its bot's leftovers are gone and the cleanup never
+    /// touches a new run (whose tools run under `bash -lc` too).
     /// `docker` nil skips the in-guest step.
     static func run(
         docker: (any BotComputerDockerClienting)?,
@@ -602,51 +614,91 @@ enum BotGuestLaunchSweep {
         Task { await barrier.open() }
     }
 
-    /// Ends every in-guest agent a crashed or killed session of this app left
-    /// running (`kill-agent --all` as the guest user), in the containers of
-    /// this database's bots, whatever their desktop kind is now. Another app
-    /// sharing the Docker daemon (the installed app beside a debug sandbox)
-    /// has its own bots and its own Application Support, so a container
-    /// counts only when its name and bot label match one of `botIDs` and its
-    /// home is bound from this app's guest home of that bot. Docker down: no
-    /// container runs, so there is nothing to end. Blocking; returns the
-    /// containers swept.
+    /// Ends what a previous session of this app left running in the
+    /// containers of this database's bots, whatever their desktop kind is
+    /// now: in-guest agents (`kill-agent --all` as the guest user, only where
+    /// a run's lease survived, i.e. the app crashed or was killed; quit and
+    /// the previous launch delete them), then `bash -lc` shells whose
+    /// `docker exec` client died with the app (`BotVMOrphanScan`, as root).
+    /// Another app sharing the Docker daemon (the installed app beside a
+    /// debug sandbox) has its own bots and its own Application Support, so a
+    /// container counts only when this app has a guest home for its bot, its
+    /// name and bot label match one of `botIDs`, and its home is bound from
+    /// that guest home. Docker down: no container runs, so there is nothing
+    /// to end. Blocking; returns the containers whose agents were ended.
     @discardableResult
     static func endLeftoverRuns(
         docker: any BotComputerDockerClienting,
         appSupport: URL,
         botIDs: [BotID]
     ) -> [String] {
-        guard !botIDs.isEmpty else { return [] }
+        // No guest home here: no container of this app is bound from it, so
+        // bots that never had a Docker desktop cost no Docker call.
+        let candidates = botIDs.filter {
+            FileManager.default.fileExists(atPath: BotComputerGuestSpec.guestHomeURL(appSupport: appSupport, botID: $0).path)
+        }
+        guard !candidates.isEmpty else { return [] }
         guard (try? docker.info()) != nil else {
             guestResolverLog.info("bot.guest.launch_sweep skipped=docker_unavailable")
             return []
         }
         var swept: [String] = []
-        for botID in botIDs {
+        var reaped = 0
+        var inspectFailures = 0
+        for botID in candidates {
             let name = BotComputerGuestSpec.containerName(botID: botID)
-            guard let container = try? docker.inspect(name: name), container.running,
+            let container: BotComputerContainerInspect
+            do {
+                container = try docker.inspect(name: name)
+            } catch {
+                // Usually a removed container; counted so a failing Docker shows.
+                inspectFailures += 1
+                continue
+            }
+            guard container.running,
                   container.labels[BotComputerGuestSpec.botIDLabelKey] == botID.value.uuidString.lowercased(),
                   let source = container.homeSource,
                   samePath(source, BotComputerGuestSpec.guestHomeURL(appSupport: appSupport, botID: botID).path)
             else { continue }
-            do {
-                _ = try docker.exec(
-                    name: name,
-                    command: [BotComputerGuestSpec.killAgentPath, "--all"],
-                    user: BotComputerGuestSpec.agentUser,
-                    detach: false
-                )
-                swept.append(name)
-            } catch {
-                // A container from before the agent kit has no kill-agent and
-                // no guest runs; a run that survived KILL is left to its
-                // reaper, which ends it once its lease stops changing.
-                guestResolverLog.error("bot.guest.launch_sweep.kill_failed container=\(name, privacy: .public)")
+            if mayHaveLeftoverRuns(appSupport: appSupport, botID: botID) {
+                do {
+                    _ = try docker.exec(
+                        name: name,
+                        command: [BotComputerGuestSpec.killAgentPath, "--all"],
+                        user: BotComputerGuestSpec.agentUser,
+                        detach: false
+                    )
+                    swept.append(name)
+                } catch {
+                    // A run that survived KILL is left to its reaper, which
+                    // ends it once its lease stops changing.
+                    guestResolverLog.error("bot.guest.launch_sweep.kill_failed container=\(name, privacy: .public)")
+                }
             }
+            reaped += BotVMOrphanScan.reap(docker: docker, names: [name]).count
         }
-        guestResolverLog.info("bot.guest.launch_sweep containers=\(swept.count, privacy: .public)")
+        guestResolverLog.info(
+            "bot.guest.launch_sweep containers=\(swept.count, privacy: .public) orphan_shells=\(reaped, privacy: .public) inspect_failed=\(inspectFailures, privacy: .public)"
+        )
         return swept
+    }
+
+    /// Whether an agent a previous session started may still run in
+    /// `botID`'s guest: a lease outlives its run only when the app did not
+    /// end it. A `.rc-runs` that is not a plain folder (the guest owns it and
+    /// may swap it for a symlink) cannot be read safely, so it counts.
+    static func mayHaveLeftoverRuns(appSupport: URL, botID: BotID) -> Bool {
+        let leases = BotComputerGuestSpec.guestHomeURL(appSupport: appSupport, botID: botID)
+            .appendingPathComponent(".rc-runs", isDirectory: true)
+        do {
+            let directory = try PrivateDirectory(leases, create: false)
+            defer { directory.close() }
+            return directory.entries().contains { $0.hasSuffix(".lease") }
+        } catch DistillGuestCredentialError.writeFailed(_, let code) where code == ENOENT {
+            return false
+        } catch {
+            return true
+        }
     }
 
     private static func samePath(_ a: String, _ b: String) -> Bool {

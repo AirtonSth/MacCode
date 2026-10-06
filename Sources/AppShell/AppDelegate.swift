@@ -461,7 +461,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // Off MainActor: process scan + optional SIGTERM grace sleeps must not
         // hitch the first interactive frame after cold launch.
         scheduleOrphanRuntimeSweep(reason: "launch")
-        router?.scanBotVMOrphansOnLaunch()
 
         if let log = context?.eventLog {
             do {
