@@ -42,6 +42,23 @@ final class NativeCrashHandlerSnapshotTests: XCTestCase {
         XCTAssertFalse(after.exceptionPorts.contains { $0.port == port }, "the reporter's port must not survive")
     }
 
+    /// Runs by default (the real-GhosttyKit test below is opt-in): the runtime
+    /// must take the snapshot before ghostty_init and restore it on every path.
+    func testRuntimeInitWrapsGhosttyInitInTheCrashHandlerGuard() throws {
+        let file = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/Surfaces/GhosttyTerminalView.swift")
+        let source = try String(contentsOf: file, encoding: .utf8)
+        let initialize = try XCTUnwrap(source.range(of: "private func initialize() {"))
+        let body = source[initialize.upperBound...]
+        let begin = try XCTUnwrap(body.range(of: "let crashHandlerGuard = GhosttyCrashHandlerGuard.begin()"))
+        let end = try XCTUnwrap(body.range(of: "defer { crashHandlerGuard.end() }"))
+        let ghosttyInit = try XCTUnwrap(body.range(of: "ghostty_init("))
+        XCTAssertLessThan(begin.lowerBound, ghosttyInit.lowerBound, "the snapshot must be taken before Ghostty installs its reporter")
+        XCTAssertLessThan(end.lowerBound, ghosttyInit.lowerBound, "the restore must be deferred so early returns restore too")
+        XCTAssertEqual(source.components(separatedBy: "ghostty_init(").count, 2, "ghostty_init must have exactly one, guarded, call site")
+    }
+
     /// The real GhosttyKit: proves its init replaces the crash handlers (the
     /// premise of the fix) and that the runtime puts them back.
     @MainActor

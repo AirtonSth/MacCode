@@ -826,9 +826,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             appLifecycleLog.fault("app.previous_run_unclean \(stale, privacy: .public)")
             recorder.record("previous_run_ended_uncleanly \(stale)")
         }
+        // The Ghostty folders are shared with Ghostty.app, so a harvested dump
+        // is not necessarily RemoteCode's own crash.
         for file in harvestedGhosttyCrashFiles {
-            appLifecycleLog.fault("app.ghostty_crash_harvested file=\(file.lastPathComponent, privacy: .public)")
-            recorder.record("ghostty_crash_harvested file=\(file.lastPathComponent)")
+            appLifecycleLog.info("app.ghostty_crash_harvested source=shared-ghostty file=\(file.lastPathComponent, privacy: .public)")
+            recorder.record("ghostty_crash_harvested source=shared-ghostty file=\(file.lastPathComponent)")
         }
         recorder.beginRun()
         recorder.installSignalHandlers()
@@ -838,9 +840,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // second or more to query, so it is recorded off the launch path.
         let uncleanRuns = staleMarkers.compactMap { marker in marker.pid.map { ($0, marker.lastAlive) } }
         if !uncleanRuns.isEmpty {
+            let bundleIdentifier = Bundle.main.bundleIdentifier
             DispatchQueue.global(qos: .utility).async {
                 for (pid, lastAlive) in uncleanRuns {
-                    recorder.record(PreviousRunExitStatus.lifecycleLine(pid: pid, lastAlive: lastAlive))
+                    recorder.record(PreviousRunExitStatus.lifecycleLine(
+                        pid: pid,
+                        lastAlive: lastAlive,
+                        bundleIdentifier: bundleIdentifier
+                    ))
                 }
             }
         }
