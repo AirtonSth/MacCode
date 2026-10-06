@@ -27,12 +27,11 @@ final class CodexAdapterReplacementSeedTests: XCTestCase {
         try context.threadRepo.upsert(thread)
         let run = AgentRun(threadId: thread.id, provider: .codex, model: "test-model", status: .pending)
         try context.runRepo.upsert(run)
-        let snapshot = try XCTUnwrap(TokenSaverCanonicalConversationSnapshot.capture(
+        let snapshot = try XCTUnwrap(ConversationContextSnapshot.capture(
             messages: [
                 AgentMessage(threadId: thread.id, role: .user, content: "prior user"),
                 AgentMessage(threadId: thread.id, role: .assistant, content: "prior assistant"),
             ],
-            persistedRCW1ByMessageId: [:],
             excludingCurrentUserText: "unused"
         ))
         var request = AgentRunRequest(
@@ -50,9 +49,9 @@ final class CodexAdapterReplacementSeedTests: XCTestCase {
         XCTAssertEqual(dest.startedTurns.count, 1)
         XCTAssertNotNil(dest.startedTurns.first?.request.preparedContextSeed)
         XCTAssertEqual(dest.startedTurns.first?.request.prompt, "after settings replace")
-        let receipts = try context.runRepo.contextSelectionReceipts().list(runId: run.id)
+        let receipts = try context.runRepo.contextSeedReceipts().list(runId: run.id)
         XCTAssertFalse(receipts.isEmpty)
-        XCTAssertTrue(receipts.allSatisfy { $0.winner.lifecycle == .delivered })
+        XCTAssertTrue(receipts.allSatisfy { $0.lifecycle == .delivered })
     }
 
     private func makeContext() throws -> AppContext {

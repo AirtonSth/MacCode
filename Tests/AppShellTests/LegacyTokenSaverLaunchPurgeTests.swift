@@ -6,7 +6,7 @@ import Persistence
 @testable import AppShell
 
 /// Token Saver was removed on 2026-10-06. A machine upgraded from a build that
-/// had it ON must come up with it OFF and without the leftovers, while the
+/// had it ON must come up without its settings and leftovers, while the
 /// user's other settings and kept data stay. Every path here is a temp folder.
 @MainActor
 final class LegacyTokenSaverLaunchPurgeTests: XCTestCase {
@@ -20,11 +20,10 @@ final class LegacyTokenSaverLaunchPurgeTests: XCTestCase {
         try Data(text.utf8).write(to: url)
     }
 
-    func test_launchTurnsOffPersistedTokenSaverAndPurgesLegacyInstall() async throws {
-        // WHY: a persisted ON would otherwise keep reading as ON in every
-        // surface that still checks it, the stored API token is a secret for a
-        // feature that no longer exists, and the multi-GB weights and provider
-        // hooks would stay on disk forever.
+    func test_launchDropsPersistedTokenSaverSettingsAndPurgesLegacyInstall() async throws {
+        // WHY: the stored API token is a secret for a feature that no longer
+        // exists, and nothing rewrites the settings blob on its own, so it would
+        // stay on disk; the multi-GB weights and provider hooks would too.
         let appSupport = tempURL("RC2LegacyTSLaunch")
         let home = tempURL("RC2LegacyTSLaunchHome")
         defer {
@@ -32,11 +31,11 @@ final class LegacyTokenSaverLaunchPurgeTests: XCTestCase {
             try? FileManager.default.removeItem(at: home)
         }
         let seed = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
-        SettingsStore(db: seed.db).update {
-            $0.tokenSaverEnabled = true
-            $0.tokenSaverAPIToken = "sk-legacy"
-            $0.terminalFontSize = 15
-        }
+        // The settings blob as a Token Saver build wrote it.
+        try seed.settingsRepo.set(
+            "app_settings",
+            #"{"tokenSaverEnabled":true,"tokenSaverAPIToken":"sk-legacy","graphifyEnabled":true,"terminalFontSize":15}"#
+        )
         let installer = AgentSkillInstaller(homeDirectory: home)
         try installLegacyDistillSkill(installer, for: .codex)
         let weights = appSupport.appendingPathComponent("Distill/Models/m/rev/model.safetensors")
@@ -54,10 +53,12 @@ final class LegacyTokenSaverLaunchPurgeTests: XCTestCase {
         )
         await context.legacyTokenSaverPurgeTask?.value
 
-        let settings = SettingsStore(db: context.db).load()
-        XCTAssertFalse(settings.tokenSaverEnabled, "a persisted ON must come up OFF")
-        XCTAssertEqual(settings.tokenSaverAPIToken, "", "the removed feature's API token must not be kept")
-        XCTAssertEqual(settings.terminalFontSize, 15, "unrelated settings must survive the force-off")
+        let stored = try XCTUnwrap(context.settingsRepo.get("app_settings"))
+        XCTAssertFalse(stored.contains("tokenSaverEnabled"), "the removed feature's switch must not stay on disk")
+        XCTAssertFalse(stored.contains("sk-legacy"), "the removed feature's API token must not be kept")
+        XCTAssertFalse(stored.contains("graphifyEnabled"))
+        XCTAssertEqual(SettingsStore(db: context.db).load().terminalFontSize, 15,
+                       "unrelated settings must survive the cleanup")
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: installer.skillDirectory(provider: .codex, skillID: "distill").path
         ))
@@ -83,7 +84,7 @@ final class LegacyTokenSaverLaunchPurgeTests: XCTestCase {
             appSupportOverride: appSupport.path,
             agentSkillsHomeOverrideForTesting: home
         )
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        try seedLegacyTokenSaverOn(context.settingsRepo)
         PrivateAccountSessionStore(repo: context.settingsRepo).save(PrivateAccountSession(
             accessToken: "tok",
             refreshToken: "ref",
@@ -163,7 +164,7 @@ final class LegacyTokenSaverLaunchPurgeTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: configURLs.claude.path))
 
         let seedContext = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: seedContext.db).save(AppSettings(tokenSaverEnabled: false))
+        try seedContext.settingsRepo.set("app_settings", #"{"tokenSaverEnabled":false}"#)
 
         let launchedContext = try AppContext(
             channel: .debug,

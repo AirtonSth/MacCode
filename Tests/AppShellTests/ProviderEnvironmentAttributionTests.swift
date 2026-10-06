@@ -34,7 +34,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         let router = AppCommandRouter(context: context)
         let workspace = try router.createWorkspace(name: "auto-ts", cwd: NSTemporaryDirectory())
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        try seedLegacyTokenSaverOn(context.settingsRepo)
 
         for provider in [AgentProvider.claude, .codex, .grok] {
             let thread = try admittedThread(in: context, provider: provider)
@@ -102,7 +102,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
                 parentCapability
             )
         )
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        try seedLegacyTokenSaverOn(context.settingsRepo)
 
         let child = try await router.createAgentThreadRouting(
             workspace: workspace.id,
@@ -270,7 +270,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             router.providerEnvironment(provider: .claude, instanceId: nil, threadId: claudeThread.id)["RC_TOKEN_SAVER_POST_TOOL_USE"]
         )
 
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
+        try seedLegacyTokenSaverOn(ctx.settingsRepo)
 
         XCTAssertNil(
             router.providerEnvironment(provider: .codex, instanceId: nil, threadId: codexThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"]
@@ -468,7 +468,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         XCTAssertNil(recovered["RC_TOKEN_SAVER_DISTILL_HINT"])
 
         // A preference an older build left ON must not bring the hint back.
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
+        try seedLegacyTokenSaverOn(ctx.settingsRepo)
         let legacyOn = await recoveryEnvironment(.codex, thread.id)
         let legacyOnPath = try XCTUnwrap(legacyOn["PATH"])
         XCTAssertTrue(legacyOnPath.hasPrefix(managedBin + ":") || legacyOnPath == managedBin)

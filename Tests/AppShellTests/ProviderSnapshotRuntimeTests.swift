@@ -1033,7 +1033,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
 
         let support = root.appendingPathComponent("support", isDirectory: true)
         let ctx = try AppContext(channel: .debug, appSupportOverride: support.path)
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
+        try seedLegacyTokenSaverOn(ctx.settingsRepo)
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
 

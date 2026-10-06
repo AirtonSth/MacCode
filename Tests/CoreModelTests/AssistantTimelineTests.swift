@@ -701,7 +701,7 @@ final class AssistantTimelineTests: XCTestCase {
         // WHY: Work log is a second presentation of tool output. It must hide
         // authenticated protocol metadata without also hiding provider text that
         // merely resembles a receipt.
-        let marker = DistillAppliedReceipt.makeMarker()
+        let marker = "[[rcd:v1.abcdefghijklmnopqrstuv]]"
         let wire = "compressed\n\(marker)"
         var state = AssistantTimelineState()
         state.apply(.itemStarted(item: AssistantItem(

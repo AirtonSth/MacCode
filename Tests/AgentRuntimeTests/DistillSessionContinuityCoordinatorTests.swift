@@ -77,9 +77,8 @@ final class DistillSessionContinuityCoordinatorTests: XCTestCase {
         // 150 messages of ~1 KB: past both RCSEED limits (100 items, 64 KB), so
         // `contextSnapshot` is nil and only the tail can carry the conversation.
         let store = try makeStore(priorMessages: 150)
-        XCTAssertNil(TokenSaverCanonicalConversationSnapshot.capture(
+        XCTAssertNil(ConversationContextSnapshot.capture(
             messages: try store.messageRepo.list(threadId: store.thread.id),
-            persistedRCW1ByMessageId: [:],
             excludingCurrentUserText: nil
         ), "precondition: the RCSEED snapshot gives up on a thread this long")
         store.adapter.script = { _, onEvent in

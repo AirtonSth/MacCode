@@ -114,8 +114,8 @@ public struct AssistantSR1Translation: Codable, Sendable, Equatable {
     }
 }
 
-/// Persisted metadata for an RCW1 request or provider response. The historical
-/// SR1 type remains decode-only so existing transcripts keep rendering.
+/// Decode-only: RCW1 request/response metadata written by Token Saver
+/// (removed). Kept, like the SR1 type, so existing transcripts keep decoding.
 public struct AssistantWireTranslation: Codable, Sendable, Equatable {
     public var itemId: String?
     public var messageId: String?
@@ -130,7 +130,7 @@ public struct AssistantWireTranslation: Codable, Sendable, Equatable {
         messageId: String? = nil,
         originalText: String,
         rewrittenText: String,
-        protocolVersion: String = RCWireProtocol.version,
+        protocolVersion: String = "RCW1",
         fallbackReason: String? = nil,
         wireRequestText: String? = nil
     ) {

@@ -658,7 +658,7 @@ public final class AppContext {
         self.coordinator.terminalTransitionLedger = TerminalTransitionLedger(directory: diagnosticsDir)
         // A fresh Codex session (no resumable thread) is seeded with the prior
         // conversation; its receipts keep a restart from seeding twice.
-        codex.contextSeedReceipts = self.runRepo.contextSelectionReceipts()
+        codex.contextSeedReceipts = self.runRepo.contextSeedReceipts()
         contextReference.value = self
         let guestRunResolver = makeBotGuestRunResolver(hostsGuestRuns: performLaunchRunReconciliation)
         botGuestRunResolver = guestRunResolver
@@ -722,12 +722,12 @@ public final class AppContext {
             reconcileRemoteCodeOrchestrate()
             reconcileComputerUseMCP()
         }
-        // Token Saver was removed. A preference persisted ON by an older build is
-        // turned off (and its API token dropped) before anything reads it. Plain
+        // Token Saver was removed. The settings an older build persisted for it
+        // (its API token among them) are dropped from the stored blob. Plain
         // unit tests keep their seeded settings; sandboxed-home tests and every
-        // real launch, the isolated sandbox included, get the force-off.
+        // real launch, the isolated sandbox included, get the cleanup.
         if !AppContext.isRunningUnitTests || agentSkillsHomeOverrideForTesting != nil {
-            forceLegacyTokenSaverOff()
+            dropLegacyTokenSaverSettings()
         }
         // The legacy purge touches the user's home, so it sits behind the same
         // gate as the always-on installs: skipped under XCTest unless a sandboxed
@@ -821,14 +821,9 @@ public final class AppContext {
                 if let o = outputAppend { p["output_append"] = .string(o) }
                 if let s = summary { p["summary"] = .string(s) }
                 EventBus.shared.publish(kind: .agentItemDelta, payload: .object(p))
-            case .itemHostMetadata(let turnId, let itemId, let distillApplied, _):
-                var p: [String: JSONValue] = [
-                    "thread_id": .string(t),
-                    "turn_id": .string(turnId),
-                    "item_id": .string(itemId),
-                ]
-                if let distillApplied { p["distill_applied"] = .bool(distillApplied) }
-                EventBus.shared.publish(kind: .agentItemDelta, payload: .object(p))
+            case .itemHostMetadata:
+                // Decode-only: never minted since Token Saver was removed.
+                break
             case .itemState(let itemId, let state):
                 if state != .streaming {
                     EventBus.shared.publish(kind: .agentItemCompleted,
@@ -1225,7 +1220,7 @@ public final class AppContext {
 
     /// Settings CLI-path commits replace the live Codex adapter through this owner.
     func replaceCodexProviderAdapter(_ adapter: CodexAppServerAdapter) {
-        adapter.contextSeedReceipts = runRepo.contextSelectionReceipts()
+        adapter.contextSeedReceipts = runRepo.contextSeedReceipts()
         coordinator.replaceProviderAdapter(.codex, adapter: adapter)
     }
 
@@ -1704,16 +1699,10 @@ public final class AppContext {
         return status
     }
 
-    /// Turns off a Token Saver preference persisted by an older build and drops
-    /// the API token it stored. No-op once both are cleared.
-    func forceLegacyTokenSaverOff() {
-        let settingsStore = SettingsStore(db: db)
-        let stored = settingsStore.load()
-        guard stored.tokenSaverEnabled || !stored.tokenSaverAPIToken.isEmpty else { return }
-        settingsStore.update {
-            $0.tokenSaverEnabled = false
-            $0.tokenSaverAPIToken = ""
-        }
+    /// Drops the Token Saver settings an older build persisted, its on switch
+    /// and API token among them. No-op once they are gone.
+    func dropLegacyTokenSaverSettings() {
+        SettingsStore(db: db).dropRemovedLegacyKeys()
     }
 
     /// The launch purge: removes what older builds installed in the user's home

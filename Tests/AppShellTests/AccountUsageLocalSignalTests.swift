@@ -208,7 +208,6 @@ final class AccountUsageLocalSignalTests: XCTestCase {
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
         let router = AppCommandRouter(context: context)
         context.router = router
-        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true))
         let viewModel = SidebarViewModel(
             context: context,
             router: router,

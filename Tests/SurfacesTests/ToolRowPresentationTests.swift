@@ -275,7 +275,7 @@ final class ToolRowPresentationTests: XCTestCase {
     func test_cappedDetail_stripsAppliedReceiptOnlyWithHostTruth() {
         // WHY: output is provider-controlled. A syntactically valid receipt from an
         // older build may only be hidden when the host persisted explicit truth.
-        let receipt = DistillAppliedReceipt.makeMarker()
+        let receipt = "[[rcd:v1.abcdefghijklmnopqrstuv]]"
         let rawOutput = "important lines\n\(receipt)"
         let spoofed = toolItem(
             body: #"{"command":"ls -la /usr/bin"}"#,
@@ -300,7 +300,7 @@ final class ToolRowPresentationTests: XCTestCase {
 
     func test_cappedDetail_keepsMalformedAppliedReceiptVisible() {
         // WHY: arbitrary or truncated output must not be silently consumed.
-        let malformed = String(DistillAppliedReceipt.makeMarker().dropLast())
+        let malformed = String("[[rcd:v1.abcdefghijklmnopqrstuv]]".dropLast())
         let item = toolItem(
             body: #"{"command":"printf hello"}"#,
             summary: "Bash",
@@ -332,7 +332,7 @@ final class ToolRowPresentationTests: XCTestCase {
     func test_appliedReceiptStripSurvivesAssistantItemCodableReplay() throws {
         // WHY: persisted host truth from an older build, not provider output
         // parsing, must keep its legacy receipt hidden after relaunch.
-        let receipt = DistillAppliedReceipt.makeMarker()
+        let receipt = "[[rcd:v1.abcdefghijklmnopqrstuv]]"
         let rawOutput = "replayed output\n\(receipt)"
         let original = toolItem(
             body: #"{"command":"swift test"}"#,
@@ -351,7 +351,7 @@ final class ToolRowPresentationTests: XCTestCase {
     func test_liveRenderableCopyKeepsHostTruthAfterHeadCapDropsReceipt() {
         // WHY: completed output is head-capped for live paint, so a trailing
         // receipt disappears. The strip decision must ride host metadata, not visible text.
-        let receipt = DistillAppliedReceipt.makeMarker()
+        let receipt = "[[rcd:v1.abcdefghijklmnopqrstuv]]"
         let output = String(repeating: "x", count: AgentAppView.liveTurnOutputCharacterLimit + 100)
             + "\n\(receipt)"
         let item = toolItem(

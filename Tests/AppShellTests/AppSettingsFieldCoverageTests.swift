@@ -32,20 +32,7 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
             "insomniaAllowDisplaySleep",
             "insomniaAllowSystemSleepWhenDisplayClosed",
             "insomniaAllowScreenSaverAfter45MinutesOfInactivity",
-            "tokenSaverEnabled",
-            "tokenSaverModelSource",
-            "tokenSaverAPIBaseURL",
-            "tokenSaverAPIModel",
-            "tokenSaverAPIToken",
-            "tokenSaverSaveTrainingPrompts",
             "terminalFontSize",
-            "sessionLearnEnabled",
-            "historyCompactionEnabled",
-            "graphifyEnabled",
-            "graphifyBinaryPath",
-            "graphifyAutoEnsure",
-            "graphifyPinnedRoots",
-            "graphifyWriteInRepo",
             "petEnabled",
             "petAnimationsEnabled",
             "petReadyCounterEnabled",
@@ -157,10 +144,10 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
         let store = SettingsStore(db: ctx.db)
         store.save(AppSettings(
+            diffWordWrap: true,
             sidebarSort: "manual",
             terminalFontSize: 18,
-            sessionLearnEnabled: true,
-            historyCompactionEnabled: true
+            petReduceMotion: true
         ))
 
         let vm = SettingsViewModel(context: ctx)
@@ -168,10 +155,10 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
 
         XCTAssertEqual(vm.appSettings.sidebarSort, "manual",
                        "reload() must restore sidebarSort from the persisted store")
-        XCTAssertTrue(vm.appSettings.sessionLearnEnabled,
-                      "reload() must restore sessionLearnEnabled from the persisted store")
-        XCTAssertTrue(vm.appSettings.historyCompactionEnabled,
-                      "reload() must restore historyCompactionEnabled from the persisted store")
+        XCTAssertTrue(vm.appSettings.diffWordWrap,
+                      "reload() must restore diffWordWrap from the persisted store")
+        XCTAssertTrue(vm.appSettings.petReduceMotion,
+                      "reload() must restore petReduceMotion from the persisted store")
         XCTAssertEqual(vm.appSettings.terminalFontSize, 18,
                        "reload() must restore terminalFontSize from the persisted store")
     }

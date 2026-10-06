@@ -155,19 +155,4 @@ final class AgentRuntimeUXGapTests: XCTestCase {
         XCTAssertTrue(desc.contains("checkpoint"),
                       "Must explain checkpoint so users know context can be restored. got: \(desc)")
     }
-
-    // MARK: - Wire prefix buffering
-
-    /// A pure-whitespace string must NOT be detected as wire.
-    /// If it were, the coordinator would buffer the entire reply and emit it
-    /// all at once at completion, destroying live streaming for normal replies.
-    func test_wireDetector_pureWhitespace_isNotWire() {
-        XCTAssertFalse(RCWireProtocol.isWire("\n"))
-        XCTAssertFalse(RCWireProtocol.isWire("\n\n   \t\n"))
-        XCTAssertFalse(RCWireProtocol.isWire("  "))
-    }
-
-    func test_wireDetector_validRCW1_isDetected() {
-        XCTAssertTrue(RCWireProtocol.isWire("RCW1\tA\t1\nO\tdone\n.\n"))
-    }
 }

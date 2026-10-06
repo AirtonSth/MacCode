@@ -5,14 +5,12 @@ import Foundation
 /// When a shell inside a RemoteCode agent turn runs `grok`, `claude`, or `codex`
 /// by bare name, the managed PATH entry (`~/.remote-code/bin`) resolves to a
 /// RemoteCode-owned proxy that:
-/// - inherits the parent provider environment / Token Saver receipt as-is
+/// - inherits the parent provider environment as-is
 /// - records a content-free Subagents lifecycle receipt (begin → end)
 /// - execs the real provider CLI outside the managed bin (no recursion)
 ///
-/// This is intentionally separate from `WrappedCommandCatalog` (Token Saver
-/// command-output compression). Provider proxies are available whenever a
-/// thread-scoped RemoteCode provider environment is created — not only when
-/// Token Saver optimization is enabled.
+/// Provider proxies are available whenever a thread-scoped RemoteCode provider
+/// environment is created.
 ///
 /// Skills should not need a manual `subagent begin/end` bridge for nested
 /// provider CLI invocations; the global controller owns that lifecycle.

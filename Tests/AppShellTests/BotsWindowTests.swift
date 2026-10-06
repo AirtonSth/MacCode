@@ -7675,7 +7675,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertNil(vm.resolvedProvider(for: bot))
     }
 
-    func test_distillACPBotDeskSendAndReopenUsesPersistedSessionWithTokenSaverOff() async throws {
+    func test_distillACPBotDeskSendAndReopenUsesPersistedSession() async throws {
         // WHY: Bot Desk must run through Distill ACP, preserve the conversation on reopen, and keep compression off.
         let root = URL(fileURLWithPath: directory, isDirectory: true)
             .appendingPathComponent("distill-bot-acp-\(UUID().uuidString)", isDirectory: true)
@@ -7733,7 +7733,6 @@ final class BotsWindowTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: harnessURL.path)
 
         let context = try makeContext()
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = false }
         context.reconcileManagedIntegration()
         let router = AppCommandRouter(context: context)
         context.router = router

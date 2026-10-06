@@ -31,4 +31,27 @@ final class LegacyAssistantEventDecodeTests: XCTestCase {
 
         XCTAssertEqual(decoded, historical)
     }
+
+    func test_storedLegacyEventBytesStillDecodeStrictly() throws {
+        // WHY: rows written by older builds are fixed bytes on disk. Decoding
+        // them as stored, not a fresh round trip, proves the removal kept the
+        // wire shape `agent.thread.read` meets.
+        let stored = [
+            #"{"sr1Translation":{"_0":{"messageId":"m-1","originalText":"O: legacy","rewrittenText":"legacy"}}}"#,
+            #"{"wireTranslation":{"_0":{"itemId":"i-1","originalText":"RCW1","rewrittenText":"legacy","protocolVersion":"RCW1"}}}"#,
+            #"{"itemHostMetadata":{"turnId":"turn-1","itemId":"item-1","distillApplied":true}}"#,
+        ]
+        let decoded = try stored.map { try JSONDecoder().decode(AssistantEvent.self, from: Data($0.utf8)) }
+
+        guard case .sr1Translation(let sr1) = decoded[0] else { return XCTFail("\(decoded[0])") }
+        XCTAssertEqual(sr1.rewrittenText, "legacy")
+        guard case .wireTranslation(let wire) = decoded[1] else { return XCTFail("\(decoded[1])") }
+        XCTAssertEqual(wire.protocolVersion, "RCW1")
+        guard case .itemHostMetadata(let turnId, let itemId, let applied, let attestation) = decoded[2] else {
+            return XCTFail("\(decoded[2])")
+        }
+        XCTAssertEqual([turnId, itemId], ["turn-1", "item-1"])
+        XCTAssertEqual(applied, true)
+        XCTAssertNil(attestation)
+    }
 }

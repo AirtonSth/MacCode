@@ -709,9 +709,9 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     /// value equality; it has no meaning outside the current host process.
     public var acceptancePermit: AgentRunAcceptancePermit?
     /// Canonical prior conversation captured before provider start. Runtime-only.
-    public var contextSnapshot: TokenSaverCanonicalConversationSnapshot?
+    public var contextSnapshot: ConversationContextSnapshot?
     /// Prepared RCSEED1 document for a confirmed fresh-fallback destination.
-    public var preparedContextSeed: TokenSaverPreparedContextSeed?
+    public var preparedContextSeed: PreparedConversationContextSeed?
     /// Main model of the last prompt the persisted provider session
     /// (`providerThreadId`) accepted. Runtime-only. Lets Distill detect a
     /// cross-family Main switch when it must `session/load` that session after
@@ -749,8 +749,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         extraArgs: [String] = [],
         runAsUser: AgentRunAsUser? = nil,
         acceptancePermit: AgentRunAcceptancePermit? = nil,
-        contextSnapshot: TokenSaverCanonicalConversationSnapshot? = nil,
-        preparedContextSeed: TokenSaverPreparedContextSeed? = nil
+        contextSnapshot: ConversationContextSnapshot? = nil,
+        preparedContextSeed: PreparedConversationContextSeed? = nil
     ) {
         self.runId = runId
         self.threadId = threadId
@@ -837,8 +837,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     }
 
     public func attachingContext(
-        snapshot: TokenSaverCanonicalConversationSnapshot? = nil,
-        seed: TokenSaverPreparedContextSeed? = nil
+        snapshot: ConversationContextSnapshot? = nil,
+        seed: PreparedConversationContextSeed? = nil
     ) -> AgentRunRequest {
         var copy = self
         if let snapshot {
@@ -861,9 +861,7 @@ public enum AgentProviderInstructionText {
         """
     }
 
-    /// The base mode instruction Codex receives every turn as `developer_instructions`. The Token
-    /// Saver distill spec is composed on top of this in `CodexAppServerClient` (it owns the full
-    /// distill body, which lives in the AgentRuntime layer); this stays a focused, mode-only base.
+    /// The base mode instruction Codex receives every turn as `developer_instructions`.
     public static func developerInstructions(for mode: AgentInteractionMode) -> String {
         switch mode {
         case .default:

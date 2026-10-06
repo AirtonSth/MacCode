@@ -95,7 +95,7 @@ final class ConversationContextSeedRuntimeTests: XCTestCase {
         try adapter.stopSession(threadId: threadId)
         _ = try await adapter.sendTurn(request) { _ in }
         XCTAssertEqual(destClient.startedTurns.filter { $0.request.preparedContextSeed != nil }.count, 1)
-        XCTAssertEqual(try store.repo.list(runId: request.runId).filter { $0.winner.lifecycle == .delivered }.count, 2)
+        XCTAssertEqual(try store.repo.list(runId: request.runId).filter { $0.lifecycle == .delivered }.count, 2)
     }
 
     func test_providerRejectionLeavesNoDeliveredReceipt() async throws {
@@ -139,8 +139,8 @@ final class ConversationContextSeedRuntimeTests: XCTestCase {
             XCTFail("provider rejection must surface")
         } catch {
             let records = try store.repo.list(runId: request.runId)
-            XCTAssertFalse(records.contains { $0.winner.lifecycle == .delivered })
-            XCTAssertTrue(records.allSatisfy { $0.winner.lifecycle == .notDelivered || $0.winner.lifecycle == .provisional })
+            XCTAssertFalse(records.contains { $0.lifecycle == .delivered })
+            XCTAssertTrue(records.allSatisfy { $0.lifecycle == .notDelivered || $0.lifecycle == .provisional })
         }
     }
 
@@ -201,7 +201,7 @@ final class ConversationContextSeedRuntimeTests: XCTestCase {
             XCTAssertEqual(try AgentThreadRepository(db: store.db).get(id: thread.id)?.providerThreadId, "old-thread")
             XCTAssertEqual(try sessionRepo.get(threadId: thread.id)?.resumeCursor, "old-thread")
             if let startedRunId = dest.startedTurns.first?.request.runId {
-                XCTAssertFalse(try store.repo.list(runId: startedRunId).contains { $0.winner.lifecycle == .delivered })
+                XCTAssertFalse(try store.repo.list(runId: startedRunId).contains { $0.lifecycle == .delivered })
             }
             XCTAssertEqual(dest.startedTurns.count, 1)
             XCTAssertNotNil(dest.startedTurns.first?.request.preparedContextSeed)
@@ -260,7 +260,7 @@ final class ConversationContextSeedRuntimeTests: XCTestCase {
             XCTFail("first seeded startTurn must reject")
         } catch {
             XCTAssertFalse(firstEvents.threadStartedIds.contains("fresh-dest-d1"))
-            XCTAssertFalse(try store.repo.list(runId: request.runId).contains { $0.winner.lifecycle == .delivered })
+            XCTAssertFalse(try store.repo.list(runId: request.runId).contains { $0.lifecycle == .delivered })
         }
 
         let retryEvents = ContextSeedEventLog()
@@ -274,7 +274,7 @@ final class ConversationContextSeedRuntimeTests: XCTestCase {
         XCTAssertFalse(retryEvents.threadStartedIds.contains("fresh-dest-d1"))
         XCTAssertEqual(retryEvents.threadStartedIds, ["fresh-dest-d2"])
         XCTAssertTrue(retryEvents.threadStartedFollowsFirstStartTurn)
-        XCTAssertTrue(try store.repo.list(runId: request.runId).contains { $0.winner.lifecycle == .delivered })
+        XCTAssertTrue(try store.repo.list(runId: request.runId).contains { $0.lifecycle == .delivered })
     }
 
     func test_recoverSessionFallbackDoesNotPublishEmptyDestinationBeforeSeed() async throws {
@@ -315,7 +315,7 @@ final class ConversationContextSeedRuntimeTests: XCTestCase {
         XCTAssertEqual(retryDest.startedTurns.count, 1)
         XCTAssertNotNil(retryDest.startedTurns.first?.request.preparedContextSeed)
         XCTAssertEqual(retryEvents.threadStartedIds, ["recover-retry-d2"])
-        XCTAssertTrue(try store.repo.list(runId: request.runId).allSatisfy { $0.winner.lifecycle == .delivered })
+        XCTAssertTrue(try store.repo.list(runId: request.runId).allSatisfy { $0.lifecycle == .delivered })
     }
 
     func test_successfulResumeAndColdStartKeepExistingEventOrderAndDoNotSeed() async throws {
@@ -448,7 +448,7 @@ final class ConversationContextSeedRuntimeTests: XCTestCase {
             XCTAssertNotNil(rejected.startedTurns.first?.request.preparedContextSeed)
             XCTAssertEqual(rejected.startedTurns.first?.request.prompt, "after notify reject")
             if let startedRunId = rejected.startedTurns.first?.request.runId {
-                XCTAssertFalse(try store.repo.list(runId: startedRunId).contains { $0.winner.lifecycle == .delivered })
+                XCTAssertFalse(try store.repo.list(runId: startedRunId).contains { $0.lifecycle == .delivered })
             }
         }
 
@@ -479,7 +479,7 @@ final class ConversationContextSeedRuntimeTests: XCTestCase {
         XCTAssertEqual(try AgentThreadRepository(db: store.db).get(id: thread.id)?.providerThreadId, "fresh-dest-d2")
         XCTAssertEqual(try sessionRepo.get(threadId: thread.id)?.resumeCursor, "fresh-dest-d2")
         if let retryRunId = accepted.startedTurns.first?.request.runId {
-            XCTAssertTrue(try store.repo.list(runId: retryRunId).contains { $0.winner.lifecycle == .delivered })
+            XCTAssertTrue(try store.repo.list(runId: retryRunId).contains { $0.lifecycle == .delivered })
         }
     }
 
@@ -541,7 +541,7 @@ final class ConversationContextSeedRuntimeTests: XCTestCase {
             XCTAssertEqual(dest.startedTurns.count, 1)
             XCTAssertNotNil(dest.startedTurns.first?.request.preparedContextSeed)
             if let startedRunId = dest.startedTurns.first?.request.runId {
-                XCTAssertFalse(try store.repo.list(runId: startedRunId).contains { $0.winner.lifecycle == .delivered })
+                XCTAssertFalse(try store.repo.list(runId: startedRunId).contains { $0.lifecycle == .delivered })
             }
         }
     }
@@ -617,10 +617,11 @@ final class ConversationContextSeedRuntimeTests: XCTestCase {
         XCTAssertFalse(snapshot.items.contains(where: { $0.canonicalText == "second" }))
     }
 
-    func test_rcw1ArmIsNotDerivedFromRCS1OnRuntimePrepare() async throws {
+    func test_runtimePrepareSendsStoredTextWithOneProvisionalReceiptPerSlot() throws {
+        // WHY: the fresh session must see exactly the stored conversation, and
+        // every slot needs its own receipt so delivery is acknowledged per slot.
         let human = String(repeating: "ABCDEFGH", count: 16)
         let snapshot = try XCTUnwrap(makeSnapshot(user: "q", assistant: human))
-        let preparer = TokenSaverHumanContextSeedPreparer()
         let request = AgentRunRequest(
             threadId: AgentThreadID(),
             provider: .codex,
@@ -628,28 +629,29 @@ final class ConversationContextSeedRuntimeTests: XCTestCase {
             cwd: "/tmp",
             prompt: "now"
         )
-        let preparedOptional = await preparer.prepare(
+        let prepared = try XCTUnwrap(ConversationContextSeedPreparer().prepare(
             snapshot: snapshot,
             request: request,
             destinationProviderThreadId: "dest"
-        )
-        let prepared = try XCTUnwrap(preparedOptional)
-        let rcs1 = RemoteCodeCompactSpan.encode(human)
-        XCTAssertNotEqual(prepared.document.items.last?.format, .rcw1)
-        XCTAssertNotEqual(prepared.document.items.last?.payload, rcs1)
-        let rcw1Arm = prepared.receipts.last?.arm(.rcw1)
-        XCTAssertEqual(rcw1Arm?.eligible, false)
-        XCTAssertNotEqual(rcw1Arm?.producerId, TokenSaverRequestSelectionReceipt.rcs1ProducerID)
+        ))
+        XCTAssertEqual(prepared.document.items.map(\.payload), ["q", human])
+        XCTAssertEqual(prepared.receipts.map(\.role), [.user, .assistant])
+        XCTAssertEqual(prepared.receipts.map(\.ordinal), [0, 1])
+        XCTAssertTrue(prepared.receipts.allSatisfy {
+            $0.lifecycle == .provisional
+                && $0.destinationProviderThreadId == "dest"
+                && $0.snapshotDigest == snapshot.digest
+                && $0.runId == request.runId.value.uuidString
+        })
     }
 
-    private func makeSnapshot(user: String, assistant: String) -> TokenSaverCanonicalConversationSnapshot? {
+    private func makeSnapshot(user: String, assistant: String) -> ConversationContextSnapshot? {
         let thread = AgentThreadID()
-        return TokenSaverCanonicalConversationSnapshot.capture(
+        return ConversationContextSnapshot.capture(
             messages: [
                 AgentMessage(threadId: thread, role: .user, content: user),
                 AgentMessage(threadId: thread, role: .assistant, content: assistant),
             ],
-            persistedRCW1ByMessageId: [:],
             excludingCurrentUserText: "unused"
         )
     }
@@ -679,7 +681,7 @@ final class ConversationContextSeedRuntimeTests: XCTestCase {
 
     private func makeReceiptStore() throws -> (
         db: SQLiteDB,
-        repo: TokenSaverContextSelectionReceiptRepository,
+        repo: ConversationContextSeedReceiptRepository,
         thread: AgentThread,
         run: AgentRun
     ) {
@@ -689,7 +691,7 @@ final class ConversationContextSeedRuntimeTests: XCTestCase {
         try AgentThreadRepository(db: db).upsert(thread)
         let run = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-test", status: .pending)
         try AgentRunRepository(db: db).upsert(run)
-        return (db, TokenSaverContextSelectionReceiptRepository(db: db), thread, run)
+        return (db, ConversationContextSeedReceiptRepository(db: db), thread, run)
     }
 }
 

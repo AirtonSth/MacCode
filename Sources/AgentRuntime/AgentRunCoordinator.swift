@@ -307,11 +307,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         threadId: AgentThreadID,
         excludingCurrentUserText: String,
         excludingCurrentUserMessageId: AgentMessageID? = nil
-    ) throws -> TokenSaverCanonicalConversationSnapshot? {
+    ) throws -> ConversationContextSnapshot? {
         let messages = try messageRepo.list(threadId: threadId)
-        return TokenSaverCanonicalConversationSnapshot.capture(
+        return ConversationContextSnapshot.capture(
             messages: messages,
-            persistedRCW1ByMessageId: [:],
             excludingCurrentUserText: excludingCurrentUserText,
             excludingCurrentUserMessageId: excludingCurrentUserMessageId
         )

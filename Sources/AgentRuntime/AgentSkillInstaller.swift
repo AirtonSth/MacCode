@@ -187,6 +187,26 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     public static let mcpEndMarker = "# RemoteCode managed MCP: end"
     /// The removed librarian MCP's table / server key in the provider configs.
     public static let retrieveMCPName = "remotecode-distill-retrieve"
+    /// Command basenames the removed Token Saver PATH-wrapped in the managed
+    /// bin (compressible commands, then exact-output ones). The purge removes
+    /// any of these links that still point at the service binary.
+    public static let legacyCommandWrapperBasenames: [String] = [
+        "find", "ls",
+        "git", "gh", "glab",
+        "swift", "xcodebuild",
+        "npm", "yarn", "pnpm", "bun", "bunx", "pip", "pip3", "poetry", "bundle", "composer", "gem", "brew",
+        "make", "cmake", "ninja", "gradle", "mvn", "dotnet", "cargo", "go", "rustc", "tsc", "javac",
+        "pytest", "jest", "mocha", "rspec", "phpunit",
+        "eslint", "pylint", "flake8", "rubocop", "swiftlint", "shellcheck", "golangci-lint", "stylelint", "hadolint",
+        "docker", "kubectl", "helm", "terraform", "terragrunt", "pulumi",
+        "curl", "wget", "aws", "gcloud", "az",
+        "python", "python3",
+        "rg", "grep", "egrep", "fgrep", "ag", "ugrep",
+        "sed", "awk", "gawk", "nawk", "cut", "tr", "paste",
+        "cat", "head", "tail", "nl", "tac",
+        "diff", "cmp", "od", "hexdump", "xxd", "base64",
+        "jq", "yq",
+    ]
     public static let computerUseMCPName = ComputerUseMCPAdmit.serverName
     public static let legacyExternalHostSkillID = "macos-harness"
     /// Environment signal set only for a logical Desktop (This Mac) run. It is
@@ -1060,7 +1080,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     ) throws -> [String] {
         let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager)
         let removedCatalog = try removeManagedWrapperSymlinks(
-            basenames: WrappedCommandCatalog.symlinkBasenamesToRemove,
+            basenames: Self.legacyCommandWrapperBasenames,
             binaryURL: binary
         )
         let removedExtras = try pruneUnmanagedManagedBinSymlinks(
@@ -1833,7 +1853,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         // the instance method recoverServiceBinaryFromManagedWrappers).
         let defaultBin = defaultManagedCLIBinDirectory()
         let probeNames = ["claude", "codex", "grok", "git", "npm", "ls", "remote-code"]
-            + WrappedCommandCatalog.commands
+            + legacyCommandWrapperBasenames
         var seen = Set<String>()
         for name in probeNames where seen.insert(name).inserted {
             let link = defaultBin.appendingPathComponent(name)

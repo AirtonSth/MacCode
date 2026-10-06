@@ -5,12 +5,10 @@ import Darwin
 
 final class ProviderProxyPolicyTests: XCTestCase {
     func test_catalogCoversAllThreeProvidersAndNotCompressionCommands() {
-        // WHY: nested provider interception is a separate controller from RTK wrap.
+        // WHY: nested provider interception covers exactly the three provider CLIs.
         for name in ["claude", "codex", "grok"] {
             XCTAssertTrue(ProviderProxyPolicy.isProviderProxy(name))
             XCTAssertTrue(ProviderProxyCatalog.isProviderProxyCommand("/usr/bin/\(name)"))
-            XCTAssertFalse(WrappedCommandCatalog.commands.contains(name))
-            XCTAssertFalse(WrappedCommandCatalog.exactOutputCommandSet.contains(name))
         }
         XCTAssertFalse(ProviderProxyPolicy.isProviderProxy("ls"))
         XCTAssertFalse(ProviderProxyPolicy.isProviderProxy("git"))

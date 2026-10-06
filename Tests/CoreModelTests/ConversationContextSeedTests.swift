@@ -5,50 +5,47 @@ import XCTest
 /// WHY: a fresh Codex destination after failed resume must reconstruct prior
 /// turns from a host-owned seed. A broken codec would either drop role/order
 /// or let a partial document leak into the provider session.
-final class TokenSaverContextSeedTests: XCTestCase {
+final class ConversationContextSeedTests: XCTestCase {
     func test_versionIsRCSEED1v1() {
-        XCTAssertEqual(TokenSaverContextSeed.version, "RCSEED1/1")
+        XCTAssertEqual(ConversationContextSeed.version, "RCSEED1/1")
     }
 
-    func test_roundtripPreservesRoleOrderAndSelectedPayloads() throws {
-        // WHY: the destination must rebuild the canonical conversation
-        // deterministically from selected representations, not from a later
-        // Human rewrite.
+    func test_roundtripPreservesRoleOrderAndPayloads() throws {
+        // WHY: the destination must rebuild the conversation deterministically.
         let digest = "a".repeatedHex
-        let document = try XCTUnwrap(TokenSaverContextSeed.encode(
+        let document = try XCTUnwrap(ConversationContextSeed.encode(
             snapshotDigest: digest,
             items: [
-                .init(role: .user, ordinal: 0, sourceMessageId: "u1", format: .human, payload: "prior user"),
-                .init(role: .assistant, ordinal: 1, sourceMessageId: "a1", format: .rcs1, payload: rcs1Payload),
+                .init(role: .user, ordinal: 0, sourceMessageId: "u1", payload: "prior user"),
+                .init(role: .assistant, ordinal: 1, sourceMessageId: "a1", payload: repeatingHuman),
             ]
         ))
         XCTAssertTrue(document.hasPrefix("RCSEED1/1\n"))
-        let decoded = try XCTUnwrap(TokenSaverContextSeed.decode(document))
+        XCTAssertTrue(document.contains("I\t0\tuser\thuman\t10\tu1\n"), "wire layout keeps the Human format field")
+        let decoded = try XCTUnwrap(ConversationContextSeed.decode(document))
         XCTAssertEqual(decoded.snapshotDigest, digest)
         XCTAssertEqual(decoded.items.map(\.role), [.user, .assistant])
         XCTAssertEqual(decoded.items.map(\.ordinal), [0, 1])
-        XCTAssertEqual(decoded.items.map(\.format), [.human, .rcs1])
-        XCTAssertEqual(decoded.items.map(\.payload), ["prior user", rcs1Payload])
-        XCTAssertEqual(TokenSaverContextSeed.encode(snapshotDigest: digest, items: decoded.items), document)
+        XCTAssertEqual(decoded.items.map(\.payload), ["prior user", repeatingHuman])
+        XCTAssertEqual(ConversationContextSeed.encode(snapshotDigest: digest, items: decoded.items), document)
     }
 
     func test_emptyOrPartialDocumentsAreRejected() {
         // WHY: an incomplete seed would teach the fresh session a truncated
         // history. Fail closed instead of emitting a prefix.
-        XCTAssertNil(TokenSaverContextSeed.encode(snapshotDigest: "ab", items: []))
-        XCTAssertNil(TokenSaverContextSeed.decode(""))
-        XCTAssertNil(TokenSaverContextSeed.decode("RCSEED1/1\n"))
-        XCTAssertNil(TokenSaverContextSeed.decode("RCSEED1/1\nH\t1\tab\nI\t0\tuser\thuman\t4\nONLY"))
-        XCTAssertNil(TokenSaverContextSeed.decode("RCW1\tA\t1\nO\tnope\n.\n"))
+        XCTAssertNil(ConversationContextSeed.encode(snapshotDigest: "ab", items: []))
+        XCTAssertNil(ConversationContextSeed.decode(""))
+        XCTAssertNil(ConversationContextSeed.decode("RCSEED1/1\n"))
+        XCTAssertNil(ConversationContextSeed.decode("RCSEED1/1\nH\t1\tab\nI\t0\tuser\thuman\t4\nONLY"))
+        XCTAssertNil(ConversationContextSeed.decode("RCW1\tA\t1\nO\tnope\n.\n"))
     }
 
     func test_oversizedSnapshotIsRejectedWithoutPartialEncode() {
-        // WHY: existing compact-span / transcript bounds are the host ceiling.
-        // Crossing them must not produce a truncated seed.
-        let huge = String(repeating: "Z", count: TokenSaverContextSeed.maxEncodedBytes + 1)
-        XCTAssertNil(TokenSaverContextSeed.encode(
+        // WHY: crossing the seed bounds must not produce a truncated seed.
+        let huge = String(repeating: "Z", count: ConversationContextSeed.maxEncodedBytes + 1)
+        XCTAssertNil(ConversationContextSeed.encode(
             snapshotDigest: "cd",
-            items: [.init(role: .user, ordinal: 0, sourceMessageId: "u", format: .human, payload: huge)]
+            items: [.init(role: .user, ordinal: 0, sourceMessageId: "u", payload: huge)]
         ))
     }
 
@@ -59,19 +56,17 @@ final class TokenSaverContextSeedTests: XCTestCase {
         let priorUser = AgentMessage(threadId: thread, role: .user, content: "first question")
         let priorAssistant = AgentMessage(threadId: thread, role: .assistant, content: repeatingHuman)
         let current = AgentMessage(threadId: thread, role: .user, content: "follow up now")
-        let snapshot = try? XCTUnwrap(TokenSaverCanonicalConversationSnapshot.capture(
+        let snapshot = ConversationContextSnapshot.capture(
             messages: [priorUser, priorAssistant, current],
-            persistedRCW1ByMessageId: [:],
             excludingCurrentUserText: "follow up now"
-        ))
+        )
         XCTAssertEqual(snapshot?.items.map(\.canonicalText), ["first question", repeatingHuman])
         XCTAssertEqual(snapshot?.items.map(\.role), [.user, .assistant])
         XCTAssertEqual(snapshot?.items.map(\.ordinal), [0, 1])
         XCTAssertFalse(snapshot?.items.contains(where: { $0.canonicalText == "follow up now" }) ?? true)
 
-        let empty = TokenSaverCanonicalConversationSnapshot.capture(
+        let empty = ConversationContextSnapshot.capture(
             messages: [current],
-            persistedRCW1ByMessageId: [:],
             excludingCurrentUserText: "follow up now"
         )
         XCTAssertNil(empty, "no prior context must not invent an empty seed snapshot")
@@ -90,19 +85,17 @@ final class TokenSaverContextSeedTests: XCTestCase {
             role: .user,
             content: "teammate line"
         )
-        let snapshot = try? XCTUnwrap(TokenSaverCanonicalConversationSnapshot.capture(
+        let snapshot = ConversationContextSnapshot.capture(
             messages: [priorUser, priorAssistant, current],
-            persistedRCW1ByMessageId: [:],
             excludingCurrentUserText: "compiled provider envelope",
             excludingCurrentUserMessageId: current.id
-        ))
+        )
         XCTAssertEqual(snapshot?.items.map(\.canonicalText), ["first question", repeatingHuman])
         XCTAssertFalse(
             snapshot?.items.contains(where: { $0.messageId == current.id.value.uuidString }) ?? true
         )
-        let empty = TokenSaverCanonicalConversationSnapshot.capture(
+        let empty = ConversationContextSnapshot.capture(
             messages: [current],
-            persistedRCW1ByMessageId: [:],
             excludingCurrentUserText: "compiled provider envelope",
             excludingCurrentUserMessageId: current.id
         )
@@ -113,24 +106,46 @@ final class TokenSaverContextSeedTests: XCTestCase {
         let thread = AgentThreadID()
         let user = AgentMessage(threadId: thread, role: .user, content: "q")
         let assistant = AgentMessage(threadId: thread, role: .assistant, content: "a")
-        let first = try XCTUnwrap(TokenSaverCanonicalConversationSnapshot.capture(
+        let first = try XCTUnwrap(ConversationContextSnapshot.capture(
             messages: [user, assistant],
-            persistedRCW1ByMessageId: [:],
             excludingCurrentUserText: "later"
         ))
         let extra = AgentMessage(threadId: thread, role: .assistant, content: "more")
-        let second = try XCTUnwrap(TokenSaverCanonicalConversationSnapshot.capture(
+        let second = try XCTUnwrap(ConversationContextSnapshot.capture(
             messages: [user, assistant, extra],
-            persistedRCW1ByMessageId: [:],
             excludingCurrentUserText: "later"
         ))
         XCTAssertNotEqual(first.digest, second.digest)
     }
 
-    private var repeatingHuman: String { String(repeating: "ABCDEFGH", count: 16) }
-    private var rcs1Payload: String {
-        RemoteCodeCompactSpan.encode(repeatingHuman) ?? "RCS1/1\nmissing"
+    func test_preparedSeedOmitsCurrentPromptAndCarriesStoredText() throws {
+        // WHY: the fresh session must get the stored Human text of every prior
+        // turn, never the current prompt, which is sent on its own.
+        let snapshot = try XCTUnwrap(ConversationContextSnapshot.capture(
+            messages: [
+                AgentMessage(threadId: AgentThreadID(), role: .user, content: "prior user"),
+                AgentMessage(threadId: AgentThreadID(), role: .assistant, content: repeatingHuman),
+                AgentMessage(threadId: AgentThreadID(), role: .user, content: "current"),
+            ],
+            excludingCurrentUserText: "current"
+        ))
+        let prepared = try XCTUnwrap(ConversationContextSeed.prepare(snapshot: snapshot))
+        XCTAssertEqual(prepared.document.items.map(\.role), [.user, .assistant])
+        XCTAssertEqual(prepared.document.items.map(\.payload), ["prior user", repeatingHuman])
+        XCTAssertEqual(ConversationContextSeed.decode(prepared.encoded), prepared.document)
     }
+
+    func test_prepareRejectsASnapshotWhoseDigestDoesNotMatchItsItems() throws {
+        // WHY: a stale or tampered snapshot must not be sent as current context.
+        let snapshot = try XCTUnwrap(ConversationContextSnapshot.capture(
+            messages: [AgentMessage(threadId: AgentThreadID(), role: .user, content: "q")],
+            excludingCurrentUserText: nil
+        ))
+        let forged = ConversationContextSnapshot(items: snapshot.items, digest: "b".repeatedHex)
+        XCTAssertNil(ConversationContextSeed.prepare(snapshot: forged))
+    }
+
+    private var repeatingHuman: String { String(repeating: "ABCDEFGH", count: 16) }
 }
 
 private extension String {
