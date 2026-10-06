@@ -654,8 +654,11 @@ public enum AgentMessageTransport {
 
     // MARK: - Appended event
 
+    /// `bodyRevision` is the stored revision for a row replaced in place
+    /// (same id, new content); a first append is revision 1.
     public static func appendedEventPayload(
-        from message: AgentMessage
+        from message: AgentMessage,
+        bodyRevision: Int = 1
     ) -> JSONValue {
         let bodyBytes = message.content.utf8.count
         let content = utf8Prefix(
@@ -688,7 +691,7 @@ public enum AgentMessageTransport {
             bodyTruncated: content.utf8.count < bodyBytes,
                 bodyByteCount: bodyBytes,
                 bodySHA256: bodySHA256Hex(message.content),
-                bodyRevision: 1,
+                bodyRevision: bodyRevision,
                 bodyOffset: nil,
                 bodyNextOffset: nil,
             attachmentCount: message.attachments.count,

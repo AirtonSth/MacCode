@@ -61,6 +61,10 @@ public final class BotStore: @unchecked Sendable {
 #if DEBUG
     var onBeforePublishCommitForTesting: (() throws -> Void)?
 #endif
+    /// Called after a bot delete commits, with the ids of the group turns the
+    /// delete cancelled. Every delete path (Bots window, paired remote) goes
+    /// through `delete(id:)`, so the group orchestrator hears of each one.
+    public var onBotDeleted: ((BotID, [BotGroupTurnID]) -> Void)?
     private let dates = LockedISO8601Formatter({
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
@@ -569,9 +573,9 @@ public final class BotStore: @unchecked Sendable {
     }
 
     public func delete(id: BotID, now: Date = Date()) throws {
-        try db.transaction {
+        let cancelledTurnIDs: [BotGroupTurnID]? = try db.transaction {
             guard let bot = try loadBot(id: id, database: db) else { throw BotStoreError.notFound }
-            if bot.deletedAt != nil { return }
+            if bot.deletedAt != nil { return nil }
             let update = try db.prepare("""
                 UPDATE bots
                 SET deleted_at = ?, hidden = 1, directory_epoch = directory_epoch + 1, updated_at = ?
@@ -613,10 +617,11 @@ public final class BotStore: @unchecked Sendable {
             try executeBound("DELETE FROM bot_routine_activations WHERE bot_id = ?;", id: id)
             try executeBound("DELETE FROM bot_routine_definitions WHERE bot_id = ?;", id: id)
             try executeBound("DELETE FROM bot_queued_follow_ups WHERE bot_id = ?;", id: id)
-            try removeFromTeamsAndGroupsLocked(botID: id, now: now)
+            return try removeFromTeamsAndGroupsLocked(botID: id, now: now)
         }
         forgetLinkedThreads(botID: id)
         bumpBotsListRevision()
+        if let cancelledTurnIDs { onBotDeleted?(id, cancelledTurnIDs) }
     }
 
     public func listLinkedAgentThreadIDs() throws -> Set<AgentThreadID> {

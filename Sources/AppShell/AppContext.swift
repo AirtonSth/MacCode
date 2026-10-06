@@ -435,11 +435,21 @@ public final class AppContext {
         appSupportDirectory: appSupportDirectory
     )
     private var tokenSaverCodexAdapter: CodexAppServerAdapter
+    /// False for a background helper sharing this SQLite (Scheduled Task
+    /// Agent): it never owns group conversation turns, so it never
+    /// interrupts, starts or settles them.
+    let hostsBotGroupConversations: Bool
     public var router: AppCommandRouter! {
         didSet {
             botPeerHandoffAuthority.router = router
-            botGroupOrchestrator.router = router
-            botGroupOrchestrator.reconcileAfterRelaunch()
+            if hostsBotGroupConversations {
+                botGroupOrchestrator.router = router
+                botStore.onBotDeleted = { [weak self] botID, cancelledTurnIDs in
+                    Task { @MainActor [weak self] in
+                        self?.botGroupOrchestrator.botWasDeleted(botID, cancelledTurnIDs: cancelledTurnIDs)
+                    }
+                }
+            }
             drainRecoveredForkPrunedThreadIDsIfPossible()
             refreshActiveAgentWorkspaceProjection()
             startBotBrowserPendingOpenObserver()
@@ -811,6 +821,15 @@ public final class AppContext {
         drainRecoveredForkPrunedThreadIDsIfPossible()
     }
 
+    /// Interrupts the group turns a previous launch left running and resumes
+    /// the planned and VM-waiting ones. The launch calls it once, after the
+    /// event log is wired and its sequence restored, so iOS receives these
+    /// changes from its cursor.
+    public func reconcileBotGroupsAfterLaunch() {
+        guard hostsBotGroupConversations, router != nil else { return }
+        botGroupOrchestrator.reconcileAfterRelaunch()
+    }
+
     private func drainRecoveredForkPrunedThreadIDsIfPossible() {
         guard let router, !pendingRecoveredForkPrunedThreadIDs.isEmpty else { return }
         let ids = pendingRecoveredForkPrunedThreadIDs.sorted {
@@ -1001,6 +1020,7 @@ public final class AppContext {
         performLaunchRunReconciliation: Bool = true
     ) throws {
         self.channel = channel
+        self.hostsBotGroupConversations = performLaunchRunReconciliation
         self.tokenSaverAccountUsageRefresher = tokenSaverAccountUsageRefresher
         self.agentSkillsHomeOverrideForTesting = agentSkillsHomeOverrideForTesting
         let bs = Bootstrap(channel: channel, dbPathOverride: dbPathOverride, appSupportOverride: appSupportOverride)

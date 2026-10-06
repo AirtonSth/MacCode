@@ -3346,6 +3346,15 @@ public final class AgentMessageRepository: @unchecked Sendable {
 
     /// Existence only. Avoids compiling `content` + `attachments_json` when
     /// startRun / startProviderRun / desk user-row only need "is this id taken?".
+    /// The stored body revision (bumped when a row's content is replaced in
+    /// place), nil when the row does not exist.
+    public func bodyRevision(id: AgentMessageID) throws -> Int? {
+        let st = try db.prepare("SELECT body_revision FROM agent_messages WHERE id = ? LIMIT 1;")
+        try st.bind(1, id.value.uuidString)
+        guard try st.step() else { return nil }
+        return max(1, Int(st.columnInt64(0)))
+    }
+
     public func exists(id: AgentMessageID) throws -> Bool {
         existsProbeCountForTesting += 1
         let st = try db.prepare("SELECT 1 FROM agent_messages WHERE id = ? LIMIT 1;")

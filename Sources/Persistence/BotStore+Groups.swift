@@ -442,7 +442,10 @@ extension BotStore {
 
     /// Inserts a round's turns atomically. Each bot must be an active
     /// participant; (round, bot, hop) and room_message_id are unique.
-    public func insertGroupTurns(_ turns: [BotGroupTurn]) throws {
+    /// `alsoWriting` runs in the same transaction (the room rows of the
+    /// turns), so the turns and their rows commit or roll back together. It
+    /// must only use `db.prepare` statements, never `performSync`.
+    public func insertGroupTurns(_ turns: [BotGroupTurn], alsoWriting: (() throws -> Void)? = nil) throws {
         guard !turns.isEmpty else { return }
         try db.transaction {
             var activeByGroup: [BotGroupID: Set<BotID>] = [:]
@@ -482,6 +485,7 @@ extension BotStore {
                 try insert.bind(14, string(turn.updatedAt))
                 _ = try insert.step()
             }
+            try alsoWriting?()
         }
     }
 
@@ -527,6 +531,9 @@ extension BotStore {
     /// still belongs to that run, so a late finish of an older run cannot
     /// settle a retried turn. `memberRunID` / `error` are written when
     /// non-nil; `clearMemberRunID` / `clearError` reset them (retry).
+    /// `alsoWriting` runs in the same transaction, only when the change
+    /// applies (the turn's room row), with the same rules as in
+    /// `insertGroupTurns`.
     @discardableResult
     public func transitionGroupTurn(
         id: BotGroupTurnID,
@@ -537,7 +544,8 @@ extension BotStore {
         clearMemberRunID: Bool = false,
         error: String? = nil,
         clearError: Bool = false,
-        now: Date = Date()
+        now: Date = Date(),
+        alsoWriting: ((BotGroupTurn) throws -> Void)? = nil
     ) throws -> BotGroupTurn? {
         try db.transaction {
             guard var turn = try loadTurn(id: id, database: db) else { throw BotStoreError.notFound }
@@ -560,23 +568,31 @@ extension BotStore {
             try update.bind(4, string(now))
             try update.bind(5, Self.key(id.value))
             _ = try update.step()
+            try alsoWriting?(turn)
             return turn
         }
     }
 
     /// Cancels every planned or waiting turn of a group (new round supersedes
-    /// the old one; Stop). Returns the cancelled turns.
+    /// the old one; Stop). Returns the cancelled turns. `alsoWriting` runs
+    /// in the same transaction with them, as in `transitionGroupTurn`.
     @discardableResult
-    public func cancelPendingGroupTurns(groupID: BotGroupID, now: Date = Date()) throws -> [BotGroupTurn] {
+    public func cancelPendingGroupTurns(
+        groupID: BotGroupID,
+        now: Date = Date(),
+        alsoWriting: (([BotGroupTurn]) throws -> Void)? = nil
+    ) throws -> [BotGroupTurn] {
         try db.transaction {
             let pending = try loadTurns(groupID: groupID, states: BotGroupTurn.State.pending, database: db)
             try cancelPendingTurnsLocked(groupID: groupID, botID: nil, now: now)
-            return pending.map {
+            let cancelled = pending.map {
                 var turn = $0
                 turn.state = .cancelled
                 turn.updatedAt = now
                 return turn
             }
+            try alsoWriting?(cancelled)
+            return cancelled
         }
     }
 
@@ -585,10 +601,20 @@ extension BotStore {
     /// Runs inside `delete(id:)`'s transaction. Group history (room rows) is
     /// kept; the bot leaves every group and team and its unstarted turns are
     /// cancelled. A lead-policy group that loses its lead falls back to
-    /// roundtable so it keeps working with the remaining bots.
-    func removeFromTeamsAndGroupsLocked(botID: BotID, now: Date) throws {
+    /// roundtable so it keeps working with the remaining bots. Returns the
+    /// cancelled turns' ids (their room rows are settled by the caller).
+    func removeFromTeamsAndGroupsLocked(botID: BotID, now: Date) throws -> [BotGroupTurnID] {
         let bot = Self.key(botID.value)
         let stamp = string(now)
+        let select = try db.prepare("""
+            SELECT id FROM bot_group_turns WHERE bot_id = ? AND state IN ('planned', 'waiting_for_bot');
+            """)
+        defer { select.reset() }
+        try select.bind(1, bot)
+        var cancelled: [BotGroupTurnID] = []
+        while try select.step() {
+            if let raw = select.columnText(0), let uuid = UUID(uuidString: raw) { cancelled.append(BotGroupTurnID(uuid)) }
+        }
         let steps: [(String, [String?])] = [
             ("""
             UPDATE bot_teams SET revision = revision + 1, updated_at = ?
@@ -615,6 +641,7 @@ extension BotStore {
             for (index, value) in values.enumerated() { try statement.bind(Int32(index + 1), value) }
             _ = try statement.step()
         }
+        return cancelled
     }
 
     // MARK: - Internals

@@ -29,15 +29,33 @@ final class BotGroupOrchestratorTests: XCTestCase {
         let ana: BotDefinition
         let bob: BotDefinition
         let cid: BotDefinition
+        let support: String
         @MainActor var orchestrator: BotGroupOrchestrator { ctx.botGroupOrchestrator }
     }
 
     private func makeFixture(anaDesktop: BotDesktopKind = .logicalExecutionSpace) throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("RC2BotGroup-\(UUID().uuidString)", isDirectory: true)
+        let support = root.appendingPathComponent("support", isDirectory: true).path
+        let (ctx, router, runner) = try openContext(support: support)
+        let ana = try ctx.botStore.create(
+            name: "Ana", title: "Writer", description: "", handle: "ana", soul: "ANA-SOUL", desktopKind: anaDesktop
+        )
+        let bob = try ctx.botStore.create(name: "Bob", title: "Critic", description: "", handle: "bob", soul: "BOB-SOUL")
+        let cid = try ctx.botStore.create(name: "Cid", title: "", description: "", handle: "cid", soul: "CID-SOUL")
+        return Fixture(ctx: ctx, router: router, runner: runner, ana: ana, bob: bob, cid: cid, support: support)
+    }
+
+    /// An app context on `support` with a controllable Codex runner. A second
+    /// call on the same `support` is a relaunch (or a helper) on the same DB.
+    private func openContext(
+        support: String,
+        performLaunchRunReconciliation: Bool = true
+    ) throws -> (AppContext, AppCommandRouter, ControlledBotHandoffRunner) {
         let ctx = try AppContext(
             channel: .debug,
-            appSupportOverride: root.appendingPathComponent("support", isDirectory: true).path
+            appSupportOverride: support,
+            performLaunchRunReconciliation: performLaunchRunReconciliation
         )
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
@@ -54,12 +72,32 @@ final class BotGroupOrchestratorTests: XCTestCase {
             )
         ])
         ctx.botGroupOrchestrator.vmPreflight = { _ in nil }
-        let ana = try ctx.botStore.create(
-            name: "Ana", title: "Writer", description: "", handle: "ana", soul: "ANA-SOUL", desktopKind: anaDesktop
+        return (ctx, router, runner)
+    }
+
+    /// A previous launch's state: Ana's turn was running (its run is gone)
+    /// and Bob's was planned, each with its waiting row.
+    private func seedInterruptedRound(
+        _ f: Fixture, _ group: BotGroupConversation
+    ) throws -> (wasRunning: BotGroupTurn, planned: BotGroupTurn) {
+        let round = BotGroupRoundID()
+        let user = AgentMessage(threadId: group.roomThreadID, role: .user, content: "Before the restart")
+        try f.ctx.messageRepo.append(user)
+        let wasRunning = BotGroupTurn(
+            groupID: group.id, roundID: round, triggerMessageID: user.id, botID: f.ana.id, ordinal: 1, memberRunID: AgentRunID()
         )
-        let bob = try ctx.botStore.create(name: "Bob", title: "Critic", description: "", handle: "bob", soul: "BOB-SOUL")
-        let cid = try ctx.botStore.create(name: "Cid", title: "", description: "", handle: "cid", soul: "CID-SOUL")
-        return Fixture(ctx: ctx, router: router, runner: runner, ana: ana, bob: bob, cid: cid)
+        let planned = BotGroupTurn(groupID: group.id, roundID: round, triggerMessageID: user.id, botID: f.bob.id, ordinal: 2)
+        try f.ctx.botStore.insertGroupTurns([wasRunning, planned])
+        try f.ctx.botStore.transitionGroupTurn(
+            id: wasRunning.id, from: [.planned], to: .running, memberRunID: try XCTUnwrap(wasRunning.memberRunID)
+        )
+        for (turn, bot) in [(wasRunning, f.ana), (planned, f.bob)] {
+            try f.ctx.messageRepo.append(AgentMessage(
+                id: turn.roomMessageID, threadId: group.roomThreadID, role: .assistant,
+                content: BotPeerTranscript.encodeActivity(peer: bot, phase: .waiting)
+            ))
+        }
+        return (wasRunning, planned)
     }
 
     private func makeGroup(
@@ -202,6 +240,11 @@ final class BotGroupOrchestratorTests: XCTestCase {
         for turn in receipt.turns {
             XCTAssertEqual(ids.filter { $0 == turn.roomMessageID.value.uuidString }.count, 2, "waiting, then reply")
             XCTAssertEqual(turnStates(log, turn), ["planned", "running", "completed"])
+            // iOS and agent.message.get must agree on the replaced row's revision.
+            let revisions = log.events
+                .filter { $0.payload["id"]?.objectValue?["value"]?.stringValue == turn.roomMessageID.value.uuidString }
+                .compactMap { $0.payload["body_revision"]?.intValue }
+            XCTAssertEqual(revisions, [1, 2], "the reply event carries the stored revision of the replaced row")
         }
 
         // Member threads: locked to their bot, on the Mac for a non-VM bot.
@@ -252,23 +295,7 @@ final class BotGroupOrchestratorTests: XCTestCase {
     func test_relaunchInterruptsTheRunningTurnAndResumesPlannedOnes() async throws {
         let f = try makeFixture()
         let group = try await makeGroup(f, bots: [f.ana, f.bob])
-        let round = BotGroupRoundID()
-        let user = AgentMessage(threadId: group.roomThreadID, role: .user, content: "Before the restart")
-        try f.ctx.messageRepo.append(user)
-        let wasRunning = BotGroupTurn(
-            groupID: group.id, roundID: round, triggerMessageID: user.id, botID: f.ana.id, ordinal: 1, memberRunID: AgentRunID()
-        )
-        let planned = BotGroupTurn(groupID: group.id, roundID: round, triggerMessageID: user.id, botID: f.bob.id, ordinal: 2)
-        try f.ctx.botStore.insertGroupTurns([wasRunning, planned])
-        try f.ctx.botStore.transitionGroupTurn(
-            id: wasRunning.id, from: [.planned], to: .running, memberRunID: try XCTUnwrap(wasRunning.memberRunID)
-        )
-        for (turn, bot) in [(wasRunning, f.ana), (planned, f.bob)] {
-            try f.ctx.messageRepo.append(AgentMessage(
-                id: turn.roomMessageID, threadId: group.roomThreadID, role: .assistant,
-                content: BotPeerTranscript.encodeActivity(peer: bot, phase: .waiting)
-            ))
-        }
+        let (wasRunning, _) = try seedInterruptedRound(f, group)
 
         f.orchestrator.reconcileAfterRelaunch()
 
@@ -481,5 +508,217 @@ final class BotGroupOrchestratorTests: XCTestCase {
         try await Task.sleep(nanoseconds: 100_000_000)
         XCTAssertTrue(f.runner.requests.isEmpty)
         XCTAssertTrue(try room(f, group).isEmpty)
+    }
+
+    // MARK: - Shared-DB helper and restart ordering
+
+    func test_aSharedDatabaseHelperNeverInterruptsOrStartsGroupTurns() async throws {
+        // WHY: the Scheduled Task Agent opens the same SQLite on its own. If it
+        // reconciled, it would interrupt the app's live turn (losing its reply)
+        // and run the planned ones in a process that is not the app.
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana, f.bob])
+        let (wasRunning, planned) = try seedInterruptedRound(f, group)
+
+        let (helper, _, helperRunner) = try openContext(support: f.support, performLaunchRunReconciliation: false)
+        helper.reconcileBotGroupsAfterLaunch()
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertEqual(try f.ctx.botStore.groupTurn(id: wasRunning.id)?.state, .running, "the app still owns it")
+        XCTAssertEqual(try f.ctx.botStore.groupTurn(id: planned.id)?.state, .planned)
+        XCTAssertEqual(
+            BotPeerTranscript.parseActivity(try XCTUnwrap(try f.ctx.messageRepo.get(id: wasRunning.roomMessageID)).content)?.phase,
+            .waiting
+        )
+        XCTAssertTrue(helperRunner.requests.isEmpty, "the helper starts no group turn")
+        XCTAssertTrue(f.runner.requests.isEmpty)
+    }
+
+    func test_aRestartReconcilesOnlyAfterTheEventLogIsRestoredAndPersistsItsEvents() async throws {
+        // WHY: iOS resumes from its event cursor. Reconcile events published
+        // before the log is wired are lost, or numbered below what iOS saw.
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana, f.bob])
+        let (wasRunning, planned) = try seedInterruptedRound(f, group)
+
+        let (relaunched, _, runner) = try openContext(support: f.support)
+        XCTAssertEqual(
+            try relaunched.botStore.groupTurn(id: wasRunning.id)?.state, .running,
+            "assigning the router reconciles nothing: the event log is not wired yet"
+        )
+
+        let bus = EventBus.shared
+        let previousRetain = bus.shouldRetainRecentEvent
+        let previousStandIn = bus.recentReplayStandIn
+        AppDelegate.wireEventPersistence(context: relaunched)
+        defer {
+            bus.persister = nil
+            bus.persistenceCommitFence = nil
+            bus.shouldRetainRecentEvent = previousRetain
+            bus.recentReplayStandIn = previousStandIn
+        }
+        // The previous session numbered its events past this process's bus.
+        let previousSessionSeq = bus.currentSeq + 500
+        try relaunched.eventLog.appendBatch([
+            EventLogRepository.PendingRow(seq: previousSessionSeq, kind: "test.previous.session", payloadJSON: "{}")
+        ])
+        let restored = try relaunched.eventLog.lastSeq()
+        bus.reloadFromPersistence(lastSeq: restored, recent: [])
+
+        relaunched.reconcileBotGroupsAfterLaunch()
+        relaunched.flushEventPersistence()
+
+        XCTAssertEqual(try relaunched.botStore.groupTurn(id: wasRunning.id)?.state, .interrupted)
+        let rows = try relaunched.eventLog.read(since: restored, limit: 1_000)
+        let turnRow = try XCTUnwrap(rows.first { row in
+            row.kind == "bot.group.turn.updated"
+                && row.payloadJSON.contains(wasRunning.id.value.uuidString.lowercased())
+                && row.payloadJSON.contains("interrupted")
+        }, "the interrupted turn event is in the persisted log")
+        XCTAssertGreaterThan(turnRow.seq, restored)
+        let roomRow = try XCTUnwrap(rows.first { row in
+            row.kind == "agent.message.appended" && row.payloadJSON.contains(wasRunning.roomMessageID.value.uuidString)
+        }, "the needs-attention row event is in the persisted log")
+        XCTAssertGreaterThan(roomRow.seq, restored)
+
+        let resumed = await waitUntil { runner.requests.count == 1 }
+        XCTAssertTrue(resumed, "the planned turn resumes in the relaunched app")
+        runner.finish(runID: try XCTUnwrap(runner.requests.first).runId, status: .completed, reply: "Back")
+        let done = await waitUntil { (try? relaunched.botStore.groupTurn(id: planned.id)?.state) == .completed }
+        XCTAssertTrue(done)
+    }
+
+    // MARK: - Bot deleted mid-round
+
+    func test_deletingABotMidRoundLetsTheNextParticipantAnswerAndLeavesNoWaitingRow() async throws {
+        // WHY: deleting a bot drops its member conversation. Its running turn
+        // must not stay running forever (that blocks the whole group), and its
+        // unstarted turns must not keep spinning rows.
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana, f.bob, f.cid])
+        let (log, subscription) = recordEvents(roomThreadID: group.roomThreadID)
+        defer { EventBus.shared.unsubscribe(subscription) }
+        let receipt = try f.orchestrator.send(groupID: group.id, text: "Who goes first?")
+        let anaStarted = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(anaStarted)
+
+        try f.ctx.botStore.delete(id: f.ana.id)
+
+        let bobStarted = await waitUntil { f.runner.requests.count == 2 }
+        XCTAssertTrue(bobStarted, "the next participant answers")
+        XCTAssertEqual(f.runner.requests.last?.threadId, try memberThread(f, group, f.bob))
+        XCTAssertEqual(try f.ctx.botStore.groupTurn(id: receipt.turns[0].id)?.state, .cancelled)
+
+        try f.ctx.botStore.delete(id: f.cid.id)
+        let cidSettled = await waitUntil {
+            (try? f.ctx.messageRepo.get(id: receipt.turns[2].roomMessageID))??.role == .system
+        }
+        XCTAssertTrue(cidSettled, "a deleted bot's planned turn settles its row")
+
+        f.runner.finish(runID: try XCTUnwrap(f.runner.requests.last).runId, status: .completed, reply: "Me.")
+        let done = await waitUntil { (try? f.ctx.botStore.groupTurn(id: receipt.turns[1].id)?.state) == .completed }
+        XCTAssertTrue(done)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(f.runner.requests.count, 2, "no deleted bot runs")
+        for row in try room(f, group) {
+            XCTAssertNotEqual(BotPeerTranscript.parseActivity(row.content)?.phase, .waiting, "no row keeps spinning")
+        }
+        XCTAssertEqual(try room(f, group).first { $0.id == receipt.turns[0].roomMessageID }?.content.contains("Ana"), true)
+        XCTAssertEqual(turnStates(log, receipt.turns[0]), ["planned", "running", "cancelled"])
+        XCTAssertEqual(turnStates(log, receipt.turns[2]), ["planned", "cancelled"])
+    }
+
+    // MARK: - Atomic writes
+
+    func test_aSendWhoseRoomWriteFailsLeavesNoTurnsBehind() async throws {
+        // WHY: turns persisted without the user's line would make the bots
+        // answer, after a relaunch, a message the room never showed.
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana])
+        try f.ctx.db.execute("""
+            CREATE TRIGGER test_fail_user_row BEFORE INSERT ON agent_messages
+            WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'disk full'); END;
+            """)
+        XCTAssertThrowsError(try f.orchestrator.send(groupID: group.id, text: "Lost?"))
+        XCTAssertTrue(try turns(f, group).isEmpty, "the turns rolled back with the row")
+        XCTAssertTrue(try room(f, group).isEmpty)
+
+        try f.ctx.db.execute("DROP TRIGGER test_fail_user_row;")
+        let receipt = try f.orchestrator.send(groupID: group.id, text: "Now it works")
+        XCTAssertEqual(try room(f, group).map(\.id), [receipt.userMessageID, receipt.turns[0].roomMessageID])
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        f.runner.finish(runID: try XCTUnwrap(f.runner.requests.first).runId, status: .completed, reply: "ok")
+    }
+
+    func test_aSettleWhoseRowWriteFailsKeepsTheTurnAndRowTogetherUntilReconcile() async throws {
+        // WHY: a turn shown as answered must have its reply row. When the row
+        // cannot be written, the turn keeps running with its waiting row, and
+        // the next launch interrupts both together instead of losing the row.
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana])
+        let receipt = try f.orchestrator.send(groupID: group.id, text: "Hello")
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        try f.ctx.db.execute("""
+            CREATE TRIGGER test_fail_row_update BEFORE UPDATE ON agent_messages
+            BEGIN SELECT RAISE(ABORT, 'disk full'); END;
+            """)
+        f.runner.finish(runID: try XCTUnwrap(f.runner.requests.first).runId, status: .completed, reply: "Hi")
+        let finished = await waitUntil {
+            f.ctx.coordinator.activeRunId(threadId: (try? self.memberThread(f, group, f.ana)) ?? AgentThreadID()) == nil
+        }
+        XCTAssertTrue(finished)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(try f.ctx.botStore.groupTurn(id: receipt.turns[0].id)?.state, .running)
+        XCTAssertEqual(
+            BotPeerTranscript.parseActivity(try XCTUnwrap(try f.ctx.messageRepo.get(id: receipt.turns[0].roomMessageID)).content)?.phase,
+            .waiting
+        )
+
+        try f.ctx.db.execute("DROP TRIGGER test_fail_row_update;")
+        f.orchestrator.reconcileAfterRelaunch()
+        XCTAssertEqual(try f.ctx.botStore.groupTurn(id: receipt.turns[0].id)?.state, .interrupted)
+        XCTAssertEqual(
+            BotPeerTranscript.parseActivity(try XCTUnwrap(try f.ctx.messageRepo.get(id: receipt.turns[0].roomMessageID)).content)?.phase,
+            .needsAttention
+        )
+    }
+
+    // MARK: - Plan A guest
+
+    func test_aDistillBotOnItsVMAnswersInsideItsGuest() async throws {
+        // WHY (plan A): a Docker-desktop bot on Distill runs inside its own
+        // Linux guest from its first group turn, with the guest's rules.
+        AgentProvider.selectableForTesting = [.distill] + AgentProvider.allCases.filter { $0 != .distill }
+        defer { AgentProvider.selectableForTesting = AgentProvider.allCases }
+        let f = try makeFixture(anaDesktop: .dockerDesktop)
+        let distill = ControlledBotHandoffRunner(provider: .distill)
+        f.ctx.coordinator.replaceProviderAdapter(.distill, adapter: TerminalRetiringOneShotAdapter(runner: distill))
+        f.router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .distill,
+                models: [AgentModelDescriptor(id: "main-a", label: "Main A", provider: .distill)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "distill"
+            )
+        ])
+        let group = try await makeGroup(f, bots: [f.ana])
+        try f.orchestrator.send(groupID: group.id, text: "Check the guest")
+        let started = await waitUntil { distill.requests.count == 1 }
+        XCTAssertTrue(started)
+
+        let thread = try XCTUnwrap(try memberThread(f, group, f.ana))
+        let placement = try XCTUnwrap(try f.ctx.threadRepo.guestPlacement(of: thread))
+        XCTAssertEqual(placement.executionTarget, .vm)
+        XCTAssertTrue(placement.runsInGuest, "the plan-A guest marker is set on the member thread")
+        let request = try XCTUnwrap(distill.requests.first)
+        XCTAssertEqual(request.threadId, thread)
+        XCTAssertTrue(request.prompt.contains(BotStandingInstructions.guestThreadRules), "the guest's rules, not the VM-shell ones")
+        XCTAssertTrue(f.runner.requests.isEmpty)
+        distill.finish(runID: request.runId, status: .completed, reply: "Guest ok")
+        let done = await waitUntil { (try? self.turns(f, group).first?.state) == .completed }
+        XCTAssertTrue(done)
     }
 }

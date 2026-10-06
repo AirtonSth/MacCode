@@ -258,6 +258,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         } catch {
             appLifecycleLog.error("event_log.sequence_init_failed error=\(error.localizedDescription, privacy: .public)")
         }
+        // After the event log: the reconcile's events must be persisted and
+        // sequenced after everything a client already saw.
+        context.reconcileBotGroupsAfterLaunch()
         updater = SparkleAppUpdater.defaultIfConfigured()
         updater?.onWillInstallUpdate = { [weak self] in
             self?.persistRestorableStateBeforeUpdate()

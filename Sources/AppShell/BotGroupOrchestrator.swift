@@ -1,8 +1,11 @@
 import Foundation
+import os
 import AgentRuntime
 import CoreModel
 import Persistence
 import SocketServer
+
+private let botGroupLog = Logger(subsystem: "io.remotecode.agent", category: "bot.group")
 
 /// Runs group conversations. The room thread holds the transcript and never
 /// runs a provider; each participant answers on its own hidden member thread
@@ -50,6 +53,10 @@ final class BotGroupOrchestrator: AgentRunObserver {
     /// Groups whose pump loop is running; a second pump call is a no-op
     /// because the running loop re-reads the turns after every await.
     private var pumpingGroups: Set<BotGroupID> = []
+    /// Runs this orchestrator started for a turn and has not settled. Every
+    /// run finish in the app reaches `settle`; any other run returns there
+    /// without touching SQLite.
+    private var ownedRunIDs: Set<AgentRunID> = []
 
     init(
         botStore: BotStore,
@@ -169,23 +176,31 @@ final class BotGroupOrchestrator: AgentRunObserver {
                 updatedAt: now
             )
         }
-        // Turns first: they validate the participants, so a refused send
-        // writes nothing to the room.
-        try botStore.insertGroupTurns(turns)
-        try writeRoomRow(userMessage)
         let botsByID = Dictionary(participants.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        try writeWaitingRows(for: turns, roomThreadID: group.roomThreadID, bots: botsByID, after: now)
+        let rows = waitingRows(for: turns, roomThreadID: group.roomThreadID, bots: botsByID, after: now)
+        // One transaction: the turns (which validate the participants, so a
+        // refused send writes nothing), the user line and the waiting rows.
+        // A failed write or a crash never leaves turns that would answer a
+        // message the room does not show.
+        try botStore.insertGroupTurns(turns) {
+            try self.messageRepo.append(userMessage)
+            for row in rows { try self.messageRepo.append(row) }
+        }
+        publishRow(userMessage)
+        rows.forEach(publishRow)
         turns.forEach { publishTurn($0, roomThreadID: group.roomThreadID) }
 
         // A new user message replaces what is still unstarted in older rounds;
         // a running turn finishes first.
         let supersession = BotGroupTurnPlanner.supersede(existingTurns + turns, newRoundID: roundID)
-        for turnID in supersession.cancelledTurnIDs {
-            guard let cancelled = try? botStore.transitionGroupTurn(
-                id: turnID, from: BotGroupTurn.State.pending, to: .cancelled
-            ) else { continue }
-            settleRoomRow(cancelled, roomThreadID: group.roomThreadID, outcome: .note(Self.supersededNote))
-            publishTurn(cancelled, roomThreadID: group.roomThreadID)
+        for turn in existingTurns + turns where supersession.cancelledTurnIDs.contains(turn.id) {
+            move(
+                turn,
+                from: BotGroupTurn.State.pending,
+                to: .cancelled,
+                roomThreadID: group.roomThreadID,
+                outcome: .note(Self.supersededNote)
+            )
         }
 
         schedulePump(groupID)
@@ -225,7 +240,9 @@ final class BotGroupOrchestrator: AgentRunObserver {
                 try activeParticipantBots(groupID: group.id).map { ($0.id, $0) },
                 uniquingKeysWith: { first, _ in first }
             )
-            try writeWaitingRows(for: missing, roomThreadID: group.roomThreadID, bots: bots, after: first.createdAt)
+            for row in waitingRows(for: missing, roomThreadID: group.roomThreadID, bots: bots, after: first.createdAt) {
+                try writeRoomRow(row)
+            }
         }
         return SendReceipt(
             groupID: group.id,
@@ -241,19 +258,37 @@ final class BotGroupOrchestrator: AgentRunObserver {
     /// Cancels every unstarted turn of the group and stops the running one.
     func stop(groupID: BotGroupID) {
         guard let group = try? botStore.group(id: groupID) else { return }
-        let cancelled = (try? botStore.cancelPendingGroupTurns(groupID: groupID)) ?? []
+        let roomThreadID = group.roomThreadID
+        let pending = (try? botStore.listGroupTurns(groupID: groupID, states: BotGroupTurn.State.pending)) ?? []
+        let rows = Dictionary(
+            pending.map { ($0.id, roomRow(for: $0, roomThreadID: roomThreadID, outcome: .note(Self.stoppedNote))) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let cancelled: [BotGroupTurn]
+        do {
+            cancelled = try botStore.cancelPendingGroupTurns(groupID: groupID) { turns in
+                for turn in turns { if let row = rows[turn.id] { try self.messageRepo.append(row) } }
+            }
+        } catch {
+            botGroupLog.error("bot.group.stop_failed group=\(groupID.value.uuidString, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            cancelled = []
+        }
         for turn in cancelled {
-            settleRoomRow(turn, roomThreadID: group.roomThreadID, outcome: .note(Self.stoppedNote))
-            publishTurn(turn, roomThreadID: group.roomThreadID)
+            if let row = rows[turn.id] { publishRow(row) }
+            publishTurn(turn, roomThreadID: roomThreadID)
         }
         let running = (try? botStore.listGroupTurns(groupID: groupID, states: [.running])) ?? []
         for turn in running {
             guard let runID = turn.memberRunID,
-                  let stopped = try? botStore.transitionGroupTurn(
-                    id: turn.id, from: [.running], to: .cancelled, expectedMemberRunID: runID
-                  ) else { continue }
-            settleRoomRow(stopped, roomThreadID: group.roomThreadID, outcome: .note(Self.stoppedNote))
-            publishTurn(stopped, roomThreadID: group.roomThreadID)
+                  move(
+                    turn,
+                    from: [.running],
+                    to: .cancelled,
+                    expectedMemberRunID: runID,
+                    roomThreadID: roomThreadID,
+                    outcome: .note(Self.stoppedNote)
+                  ) != nil else { continue }
+            ownedRunIDs.remove(runID)
             coordinator.stopRun(runID)
             if let memberThread = memberThreadID(groupID: groupID, botID: turn.botID) {
                 // A start still being prepared has no run to stop yet.
@@ -274,18 +309,19 @@ final class BotGroupOrchestrator: AgentRunObserver {
             if let runID = turn.memberRunID,
                let memberThread = memberThreadID(groupID: turn.groupID, botID: turn.botID),
                coordinator.activeRunId(threadId: memberThread) == runID {
+                ownedRunIDs.insert(runID)
                 continue
             }
-            guard let group = try? botStore.group(id: turn.groupID),
-                  let interrupted = try? botStore.transitionGroupTurn(
-                    id: turn.id,
-                    from: [.running],
-                    to: .interrupted,
-                    expectedMemberRunID: turn.memberRunID,
-                    error: Self.interruptedError
-                  ) else { continue }
-            settleRoomRow(interrupted, roomThreadID: group.roomThreadID, outcome: .needsAttention)
-            publishTurn(interrupted, roomThreadID: group.roomThreadID)
+            guard let group = try? botStore.group(id: turn.groupID) else { continue }
+            move(
+                turn,
+                from: [.running],
+                to: .interrupted,
+                expectedMemberRunID: turn.memberRunID,
+                error: Self.interruptedError,
+                roomThreadID: group.roomThreadID,
+                outcome: .needsAttention
+            )
         }
         let pending = (try? botStore.listGroupTurns(groupID: nil, states: BotGroupTurn.State.pending)) ?? []
         groups.formUnion(pending.map(\.groupID))
@@ -297,7 +333,8 @@ final class BotGroupOrchestrator: AgentRunObserver {
     /// Called when a bot's VM is handed to `memberThreadID`: starts the group
     /// turn waiting for it. False when the thread has no waiting group turn.
     func resumeWaitingTurn(memberThreadID: AgentThreadID) async -> Bool {
-        guard let conversation = try? botStore.conversationLinked(to: memberThreadID),
+        guard router != nil,
+              let conversation = try? botStore.conversationLinked(to: memberThreadID),
               let groupID = conversation.groupID,
               let waiting = try? botStore.listGroupTurns(groupID: groupID, states: [.waitingForBot]),
               waiting.contains(where: { $0.botID == conversation.botID }) else { return false }
@@ -336,16 +373,16 @@ final class BotGroupOrchestrator: AgentRunObserver {
         // True when the turn failed here; false when it had already moved on
         // (the loop stops instead of retrying a turn it cannot change).
         func fail(_ message: String, runID: AgentRunID?) -> Bool {
-            guard let failed = try? botStore.transitionGroupTurn(
-                id: turn.id,
+            if let runID { ownedRunIDs.remove(runID) }
+            return move(
+                turn,
                 from: runID == nil ? BotGroupTurn.State.pending : [.running],
                 to: .failed,
                 expectedMemberRunID: runID,
-                error: message
-            ) else { return false }
-            settleRoomRow(failed, roomThreadID: roomThreadID, outcome: .needsAttention)
-            publishTurn(failed, roomThreadID: roomThreadID)
-            return true
+                error: message,
+                roomThreadID: roomThreadID,
+                outcome: .needsAttention
+            ) != nil
         }
 
         guard let bot = try? botStore.get(id: turn.botID), bot.deletedAt == nil,
@@ -364,9 +401,8 @@ final class BotGroupOrchestrator: AgentRunObserver {
 
         // D12: one run per bot VM. Another thread holds it: wait, persisted.
         if onVM, let holder = BotVMRunRegistry.shared.active(botID: bot.id), holder.threadID != threadID {
-            if turn.state != .waitingForBot,
-               let waiting = try? botStore.transitionGroupTurn(id: turn.id, from: [.planned], to: .waitingForBot) {
-                publishTurn(waiting, roomThreadID: roomThreadID)
+            if turn.state != .waitingForBot {
+                move(turn, from: [.planned], to: .waitingForBot, roomThreadID: roomThreadID)
             }
             router.waitForBotVM(botID: bot.id, thread: threadID, holder: holder)
             return false
@@ -378,14 +414,15 @@ final class BotGroupOrchestrator: AgentRunObserver {
         }
 
         let runID = AgentRunID()
-        guard let running = try? botStore.transitionGroupTurn(
-            id: turn.id,
+        guard move(
+            turn,
             from: BotGroupTurn.State.pending,
             to: .running,
             memberRunID: runID,
-            clearError: true
-        ) else { return false }
-        publishTurn(running, roomThreadID: roomThreadID)
+            clearError: true,
+            roomThreadID: roomThreadID
+        ) != nil else { return false }
+        ownedRunIDs.insert(runID)
 
         if onVM {
             let failure: String?
@@ -458,8 +495,9 @@ final class BotGroupOrchestrator: AgentRunObserver {
             )
             guard result.status != .queued else {
                 // The thread turned busy after the check: the compiled turn must
-                // never run later as if the user had typed it.
-                if let queued = result.queuedMessage { _ = try? queuedMessageRepo.delete(id: queued.id) }
+                // never run later as if the user had typed it. Cancelled the way
+                // the user cancels one, so iOS drops the queued row it was sent.
+                if let queued = result.queuedMessage { _ = try? router.cancelAgentQueuedMessage(id: queued.id) }
                 return fail("\(bot.name) is busy in its private thread. Retry when it finishes.", runID: runID)
             }
             guard result.runId == runID else {
@@ -467,14 +505,15 @@ final class BotGroupOrchestrator: AgentRunObserver {
             }
         } catch let busy as BotVMBusyError {
             // The VM was taken between the check and the start.
-            if let waiting = try? botStore.transitionGroupTurn(
-                id: turn.id,
+            ownedRunIDs.remove(runID)
+            if move(
+                turn,
                 from: [.running],
                 to: .waitingForBot,
                 expectedMemberRunID: runID,
-                clearMemberRunID: true
-            ) {
-                publishTurn(waiting, roomThreadID: roomThreadID)
+                clearMemberRunID: true,
+                roomThreadID: roomThreadID
+            ) != nil {
                 router.waitForBotVM(botID: bot.id, thread: threadID, holder: busy.holder)
             }
             return false
@@ -520,6 +559,9 @@ final class BotGroupOrchestrator: AgentRunObserver {
         }
         // Same default as a new desk conversation: an empty Distill model
         // resolves to the last-used, then the first listed model.
+        // Known gap (T3): the default permission mode asks before tool
+        // actions, and this hidden thread has no surface for the approval
+        // yet; the turn waits until Stop. T4/T5 project it to the room.
         var routing = BotDeskRouting()
         let snapshots = router.cachedProviderSnapshotsForSend()
         routing.model = BotsViewModel.resolvedUnlinkedDeskModel(
@@ -590,10 +632,12 @@ final class BotGroupOrchestrator: AgentRunObserver {
 
     /// Settles the turn that owns `runID`. A finish of any other run (an older
     /// run, a retried turn's previous run) matches nothing and changes nothing.
+    /// The turn is found by its run alone (unique, compare-and-set guarded):
+    /// a bot deleted mid-turn has no member conversation any more.
     func settle(runID: AgentRunID, threadID: AgentThreadID, status: AgentRunStatus, finalMessage: String?) {
-        guard let turn = (try? botStore.listGroupTurns(groupID: nil, states: [.running]))?
+        guard ownedRunIDs.remove(runID) != nil,
+              let turn = (try? botStore.listGroupTurns(groupID: nil, states: [.running]))?
                 .first(where: { $0.memberRunID == runID }),
-              memberThreadID(groupID: turn.groupID, botID: turn.botID) == threadID,
               let group = try? botStore.group(id: turn.groupID) else { return }
         let roomThreadID = group.roomThreadID
         defer { schedulePump(group.id) }
@@ -605,22 +649,25 @@ final class BotGroupOrchestrator: AgentRunObserver {
             let error = state == .cancelled ? nil
                 : ((try? runRepo.errorMessage(of: runID)) ?? nil)
                     ?? (status == .completed ? "The bot finished without a reply." : "The bot's run ended with \(status.rawValue).")
-            guard let settled = try? botStore.transitionGroupTurn(
-                id: turn.id, from: [.running], to: state, expectedMemberRunID: runID, error: error
-            ) else { return }
-            settleRoomRow(
-                settled,
+            move(
+                turn,
+                from: [.running],
+                to: state,
+                expectedMemberRunID: runID,
+                error: error,
                 roomThreadID: roomThreadID,
                 outcome: state == .cancelled ? .note(Self.stoppedNote) : .needsAttention
             )
-            publishTurn(settled, roomThreadID: roomThreadID)
             return
         }
-        guard let completed = try? botStore.transitionGroupTurn(
-            id: turn.id, from: [.running], to: .completed, expectedMemberRunID: runID
+        guard let completed = move(
+            turn,
+            from: [.running],
+            to: .completed,
+            expectedMemberRunID: runID,
+            roomThreadID: roomThreadID,
+            outcome: .reply(reply)
         ) else { return }
-        settleRoomRow(completed, roomThreadID: roomThreadID, outcome: .reply(reply))
-        publishTurn(completed, roomThreadID: roomThreadID)
         planHandOff(after: completed, reply: reply, group: group)
     }
 
@@ -653,9 +700,17 @@ final class BotGroupOrchestrator: AgentRunObserver {
             )
         }
         let botsByID = Dictionary(participants.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        if !handOffs.isEmpty, (try? botStore.insertGroupTurns(handOffs)) != nil {
-            try? writeWaitingRows(for: handOffs, roomThreadID: group.roomThreadID, bots: botsByID, after: now)
-            handOffs.forEach { publishTurn($0, roomThreadID: group.roomThreadID) }
+        if !handOffs.isEmpty {
+            let rows = waitingRows(for: handOffs, roomThreadID: group.roomThreadID, bots: botsByID, after: now)
+            do {
+                try botStore.insertGroupTurns(handOffs) {
+                    for row in rows { try self.messageRepo.append(row) }
+                }
+                rows.forEach(publishRow)
+                handOffs.forEach { publishTurn($0, roomThreadID: group.roomThreadID) }
+            } catch {
+                botGroupLog.error("bot.group.handoff_failed group=\(group.id.value.uuidString, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            }
         }
         if !plan.pausedBotIDs.isEmpty {
             let paused = plan.pausedBotIDs.compactMap { botsByID[$0] }
@@ -688,10 +743,91 @@ final class BotGroupOrchestrator: AgentRunObserver {
 
     static let stoppedNote = "stopped before answering."
     static let supersededNote = "did not answer: a newer message took over."
+    static let removedNote = "was removed before answering."
     static let interruptedError = "RemoteCode closed while this turn was running."
 
-    /// Replaces the turn's waiting row in place (same id, same position).
-    private func settleRoomRow(_ turn: BotGroupTurn, roomThreadID: AgentThreadID, outcome: RowOutcome) {
+    /// Moves the turn and, with `outcome`, rewrites its room row in the same
+    /// transaction, then publishes the row and the turn once each. Nil when
+    /// the turn had already moved on, or when the write failed (logged; the
+    /// turn keeps its state and its row, and a turn left running is
+    /// interrupted with its row at the next launch).
+    @discardableResult
+    private func move(
+        _ turn: BotGroupTurn,
+        from expected: [BotGroupTurn.State],
+        to state: BotGroupTurn.State,
+        expectedMemberRunID: AgentRunID? = nil,
+        memberRunID: AgentRunID? = nil,
+        clearMemberRunID: Bool = false,
+        error: String? = nil,
+        clearError: Bool = false,
+        roomThreadID: AgentThreadID,
+        outcome: RowOutcome? = nil
+    ) -> BotGroupTurn? {
+        let row = outcome.map { roomRow(for: turn, roomThreadID: roomThreadID, outcome: $0) }
+        let moved: BotGroupTurn?
+        do {
+            moved = try botStore.transitionGroupTurn(
+                id: turn.id,
+                from: expected,
+                to: state,
+                expectedMemberRunID: expectedMemberRunID,
+                memberRunID: memberRunID,
+                clearMemberRunID: clearMemberRunID,
+                error: error,
+                clearError: clearError,
+                alsoWriting: { _ in if let row { try self.messageRepo.append(row) } }
+            )
+        } catch let failure {
+            botGroupLog.error("bot.group.turn_move_failed turn=\(turn.id.value.uuidString, privacy: .public) to=\(state.rawValue, privacy: .public) error=\(failure.localizedDescription, privacy: .public)")
+            return nil
+        }
+        guard let moved else { return nil }
+        if let row { publishRow(row) }
+        publishTurn(moved, roomThreadID: roomThreadID)
+        return moved
+    }
+
+    /// The bot was deleted. The delete already cancelled its unstarted turns
+    /// (`cancelledTurnIDs`): their rows settle here. Its running turn stops;
+    /// the rest of each group goes on.
+    func botWasDeleted(_ botID: BotID, cancelledTurnIDs: [BotGroupTurnID]) {
+        var groups = Set<BotGroupID>()
+        for turnID in cancelledTurnIDs {
+            guard let turn = try? botStore.groupTurn(id: turnID), turn.state == .cancelled,
+                  let group = try? botStore.group(id: turn.groupID) else { continue }
+            groups.insert(group.id)
+            let row = roomRow(for: turn, roomThreadID: group.roomThreadID, outcome: .note(Self.removedNote))
+            do {
+                try writeRoomRow(row)
+            } catch {
+                botGroupLog.error("bot.group.removed_row_failed turn=\(turnID.value.uuidString, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            }
+            publishTurn(turn, roomThreadID: group.roomThreadID)
+        }
+        let running = ((try? botStore.listGroupTurns(groupID: nil, states: [.running])) ?? [])
+            .filter { $0.botID == botID }
+        for turn in running {
+            guard let runID = turn.memberRunID,
+                  let group = try? botStore.group(id: turn.groupID) else { continue }
+            groups.insert(group.id)
+            guard move(
+                turn,
+                from: [.running],
+                to: .cancelled,
+                expectedMemberRunID: runID,
+                roomThreadID: group.roomThreadID,
+                outcome: .note(Self.removedNote)
+            ) != nil else { continue }
+            ownedRunIDs.remove(runID)
+            coordinator.stopRun(runID)
+        }
+        groups.forEach(schedulePump)
+    }
+
+    /// The turn's settled row: it replaces the waiting row in place (same
+    /// id, same position).
+    private func roomRow(for turn: BotGroupTurn, roomThreadID: AgentThreadID, outcome: RowOutcome) -> AgentMessage {
         let existing = try? messageRepo.get(id: turn.roomMessageID)
         let identity = identityForRow(turn: turn, existing: existing)
         let content: String
@@ -707,13 +843,13 @@ final class BotGroupOrchestrator: AgentRunObserver {
             content = "\(identity.name) (\(BotPeerTranscript.handleLabel(identity.handle))) \(text)"
             role = .system
         }
-        try? writeRoomRow(AgentMessage(
+        return AgentMessage(
             id: turn.roomMessageID,
             threadId: roomThreadID,
             role: role,
             content: content,
             createdAt: existing?.createdAt ?? turn.createdAt
-        ))
+        )
     }
 
     /// The bot as the room shows it: the live bot, or the identity the
@@ -730,31 +866,38 @@ final class BotGroupOrchestrator: AgentRunObserver {
         )
     }
 
-    private func writeWaitingRows(
+    private func waitingRows(
         for turns: [BotGroupTurn],
         roomThreadID: AgentThreadID,
         bots: [BotID: BotDefinition],
         after date: Date
-    ) throws {
-        for (index, turn) in turns.enumerated() {
+    ) -> [AgentMessage] {
+        turns.enumerated().map { index, turn in
             let bot = bots[turn.botID] ?? identityForRow(turn: turn, existing: nil)
-            try writeRoomRow(AgentMessage(
+            return AgentMessage(
                 id: turn.roomMessageID,
                 threadId: roomThreadID,
                 role: .assistant,
                 content: BotPeerTranscript.encodeActivity(peer: bot, phase: .waiting),
                 // Strictly after the trigger so every client orders the rows the same.
                 createdAt: date.addingTimeInterval(Double(index + 1) / 1000)
-            ))
+            )
         }
     }
 
-    /// One durable room write, one `agent.message.appended`, one local repaint.
+    /// One durable room write, then its event and repaint.
     private func writeRoomRow(_ message: AgentMessage) throws {
         try messageRepo.append(message)
+        publishRow(message)
+    }
+
+    /// One `agent.message.appended` (with the stored body revision, which a
+    /// row replaced in place bumps) and one local repaint for a written row.
+    private func publishRow(_ message: AgentMessage) {
+        let revision = ((try? messageRepo.bodyRevision(id: message.id)) ?? nil) ?? 1
         EventBus.shared.publish(
             kind: .agentMessageAppended,
-            payload: AgentMessageTransport.appendedEventPayload(from: message)
+            payload: AgentMessageTransport.appendedEventPayload(from: message, bodyRevision: revision)
         )
         router?.projectAgentAppPeerMessage(threadID: message.threadId, messageID: message.id)
     }
