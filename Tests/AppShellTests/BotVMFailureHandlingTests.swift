@@ -238,6 +238,42 @@ final class BotVMFailureHandlingTests: XCTestCase {
         XCTAssertTrue(create.contains("\(ws):\(ws)"), "missing bind in \(create)")
     }
 
+    /// WHY: the guest distill build is ~224 MB; a bot VM preflight with Docker up
+    /// must start its download in the background for the daemon's architecture,
+    /// so the first in-guest run (or the first after a host update) does not wait for it.
+    func test_preflightPrefetchesGuestDistillForTheDockerArchitecture() async throws {
+        let f = try makeFixture()
+        let docker = RecordingDockerRun()
+        f.router.botVMDocker = BotComputerDockerCLI(run: { args in
+            args.first == "info" ? Data(" OSType: linux\n Architecture: aarch64\n".utf8) : try docker.run(args)
+        })
+        try f.ctx.settingsRepo.set("cli.distill.path", "/usr/bin/true")
+        let requested = LockedURLs()
+        f.ctx.distillGuestBinaries = DistillGuestBinaryProvisioner(
+            guestToolsRoot: f.workspaceDir.appendingPathComponent("guest-tools"),
+            fetch: { url, _ in
+                requested.append(url)
+                throw DistillGuestBinaryError.downloadFailed(url: url.absoluteString, status: 404)
+            },
+            versionProbe: { _ in "distill 2.0.31 (test)" }
+        )
+        let failure = await f.router.botVMPreflight(f.bot.id, workspace: f.workspaceDir.path)
+        XCTAssertNil(failure, "a prefetch must never block or fail the send")
+        let deadline = Date().addingTimeInterval(5)
+        while requested.urls.isEmpty, Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(
+            requested.urls.first?.absoluteString,
+            "https://github.com/samuelfaj/distill/releases/download/v2.0.31/SHA256SUMS"
+        )
+    }
+
+    private final class LockedURLs: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: [URL] = []
+        var urls: [URL] { lock.withLock { stored } }
+        func append(_ url: URL) { lock.withLock { stored.append(url) } }
+    }
+
     /// WHY: an unregistered path must block the send instead of mounting arbitrary host directories.
     func test_preflightRefusesUnregisteredWorkspace() async throws {
         let f = try makeFixture()

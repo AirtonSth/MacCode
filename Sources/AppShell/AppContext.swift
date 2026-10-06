@@ -383,6 +383,10 @@ public final class AppContext {
             if succeeded { await self.router?.refreshDistillProviderCatalog() }
         }
     }()
+    /// One per app so every bot shares the guest distill cache and its downloads.
+    public lazy var distillGuestBinaries = DistillGuestBinaryProvisioner(
+        guestToolsRoot: BotComputerGuestSpec.guestToolsURL(appSupport: appSupportDirectory)
+    )
     let projectScriptRuns = ProjectScriptRunRegistry()
     public private(set) var remoteCodeOrchestrateInstallResult: RemoteCodeOrchestrateInstallResult?
     public private(set) var remoteCodeOrchestrateStatus: RemoteCodeOrchestrateStatus?

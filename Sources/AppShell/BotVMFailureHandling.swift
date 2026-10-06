@@ -44,9 +44,10 @@ extension AppCommandRouter {
         let docker = botVMDocker
         let service = botVMService(appSupport: ctx.appSupportDirectory)
         let registered = Set(ctx.state.workspaces.values.map(\.cwd))
+        let prefetch = guestDistillPrefetch()
         return await Task.detached(priority: .userInitiated) { () -> String? in
             do {
-                _ = try docker.info()
+                prefetch(try docker.info())
                 if BotVMRunRegistry.shared.active(botID: botID) == nil {
                     try service.ensureWorkspaceMounted(botID: botID, workspace: workspace, registered: registered)
                 }
@@ -65,13 +66,32 @@ extension AppCommandRouter {
         )
     }
 
+    /// Starts the guest distill download in the background when Docker is up
+    /// and distill is installed on the Mac, so a bot's first in-guest run, or
+    /// its first run after a host distill update, does not wait for it.
+    func guestDistillPrefetch() -> @Sendable (_ dockerInfo: String) -> Void {
+        guard let ctx = context else { return { _ in } }
+        let provisioner = ctx.distillGuestBinaries
+        let override = (try? ctx.settingsRepo.get("cli.distill.path")) ?? nil
+        return { info in
+            guard let arch = DistillGuestBinaryProvisioner.dockerArchitecture(fromInfo: info),
+                  let host = DistillProvisioner.resolveInstalledBinary(override: override) else { return }
+            provisioner.prefetch(hostBinary: host, dockerArch: arch)
+        }
+    }
+
     /// nil on success; otherwise the user-facing failure.
     func provisionBotVM(_ botID: BotID) async -> String? {
         guard let appSupport = context?.appSupportDirectory else { return "Contexto indisponível." }
         let service = botVMService(appSupport: appSupport)
+        let docker = botVMDocker
+        let prefetch = guestDistillPrefetch()
         return await Task.detached(priority: .userInitiated) { () -> String? in
             do {
                 _ = try service.provision(botID: botID)
+                Task.detached(priority: .utility) {
+                    if let info = try? docker.info() { prefetch(info) }
+                }
                 return nil
             } catch {
                 return (error as? LocalizedError)?.errorDescription ?? String(describing: error)
