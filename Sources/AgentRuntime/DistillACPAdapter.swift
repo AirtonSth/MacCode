@@ -176,6 +176,12 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         var onEvent: (@Sendable (AgentRunEvent) -> Void)?
         var history: DistillACPHistoryRetention
         var pendingPermissions: [String: PendingPermission] = [:]
+        /// Provider failure text from `x.ai/session/prompt_complete`
+        /// (`stopReason: "error"`) for `generation`. Fallback for peers that
+        /// answer the failed `session/prompt` with a bare "Internal error".
+        var promptFailureDetail: (generation: UInt64, text: String)?
+        /// The provider rejected this session's own history; never prompt it again.
+        var historyIncompatible = false
 
         init(
             threadId: AgentThreadID,
@@ -250,6 +256,10 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     private static let discoveryCacheLock = NSLock()
     private static var sharedDiscoveryCache: [String: (result: DistillACPDiscoveryResult, fetchedAt: Date)] = [:]
     private var sessions: [AgentThreadID: Session] = [:]
+    /// Provider sessions whose history the model rejected. A Retry (or a resume
+    /// after the live process ended) must open a new session instead of
+    /// replaying the same history into the same 400.
+    private var retiredProviderThreadIds: Set<String> = []
     private var promptWriteAcceptanceCountForTestingStorage = 0
     var beforePromptWriteForTesting: (() -> Void)?
     var beforePhysicalPromptWriteForTesting: (() -> Void)?
@@ -495,6 +505,21 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         }
         let existing = synchronized { sessions[request.threadId] }
         guard let existing else {
+            if let resumeId = request.providerThreadId, !resumeId.isEmpty {
+                let retired = synchronized { retiredProviderThreadIds.contains(resumeId) }
+                let previousModel = request.priorProviderSessionModel
+                let reason: FreshSessionReason?
+                if retired {
+                    reason = .incompatibleHistory
+                } else if Self.isCrossModelFamilySwitch(from: previousModel, to: request.model) {
+                    reason = .modelFamilySwitch(from: previousModel ?? "")
+                } else {
+                    reason = nil
+                }
+                if let reason {
+                    return try await openFreshSession(request, reason: reason, onEvent: onEvent)
+                }
+            }
             return try await openSession(
                 request,
                 loadExisting: request.providerThreadId?.isEmpty == false,
@@ -502,8 +527,141 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 startPrompt: true
             )
         }
+        let reason: FreshSessionReason? = synchronized {
+            // An in-flight session is never replaced; startPrompt refuses it.
+            guard !existing.inFlight else { return nil }
+            if existing.historyIncompatible || retiredProviderThreadIds.contains(existing.providerThreadId) {
+                return .incompatibleHistory
+            }
+            let previousModel = existing.mainModelSelection ?? existing.model
+            return Self.isCrossModelFamilySwitch(from: previousModel, to: request.model)
+                ? .modelFamilySwitch(from: previousModel)
+                : nil
+        }
+        if let reason {
+            return try await openFreshSession(request, reason: reason, onEvent: onEvent)
+        }
         try await startPrompt(request, session: existing, onEvent: onEvent)
         return handle(for: request.runId, session: existing)
+    }
+
+    /// Why a turn must run in a new Distill session instead of the thread's one.
+    enum FreshSessionReason: Equatable {
+        /// Main moved between model families. Distill replays the old family's
+        /// reasoning items verbatim (Anthropic receives unsigned `thinking`
+        /// blocks and rejects the whole request), so the old session cannot
+        /// serve the new model.
+        case modelFamilySwitch(from: String)
+        /// The provider already rejected this session's history.
+        case incompatibleHistory
+    }
+
+    enum ModelFamily: Equatable {
+        /// `claude/*` models served through the Anthropic Messages API.
+        case anthropicMessages
+        case other
+    }
+
+    /// Distill has no backend field in its ACP model catalog, so the family is
+    /// derived from the id prefix Distill gives its Anthropic models.
+    static func modelFamily(of modelId: String) -> ModelFamily {
+        let id = modelId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return id.hasPrefix("claude/") || id.hasPrefix("anthropic/") ? .anthropicMessages : .other
+    }
+
+    static func isCrossModelFamilySwitch(from previousModel: String?, to nextModel: String) -> Bool {
+        let previous = previousModel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let next = nextModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !previous.isEmpty, !next.isEmpty else { return false }
+        return modelFamily(of: previous) != modelFamily(of: next)
+    }
+
+    struct FreshSessionSeed: Sendable {
+        let handoff: String
+        let notice: String
+    }
+
+    static let modelFamilySwitchNotice = "Switched model family — started a new Distill session"
+    static let incompatibleHistoryNotice = "The model rejected the previous Distill session's history — started a new Distill session"
+    static let handoffMaxCharacters = 16_000
+    static let handoffMaxItemCharacters = 2_000
+
+    /// Compact handoff of the app's own transcript for the first prompt of a
+    /// replacement session. Most recent messages win the budget.
+    static func freshSessionHandoff(
+        reason: FreshSessionReason,
+        newModel: String,
+        snapshot: TokenSaverCanonicalConversationSnapshot?
+    ) -> String {
+        var header = "[RemoteCode context handoff] This conversation started in an earlier Distill session"
+        switch reason {
+        case .modelFamilySwitch(let previousModel):
+            header += " on \(previousModel). It moved to \(newModel), a different model family, so it continues in a new session."
+        case .incompatibleHistory:
+            header += " whose history \(newModel) rejected, so it continues in a new session."
+        }
+        header += " Earlier tool results and files read are not loaded here; re-read anything you need."
+        let items = snapshot?.items ?? []
+        guard !items.isEmpty else {
+            return header + " The earlier conversation is not available; ask the user for any detail you need from it."
+        }
+        var budget = handoffMaxCharacters
+        var kept: [String] = []
+        for item in items.reversed() {
+            let speaker = item.role == .user ? "User" : "Assistant"
+            var text = item.canonicalText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            if text.count > handoffMaxItemCharacters {
+                text = String(text.prefix(handoffMaxItemCharacters)) + "…"
+            }
+            let line = "\(speaker): \(text)"
+            guard line.count <= budget else { break }
+            budget -= line.count
+            kept.append(line)
+        }
+        let omitted = items.count - kept.count
+        var body = header + " Earlier conversation, oldest first:"
+        if omitted > 0 {
+            body += "\n\n(\(omitted) earlier message\(omitted == 1 ? "" : "s") omitted)"
+        }
+        for line in kept.reversed() {
+            body += "\n\n" + line
+        }
+        return body + "\n\n[End of handoff. The user's new message follows.]"
+    }
+
+    private func openFreshSession(
+        _ request: AgentRunRequest,
+        reason: FreshSessionReason,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        let reasonLabel: String
+        let notice: String
+        switch reason {
+        case .modelFamilySwitch:
+            reasonLabel = "model_family_switch"
+            notice = Self.modelFamilySwitchNotice
+        case .incompatibleHistory:
+            reasonLabel = "incompatible_history"
+            notice = Self.incompatibleHistoryNotice
+        }
+        distillAcpLog.info(
+            "distill.session.fresh thread=\(request.threadId.value.uuidString, privacy: .public) reason=\(reasonLabel, privacy: .public)"
+        )
+        return try await openSession(
+            request,
+            loadExisting: false,
+            onEvent: onEvent,
+            startPrompt: true,
+            freshSession: FreshSessionSeed(
+                handoff: Self.freshSessionHandoff(
+                    reason: reason,
+                    newModel: request.model,
+                    snapshot: request.contextSnapshot
+                ),
+                notice: notice
+            )
+        )
     }
 
     public func interruptTurn(threadId: AgentThreadID) throws {
@@ -748,7 +906,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         _ request: AgentRunRequest,
         loadExisting: Bool,
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void,
-        startPrompt shouldStartPrompt: Bool
+        startPrompt shouldStartPrompt: Bool,
+        freshSession: FreshSessionSeed? = nil
     ) async throws -> AgentRunHandle {
         guard !request.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AgentProviderAdapterError.unsupported("Select an explicit Distill Main model before running.")
@@ -914,7 +1073,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             }
             session.mapper.sealHydration()
             if shouldStartPrompt {
-                try await startPrompt(request, session: session, onEvent: onEvent)
+                try await startPrompt(request, session: session, onEvent: onEvent, freshSession: freshSession)
             } else {
                 session.status = .completed
             }
@@ -937,7 +1096,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     private func startPrompt(
         _ request: AgentRunRequest,
         session: Session,
-        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void,
+        freshSession: FreshSessionSeed? = nil
     ) async throws {
         let promptGeneration: UInt64 = try synchronized {
             guard sessions[request.threadId] === session, session.isLive else {
@@ -956,6 +1116,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             session.forceKillWorkItem?.cancel()
             session.forceKillWorkItem = nil
             session.promptGeneration &+= 1
+            session.promptFailureDetail = nil
             session.onEvent = onEvent
             cancelTurnWatchdogLocked(session: session)
             return session.promptGeneration
@@ -1144,6 +1305,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                             request: request,
                             capabilities: session.capabilities,
                             writePermit: session.promptWritePermit,
+                            contextHandoff: freshSession?.handoff,
                             beforeWrite: { [weak self] in
                                 self?.beforePhysicalPromptWriteForTesting?()
                             },
@@ -1162,6 +1324,9 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                                 }
                                 for event in session.mapper.beginTurn() {
                                     self.emit(event, session: session)
+                                }
+                                if let notice = freshSession?.notice {
+                                    self.emitFreshSessionNotice(notice, session: session)
                                 }
                                 onEvent(.status(.running))
                                 self.refreshTurnWatchdog(session: session, generation: promptGeneration)
@@ -1200,6 +1365,13 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     method: method,
                     params: params
                 )
+                if let failure = ACPRPCErrorPayload.promptCompleteFailure(
+                    method: resolvedMethod,
+                    payload: resolvedPayload,
+                    sessionId: session.providerThreadId
+                ) {
+                    synchronized { session.promptFailureDetail = (session.promptGeneration, failure) }
+                }
                 emit(Self.runtimeEvent(method: resolvedMethod, payload: resolvedPayload), session: session)
             }
             return
@@ -1319,10 +1491,13 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         for event in session.mapper.finishTurn(stopReason: stopReason, usage: usage) { emit(event, session: session) }
         let status = DistillACPTerminalClassifier.status(stopReason: stopReason)
         if status == .failed {
-            session.onEvent?(.error(DistillACPFailureTaxonomy.normalize(
-                diagnostic: "Distill ACP stopped: \(stopReason)",
+            let detail = currentPromptFailureDetail(session: session).map { ": \($0)" } ?? ""
+            let failure = DistillACPFailureTaxonomy.normalize(
+                diagnostic: "Distill ACP stopped: \(stopReason)\(detail)",
                 context: .turn
-            ).message))
+            )
+            retireSessionIfHistoryIncompatible(failure, session: session)
+            session.onEvent?(.error(failure.message))
         }
         finishTurn(session: session, status: status)
     }
@@ -1380,12 +1555,66 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         lock.unlock()
         guard active else { return }
         if terminal == .failed {
-            session.onEvent?(.error(DistillACPFailureTaxonomy.normalize(error, context: .turn).message))
+            let failure = DistillACPFailureTaxonomy.normalize(
+                Self.addingPromptFailureDetail(currentPromptFailureDetail(session: session), to: error),
+                context: .turn
+            )
+            retireSessionIfHistoryIncompatible(failure, session: session)
+            session.onEvent?(.error(failure.message))
         }
         for event in session.mapper.finishTurn(stopReason: terminal == .cancelled ? "cancelled" : "failed", usage: nil) {
             emit(event, session: session)
         }
         finishTurn(session: session, status: terminal)
+    }
+
+    /// `prompt_complete` failure text captured for the turn now in flight.
+    private func currentPromptFailureDetail(session: Session) -> String? {
+        synchronized {
+            guard let captured = session.promptFailureDetail,
+                  captured.generation == session.promptGeneration else { return nil }
+            return captured.text
+        }
+    }
+
+    /// A bare "Internal error" RPC failure borrows the provider text Distill
+    /// already sent as `prompt_complete.agentResult` for the same prompt.
+    static func addingPromptFailureDetail(_ detail: String?, to error: Error) -> Error {
+        guard let detail,
+              case let DistillACPError.rpcError(code, message, existing, httpStatus) = error,
+              existing == nil else { return error }
+        return DistillACPError.rpcError(code: code, message: message, detail: detail, httpStatus: httpStatus)
+    }
+
+    private func retireSessionIfHistoryIncompatible(_ failure: DistillACPFailure, session: Session) {
+        guard failure.category == .incompatibleHistory else { return }
+        synchronized {
+            session.historyIncompatible = true
+            retiredProviderThreadIds.insert(session.providerThreadId)
+        }
+        distillAcpLog.info(
+            "distill.session.retired thread=\(session.threadId.value.uuidString, privacy: .public) reason=incompatible_history"
+        )
+    }
+
+    /// Visible transcript row for a replacement session (Agent App, bot desk
+    /// and the iOS mirror all render the persisted item).
+    private func emitFreshSessionNotice(_ notice: String, session: Session) {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let itemId = "distill-fresh-session-\(session.providerThreadId)"
+        let turnId = session.mapper.activeTurnId ?? ""
+        emit(.itemStarted(item: AssistantItem(
+            id: itemId,
+            turnId: turnId,
+            type: .contextCompaction,
+            state: .completed,
+            summary: notice,
+            body: notice,
+            startedAtMs: now,
+            finishedAtMs: now
+        )), session: session)
+        emit(.itemCompleted(itemId: itemId, finalState: .completed), session: session)
+        emit(.contextCompaction(summary: notice), session: session)
     }
 
     private func finishTurn(session: Session, status: AgentRunStatus) {

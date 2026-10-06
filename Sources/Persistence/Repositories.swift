@@ -8336,6 +8336,20 @@ public final class ProviderSessionRuntimeRepository {
         return statement.columnText(0)
     }
 
+    /// Cheap probe of the model the persisted provider session last ran, only
+    /// when its resume cursor is still `resumeCursor`. Nil otherwise. Distill
+    /// uses it before `session/load` to avoid replaying another model family's
+    /// history into the new Main model.
+    public func sessionModel(of threadId: AgentThreadID, resumeCursor: String) throws -> String? {
+        let statement = try db.prepare(
+            "SELECT model FROM provider_session_runtime WHERE thread_id = ? AND resume_cursor = ? LIMIT 1;"
+        )
+        try statement.bind(1, threadId.value.uuidString)
+        try statement.bind(2, resumeCursor)
+        guard try statement.step() else { return nil }
+        return statement.columnText(0)
+    }
+
     /// Cheap last-error probe for finish-path terminal claim. Avoids the
     /// 16-column `get` (including `runtime_payload_json`) when in-memory
     /// `latestRunErrorMessages` is empty. Returns nil when the durable row

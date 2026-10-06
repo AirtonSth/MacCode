@@ -691,6 +691,10 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     public var contextSnapshot: TokenSaverCanonicalConversationSnapshot?
     /// Prepared RCSEED1 document for a confirmed fresh-fallback destination.
     public var preparedContextSeed: TokenSaverPreparedContextSeed?
+    /// Model the persisted provider session (`providerThreadId`) last ran.
+    /// Runtime-only. Lets Distill detect a cross-family Main switch when it
+    /// must `session/load` that session after an app restart.
+    public var priorProviderSessionModel: String?
 
     public init(
         runId: AgentRunID = AgentRunID(),

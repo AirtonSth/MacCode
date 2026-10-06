@@ -393,6 +393,62 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(result.models.map(\.id), ["grok-4.5"])
     }
 
+    func test_rpcErrorDataCarriesTheProviderFailureAndHTTPStatus() {
+        // WHY: Grok/Distill put the real provider failure in JSON-RPC error.data
+        // behind "-32603 Internal error"; users saw only "Internal error" and a
+        // 429/401 in data never reached the retry / Sign in taxonomy.
+        let parsed = ACPRPCErrorPayload.parse(
+            ["code": -32_603, "message": "Internal error",
+             "data": ["message": "API error (status 429 Too Many Requests): slow down", "http_status": 429]],
+            defaultMessage: "Unknown Grok ACP error"
+        )
+        XCTAssertEqual(parsed, .init(code: -32_603, message: "Internal error",
+                                     detail: "API error (status 429 Too Many Requests): slow down", httpStatus: 429))
+        let stringData = ACPRPCErrorPayload.parse(
+            ["code": -32_603, "message": "Internal error", "data": "invalid-argument: Invalid reasoning effort."],
+            defaultMessage: "Unknown Grok ACP error"
+        )
+        XCTAssertEqual(stringData.detail, "invalid-argument: Invalid reasoning effort.")
+        XCTAssertNil(stringData.httpStatus)
+
+        let error = GrokACPError.rpcError(code: parsed.code, message: parsed.message,
+                                          detail: parsed.detail, httpStatus: parsed.httpStatus)
+        XCTAssertEqual(error.description, "Grok ACP RPC error: API error (status 429 Too Many Requests): slow down",
+                       "a generic RPC message must be replaced by error.data.message")
+        XCTAssertEqual(GrokACPFailureTaxonomy.normalize(error, context: .turn).category, .rateLimited)
+        let auth = GrokACPError.rpcError(code: -32_603, message: "Internal error",
+                                         detail: "upstream rejected the request", httpStatus: 403)
+        XCTAssertEqual(GrokACPFailureTaxonomy.normalize(auth, context: .turn).category, .authRequired,
+                       "HTTP 401/403 in error.data must offer Sign in even though the RPC code is -32603")
+        XCTAssertEqual(
+            GrokACPError.rpcError(code: -32_602, message: "Invalid params", detail: "modelId is required").description,
+            "Grok ACP RPC error: Invalid params: modelId is required",
+            "a specific RPC message keeps its text and gains the detail"
+        )
+    }
+
+    func test_promptCompleteErrorFillsABareInternalErrorOnlyForItsSession() {
+        let payload: [String: Any] = ["sessionId": "s1", "promptId": "p", "stopReason": "error",
+                                      "agentResult": "API error (status 400 Bad Request): This model always engages in thinking"]
+        XCTAssertNil(ACPRPCErrorPayload.promptCompleteFailure(method: "_x.ai/session/prompt_complete", payload: payload, sessionId: "s2"),
+                     "another session's failure must never be shown for this turn")
+        XCTAssertNil(ACPRPCErrorPayload.promptCompleteFailure(
+            method: "_x.ai/session/prompt_complete",
+            payload: ["sessionId": "s1", "stopReason": "end_turn", "agentResult": NSNull()],
+            sessionId: "s1"
+        ))
+        let detail = ACPRPCErrorPayload.promptCompleteFailure(method: "x.ai/session/prompt_complete", payload: payload, sessionId: "s1")
+        let enriched = GrokACPAdapter.addingPromptFailureDetail(
+            detail,
+            to: GrokACPError.rpcError(code: -32_603, message: "Internal error")
+        )
+        XCTAssertEqual(String(describing: enriched),
+                       "Grok ACP RPC error: API error (status 400 Bad Request): This model always engages in thinking")
+        let withData = GrokACPError.rpcError(code: -32_603, message: "Internal error", detail: "from data")
+        XCTAssertEqual(String(describing: GrokACPAdapter.addingPromptFailureDetail(detail, to: withData)),
+                       "Grok ACP RPC error: from data", "error.data stays authoritative when present")
+    }
+
     func test_failureTaxonomyMapsOnlyExplicitRecoveryClassesAndSanitizesDiagnostics() {
         let auth = GrokACPFailureTaxonomy.normalize(
             GrokACPError.rpcError(

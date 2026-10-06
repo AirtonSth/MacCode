@@ -200,6 +200,11 @@ final class AgentAppViewModelTests: XCTestCase {
             message: "Grok ACP session/load failed: session not found",
             recoverable: false
         ), .startFresh, "an invalid resume cursor must not retry the same broken session")
+        XCTAssertEqual(AgentAppViewModel.errorRecoveryAction(
+            provider: .distill,
+            message: "[fresh-session:incompatible-history] The model rejected this Distill session's history; Retry starts a new Distill session: Distill ACP RPC error: API error (status 400 Bad Request): Invalid `signature` in `thinking` block",
+            recoverable: false
+        ), .retry, "the adapter retires the poisoned session, so Retry keeps the thread (and a bot desk link) instead of Start fresh")
         XCTAssertNil(AgentAppViewModel.errorRecoveryAction(
             provider: .codex,
             message: "invalid request payload",

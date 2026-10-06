@@ -2295,6 +2295,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             hasUnread: false
         )
         if let repo = providerSessionRepo {
+            // Read before the pending upsert below overwrites `model`: Distill
+            // must not `session/load` another model family's history (Anthropic
+            // rejects foreign unsigned reasoning as an invalid thinking block).
+            if effectiveRequest.provider == .distill,
+               let resumeCursor = effectiveRequest.providerThreadId, !resumeCursor.isEmpty {
+                effectiveRequest.priorProviderSessionModel = try? repo.sessionModel(
+                    of: effectiveRequest.threadId,
+                    resumeCursor: resumeCursor
+                )
+            }
             // Payload JSON only. A leftover 16-column session `get`
             // (including cwd/model/status/error) hitchs every send just
             // to copy `runtime_payload_json` into the pending upsert.

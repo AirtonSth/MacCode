@@ -6,7 +6,9 @@ public enum DistillACPError: Error, CustomStringConvertible {
     case missingBinary(String)
     case spawnFailed(String)
     case invalidJSON(String)
-    case rpcError(code: Int?, message: String)
+    /// `detail` / `httpStatus` come from JSON-RPC `error.data`, where the peer puts
+    /// the provider's real failure behind a generic `-32603 Internal error`.
+    case rpcError(code: Int?, message: String, detail: String? = nil, httpStatus: Int? = nil)
     case processExited(reason: Process.TerminationReason, status: Int32, stderrTail: String)
     case responseTypeMismatch(String)
     case unsupported(String)
@@ -17,7 +19,8 @@ public enum DistillACPError: Error, CustomStringConvertible {
         case .missingBinary(let binary): return "Distill ACP binary not found: \(binary)"
         case .spawnFailed(let message): return "Failed to spawn Distill ACP: \(message)"
         case .invalidJSON(let line): return "Distill ACP emitted invalid JSON: \(line)"
-        case .rpcError(_, let message): return "Distill ACP RPC error: \(message)"
+        case .rpcError(_, let message, let detail, _):
+            return "Distill ACP RPC error: \(ACPRPCErrorPayload.describe(message: message, detail: detail))"
         case .processExited(let reason, let status, let stderr):
             let suffix = stderr.isEmpty ? "" : ": \(stderr)"
             return "Distill ACP process exited (\(reason == .exit ? "exit" : "signal") \(status))\(suffix)"
@@ -40,6 +43,11 @@ enum DistillACPFailureCategory: String, Sendable {
     case network
     case timeout
     case invalidResume
+    /// The provider rejected the session's own history (e.g. unsigned reasoning
+    /// from another model family replayed to Anthropic as a `thinking` block).
+    /// Re-sending into the same Distill session fails identically, so the
+    /// adapter retires it and the next turn opens a fresh session.
+    case incompatibleHistory
     case nonRecoverable
 }
 
@@ -57,6 +65,13 @@ enum DistillACPFailureTaxonomy {
     static let networkMarker = "[retryable:network]"
     static let timeoutMarker = "[retryable:timeout]"
     static let invalidResumeMarker = "[start-fresh:invalid-resume]"
+    /// Retry is safe because the adapter replaces the poisoned session; the
+    /// thread (and any bot desk link) is kept.
+    static let incompatibleHistoryMarker = "[fresh-session:incompatible-history]"
+    static let incompatibleHistoryMarkers = [
+        "invalid `signature` in `thinking` block", "invalid signature in thinking block",
+        "encrypted_content", "history is incompatible", "history incompatible"
+    ]
 
     static func normalize(_ error: Error, context: DistillACPFailureContext) -> DistillACPFailure {
         if let failure = error as? DistillACPFailure { return failure }
@@ -90,6 +105,8 @@ enum DistillACPFailureTaxonomy {
             prefix = "\(timeoutMarker) Distill request timed out"
         case .invalidResume:
             prefix = "\(invalidResumeMarker) Distill invalid resume"
+        case .incompatibleHistory:
+            prefix = "\(incompatibleHistoryMarker) The model rejected this Distill session's history; Retry starts a new Distill session"
         case .nonRecoverable:
             prefix = "Distill ACP failure"
         }
@@ -104,10 +121,17 @@ enum DistillACPFailureTaxonomy {
             switch error {
             case .requestTimedOut:
                 return .timeout
-            case .rpcError(let code, let message):
-                if code == 401 || code == 403 { return .authRequired }
-                if code == 429 { return .rateLimited }
-                return category(forDiagnostic: message, context: context)
+            case .rpcError(let code, let message, let detail, let httpStatus):
+                // The JSON-RPC code is -32603 for every provider failure; the
+                // provider's HTTP status rides in error.data.http_status.
+                for status in [httpStatus, code].compactMap({ $0 }) {
+                    if status == 401 || status == 403 { return .authRequired }
+                    if status == 429 { return .rateLimited }
+                }
+                return category(
+                    forDiagnostic: ACPRPCErrorPayload.describe(message: message, detail: detail),
+                    context: context
+                )
             default:
                 break
             }
@@ -120,11 +144,13 @@ enum DistillACPFailureTaxonomy {
         context: DistillACPFailureContext
     ) -> DistillACPFailureCategory {
         let normalized = diagnostic.lowercased()
+        if normalized.contains(incompatibleHistoryMarker) { return .incompatibleHistory }
         if normalized.contains(invalidResumeMarker) { return .invalidResume }
         if normalized.contains(authRequiredMarker) { return .authRequired }
         if normalized.contains(rateLimitedMarker) { return .rateLimited }
         if normalized.contains(timeoutMarker) { return .timeout }
         if normalized.contains(networkMarker) { return .network }
+        if incompatibleHistoryMarkers.contains(where: normalized.contains) { return .incompatibleHistory }
         let invalidResumeMarkers = [
             "invalid resume", "invalid_resume", "invalid-resume", "resume invalid",
             "resume is invalid", "resume cursor", "failed to resume",
@@ -1135,12 +1161,17 @@ public final class DistillACPClient: @unchecked Sendable {
         request: AgentRunRequest,
         capabilities: DistillACPInitializeResult,
         writePermit: AgentRunAcceptancePermit,
+        contextHandoff: String? = nil,
         beforeWrite: @escaping @Sendable () -> Void,
         onAccepted: @escaping @Sendable () throws -> Void
     ) async throws -> JSONObject {
         try await requestJSONObject(
             method: "session/prompt",
-            params: ["sessionId": sessionId, "prompt": try Self.promptBlocks(for: request, capabilities: capabilities)],
+            params: ["sessionId": sessionId, "prompt": try Self.promptBlocks(
+                for: request,
+                capabilities: capabilities,
+                contextHandoff: contextHandoff
+            )],
             timeout: nil,
             acceptancePermit: request.acceptancePermit,
             writePermit: writePermit,
@@ -1206,8 +1237,16 @@ public final class DistillACPClient: @unchecked Sendable {
         }
     }
 
-    public static func promptBlocks(for request: AgentRunRequest, capabilities: DistillACPInitializeResult) throws -> [JSONObject] {
+    /// `contextHandoff` seeds the first prompt of a replacement session with the
+    /// app's own record of the earlier conversation. It rides in its own block so
+    /// a `/command` prompt stays the first block Distill parses.
+    public static func promptBlocks(
+        for request: AgentRunRequest,
+        capabilities: DistillACPInitializeResult,
+        contextHandoff: String? = nil
+    ) throws -> [JSONObject] {
         var blocks: [JSONObject] = []
+        let handoff = contextHandoff?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // Distill owns mode semantics natively; send human text without generic provider prose.
         let providerPrompt = request.prompt
         // Additive: background-await self-declare marker so shell-detached
@@ -1223,8 +1262,10 @@ public final class DistillACPClient: @unchecked Sendable {
             // Distill parses `/name args` from the FIRST text block only, so the
             // directive rides in its own following block to keep args exact.
             blocks.append(["type": "text", "text": providerPrompt])
+            if !handoff.isEmpty { blocks.append(["type": "text", "text": handoff]) }
             if !alwaysOn.isEmpty { blocks.append(["type": "text", "text": alwaysOn]) }
         } else {
+            if !handoff.isEmpty { blocks.append(["type": "text", "text": handoff]) }
             let composed = providerPrompt.isEmpty
                 ? alwaysOn
                 : providerPrompt + "\n\n" + alwaysOn
@@ -1441,9 +1482,12 @@ public final class DistillACPClient: @unchecked Sendable {
         }
         if let id = object["id"] as? Int, object["method"] as? String == nil {
             if let error = object["error"] as? JSONObject {
+                let parsed = ACPRPCErrorPayload.parse(error, defaultMessage: "Unknown Distill ACP error")
                 completePending(id: id, result: .failure(DistillACPError.rpcError(
-                    code: error["code"] as? Int,
-                    message: error["message"] as? String ?? "Unknown Distill ACP error"
+                    code: parsed.code,
+                    message: parsed.message,
+                    detail: parsed.detail,
+                    httpStatus: parsed.httpStatus
                 )))
             } else {
                 completePending(id: id, result: .success(object["result"]))

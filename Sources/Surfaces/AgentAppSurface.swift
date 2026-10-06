@@ -9395,6 +9395,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         recoverable: Bool
     ) -> AgentErrorRecoveryAction? {
         let normalized = message.lowercased()
+        // `[fresh-session:…]`: the adapter already retired the session whose
+        // history the model rejected, so Retry re-runs the prompt in a new
+        // provider session on the SAME thread (a bot desk keeps its linked
+        // conversation). Start fresh would orphan the desk link instead.
+        if normalized.contains("[fresh-session:") {
+            return .retry
+        }
         let resumeInvalidMarkers = [
             "session not found", "session/load", "invalid session", "invalid resume",
             "resume cursor", "could not be resumed", "failed to resume", "resume invalid"

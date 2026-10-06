@@ -170,6 +170,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         var onEvent: (@Sendable (AgentRunEvent) -> Void)?
         var history: GrokACPHistoryRetention
         var pendingPermissions: [String: PendingPermission] = [:]
+        /// Provider failure text from `x.ai/session/prompt_complete`
+        /// (`stopReason: "error"`) for `generation`. Fallback for peers that
+        /// answer the failed `session/prompt` with a bare "Internal error".
+        var promptFailureDetail: (generation: UInt64, text: String)?
 
         init(
             threadId: AgentThreadID,
@@ -922,6 +926,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             session.forceKillWorkItem?.cancel()
             session.forceKillWorkItem = nil
             session.promptGeneration &+= 1
+            session.promptFailureDetail = nil
             session.onEvent = onEvent
             cancelTurnWatchdogLocked(session: session)
             return session.promptGeneration
@@ -1055,6 +1060,13 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                     method: method,
                     params: params
                 )
+                if let failure = ACPRPCErrorPayload.promptCompleteFailure(
+                    method: resolvedMethod,
+                    payload: resolvedPayload,
+                    sessionId: session.providerThreadId
+                ) {
+                    synchronized { session.promptFailureDetail = (session.promptGeneration, failure) }
+                }
                 emit(Self.runtimeEvent(method: resolvedMethod, payload: resolvedPayload), session: session)
             }
             return
@@ -1174,8 +1186,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         for event in session.mapper.finishTurn(stopReason: stopReason, usage: usage) { emit(event, session: session) }
         let status = GrokACPTerminalClassifier.status(stopReason: stopReason)
         if status == .failed {
+            let detail = currentPromptFailureDetail(session: session).map { ": \($0)" } ?? ""
             session.onEvent?(.error(GrokACPFailureTaxonomy.normalize(
-                diagnostic: "Grok ACP stopped: \(stopReason)",
+                diagnostic: "Grok ACP stopped: \(stopReason)\(detail)",
                 context: .turn
             ).message))
         }
@@ -1235,12 +1248,33 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         lock.unlock()
         guard active else { return }
         if terminal == .failed {
-            session.onEvent?(.error(GrokACPFailureTaxonomy.normalize(error, context: .turn).message))
+            session.onEvent?(.error(GrokACPFailureTaxonomy.normalize(
+                Self.addingPromptFailureDetail(currentPromptFailureDetail(session: session), to: error),
+                context: .turn
+            ).message))
         }
         for event in session.mapper.finishTurn(stopReason: terminal == .cancelled ? "cancelled" : "failed", usage: nil) {
             emit(event, session: session)
         }
         finishTurn(session: session, status: terminal)
+    }
+
+    /// `prompt_complete` failure text captured for the turn now in flight.
+    private func currentPromptFailureDetail(session: Session) -> String? {
+        synchronized {
+            guard let captured = session.promptFailureDetail,
+                  captured.generation == session.promptGeneration else { return nil }
+            return captured.text
+        }
+    }
+
+    /// A bare "Internal error" RPC failure borrows the provider text Grok
+    /// already sent as `prompt_complete.agentResult` for the same prompt.
+    static func addingPromptFailureDetail(_ detail: String?, to error: Error) -> Error {
+        guard let detail,
+              case let GrokACPError.rpcError(code, message, existing, httpStatus) = error,
+              existing == nil else { return error }
+        return GrokACPError.rpcError(code: code, message: message, detail: detail, httpStatus: httpStatus)
     }
 
     private func finishTurn(session: Session, status: AgentRunStatus) {
