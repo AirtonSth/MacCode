@@ -295,6 +295,18 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
         }
     }
 
+    /// App quit: ends every run at once, deleting their copies and stopping
+    /// the watcher and renewals so nothing re-copies a sign-in afterwards.
+    public func endAll() {
+        queue.sync {
+            for home in Set(runs.values.map(\.home)) {
+                removeCopies(home, runID: "app_termination")
+            }
+            runs = [:]
+            stopAll()
+        }
+    }
+
     private func removeCopies(_ home: URL, runID: String) {
         do {
             try DistillGuestCredentials.removeCopies(guestDistillHome: home)

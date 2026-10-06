@@ -78,6 +78,8 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
     private let deps: Dependencies
     private let lock = NSLock()
     private var mirrors: [String: DistillGuestCredentialMirror] = [:]
+    /// Plans handed out and not yet torn down, by run id.
+    private var livePlans: [String: DistillGuestLaunchPlan] = [:]
 
     init(_ dependencies: Dependencies) {
         self.deps = dependencies
@@ -225,7 +227,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             guestResolverLog.info(
                 "bot.guest.prepared run=\(runID, privacy: .public) bot=\(leaseKey, privacy: .public) binary=\(binaryPath, privacy: .public)"
             )
-            return DistillGuestLaunchPlan(
+            let plan = DistillGuestLaunchPlan(
                 runID: runID,
                 dockerExecutable: dockerExecutable,
                 container: vm.container,
@@ -233,12 +235,15 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                 guestCommand: guestCommand,
                 envFileURL: envFile,
                 lease: lease,
-                teardown: { _ in
+                teardown: { [weak self] _ in
                     heartbeat.stop()
                     mirror.end(runID: runID)
                     gateway.revoke(runID: runID)
+                    self?.forgetPlan(runID: runID)
                 }
             )
+            lock.withLock { livePlans[runID] = plan }
+            return plan
         } catch {
             undo.reversed().forEach { $0() }
             await lease.release()
@@ -253,6 +258,28 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             }
             throw Self.launchError(error)
         }
+    }
+
+    // MARK: - App termination
+
+    /// App quit, synchronous: ends every guest run this app still owns
+    /// (including one whose turn is still ending, which the adapter no longer
+    /// tracks) with a fire-and-forget `kill-agent`, stops renewing their
+    /// sign-in copies, and deletes every copy, env file and lease, as the
+    /// next launch would. A run whose kill does not land is ended by its
+    /// guest reaper once its lease stops changing. A process that does not
+    /// host guest runs (the scheduled-task agent) leaves the app's alone.
+    func endRunsForAppTermination() {
+        guard deps.hostsGuestRuns else { return }
+        let (plans, mirrors) = lock.withLock { (Array(livePlans.values), Array(self.mirrors.values)) }
+        plans.forEach { $0.killGuestDetached() }
+        mirrors.forEach { $0.endAll() }
+        BotGuestLaunchSweep.removeLeftovers(appSupport: deps.appSupport)
+        guestResolverLog.info("bot.guest.app_termination runs=\(plans.count, privacy: .public)")
+    }
+
+    private func forgetPlan(runID: String) {
+        lock.withLock { _ = livePlans.removeValue(forKey: runID) }
     }
 
     // MARK: - Rules
@@ -510,9 +537,14 @@ extension AppContext {
         let distillOverride = (try? settingsRepo.get("cli.distill.path")) ?? nil
         let barrier = botGuestLaunchBarrier
         if hostsGuestRuns {
+            // Unit tests never reach the user's Docker daemon.
+            let sweepDocker: (any BotComputerDockerClienting)? = AppContext.isRunningUnitTests ? nil : docker
+            let store = botStore
             DispatchQueue.global(qos: .utility).async {
-                BotGuestLaunchSweep.removeLeftovers(appSupport: appSupport)
-                Task { await barrier.open() }
+                let bots = sweepDocker == nil ? [] : (try? store.list(includeHidden: true, includeDeleted: true)) ?? []
+                BotGuestLaunchSweep.run(
+                    docker: sweepDocker, appSupport: appSupport, botIDs: bots.map(\.id), barrier: barrier
+                )
             }
         }
         return BotGuestRunResolver(BotGuestRunResolver.Dependencies(
@@ -552,8 +584,78 @@ extension AppContext {
 }
 
 /// App launch: no guest run survives a quit, so nothing a previous run left
-/// on the Mac side is live. Runs before the launch barrier opens.
+/// is live. Quit runs `removeLeftovers` too.
 enum BotGuestLaunchSweep {
+    /// The launch cleanup, blocking: ends leftover in-guest agents, then
+    /// deletes the Mac-side leftovers (sign-in copies, env files, leases),
+    /// then opens `barrier`, so no guest run starts before its bot's
+    /// leftovers are gone and the cleanup never touches a new run.
+    /// `docker` nil skips the in-guest step.
+    static func run(
+        docker: (any BotComputerDockerClienting)?,
+        appSupport: URL,
+        botIDs: [BotID],
+        barrier: DistillGuestLaunchBarrier
+    ) {
+        if let docker { endLeftoverRuns(docker: docker, appSupport: appSupport, botIDs: botIDs) }
+        removeLeftovers(appSupport: appSupport)
+        Task { await barrier.open() }
+    }
+
+    /// Ends every in-guest agent a crashed or killed session of this app left
+    /// running (`kill-agent --all` as the guest user), in the containers of
+    /// this database's bots, whatever their desktop kind is now. Another app
+    /// sharing the Docker daemon (the installed app beside a debug sandbox)
+    /// has its own bots and its own Application Support, so a container
+    /// counts only when its name and bot label match one of `botIDs` and its
+    /// home is bound from this app's guest home of that bot. Docker down: no
+    /// container runs, so there is nothing to end. Blocking; returns the
+    /// containers swept.
+    @discardableResult
+    static func endLeftoverRuns(
+        docker: any BotComputerDockerClienting,
+        appSupport: URL,
+        botIDs: [BotID]
+    ) -> [String] {
+        guard !botIDs.isEmpty else { return [] }
+        guard (try? docker.info()) != nil else {
+            guestResolverLog.info("bot.guest.launch_sweep skipped=docker_unavailable")
+            return []
+        }
+        var swept: [String] = []
+        for botID in botIDs {
+            let name = BotComputerGuestSpec.containerName(botID: botID)
+            guard let container = try? docker.inspect(name: name), container.running,
+                  container.labels[BotComputerGuestSpec.botIDLabelKey] == botID.value.uuidString.lowercased(),
+                  let source = container.homeSource,
+                  samePath(source, BotComputerGuestSpec.guestHomeURL(appSupport: appSupport, botID: botID).path)
+            else { continue }
+            do {
+                _ = try docker.exec(
+                    name: name,
+                    command: [BotComputerGuestSpec.killAgentPath, "--all"],
+                    user: BotComputerGuestSpec.agentUser,
+                    detach: false
+                )
+                swept.append(name)
+            } catch {
+                // A container from before the agent kit has no kill-agent and
+                // no guest runs; a run that survived KILL is left to its
+                // reaper, which ends it once its lease stops changing.
+                guestResolverLog.error("bot.guest.launch_sweep.kill_failed container=\(name, privacy: .public)")
+            }
+        }
+        guestResolverLog.info("bot.guest.launch_sweep containers=\(swept.count, privacy: .public)")
+        return swept
+    }
+
+    private static func samePath(_ a: String, _ b: String) -> Bool {
+        func canonical(_ path: String) -> String {
+            URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+        }
+        return canonical(a) == canonical(b)
+    }
+
     static func removeLeftovers(appSupport: URL, fileManager: FileManager = .default) {
         let guestHomes = BotComputerGuestSpec.guestHomeRoot(appSupport: appSupport)
         DistillGuestCredentials.removeAllCopies(guestHomeRoot: guestHomes)
@@ -561,9 +663,9 @@ enum BotGuestLaunchSweep {
         for name in (try? fileManager.contentsOfDirectory(atPath: runs.path)) ?? [] where name.hasSuffix(".env") {
             unlink(runs.appendingPathComponent(name).path)
         }
-        // A lease nobody renews makes the guest reaper end its leftover agent
-        // (up to ~50 s later: S10 ends them before the barrier opens). The
-        // guest owns `.rc-runs`: a symlinked one is skipped, never followed.
+        // A lease nobody renews makes the guest reaper end a leftover agent
+        // `endLeftoverRuns` could not reach (up to ~50 s later). The guest
+        // owns `.rc-runs`: a symlinked one is skipped, never followed.
         for bot in (try? fileManager.contentsOfDirectory(atPath: guestHomes.path)) ?? [] {
             let leases = guestHomes.appendingPathComponent(bot, isDirectory: true)
                 .appendingPathComponent("home/.rc-runs", isDirectory: true)

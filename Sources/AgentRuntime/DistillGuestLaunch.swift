@@ -79,15 +79,10 @@ public enum DistillGuestStage: String, Sendable, Equatable, CaseIterable {
     }
 }
 
-/// Opens once. Guest runs wait on it until launch cleanup (stale credential
-/// copies, env files and leases) is done, so the cleanup can never delete
-/// what a new run just wrote.
-///
-/// The cleanup does not yet end a leftover in-guest agent of a crashed or
-/// killed session (S10 adds `kill-agent --all` before opening). Until then
-/// such an agent ends only when its reaper sees no lease change for 45 s,
-/// so it can live up to about 50 s after the barrier opens, and a new run of
-/// the same bot admitted in that window shares its guest home with it.
+/// Opens once. Guest runs wait on it until launch cleanup (leftover in-guest
+/// agents of a crashed or killed session, then stale credential copies, env
+/// files and leases) is done, so the cleanup can never end or delete what a
+/// new run just started or wrote.
 public actor DistillGuestLaunchBarrier {
     private var isOpen = false
     private var waiters: [UInt64: CheckedContinuation<Void, Error>] = [:]
@@ -148,6 +143,7 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
     private let killGuestDetachedBody: @Sendable () -> Void
     private let lock = NSLock()
     private var finishTask: Task<Void, Never>?
+    private var killedDetached = false
 
     /// Bound on one `kill-agent` (TERM, 1 s, KILL inside the guest).
     public static let killTimeout: TimeInterval = 5
@@ -235,9 +231,14 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
         await killGuestBody()
     }
 
-    /// Fire-and-forget kill for app termination, which cannot wait.
+    /// Fire-and-forget kill for app termination, which cannot wait. Once per
+    /// plan: the adapter and the resolver both end live runs at quit.
     public func killGuestDetached() {
-        killGuestDetachedBody()
+        let first = lock.withLock { () -> Bool in
+            defer { killedDetached = true }
+            return !killedDetached
+        }
+        if first { killGuestDetachedBody() }
     }
 
     /// Kill the guest, run the resolver's teardown, delete the env file, then

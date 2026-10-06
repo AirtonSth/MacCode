@@ -20,6 +20,29 @@ final class BotComputerDockerClientTests: XCTestCase {
         XCTAssertThrowsError(try unknown.containerExists(name: "remotecode-bot-exact"))
     }
 
+    func test_inspectReadsTheHomeBindSource_soAContainerOfAnotherAppIsToldApart() throws {
+        // WHY: the launch sweep kills in-guest agents; the installed app and a
+        // debug sandbox share one Docker daemon, and the guest-home bind (in
+        // each app's own Application Support) is what proves a container is
+        // this app's. The path holds spaces, so it rides JSON-quoted on its
+        // own line without disturbing the fields before it.
+        let home = "/Users/a/Library/Application Support/RemoteCode/bot-guests/b/home"
+        var formats: [String] = []
+        let cli = BotComputerDockerCLI { args in
+            formats.append(args[2])
+            return Data(("true sha256:abc 36385 net-a, {\"remotecode.botId\":\"b\"}\n\"\(home)\"\n").utf8)
+        }
+        let inspect = try cli.inspect(name: "remotecode-bot-b")
+        XCTAssertEqual(inspect, BotComputerContainerInspect(
+            running: true, imageID: "sha256:abc", hostPort: 36385, networkNames: ["net-a"],
+            labels: ["remotecode.botId": "b"], homeSource: home
+        ))
+        XCTAssertTrue(formats.first?.contains("eq .Destination \"/home/remotecode\"") == true)
+
+        let noHome = BotComputerDockerCLI { _ in Data("false sha256:abc 0  {}\n\n".utf8) }
+        XCTAssertNil(try noHome.inspect(name: "x").homeSource, "a container without a home bind proves nothing")
+    }
+
     func test_buildLabelsTheImageWithTheDigestOfTheRecipeItWasBuiltFrom() throws {
         // WHY: the app reuses a base image only when this label matches its own
         // recipe; an image from another recipe under the same tag and revision

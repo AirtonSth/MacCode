@@ -129,18 +129,24 @@ public struct BotComputerContainerInspect: Equatable, Sendable {
     public var hostPort: Int
     public var networkNames: [String]
     public var labels: [String: String]
+    /// Host path bound at the guest user's home; nil when none is. Tells which
+    /// app's Application Support (the installed app or a debug sandbox) owns
+    /// the container.
+    public var homeSource: String?
     public init(
         running: Bool,
         imageID: String,
         hostPort: Int,
         networkNames: [String] = [],
-        labels: [String: String] = [:]
+        labels: [String: String] = [:],
+        homeSource: String? = nil
     ) {
         self.running = running
         self.imageID = imageID
         self.hostPort = hostPort
         self.networkNames = networkNames
         self.labels = labels
+        self.homeSource = homeSource
     }
 }
 
@@ -300,11 +306,18 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         let data = try run([
             "inspect",
             "-f",
-            "{{.State.Running}} {{.Image}} {{with (index .NetworkSettings.Ports \"6080/tcp\")}}{{(index . 0).HostPort}}{{else}}0{{end}} {{range $k, $_ := .NetworkSettings.Networks}}{{$k}},{{end}} {{json .Config.Labels}}",
+            "{{.State.Running}} {{.Image}} {{with (index .NetworkSettings.Ports \"6080/tcp\")}}{{(index . 0).HostPort}}{{else}}0{{end}} {{range $k, $_ := .NetworkSettings.Networks}}{{$k}},{{end}} {{json .Config.Labels}}"
+                + "\n{{range .Mounts}}{{if eq .Destination \"\(BotComputerGuestSpec.guestUserHome)\"}}{{json .Source}}{{end}}{{end}}",
             name,
         ])
-        let text = (String(data: data, encoding: .utf8) ?? "")
+        // Line 2: the home bind's source, JSON-quoted (it may hold spaces).
+        let lines = (String(data: data, encoding: .utf8) ?? "")
+            .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+        let text = (lines.first.map(String.init) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let homeSource = lines.dropFirst().first
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { try? JSONDecoder().decode(String.self, from: Data($0.utf8)) }
         let parts = text.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: false)
         let running = parts.first.map { $0.caseInsensitiveCompare("true") == .orderedSame } ?? false
         let image = parts.dropFirst().first.map(String.init) ?? ""
@@ -321,7 +334,8 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             imageID: image,
             hostPort: port,
             networkNames: networks,
-            labels: labels
+            labels: labels,
+            homeSource: homeSource
         )
     }
 

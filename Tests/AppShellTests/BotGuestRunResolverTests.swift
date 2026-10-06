@@ -49,6 +49,7 @@ final class BotGuestRunResolverTests: XCTestCase {
         let barrier: DistillGuestLaunchBarrier
         let refreshes: Recorder<DistillAccountProvider?>
         let resolver: BotGuestRunResolver
+        let deps: BotGuestRunResolver.Dependencies
         let appSupport: URL
 
         var guestHome: URL {
@@ -95,7 +96,7 @@ final class BotGuestRunResolverTests: XCTestCase {
         let gateway = BotGuestMCPGateway()
         gateways.append(gateway)
         let workspaces = [workspace.id: workspaceDir.path]
-        let resolver = BotGuestRunResolver(BotGuestRunResolver.Dependencies(
+        let deps = BotGuestRunResolver.Dependencies(
             threadRepo: ctx.threadRepo,
             botStore: ctx.botStore,
             appSupport: ctx.appSupportDirectory,
@@ -115,11 +116,11 @@ final class BotGuestRunResolverTests: XCTestCase {
             gitIdentity: { GitIdentity(name: "Ada", email: "ada@example.com") },
             processEnvironment: ["DISTILL_HOME": hostHome.path],
             heartbeatInterval: 0.05
-        ))
+        )
         return Fixture(
             ctx: ctx, router: router, bot: bot, workspace: workspace, hostHome: hostHome, vm: vm,
-            registry: registry, leases: leases, barrier: barrier, refreshes: refreshes, resolver: resolver,
-            appSupport: ctx.appSupportDirectory
+            registry: registry, leases: leases, barrier: barrier, refreshes: refreshes,
+            resolver: BotGuestRunResolver(deps), deps: deps, appSupport: ctx.appSupportDirectory
         )
     }
 
@@ -535,6 +536,156 @@ final class BotGuestRunResolverTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: victim.path), [])
     }
 
+    // MARK: - Launch sweep and quit (S10)
+
+    func test_launchSweep_endsLeftoverAgentsOnlyInRunningContainersOfThisAppsOwnBots() throws {
+        // WHY: an agent left running by a crashed session keeps executing with
+        // the user's sign-ins until something ends it. The Docker daemon is
+        // shared with the user's installed app (and other sandboxes), whose
+        // live runs must never be killed: only containers named and labelled
+        // for this database's bots, with their home bound from this app's
+        // Application Support, are touched.
+        let appSupport = root.appendingPathComponent("support-a", isDirectory: true)
+        let otherSupport = root.appendingPathComponent("support-b", isDirectory: true)
+        let mine = BotID(), stopped = BotID(), predatesKit = BotID(), copiedDB = BotID(), relabelled = BotID()
+        let foreign = BotID()
+        let docker = SweepDocker()
+        func add(_ bot: BotID, running: Bool = true, label: BotID? = nil, support: URL? = nil) {
+            docker.containers[BotComputerGuestSpec.containerName(botID: bot)] = BotComputerContainerInspect(
+                running: running, imageID: "img", hostPort: 0,
+                labels: [BotComputerGuestSpec.botIDLabelKey: (label ?? bot).value.uuidString.lowercased()],
+                homeSource: BotComputerGuestSpec.guestHomeURL(appSupport: support ?? appSupport, botID: bot).path
+            )
+        }
+        add(mine)
+        add(stopped, running: false)
+        add(predatesKit)
+        add(copiedDB, support: otherSupport) // same bot id, the other app's container
+        add(relabelled, label: BotID())
+        add(foreign) // a bot of the other app's database
+        docker.failingExecs = [BotComputerGuestSpec.containerName(botID: predatesKit)]
+
+        let swept = BotGuestLaunchSweep.endLeftoverRuns(
+            docker: docker, appSupport: appSupport,
+            botIDs: [predatesKit, mine, stopped, copiedDB, relabelled, BotID() /* no container */]
+        )
+
+        XCTAssertEqual(swept, [BotComputerGuestSpec.containerName(botID: mine)],
+                       "a container whose kill-agent fails (no kit yet) does not stop the sweep")
+        XCTAssertEqual(docker.execs.map(\.name), [predatesKit, mine].map { BotComputerGuestSpec.containerName(botID: $0) })
+        for exec in docker.execs {
+            XCTAssertEqual(exec.command, [BotComputerGuestSpec.killAgentPath, "--all"])
+            XCTAssertEqual(exec.user, BotComputerGuestSpec.agentUser,
+                           "root cannot read another user's run tags: kill-agent must run as the guest user")
+        }
+        XCTAssertFalse(docker.inspected.contains(BotComputerGuestSpec.containerName(botID: foreign)),
+                       "the other app's bots are not even looked at")
+
+        // Docker down: no container runs, nothing to end, no exec attempted.
+        let down = SweepDocker()
+        down.infoFails = true
+        XCTAssertEqual(BotGuestLaunchSweep.endLeftoverRuns(docker: down, appSupport: appSupport, botIDs: [mine]), [])
+        XCTAssertTrue(down.inspected.isEmpty)
+    }
+
+    func test_launchSweep_endsLeftoverAgentsBeforeDeletingTheirSignInCopies_andOnlyThenAdmitsGuestRuns() async throws {
+        // WHY (M5): a leftover agent must be dead before its copies go (it
+        // would otherwise run on, then fail mid-turn), and a new run must not
+        // start until the sweep is done or the sweep would end it or delete
+        // what it just wrote.
+        let f = try await makeFixture(openBarrier: false)
+        try await f.ctx.botGuestLaunchBarrier.wait() // the context's own launch sweep is done
+        let copy = f.guestDistillHome.appendingPathComponent("claude-auth.json")
+        try FileManager.default.createDirectory(at: f.guestDistillHome, withIntermediateDirectories: true)
+        try #"{"access_token":"stale","refresh_token":""}"#.write(to: copy, atomically: true, encoding: .utf8)
+        let docker = SweepDocker()
+        docker.containers[BotComputerGuestSpec.containerName(botID: f.bot.id)] = BotComputerContainerInspect(
+            running: true, imageID: "img", hostPort: 0,
+            labels: [BotComputerGuestSpec.botIDLabelKey: f.bot.id.value.uuidString.lowercased()],
+            homeSource: f.guestHome.path
+        )
+        let killing = DispatchSemaphore(value: 0)
+        let copyAtKill = Recorder<Bool>()
+        docker.onExec = {
+            copyAtKill.append(FileManager.default.fileExists(atPath: copy.path))
+            killing.wait()
+        }
+        let thread = try makeThread(f)
+        let run = Task { try await f.resolver.prepare(self.request(thread)) { _ in } }
+        let sweep = Thread {
+            BotGuestLaunchSweep.run(docker: docker, appSupport: f.appSupport, botIDs: [f.bot.id], barrier: f.barrier)
+        }
+        sweep.start()
+
+        try await waitUntil { docker.execs.count == 1 }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(copyAtKill.values, [true], "the agent is ended while its copies still exist")
+        XCTAssertEqual(f.vm.calls.count, 0, "no guest run starts while the sweep is still ending leftovers")
+        XCTAssertNil(f.registry.active(botID: f.bot.id))
+        killing.signal()
+
+        let plan = try unwrapPlan(try await run.value)
+        XCTAssertEqual(f.vm.calls.count, 1)
+        let fresh = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: copy)) as? [String: Any])
+        XCTAssertEqual(fresh["access_token"] as? String, "at-1", "the new run's copy is written after the sweep, never deleted by it")
+        await plan.finish(.completed).value
+    }
+
+    func test_quit_endsALiveGuestRun_deletesItsSignInCopyEnvFileAndLease_andNothingIsCopiedAgain() async throws {
+        // WHY: after quit nothing renews the sign-in copies or the lease; the
+        // agent must not keep running with the user's accounts, and the copies
+        // must not sit in the guest-readable home until the next launch.
+        let f = try await makeFixture()
+        try await f.ctx.botGuestLaunchBarrier.wait() // the context's own launch sweep is done
+        let log = root.appendingPathComponent("docker.log")
+        let fakeDocker = root.appendingPathComponent("fake-docker")
+        try "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '\(log.path)'\n".write(to: fakeDocker, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeDocker.path)
+        var deps = f.deps
+        deps.dockerExecutable = { fakeDocker.path }
+        let resolver = BotGuestRunResolver(deps)
+        let req = request(try makeThread(f))
+        let plan = try unwrapPlan(try await resolver.prepare(req) { _ in })
+        let copy = f.guestDistillHome.appendingPathComponent("claude-auth.json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: copy.path), "positive control: the live run has its copy")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: plan.envFileURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: leaseFile(f, req.runId).path))
+
+        // The resolver kills it itself: a run whose turn is still ending is
+        // no longer in the adapter's sessions, which the adapter's quit kill
+        // walks.
+        resolver.endRunsForAppTermination()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: copy.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: plan.envFileURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: leaseFile(f, req.runId).path))
+        let runID = req.runId.value.uuidString.lowercased()
+        try await waitUntil { ((try? String(contentsOf: log, encoding: .utf8)) ?? "").contains(runID) }
+        plan.killGuestDetached() // the adapter's own quit kill of the same run: no second docker call
+        // A Mac renewal right after quit must not re-copy the sign-in.
+        try #"{"access_token":"at-2","refresh_token":"rt-host-only","expires_at":4102444800000}"#
+            .write(to: f.hostHome.appendingPathComponent("claude-auth.json"), atomically: true, encoding: .utf8)
+        try await Task.sleep(nanoseconds: 900_000_000) // past the mirror's 0.5 s debounce
+        XCTAssertFalse(FileManager.default.fileExists(atPath: copy.path))
+        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "exec -d -u remotecode remotecode-bot-test \(BotComputerGuestSpec.killAgentPath) \(runID)\n")
+        await plan.finish(.cancelled).value
+    }
+
+    func test_quitOfAProcessThatHostsNoGuestRuns_leavesTheAppsLiveRunsAlone() async throws {
+        // WHY: the scheduled-task agent shares this Application Support; its
+        // exit must not delete the sign-in copies of the app's live runs.
+        let f = try await makeFixture()
+        let req = request(try makeThread(f))
+        let plan = try unwrapPlan(try await f.resolver.prepare(req) { _ in })
+        var deps = f.deps
+        deps.hostsGuestRuns = false
+        BotGuestRunResolver(deps).endRunsForAppTermination()
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: f.guestDistillHome.appendingPathComponent("claude-auth.json").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: plan.envFileURL.path))
+        await plan.finish(.completed).value
+    }
+
     // MARK: - Coordinator placement
 
     func test_aGuestThreadOnAnotherProviderFailsBeforeAnythingIsRecordedOrSpawned() async throws {
@@ -670,6 +821,47 @@ private final class FakeGuestVM: BotGuestVMPreparing, @unchecked Sendable {
         if let error { throw error }
         return BotGuestVM(container: "remotecode-bot-test", dockerArch: "aarch64", mountedWorkspaces: workspace.map { [$0] } ?? [])
     }
+}
+
+/// Docker for the launch sweep: containers by name, exec recording.
+private final class SweepDocker: BotComputerDockerClienting, @unchecked Sendable {
+    struct Exec { let name: String; let command: [String]; let user: String? }
+    private let lock = NSLock()
+    var containers: [String: BotComputerContainerInspect] = [:]
+    var failingExecs: Set<String> = []
+    var infoFails = false
+    var onExec: (() -> Void)?
+    private var recordedExecs: [Exec] = []
+    private var recordedInspects: [String] = []
+    var execs: [Exec] { lock.withLock { recordedExecs } }
+    var inspected: [String] { lock.withLock { recordedInspects } }
+
+    func info() throws -> String {
+        if infoFails { throw BotComputerDockerError.daemonUnavailable }
+        return "Architecture: aarch64"
+    }
+    func inspect(name: String) throws -> BotComputerContainerInspect {
+        lock.withLock { recordedInspects.append(name) }
+        guard let container = containers[name] else { throw BotComputerDockerError.provisioningFailed }
+        return container
+    }
+    func exec(name: String, command: [String], user: String?, detach: Bool, workdir: String?, environment: [String: String]) throws -> Data {
+        lock.withLock { recordedExecs.append(Exec(name: name, command: command, user: user)) }
+        onExec?()
+        if failingExecs.contains(name) { throw BotComputerDockerError.provisioningFailed }
+        return Data()
+    }
+    func imageExists(tag: String) throws -> Bool { true }
+    func imageLabel(tag: String, key: String) throws -> String { "" }
+    func imageID(tag: String) throws -> String { "" }
+    func build(context: URL, tag: String) throws {}
+    func create(options: BotComputerContainerCreateOptions) throws -> String { "" }
+    func start(name: String) throws {}
+    func stop(name: String) throws {}
+    func rename(from: String, to: String) throws {}
+    func ensureNetwork(name: String) throws {}
+    func remove(name: String) throws { XCTFail("the launch sweep never removes a container") }
+    func removeMatching(namePrefix: String) throws { XCTFail("the launch sweep never removes a container") }
 }
 
 private final class Recorder<Value: Sendable>: @unchecked Sendable {

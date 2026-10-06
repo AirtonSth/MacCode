@@ -620,6 +620,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         persistRestorableStateBeforeUpdate()
         stopPetController()
         stopLiveRuntimesForAppTermination()
+        // After the provider sessions: also ends guest runs whose turn was
+        // still ending, and deletes their sign-in copies before exit.
+        context?.botGuestRunResolver?.endRunsForAppTermination()
         // Runtime shutdown publishes final lifecycle events after the snapshot
         // barrier above. Drain them before the process exits.
         context?.flushEventPersistence()

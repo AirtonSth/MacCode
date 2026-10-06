@@ -30,6 +30,8 @@ public enum BotComputerGuestSpec {
     /// differs is recreated, but only while the bot has no active run.
     public static let runtimeRevision = "2"
     public static let runtimeLabelKey = "remotecode.runtime"
+    /// The bot (of the app database that created it) a container belongs to.
+    public static let botIDLabelKey = "remotecode.botId"
     /// Read-only agent kit (guest Distill binary, scripts) shared by every bot.
     public static let agentKitMountPoint = "/opt/remotecode-agent"
     /// Lets the guest reach host loopback services by name on any Docker runtime.
@@ -205,7 +207,7 @@ public enum BotComputerGuestSpec {
             image: image,
             labels: [
                 "remotecode.managed": "1",
-                "remotecode.botId": botID.value.uuidString.lowercased(),
+                botIDLabelKey: botID.value.uuidString.lowercased(),
                 workspacesLabelKey: workspacesLabel(workspaces),
                 runtimeLabelKey: runtimeRevision,
             ],

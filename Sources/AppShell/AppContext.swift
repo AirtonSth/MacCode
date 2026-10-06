@@ -388,6 +388,8 @@ public final class AppContext {
     }()
     /// Opens once launch cleanup of bot guests is done; guest runs wait on it.
     public let botGuestLaunchBarrier = DistillGuestLaunchBarrier()
+    /// Decides and prepares in-guest Distill runs; quit ends the ones it owns.
+    private(set) var botGuestRunResolver: BotGuestRunResolver?
     /// One per app so every bot shares the guest distill cache and its downloads.
     public lazy var distillGuestBinaries = DistillGuestBinaryProvisioner(
         guestToolsRoot: BotComputerGuestSpec.guestToolsURL(appSupport: appSupportDirectory)
@@ -1163,7 +1165,9 @@ public final class AppContext {
         self.tokenSaverCodexAdapter.contextSeedPreparer = self.coordinator.tokenSaverContextSeedPreparer
         self.tokenSaverCodexAdapter.contextSeedReceipts = self.runRepo.contextSelectionReceipts()
         contextReference.value = self
-        distill.setGuestLaunchResolver(makeBotGuestRunResolver(hostsGuestRuns: performLaunchRunReconciliation))
+        let guestRunResolver = makeBotGuestRunResolver(hostsGuestRuns: performLaunchRunReconciliation)
+        botGuestRunResolver = guestRunResolver
+        distill.setGuestLaunchResolver(guestRunResolver)
         let liveActivitySyncCoordinator = self.liveActivitySyncCoordinator
         coordinator.onActiveRunProjectionChanged = { [weak contextReference] projection, cause in
             let syncCause: LiveActivitySyncCause
