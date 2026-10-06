@@ -72,7 +72,9 @@ extension AppCommandRouter {
     func handOffBotVM(botID: BotID, to thread: AgentThreadID) async {
         var next: AgentThreadID? = thread
         while let current = next {
-            try? await drainNextQueuedAgentMessage(thread: current, botVMHandOff: true)
+            if await context?.botGroupOrchestrator.resumeWaitingTurn(memberThreadID: current) != true {
+                try? await drainNextQueuedAgentMessage(thread: current, botVMHandOff: true)
+            }
             next = BotVMRunRegistry.shared.popWaitingIfFree(botID: botID)
         }
     }

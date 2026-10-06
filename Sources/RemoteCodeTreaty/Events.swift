@@ -62,6 +62,7 @@ public enum RemoteCodeEventKind: String, Codable, CaseIterable, Sendable {
     case botFilesChanged = "bot.files.changed"
     case botFilesOpened = "bot.files.opened"
     case botFilesUpdated = "bot.files.updated"
+    case botGroupTurnUpdated = "bot.group.turn.updated"
     case botGuestUpdated = "bot.guest.updated"
     case botMessageAccepted = "bot.message.accepted"
     case botMessageQueued = "bot.message.queued"

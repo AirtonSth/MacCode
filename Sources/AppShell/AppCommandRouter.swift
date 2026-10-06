@@ -5189,6 +5189,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let admission = try ctx.threadRepo.sendAdmission(of: thread) else {
             throw LayoutError.workspaceNotFound
         }
+        // A group room never runs a provider: its bots answer on their own threads.
+        if try ctx.botStore.group(roomThreadID: thread) != nil {
+            throw JSONRPCError(code: -32000, message: "This is a group conversation. Send to it with bot.group.send.")
+        }
         let effectiveRouting: AgentRoutingConfiguration?
         if let passed = orchestrationRoutingSnapshot?.configuration
             ?? routingSnapshot?.configuration

@@ -424,10 +424,22 @@ public final class AppContext {
         orchestrationRuntime: orchestrationRuntime
     )
     lazy var botDraftPersistenceAuthority = BotDraftPersistenceAuthority()
+    lazy var botGroupOrchestrator = BotGroupOrchestrator(
+        botStore: botStore,
+        threadRepo: threadRepo,
+        runRepo: runRepo,
+        messageRepo: messageRepo,
+        checkpointRepo: turnCheckpointRepo,
+        queuedMessageRepo: queuedMessageRepo,
+        coordinator: coordinator,
+        appSupportDirectory: appSupportDirectory
+    )
     private var tokenSaverCodexAdapter: CodexAppServerAdapter
     public var router: AppCommandRouter! {
         didSet {
             botPeerHandoffAuthority.router = router
+            botGroupOrchestrator.router = router
+            botGroupOrchestrator.reconcileAfterRelaunch()
             drainRecoveredForkPrunedThreadIDsIfPossible()
             refreshActiveAgentWorkspaceProjection()
             startBotBrowserPendingOpenObserver()
