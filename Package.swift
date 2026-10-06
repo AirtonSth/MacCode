@@ -177,7 +177,8 @@ let package = Package(
             exclude: ["RemoteCode.entitlements"],
             resources: [
                 .copy("Resources/Pet"),
-                .copy("Resources/ComputerGuest")
+                .copy("Resources/ComputerGuest"),
+                .copy("Resources/GuestAgentKit")
             ],
             linkerSettings: [
                 .linkedFramework("IOKit")

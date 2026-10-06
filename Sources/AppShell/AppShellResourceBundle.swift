@@ -136,20 +136,38 @@ enum AppShellResourceBundle {
     static func computerGuestRecipeURL(
         fileManager: FileManager = .default
     ) -> URL? {
+        resourceDirectoryURL(named: "ComputerGuest", containing: "Dockerfile", fileManager: fileManager)
+    }
+
+    /// In-guest agent kit (`bin/run-agent`, `bin/kill-agent`, vendored
+    /// linux-use) that `BotGuestAgentKit` copies into `<AppSupport>/guest-tools`.
+    static func guestAgentKitURL(
+        fileManager: FileManager = .default
+    ) -> URL? {
+        resourceDirectoryURL(named: "GuestAgentKit", containing: "bin/run-agent", fileManager: fileManager)
+    }
+
+    /// A copied resource directory of the AppShell bundle, falling back to the
+    /// source tree; `marker` must exist inside it.
+    private static func resourceDirectoryURL(
+        named name: String,
+        containing marker: String,
+        fileManager: FileManager
+    ) -> URL? {
         var candidates: [URL] = []
         if let bundle = try? bundle() {
-            if let url = bundle.url(forResource: "ComputerGuest", withExtension: nil) {
+            if let url = bundle.url(forResource: name, withExtension: nil) {
                 candidates.append(url)
             }
             if let resources = bundle.resourceURL {
-                candidates.append(resources.appendingPathComponent("ComputerGuest"))
+                candidates.append(resources.appendingPathComponent(name))
             }
-            candidates.append(bundle.bundleURL.appendingPathComponent("ComputerGuest"))
+            candidates.append(bundle.bundleURL.appendingPathComponent(name))
         }
         let source = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .appendingPathComponent("Resources", isDirectory: true)
-            .appendingPathComponent("ComputerGuest", isDirectory: true)
+            .appendingPathComponent(name, isDirectory: true)
         candidates.append(source)
 
         var seen = Set<String>()
@@ -157,8 +175,7 @@ enum AppShellResourceBundle {
             let path = url.standardizedFileURL.path
             if seen.contains(path) { continue }
             seen.insert(path)
-            let dockerfile = url.appendingPathComponent("Dockerfile")
-            if fileManager.fileExists(atPath: dockerfile.path) {
+            if fileManager.fileExists(atPath: url.appendingPathComponent(marker).path) {
                 return url
             }
         }

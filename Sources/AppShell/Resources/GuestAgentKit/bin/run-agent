@@ -1,0 +1,43 @@
+#!/bin/sh
+# run-agent <runId> -- <command> [args...]
+#
+# Starts one in-guest agent run. Every process it starts carries
+# RC_GUEST_RUN_ID=<runId>, which is how kill-agent finds the whole run, and the
+# run's pid (also its session id) is recorded for kill-agent. A lease reaper
+# ends the run once the Mac stops refreshing /home/remotecode/.rc-runs/<runId>.lease,
+# because a crashed or killed app cannot stop it otherwise: the agent outlives
+# its `docker exec` client.
+set -eu
+
+usage() {
+    echo "usage: run-agent <runId> -- <command> [args...]" >&2
+    exit 64
+}
+
+run=${1:-}
+[ ${#run} -eq 36 ] || usage
+case $run in *[!0-9A-Fa-f-]*) usage ;; esac
+shift
+[ "${1:-}" = "--" ] || usage
+shift
+[ $# -gt 0 ] || usage
+
+# kill-agent ends the run by its session, so the agent must lead one.
+# `docker exec` already starts it as a session leader; anything else re-execs
+# under setsid, which keeps stdio and waits so the caller still sees the exit.
+if [ "$(ps -o sid= -p $$ | tr -d ' ')" != "$$" ]; then
+    exec setsid -w /bin/sh "$0" "$run" -- "$@"
+fi
+
+kit=$(dirname "$0")
+state=/tmp/rc-agent
+mkdir -m 0700 "$state" 2>/dev/null || [ -d "$state" ]
+
+# The reaper must not carry the run tag (it would count itself as the run) and
+# must not hold the agent's stdio open (docker exec would never see EOF).
+env -u RC_GUEST_RUN_ID RC_GUEST_REAPER_RUN_ID="$run" \
+    setsid "$kit/kill-agent" --reap "$run" </dev/null >/dev/null 2>&1 &
+
+printf '%s\n' "$$" > "$state/$run.pid"
+export RC_GUEST_RUN_ID="$run"
+exec "$@"

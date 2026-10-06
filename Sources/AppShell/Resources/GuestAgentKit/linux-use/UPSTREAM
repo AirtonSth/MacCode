@@ -1,0 +1,5 @@
+Vendored, unmodified, from https://github.com/samuelfaj/linux-use
+commit ee0231ce80c56bbeec2daa68363c9e4477a4a923
+server.py sha256 7a9ca52161ab0355ee27568c4cfe2b590a062067436888166ec83f64f6c9ae3a
+Only server.py is vendored: the Chrome extension and its native-messaging host
+are not part of the guest kit.

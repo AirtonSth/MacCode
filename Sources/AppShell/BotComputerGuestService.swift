@@ -202,6 +202,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
         requestingThreadID: AgentThreadID?
     ) throws -> BotComputerGuestReady {
         let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
+        // A reused container sees the current kit through its bind too.
+        try BotGuestAgentKit.materialize(appSupport: appSupport)
         try seedRecipe(botID: botID)
         try ensureCurrentImage()
         let name = BotComputerGuestSpec.containerName(botID: botID)
@@ -244,6 +246,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
         requestingThreadID: AgentThreadID? = nil
     ) throws {
         try BotComputerGuestSpec.assertWorkspaceMountPath(workspace, registeredWorkspaces: registered)
+        try BotGuestAgentKit.materialize(appSupport: appSupport)
         let stored = prunedWorkspaces(botID: botID, keeping: [workspace])
         let wanted = Array(Set(stored).union([workspace])).sorted()
         let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
@@ -321,12 +324,10 @@ public final class BotComputerGuestService: @unchecked Sendable {
     }
 
     /// Every container binds the shared agent kit; its host directory must
-    /// exist first or Docker would create it owned by the daemon.
+    /// exist first or Docker would create it owned by the daemon. Materializing
+    /// the kit creates it.
     private func createContainer(_ options: BotComputerContainerCreateOptions) throws -> String {
-        try FileManager.default.createDirectory(
-            at: BotComputerGuestSpec.guestToolsURL(appSupport: appSupport),
-            withIntermediateDirectories: true
-        )
+        try BotGuestAgentKit.materialize(appSupport: appSupport)
         return try docker.create(options: options)
     }
 

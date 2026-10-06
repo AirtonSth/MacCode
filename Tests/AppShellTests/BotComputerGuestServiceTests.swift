@@ -971,8 +971,15 @@ final class BotComputerGuestServiceTests: XCTestCase {
             atPath: BotComputerGuestSpec.guestToolsURL(appSupport: support).path
         ), "the kit's host directory exists before Docker binds it")
         idleFake.created.removeAll()
+        let runAgent = BotComputerGuestSpec.guestToolsURL(appSupport: support)
+            .appendingPathComponent("bin/run-agent")
+        try FileManager.default.removeItem(at: runAgent)
         XCTAssertTrue(try idle.provision(botID: idleBot).resumed, "a current container is reused")
         XCTAssertTrue(idleFake.created.isEmpty)
+        XCTAssertTrue(
+            FileManager.default.isExecutableFile(atPath: runAgent.path),
+            "a reused container sees the agent kit through its bind, so provision restores it"
+        )
 
         let busyFake = FakeDocker()
         let registry = BotVMRunRegistry()

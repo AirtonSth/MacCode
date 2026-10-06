@@ -35,6 +35,20 @@ public enum BotComputerGuestSpec {
     /// Lets the guest reach host loopback services by name on any Docker runtime.
     public static let hostGatewayAlias = "host.docker.internal:host-gateway"
     public static let guestUserHome = "/home/remotecode"
+    /// Guest user that agent runs and `kill-agent` run as (`docker exec -u`).
+    /// kill-agent refuses root: without CAP_SYS_PTRACE root cannot read the
+    /// run tag in another user's /proc/<pid>/environ.
+    public static let agentUser = "remotecode"
+    /// `run-agent <runId> -- <argv>`: tags the run, records its pid, starts the
+    /// lease reaper and execs argv (Resources/GuestAgentKit).
+    public static let runAgentPath = "\(agentKitMountPoint)/bin/run-agent"
+    /// `kill-agent <runId>|--all`: TERM then KILL; idempotent.
+    public static let killAgentPath = "\(agentKitMountPoint)/bin/kill-agent"
+    /// Vendored linux-use stdio MCP server (python3).
+    public static let linuxUseServerPath = "\(agentKitMountPoint)/linux-use/server.py"
+    /// The Mac renews `<runId>.lease` here while it owns the run; run-agent's
+    /// reaper ends a run whose lease is more than 45 s old.
+    public static let agentLeaseDirectory = "\(guestUserHome)/.rc-runs"
     public static let screenPort = 6080
     public static let minimumShmBytes: Int = 256 * 1024 * 1024
 
