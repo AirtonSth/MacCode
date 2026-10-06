@@ -23,6 +23,16 @@ HOST = "io.macuse.computer_use"
 BRIDGE_PATH = Path.home() / ".local/share/linux-use/bridge.sock"
 BROWSER_SESSION = str(uuid.uuid4())
 BASE_TOOLS = ["screenshot", "zoom", "cursor_position", "list_windows", "get_ui_tree", "jev_decide", "doctor", "restore_window", "left_click", "type", "key", "scroll", "click_element", "native_visual_propose", "native_visual_execute", "browser_open", "browser_snapshot", "browser_act", "browser_close", "browser_status"]
+# RemoteCode guest kit: the guest has no Chrome extension, native-messaging host
+# or linux-use skill, so the extension tools (browser_*, jev_decide) could only
+# fail. They are not listed, not reported by doctor and refused by tools/call.
+BASE_TOOLS = [x for x in BASE_TOOLS if not x.startswith("browser_") and x != "jev_decide"]
+GUEST_INSTRUCTIONS = ("Linux native desktop controls are X11-only. doctor/list_windows and explicit wmctrl restore_window plus "
+                      "xwd/ImageMagick screenshots and xdotool click/type/key/scroll for exact windows with fresh state tokens "
+                      "are available when their utilities exist. For native X11 windows, screenshot returns an image to the MCP "
+                      "caller's visual model; that model may submit a one-use native_visual_propose tied to the image "
+                      "target/token, then native_visual_execute revalidates before input. Window restoration changes the active "
+                      "window and is explicit. Report cleanup that cannot be verified.")
 NATIVE_VISUAL_PROPOSALS = {}
 NATIVE_VISUAL_OBSERVATIONS = {}
 
@@ -250,6 +260,8 @@ def take_native_visual_proposal(proposal_id):
 
 
 def call_tool(name, args):
+    if name not in BASE_TOOLS:  # RemoteCode guest kit: hidden extension tools are unknown here.
+        raise ValueError(f"unknown tool: {name}")
     if name == "doctor":
         supported = []
         if os.environ.get("DISPLAY") and os.environ.get("XDG_SESSION_TYPE", "").lower() != "wayland" and shutil.which("wmctrl"):
@@ -395,7 +407,7 @@ def handle(message):
     if method.startswith("notifications/") or ident is None:
         return None
     if method == "initialize":
-        return {"jsonrpc": "2.0", "id": ident, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "linux-use", "version": "1.0.0"}, "instructions": "Read the installed linux-use skill before using these tools (repository: skills/linux-use/SKILL.md). Track resources created by this task and clean them up on success, failure, or cancellation before responding. Preserve pre-existing resources, user takeovers, and requested deliverables. After each browser use, call browser_close on the same MCP connection and verify the result plus browser_status; released does not mean closed. Report cleanup that cannot be verified. Linux native desktop controls are X11-only. doctor/list_windows and explicit wmctrl restore_window plus xwd/ImageMagick screenshots and xdotool click/type/key/scroll for exact windows with fresh state tokens are available when their utilities exist. Chrome automation is available through the separately registered extension. Jev advice is available only for an owned Chrome tab with configured credentials; it sends filtered control labels and returns proposals without executing actions; risky controls (delete/send/purchase/close) need allowed_risks and browser_act returns a fresh snapshot, so earlier refs are stale. For native X11 windows, screenshot returns an image to the MCP caller's visual model (not Jev); that model may submit a one-use native_visual_propose tied to the image target/token, then native_visual_execute revalidates before input. This token does not prove proposal origin. Jev remains available for structured owned Chrome observations. Window restoration changes the active window and is explicit."}}
+        return {"jsonrpc": "2.0", "id": ident, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "linux-use", "version": "1.0.0"}, "instructions": GUEST_INSTRUCTIONS}}
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": ident, "result": {"tools": schemas()}}
     if method == "tools/call":

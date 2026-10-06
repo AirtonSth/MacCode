@@ -16,14 +16,22 @@
 # /proc/<pid>/environ and would find no run at all.
 #
 # kill-agent --reap <runId> is the lease reaper run-agent starts: it ends the
-# run once /home/remotecode/.rc-runs/<runId>.lease is more than 45 s old (or
-# missing for 45 s after the run started), and exits when the run ends.
+# run once /home/remotecode/.rc-runs/<runId>.lease has not changed for 45 s of
+# the reaper's own polling (missing counts as unchanged), and exits when the
+# run ends. Only a change in the lease counts, never its age against the guest
+# clock: the Mac writes the mtime with its own clock, and after the Mac sleeps
+# the guest clock jumps ahead, which would end a live run before its next
+# renewal. A sleep that spans a suspend is one poll, so the Mac's next renewal
+# still lands in time. RC_AGENT_LEASE_MAX_AGE and RC_AGENT_REAP_INTERVAL
+# (whole seconds) override 45 and 5 for tests.
 set -u
 
 state=/tmp/rc-agent
 lease_dir=/home/remotecode/.rc-runs
-lease_max_age=45
-reap_interval=5
+lease_max_age=${RC_AGENT_LEASE_MAX_AGE:-45}
+reap_interval=${RC_AGENT_REAP_INTERVAL:-5}
+[[ $lease_max_age =~ ^[0-9]+$ ]] || lease_max_age=45
+[[ $reap_interval =~ ^[1-9][0-9]*$ ]] || reap_interval=5
 
 usage() {
     echo "usage: kill-agent <runId>|--all|--reap <runId>" >&2
@@ -136,18 +144,22 @@ kill_runs() {
 }
 
 reap() {
-    local run=$1 lease=$lease_dir/$1.lease started now fresh modified
-    started=$(date +%s)
+    local run=$1 lease=$lease_dir/$1.lease seen="" current idle=0
     while sleep "$reap_interval"; do
         scan
         if [ -z "$(targets "$run" 0)" ]; then
             rm -f "$state/$run.pid"
             exit 0
         fi
-        now=$(date +%s)
-        fresh=$started
-        modified=$(stat -c %Y -- "$lease" 2>/dev/null) && [ "$modified" -gt "$fresh" ] && fresh=$modified
-        if [ $((now - fresh)) -gt "$lease_max_age" ]; then
+        # %y has sub-second precision: every renewal changes it.
+        current=$(stat -c %y -- "$lease" 2>/dev/null) || current=""
+        if [ -n "$current" ] && [ "$current" != "$seen" ]; then
+            seen=$current
+            idle=0
+        else
+            idle=$((idle + reap_interval))
+        fi
+        if [ "$idle" -gt "$lease_max_age" ]; then
             # The Mac stopped renewing the lease: end the run, then this reaper.
             kill_runs "$run" 0
             exit

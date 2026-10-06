@@ -44,10 +44,12 @@ public enum BotComputerGuestSpec {
     public static let runAgentPath = "\(agentKitMountPoint)/bin/run-agent"
     /// `kill-agent <runId>|--all`: TERM then KILL; idempotent.
     public static let killAgentPath = "\(agentKitMountPoint)/bin/kill-agent"
-    /// Vendored linux-use stdio MCP server (python3).
+    /// Vendored linux-use stdio MCP server (python3), native X11 tools only:
+    /// the guest has no Chrome extension, so browser_* and jev_decide are removed.
     public static let linuxUseServerPath = "\(agentKitMountPoint)/linux-use/server.py"
-    /// The Mac renews `<runId>.lease` here while it owns the run; run-agent's
-    /// reaper ends a run whose lease is more than 45 s old.
+    /// The Mac renews `<runId>.lease` here while it owns the run, by writing
+    /// (re-creating) the file: the agent can delete it. run-agent's reaper ends
+    /// a run whose lease has not changed for 45 s of its own polling.
     public static let agentLeaseDirectory = "\(guestUserHome)/.rc-runs"
     public static let screenPort = 6080
     public static let minimumShmBytes: Int = 256 * 1024 * 1024
