@@ -8541,6 +8541,26 @@ public final class ProviderSessionRuntimeRepository {
         _ = try statement.step()
     }
 
+    /// Forgets the provider session a thread would resume: `resume_cursor`
+    /// and the payload's `providerThreadId` fallback. The next run opens a new
+    /// session. Missing rows are a no-op.
+    public func clearResumeCursor(threadId: AgentThreadID, at date: Date = Date()) throws {
+        let statement = try db.prepare("""
+            UPDATE provider_session_runtime
+            SET resume_cursor = NULL,
+                runtime_payload_json = CASE
+                    WHEN json_valid(runtime_payload_json)
+                        THEN json_remove(runtime_payload_json, '$.providerThreadId')
+                    ELSE runtime_payload_json
+                END,
+                updated_at = ?
+            WHERE thread_id = ?;
+            """)
+        try statement.bind(1, iso.string(from: date))
+        try statement.bind(2, threadId.value.uuidString)
+        _ = try statement.step()
+    }
+
     /// Start-path session chrome only. Avoids the full session get+upsert
     /// (including `runtime_payload_json`) when `sendTurn` promotes pending →
     /// running. Missing rows are a no-op.

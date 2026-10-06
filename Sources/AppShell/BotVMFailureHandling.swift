@@ -7,27 +7,41 @@ extension AppCommandRouter {
     static let macExecutionApprovedFollowUp = "Execução no Mac aprovada pelo usuário. Continue."
     static let macExecutionDeclinedFollowUp = "O usuário recusou a execução no Mac. Continue na VM ou pare e explique."
 
+    /// Every Agent App view model that can show a bot thread: the Agent App
+    /// tabs and the embedded Bots Desk.
+    var botThreadViewModels: [AgentAppViewModel] {
+        var models: [AgentAppViewModel] = []
+        for case let agent as AgentAppSurface in SurfaceRegistry.shared.all() {
+            models.append(agent.viewModel)
+        }
+        if let desk = botsViewModel?.deskAgentVM { models.append(desk) }
+        return models
+    }
+
     func handleMacExecutionRequested(threadID: AgentThreadID, reason: String) {
         pendingMacExecution[threadID] = reason
-        for case let agent as AgentAppSurface in SurfaceRegistry.shared.all() {
-            agent.viewModel.pendingMacExecutionByThread[threadID] = reason
+        for viewModel in botThreadViewModels {
+            viewModel.pendingMacExecutionByThread[threadID] = reason
         }
     }
 
     /// Approve switches the thread to the Mac (actor and lock kept); decline leaves the target alone.
     /// Both send a follow-up so the bot learns the outcome. Only ever called from a user click.
+    /// A guest thread keeps its marker: its next run (this follow-up, once a
+    /// still-finishing guest turn ends) starts a new Mac session with a
+    /// handoff summary (`AgentRunCoordinator.pendingMacHandoff`).
     func resolveMacExecution(thread: AgentThreadID, approve: Bool) async {
         guard pendingMacExecution.removeValue(forKey: thread) != nil else { return }
-        for case let agent as AgentAppSurface in SurfaceRegistry.shared.all() {
-            agent.viewModel.pendingMacExecutionByThread[thread] = nil
+        for viewModel in botThreadViewModels {
+            viewModel.pendingMacExecutionByThread[thread] = nil
         }
         if approve {
             guard let stored = try? context?.threadRepo.get(id: thread),
                   (try? context?.threadRepo.setActor(
                       id: thread, actor: stored.actor, lockedAt: stored.actorLockedAt, executionTarget: .mac
                   )) == true else { return }
-            for case let agent as AgentAppSurface in SurfaceRegistry.shared.all() {
-                agent.viewModel.mirrorExecutionTarget(.mac, thread: thread)
+            for viewModel in botThreadViewModels {
+                viewModel.mirrorExecutionTarget(.mac, thread: thread)
             }
         }
         _ = try? await sendAgentMessage(
@@ -38,8 +52,10 @@ extension AppCommandRouter {
     }
 
     /// nil when Docker answers and the run's workspace is mounted; otherwise the user-facing failure.
+    /// A workspace-less thread (`workspace` nil, a Bots Desk thread) only needs the container up:
+    /// its agent runs in the guest user's home, and BotHome is never a mountable workspace.
     /// A bot already running elsewhere keeps its container: the send queues instead of remounting.
-    func botVMPreflight(_ botID: BotID, workspace: String) async -> String? {
+    func botVMPreflight(_ botID: BotID, workspace: String?) async -> String? {
         guard let ctx = context else { return "Contexto indisponível." }
         let docker = botVMDocker
         let service = botVMService(appSupport: ctx.appSupportDirectory)
@@ -49,7 +65,11 @@ extension AppCommandRouter {
             do {
                 prefetch(try docker.info())
                 if BotVMRunRegistry.shared.active(botID: botID) == nil {
-                    try service.ensureWorkspaceMounted(botID: botID, workspace: workspace, registered: registered)
+                    if let workspace {
+                        try service.ensureWorkspaceMounted(botID: botID, workspace: workspace, registered: registered)
+                    } else {
+                        _ = try service.provision(botID: botID)
+                    }
                 }
                 return nil
             } catch {

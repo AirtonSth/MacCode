@@ -81,6 +81,15 @@ public struct AgentThreadGuestPlacement: Equatable, Sendable {
     public var runsInGuest: Bool {
         executionTarget == .vm && guestRuntime?.isEmpty == false
     }
+
+    /// A guest thread the user moved to the Mac ("Rodar esta thread no Mac",
+    /// an approved Mac-execution request) keeps its marker until its next
+    /// run starts: that run drops the guest session, which the Mac cannot
+    /// load, and carries a handoff summary instead. Deferred to the run start
+    /// because a guest run still finishing would write its session back.
+    public var macHandoffPending: Bool {
+        executionTarget == .mac && guestRuntime?.isEmpty == false
+    }
 }
 
 public enum BotExecutionDefault {

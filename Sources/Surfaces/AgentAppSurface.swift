@@ -438,7 +438,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Approves or declines a pending Mac-execution request; wired by the host.
     public var botMacExecutionResolver: (@MainActor (AgentThreadID, Bool) async -> Void)?
     /// Returns a user-facing error when the bot VM cannot run; nil when ready. Wired by the host.
-    public var botVMPreflight: ((BotID, String) async -> String?)?
+    /// The workspace is nil for a workspace-less (Bots Desk) thread: the VM only has to be up.
+    public var botVMPreflight: ((BotID, String?) async -> String?)?
     /// Starts (provisions) the bot VM; returns a user-facing error or nil. Wired by the host.
     public var botVMProvision: ((BotID) async -> String?)?
     /// Set when the VM preflight failed; drives the "VM indisponível" banner.
@@ -6135,9 +6136,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     /// Blocks the send (true) when a bot thread's workspace is gone or its VM is down. Never falls back to the Mac.
+    /// A thread with no workspace (a Bots Desk thread runs in BotHome) has nothing to mount: the gate only
+    /// needs the VM up, since BotHome is never a registered workspace and mounting it would always fail.
     private func botVMGateBlocksRun(botID: BotID, thread: AgentThread?) async -> Bool {
-        let workspace = thread?.worktreePath ?? cwd
-        if !FileManager.default.fileExists(atPath: workspace) {
+        let workspace: String? = embedding != nil && thread?.workspaceId == nil
+            ? nil
+            : thread?.worktreePath ?? cwd
+        if let workspace, !FileManager.default.fileExists(atPath: workspace) {
             statusMessage = "Workspace removido"
             return true
         }
@@ -6219,21 +6224,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    /// Max chars kept per message in the handoff summary.
-    static let handoffMessageLimit = 300
-    static let handoffMessageCount = 6
-
     /// Deterministic continuation draft: header plus the last user/assistant messages, truncated.
     public static func handoffSummary(title: String, threadId: AgentThreadID, messages: [AgentMessage]) -> String {
-        var lines = ["Continuação da thread \"\(title)\" (id \(threadId.value.uuidString.lowercased()))"]
-        let turns = messages.filter { $0.role == .user || $0.role == .assistant }.suffix(handoffMessageCount)
-        for message in turns {
-            let label = message.role == .user ? "Usuário" : "Assistente"
-            let text = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
-            let clipped = text.count > handoffMessageLimit ? String(text.prefix(handoffMessageLimit)) + "…" : text
-            lines.append("\(label): \(clipped)")
-        }
-        return lines.joined(separator: "\n")
+        AgentThreadHandoff.summary(title: title, threadId: threadId, messages: messages)
     }
 
     /// Opens a new thread in this workspace for `actor`, with a draft summarising `oldThreadId`.
@@ -8892,7 +8885,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let actorThread = threads.first(where: { $0.id == tid })
         let runActor: RunActor = actorThread?.actorLockedAt != nil ? (actorThread?.actor ?? .none) : selectedRunActor
         var botPrompt: String?
-        if embedding == nil, case .bot(let botID) = runActor,
+        // Agent App tabs gate every bot send; the embedded desk gates the threads
+        // locked to the bot's VM (its legacy unlocked threads keep running on the Mac).
+        if case .bot(let botID) = runActor,
+           embedding == nil || (actorThread?.actorLockedAt != nil && actorThread?.executionTarget == .vm),
            await botVMGateBlocksRun(botID: botID, thread: actorThread) {
             return nil
         }

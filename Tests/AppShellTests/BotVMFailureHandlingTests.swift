@@ -170,6 +170,126 @@ final class BotVMFailureHandlingTests: XCTestCase {
         XCTAssertNil(f.vm.vmUnavailableBotID)
     }
 
+    // MARK: - Guest thread → Mac handoff (plan A M10)
+
+    /// Makes the fixture thread a guest thread with a transcript whose Distill
+    /// session `guestSession` lives inside the bot's Linux VM: marker on a `.vm`
+    /// lock, and the cursor on both the thread and its provider session row.
+    private func makeGuestThreadWithHistory(_ f: Fixture, guestSession: String) throws {
+        try f.ctx.messageRepo.append(AgentMessage(
+            threadId: f.thread.id, role: .user, content: "primeira tarefa", createdAt: Date().addingTimeInterval(-10)
+        ))
+        try f.ctx.messageRepo.append(AgentMessage(
+            threadId: f.thread.id, role: .assistant, content: "feito na VM", createdAt: Date().addingTimeInterval(-5)
+        ))
+        try f.ctx.providerSessionRuntimeRepo.upsert(ProviderSessionRuntime(
+            threadId: f.thread.id, provider: .codex, status: .completed, resumeCursor: guestSession,
+            runtimePayloadJSON: "{\"providerThreadId\":\"\(guestSession)\"}"
+        ))
+        try writeGuestCursor(f, guestSession)
+        try XCTUnwrap(f.router.botWorkspaceRunHooks).link(f.bot.id, f.thread.id)
+        try lockOnVM(f)
+        try f.ctx.threadRepo.setGuestRuntime(id: f.thread.id, BotGuestRuntime.distillV1)
+        f.vm.reloadThreads()
+        f.vm.selectThread(f.thread.id)
+    }
+
+    /// What a guest turn's finish persists: its session as the thread's cursor.
+    private func writeGuestCursor(_ f: Fixture, _ guestSession: String) throws {
+        try f.ctx.threadRepo.updateProviderThreadId(id: f.thread.id, providerThreadId: guestSession)
+        try f.ctx.providerSessionRuntimeRepo.stampResumeCursor(threadId: f.thread.id, resumeCursor: guestSession)
+    }
+
+    func test_approvingMacExecutionOnAGuestThreadStartsANewMacSessionWithTheHandoffSummary() async throws {
+        // WHY (M10): the guest's Distill session lives in the VM's home; the Mac
+        // cannot load it. The Mac run must drop that cursor (thread and provider
+        // session) and the marker, and carry the recent transcript instead, or the
+        // follow-up either fails to load the session or loses the conversation.
+        let f = try makeFixture()
+        try makeGuestThreadWithHistory(f, guestSession: "guest-session-1")
+        await requestMacExecution(f)
+        await f.router.resolveMacExecution(thread: f.thread.id, approve: true)
+        let sent = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(sent)
+        let followUp = try XCTUnwrap(f.runner.requests.last)
+        XCTAssertNil(followUp.providerThreadId, "the guest session must not be resumed on the Mac")
+        XCTAssertTrue(followUp.prompt.hasPrefix("Continuação da thread \"VM thread\""), followUp.prompt)
+        XCTAssertTrue(followUp.prompt.contains("Usuário: primeira tarefa"))
+        XCTAssertTrue(followUp.prompt.contains("Assistente: feito na VM"))
+        XCTAssertTrue(followUp.prompt.hasSuffix(AppCommandRouter.macExecutionApprovedFollowUp))
+        XCTAssertEqual(followUp.userMessageContent, AppCommandRouter.macExecutionApprovedFollowUp,
+                       "the transcript keeps the follow-up text, not the summary")
+        let placement = try XCTUnwrap(try f.ctx.threadRepo.guestPlacement(of: f.thread.id))
+        XCTAssertEqual(placement.executionTarget, .mac)
+        XCTAssertNil(placement.guestRuntime, "the marker is gone once the Mac session takes over")
+        XCTAssertNotEqual(try f.ctx.providerSessionRuntimeRepo.resumeCursor(of: f.thread.id), "guest-session-1")
+    }
+
+    func test_approvalDuringAStillRunningGuestTurnHandsOffWhenTheFollowUpStarts() async throws {
+        // WHY: the bot asks for the Mac mid-turn, so the user can approve before the
+        // guest turn ends. That turn's finish writes the guest cursor back; clearing
+        // at approval time would be undone, and the queued follow-up would try to
+        // load the guest session on the Mac.
+        let f = try makeFixture()
+        try makeGuestThreadWithHistory(f, guestSession: "guest-session-1")
+        // The guest turn that asked for the Mac is still running.
+        try f.ctx.threadRepo.updateStatus(id: f.thread.id, status: .running, hasUnread: false)
+        await requestMacExecution(f)
+        await f.router.resolveMacExecution(thread: f.thread.id, approve: true)
+        XCTAssertEqual(try f.ctx.queuedMessageRepo.list(threadId: f.thread.id).count, 1, "the follow-up waits")
+        XCTAssertTrue(f.runner.requests.isEmpty)
+        // The guest turn ends after the approval and persists its session.
+        try writeGuestCursor(f, "guest-session-1")
+        try f.ctx.threadRepo.updateStatus(id: f.thread.id, status: .completed, hasUnread: false)
+        try await f.router.drainNextQueuedAgentMessage(thread: f.thread.id)
+        let drained = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(drained)
+        let followUp = try XCTUnwrap(f.runner.requests.last)
+        XCTAssertNil(followUp.providerThreadId)
+        XCTAssertTrue(followUp.prompt.hasPrefix("Continuação da thread"), followUp.prompt)
+        XCTAssertEqual(followUp.userMessageContent, AppCommandRouter.macExecutionApprovedFollowUp)
+        XCTAssertNil(try f.ctx.threadRepo.guestPlacement(of: f.thread.id)?.guestRuntime)
+    }
+
+    func test_approvingMacExecutionOnALegacyVMThreadKeepsItsMacSession() async throws {
+        // WHY (D5): a `.vm` thread without the guest marker always ran on the Mac;
+        // its session is a Mac session and must keep resuming.
+        let f = try makeFixture()
+        try lockOnVM(f)
+        try f.ctx.threadRepo.updateProviderThreadId(id: f.thread.id, providerThreadId: "mac-session-1")
+        await requestMacExecution(f)
+        await f.router.resolveMacExecution(thread: f.thread.id, approve: true)
+        let sent = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(sent)
+        let followUp = try XCTUnwrap(f.runner.requests.first)
+        XCTAssertEqual(followUp.providerThreadId, "mac-session-1")
+        XCTAssertEqual(followUp.prompt.contains("Continuação da thread"), false)
+    }
+
+    func test_runOnMacFromTheVMBannerHandsAGuestThreadOffOnItsNextSend() async throws {
+        // WHY (D11 + M10): "Rodar esta thread no Mac" is the only way a guest
+        // thread reaches the Mac; its next send must start a Mac session from the
+        // transcript, not try to load the guest session.
+        let f = try makeFixture()
+        try makeGuestThreadWithHistory(f, guestSession: "guest-session-1")
+        f.vm.botVMPreflight = { _, _ in "docker parado" }
+        f.vm.prompt = "continua"
+        await f.vm.send()
+        XCTAssertEqual(f.vm.vmUnavailableBotID, f.bot.id, f.vm.statusMessage)
+        XCTAssertTrue(f.runner.requests.isEmpty, "no run while the VM is down")
+        f.vm.runSelectedThreadOnMac()
+        XCTAssertEqual(try f.ctx.threadRepo.guestPlacement(of: f.thread.id)?.macHandoffPending, true)
+        f.vm.prompt = "continua"
+        await f.vm.send()
+        let sent = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(sent, f.vm.statusMessage)
+        let request = try XCTUnwrap(f.runner.requests.last)
+        XCTAssertNil(request.providerThreadId)
+        XCTAssertTrue(request.prompt.hasPrefix("Continuação da thread"), request.prompt)
+        XCTAssertEqual(request.userMessageContent, "continua")
+        XCTAssertNil(try f.ctx.threadRepo.guestPlacement(of: f.thread.id)?.guestRuntime)
+    }
+
     func test_removedWorkspaceRefusesBotSend() async throws {
         let f = try makeFixture()
         try FileManager.default.removeItem(at: f.workspaceDir)
@@ -272,6 +392,19 @@ final class BotVMFailureHandlingTests: XCTestCase {
         private var stored: [URL] = []
         var urls: [URL] { lock.withLock { stored } }
         func append(_ url: URL) { lock.withLock { stored.append(url) } }
+    }
+
+    /// WHY (B5): a Bots Desk thread runs in BotHome, which is never a registered
+    /// workspace; mounting it always failed, so every desk send showed "VM
+    /// indisponível". A workspace-less thread only needs the container up.
+    func test_preflightWithoutWorkspaceProvisionsWithoutMountingAnything() async throws {
+        let f = try makeFixture()
+        let docker = RecordingDockerRun()
+        f.router.botVMDocker = BotComputerDockerCLI(run: { try docker.run($0) })
+        let failure = await f.router.botVMPreflight(f.bot.id, workspace: nil)
+        XCTAssertNil(failure)
+        let create = try XCTUnwrap(docker.calls.first { $0.first == "create" }, "the VM must be brought up")
+        XCTAssertFalse(create.contains { $0.contains(f.workspaceDir.path) }, "nothing is mounted: \(create)")
     }
 
     /// WHY: an unregistered path must block the send instead of mounting arbitrary host directories.

@@ -2812,11 +2812,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         agent.viewModel.mentionableBotsRevisionProvider = { [weak self] in
             self?.context?.botStore.botsListRevision ?? 0
         }
-        agent.viewModel.botExecutionTargetProvider = { [weak self] botID in
-            guard let store = self?.context?.botStore else { return .mac }
-            let revision = (try? store.get(id: botID))?.currentRevisionID.flatMap { try? store.getRevision(id: $0) }
-            return BotExecutionDefault.target(for: revision ?? nil)
-        }
+        configureBotVMHooks(on: agent.viewModel)
         agent.viewModel.botIsAvailable = { [weak self] botID in
             guard let store = self?.context?.botStore else { return false }
             if ((try? store.listCached()) ?? []).contains(where: { $0.id == botID }) { return true }
@@ -2851,21 +2847,32 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 )
             }
         }
-        agent.viewModel.botBusyMessage = { botID, threadID in
+        agent.viewModel.openBotScreen = { [weak self] botID in self?.openBotGuestDesktopInNewWindow(botID) }
+    }
+
+    /// The bot VM hooks every Agent App that runs bot threads shares (Agent
+    /// App tabs and the embedded Bots Desk): target default, one-run-per-VM
+    /// queue, Mac-execution approvals, and the VM gate behind the D11 banner.
+    func configureBotVMHooks(on viewModel: AgentAppViewModel) {
+        viewModel.botExecutionTargetProvider = { [weak self] botID in
+            guard let store = self?.context?.botStore else { return .mac }
+            let revision = (try? store.get(id: botID))?.currentRevisionID.flatMap { try? store.getRevision(id: $0) }
+            return BotExecutionDefault.target(for: revision ?? nil)
+        }
+        viewModel.botBusyMessage = { botID, threadID in
             BotVMRunRegistry.shared.busyMessage(botID: botID, threadID: threadID)
         }
-        agent.viewModel.botWaitForVM = { botID, threadID in
+        viewModel.botWaitForVM = { botID, threadID in
             BotVMRunRegistry.shared.addWaiting(botID: botID, threadID: threadID)
         }
-        agent.viewModel.botMacExecutionResolver = { [weak self] threadID, approve in
+        viewModel.botMacExecutionResolver = { [weak self] threadID, approve in
             await self?.resolveMacExecution(thread: threadID, approve: approve)
         }
-        agent.viewModel.openBotScreen = { [weak self] botID in self?.openBotGuestDesktopInNewWindow(botID) }
-        agent.viewModel.botVMPreflight = { [weak self] botID, workspace in
+        viewModel.botVMPreflight = { [weak self] botID, workspace in
             await self?.botVMPreflight(botID, workspace: workspace)
         }
-        agent.viewModel.botVMProvision = { [weak self] botID in await self?.provisionBotVM(botID) }
-        agent.viewModel.pendingMacExecutionByThread = pendingMacExecution
+        viewModel.botVMProvision = { [weak self] botID in await self?.provisionBotVM(botID) }
+        viewModel.pendingMacExecutionByThread = pendingMacExecution
     }
 
     private struct BotWorkspaceRunUnavailable: LocalizedError {

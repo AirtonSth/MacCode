@@ -1898,6 +1898,61 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         )
     }
 
+    /// The first run of a guest thread the user moved to the Mac
+    /// (`macHandoffPending`) opens a new Mac session: the guest's session
+    /// cannot load on the Mac. It clears the thread's cursor, the provider
+    /// session's resume cursor and the marker, and opens the provider prompt
+    /// with the recent transcript; the transcript keeps the user's own words.
+    /// Legacy `.vm` threads (no marker) keep their Mac sessions untouched.
+    /// Returns the handed-off request, or nil when no handoff is pending.
+    func pendingMacHandoff(
+        _ request: AgentRunRequest, placement: AgentThreadGuestPlacement?
+    ) throws -> AgentRunRequest? {
+        guard placement?.macHandoffPending == true else { return nil }
+        let recent = try messageRepo.listRecent(threadId: request.threadId, limit: 50)
+        let title = try threadRepo.get(id: request.threadId)?.title ?? ""
+        try providerSessionRepo?.clearResumeCursor(threadId: request.threadId)
+        try threadRepo.updateProviderThreadId(id: request.threadId, providerThreadId: nil)
+        // Last, so a failure above leaves the handoff pending for the next start.
+        try threadRepo.setGuestRuntime(id: request.threadId, nil)
+        agentRunLog.info(
+            "bot.guest.mac_handoff thread=\(request.threadId.value.uuidString, privacy: .public)"
+        )
+        let summary = recent.contains { $0.role == .user || $0.role == .assistant }
+            ? AgentThreadHandoff.summary(title: title, threadId: request.threadId, messages: recent)
+            : nil
+        var handed = AgentRunRequest(
+            runId: request.runId,
+            threadId: request.threadId,
+            provider: request.provider,
+            providerInstanceId: request.providerInstanceId,
+            model: request.model,
+            cwd: request.cwd,
+            prompt: summary.map { "\($0)\n\n\(request.prompt)" } ?? request.prompt,
+            userMessageContent: summary == nil ? request.userMessageContent : (request.userMessageContent ?? request.prompt),
+            attachments: request.attachments,
+            providerThreadId: nil,
+            permissionMode: request.permissionMode,
+            reasoningEffort: request.reasoningEffort,
+            reasoningModel: request.reasoningModel,
+            distillMainEffortSelection: request.distillMainEffortSelection,
+            distillReasoningEffortSelection: request.distillReasoningEffortSelection,
+            serviceTier: request.serviceTier,
+            interactionMode: request.interactionMode,
+            providerBinary: request.providerBinary,
+            environment: request.environment,
+            extraArgs: request.extraArgs,
+            runAsUser: request.runAsUser,
+            acceptancePermit: request.acceptancePermit,
+            contextSnapshot: request.contextSnapshot,
+            preparedContextSeed: request.preparedContextSeed
+        )
+        // Same contract as a bot-brain prompt: the provider prompt differs from
+        // the displayed text, so it is the prompt that goes out.
+        handed.tokenSaverCompressesPrompt = request.tokenSaverCompressesPrompt || summary != nil
+        return handed
+    }
+
     @discardableResult
     public func startRun(
         _ request: AgentRunRequest,
@@ -2119,7 +2174,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             routingSnapshot: routingSnapshot,
             delegationCapabilitySHA256: delegationCapabilitySHA256
         )
-        let request = admittedRequest.request
+        // One read serves the Mac handoff and the guest placement check below.
+        let guestPlacement = try threadRepo.guestPlacement(of: admittedRequest.request.threadId)
+        let macHandoff = try pendingMacHandoff(admittedRequest.request, placement: guestPlacement)
+        let request = macHandoff ?? admittedRequest.request
         // A user-initiated run ends any background-await auto-continuation streak;
         // the auto-nudge path passes `isAutoContinuation: true` to preserve the bound.
         // F37: it must also invalidate any ALREADY-SCHEDULED continuation (same
@@ -2131,7 +2189,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             resetAutoContinuationStreak(request.threadId)
             invalidateScheduledAutoContinuation(request.threadId)
         }
-        let recoveryContext = request.providerThreadId == nil ? try recoverableResumeContext(for: request) : nil
+        // A Mac handoff starts a new session: nothing of the guest's is resumed.
+        let recoveryContext = request.providerThreadId == nil && macHandoff == nil
+            ? try recoverableResumeContext(for: request) : nil
         let resumeCursor = request.providerThreadId ?? recoveryContext?.resumeCursor
         // Token Saver: compress only the text sent to the provider; the
         // original prompt is preserved verbatim as the displayed user message.
@@ -2322,10 +2382,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         guard let runner = providers[effectiveRequest.provider] else {
             throw AgentRunError.missingBinary(effectiveRequest.provider.rawValue)
         }
-        try Self.checkGuestPlacement(
-            provider: effectiveRequest.provider,
-            placement: try threadRepo.guestPlacement(of: effectiveRequest.threadId)
-        )
+        try Self.checkGuestPlacement(provider: effectiveRequest.provider, placement: guestPlacement)
         try await providerAdmissionCheck(effectiveRequest.provider, effectiveRequest.threadId)
         let adapterKey = providerAdapterKey(runner)
         let binaryIdentity = providerBinaryIdentity(effectiveRequest.provider, adapter: runner)

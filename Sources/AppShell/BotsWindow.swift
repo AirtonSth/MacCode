@@ -10071,6 +10071,23 @@ public final class BotsViewModel: ObservableObject {
         }
         vm.botComputerControl = router.botComputerControl
         vm.manualActionStore = router.manualActionStore
+        // Desk threads locked to the bot's VM get the same gate, queue and
+        // D11 banner as Agent App tabs. A workspace-less desk thread's gate
+        // starts the desktop through the desk's own launch, so the desktop
+        // pane and the send admission see the VM the gate brought up.
+        router.configureBotVMHooks(on: vm)
+        vm.botVMPreflight = { [weak self, weak router] botID, workspace in
+            if let workspace {
+                guard let router else { return "Bot indisponível." }
+                return await router.botVMPreflight(botID, workspace: workspace)
+            }
+            guard let self else { return "Bot indisponível." }
+            return await self.deskGuestDesktopFailure(botID)
+        }
+        vm.botVMProvision = { [weak self] botID in
+            guard let self else { return "Bot indisponível." }
+            return await self.deskGuestDesktopFailure(botID)
+        }
         vm.botNameProvider = { [weak self] botID in
             (try? self?.botStore.get(id: botID))??.name
         }
@@ -10090,6 +10107,21 @@ public final class BotsViewModel: ObservableObject {
         AppCommandRouter.wireTokenSaverThreadFooter(on: vm, context: context)
         deskAgentKey = key
         deskAgentVM = vm
+    }
+
+    /// nil once the bot's Linux desktop is up (starting it when it is not);
+    /// otherwise the user-facing failure. Same readiness `admitDesktopSend` uses.
+    private func deskGuestDesktopFailure(_ botID: BotID) async -> String? {
+        if let dockerGuestReadyOverrideForTesting {
+            return dockerGuestReadyOverrideForTesting ? nil : "Docker desktop is not ready."
+        }
+        if isGuestRunning(botID) { return nil }
+        let ready = await withCheckedContinuation { continuation in
+            presentGuestDesktop(botID: botID) { continuation.resume(returning: $0) }
+        }
+        if ready != nil { return nil }
+        if case .failed(let message) = guestLaunchState(for: botID) { return message }
+        return "Linux desktop is starting. Try again when it is ready."
     }
 
     /// Workspace-linked threads keep running in their workspace (or worktree), not the bot home.
@@ -10114,16 +10146,14 @@ public final class BotsViewModel: ObservableObject {
                       conversation.botID == bot.id else {
                     throw BotDeskSendRefused(reason: "Bot indisponível.")
                 }
-                let prompt = try self.compileDeskPrompt(
+                // Carries the VM rules for a thread locked to the bot's VM.
+                return try self.compileDeskPrompt(
                     botID: bot.id,
                     conversationID: conversation.id,
                     text: text,
                     threadID: threadID,
                     runID: runID
                 )
-                let thread = try? self.context.threadRepo.get(id: threadID)
-                guard thread?.executionTarget == .vm else { return prompt }
-                return prompt + "\n\n" + BotStandingInstructions.vmThreadRules
             },
             runStarted: { [weak self] botID, runID, threadID in
                 guard let self,
@@ -10300,23 +10330,28 @@ public final class BotsViewModel: ObservableObject {
         return Self.supervisedRunPrompt(
             userText: text,
             compiledPayload: receipt.compiledPayload,
-            provider: routing.provider
+            provider: routing.provider,
+            executionTarget: thread?.executionTarget
         )
     }
 
     /// Distill resolves `/name args` only when the prompt starts with the slash;
     /// the brain wrap would bury it, so slash commands go through raw. Shared by
-    /// the embedded desk and the paired-device (iOS) supervised run.
+    /// the embedded desk and the paired-device (iOS) supervised run. A thread
+    /// locked to the bot's VM gets the VM rules after the brain (never after a
+    /// raw slash command, whose arguments they would become).
     nonisolated static func supervisedRunPrompt(
         userText: String,
         compiledPayload: String,
-        provider: AgentProvider
+        provider: AgentProvider,
+        executionTarget: ExecutionTarget? = nil
     ) -> String {
         if provider == .distill,
            userText.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/") {
             return userText
         }
-        return compiledPayload
+        guard executionTarget == .vm else { return compiledPayload }
+        return compiledPayload + "\n\n" + BotStandingInstructions.vmThreadRules
     }
 
     private func deskAgentRunStarted(
@@ -10429,6 +10464,7 @@ public final class BotsViewModel: ObservableObject {
             )
             createdThread.reasoningModel = routing.reasoningModel
             try context.threadRepo.upsert(createdThread)
+            try lockNewDeskThreadToGuestIfDistill(&createdThread, bot: bot, provider: routing.provider)
             thread = createdThread
             liveConversation.linkedAgentThreadID = thread.id
             try botStore.upsertConversation(liveConversation)
@@ -10438,6 +10474,32 @@ public final class BotsViewModel: ObservableObject {
             adoptFollowThroughConversation(liveConversation)
         }
         return (thread, liveConversation)
+    }
+
+    /// Plan A: a new desk conversation of a Docker-desktop bot on Distill runs
+    /// inside the bot's Linux guest. Its thread is locked to the bot on the VM
+    /// and carries the guest marker from creation, before its first run. Other
+    /// providers and other desktops keep today's unlocked desk thread on the Mac,
+    /// and so does every desk thread created before this (D5): reused threads
+    /// never reach here.
+    private func lockNewDeskThreadToGuestIfDistill(
+        _ thread: inout AgentThread,
+        bot: BotDefinition,
+        provider: AgentProvider
+    ) throws {
+        guard provider == .distill,
+              BotExecutionDefault.target(for: try currentRevision(for: bot)) == .vm else { return }
+        let lockedAt = Date()
+        // Marker first: on its own (no `.vm` target yet) it routes nothing.
+        try context.threadRepo.setGuestRuntime(id: thread.id, BotGuestRuntime.distillV1)
+        guard try context.threadRepo.setActor(
+            id: thread.id, actor: .bot(bot.id), lockedAt: lockedAt, executionTarget: .vm
+        ) else {
+            throw BotDeskSendRefused(reason: "A conversa sumiu antes de iniciar.")
+        }
+        thread.actor = .bot(bot.id)
+        thread.actorLockedAt = lockedAt
+        thread.executionTarget = .vm
     }
 
     private func prepareSupervisedRun(
@@ -10673,7 +10735,8 @@ public final class BotsViewModel: ObservableObject {
                 text: Self.supervisedRunPrompt(
                     userText: userText,
                     compiledPayload: receipt.compiledPayload,
-                    provider: routing.provider
+                    provider: routing.provider,
+                    executionTarget: prepared.thread.executionTarget
                 ),
                 provider: routing.provider,
                 model: model,
