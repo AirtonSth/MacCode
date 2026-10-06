@@ -42,6 +42,10 @@ final class AccountUsageNotificationTests: XCTestCase {
         blockingQueue.maxConcurrentOperationCount = 1
 
         let delivered = expectation(description: "usage-changed eventually delivered")
+        // `.rc2AccountUsageChanged` is posted with `object: nil`, so throttled
+        // posts from AppContexts built by earlier tests in the same process can
+        // also reach this observer. Extra deliveries must not abort the run.
+        delivered.assertForOverFulfill = false
         let observer = NotificationCenter.default.addObserver(
             forName: .rc2AccountUsageChanged,
             object: nil,
@@ -110,6 +114,10 @@ final class AccountUsageNotificationTests: XCTestCase {
         try context.runRepo.upsert(run)
 
         let delivered = expectation(description: "usage-changed delivered on main")
+        // The notification is global (`object: nil`): throttled posts from
+        // AppContexts created by earlier tests can arrive after this one.
+        // Tolerate them instead of aborting on over-fulfill.
+        delivered.assertForOverFulfill = false
         var observerCallCount = 0
         var observedIsMainThread = false
 
@@ -142,7 +150,9 @@ final class AccountUsageNotificationTests: XCTestCase {
 
         await fulfillment(of: [delivered], timeout: 3.0)
 
-        XCTAssertEqual(observerCallCount, 1)
+        // At least one delivery; stray posts from other contexts in the same
+        // process can add more, and every one of them runs on main.
+        XCTAssertGreaterThanOrEqual(observerCallCount, 1)
         XCTAssertTrue(
             observedIsMainThread,
             "rc2AccountUsageChanged UI observers must run on the main thread, not a provider parse queue"

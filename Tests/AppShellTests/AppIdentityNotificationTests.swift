@@ -50,7 +50,7 @@ final class AppIdentityNotificationTests: XCTestCase {
                       "dragging a Finder folder onto the Dock app icon must route that folder to NSApplication open-file handling")
         XCTAssertTrue(script.contains("AppIcon.icns"))
         XCTAssertTrue(script.contains("DISTILL_SERVICE=\"$BIN_DIR/RemoteCodeDistillService\""),
-                      "packaging must require the Token Saver sidecar executable")
+                      "packaging must require the RemoteCodeDistillService executable")
         XCTAssertTrue(script.contains("Contents/MacOS/RemoteCodeDistillService"),
                       "RemoteCode.app must contain the sidecar so Bundle.main can resolve it without global installs")
         XCTAssertTrue(script.contains("SCHEDULED_TASK_AGENT=\"$BIN_DIR/RemoteCodeScheduledTaskAgent\""),
