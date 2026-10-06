@@ -102,7 +102,7 @@ public enum BotGroupTurnPlanner {
             roundTurns.filter { !$0.state.isTerminal && $0.id != author.id }.map(\.botID)
         )
         let mentioned = BotMentionParser.mentionedBots(
-            in: replyText,
+            in: handOffMentionText(replyText),
             bots: participants,
             excluding: author.botID
         ).filter { !alreadyQueued.contains($0.id) }
@@ -123,8 +123,9 @@ public enum BotGroupTurnPlanner {
     }
 
     /// What a new user message does to the group's existing turns: unstarted
-    /// turns of earlier rounds are cancelled; a running turn finishes first
-    /// and the new round waits for it.
+    /// turns of every round except `newRoundID` are cancelled; a running turn
+    /// finishes first and the new round waits for it. Turns of `newRoundID`
+    /// are left alone whether or not they were inserted yet.
     public struct Supersession: Equatable, Sendable {
         public var cancelledTurnIDs: [BotGroupTurnID]
         public var runningTurnID: BotGroupTurnID?
@@ -135,13 +136,37 @@ public enum BotGroupTurnPlanner {
         }
     }
 
-    public static func supersede(_ groupTurns: [BotGroupTurn]) -> Supersession {
-        Supersession(
-            cancelledTurnIDs: groupTurns
+    public static func supersede(_ groupTurns: [BotGroupTurn], newRoundID: BotGroupRoundID) -> Supersession {
+        let earlier = groupTurns.filter { $0.roundID != newRoundID }
+        return Supersession(
+            cancelledTurnIDs: earlier
                 .filter { BotGroupTurn.State.pending.contains($0.state) }
                 .map(\.id),
-            runningTurnID: groupTurns.first { $0.state == .running }?.id
+            runningTurnID: earlier.first { $0.state == .running }?.id
         )
+    }
+
+    private static let codeSpanRegex = try! NSRegularExpression(
+        pattern: #"(```|~~~)[\s\S]*?(?:\1|\z)|``[^\n]*?``|`[^`\n]*`"#
+    )
+
+    /// A reply's text with the parts that are not a hand-off blanked out:
+    /// fenced and inline code, and `@` glued to a word (`bob@beta`). The
+    /// author's prose mentions are kept as written.
+    static func handOffMentionText(_ text: String) -> String {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        let withoutCode = codeSpanRegex.stringByReplacingMatches(in: text, range: range, withTemplate: " ")
+        var result = ""
+        var previous: Character?
+        for character in withoutCode {
+            if character == "@", let previous, previous.isLetter || previous.isNumber || previous == "_" {
+                result.append(" ")
+            } else {
+                result.append(character)
+            }
+            previous = character
+        }
+        return result
     }
 
     /// Honest room note when mentions were not handed off.

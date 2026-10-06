@@ -252,9 +252,60 @@ final class BotGroupTurnPlannerTests: XCTestCase {
         let planned = turn(beta, round: round, state: .planned, ordinal: 1)
         let waiting = turn(gamma, round: round, state: .waitingForBot, ordinal: 2)
         let done = turn(gamma, round: BotGroupRoundID(), state: .completed)
-        let result = BotGroupTurnPlanner.supersede([done, running, planned, waiting])
+        let result = BotGroupTurnPlanner.supersede([done, running, planned, waiting], newRoundID: BotGroupRoundID())
         XCTAssertEqual(result.cancelledTurnIDs, [planned.id, waiting.id])
         XCTAssertEqual(result.runningTurnID, running.id)
+    }
+
+    func test_supersede_neverCancelsTheNewRoundsOwnTurns() {
+        // WHY: the orchestrator may insert the new round's turns before it
+        // supersedes; the new message must not cancel its own answers.
+        let oldRound = BotGroupRoundID()
+        let newRound = BotGroupRoundID()
+        let oldPlanned = turn(beta, round: oldRound, state: .planned, ordinal: 1)
+        let newPlanned = turn(alpha, round: newRound, state: .planned, ordinal: 2)
+        let newWaiting = turn(gamma, round: newRound, state: .waitingForBot, ordinal: 3)
+        let result = BotGroupTurnPlanner.supersede([oldPlanned, newPlanned, newWaiting], newRoundID: newRound)
+        XCTAssertEqual(result.cancelledTurnIDs, [oldPlanned.id])
+        XCTAssertNil(result.runningTurnID)
+    }
+
+    func test_handOff_ignoresEmailsAndMentionsInCode() {
+        // WHY: a hand-off starts a real run. An address like bob@beta or an
+        // example in code is not the author handing the floor to anyone.
+        let round = BotGroupRoundID()
+        let author = turn(alpha, round: round, state: .running)
+        let reply = """
+        Mail bob@beta or x_@gamma. Use `@beta` inline, ``say @gamma``, or:
+        ```
+        @beta run
+        ```
+        ~~~
+        @gamma run
+        ~~~
+        Unclosed fence:
+        ```
+        @beta
+        """
+        let plan = BotGroupTurnPlanner.planHandOff(
+            replyText: reply,
+            author: author,
+            groupTurns: [author],
+            latestRoundID: round,
+            participants: participants,
+            maxAutoHops: 4
+        )
+        XCTAssertEqual(plan, .none)
+
+        let prose = BotGroupTurnPlanner.planHandOff(
+            replyText: "See `code` then (@gamma) and,@beta please.",
+            author: author,
+            groupTurns: [author],
+            latestRoundID: round,
+            participants: participants,
+            maxAutoHops: 4
+        )
+        XCTAssertEqual(prose.turns.map(\.botID), [gamma.id, beta.id], "prose mentions after punctuation still hand off")
     }
 
     func test_supersededRound_handsOffNothing() {

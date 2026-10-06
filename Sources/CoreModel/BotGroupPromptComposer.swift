@@ -8,8 +8,10 @@ public enum BotGroupPromptComposer {
 
     public struct Composition: Equatable, Sendable {
         public let prompt: String
-        /// Newest room message at compose time; the new watermark once the
-        /// turn starts. Nil when the room has nothing past the watermark.
+        /// The new watermark once the turn starts, or nil when it must not
+        /// move. It stops just before the first waiting row of another bot
+        /// that can still become a reply: that row is replaced in place, so
+        /// it is read again on this bot's next turn.
         public let lastSeenMessageID: AgentMessageID?
         public let lastSeenCreatedAt: Date?
         public let includedCount: Int
@@ -21,6 +23,11 @@ public enum BotGroupPromptComposer {
     ///   - participants: active participants in group order (includes `me`).
     ///   - seenMessageID/seenCreatedAt: `me`'s watermark. The id wins; the
     ///     timestamp covers a watermark row that no longer exists.
+    ///   - groupTurns: the group's turns (any rounds, any state). A bot row
+    ///     is attributed through its turn's `botID`, so a renamed or reused
+    ///     handle never changes whose row it is; rows without a turn fall
+    ///     back to the handle. A waiting row whose turn was cancelled,
+    ///     failed, interrupted or skipped never holds the watermark.
     public static func compose(
         groupTitle: String,
         me: BotDefinition,
@@ -28,10 +35,15 @@ public enum BotGroupPromptComposer {
         roomMessages: [AgentMessage],
         seenMessageID: AgentMessageID?,
         seenCreatedAt: Date?,
+        groupTurns: [BotGroupTurn],
         maxDeltaCharacters: Int = defaultMaxDeltaCharacters
     ) -> Composition {
         let unseen = delta(roomMessages, seenMessageID: seenMessageID, seenCreatedAt: seenCreatedAt)
-        let entries = unseen.compactMap { entry(for: $0, me: me) }
+        let turnsByRow = Dictionary(
+            groupTurns.map { ($0.roomMessageID, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let entries = unseen.compactMap { entry(for: $0, me: me, turnsByRow: turnsByRow) }
 
         // Keep the newest entries that fit; the newest one is always kept
         // whole so the message that triggered this turn is never cut.
@@ -59,7 +71,9 @@ public enum BotGroupPromptComposer {
         )
         sections.append(BotPeerTranscript.languageInstruction)
 
-        let last = unseen.last
+        let blocker = unseen.firstIndex { holdsWatermark($0, me: me, turnsByRow: turnsByRow) }
+        let seenThrough = blocker.map { unseen[unseen.startIndex..<$0] } ?? unseen
+        let last = seenThrough.last
         return Composition(
             prompt: sections.joined(separator: "\n\n"),
             lastSeenMessageID: last?.id,
@@ -98,7 +112,10 @@ public enum BotGroupPromptComposer {
             return messages[messages.index(after: index)...]
         }
         if let seenCreatedAt {
-            return messages[(messages.firstIndex { $0.createdAt > seenCreatedAt } ?? messages.endIndex)...]
+            // `>=`: the user row and the waiting rows of one send share a
+            // timestamp, and the watermark can stop just before such a row.
+            // Re-reading an equal-time row beats dropping it.
+            return messages[(messages.firstIndex { $0.createdAt >= seenCreatedAt } ?? messages.endIndex)...]
         }
         return messages[...]
     }
@@ -106,24 +123,52 @@ public enum BotGroupPromptComposer {
     /// One room row as prompt text, or nil when it carries nothing for `me`:
     /// waiting/attention placeholders, `me`'s own replies (already in its
     /// member thread) and rows that are empty once markers are removed.
-    /// User text is quoted verbatim.
-    static func entry(for message: AgentMessage, me: BotDefinition) -> String? {
+    /// User rows are quoted verbatim, even when they look like host markers.
+    static func entry(
+        for message: AgentMessage,
+        me: BotDefinition,
+        turnsByRow: [AgentMessageID: BotGroupTurn]
+    ) -> String? {
+        if message.role == .user {
+            guard !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return "User:\n\(message.content)"
+        }
         if BotPeerTranscript.parseActivity(message.content) != nil { return nil }
         if let reply = BotPeerTranscript.parse(message.content) {
-            if BotHandle.normalize(reply.handle) == BotHandle.normalize(me.handle) { return nil }
+            if isOwnRow(message, handle: reply.handle, me: me, turnsByRow: turnsByRow) { return nil }
             let body = strippingMarkers(reply.body)
             guard !body.isEmpty else { return nil }
             return "\(reply.name) (\(BotPeerTranscript.handleLabel(reply.handle))):\n\(body)"
         }
-        switch message.role {
-        case .user:
-            guard !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-            return "User:\n\(message.content)"
-        case .assistant, .system:
-            let body = strippingMarkers(message.content)
-            guard !body.isEmpty else { return nil }
-            return "Group note:\n\(body)"
-        }
+        let body = strippingMarkers(message.content)
+        guard !body.isEmpty else { return nil }
+        return "Group note:\n\(body)"
+    }
+
+    /// Another bot's waiting row that can still be replaced by its reply.
+    static func holdsWatermark(
+        _ message: AgentMessage,
+        me: BotDefinition,
+        turnsByRow: [AgentMessageID: BotGroupTurn]
+    ) -> Bool {
+        guard message.role != .user,
+              let activity = BotPeerTranscript.parseActivity(message.content),
+              activity.phase == .waiting,
+              !isOwnRow(message, handle: activity.handle, me: me, turnsByRow: turnsByRow)
+        else { return false }
+        guard let turn = turnsByRow[message.id] else { return true }
+        // A completed turn whose reply is not written yet still resolves.
+        return !turn.state.isTerminal || turn.state == .completed
+    }
+
+    private static func isOwnRow(
+        _ message: AgentMessage,
+        handle: String,
+        me: BotDefinition,
+        turnsByRow: [AgentMessageID: BotGroupTurn]
+    ) -> Bool {
+        if let turn = turnsByRow[message.id] { return turn.botID == me.id }
+        return BotHandle.normalize(handle) == BotHandle.normalize(me.handle)
     }
 
     private static let hostMarkerRegex = try! NSRegularExpression(pattern: #"\[\[rc:[^\]\n]*\]\]"#)
