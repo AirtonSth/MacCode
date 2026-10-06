@@ -122,13 +122,16 @@ final class BotStoreTeamsTests: BotStoreGroupsFixture {
         let team = try store.createTeam(name: "Ops", memberBotIDs: [ana.id, ben.id], now: t0)
         let group = try makeGroup([ana, ben], teamID: team.id)
 
-        try store.deleteTeam(id: team.id)
+        try store.deleteTeam(id: team.id, now: t0.addingTimeInterval(5))
 
         XCTAssertTrue(try store.listTeams().isEmpty)
         XCTAssertTrue(try store.listTeamMembers().isEmpty)
         XCTAssertNotNil(try store.get(id: ana.id))
         let kept = try XCTUnwrap(store.group(id: group.id))
         XCTAssertNil(kept.teamID, "the group outlives its source team")
+        XCTAssertEqual(kept.revision, group.revision + 1,
+                       "revision-keyed caches (iOS) must learn the team link is gone")
+        XCTAssertEqual(kept.updatedAt, t0.addingTimeInterval(5))
         XCTAssertEqual(try store.listGroupParticipants(groupID: group.id).map(\.botID), [ana.id, ben.id])
     }
 
@@ -451,5 +454,205 @@ final class BotStoreGroupsTests: BotStoreGroupsFixture {
         _ = try relaunched.updateGroup(id: group.id, expectedRevision: nil) { $0.hidden = true }
         XCTAssertTrue(try relaunched.listGroups().isEmpty)
         XCTAssertEqual(try relaunched.listGroups(includeHidden: true).map(\.id), [group.id])
+    }
+}
+
+/// Review fixes for T1: member conversations stay isolated from desk paths,
+/// and stores stay usable after the bots that formed them are gone.
+final class BotStoreGroupIsolationTests: BotStoreGroupsFixture {
+    func test_clearDesk_keepsGroupMemberConversations_becauseParticipantsStillPointAtThem() throws {
+        // WHY: "Clear all desk threads" and remote bot.conversation.clear_all
+        // call deleteConversations. Deleting member rows would orphan the
+        // participant, drop the member thread from the bot-owned set (Pet would
+        // show it as a plain Agent App thread) and break the next room turn.
+        let ana = try makeBot("Ana")
+        let group = try makeGroup([ana])
+        var member = try XCTUnwrap(store.listGroupMemberConversations(groupID: group.id).first)
+        let memberThread = AgentThreadID()
+        member.linkedAgentThreadID = memberThread
+        try store.upsertConversation(member)
+        let deskThread = AgentThreadID()
+        try store.upsertConversation(BotConversation(botID: ana.id, title: "Desk", linkedAgentThreadID: deskThread))
+        XCTAssertEqual(store.cachedBotID(linkedTo: memberThread), ana.id)
+
+        try store.deleteConversations(botID: ana.id)
+
+        XCTAssertTrue(try store.listConversations(botID: ana.id).isEmpty, "the desk is cleared")
+        XCTAssertEqual(try store.listGroupMemberConversations(groupID: group.id).map(\.id), [member.id])
+        let linked = try store.listLinkedAgentThreadIDs()
+        XCTAssertTrue(linked.contains(memberThread))
+        XCTAssertFalse(linked.contains(deskThread))
+        XCTAssertEqual(store.cachedBotID(linkedTo: memberThread), ana.id, "member thread stays bot-owned in the cache")
+        XCTAssertNil(store.cachedBotID(linkedTo: deskThread))
+        let participant = try XCTUnwrap(store.listGroupParticipants(groupID: group.id).first)
+        XCTAssertEqual(participant.memberConversationID, member.id)
+        XCTAssertNotNil(try store.conversation(id: participant.memberConversationID))
+    }
+
+    func test_memberActivityStaysOutOfPetAttentionAndRosterRecency() throws {
+        // WHY: member conversations are hidden plumbing. Once room turns set
+        // attention on them, Pet's inbox and the attention list would show
+        // phantom chats, and room activity would reorder the desk roster.
+        let ana = try makeBot("Ana")
+        let group = try makeGroup([ana])
+        let desk = BotConversation(botID: ana.id, title: "Desk", attentionState: .needsAttention,
+                                   createdAt: t0, updatedAt: t0)
+        try store.upsertConversation(desk)
+        var member = try XCTUnwrap(store.listGroupMemberConversations(groupID: group.id).first)
+        member.attentionState = .needsAttention
+        member.updatedAt = t0.addingTimeInterval(60)
+        try store.upsertConversation(member)
+        let deskItem = BotAttentionItem(botID: ana.id, conversationID: desk.id, kind: .question, title: "Desk?")
+        let memberItem = BotAttentionItem(botID: ana.id, conversationID: member.id, kind: .question, title: "Room?")
+        try store.upsertAttention(deskItem)
+        try store.upsertAttention(memberItem)
+
+        XCTAssertEqual(try store.listConversations(attentionStates: [.needsAttention]).map(\.id), [desk.id])
+        XCTAssertEqual(try store.listAttention().map(\.id), [deskItem.id])
+        XCTAssertEqual(try store.latestConversationUpdatedAt(botIDs: [ana.id])[ana.id], t0,
+                       "room activity must not move the bot up the desk roster")
+    }
+
+    func test_updateGroup_afterItsLastBotIsDeleted_stillTakesBookkeeping() throws {
+        // WHY: the bot-delete cascade marks every participant left. If
+        // updateGroup re-checked "at least one bot", the room could never be
+        // hidden, renamed or marked read, and host attention writes would throw.
+        let ana = try makeBot("Ana")
+        let group = try makeGroup([ana])
+        try store.delete(id: ana.id, now: t0)
+        XCTAssertTrue(try store.listGroupParticipants(groupID: group.id).isEmpty)
+
+        let marked = try store.updateGroup(id: group.id, expectedRevision: nil) { $0.unread = true }
+        XCTAssertTrue(marked.unread)
+        let renamed = try store.updateGroup(id: group.id, expectedRevision: marked.revision) { $0.title = "Archive" }
+        XCTAssertEqual(renamed.title, "Archive")
+        let hidden = try store.updateGroup(id: group.id, expectedRevision: nil) { $0.hidden = true }
+        XCTAssertTrue(hidden.hidden)
+        assertInvalidInput(try store.updateGroup(id: group.id, expectedRevision: nil) { $0.maxAutoHops = 9 })
+        // Changing participants still needs at least one bot.
+        assertInvalidInput(try store.setGroupParticipants(id: group.id, expectedRevision: hidden.revision, botIDs: []))
+    }
+
+    func test_transitionGroupTurn_staleRunCannotSettleARetriedTurn() throws {
+        // WHY: run R1 is stopped (turn cancelled), the turn is retried with
+        // R2, then R1's late didFinish arrives. Its outcome must not land on
+        // R2's turn, so the run check has to be inside the store transaction.
+        let ana = try makeBot("Ana")
+        let group = try makeGroup([ana])
+        let turn = BotGroupTurn(groupID: group.id, roundID: BotGroupRoundID(), botID: ana.id, ordinal: 1)
+        try store.insertGroupTurns([turn])
+        let r1 = AgentRunID()
+        let r2 = AgentRunID()
+        _ = try XCTUnwrap(store.transitionGroupTurn(id: turn.id, from: [.planned], to: .running, memberRunID: r1))
+        _ = try XCTUnwrap(store.transitionGroupTurn(id: turn.id, from: [.running], to: .failed,
+                                                expectedMemberRunID: r1, error: "Stopped"))
+        let retried = try XCTUnwrap(store.transitionGroupTurn(id: turn.id, from: [.failed], to: .running,
+                                                              memberRunID: r2, clearError: true))
+        XCTAssertNil(retried.error, "a retry starts clean")
+        XCTAssertEqual(retried.memberRunID, r2)
+
+        XCTAssertNil(try store.transitionGroupTurn(id: turn.id, from: [.running], to: .completed,
+                                                   expectedMemberRunID: r1),
+                     "R1's late finish matches the state but not the run")
+        let stillRunning = try XCTUnwrap(store.groupTurn(id: turn.id))
+        XCTAssertEqual(stillRunning.state, .running)
+        XCTAssertEqual(stillRunning.memberRunID, r2)
+
+        let settled = try XCTUnwrap(store.transitionGroupTurn(id: turn.id, from: [.running], to: .completed,
+                                                              expectedMemberRunID: r2))
+        XCTAssertEqual(settled.state, .completed)
+        let cleared = try XCTUnwrap(store.transitionGroupTurn(id: turn.id, from: [.completed], to: .planned,
+                                                              clearMemberRunID: true))
+        XCTAssertNil(cleared.memberRunID)
+        XCTAssertNil(try store.groupTurn(id: turn.id)?.memberRunID, "the clear is persisted")
+    }
+
+    func test_insertGroupTurns_rejectsADuplicateRoundForTheSameSubmitKey() throws {
+        // WHY: bot.group.send is idempotent by submit_key. Two concurrent
+        // retries must not each insert a full round; the loser's batch fails
+        // as a whole and the first round is untouched.
+        let ana = try makeBot("Ana")
+        let ben = try makeBot("Ben")
+        let group = try makeGroup([ana, ben])
+        let first = BotGroupRoundID()
+        try store.insertGroupTurns([
+            BotGroupTurn(groupID: group.id, roundID: first, botID: ana.id, ordinal: 1, submitKey: "send-1"),
+            BotGroupTurn(groupID: group.id, roundID: first, botID: ben.id, ordinal: 2, submitKey: "send-1"),
+        ])
+        let duplicate = BotGroupRoundID()
+        XCTAssertThrowsError(try store.insertGroupTurns([
+            BotGroupTurn(groupID: group.id, roundID: duplicate, botID: ana.id, ordinal: 3, submitKey: "send-1"),
+            BotGroupTurn(groupID: group.id, roundID: duplicate, botID: ben.id, ordinal: 4, submitKey: "send-1"),
+        ]))
+        XCTAssertEqual(Set(try store.listGroupTurns(groupID: group.id).map(\.roundID)), [first])
+        XCTAssertNoThrow(try store.insertGroupTurns([
+            BotGroupTurn(groupID: group.id, roundID: BotGroupRoundID(), botID: ana.id, ordinal: 3, submitKey: "send-2"),
+            BotGroupTurn(groupID: group.id, roundID: BotGroupRoundID(), botID: ana.id, ordinal: 4),
+            BotGroupTurn(groupID: group.id, roundID: BotGroupRoundID(), botID: ana.id, ordinal: 5),
+        ]), "a new send, and turns without a key, are never deduplicated")
+    }
+
+    func test_remoteConversationRPCsRejectMemberConversations_becauseOnlyGroupRPCsMayReachThem() throws {
+        // WHY: a paired client that learns a member conversation id must not
+        // send into it (bypassing sequential turns and D12), select it, or
+        // stage attachments there (groups reject attachments).
+        let ana = try makeBot("Ana")
+        let group = try makeGroup([ana])
+        let member = try XCTUnwrap(store.listGroupMemberConversations(groupID: group.id).first)
+        let support = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-bot-groups-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: support) }
+        let authority = BotRemoteControlAuthority(db: db, store: store, settings: SettingsStore(db: db),
+                                                  appSupportDirectory: support)
+        let botID = ana.id.value.uuidString.lowercased()
+        let memberID = member.id.value.uuidString.lowercased()
+        let calls: [(String, [String: Any])] = [
+            ("bot.send", ["text": "hello"]),
+            ("bot.conversation.select", [:]),
+            ("bot.attachment.stage", [
+                "attachment_id": "rcatt1_\(String(repeating: "a", count: 32))",
+                "filename": "x.txt",
+                "kind": "file",
+                "digest": String(repeating: "b", count: 64),
+                "size": 4,
+            ]),
+            ("bot.attachment.list", [:]),
+        ]
+        for (index, call) in calls.enumerated() {
+            var params = call.1
+            params["client_request_id"] = "member-\(index)"
+            params["bot_id"] = botID
+            params["conversation_id"] = memberID
+            XCTAssertThrowsError(try authority.dispatch(method: call.0, params: params), call.0) { error in
+                XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .crossTarget, call.0)
+            }
+        }
+    }
+}
+
+/// `migrateSteps` skips by version. A sibling branch's step recorded at v88
+/// first must not leave this branch without its group schema.
+final class BotTeamsGroupsSchemaHealTests: XCTestCase {
+    func test_foreignStepAtV88_stillLeavesTheGroupSchemaInPlace() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version < Schema.botTeamsGroupsSchemaVersion })
+        try db.execute("""
+            INSERT INTO schema_meta(version, applied_at)
+            VALUES(\(Schema.botTeamsGroupsSchemaVersion), '2026-10-06T00:00:00Z');
+            """)
+
+        try Schema.migrate(db)
+        try Schema.migrate(db)
+
+        let store = BotStore(db: db)
+        let ana = try store.create(name: "Ana", title: "Teammate", description: "", provider: .claude)
+        let group = try store.createGroup(title: "Room", roomThreadID: AgentThreadID(), participantBotIDs: [ana.id])
+        XCTAssertTrue(try store.listConversations(botID: ana.id).isEmpty, "group_id exists, so desk lists work")
+        XCTAssertEqual(try store.listGroupMemberConversations(groupID: group.id).count, 1)
+        let index = try db.prepare("SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_bot_group_turns_submit';")
+        defer { index.reset() }
+        XCTAssertTrue(try index.step())
+        XCTAssertEqual(index.columnInt64(0), 1)
     }
 }

@@ -137,9 +137,20 @@ extension BotStore {
 
     /// Deletes the team and its memberships. Bots and group conversations stay;
     /// groups created from this team keep their participants (team_id → NULL).
-    public func deleteTeam(id: BotTeamID) throws {
+    public func deleteTeam(id: BotTeamID, now: Date = Date()) throws {
         try db.transaction {
             guard try loadTeam(id: id, database: db) != nil else { throw BotStoreError.notFound }
+            // The FK clears team_id on its own; bump the groups so
+            // revision-keyed caches learn the team link is gone.
+            let bump = try db.prepare("""
+                UPDATE bot_group_conversations SET revision = revision + 1, updated_at = ?
+                WHERE team_id = ?;
+                """)
+            defer { bump.reset() }
+            try bump.bind(1, string(now))
+            try bump.bind(2, Self.key(id.value))
+            _ = try bump.step()
+            bump.reset()
             let delete = try db.prepare("DELETE FROM bot_teams WHERE id = ?;")
             defer { delete.reset() }
             try delete.bind(1, Self.key(id.value))
@@ -286,8 +297,11 @@ extension BotStore {
             group.title = try Self.requiredName(group.title, what: "Group title")
             group.revision = current.revision + 1
             group.updatedAt = now
+            // Participant count is checked only where participants change: a
+            // group whose last bot was deleted must still take bookkeeping
+            // (unread, attention, hide, rename).
             let active = try loadParticipants(groupID: id, includeLeft: false, database: db).map(\.botID)
-            try Self.validate(group, participants: active)
+            try Self.validateSettings(group, participants: active)
             if let teamID = group.teamID, teamID != current.teamID,
                try loadTeam(id: teamID, database: db) == nil {
                 throw BotStoreError.notFound
@@ -508,22 +522,31 @@ extension BotStore {
 
     /// Single-winner state change: applies only while the turn is in one of
     /// `expected` states and returns the updated turn, else nil (a stale or
-    /// duplicate settle changes nothing). `memberRunID` / `error` are written
-    /// only when non-nil.
+    /// duplicate settle changes nothing). A run settling its turn passes
+    /// `expectedMemberRunID`: the change then applies only while the turn
+    /// still belongs to that run, so a late finish of an older run cannot
+    /// settle a retried turn. `memberRunID` / `error` are written when
+    /// non-nil; `clearMemberRunID` / `clearError` reset them (retry).
     @discardableResult
     public func transitionGroupTurn(
         id: BotGroupTurnID,
         from expected: [BotGroupTurn.State],
         to state: BotGroupTurn.State,
+        expectedMemberRunID: AgentRunID? = nil,
         memberRunID: AgentRunID? = nil,
+        clearMemberRunID: Bool = false,
         error: String? = nil,
+        clearError: Bool = false,
         now: Date = Date()
     ) throws -> BotGroupTurn? {
         try db.transaction {
             guard var turn = try loadTurn(id: id, database: db) else { throw BotStoreError.notFound }
             guard expected.contains(turn.state) else { return nil }
+            if let expectedMemberRunID, turn.memberRunID != expectedMemberRunID { return nil }
             turn.state = state
+            if clearMemberRunID { turn.memberRunID = nil }
             if let memberRunID { turn.memberRunID = memberRunID }
+            if clearError { turn.error = nil }
             if let error { turn.error = error }
             turn.updatedAt = now
             let update = try db.prepare("""
@@ -613,6 +636,11 @@ extension BotStore {
                 "A group can have at most \(BotGroupConversation.maxParticipants) bots."
             )
         }
+        try validateSettings(group, participants: participants)
+    }
+
+    /// Hop budget and lead rules, independent of how many bots are active.
+    private static func validateSettings(_ group: BotGroupConversation, participants: [BotID]) throws {
         guard (0...BotGroupConversation.maxAutoHopsCap).contains(group.maxAutoHops) else {
             throw BotStoreError.invalidInput(
                 "Hand-offs must be between 0 and \(BotGroupConversation.maxAutoHopsCap)."

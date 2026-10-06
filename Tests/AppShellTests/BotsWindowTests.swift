@@ -2115,6 +2115,51 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_groupMemberRunCountsForBotWideStopButNeverReachesTheDesk() throws {
+        // WHY (T1 decision): bot-wide Stop and delete must reach the bot's
+        // room turn, so a member-thread run counts as the bot's live run. The
+        // member conversation is still hidden plumbing: it never shows on the
+        // desk, does not make the desk look busy, and a desk send cannot
+        // target it (that would bypass the group's sequential turns).
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let group = try context.botStore.createGroup(
+            title: "Launch room",
+            roomThreadID: AgentThreadID(),
+            participantBotIDs: [bot.id]
+        )
+        var member = try XCTUnwrap(context.botStore.listGroupMemberConversations(groupID: group.id).first)
+        let thread = AgentThread(title: "Launch room", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        try context.runRepo.upsert(AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        ))
+        member.linkedAgentThreadID = thread.id
+        try context.botStore.upsertConversation(member)
+
+        XCTAssertTrue(vm.hasLiveRun(botID: bot.id), "bot-wide stop must see the room turn")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.conversations.isEmpty)
+        XCTAssertFalse(vm.deskRunIsLive)
+        XCTAssertThrowsError(try vm.enqueueHostMessage(
+            botID: bot.id,
+            text: "hi",
+            conversationID: member.id,
+            routing: BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+        )) { error in
+            guard case BotStoreError.notFound = error else {
+                return XCTFail("expected notFound for a member conversation, got \(error)")
+            }
+        }
+    }
+
     func test_deskReplaysStreamEventsOnOpen_becauseThinkingMustSurviveClose() throws {
         // WHY: Desk is not a second Agent App window, but it must replay the
         // linked thread's persisted stream events so Thought / Worked remain

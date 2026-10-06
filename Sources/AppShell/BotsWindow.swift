@@ -6119,6 +6119,12 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    /// Every live thread of the bot, group member threads included: bot-wide
+    /// Stop and delete must reach the bot's room turn too. `hasLiveRun` uses the
+    /// same set, so bot.stop's `terminal` readback matches what Stop touched.
+    /// Desk sends do not gate on it: they queue per desk thread
+    /// (`enqueueHostMessage`), so a host bot answering in a room keeps taking
+    /// desk sends. VM-bot serialization (D12) belongs to `BotVMRunRegistry`.
     private func liveThreadIDs(for botID: BotID, includeInFlightSends: Bool = true) throws -> [AgentThreadID] {
         if let error = liveThreadDiscoveryErrorForTesting {
             throw error
@@ -6338,7 +6344,7 @@ public final class BotsViewModel: ObservableObject {
 
         if let conversationID {
             guard let existing = try botStore.conversation(id: conversationID),
-                  existing.botID == bot.id else {
+                  existing.botID == bot.id, existing.groupID == nil else {
                 throw BotStoreError.notFound
             }
             if let threadID = existing.linkedAgentThreadID,

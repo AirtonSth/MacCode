@@ -1012,7 +1012,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                   let stored = try store.conversation(id: BotConversationID(uuid)) else {
                 throw Error.conversationGone
             }
-            guard stored.botID == bot.id else { throw Error.crossTarget }
+            // Group member conversations are reached only through the group RPCs.
+            guard stored.botID == bot.id, stored.groupID == nil else { throw Error.crossTarget }
             conversation = stored.id
         } else {
             conversation = nil
@@ -1373,7 +1374,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let conversationID = string(params, "conversation_id") ?? ""
         guard let uuid = UUID(uuidString: conversationID),
               let conversation = try store.conversation(id: BotConversationID(uuid)) else { throw Error.conversationGone }
-        guard conversation.botID == bot.id else { throw Error.crossTarget }
+        guard conversation.botID == bot.id, conversation.groupID == nil else { throw Error.crossTarget }
         let normalizedID = conversation.id.value.uuidString.lowercased()
         selectedConversation[id(bot)] = normalizedID
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
@@ -1582,7 +1583,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard let conversationRaw = string(params, "conversation_id"),
               let conversationUUID = UUID(uuidString: conversationRaw),
               let conversation = try store.conversation(id: BotConversationID(conversationUUID)) else { throw Error.conversationGone }
-        guard conversation.botID == bot.id else { throw Error.crossTarget }
+        guard conversation.botID == bot.id, conversation.groupID == nil else { throw Error.crossTarget }
         guard let attachmentID = string(params, "attachment_id"), !attachmentID.isEmpty,
               let filename = string(params, "filename"), !filename.isEmpty,
               let rawKind = string(params, "kind"), AgentAttachmentKind(rawValue: rawKind) != nil,
@@ -1608,7 +1609,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard let conversationRaw = string(params, "conversation_id"),
               let conversationUUID = UUID(uuidString: conversationRaw),
               let conversation = try store.conversation(id: BotConversationID(conversationUUID)) else { throw Error.conversationGone }
-        guard conversation.botID == bot.id else { throw Error.crossTarget }
+        guard conversation.botID == bot.id, conversation.groupID == nil else { throw Error.crossTarget }
         let hostID = try requireFileHost(params: params, botID: id(bot))
         let rootHandle = string(params, "root_handle") ?? ""
         let handle = string(params, "handle") ?? ""
@@ -1687,7 +1688,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard let conversationRaw = string(params, "conversation_id"),
               let conversationUUID = UUID(uuidString: conversationRaw),
               let conversation = try store.conversation(id: BotConversationID(conversationUUID)) else { throw Error.conversationGone }
-        guard conversation.botID == bot.id else { throw Error.crossTarget }
+        guard conversation.botID == bot.id, conversation.groupID == nil else { throw Error.crossTarget }
         let botID = id(bot)
         let conversationID = conversation.id.value.uuidString.lowercased()
         let rows = attachments.values.filter {
@@ -1709,7 +1710,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard let conversationRaw = string(params, "conversation_id"),
               let conversationUUID = UUID(uuidString: conversationRaw),
               let conversation = try store.conversation(id: BotConversationID(conversationUUID)) else { throw Error.conversationGone }
-        guard conversation.botID == bot.id else { throw Error.crossTarget }
+        guard conversation.botID == bot.id, conversation.groupID == nil else { throw Error.crossTarget }
         let conversationID = conversation.id.value.uuidString.lowercased()
         let grantID = string(params, "id") ?? ""
         guard let grant = attachments[grantID],

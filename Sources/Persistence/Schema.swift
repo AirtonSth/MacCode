@@ -1897,6 +1897,11 @@ public enum Schema {
             ON bot_group_turns(round_id, bot_id, hop);
         CREATE INDEX IF NOT EXISTS idx_bot_group_turns_bot_state
             ON bot_group_turns(bot_id, state);
+        -- bot.group.send is idempotent by submit_key: a retried send cannot
+        -- insert a second round for the same bots.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_group_turns_submit
+            ON bot_group_turns(group_id, submit_key, bot_id, hop)
+            WHERE submit_key IS NOT NULL;
 
         CREATE INDEX IF NOT EXISTS idx_bot_conversations_group
             ON bot_conversations(group_id)
@@ -1933,6 +1938,32 @@ public enum Schema {
 
     public static func migrate(_ db: SQLiteDB) throws {
         try migrateSteps(db, steps)
+        try healBotTeamsGroupsSchema(db)
+    }
+
+    /// `migrateSteps` skips by version, not by step. If a sibling branch
+    /// recorded its own step at v88 or later first, the teams/groups step never
+    /// ran. Its objects are additive and idempotent, so re-apply them whenever
+    /// any is missing.
+    static func healBotTeamsGroupsSchema(_ db: SQLiteDB) throws {
+        let probe = try db.prepare("""
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE name IN ('bot_teams', 'bot_team_members', 'bot_group_conversations',
+                           'bot_group_participants', 'bot_group_turns', 'idx_bot_group_turns_submit');
+            """)
+        let objects = try probe.step() ? probe.columnInt64(0) : 0
+        probe.reset()
+        let columns = try db.prepare("PRAGMA table_info(bot_conversations);")
+        var hasGroupID = false
+        while try columns.step() {
+            if columns.columnText(1) == "group_id" { hasGroupID = true }
+        }
+        columns.reset()
+        guard objects < 6 || !hasGroupID else { return }
+        try db.transaction {
+            try addMissingBotConversationGroupColumn(db)
+            try db.execute(botTeamsGroupsMigrationSQL)
+        }
     }
 
     private static func addMissingScheduledTaskModelColumns(_ db: SQLiteDB) throws {

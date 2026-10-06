@@ -720,7 +720,7 @@ public final class BotStore: @unchecked Sendable {
             let marks = Array(repeating: "?", count: attentionStates.count).joined(separator: ",")
             let statement = try database.prepare(
                 Self.conversationSelect + """
-                 WHERE (
+                 WHERE group_id IS NULL AND (
                      CASE
                          WHEN linked_agent_thread_id IS NOT NULL
                           AND (
@@ -820,7 +820,7 @@ public final class BotStore: @unchecked Sendable {
                 let statement = try database.prepare("""
                     SELECT bot_id, MAX(updated_at)
                     FROM bot_conversations
-                    WHERE bot_id IN (\(marks))
+                    WHERE bot_id IN (\(marks)) AND group_id IS NULL
                     GROUP BY bot_id;
                     """)
                 defer { statement.reset() }
@@ -838,14 +838,30 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    /// Clears the bot's desk conversations. Group member conversations stay:
+    /// their group participants still point at them.
     public func deleteConversations(botID: BotID) throws {
-        try db.performSync { database in
-            let statement = try database.prepare("DELETE FROM bot_conversations WHERE bot_id = ?;")
+        let deskThreads: [AgentThreadID] = try db.performSync { database in
+            let linked = try database.prepare("""
+                SELECT linked_agent_thread_id FROM bot_conversations
+                WHERE bot_id = ? AND group_id IS NULL AND linked_agent_thread_id IS NOT NULL;
+                """)
+            defer { linked.reset() }
+            try linked.bind(1, botID.value.uuidString.lowercased())
+            var threads: [AgentThreadID] = []
+            while try linked.step() {
+                if let raw = linked.columnText(0), let uuid = UUID(uuidString: raw) {
+                    threads.append(AgentThreadID(uuid))
+                }
+            }
+            linked.reset()
+            let statement = try database.prepare("DELETE FROM bot_conversations WHERE bot_id = ? AND group_id IS NULL;")
             defer { statement.reset() }
             try statement.bind(1, botID.value.uuidString.lowercased())
             _ = try statement.step()
+            return threads
         }
-        forgetLinkedThreads(botID: botID)
+        forgetLinkedThreads(deskThreads)
     }
 
     public func upsertConversation(_ conversation: BotConversation) throws {
@@ -1053,6 +1069,7 @@ public final class BotStore: @unchecked Sendable {
                                SELECT 1
                                FROM bot_conversations
                                WHERE bot_conversations.id = bot_attention_items.conversation_id
+                                 AND bot_conversations.group_id IS NULL
                                  AND (
                                      bot_conversations.linked_agent_thread_id IS NULL
                                      OR (
