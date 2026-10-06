@@ -73,17 +73,21 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let source = try String(
-            contentsOf: root.appendingPathComponent(
-                "Sources/AgentRuntime/TokenSaverAccountUsageRefresher.swift"
-            ),
-            encoding: .utf8
-        )
+        // The parser lives in its own file; both halves of the refresh path are audited.
+        for path in [
+            "Sources/AgentRuntime/TokenSaverAccountUsageRefresher.swift",
+            "Sources/AgentRuntime/AssistantAccountUsageParser.swift"
+        ] {
+            let source = try String(
+                contentsOf: root.appendingPathComponent(path),
+                encoding: .utf8
+            )
 
-        XCTAssertFalse(
-            source.contains("Claude Code-credentials") || source.contains("SecItemCopyMatching"),
-            "checking Claude limits must use Claude's own CLI fallback instead of prompting for Keychain access"
-        )
+            XCTAssertFalse(
+                source.contains("Claude Code-credentials") || source.contains("SecItemCopyMatching"),
+                "checking Claude limits must use Claude's own CLI fallback instead of prompting for Keychain access (\(path))"
+            )
+        }
     }
 
     func test_codexParserPrefersWeeklyCodexLimitBucket() {

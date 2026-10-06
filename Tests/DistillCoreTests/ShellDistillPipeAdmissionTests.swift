@@ -1,6 +1,7 @@
 import XCTest
 import CoreModel
 @testable import DistillCore
+import AgentRuntime
 
 final class ShellDistillPipeAdmissionTests: XCTestCase {
     private let distill = "/tmp/rc-bin/distill"

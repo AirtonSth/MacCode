@@ -205,7 +205,7 @@ let package = Package(
         ),
         .testTarget(
             name: "AgentRuntimeTests",
-            // DistillCore: ProviderProxyLifecycleTests imports it directly.
+            // DistillCore: still imported by Token Saver tests that are removed with the feature.
             dependencies: ["AgentRuntime", "CoreModel", "GitTestSupport", "DistillCore"],
             path: "Tests/AgentRuntimeTests",
             resources: [

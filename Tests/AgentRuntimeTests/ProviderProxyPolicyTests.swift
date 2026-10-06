@@ -1,6 +1,6 @@
 import XCTest
 import CoreModel
-import DistillCore
+import AgentRuntime
 import Darwin
 
 final class ProviderProxyPolicyTests: XCTestCase {

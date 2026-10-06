@@ -2479,13 +2479,16 @@ public enum ProviderProxyPolicy {
         isExecutableFile: (String) -> Bool,
         resolvesToSelf: (String) -> Bool
     ) -> String? {
-        CommandWrapPolicy.resolveRealExecutable(
-            command: command,
-            pathEntries: pathEntries,
-            managedBinDirectory: managedBinDirectory,
-            isExecutableFile: isExecutableFile,
-            resolvesToSelf: resolvesToSelf
-        )
+        let name = (command as NSString).lastPathComponent
+        let managed = normalizedDirectory(managedBinDirectory)
+        for entry in pathEntries {
+            let dir = entry.trimmingCharacters(in: .whitespaces)
+            guard !dir.isEmpty, normalizedDirectory(dir) != managed else { continue }
+            let candidate = (dir as NSString).appendingPathComponent(name)
+            guard isExecutableFile(candidate), !resolvesToSelf(candidate) else { continue }
+            return candidate
+        }
+        return nil
     }
 
     /// Whether a PATH candidate under the managed bin is a provider proxy shim
