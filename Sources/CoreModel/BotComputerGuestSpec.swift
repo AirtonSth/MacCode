@@ -9,6 +9,23 @@ public enum BotComputerGuestSpec {
     /// same tag back and forth.
     public static let imageTag = "remotecode/computer:r\(recipeRevision)"
     public static let recipeLabelKey = "remotecode.recipe"
+    /// SHA-256 of the recipe files an image was built from. The tag and the
+    /// revision label alone do not identify the recipe: another build on the
+    /// same daemon can leave a different image under this tag and revision.
+    public static let recipeDigestLabelKey = "remotecode.recipe.sha256"
+    public static let recipeFileNames = ["Dockerfile", "start.sh", "embed.html", "launch-browser.sh"]
+
+    /// Digest over each recipe file's name and SHA-256 in `recipeFileNames`
+    /// order; a missing file counts as absent, so adding one changes it too.
+    public static func recipeDigest(context: URL) -> String {
+        var manifest = ""
+        for name in recipeFileNames {
+            let file = (try? Data(contentsOf: context.appendingPathComponent(name)))
+                .map { SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined() }
+            manifest += "\(name) \(file ?? "absent")\n"
+        }
+        return SHA256.hash(data: Data(manifest.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
     /// Bump when the container create options change. A container whose label
     /// differs is recreated, but only while the bot has no active run.
     public static let runtimeRevision = "2"
@@ -47,6 +64,9 @@ public enum BotComputerGuestSpec {
     /// Kept out of every per-bot image build. The recipe lives in the guest home,
     /// which the guest can edit, and that home holds credentials and run state.
     public static let requiredDockerIgnorePatterns = [".distill", ".rc-*", ".browser-profiles"]
+    /// Ignore files a builder may read instead of `.dockerignore`: BuildKit
+    /// prefers `Dockerfile.dockerignore`, Podman/Buildah `.containerignore`.
+    public static let alternateDockerIgnoreFileNames = ["Dockerfile.dockerignore", ".containerignore"]
     static let dockerIgnoreEnforcedHeader = "# RemoteCode: always excluded (rewritten before every build)"
 
     /// The bot's `.dockerignore` with the required patterns moved to the end.

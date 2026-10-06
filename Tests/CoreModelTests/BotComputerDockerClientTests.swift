@@ -20,6 +20,38 @@ final class BotComputerDockerClientTests: XCTestCase {
         XCTAssertThrowsError(try unknown.containerExists(name: "remotecode-bot-exact"))
     }
 
+    func test_buildLabelsTheImageWithTheDigestOfTheRecipeItWasBuiltFrom() throws {
+        // WHY: the app reuses a base image only when this label matches its own
+        // recipe; an image from another recipe under the same tag and revision
+        // must be told apart. Any recipe file edit must change the digest.
+        let context = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-digest-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: context, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: context) }
+        for name in BotComputerGuestSpec.recipeFileNames {
+            try Data(name.utf8).write(to: context.appendingPathComponent(name))
+        }
+        var calls: [[String]] = []
+        let cli = BotComputerDockerCLI { args in
+            calls.append(args)
+            return Data()
+        }
+
+        try cli.build(context: context, tag: "remotecode/computer:test")
+
+        let digest = BotComputerGuestSpec.recipeDigest(context: context)
+        XCTAssertEqual(calls, [[
+            "build", "-t", "remotecode/computer:test",
+            "--label", "\(BotComputerGuestSpec.recipeLabelKey)=\(BotComputerGuestSpec.recipeRevision)",
+            "--label", "\(BotComputerGuestSpec.recipeDigestLabelKey)=\(digest)",
+            context.path,
+        ]])
+        try Data("start.sh edited".utf8).write(to: context.appendingPathComponent("start.sh"))
+        XCTAssertNotEqual(BotComputerGuestSpec.recipeDigest(context: context), digest)
+        try FileManager.default.removeItem(at: context.appendingPathComponent("embed.html"))
+        XCTAssertNotEqual(BotComputerGuestSpec.recipeDigest(context: context), digest)
+    }
+
     func test_createPassesInitHostAliasAndTheReadOnlyAgentKitBind() throws {
         // WHY: create options only matter if they reach `docker create`; without
         // --init the agent's orphans are never reaped, without --add-host the

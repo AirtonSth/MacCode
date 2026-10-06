@@ -6,7 +6,9 @@ export HOME="${HOME:-/home/remotecode}"
 mkdir -p "$HOME/.browser-profiles/chromium" /tmp/fluxbox
 # The profile lives on the persisted home bind. A recreated container has a new
 # hostname, so Chromium reads the previous container's lock as "in use on another
-# computer" and never opens. Nothing uses the profile yet at container start.
+# computer" and never opens. Removing the lock is safe only because no other
+# container runs on this home: rebuild and workspace remounts stop the old
+# container before the new one starts.
 rm -f "$HOME/.browser-profiles/chromium/SingletonLock" \
     "$HOME/.browser-profiles/chromium/SingletonSocket" \
     "$HOME/.browser-profiles/chromium/SingletonCookie"

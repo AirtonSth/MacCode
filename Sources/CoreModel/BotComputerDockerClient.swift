@@ -191,6 +191,8 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             "-t", tag,
             "--label",
             "\(BotComputerGuestSpec.recipeLabelKey)=\(BotComputerGuestSpec.recipeRevision)",
+            "--label",
+            "\(BotComputerGuestSpec.recipeDigestLabelKey)=\(BotComputerGuestSpec.recipeDigest(context: context))",
             context.path,
         ])
     }

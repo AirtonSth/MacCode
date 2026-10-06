@@ -131,7 +131,7 @@ enum AppShellResourceBundle {
 
     /// First-party Docker guest recipe (`Dockerfile` + start scripts).
     /// Prefer the packaged AppShell resource bundle; fall back to the
-    /// source tree so Studio can build `the base image (`BotComputerGuestSpec.imageTag`)` in
+    /// source tree so Studio can build the base image (`BotComputerGuestSpec.imageTag`) in
     /// `swift test` and local checkouts without `Bundle.module`.
     static func computerGuestRecipeURL(
         fileManager: FileManager = .default

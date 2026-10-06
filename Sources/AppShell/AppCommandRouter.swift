@@ -536,6 +536,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let reason = info[BotHostNotificationKey.reason] as? String ?? ""
             Task { @MainActor [weak self] in self?.handleBotScreenshotPosted(threadID: threadID, jpeg: jpeg, reason: reason) }
         })
+        // Same drain a finished run triggers (AppContext.onRunFinished) for the send that queued behind a rebuild.
+        botHostObservers.append(center.addObserver(forName: .botVMRebuildReleased, object: nil, queue: nil) { [weak self] note in
+            guard let threadID = note.userInfo?[BotHostNotificationKey.threadID] as? AgentThreadID else { return }
+            Task { @MainActor [weak self] in try? await self?.drainNextQueuedAgentMessage(thread: threadID) }
+        })
     }
 
     private func handleManualActionRequested(_ request: ManualActionRequest) {

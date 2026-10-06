@@ -178,6 +178,9 @@ public extension Notification.Name {
     static let botScreenshotPosted = Notification.Name("io.remotecode.bot.screenshot-posted")
     /// userInfo: `botID` BotID, `threadID` AgentThreadID?, `reason` String
     static let botMacExecutionRequested = Notification.Name("io.remotecode.bot.mac-execution-requested")
+    /// userInfo: `botID` BotID, `threadID` AgentThreadID. A rebuild that held the bot finished;
+    /// `threadID` is the send that queued meanwhile and now drains.
+    static let botVMRebuildReleased = Notification.Name("io.remotecode.bot.vm-rebuild-released")
     /// userInfo: `threadID` AgentThreadID. Posted after a manual-action take/resolve so every view model refreshes.
     static let manualActionStateChanged = Notification.Name("io.remotecode.bot.manual-action-state-changed")
 }

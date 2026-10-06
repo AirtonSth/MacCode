@@ -31,6 +31,15 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     var imageLabels: [String: String] = [
         BotComputerGuestSpec.imageTag: BotComputerGuestSpec.recipeRevision
     ]
+    /// `remotecode.recipe.sha256` per tag; the base image starts as built from the bundled recipe.
+    var imageDigests: [String: String] = [
+        BotComputerGuestSpec.imageTag: AppShellResourceBundle.computerGuestRecipeURL()
+            .map { BotComputerGuestSpec.recipeDigest(context: $0) } ?? "",
+    ]
+    /// Ordered start/stop log, e.g. "stop:<name>".
+    var lifecycle: [String] = []
+    /// Runs while `docker build` is in progress.
+    var onBuild: (() -> Void)?
 
     func info() throws -> String {
         if infoFails { throw BotComputerGuestError.dockerUnavailable }
@@ -38,8 +47,11 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     }
     func imageExists(tag: String) throws -> Bool { images.contains(tag) }
     func imageLabel(tag: String, key: String) throws -> String {
-        guard key == BotComputerGuestSpec.recipeLabelKey else { return "" }
-        return imageLabels[tag] ?? ""
+        switch key {
+        case BotComputerGuestSpec.recipeLabelKey: return imageLabels[tag] ?? ""
+        case BotComputerGuestSpec.recipeDigestLabelKey: return imageDigests[tag] ?? ""
+        default: return ""
+        }
     }
     func imageID(tag: String) throws -> String {
         guard images.contains(tag) else { throw BotComputerGuestError.dockerUnavailable }
@@ -47,8 +59,10 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     }
     func build(context: URL, tag: String) throws {
         builds.append(context)
+        onBuild?()
         images.insert(tag)
         imageLabels[tag] = BotComputerGuestSpec.recipeRevision
+        imageDigests[tag] = BotComputerGuestSpec.recipeDigest(context: context)
     }
     func create(options: BotComputerContainerCreateOptions) throws -> String {
         created.append(options.name)
@@ -61,12 +75,14 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     func start(name: String) throws {
         if startDelay > 0 { Thread.sleep(forTimeInterval: startDelay) }
         started.append(name)
+        lifecycle.append("start:\(name)")
         containers[name] = BotComputerContainerInspect(
             running: true, imageID: "img", hostPort: 49152, labels: containers[name]?.labels ?? [:]
         )
     }
     func stop(name: String) throws {
         stopped.append(name)
+        lifecycle.append("stop:\(name)")
         if var value = containers[name] {
             value.running = false
             containers[name] = value
@@ -551,7 +567,7 @@ final class BotComputerGuestServiceTests: XCTestCase {
 
     func test_proveReadyRebuildsImageWhenRecipeRevisionIsStale() throws {
         // WHY: viewer admission changes do nothing if Studio keeps an older,
-        // unauthenticated the base image image.
+        // unauthenticated base image.
         let support = makeSupport("rc-guest-stale")
         defer { try? FileManager.default.removeItem(at: support) }
         let recipe = try XCTUnwrap(AppShellResourceBundle.computerGuestRecipeURL())
@@ -1101,6 +1117,31 @@ final class BotComputerGuestServiceTests: XCTestCase {
         let lines = try String(contentsOf: ignore, encoding: .utf8).split(separator: "\n").map(String.init)
         XCTAssertEqual(Array(lines.suffix(3)), BotComputerGuestSpec.requiredDockerIgnorePatterns)
         XCTAssertEqual(fake.builds.last, BotComputerGuestSpec.recipeURL(appSupport: support, botID: botID))
+
+        // BuildKit reads Dockerfile.dockerignore instead of .dockerignore when
+        // it exists (verified: an empty one put .distill/claude-auth.json into
+        // the image); Podman reads .containerignore. Both get the exclusions.
+        let recipe = BotComputerGuestSpec.recipeURL(appSupport: support, botID: botID)
+        for name in BotComputerGuestSpec.alternateDockerIgnoreFileNames {
+            try "".write(to: recipe.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        _ = try service.rebuild(botID: botID)
+        for name in BotComputerGuestSpec.alternateDockerIgnoreFileNames {
+            let planted = try String(contentsOf: recipe.appendingPathComponent(name), encoding: .utf8)
+            XCTAssertEqual(planted, BotComputerGuestSpec.enforcedDockerIgnore(""), name)
+        }
+
+        // A guest-planted symlink names a host path. The host must replace the
+        // link, never read the file behind it into the guest-readable home.
+        let hostSecret = support.appendingPathComponent("host-secret")
+        try "HOST-PRIVATE-KEY\n".write(to: hostSecret, atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(at: ignore)
+        try FileManager.default.createSymbolicLink(at: ignore, withDestinationURL: hostSecret)
+        _ = try service.rebuild(botID: botID)
+        let replaced = try FileManager.default.attributesOfItem(atPath: ignore.path)[.type] as? FileAttributeType
+        XCTAssertEqual(replaced, .typeRegular)
+        XCTAssertFalse(try String(contentsOf: ignore, encoding: .utf8).contains("HOST-PRIVATE-KEY"))
+        XCTAssertEqual(try String(contentsOf: hostSecret, encoding: .utf8), "HOST-PRIVATE-KEY\n")
     }
 
     func test_provisionStartsStoppedContainerInsteadOfRecreating() throws {
@@ -1352,6 +1393,207 @@ final class BotComputerGuestServiceTests: XCTestCase {
             defer { lock.unlock() }
             return mainThread
         }
+    }
+
+    func test_ensureImageRebuildsAnImageWithTheRightRevisionButAnotherRecipe() throws {
+        // WHY: another build on the same daemon left an image under this tag and
+        // revision label from a different recipe (no Node 24, no Playwright MCP,
+        // no CDP). Trusting tag + revision would run every bot on it.
+        let support = makeSupport("rc-guest-foreign-image")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let recipe = try XCTUnwrap(AppShellResourceBundle.computerGuestRecipeURL())
+        let fake = FakeDocker()
+        fake.imageDigests[BotComputerGuestSpec.imageTag] = "built-from-another-recipe"
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, recipeContext: recipe,
+            observeAttempts: 1, observeDelay: 0
+        )
+        XCTAssertTrue(service.proveReady())
+        XCTAssertEqual(fake.builds, [recipe])
+        XCTAssertEqual(
+            fake.imageDigests[BotComputerGuestSpec.imageTag],
+            BotComputerGuestSpec.recipeDigest(context: recipe)
+        )
+        XCTAssertTrue(service.proveReady())
+        XCTAssertEqual(fake.builds, [recipe], "an image built from this recipe is reused, not rebuilt every time")
+    }
+
+    func test_rebuildStopsTheOldContainerBeforeTheNewOneStarts() throws {
+        // WHY: both containers bind the same home, and start.sh clears
+        // Chromium's profile lock. Two running at once means two Chromiums
+        // writing one profile, which corrupts the bot's cookies and logins.
+        let support = makeSupport("rc-guest-rebuild-order")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0,
+            vmRuns: BotVMRunRegistry()
+        )
+        let botID = BotID()
+        let canonical = BotComputerGuestSpec.containerName(botID: botID)
+        let next = BotComputerGuestSpec.nextContainerName(botID: botID)
+        _ = try service.provision(botID: botID)
+        fake.lifecycle.removeAll()
+
+        _ = try service.rebuild(botID: botID)
+
+        let stop = try XCTUnwrap(fake.lifecycle.firstIndex(of: "stop:\(canonical)"))
+        let start = try XCTUnwrap(fake.lifecycle.firstIndex(of: "start:\(next)"))
+        XCTAssertLessThan(stop, start)
+        XCTAssertEqual(fake.containers[canonical]?.running, true)
+    }
+
+    func test_rebuildThatNeverGetsReadyBringsTheOldContainerBack() throws {
+        // WHY: the old container is stopped before the new one starts; a new
+        // desktop that never proves its screen must not leave the bot with none.
+        let support = makeSupport("rc-guest-rebuild-rollback")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0,
+            vmRuns: BotVMRunRegistry()
+        )
+        let botID = BotID()
+        let canonical = BotComputerGuestSpec.containerName(botID: botID)
+        let next = BotComputerGuestSpec.nextContainerName(botID: botID)
+        _ = try service.provision(botID: botID)
+        fake.lifecycle.removeAll()
+        fake.execError = BotComputerGuestError.observeFailed
+
+        XCTAssertThrowsError(try service.rebuild(botID: botID))
+
+        XCTAssertNil(fake.containers[next], "the unready replacement is removed")
+        XCTAssertEqual(fake.lifecycle.last, "start:\(canonical)")
+        XCTAssertEqual(fake.containers[canonical]?.running, true)
+    }
+
+    func test_rebuildHoldsTheBotSoASendDuringTheBuildQueuesAndDrainsAfter() throws {
+        // WHY: `docker build` takes minutes. A run that starts on the old
+        // container meanwhile would have it stopped under it; it must queue
+        // behind the rebuild and be started once the rebuild lets go.
+        let support = makeSupport("rc-guest-rebuild-claim")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let registry = BotVMRunRegistry()
+        let center = NotificationCenter()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0,
+            notificationCenter: center, vmRuns: registry
+        )
+        let botID = BotID()
+        let sender = AgentThreadID()
+        var drained: [AgentThreadID] = []
+        let token = center.addObserver(forName: .botVMRebuildReleased, object: nil, queue: nil) { note in
+            if let thread = note.userInfo?[BotHostNotificationKey.threadID] as? AgentThreadID { drained.append(thread) }
+        }
+        defer { center.removeObserver(token) }
+        var refusedBy: BotVMRunRegistry.Entry?
+        fake.onBuild = {
+            refusedBy = registry.tryBegin(botID: botID, entry: .init(
+                threadID: sender, runID: AgentRunID(), title: "Deploy", workspace: ""
+            ))
+            XCTAssertNotNil(registry.busyMessage(botID: botID, threadID: sender))
+            registry.addWaiting(botID: botID, threadID: sender)
+        }
+
+        _ = try service.rebuild(botID: botID)
+
+        XCTAssertEqual(refusedBy?.title, BotComputerGuestService.rebuildClaimTitle)
+        XCTAssertNil(registry.active(botID: botID), "the rebuild lets go of the bot")
+        XCTAssertEqual(drained, [sender])
+        XCTAssertTrue(registry.waitingThreads(botID: botID).isEmpty)
+    }
+
+    func test_rebuildAbortsWhenAnotherRunTookTheBotDuringTheBuild() throws {
+        // WHY: the holding thread's own agent may rebuild, but if that run ends
+        // during the build and another thread's run starts, the old container
+        // now hosts that run and must not be stopped under it.
+        let support = makeSupport("rc-guest-rebuild-recheck")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let registry = BotVMRunRegistry()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0,
+            vmRuns: registry
+        )
+        let botID = BotID()
+        let canonical = BotComputerGuestSpec.containerName(botID: botID)
+        _ = try service.provision(botID: botID)
+        let holder = AgentThreadID()
+        let holderRun = AgentRunID()
+        registry.begin(botID: botID, entry: .init(threadID: holder, runID: holderRun, title: "Fix CI", workspace: ""))
+        let other = BotVMRunRegistry.Entry(threadID: AgentThreadID(), runID: AgentRunID(), title: "Deploy", workspace: "")
+        fake.onBuild = {
+            registry.end(botID: botID, runID: holderRun)
+            XCTAssertNil(registry.tryBegin(botID: botID, entry: other))
+        }
+        fake.stopped.removeAll()
+
+        XCTAssertThrowsError(try service.rebuild(botID: botID, requestingThreadID: holder)) {
+            XCTAssertEqual($0 as? BotComputerGuestServiceError, .rebuildWhileRunActive(threadTitle: "Deploy"))
+        }
+        XCTAssertFalse(fake.stopped.contains(canonical))
+        XCTAssertEqual(fake.containers[canonical]?.running, true)
+        XCTAssertNil(fake.containers[BotComputerGuestSpec.nextContainerName(botID: botID)])
+        XCTAssertEqual(registry.active(botID: botID), other)
+    }
+
+    func test_provisionByTheHoldingThreadReplacesAnOutdatedContainer() throws {
+        // WHY: an in-guest agent's run claims the bot before it provisions.
+        // Counting its own claim as "busy" would keep a container without the
+        // agent-kit bind or host alias, where that agent cannot start.
+        let support = makeSupport("rc-guest-runtime-requester")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let registry = BotVMRunRegistry()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0,
+            vmRuns: registry
+        )
+        let botID = BotID()
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        let holder = AgentThreadID()
+        registry.begin(botID: botID, entry: .init(threadID: holder, runID: AgentRunID(), title: "Fix CI", workspace: ""))
+        fake.containers[name] = BotComputerContainerInspect(
+            running: true, imageID: "img", hostPort: 49152,
+            labels: [BotComputerGuestSpec.workspacesLabelKey: BotComputerGuestSpec.workspacesLabel([])]
+        )
+
+        XCTAssertTrue(try service.provision(botID: botID).resumed, "another caller keeps the holder's container")
+        XCTAssertTrue(fake.created.isEmpty)
+        XCTAssertFalse(try service.provision(botID: botID, requestingThreadID: holder).resumed)
+        XCTAssertEqual(fake.created, [name])
+        XCTAssertEqual(fake.createdOptions.last?.labels[BotComputerGuestSpec.runtimeLabelKey], BotComputerGuestSpec.runtimeRevision)
+    }
+
+    func test_containerFromAnOlderImageIsKeptWhileAnotherRunHoldsTheBot() throws {
+        // WHY: a rebuilt per-bot or base image must not swap the container
+        // out from under a run; it is applied once the bot is idle.
+        let support = makeSupport("rc-guest-image-busy")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let registry = BotVMRunRegistry()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0,
+            vmRuns: registry
+        )
+        let botID = BotID()
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        let run = AgentRunID()
+        registry.begin(botID: botID, entry: .init(threadID: AgentThreadID(), runID: run, title: "Fix CI", workspace: ""))
+        fake.containers[name] = BotComputerContainerInspect(
+            running: true, imageID: "older-image", hostPort: 49152,
+            labels: [
+                BotComputerGuestSpec.workspacesLabelKey: BotComputerGuestSpec.workspacesLabel([]),
+                BotComputerGuestSpec.runtimeLabelKey: BotComputerGuestSpec.runtimeRevision,
+            ]
+        )
+
+        XCTAssertTrue(try service.provision(botID: botID).resumed)
+        XCTAssertTrue(fake.removed.isEmpty)
+        registry.end(botID: botID, runID: run)
+        XCTAssertFalse(try service.provision(botID: botID).resumed)
+        XCTAssertEqual(fake.removed, [name])
     }
 
     private func makeSupport(_ prefix: String) -> URL {
