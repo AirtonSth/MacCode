@@ -604,16 +604,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         stopInProcessScheduledTaskScheduler()
         removeScheduledTaskStoreObserver()
         disableInsomniaForAppClose()
-        // Always stop the Distill MLX server on quit — multi-GB model must not linger.
-        // On terminate, reconcile Distill with the Token Saver toggle (install only when
-        // enabled; otherwise scrub legacy homes + uninstall CLI/wrappers). The MLX
-        // sidecar is stopped separately.
+        // Always stop a leftover Distill MLX server on quit — a multi-GB model must
+        // not linger. Token Saver was removed, so quit only purges what older
+        // builds installed; it never installs anything.
         stopTokenSaverDistillServiceForAppTermination()
-        let tokenSaverEnabled = context.map { SettingsStore(db: $0.db).load().tokenSaverEnabled } ?? false
         if ProcessInfo.processInfo.environment["RC2_DISABLE_MANAGED_DISTILL_RECONCILE"] == "1" {
             appLifecycleLog.info("app.will_terminate distill_integration=unchanged isolated_process=true")
         } else {
-            appLifecycleLog.info("app.will_terminate distill_integration=app_private_retained distill_server=stopped token_saver=\(tokenSaverEnabled ? "enabled" : "disabled")")
+            appLifecycleLog.info("app.will_terminate distill_integration=legacy_purged distill_server=stopped")
             context?.prepareTokenSaverLifecycleForTermination()
         }
         persistRestorableStateBeforeUpdate()
@@ -1384,13 +1382,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         petItem.keyEquivalentModifierMask = [.command, .option]
         petItem.target = self
         viewMenu.addItem(petItem)
-        // UX-MAC_APPSHELL-TOKENSAVER-KEYBOARD: keyboard-reachable Token Saver toggle
-        // (Cmd+Shift+S). Posts rc2TokenSaverToggle; SidebarViewModel observes and
-        // calls setTokenSaverEnabled(!current). Cmd+Shift+S is unused in this menu map.
-        let tokenSaverToggleItem = NSMenuItem(title: "Toggle Token Saver", action: #selector(toggleTokenSaverFromMenu), keyEquivalent: "s")
-        tokenSaverToggleItem.keyEquivalentModifierMask = [.command, .shift]
-        tokenSaverToggleItem.target = self
-        viewMenu.addItem(tokenSaverToggleItem)
         viewMenu.addItem(.separator())
         let revealDiagnostics = NSMenuItem(title: "Reveal Diagnostics in Finder", action: #selector(revealDiagnosticsInFinder), keyEquivalent: "")
         revealDiagnostics.target = self
@@ -1741,10 +1732,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     @objc private func togglePalette() {
         palette?.toggle()
-    }
-
-    @objc private func toggleTokenSaverFromMenu() {
-        NotificationCenter.default.post(name: .rc2TokenSaverToggle, object: nil)
     }
 
     @objc private func togglePetPopoverFromMenu() {

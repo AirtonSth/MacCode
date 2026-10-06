@@ -1676,7 +1676,6 @@ public struct SettingsView: View {
                     sidebarSection
                     petSection
                     insomniaSection
-                    tokenSaverSection
                     botsSection
                     keybindingsSection
                     advancedSection

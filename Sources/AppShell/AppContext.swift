@@ -640,9 +640,8 @@ public final class AppContext {
     /// tests never write /distill state into the developer's real ~/.claude or
     /// ~/.codex. Production code never sets this (installs to the real provider dirs).
     var agentSkillsHomeOverrideForTesting: URL?
-    /// Test seam for proving paid cleanup does not depend on legacy-home cleanup.
-    /// Production leaves this nil and calls the ownership-safe installer scrub.
-    var legacyDistillCleanupOverrideForTesting: (() throws -> Void)?
+    /// The launch-time legacy purge (`startLegacyTokenSaverPurge`).
+    private(set) var legacyTokenSaverPurgeTask: Task<Void, Never>?
     var tokenSaverRolloverBeforeCommitForTesting: (() throws -> Void)?
     private static let tokenSaverUsageNotificationMinimumInterval: TimeInterval = 2
     /// Process-local once flag for empty lane_state diagnostic (silent-death condition).
@@ -1306,77 +1305,25 @@ public final class AppContext {
             reconcileRemoteCodeOrchestrate()
             reconcileComputerUseMCP()
         }
-        // Managed Distill is app-private (Application Support/AgentSkills/distill) and
-        // injected at runtime — never written into ~/.claude/skills or ~/.codex/skills.
-        // Skip open-trigger reconcile under XCTest unless a sandboxed home was injected.
+        // Token Saver was removed. A preference persisted ON by an older build is
+        // turned off (and its API token dropped) before anything reads it. Plain
+        // unit tests keep their seeded settings; sandboxed-home tests and every
+        // real launch, the isolated sandbox included, get the force-off.
+        if !AppContext.isRunningUnitTests || agentSkillsHomeOverrideForTesting != nil {
+            forceLegacyTokenSaverOff()
+        }
+        // The legacy purge touches the user's home, so it sits behind the same
+        // gate as the always-on installs: skipped under XCTest unless a sandboxed
+        // home was injected, and in processes that set
+        // RC2_DISABLE_MANAGED_DISTILL_RECONCILE (isolated sandbox, scheduled-task agent).
         if AppContext.shouldReconcileManagedDistillIntegration(
             isRunningUnitTests: AppContext.isRunningUnitTests,
             hasSkillsHomeOverride: agentSkillsHomeOverrideForTesting != nil,
             environment: ProcessInfo.processInfo.environment
         ) {
-            let bootSettings = SettingsStore(db: db).load()
-            if !bootSettings.tokenSaverEnabled {
-                _ = applyTokenSaverLifecycle(
-                    requestedEnabled: false,
-                    persistPreference: false
-                )
-            } else {
-                let bootSession = PrivateAccountSessionStore(repo: settingsRepo).load()
-                if bootSession?.user.subscribed != true {
-                    // Entitlement is known synchronously; no reason to hash
-                    // multi-GB model files before failing closed.
-                    _ = applyTokenSaverLifecycle(
-                        requestedEnabled: true,
-                        modelValidation: .init(
-                            state: .missing,
-                            reason: "model readiness not evaluated without subscription"
-                        ),
-                        persistPreference: false
-                    )
-                } else if !Self.tokenSaverUsesLocalModel(settings: bootSettings) {
-                    // API targets have no local readiness work. The lifecycle
-                    // planner admits a valid API immediately and fails an invalid
-                    // API loudly without ever falling back to local validation.
-                    _ = applyTokenSaverLifecycle(
-                        requestedEnabled: true,
-                        modelValidation: .installed,
-                        persistPreference: false
-                    )
-                } else {
-                    // Model validation may hash multi-GB weights on a cold cache.
-                    // Revoke paid runtime synchronously, then admit it only after
-                    // the full validation finishes off the main actor.
-                    _ = applyTokenSaverLifecycle(
-                        requestedEnabled: false,
-                        persistPreference: false
-                    )
-                    let appSupport = appSupportDirectory
-                    tokenSaverBootModelValidationTask = Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        defer {
-                            self.tokenSaverBootModelValidationTask = nil
-                        }
-                        let validation = await Self.tokenSaverBackgroundModelValidation(
-                            appSupportDirectory: appSupport,
-                            settings: bootSettings,
-                            beforeValidation: self.beforeTokenSaverBackgroundModelValidationForTesting,
-                            validationOverride: self.tokenSaverBackgroundModelValidationOverrideForTesting
-                        )
-                        let currentSettings = SettingsStore(db: self.db).load()
-                        guard !Task.isCancelled,
-                              let validation,
-                              currentSettings.tokenSaverEnabled,
-                              Self.tokenSaverUsesLocalModel(settings: currentSettings) else {
-                            return
-                        }
-                        _ = self.applyTokenSaverLifecycle(
-                            requestedEnabled: true,
-                            modelValidation: validation,
-                            persistPreference: false
-                        )
-                    }
-                }
-            }
+            revokeLegacyTokenSaverRuntime()
+            installAlwaysOnRouting(makeAgentSkillInstaller())
+            startLegacyTokenSaverPurge()
         } else {
             // Still apply Graphify defaults outside distill reconcile gate (unit tests stay quiet).
             if !AppContext.isRunningUnitTests {
@@ -2669,97 +2616,84 @@ public final class AppContext {
         }
     }
 
+    /// Token Saver was removed: every request, ON included, revokes the runtime,
+    /// persists OFF when asked to, and removes the legacy integration. It stays
+    /// the one entry point until the remaining Token Saver callers are deleted.
     @discardableResult
     public func applyTokenSaverLifecycle(
         requestedEnabled: Bool,
         modelValidation: TokenSaverModelValidation? = nil,
         persistPreference: Bool
     ) -> TokenSaverLifecycleOutcome {
-        let settingsStore = SettingsStore(db: db)
-
-        func settings(enabled: Bool) -> AppSettings {
-            var value = settingsStore.load()
-            value.tokenSaverEnabled = enabled
-            return value
-        }
-
-        func disableRuntime() -> String? {
-            cancelTokenSaverLocalAsyncWork()
-            tokenSaverRuntimeAdmitted = false
-            invalidateTokenSaverRuntimeActiveCache()
-            if persistPreference {
-                settingsStore.update { $0.tokenSaverEnabled = false }
-            }
-            // Revoke live capabilities before touching any legacy install. A
-            // failed legacy scrub must never leave a resident paid sidecar,
-            // Graphify watcher, CLI, wrapper, or retrieve MCP active.
-            tokenSaverDistillServiceController.stop()
-            reconcileGraphifyHost(settings: settings(enabled: false))
-            return reconcileManagedDistillSkills(tokenSaverEnabled: false)
-        }
-
-        guard requestedEnabled else {
-            if let error = disableRuntime() {
-                return .failed(error)
-            }
-            return .disabled
-        }
-
-        let enabledSettings = settings(enabled: true)
-        if !Self.tokenSaverUsesLocalModel(settings: enabledSettings) {
-            cancelTokenSaverLocalAsyncWork()
-        }
-        let session = PrivateAccountSessionStore(repo: settingsRepo).load()
-        let validation = Self.tokenSaverModelValidation(settings: enabledSettings) {
-            modelValidation
-                ?? TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
-                    .validateInstalledTokenSaverModels()
-        }
-        let target = enabledSettings.tokenSaverGenerateTarget
-        let decision = TokenSaverDistillLaunchPlanner.decide(.init(
-            hasPrivateAccount: session != nil,
-            isSubscribed: session?.user.subscribed == true,
-            tokenSaverEnabled: true,
-            modelValidation: validation,
-            allowsExternalGenerate: target.usesExternalGenerate,
-            externalGenerateError: target.configurationError
-        ))
-
-        switch decision {
-        case .skip(let reason):
-            if let cleanupError = disableRuntime() {
-                return .failed(cleanupError)
-            }
-            return .blocked(reason)
-        case .requireModel(let reason):
-            if let cleanupError = disableRuntime() {
-                return .failed(cleanupError)
-            }
-            return .blocked(reason ?? "model download required")
-        case .start:
-            break
-        }
-
-        if let installError = reconcileManagedDistillSkills(tokenSaverEnabled: true) {
-            _ = disableRuntime()
-            return .failed(installError)
-        }
         if persistPreference {
-            settingsStore.update { $0.tokenSaverEnabled = true }
+            SettingsStore(db: db).update { $0.tokenSaverEnabled = false }
         }
-        tokenSaverRuntimeAdmitted = true
+        // Revoke live capabilities before touching any legacy install. A
+        // failed legacy scrub must never leave a resident sidecar or a
+        // Graphify watcher running.
+        revokeLegacyTokenSaverRuntime()
+        if let error = reconcileManagedIntegration() {
+            return .failed(error)
+        }
+        return .disabled
+    }
+
+    /// Stops anything an older build could still have running: in-flight
+    /// local work, the runtime admission, a resident sidecar, Graphify watchers.
+    private func revokeLegacyTokenSaverRuntime() {
+        cancelTokenSaverLocalAsyncWork()
+        tokenSaverRuntimeAdmitted = false
         invalidateTokenSaverRuntimeActiveCache()
-        tokenSaverDistillServiceController.startIfEligible(
-            session: session,
-            settings: enabledSettings,
-            modelValidation: validation
-        )
-        activatePreferredTokenSaverModelIfDownloaded(
-            settings: enabledSettings,
-            session: session
-        )
-        reconcileGraphifyHost(settings: enabledSettings)
-        return .enabled
+        tokenSaverDistillServiceController.stop()
+        var disabledSettings = SettingsStore(db: db).load()
+        disabledSettings.tokenSaverEnabled = false
+        reconcileGraphifyHost(settings: disabledSettings)
+    }
+
+    /// Turns off a Token Saver preference persisted by an older build and drops
+    /// the API token it stored. No-op once both are cleared.
+    func forceLegacyTokenSaverOff() {
+        let settingsStore = SettingsStore(db: db)
+        let stored = settingsStore.load()
+        guard stored.tokenSaverEnabled || !stored.tokenSaverAPIToken.isEmpty else { return }
+        settingsStore.update {
+            $0.tokenSaverEnabled = false
+            $0.tokenSaverAPIToken = ""
+        }
+    }
+
+    /// The launch purge: removes what older builds installed in the user's home
+    /// (`LegacyTokenSaverPurge.purgeIntegration`) and their Application Support
+    /// data (multi-GB model weights, Graphify graphs). File work only, on a
+    /// utility task, so launch never waits on it. Tests await
+    /// `legacyTokenSaverPurgeTask`.
+    private func startLegacyTokenSaverPurge() {
+        let purge = LegacyTokenSaverPurge(installer: makeAgentSkillInstaller())
+        let appSupport = appSupportDirectory
+        // Graphify always wrote under the stable app's folder; a sandboxed-home
+        // test must never reach the developer's real Application Support.
+        let graphifyGraphs = agentSkillsHomeOverrideForTesting == nil
+            ? LegacyTokenSaverPurge.defaultGraphifyGraphsDirectory()
+            : appSupport.appendingPathComponent("graphify-graphs", isDirectory: true)
+        legacyTokenSaverPurgeTask = Task.detached(priority: .utility) {
+            let failures = purge.purgeIntegration(defaults: .standard)
+            if !failures.isEmpty {
+                NSLog("RemoteCode legacy Token Saver purge incomplete: \(failures.joined(separator: "; "))")
+            }
+            let result = LegacyTokenSaverPurge.purgeAppSupportData(
+                appSupportDirectory: appSupport,
+                graphifyGraphsDirectory: graphifyGraphs
+            )
+            for path in result.removed {
+                NSLog("RemoteCode removed legacy Token Saver data at \(path)")
+            }
+            if !result.failures.isEmpty {
+                NSLog("RemoteCode legacy Token Saver data purge incomplete: \(result.failures.joined(separator: "; "))")
+            }
+            if let training = result.keptTrainingDirectory {
+                NSLog("RemoteCode kept saved Token Saver training prompts at \(training)")
+            }
+        }
     }
 
     /// Restart the Distill sidecar so Settings model / API / training changes take effect.
@@ -2916,177 +2850,48 @@ public final class AppContext {
         }
     }
 
-    /// Quit-time lifecycle is cleanup-only. It never installs hooks or starts a
-    /// process from a persisted bool: eligible state is left as-is, while an
-    /// ineligible/off state is revoked before the app exits.
+    /// Quit-time cleanup: stop any sidecar and remove the legacy Token Saver
+    /// integration. Never installs anything Token Saver owned.
     @discardableResult
     public func prepareTokenSaverLifecycleForTermination() -> TokenSaverLifecycleOutcome {
-        tokenSaverDistillServiceController.stop()
-        let settingsStore = SettingsStore(db: db)
-        let storedSettings = settingsStore.load()
-        guard storedSettings.tokenSaverEnabled else {
-            reconcileGraphifyHost(settings: storedSettings)
-            if let error = reconcileManagedDistillSkills(tokenSaverEnabled: false) {
-                return .failed(error)
-            }
-            return .disabled
-        }
-
-        let session = PrivateAccountSessionStore(repo: settingsRepo).load()
-        let currentSettings = SettingsStore(db: db).load()
-        let validation = Self.tokenSaverModelValidation(settings: currentSettings) {
-            TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
-                .validateInstalledTokenSaverModels()
-        }
-        let target = currentSettings.tokenSaverGenerateTarget
-        let decision = TokenSaverDistillLaunchPlanner.decide(.init(
-            hasPrivateAccount: session != nil,
-            isSubscribed: session?.user.subscribed == true,
-            tokenSaverEnabled: true,
-            modelValidation: validation,
-            allowsExternalGenerate: target.usesExternalGenerate,
-            externalGenerateError: target.configurationError
-        ))
-        switch decision {
-        case .start:
-            // Preserve the already-admitted on-disk integration. Do not
-            // reconcile ON here: reconciliation can install missing paid hooks.
-            return .enabled
-        case .skip(let reason):
-            var disabledSettings = storedSettings
-            disabledSettings.tokenSaverEnabled = false
-            reconcileGraphifyHost(settings: disabledSettings)
-            if let error = reconcileManagedDistillSkills(tokenSaverEnabled: false) {
-                return .failed(error)
-            }
-            return .blocked(reason)
-        case .requireModel(let reason):
-            var disabledSettings = storedSettings
-            disabledSettings.tokenSaverEnabled = false
-            reconcileGraphifyHost(settings: disabledSettings)
-            if let error = reconcileManagedDistillSkills(tokenSaverEnabled: false) {
-                return .failed(error)
-            }
-            return .blocked(reason ?? "model download required")
-        }
+        applyTokenSaverLifecycle(requestedEnabled: false, persistPreference: false)
     }
 
-    /// Reconcile Distill integration after the lifecycle gate above (paid
-    /// feature). The app-private skill package lives under Application Support
-    /// only (never `~/.claude` / `~/.codex` skill trees). CLI, command wrappers,
-    /// and retrieve
-    /// MCP are installed only while Token Saver is enabled; disabled removes them
-    /// so free/unsubscribed runs never get token-economy hooks.
+    /// Removes the legacy Token Saver integration (`LegacyTokenSaverPurge`), then
+    /// installs the always-on routing.
     ///
-    /// Nested provider PATH proxies (`grok`/`claude`/`codex`) are always installed
-    /// when reconcile runs: they are not a Token Saver lane. They only intercept
+    /// Nested provider PATH proxies (`grok`/`claude`/`codex`), the Agent App
+    /// middleware and the shell bridge are not Token Saver. They only intercept
     /// shell-launched bare provider names inside a thread-scoped environment;
     /// host top-level turns keep absolute resolved binaries via ProcessLocator.
+    ///
+    /// Behind the same gate as launch: never under XCTest without a sandboxed
+    /// home (that would be the developer's real home), never with
+    /// RC2_DISABLE_MANAGED_DISTILL_RECONCILE=1.
     @discardableResult
-    func reconcileManagedDistillSkills(tokenSaverEnabled: Bool) -> String? {
+    func reconcileManagedIntegration() -> String? {
+        guard Self.shouldReconcileManagedDistillIntegration(
+            isRunningUnitTests: Self.isRunningUnitTests,
+            hasSkillsHomeOverride: agentSkillsHomeOverrideForTesting != nil,
+            environment: ProcessInfo.processInfo.environment
+        ) else { return nil }
         let installer = makeAgentSkillInstaller()
-        var failures: [String] = []
+        let failures = LegacyTokenSaverPurge(installer: installer)
+            .purgeIntegration(defaults: .standard)
+        managedDistillSkillInstallResults = []
+        installAlwaysOnRouting(installer)
 
-        func capture(_ label: String, _ operation: () throws -> Void) {
-            do {
-                try operation()
-            } catch {
-                failures.append("\(label): \((error as NSError).localizedDescription)")
-            }
+        let failure = failures.isEmpty ? nil : failures.joined(separator: "; ")
+        managedDistillSkillInstallError = failure
+        if let failure {
+            NSLog("RemoteCode legacy Token Saver purge incomplete: \(failure)")
         }
+        return failure
+    }
 
-        func removePaidIntegration() {
-            // Keep these independent and first. One malformed provider config or
-            // filesystem failure must not short-circuit the remaining removals.
-            capture("command wrapper cleanup") {
-                _ = try installer.uninstallCommandWrappers()
-            }
-            capture("Distill CLI cleanup") {
-                _ = try installer.uninstallDistillCLI()
-            }
-            capture("retrieve MCP cleanup") {
-                try installer.uninstallRetrieveMCP()
-            }
-            capture("Grok PreToolUse pipe hook cleanup") {
-                _ = try installer.uninstallGrokPreToolPipeHook()
-            }
-            capture("Grok PostToolUse output hook cleanup") {
-                _ = try installer.uninstallGrokPostToolUseHook()
-            }
-        }
-
-        if tokenSaverEnabled {
-            // Install each paid integration independently. A skill-copy failure
-            // must not leave `~/.remote-code/bin/distill` missing while npm/claude
-            // wrappers remain (PostToolUse + `| distill` then fail open silently).
-            // Resolve the service binary once so every user gets the same target
-            // for distill + wrappers (including recovery from existing wrappers).
-            let sharedBinary = AgentSkillInstaller.resolveServiceBinary()
-            var appPrivateResult: AgentSkillInstallResult?
-            capture("app-private Distill skill") {
-                appPrivateResult = try installer.installAppPrivateDistillSkill(
-                    sourceRevision: "github-main-remote-code-template-v2"
-                )
-            }
-            capture("Distill CLI ensure") {
-                _ = try installer.ensureDistillCLI(serviceBinaryURL: sharedBinary)
-            }
-            capture("command wrappers") {
-                let searchDirectories = ProcessLocator.expandedPath(
-                    environmentPath: ProcessInfo.processInfo.environment["PATH"],
-                    homeDirectory: FileManager.default.homeDirectoryForCurrentUser.path
-                )
-                .split(separator: ":")
-                .map(String.init)
-                _ = try installer.installCommandWrappers(
-                    serviceBinaryURL: sharedBinary,
-                    searchDirectoriesOverride: searchDirectories
-                )
-            }
-            // Re-ensure after wrappers: recovers from catalog refresh races and
-            // from hosts where only wrappers survived a prior partial install.
-            capture("Distill CLI re-ensure") {
-                _ = try installer.ensureDistillCLI(serviceBinaryURL: sharedBinary)
-            }
-            capture("retrieve MCP") {
-                try installer.installRetrieveMCP()
-            }
-            capture("Grok PreToolUse pipe hook") {
-                try installer.installGrokPreToolPipeHook()
-            }
-            capture("Grok PostToolUse output hook") {
-                try installer.installGrokPostToolUseHook()
-            }
-            LoginShellEnvironment.prewarm()
-            if let appPrivateResult {
-                managedDistillSkillInstallResults = [appPrivateResult]
-            } else {
-                managedDistillSkillInstallResults = []
-            }
-            // Loud residual when the managed distill binary is still unhealthy —
-            // Token Saver techniques that depend on it will fail open.
-            if !installer.isDistillCLIHealthy() {
-                failures.append(
-                    "Distill CLI unhealthy at \(installer.distillCLIURL().path) after Token Saver install"
-                )
-            }
-        } else {
-            removePaidIntegration()
-            managedDistillSkillInstallResults = []
-        }
-
-        // Legacy provider-home cleanup is intentionally after paid OFF cleanup.
-        // It is migration hygiene, never an authorization dependency.
-        capture("legacy Distill cleanup") {
-            if let override = legacyDistillCleanupOverrideForTesting {
-                try override()
-            } else {
-                try installer.uninstallLegacyProviderDistillSkills()
-            }
-        }
-
-        // Always-on subagent routing is independent of Token Saver. Install each
-        // component separately so a failure cannot remove or suppress siblings.
+    /// Always-on subagent routing. Install each component separately so a
+    /// failure cannot remove or suppress siblings.
+    private func installAlwaysOnRouting(_ installer: AgentSkillInstaller) {
         let activeServiceBinary = AgentSkillInstaller.resolveServiceBinary()
         do {
             _ = try installer.installProviderProxies(
@@ -3107,13 +2912,6 @@ public final class AppContext {
         } catch {
             NSLog("RemoteCode provider shell bridge install failed: \(error)")
         }
-
-        let failure = failures.isEmpty ? nil : failures.joined(separator: "; ")
-        managedDistillSkillInstallError = failure
-        if let failure {
-            NSLog("RemoteCode managed Distill reconcile incomplete: \(failure)")
-        }
-        return failure
     }
 
     func startBotBrowserPendingOpenObserver() {

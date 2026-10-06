@@ -437,72 +437,6 @@ final class TokenSaverAppContextTests: XCTestCase {
         )
     }
 
-    private func managedDistillCLIURL(home: URL) -> URL {
-        home.appendingPathComponent(".remote-code/bin/distill")
-    }
-
-    private func managedDistillPathLinkURL(home: URL) -> URL {
-        home.appendingPathComponent(".local/bin/distill")
-    }
-
-    func test_appContextReconcilesManagedDistillStateWithTokenSaverToggle() throws {
-        let appSupport = NSTemporaryDirectory() + "RC2ManagedSkills-" + UUID().uuidString
-        let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("RC2ManagedSkillsHome-" + UUID().uuidString, isDirectory: true)
-
-        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        // Sandbox the install roots so the test writes into a temp home, not the
-        // developer's real ~/.claude / ~/.codex.
-        context.agentSkillsHomeOverrideForTesting = home
-
-        // Legacy provider-home skill dirs must never be used again.
-        let codexSkill = home.appendingPathComponent(".codex/skills/distill/SKILL.md")
-        let claudeSkill = home.appendingPathComponent(".claude/skills/distill/SKILL.md")
-        let configURLs = managedDistillConfigURLs(home: home)
-        let cliURL = managedDistillCLIURL(home: home)
-        let pathLink = managedDistillPathLinkURL(home: home)
-        let appPrivateSkill = URL(fileURLWithPath: appSupport, isDirectory: true)
-            .appendingPathComponent("AgentSkills/distill/SKILL.md")
-
-        // Token Saver off: no Distill CLI / app-private install results; still scrub legacy homes.
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: false)
-        XCTAssertEqual(context.managedDistillSkillInstallResults.count, 0)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: codexSkill.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: claudeSkill.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.codex.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.claude.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: cliURL.path),
-                       "Token Saver off must not leave managed distill CLI installed")
-
-        // Token Saver on: app-private Distill + CLI under RemoteCode Application Support.
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
-        XCTAssertEqual(context.managedDistillSkillInstallResults.count, 1)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: appPrivateSkill.path),
-                      "Distill lives under RemoteCode Application Support, not provider homes")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: codexSkill.path),
-                       "must never install into ~/.codex/skills")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: claudeSkill.path),
-                       "must never install into ~/.claude/skills")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: cliURL.path),
-                      "Token Saver on installs managed distill CLI for | distill pipes")
-        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: pathLink.path), cliURL.path)
-
-        let skillText = try String(contentsOf: appPrivateSkill)
-        XCTAssertTrue(skillText.contains("Distill tool output"))
-        XCTAssertTrue(skillText.contains("not a conversation mode or user command"))
-        XCTAssertFalse(skillText.contains("S=state"))
-        XCTAssertFalse(skillText.contains("R0 micro"))
-        let cliDest = try FileManager.default.destinationOfSymbolicLink(atPath: cliURL.path)
-        XCTAssertTrue(cliDest.hasSuffix("RemoteCodeDistillService"), "managed CLI is a native symlink, not a script")
-        XCTAssertFalse(cliDest.contains("dev/distill/src/cli.ts"))
-
-        // Toggle off again removes economy hooks.
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: false)
-        XCTAssertEqual(context.managedDistillSkillInstallResults.count, 0)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: cliURL.path),
-                       "disabling Token Saver must uninstall managed distill CLI")
-    }
-
     func test_distillInstallStatusMappingDistinguishesFailedFromOff() {
         // A reconcile failure must surface as .failed (visible), never collapse into
         // .inactive. Installed only when Token Saver is on and package is present.
@@ -528,26 +462,6 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertEqual(
             DistillInstallStatus.from(error: nil, enabled: false, installedCount: 0),
             .inactive)
-    }
-
-    func test_reconcileClearsInstallErrorOnSuccessAndOff() throws {
-        let appSupport = NSTemporaryDirectory() + "RC2DistillInstallStatus-" + UUID().uuidString
-        let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("RC2DistillInstallStatusHome-" + UUID().uuidString, isDirectory: true)
-        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        context.agentSkillsHomeOverrideForTesting = home
-
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
-        XCTAssertEqual(context.managedDistillSkillInstallResults.count, 1,
-                       "app-private Distill is a single package install")
-        XCTAssertNil(context.managedDistillSkillInstallError,
-                     "a clean install must leave no error so the UI shows installed, not failed")
-
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: false)
-        XCTAssertEqual(context.managedDistillSkillInstallResults.count, 0,
-                       "Token Saver off must uninstall Distill economy hooks")
-        XCTAssertNil(context.managedDistillSkillInstallError,
-                     "turning Token Saver off is not a failure — the error must clear")
     }
 
     func test_managedDistillCLIUsesLocalMacDistillService() async throws {
@@ -636,45 +550,7 @@ final class TokenSaverAppContextTests: XCTestCase {
                        "the provider-visible CLI path must never hit the old TypeScript checkout")
     }
 
-    func test_appContextInstallsAppPrivateDistillWhenEntitledAndModelReady() throws {
-        let appSupport = NSTemporaryDirectory() + "RC2ManagedSkillsLaunchOn-" + UUID().uuidString
-        let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("RC2ManagedSkillsLaunchHome-" + UUID().uuidString, isDirectory: true)
-        let skillURLs = managedDistillSkillURLs(home: home)
-        let configURLs = managedDistillConfigURLs(home: home)
-        let appPrivateSkill = URL(fileURLWithPath: appSupport, isDirectory: true)
-            .appendingPathComponent("AgentSkills/distill/SKILL.md")
-
-        let launchedContext = try AppContext(
-            channel: .debug,
-            appSupportOverride: appSupport,
-            agentSkillsHomeOverrideForTesting: home
-        )
-        savePrivateSession(in: launchedContext)
-        XCTAssertEqual(
-            launchedContext.applyTokenSaverLifecycle(
-                requestedEnabled: true,
-                modelValidation: .installed,
-                persistPreference: true
-            ),
-            .enabled
-        )
-
-        XCTAssertEqual(launchedContext.managedDistillSkillInstallResults.count, 1,
-                       "an entitled, model-ready Token Saver installs one app-private Distill package")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: appPrivateSkill.path),
-                      "Distill lives under RemoteCode Application Support, not provider homes")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.codex.path),
-                       "must never install into ~/.codex/skills")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.claude.path),
-                       "must never install into ~/.claude/skills")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.codex.path),
-                       "Codex instructions are injected only into admitted runtime turns")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.claude.path),
-                       "Claude instructions are injected only into admitted runtime turns")
-    }
-
-    func test_appContextLaunchRemovesManagedDistillStateWhenPersistedTokenSaverDisabled() throws {
+    func test_appContextLaunchRemovesManagedDistillStateWhenPersistedTokenSaverDisabled() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2ManagedSkillsLaunchOff-" + UUID().uuidString
         let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2ManagedSkillsLaunchOffHome-" + UUID().uuidString, isDirectory: true)
@@ -698,6 +574,7 @@ final class TokenSaverAppContextTests: XCTestCase {
             appSupportOverride: appSupport,
             agentSkillsHomeOverrideForTesting: home
         )
+        await launchedContext.legacyTokenSaverPurgeTask?.value
 
         // Launch with Token Saver off scrubs legacy provider-home skill copies and
         // does not install Distill economy hooks (paid feature).
@@ -708,10 +585,16 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.claude.path))
     }
 
-    func test_applicationWillTerminateScrubsLegacyHomeDistillButKeepsAppPrivate() throws {
+    func test_applicationWillTerminatePurgesLegacyHomeAndAppPrivateDistill() async throws {
+        // WHY: Token Saver was removed. Quit must finish the purge (provider-home
+        // skills and the app-private Distill package) and never reinstall either.
         let appSupport = NSTemporaryDirectory() + "RC2ManagedSkillsClose-" + UUID().uuidString
         let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2ManagedSkillsCloseHome-" + UUID().uuidString, isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(atPath: appSupport)
+            try? FileManager.default.removeItem(at: home)
+        }
         let skillURLs = managedDistillSkillURLs(home: home)
         let configURLs = managedDistillConfigURLs(home: home)
         let context = try AppContext(
@@ -719,28 +602,29 @@ final class TokenSaverAppContextTests: XCTestCase {
             appSupportOverride: appSupport,
             agentSkillsHomeOverrideForTesting: home
         )
-        // Seed legacy home installs, then reconcile (scrubs home, keeps app-private).
+        await context.legacyTokenSaverPurgeTask?.value
+        // An older build left these behind after this launch's purge ran.
         let installer = AgentSkillInstaller(homeDirectory: home)
         _ = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
         _ = try installer.installDistillSkill(for: .claude, sourceRevision: "rev-a")
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.codex.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.claude.path))
         let appPrivate = URL(fileURLWithPath: appSupport, isDirectory: true)
             .appendingPathComponent("AgentSkills/distill/SKILL.md")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: appPrivate.path))
+        try FileManager.default.createDirectory(
+            at: appPrivate.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("legacy".utf8).write(to: appPrivate)
 
         let delegate = AppDelegate()
         delegate.context = context
         delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
 
-        // Terminate reconcile still must not reinstall into provider homes.
         XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.codex.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.claude.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.codex.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.claude.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: appPrivate.path),
-                      "app-private Distill package remains for the next launch")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: appPrivate.path),
+                       "quit removes the app-private Distill package of the removed feature")
     }
 
     func test_tokenSaverDistillLaunchPlannerOnlyStartsForPaidEnabledInstalledModel() {

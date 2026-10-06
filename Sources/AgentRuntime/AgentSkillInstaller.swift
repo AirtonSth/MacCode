@@ -1179,6 +1179,17 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return AgentSkillInstallResult(action: .installed, manifest: manifest)
     }
 
+    /// Remove the app-private Distill skill folder an earlier Token Saver build
+    /// installed. The folder lives under RemoteCode's own Application Support
+    /// skills root, so it is always app-owned.
+    @discardableResult
+    public func uninstallAppPrivateDistillSkill() throws -> AgentSkillUninstallResult {
+        let directory = distillAppPrivateDirectory()
+        guard fileManager.fileExists(atPath: directory.path) else { return .notPresent }
+        try fileManager.removeItem(at: directory)
+        return .removed
+    }
+
     /// Remove legacy Distill copies that used to live in each provider's home skill tree.
     public func uninstallLegacyProviderDistillSkills() throws {
         for provider in AgentProvider.allCases {
@@ -1823,12 +1834,12 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return removed
     }
 
-    /// Basenames that may keep a Distill symlink in the managed bin.
+    /// Basenames that may keep a Distill symlink in the managed bin. `distill`
+    /// and `rc-retrieve-mcp` are not kept: they belonged to the removed Token
+    /// Saver, so the prune removes leftover links with those names too.
     func reservedManagedBinBasenames(includingCommandWrappers: Bool) -> Set<String> {
         var names = Set(ProviderProxyCatalog.providers)
         names.insert(Self.agentAppMiddlewareCommand)
-        names.insert("distill")
-        names.insert("rc-retrieve-mcp")
         if includingCommandWrappers {
             for command in WrappedCommandCatalog.commands where !WrappedCommandCatalog.isShebangInterpreter(command) {
                 names.insert(command)

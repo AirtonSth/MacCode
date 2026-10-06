@@ -406,7 +406,7 @@ final class BotsWindowTests: XCTestCase {
         // compiled payload is the original provider input.
         let context = try makeContext()
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = false }
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        context.reconcileManagedIntegration()
         let router = AppCommandRouter(context: context)
         context.router = router
         let runner = ControlledBotHandoffRunner(provider: .grok)
@@ -448,7 +448,6 @@ final class BotsWindowTests: XCTestCase {
         // admit Distill through the real send() → sendAgentMessage path.
         let context = try makeContext()
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
         let configuration = try DistillServiceConfiguration(
             authToken: "bot-desk-wire-token",
             appSupportDirectory: directory
@@ -8105,7 +8104,7 @@ final class BotsWindowTests: XCTestCase {
 
         let context = try makeContext()
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = false }
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        context.reconcileManagedIntegration()
         let router = AppCommandRouter(context: context)
         context.router = router
         let adapter = DistillACPAdapter(binaryNameOverride: harnessURL.path)

@@ -51,7 +51,6 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         let router = AppCommandRouter(context: context)
         let workspace = try router.createWorkspace(name: "auto-ts", cwd: NSTemporaryDirectory())
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
 
         for provider in [AgentProvider.claude, .codex, .grok] {
             let thread = try admittedThread(in: context, provider: provider)
@@ -151,7 +150,6 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             )
         )
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
 
         let child = try await router.createAgentThreadRouting(
             workspace: workspace.id,
@@ -312,7 +310,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         let claudeThread = try admittedThread(in: ctx, provider: .claude)
         let grokThread = try admittedThread(in: ctx, provider: .grok)
 
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        ctx.reconcileManagedIntegration()
         XCTAssertNil(
             router.providerEnvironment(provider: .codex, instanceId: nil, threadId: codexThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"]
         )
@@ -321,7 +319,6 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         )
 
         SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: true)
 
         XCTAssertEqual(
             router.providerEnvironment(provider: .codex, instanceId: nil, threadId: codexThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"],
@@ -379,7 +376,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         let codexThread = try admittedThread(in: ctx, provider: .codex)
         let claudeThread = try admittedThread(in: ctx, provider: .claude)
 
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        ctx.reconcileManagedIntegration()
 
         // Token Saver off → no token-economy env.
         let codexOff = ctx.tokenSaverAgentEnvironment(provider: .codex, threadId: codexThread.id)
@@ -387,7 +384,6 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         XCTAssertNil(codexOff["RC_TOKEN_SAVER_POST_TOOL_USE"])
 
         SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: true)
 
         let codex = ctx.tokenSaverAgentEnvironment(provider: .codex, threadId: codexThread.id)
         XCTAssertEqual(codex["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
@@ -433,7 +429,6 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         )
         let thread = try admittedThread(in: context, provider: .codex)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
         let base = ["PATH": pathDirectory.path]
 
         // First admitted turn: the pass runs and wraps what the effective PATH offers.
@@ -505,7 +500,6 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         let appSupport = NSTemporaryDirectory() + "RC2TSEnvProjectless-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: true)
         let workspaceID = WorkspaceID()
         let thread = AgentThread(
             projectId: nil,
@@ -536,7 +530,6 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         let appSupport = NSTemporaryDirectory() + "RC2TSEnvPath-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: true)
         let router = AppCommandRouter(context: ctx)
         let codexThread = try admittedThread(in: ctx, provider: .codex)
         let claudeThread = try admittedThread(in: ctx, provider: .claude)
@@ -564,7 +557,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             agentSkillsHomeOverrideForTesting: skillsHome
         )
         SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = false }
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        ctx.reconcileManagedIntegration()
         let router = AppCommandRouter(context: ctx)
         let managedBin = skillsHome.appendingPathComponent(".remote-code/bin").path
         let shellBridge = skillsHome.appendingPathComponent(".remote-code/shell/zsh").path
@@ -636,44 +629,6 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             env["ZDOTDIR"],
             skillsHome.appendingPathComponent(".remote-code/shell/zsh").path
         )
-
-        ctx.tokenSaverEntitlementModelValidationOverrideForTesting = .installed
-        PrivateAccountSessionStore(repo: ctx.settingsRepo).save(.init(
-            accessToken: "test-access",
-            refreshToken: "test-refresh",
-            user: .init(
-                daysRemaing: nil,
-                daysRemaining: 30,
-                email: "paid@example.com",
-                id: "paid",
-                subscribed: true
-            )
-        ))
-        XCTAssertEqual(
-            ctx.applyTokenSaverLifecycle(
-                requestedEnabled: true,
-                modelValidation: .installed,
-                persistPreference: true
-            ),
-            .enabled
-        )
-        // This environment-only test has no packaged sidecar executable. Put
-        // the controller back on the explicit XCTest injected-ready seam after
-        // lifecycle admission so the assertion exercises the emitted runtime
-        // environment rather than a synthetic process-launch failure.
-        ctx.tokenSaverDistillServiceController.stop()
-        let tokenSaverEnv = router.providerEnvironment(
-            provider: .claude,
-            instanceId: "claude-isolated",
-            threadId: thread.id
-        )
-        XCTAssertTrue(
-            tokenSaverEnv["PATH"]?.hasPrefix(
-                skillsHome.appendingPathComponent(".remote-code/bin").path + ":"
-            ) == true,
-            "Token Saver admission must retain the sandboxed managed bin"
-        )
-        XCTAssertEqual(tokenSaverEnv["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
     }
 
     @MainActor
@@ -720,7 +675,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         let recoveryEnvironment = try XCTUnwrap(ctx.coordinator.recoveryEnvironmentProvider)
 
         SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = false }
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        ctx.reconcileManagedIntegration()
         let disabled = await recoveryEnvironment(.codex, thread.id)
         let disabledPath = try XCTUnwrap(disabled["PATH"])
         XCTAssertTrue(disabledPath.hasPrefix(managedBin + ":") || disabledPath == managedBin)
@@ -728,7 +683,6 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         XCTAssertNil(disabled["RC_TOKEN_SAVER_DISTILL_HINT"])
 
         SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: true)
         let enabled = await recoveryEnvironment(.codex, thread.id)
         let enabledPath = try XCTUnwrap(enabled["PATH"])
         XCTAssertTrue(enabledPath.hasPrefix(managedBin + ":") || enabledPath == managedBin)

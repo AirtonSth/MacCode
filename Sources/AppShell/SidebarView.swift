@@ -16,9 +16,6 @@ public extension Notification.Name {
     /// job: local paths (enable toggle, `savings_recorded`) post it without
     /// querying any provider, so it can never prove the probe finished.
     static let rc2TokenSaverAccountUsageSettled = Notification.Name("rc2TokenSaverAccountUsageSettled")
-    /// Posted by AppDelegate's "Toggle Token Saver" menu item (Cmd+Shift+S).
-    /// SidebarViewModel observes this and calls setTokenSaverEnabled(!tokenSaverEnabled).
-    static let rc2TokenSaverToggle = Notification.Name("rc2TokenSaverToggle")
 }
 
 @MainActor
@@ -473,7 +470,6 @@ public final class SidebarViewModel: ObservableObject {
     var tokenSaverInstalledModelSizeCache = TokenSaverInstalledModelSizeCache()
     private var tokenSaverLocalUsageBaseline: [AgentProvider: Int]?
     private var sidecarStatusObserver: NSObjectProtocol?
-    private var tokenSaverToggleObserver: NSObjectProtocol?
     private var tokenSaverConfigurationObserver: NSObjectProtocol?
     private let updateChecker: AppUpdateChecking?
     private let settingsStore: SettingsStore
@@ -572,14 +568,6 @@ public final class SidebarViewModel: ObservableObject {
                   let controller = note.object as? TokenSaverDistillServiceController else { return }
             Task { @MainActor in viewModel.sidecarStatus = controller.status }
         }
-        self.tokenSaverToggleObserver = NotificationCenter.default.addObserver(
-            forName: .rc2TokenSaverToggle,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            guard let viewModel = self else { return }
-            Task { @MainActor in viewModel.setTokenSaverEnabled(!viewModel.tokenSaverEnabled) }
-        }
         self.tokenSaverConfigurationObserver = NotificationCenter.default.addObserver(
             forName: .rc2TokenSaverConfigurationChanged,
             object: context,
@@ -623,9 +611,6 @@ public final class SidebarViewModel: ObservableObject {
         }
         if let sidecarStatusObserver {
             NotificationCenter.default.removeObserver(sidecarStatusObserver)
-        }
-        if let tokenSaverToggleObserver {
-            NotificationCenter.default.removeObserver(tokenSaverToggleObserver)
         }
         if let tokenSaverConfigurationObserver {
             NotificationCenter.default.removeObserver(tokenSaverConfigurationObserver)
@@ -1255,89 +1240,31 @@ public final class SidebarViewModel: ObservableObject {
         finishInsomniaSession()
     }
 
+    /// Token Saver was removed: turning it ON does nothing (no enable, no model
+    /// download). Turning it OFF still clears a stale ON left by an older build.
     public func setTokenSaverEnabled(_ enabled: Bool) {
-        if !enabled {
-            let confirmed: Bool
-            if let provider = tokenSaverDisableConfirmProvider {
-                confirmed = provider()
-            } else {
-                confirmed = Self.defaultTokenSaverDisableConfirm(
-                    source: settingsStore.load().tokenSaverModelSource
-                )
-            }
-            guard confirmed else { return }
-            tokenSaverEnabled = false
-            graphifyRuntimeActive = false
-            invalidateInstalledTokenSaverModelBytes()
-            settingsStore.update {
-                $0.tokenSaverEnabled = false
-            }
-            _ = context?.applyTokenSaverLifecycle(
-                requestedEnabled: false,
-                persistPreference: true
+        guard !enabled else { return }
+        let confirmed: Bool
+        if let provider = tokenSaverDisableConfirmProvider {
+            confirmed = provider()
+        } else {
+            confirmed = Self.defaultTokenSaverDisableConfirm(
+                source: settingsStore.load().tokenSaverModelSource
             )
-            // Footer + other surfaces re-check eligibility immediately.
-            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
-            return
         }
-        guard privateAccountUser?.subscribed == true else { return }
-        let settings = settingsStore.load()
-        guard AppContext.tokenSaverUsesLocalModel(settings: settings) else {
-            tokenSaverEnabled = true
-            settingsStore.update {
-                $0.tokenSaverEnabled = true
-            }
-            graphifyRuntimeActive = settingsStore.load().isGraphifyRuntimeActive
-            refreshTokenSaverDistillService(modelValidation: .installed)
-            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
-            return
+        guard confirmed else { return }
+        tokenSaverEnabled = false
+        graphifyRuntimeActive = false
+        invalidateInstalledTokenSaverModelBytes()
+        settingsStore.update {
+            $0.tokenSaverEnabled = false
         }
-        let selectedValidation = validateTokenSaverModel(requireSelectedModel: true)
-        if selectedValidation.state == .installed {
-            tokenSaverEnabled = true
-            settingsStore.update {
-                $0.tokenSaverEnabled = true
-            }
-            graphifyRuntimeActive = settingsStore.load().isGraphifyRuntimeActive
-            refreshTokenSaverDistillService(modelValidation: selectedValidation)
-            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
-            return
-        }
-
-        let installedFallbackValidation = validateTokenSaverModel(requireSelectedModel: false)
-        if installedFallbackValidation.state == .installed {
-            tokenSaverEnabled = true
-            settingsStore.update {
-                $0.tokenSaverEnabled = true
-            }
-            graphifyRuntimeActive = settingsStore.load().isGraphifyRuntimeActive
-            refreshTokenSaverDistillService(modelValidation: installedFallbackValidation)
-            beginTokenSaverModelDownload(reason: selectedValidation.reason)
-            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
-            return
-        }
-
-        guard selectedValidation.state == .installed else {
-            // Model is not present: require confirmation before starting the
-            // multi-GB download. Skip the prompt only when the model is already
-            // installed (no download needed).
-            let freeDisk = Self.volumeFreeDiskBytes()
-            let decision = Self.downloadConfirmDecision(
-                modelBytes: Self.approvedModelEstimatedBytes,
-                freeDiskBytes: freeDisk
-            )
-            let sizeString = Self.humanModelSizeString()
-            let hasEnoughDisk = decision == .confirm
-            let confirmed: Bool
-            if let provider = tokenSaverDownloadConfirmProvider {
-                confirmed = provider(sizeString, hasEnoughDisk)
-            } else {
-                confirmed = Self.defaultTokenSaverDownloadConfirm(sizeString: sizeString, hasEnoughDisk: hasEnoughDisk)
-            }
-            guard confirmed else { return }
-            beginTokenSaverModelDownload(reason: selectedValidation.reason)
-            return
-        }
+        _ = context?.applyTokenSaverLifecycle(
+            requestedEnabled: false,
+            persistPreference: true
+        )
+        // Footer + other surfaces re-check eligibility immediately.
+        NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
     }
 
     public func dismissTokenSaverModelDownload() {

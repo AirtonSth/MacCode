@@ -38,7 +38,6 @@ final class TokenSaverBotAgentAppInterceptorTests: XCTestCase {
         for (provider, model) in cases {
             let context = try AppContext(channel: .debug, appSupportOverride: directory)
             SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-            context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
             let router = AppCommandRouter(context: context)
             context.router = router
             let runner = ControlledBotHandoffRunner(provider: provider)
@@ -90,7 +89,6 @@ final class TokenSaverBotAgentAppInterceptorTests: XCTestCase {
         // ON must still stamp DISTILL_HINT + managed PATH; Distill fail-opens.
         let context = try AppContext(channel: .debug, appSupportOverride: directory)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
         let thread = AgentThread(
             title: "blocked-sidecar",
             provider: .codex,
@@ -123,7 +121,6 @@ final class TokenSaverBotAgentAppInterceptorTests: XCTestCase {
         let context = try AppContext(channel: .debug, appSupportOverride: directory)
         let router = AppCommandRouter(context: context)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
 
         for provider in [AgentProvider.claude, .codex, .grok] {
             let thread = AgentThread(
