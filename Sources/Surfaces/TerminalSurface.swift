@@ -707,6 +707,29 @@ final class TerminalMemoryBudgetAuthority {
         }
     }
 
+    /// OS memory-pressure relief. Reclaims owners whose priority is at most
+    /// `maxPriority`, least recently used first, until retained bytes are at or
+    /// below `ceiling`. Unlike `enforceBudget`, each owner takes at most one
+    /// reclaim step per call, so a single pressure event compacts a hidden
+    /// terminal once instead of walking it down to dormant. Returns how many
+    /// owners actually shrank.
+    @discardableResult
+    func relieveMemoryPressure(ceiling: Int, maxPriority: Int) -> Int {
+        purgeReleasedOwners()
+        let candidates = entries.values
+            .filter { $0.owner != nil && $0.priority() <= maxPriority }
+            .sorted { $0.lastTouched < $1.lastTouched }
+        var reclaimed = 0
+        for entry in candidates {
+            guard retainedBytesForTesting > max(0, ceiling) else { break }
+            guard entry.owner != nil else { continue }
+            let before = max(0, entry.retainedBytes())
+            entry.reclaim()
+            if max(0, entry.retainedBytes()) < before { reclaimed += 1 }
+        }
+        return reclaimed
+    }
+
     var retainedBytesForTesting: Int {
         entries.values.reduce(into: 0) { total, entry in
             guard entry.owner != nil else { return }

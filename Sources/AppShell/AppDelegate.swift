@@ -122,6 +122,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var lifecycleRecorder: AppLifecycleRecorder?
     /// Forensic-only hang detector (plan-final W0). Never mutates run status.
     private var hangWatchdog: HangWatchdog?
+    /// S-F4a: reclaims hidden terminals when the OS reports memory pressure.
+    private var memoryPressureMonitor: MemoryPressureMonitor?
     /// Sleep-aware awake state for HangWatchdog (updated from NSWorkspace sleep/wake).
     private let hangWatchdogAwakeState = HangWatchdogAwakeBox(initial: .unknown)
     /// Distributed-notification observer: schedule store commits → rail reload.
@@ -239,6 +241,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
 
         installLifecycleRecorder(harvestedGhosttyCrashFiles: harvestedGhosttyCrashFiles)
+        startMemoryPressureMonitor()
         // PERF (cold launch): the orphan provider sweep is a process scan and
         // the event-log decode + PTY restore are heavy. StartupPlan defers them
         // past the first frame; see runDeferredStartup().
@@ -853,6 +856,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             }
         }
         startHangWatchdog(recorder: recorder, diagnosticsDirectory: directory)
+    }
+
+    private func startMemoryPressureMonitor() {
+        let monitor = MemoryPressureMonitor(log: { [weak self] line in
+            appLifecycleLog.info("app.\(line, privacy: .public)")
+            self?.lifecycleRecorder?.record(line)
+        })
+        memoryPressureMonitor = monitor
+        monitor.start()
     }
 
     private func startHangWatchdog(recorder: AppLifecycleRecorder, diagnosticsDirectory: URL) {
