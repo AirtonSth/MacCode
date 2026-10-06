@@ -72,8 +72,6 @@ public final class PetController {
     private var activeThreadChromeFetchTask: Task<Void, Never>?
     /// True when the last progress republish reused cached chrome.
     private(set) var progressRepublishUsedCachedChromeForTesting = false
-    /// Local-LLM Live Activity descriptions, cached per card and debounced so a
-    /// chatty run does not ask the model to summarize every tool line.
     private(set) var handledEventOutOfOrderForTests = false
     private(set) var handledEventCountForTests = 0
     private(set) var lastScheduledTransientMillisecondsForTests: Int64?

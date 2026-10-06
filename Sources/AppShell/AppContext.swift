@@ -1820,6 +1820,17 @@ public final class AppContext {
             Task { @MainActor [weak self] in
                 self?.publishTokenSaverWidgetDigestFromDisk()
             }
+            // Usage events (already throttled where they are posted) must reach
+            // the iOS widget digest without waiting for the next account poll.
+            NotificationCenter.default.addObserver(
+                forName: .rc2TokenSaverUsageChanged,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.publishTokenSaverWidgetDigestFromDisk()
+                }
+            }
         }
 
         lastTokenSaverAccountIdentity = currentTokenSaverAccountIdentity()

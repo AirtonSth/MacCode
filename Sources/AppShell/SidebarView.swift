@@ -567,6 +567,7 @@ public final class SidebarViewModel: ObservableObject {
         guard !accountUsageIsRefreshing else { return }
         guard privateAccountUser != nil else { return }
         accountUsageIsRefreshing = true
+        context?.publishTokenSaverWidgetDigestFromDisk(isRefreshing: true)
         // Fire-and-forget: kick the refresh, then observe the settle
         // notification to detect completion.  A 90-second timeout ensures the
         // spinner stops even when the CLI probe hangs or the notification is
@@ -598,6 +599,9 @@ public final class SidebarViewModel: ObservableObject {
             }
             self.accountUsageIsRefreshing = false
             if done { self.accountUsageLastUpdated = Date() }
+            // The settle path already publishes isRefreshing: false; the
+            // timeout path does not, so clear the iOS refreshing state here.
+            if !done { self.context?.publishTokenSaverWidgetDigestFromDisk(isRefreshing: false) }
         }
     }
 

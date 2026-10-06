@@ -435,6 +435,83 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertNil(request.environment["RC_TOKEN_SAVER_POST_TOOL_USE"])
     }
 
+    func test_deskSendPersistsHumanUserRowAndColdRestoreKeepsIt() async throws {
+        // WHY: the provider gets the compiled Bot brain, but the transcript must
+        // keep the teammate's own words. A real send() must persist the human
+        // row under the run id first, keep it out of the canonical seed, and a
+        // cold restore must show that human text, never the brain envelope.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.grok, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .grok,
+                models: [AgentModelDescriptor(id: "grok-4.6", label: "Grok 4.6", provider: .grok)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "grok"
+            ),
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .grok, model: "grok-4.6")
+        vm.openDesk(bot)
+        vm.deskRouting = BotDeskRouting(
+            provider: .grok,
+            providerInstanceID: "grok",
+            model: "grok-4.6",
+            routingMode: .manual
+        )
+        let humanText = "Summarize the overnight build failures for the team."
+        vm.composerText = humanText
+        XCTAssertTrue(vm.send())
+        let started = await waitUntil(timeout: 8) { !runner.requests.isEmpty }
+        XCTAssertTrue(started, "Desk send must reach the provider runner")
+        let request = try XCTUnwrap(runner.requests.first)
+        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID)
+        let persisted = try XCTUnwrap(context.threadRepo.get(id: threadID))
+        XCTAssertNil(persisted.workspaceId, "bot threads must stay off Agent App workspace rails")
+        XCTAssertTrue(
+            request.prompt.contains("User request:"),
+            "Desk still compiles the Bot brain around the user turn"
+        )
+        let currentUserId = request.runId.value.uuidString
+        XCTAssertFalse(
+            request.contextSnapshot?.items.contains { $0.messageId == currentUserId } ?? false,
+            "canonical seed must exclude the current run-id user row even when Human != compiled prompt"
+        )
+        let conversationID = try XCTUnwrap(vm.selectedConversation?.id)
+        let hydrated = await waitUntil(timeout: 5) {
+            vm.selectDeskThread(conversationID)
+            return vm.deskMessages.contains {
+                $0.role == .user && $0.agentMessageID?.value == request.runId.value
+            }
+        }
+        XCTAssertTrue(hydrated, "restore must show the persisted human row for this run")
+        let user = try XCTUnwrap(vm.deskMessages.first { $0.role == .user })
+        XCTAssertTrue(
+            user.text.contains(humanText),
+            "Desk must keep the teammate line, not the provider-bound envelope"
+        )
+        XCTAssertFalse(user.text.contains("User request:"))
+        XCTAssertEqual(user.agentMessageID?.value, request.runId.value)
+
+        let cold = BotsViewModel(context: context, router: router)
+        cold.openDesk(bot)
+        cold.selectDeskThread(conversationID)
+        let restored = try XCTUnwrap(cold.deskMessages.first { $0.role == .user })
+        XCTAssertEqual(restored.agentMessageID?.value, request.runId.value)
+        XCTAssertTrue(
+            restored.text.contains(humanText),
+            "cold restore must keep the human text"
+        )
+        XCTAssertFalse(
+            restored.text.contains("You are Piper"),
+            "cold restore must not surface the compiled brain envelope"
+        )
+    }
+
     func test_deskRestoreRebuildsImageMarkersFromCompiledPayload() throws {
         // WHY: after persist, Desk rereads the compiled provider envelope.
         // Image markers must come back from the shared displayUserLine using
