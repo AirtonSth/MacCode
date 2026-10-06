@@ -28,27 +28,27 @@ final class AccountUsageAppContextTests: XCTestCase {
         }
     }
 
-    private actor FakeAccountUsageRefresher: TokenSaverAccountUsageRefreshing {
+    private actor FakeAccountUsageRefresher: ProviderAccountUsageRefreshing {
         let response: [AssistantAccountUsage]
-        private(set) var requests: [TokenSaverAccountUsageRefreshRequest] = []
+        private(set) var requests: [ProviderAccountUsageRefreshRequest] = []
 
         init(response: [AssistantAccountUsage]) {
             self.response = response
         }
 
-        func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
+        func refreshAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
             requests.append(request)
             return response
         }
     }
 
-    private actor PeriodicAccountUsageRefresher: TokenSaverAccountUsageRefreshing {
+    private actor PeriodicAccountUsageRefresher: ProviderAccountUsageRefreshing {
         private let fullDelayNanoseconds: UInt64
         private let grokDelayNanoseconds: UInt64
         private let fullResponse: [AssistantAccountUsage]
         private let grokResponse: AssistantAccountUsage?
-        private(set) var fullRequests: [TokenSaverAccountUsageRefreshRequest] = []
-        private(set) var grokRequests: [TokenSaverAccountUsageRefreshRequest] = []
+        private(set) var fullRequests: [ProviderAccountUsageRefreshRequest] = []
+        private(set) var grokRequests: [ProviderAccountUsageRefreshRequest] = []
 
         init(
             fullDelayNanoseconds: UInt64 = 0,
@@ -62,7 +62,7 @@ final class AccountUsageAppContextTests: XCTestCase {
             self.grokResponse = grokResponse
         }
 
-        func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
+        func refreshAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
             fullRequests.append(request)
             if fullDelayNanoseconds > 0 {
                 try? await Task.sleep(nanoseconds: fullDelayNanoseconds)
@@ -70,7 +70,7 @@ final class AccountUsageAppContextTests: XCTestCase {
             return fullResponse
         }
 
-        func grokAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+        func grokAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
             grokRequests.append(request)
             if grokDelayNanoseconds > 0 {
                 try? await Task.sleep(nanoseconds: grokDelayNanoseconds)
@@ -79,15 +79,15 @@ final class AccountUsageAppContextTests: XCTestCase {
         }
     }
 
-    private actor OutOfOrderGrokAccountUsageRefresher: TokenSaverAccountUsageRefreshing {
+    private actor OutOfOrderGrokAccountUsageRefresher: ProviderAccountUsageRefreshing {
         private var grokRequestCount = 0
         var requestCount: Int { grokRequestCount }
 
-        func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
+        func refreshAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
             []
         }
 
-        func grokAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+        func grokAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
             grokRequestCount += 1
             let ordinal = grokRequestCount
             try? await Task.sleep(nanoseconds: ordinal == 1 ? 150_000_000 : 20_000_000)
@@ -99,11 +99,11 @@ final class AccountUsageAppContextTests: XCTestCase {
         }
     }
 
-    private actor CrossTickAccountUsageRefresher: TokenSaverAccountUsageRefreshing {
+    private actor CrossTickAccountUsageRefresher: ProviderAccountUsageRefreshing {
         private(set) var fullRequestCount = 0
         private(set) var grokRequestCount = 0
 
-        func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
+        func refreshAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
             fullRequestCount += 1
             let ordinal = fullRequestCount
             try? await Task.sleep(nanoseconds: ordinal == 1 ? 10_000_000 : 220_000_000)
@@ -115,17 +115,17 @@ final class AccountUsageAppContextTests: XCTestCase {
             )]
         }
 
-        func grokAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+        func grokAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
             grokRequestCount += 1
             try? await Task.sleep(nanoseconds: 120_000_000)
             return nil
         }
     }
 
-    private actor OutOfOrderFullGrokAccountUsageRefresher: TokenSaverAccountUsageRefreshing {
+    private actor OutOfOrderFullGrokAccountUsageRefresher: ProviderAccountUsageRefreshing {
         private(set) var fullRefreshStarted = false
 
-        func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
+        func refreshAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
             fullRefreshStarted = true
             try? await Task.sleep(nanoseconds: 150_000_000)
             return [AssistantAccountUsage(
@@ -135,7 +135,7 @@ final class AccountUsageAppContextTests: XCTestCase {
             )]
         }
 
-        func grokAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+        func grokAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
             try? await Task.sleep(nanoseconds: 20_000_000)
             return AssistantAccountUsage(
                 provider: .grok,
@@ -793,7 +793,7 @@ final class AccountUsageAppContextTests: XCTestCase {
             AssistantAccountUsage(provider: .claude, weeklyUsedPercent: 42)
         ]
         let refresher = FakeAccountUsageRefresher(response: expected)
-        let request = TokenSaverAccountUsageRefreshRequest(codexBinary: "codex", claudeBinary: "claude")
+        let request = ProviderAccountUsageRefreshRequest(codexBinary: "codex", claudeBinary: "claude")
 
         // 5-second timeout: more than enough for an in-process fake; tight enough that
         // a regression returning [] (watchdog fires first) would be caught quickly.
@@ -812,8 +812,8 @@ final class AccountUsageAppContextTests: XCTestCase {
     func test_refreshAccountUsageWithTimeoutReturnsEmptyWhenWorkExceedsTimeout() async {
         // WHY: the timeout path must still fire if work hangs; returning [] is the
         // correct sentinel that the caller treats as "no data this cycle".
-        struct HangingRefresher: TokenSaverAccountUsageRefreshing {
-            func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
+        struct HangingRefresher: ProviderAccountUsageRefreshing {
+            func refreshAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
                 // Simulate a hang; respect cooperative cancellation so the test finishes.
                 try? await Task.sleep(nanoseconds: 30_000_000_000)
                 return [AssistantAccountUsage(provider: .claude, weeklyUsedPercent: 99)]
@@ -823,7 +823,7 @@ final class AccountUsageAppContextTests: XCTestCase {
         // 10 ms timeout: work hangs => watchdog fires => returns [].
         let result = await AppContext.refreshAccountUsageWithTimeout(
             refresher: HangingRefresher(),
-            request: TokenSaverAccountUsageRefreshRequest(codexBinary: "codex", claudeBinary: "claude"),
+            request: ProviderAccountUsageRefreshRequest(codexBinary: "codex", claudeBinary: "claude"),
             timeoutNanoseconds: 10_000_000
         )
 

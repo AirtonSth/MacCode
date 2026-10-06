@@ -3,7 +3,7 @@ import CoreModel
 import Darwin
 @testable import AgentRuntime
 
-final class TokenSaverAccountUsageRefresherTests: XCTestCase {
+final class ProviderAccountUsageRefresherTests: XCTestCase {
     private final class GrokProbeWorkload: @unchecked Sendable {
         private let lock = NSLock()
         private var fetchCountStorage = 0
@@ -54,7 +54,7 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
             .deletingLastPathComponent()
         let source = try String(
             contentsOf: root.appendingPathComponent(
-                "Sources/AgentRuntime/TokenSaverAccountUsageRefresher.swift"
+                "Sources/AgentRuntime/ProviderAccountUsageRefresher.swift"
             ),
             encoding: .utf8
         )
@@ -75,7 +75,7 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
             .deletingLastPathComponent()
         // The parser lives in its own file; both halves of the refresh path are audited.
         for path in [
-            "Sources/AgentRuntime/TokenSaverAccountUsageRefresher.swift",
+            "Sources/AgentRuntime/ProviderAccountUsageRefresher.swift",
             "Sources/AgentRuntime/AssistantAccountUsageParser.swift"
         ] {
             let source = try String(
@@ -327,7 +327,7 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
         try #"{"msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":10.0,"billingPeriodEnd":"2099-07-22T20:46:41.975270+00:00"}}}"#
             .write(to: log, atomically: true, encoding: .utf8)
 
-        let refresher = TokenSaverAccountUsageRefresher(
+        let refresher = ProviderAccountUsageRefresher(
             timeoutSeconds: 3,
             grokCreditsFetcher: { _, token in
                 guard token == "test-token" else { return nil }
@@ -342,7 +342,7 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
                 ]
             }
         )
-        let usage = await refresher.grokAccountUsage(TokenSaverAccountUsageRefreshRequest(
+        let usage = await refresher.grokAccountUsage(ProviderAccountUsageRefreshRequest(
             grokBillingLogURL: log,
             grokAuthFileURL: auth
         ))
@@ -363,11 +363,11 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
         try #"{"msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":42.0,"billingPeriodEnd":"2099-07-22T20:46:41.975270+00:00"}}}"#
             .write(to: log, atomically: true, encoding: .utf8)
 
-        let refresher = TokenSaverAccountUsageRefresher(
+        let refresher = ProviderAccountUsageRefresher(
             timeoutSeconds: 3,
             grokCreditsFetcher: { _, _ in nil }
         )
-        let usage = await refresher.grokAccountUsage(TokenSaverAccountUsageRefreshRequest(
+        let usage = await refresher.grokAccountUsage(ProviderAccountUsageRefreshRequest(
             grokBillingLogURL: log,
             grokAuthFileURL: auth
         ))
@@ -400,7 +400,7 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
         let claudeURL = URL(string: "https://perf.invalid/claude")!
 
         let workload = GrokProbeWorkload()
-        let refresher = TokenSaverAccountUsageRefresher(
+        let refresher = ProviderAccountUsageRefresher(
             timeoutSeconds: 3,
             jsonAPIFetcher: { url, _ in
                 switch url {
@@ -425,7 +425,7 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
         let ticksPerSample = 20
 
         func measure(includeGrokInFullRefresh: Bool) async -> (wallMS: Double, cpuMS: Double, fetches: Int) {
-            let request = TokenSaverAccountUsageRefreshRequest(
+            let request = ProviderAccountUsageRefreshRequest(
                 grokAuthFileURL: auth,
                 grokCreditsAPIURL: grokURL,
                 claudeAuthFileURL: claudeAuth,
@@ -563,14 +563,14 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
             "claudeAiOauth": ["accessToken": "claude-token"]
         ]).write(to: auth)
 
-        let refresher = TokenSaverAccountUsageRefresher(
+        let refresher = ProviderAccountUsageRefresher(
             timeoutSeconds: 3,
             jsonAPIFetcher: { _, headers in
                 guard headers["Authorization"] == "Bearer claude-token" else { return nil }
                 return ["seven_day": ["utilization": 26, "resets_at": "2099-08-26T11:00:00Z"]]
             }
         )
-        let usages = await refresher.refreshAccountUsage(TokenSaverAccountUsageRefreshRequest(
+        let usages = await refresher.refreshAccountUsage(ProviderAccountUsageRefreshRequest(
             claudeBinary: dir.appendingPathComponent("missing-claude").path,
             claudeAuthFileURL: auth
         ))
@@ -610,7 +610,7 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
             "tokens": ["access_token": "codex-token", "account_id": "acct-1"]
         ]).write(to: auth)
 
-        let refresher = TokenSaverAccountUsageRefresher(
+        let refresher = ProviderAccountUsageRefresher(
             timeoutSeconds: 3,
             jsonAPIFetcher: { _, headers in
                 guard headers["Authorization"] == "Bearer codex-token",
@@ -625,7 +625,7 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
                 ]
             }
         )
-        let usages = await refresher.refreshAccountUsage(TokenSaverAccountUsageRefreshRequest(
+        let usages = await refresher.refreshAccountUsage(ProviderAccountUsageRefreshRequest(
             codexBinary: dir.appendingPathComponent("missing-codex").path,
             codexAuthFileURL: auth
         ))
@@ -722,8 +722,8 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
         """#.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
 
-        let usages = await TokenSaverAccountUsageRefresher(timeoutSeconds: 3)
-            .refreshAccountUsage(TokenSaverAccountUsageRefreshRequest(
+        let usages = await ProviderAccountUsageRefresher(timeoutSeconds: 3)
+            .refreshAccountUsage(ProviderAccountUsageRefreshRequest(
                 codexBinary: dir.appendingPathComponent("missing-codex").path,
                 claudeBinary: script.path,
                 grokBillingLogURL: dir.appendingPathComponent("missing-grok-billing-log"),
@@ -760,8 +760,8 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
             throw XCTSkip("Set REMOTE_CODE_LIVE_USAGE_TEST=1 to call local provider usage commands.")
         }
 
-        let usages = await TokenSaverAccountUsageRefresher(timeoutSeconds: 18)
-            .refreshAccountUsage(TokenSaverAccountUsageRefreshRequest(
+        let usages = await ProviderAccountUsageRefresher(timeoutSeconds: 18)
+            .refreshAccountUsage(ProviderAccountUsageRefreshRequest(
                 cwd: "/Users/samuelfajreldines/dev/empath",
                 environment: [:]
             ))

@@ -218,7 +218,7 @@ public final class AppContext {
     private var lastPublishedActiveThreadCount: Int = 0
     private var pendingRecoveredForkPrunedThreadIDs: Set<AgentThreadID> = []
     public var socketServer: UnixSocketServer?
-    private let accountUsageRefresher: TokenSaverAccountUsageRefreshing
+    private let accountUsageRefresher: ProviderAccountUsageRefreshing
     private var accountUsageRefreshTask: Task<Void, Never>?
     private var periodicGrokAccountUsageRefreshTask: Task<Void, Never>?
     private var grokAccountUsageRefreshGeneration: UInt64 = 0
@@ -504,7 +504,7 @@ public final class AppContext {
         channel: ReleaseChannel = .debug,
         dbPathOverride: String? = nil,
         appSupportOverride: String? = nil,
-        accountUsageRefresher: TokenSaverAccountUsageRefreshing = TokenSaverAccountUsageRefresher(),
+        accountUsageRefresher: ProviderAccountUsageRefreshing = ProviderAccountUsageRefresher(),
         agentSkillsHomeOverrideForTesting: URL? = nil,
         /// Interactive RemoteCode must reconcile abandoned runs on launch.
         /// Background helpers that share the same SQLite (Scheduled Task Agent)
@@ -1940,7 +1940,7 @@ public final class AppContext {
         let codexBinary = (try? settingsRepo.get("cli.codex.path"))?.trimmingCharacters(in: .whitespacesAndNewlines)
         let claudeBinary = (try? settingsRepo.get("cli.claude.path"))?.trimmingCharacters(in: .whitespacesAndNewlines)
         let grokBinary = (try? settingsRepo.get("cli.grok.path"))?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let request = TokenSaverAccountUsageRefreshRequest(
+        let request = ProviderAccountUsageRefreshRequest(
             codexBinary: codexBinary?.isEmpty == false ? codexBinary! : "codex",
             claudeBinary: claudeBinary?.isEmpty == false ? claudeBinary! : "claude",
             grokBinary: grokBinary?.isEmpty == false ? grokBinary! : "grok",
@@ -2097,7 +2097,7 @@ public final class AppContext {
         let logURL = billingLogURL
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".grok/logs/unified.jsonl")
-        let request = TokenSaverAccountUsageRefreshRequest(
+        let request = ProviderAccountUsageRefreshRequest(
             grokBillingLogURL: logURL,
             grokAuthFileURL: billingLogURL == nil ? Self.defaultGrokAuthFileURL : nil,
             cwd: state.workspaces.values.first?.cwd ?? NSHomeDirectory(),
@@ -2175,8 +2175,8 @@ public final class AppContext {
     }
 
     static func refreshAccountUsageWithTimeout(
-        refresher: TokenSaverAccountUsageRefreshing,
-        request: TokenSaverAccountUsageRefreshRequest,
+        refresher: ProviderAccountUsageRefreshing,
+        request: ProviderAccountUsageRefreshRequest,
         timeoutNanoseconds: UInt64 = 60_000_000_000
     ) async -> [AssistantAccountUsage] {
         await withCheckedContinuation { continuation in

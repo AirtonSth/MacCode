@@ -3,7 +3,7 @@ import Darwin
 import CoreModel
 import RemoteCodeCSystem
 
-public struct TokenSaverAccountUsageRefreshRequest: Sendable, Equatable {
+public struct ProviderAccountUsageRefreshRequest: Sendable, Equatable {
     public static let defaultGrokCreditsAPIURL = URL(
         string: "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
     )!
@@ -68,13 +68,13 @@ public struct TokenSaverAccountUsageRefreshRequest: Sendable, Equatable {
     }
 }
 
-public protocol TokenSaverAccountUsageRefreshing: Sendable {
-    func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage]
-    func grokAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage?
+public protocol ProviderAccountUsageRefreshing: Sendable {
+    func refreshAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> [AssistantAccountUsage]
+    func grokAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage?
 }
 
-extension TokenSaverAccountUsageRefreshing {
-    public func grokAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+extension ProviderAccountUsageRefreshing {
+    public func grokAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
         let url = request.grokBillingLogURL
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".grok/logs/unified.jsonl")
@@ -82,7 +82,7 @@ extension TokenSaverAccountUsageRefreshing {
     }
 }
 
-public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing, @unchecked Sendable {
+public final class ProviderAccountUsageRefresher: ProviderAccountUsageRefreshing, @unchecked Sendable {
     private struct CommandResult {
         let status: Int32
         let stdout: String
@@ -115,7 +115,7 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         }
     }
 
-    public func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
+    public func refreshAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
         let task: Task<[AssistantAccountUsage], Never>
         let generation: UInt64
         refreshGate.lock()
@@ -139,7 +139,7 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     }
 
     private func performRefreshAccountUsage(
-        _ request: TokenSaverAccountUsageRefreshRequest
+        _ request: ProviderAccountUsageRefreshRequest
     ) async -> [AssistantAccountUsage] {
         async let codex = withProviderTimeout { await self.fetchCodexUsage(request) }
         async let claude = withProviderTimeout { await self.fetchClaudeUsage(request) }
@@ -154,7 +154,7 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
             .sorted { $0.provider.rawValue < $1.provider.rawValue }
     }
 
-    public func grokAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+    public func grokAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
         await fetchGrokUsage(request)
     }
 
@@ -185,7 +185,7 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         }
     }
 
-    private func fetchCodexUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+    private func fetchCodexUsage(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
         if let live = await fetchCodexWhamUsage(request) {
             return live
         }
@@ -209,7 +209,7 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         }
     }
 
-    private func fetchClaudeUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+    private func fetchClaudeUsage(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
         if let live = await fetchClaudeOAuthUsage(request) {
             return live
         }
@@ -245,7 +245,7 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     /// Grok weekly credits: live CLI billing API first (same host the Grok
     /// Usage UI uses), then `~/.grok/logs/unified.jsonl`. A failed probe returns
     /// nil so the last known percent is kept instead of painting 0%.
-    private func fetchGrokUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+    private func fetchGrokUsage(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
         if let live = await fetchGrokCreditsAPI(request) {
             return live
         }
@@ -255,13 +255,13 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         return AssistantAccountUsageParser.grokFromBillingLogFile(at: url)
     }
 
-    private func fetchGrokCreditsAPI(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+    private func fetchGrokCreditsAPI(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
         guard let authFile = request.grokAuthFileURL,
               let token = AssistantAccountUsageParser.grokAccessToken(fromAuthFile: authFile) else {
             return nil
         }
         let endpoint = request.grokCreditsAPIURL
-            ?? TokenSaverAccountUsageRefreshRequest.defaultGrokCreditsAPIURL
+            ?? ProviderAccountUsageRefreshRequest.defaultGrokCreditsAPIURL
         guard let payload = await fetchGrokCreditsJSON(endpoint: endpoint, token: token) else {
             return nil
         }
@@ -276,13 +276,13 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         ])
     }
 
-    private func fetchClaudeOAuthUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+    private func fetchClaudeOAuthUsage(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
         guard let authFile = request.claudeAuthFileURL,
               let token = AssistantAccountUsageParser.claudeAccessToken(fromAuthFile: authFile) else {
             return nil
         }
         let endpoint = request.claudeUsageAPIURL
-            ?? TokenSaverAccountUsageRefreshRequest.defaultClaudeUsageAPIURL
+            ?? ProviderAccountUsageRefreshRequest.defaultClaudeUsageAPIURL
         guard let payload = await fetchJSON(endpoint: endpoint, headers: [
             "Authorization": "Bearer \(token)",
             "Accept": "application/json",
@@ -294,13 +294,13 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         return AssistantAccountUsageParser.claudeOAuthUsage(from: payload)
     }
 
-    private func fetchCodexWhamUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+    private func fetchCodexWhamUsage(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
         guard let authFile = request.codexAuthFileURL,
               let creds = AssistantAccountUsageParser.codexAccessToken(fromAuthFile: authFile) else {
             return nil
         }
         let endpoint = request.codexUsageAPIURL
-            ?? TokenSaverAccountUsageRefreshRequest.defaultCodexUsageAPIURL
+            ?? ProviderAccountUsageRefreshRequest.defaultCodexUsageAPIURL
         var headers = [
             "Authorization": "Bearer \(creds.token)",
             "Accept": "application/json",
@@ -338,7 +338,7 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         }
     }
 
-    private func runClaudeUsageScreen(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+    private func runClaudeUsageScreen(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
         guard let path = ProcessLocator.resolve(request.claudeBinary) else {
             return nil
         }

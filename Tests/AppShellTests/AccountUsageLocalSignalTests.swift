@@ -171,14 +171,14 @@ final class AccountUsageLocalSignalTests: XCTestCase {
         )
     }
 
-    private actor GatedAccountUsageRefresher: TokenSaverAccountUsageRefreshing {
+    private actor GatedAccountUsageRefresher: ProviderAccountUsageRefreshing {
         private var started = false
         private var released = false
         private var waiters: [CheckedContinuation<Void, Never>] = []
 
         func hasStarted() -> Bool { started }
 
-        func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
+        func refreshAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
             started = true
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 if released {
