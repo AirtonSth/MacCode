@@ -823,24 +823,30 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         recorder.installSignalHandlers()
         recorder.installExitHandler()
         lifecycleRecorder = recorder
-        startHangWatchdog(recorder: recorder)
+        startHangWatchdog(recorder: recorder, diagnosticsDirectory: directory)
     }
 
-    private func startHangWatchdog(recorder: AppLifecycleRecorder) {
+    private func startHangWatchdog(recorder: AppLifecycleRecorder, diagnosticsDirectory: URL) {
         hangWatchdog?.stop()
         hangWatchdogAwakeState.value = .awake
         let bootId = HostBootIdentity.currentBootId()
         let awakeBox = hangWatchdogAwakeState
+        // S-F5: a hang that lasts 5 s gets one `sample` stack per episode.
+        let stackCapture = HangStackCapture(
+            directory: diagnosticsDirectory,
+            log: { [weak recorder] line in recorder?.record(line) }
+        )
         let watchdog = HangWatchdog(
             pingInterval: 1.0,
             hangThreshold: 2.0,
             awakeProvider: { awakeBox.value },
             sideContextProvider: { [weak self] in
                 HangWatchdogSideContext(
-                    providerProcessCount: self?.context?.coordinator.activeThreadIdsSnapshot().count ?? 0,
+                    activeAgentThreadCount: self?.context?.coordinator.activeThreadIdsSnapshot().count ?? 0,
                     recoveryInFlight: false,
                     bootId: bootId,
-                    // Spindump capture is residual; do not claim samples were taken.
+                    // The breach fires at 2 s; HangStackCapture logs its own
+                    // hang_stack_* line once a sample is actually taken.
                     sampleCountRequested: 0
                 )
             },
@@ -849,6 +855,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 recorder?.record(
                     "\(breach.sideContext.lifecycleLine) gapSec=\(Int(breach.gapSeconds)) kind=\(breach.kind.rawValue) awake=\(breach.awake.rawValue)"
                 )
+            },
+            gapObserver: { gapSeconds, kind, episodeStart in
+                stackCapture.observe(gapSeconds: gapSeconds, kind: kind, episodeStart: episodeStart)
             }
         )
         hangWatchdog = watchdog
