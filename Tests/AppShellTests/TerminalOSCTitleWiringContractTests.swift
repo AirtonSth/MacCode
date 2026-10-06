@@ -147,8 +147,10 @@ final class TerminalOSCTitleWiringContractTests: XCTestCase {
     )
     XCTAssertTrue(TerminalSurface.hasSpinnerTitle(terminal.descriptor.title))
 
+    router.terminalTitleCoalescer.interval = 0.2
     let changed = captureSurfaceRenamedEvents {
       terminal.handleOSCTitle("⠋ - Fix build - Distill")
+      pumpMainRunLoop(for: 0.4)
     }
     XCTAssertEqual(
       changed.first?.payload.objectValue?["title"]?.stringValue,
@@ -156,6 +158,147 @@ final class TerminalOSCTitleWiringContractTests: XCTestCase {
       "a real title change behind the spinner must still reach iOS"
     )
     XCTAssertEqual(changed.count, 1)
+  }
+
+  func testSixtyMixedSpinnerFramesScheduleNoSnapshotSaveAndPublishNoEvent() throws {
+    // WHY (H3): Claude/Codex TUIs park ✳ when idle and animate braille or
+    // ◐◓◑◒ while working, ~1 frame/s per busy terminal. Every frame used to
+    // run a layout apply, a session_snapshots write, a full window refresh
+    // and a persisted surface.renamed for iOS. Only the normalized title
+    // ("Claude Code") is user state, so the spinner must cost nothing.
+    let (context, router, _) = try makeHarness()
+    router.terminalTitleCoalescer.interval = 0.2
+    let (workspace, terminal) = try makeTerminal(router, name: "H3 spinner")
+    terminal.handleOSCTitle("✳ Claude Code")
+    XCTAssertEqual(
+      surfaceTitle(in: context, workspaceID: workspace, surfaceID: terminal.descriptor.id),
+      "Claude Code",
+      "the first title commits on the same turn with the idle ✳ stripped"
+    )
+    pumpMainRunLoop(for: 0.3)
+
+    let glyphs = ["◐", "◓", "◑", "◒", "⠂", "⠐", "✳", "✳️", "✶", "✻"]
+    let frames = (0..<60).map { "\(glyphs[$0 % glyphs.count]) Claude Code" }
+    let savesBefore = context.snapshotSaveScheduleCountForTesting
+    let events = captureSurfaceRenamedEvents(surfaceID: terminal.descriptor.id) {
+      for frame in frames { terminal.handleOSCTitle(frame) }
+      pumpMainRunLoop(for: 0.4)
+    }
+
+    XCTAssertEqual(
+      context.snapshotSaveScheduleCountForTesting - savesBefore, 0,
+      "spinner-only frames must never schedule a session snapshot save")
+    XCTAssertLessThanOrEqual(events.count, 1)
+    XCTAssertEqual(events.count, 0, "the normalized title never changed, so iOS gets nothing")
+    XCTAssertFalse(router.terminalTitleCoalescer.hasPendingWorkForTesting)
+    XCTAssertEqual(terminal.descriptor.title, frames.last, "the live surface keeps the raw frame")
+  }
+
+  func testRapidRealTitleChangesCommitImmediatelyThenOnceWithTheLatestTitle() throws {
+    // WHY (H3): a TUI that rewrites its title every second (task summary,
+    // elapsed counter) must not persist and broadcast each rewrite. The first
+    // change is acknowledged at once; a burst inside the window collapses into
+    // one trailing commit of the newest title, persisted exactly once.
+    let (context, router, directory) = try makeHarness()
+    router.terminalTitleCoalescer.interval = 0.3
+    let (workspace, terminal) = try makeTerminal(router, name: "H3 burst")
+    let surfaceID = terminal.descriptor.id
+
+    var savesBefore = context.snapshotSaveScheduleCountForTesting
+    let immediate = captureSurfaceRenamedEvents(surfaceID: surfaceID) {
+      terminal.handleOSCTitle("◐ Step 1")
+    }
+    XCTAssertEqual(immediate.map { $0.payload.objectValue?["title"]?.stringValue }, ["Step 1"])
+    XCTAssertEqual(context.snapshotSaveScheduleCountForTesting - savesBefore, 1)
+
+    savesBefore = context.snapshotSaveScheduleCountForTesting
+    var burstSavesBeforeFlush = -1
+    let trailing = captureSurfaceRenamedEvents(surfaceID: surfaceID) {
+      terminal.handleOSCTitle("◑ Step 2")
+      terminal.handleOSCTitle("◐ Step 3")
+      terminal.handleOSCTitle("◑ Step 4")
+      burstSavesBeforeFlush = context.snapshotSaveScheduleCountForTesting - savesBefore
+      pumpMainRunLoop(for: 0.6)
+    }
+    XCTAssertEqual(burstSavesBeforeFlush, 0, "changes inside the window wait for the trailing edge")
+    XCTAssertEqual(
+      trailing.map { $0.payload.objectValue?["title"]?.stringValue }, ["Step 4"],
+      "only the latest title in the burst reaches iOS, normalized")
+    XCTAssertEqual(context.snapshotSaveScheduleCountForTesting - savesBefore, 1, "persisted once")
+    XCTAssertEqual(surfaceTitle(in: context, workspaceID: workspace, surfaceID: surfaceID), "Step 4")
+
+    context.saveSnapshot()
+    closeAndUnregisterAllSurfaces()
+    let reloaded = try AppContext(channel: .debug, appSupportOverride: directory)
+    XCTAssertEqual(
+      surfaceTitle(in: reloaded, workspaceID: workspace, surfaceID: surfaceID), "Step 4",
+      "the coalesced title must survive a relaunch")
+  }
+
+  func testTitleThatReturnsToTheCommittedValueInsideTheWindowIsDropped() throws {
+    // WHY (H3, A->B->A race): the trailing commit must compare against the
+    // authoritative title, so a stale intermediate value never lands.
+    let (context, router, _) = try makeHarness()
+    router.terminalTitleCoalescer.interval = 0.3
+    let (workspace, terminal) = try makeTerminal(router, name: "H3 aba")
+    let surfaceID = terminal.descriptor.id
+    terminal.handleOSCTitle("Build")
+
+    let savesBefore = context.snapshotSaveScheduleCountForTesting
+    let events = captureSurfaceRenamedEvents(surfaceID: surfaceID) {
+      terminal.handleOSCTitle("Deploy")
+      terminal.handleOSCTitle("Build")
+      pumpMainRunLoop(for: 0.6)
+    }
+    XCTAssertTrue(events.isEmpty)
+    XCTAssertEqual(context.snapshotSaveScheduleCountForTesting - savesBefore, 0)
+    XCTAssertEqual(surfaceTitle(in: context, workspaceID: workspace, surfaceID: surfaceID), "Build")
+  }
+
+  func testPendingTitleForAClosedTerminalNeverCommits() throws {
+    // WHY (H3): the trailing commit is deferred work; a tab closed inside the
+    // window must not resurrect a rename event or a snapshot save.
+    let (context, router, _) = try makeHarness()
+    router.terminalTitleCoalescer.interval = 0.3
+    let (_, terminal) = try makeTerminal(router, name: "H3 closed")
+    let surfaceID = terminal.descriptor.id
+    terminal.handleOSCTitle("First")
+
+    let savesBefore = context.snapshotSaveScheduleCountForTesting
+    let events = captureSurfaceRenamedEvents(surfaceID: surfaceID) {
+      terminal.handleOSCTitle("Second")
+      terminal.close()
+      SurfaceRegistry.shared.unregister(surfaceID)
+      pumpMainRunLoop(for: 0.6)
+    }
+    XCTAssertTrue(events.isEmpty)
+    XCTAssertEqual(context.snapshotSaveScheduleCountForTesting - savesBefore, 0)
+    XCTAssertFalse(router.terminalTitleCoalescer.hasPendingWorkForTesting)
+  }
+
+  private func makeTerminal(
+    _ router: AppCommandRouter, name: String
+  ) throws -> (WorkspaceID, TerminalSurface) {
+    let workspace = try router.createWorkspace(name: name, cwd: NSTemporaryDirectory())
+    let descriptor = try router.createSurface(
+      workspace: workspace.id, type: .terminal, paneID: nil, title: "Before OSC")
+    let terminal = try XCTUnwrap(SurfaceRegistry.shared.surface(descriptor.id) as? TerminalSurface)
+    return (workspace.id, terminal)
+  }
+
+  private func pumpMainRunLoop(for seconds: TimeInterval) {
+    let deadline = Date().addingTimeInterval(seconds)
+    while Date() < deadline {
+      RunLoop.main.run(mode: .default, before: min(deadline, Date().addingTimeInterval(0.01)))
+    }
+  }
+
+  private func captureSurfaceRenamedEvents(
+    surfaceID: SurfaceID, _ body: () -> Void
+  ) -> [EventBus.Event] {
+    captureSurfaceRenamedEvents(body).filter {
+      $0.payload.objectValue?["id"]?.stringValue == surfaceID.value.uuidString
+    }
   }
 
   private func makeHarness() throws -> (AppContext, AppCommandRouter, String) {

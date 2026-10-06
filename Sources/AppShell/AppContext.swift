@@ -6121,6 +6121,7 @@ public final class AppContext {
     }
 
     private var pendingSave: DispatchWorkItem?
+    private(set) var snapshotSaveScheduleCountForTesting = 0
 
     /// Serial utility queue for all event-log appends and snapshot writes.
     /// Keeping DB I/O off the main/publish thread avoids priority inversion
@@ -6222,6 +6223,7 @@ public final class AppContext {
     }
 
     public func scheduleSnapshotSave(delay: TimeInterval = 0.4) {
+        snapshotSaveScheduleCountForTesting += 1
         pendingSave?.cancel()
         // Capture layout state on main, then write to DB off-main so the
         // debounced save does not block the main thread during event bursts.

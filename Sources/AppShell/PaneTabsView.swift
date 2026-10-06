@@ -749,6 +749,13 @@ public final class PaneTabsView: NSObject {
         tabButtons[surfaceID]?.setDirty(isDirty)
     }
 
+    /// H3: in-place label patch for a title-only change (no reconcile pass).
+    func setTabTitle(_ surfaceID: SurfaceID, title: String) {
+        guard let index = pane.surfaces.firstIndex(where: { $0.id == surfaceID }) else { return }
+        pane.surfaces[index].title = title
+        tabButtons[surfaceID]?.setTitle(title)
+    }
+
     func refreshBusyStates() {
         // PF-13: hidden workspace windows still hosted pane controllers.
         // Skip the busy walk when this pane's window is not visible.

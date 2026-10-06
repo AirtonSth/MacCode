@@ -1336,10 +1336,24 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         return (0x2800...0x28FF).contains(scalar.value)
     }
 
-    /// `title` without its leading braille spinner run and the " - " that follows it.
+    /// Glyphs TUIs animate or park at the start of the OSC title: braille spinners,
+    /// ◐◑◒◓ / ◴◵◶◷ quarter circles, and Claude Code's ·✢✳✶✻✽ stars (✳ is its idle mark).
+    nonisolated static func isTitleSpinnerGlyph(_ character: Character) -> Bool {
+        character.unicodeScalars.allSatisfy { scalar in
+            switch scalar.value {
+            case 0x2800...0x28FF, 0x25D0...0x25D3, 0x25F4...0x25F7,
+                 0x00B7, 0x2722, 0x2733, 0x2736, 0x273B, 0x273D, 0xFE0E, 0xFE0F:
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    /// `title` without its leading spinner-glyph run and the " - " that follows it.
     nonisolated static func stableTitle(_ title: String) -> String {
-        guard hasSpinnerTitle(title) else { return title }
-        var rest = Substring(title).drop { $0.unicodeScalars.allSatisfy { (0x2800...0x28FF).contains($0.value) } }
+        guard let first = title.first, isTitleSpinnerGlyph(first) else { return title }
+        var rest = Substring(title).drop(while: isTitleSpinnerGlyph)
         rest = rest.drop { $0.isWhitespace }
         if rest.first == "-" { rest = rest.dropFirst().drop { $0.isWhitespace } }
         return String(rest)

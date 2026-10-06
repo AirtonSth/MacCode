@@ -145,6 +145,25 @@ final class PaneTabStripDiffTests: XCTestCase {
         XCTAssertEqual(buttonB?.titleForTesting, "B renamed", "title patched in place")
     }
 
+    /// WHY (H3): a terminal title change patches only its tab label -- no
+    /// reconcile or window refresh -- and keeps the pane copy in sync so a
+    /// later in-place reconcile does not flash the old title back.
+    func test_setTabTitle_patchesOnlyThatLabelInPlace() {
+        let a = SurfaceID(); let b = SurfaceID()
+        let pane = PaneNode(surfaces: [surface(a, title: "A"), surface(b, title: "B")],
+                            selectedSurfaceID: a)
+        let view = PaneTabsView(pane: pane, router: nil)
+        let buttonB = view.tabButtonForTesting(b)
+
+        view.setTabTitle(b, title: "B live")
+        view.setTabTitle(SurfaceID(), title: "ignored")
+
+        XCTAssertTrue(view.tabButtonForTesting(b) === buttonB, "no rebuild for a title change")
+        XCTAssertEqual(buttonB?.titleForTesting, "B live")
+        XCTAssertEqual(view.tabButtonForTesting(a)?.titleForTesting, "A")
+        XCTAssertEqual(view.pane.surfaces.first { $0.id == b }?.title, "B live")
+    }
+
     /// WHY: adding a surface changes the id SET, which is the one case that
     /// MUST restructure. reconcile must report it did NOT patch in place so
     /// the strip is rebuilt, and the new id must be present.

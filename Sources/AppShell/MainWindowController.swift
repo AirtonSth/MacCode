@@ -935,6 +935,17 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         }
     }
 
+    /// H3: title-only change. Patches the matching tab label in place across the
+    /// main and detached windows instead of a full refreshFromState pass.
+    public func updateSurfaceTabTitle(_ surfaceID: SurfaceID, title: String) {
+        for controller in paneControllers {
+            controller.setTabTitle(surfaceID, title: title)
+        }
+        for controller in workspaceWindows.values {
+            controller.updateSurfaceTabTitle(surfaceID, title: title)
+        }
+    }
+
     public func refreshSurfaceRuntimeState() {
         sidebar.refresh()
         activeThreadsDidChange()
@@ -2239,6 +2250,12 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate, PaneK
     func refreshSurfaceRuntimeState() {
         for controller in paneControllers {
             controller.refreshBusyStates()
+        }
+    }
+
+    func updateSurfaceTabTitle(_ surfaceID: SurfaceID, title: String) {
+        for controller in paneControllers {
+            controller.setTabTitle(surfaceID, title: title)
         }
     }
 

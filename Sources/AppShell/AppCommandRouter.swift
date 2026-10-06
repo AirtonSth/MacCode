@@ -384,6 +384,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return AnyView(DistillAccountsPanelHost(controller: controller))
     }
     public weak var windowController: MainWindowController?
+    /// H3: throttles terminal OSC title commits (persist + surface.renamed) per surface.
+    let terminalTitleCoalescer = TerminalTitleCoalescer()
     public weak var botsViewModel: BotsViewModel?
     private let botComputerReconciliationQueue = DispatchQueue(
         label: "io.remotecode.bot-computer-reconciliation",
@@ -7859,23 +7861,41 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         terminal.onTitleChange = { [weak self, weak terminal] title in
             guard let self, let terminal else { return }
             let surfaceID = terminal.descriptor.id
-            do {
-                try self.renameSurface(workspace, surfaceID, title)
-            } catch {
-                NSLog(
-                    "RemoteCode terminal title persistence failed surface=%@ error=%@",
-                    surfaceID.value.uuidString,
-                    String(describing: error)
-                )
-                return
+            self.terminalTitleCoalescer.submit(surfaceID, title: title) { [weak self] latest in
+                self?.commitTerminalTitle(workspace: workspace, surfaceID: surfaceID, title: latest)
             }
-            EventBus.shared.publish(kind: .surfaceRenamed, payload: .object([
-                "workspace_id": .string(workspace.value.uuidString),
-                "id": .string(surfaceID.value.uuidString),
-                "title": .string(title)
-            ]))
         }
         return terminal
+    }
+
+    /// H3: a normalized terminal title change. Persists through one layout apply
+    /// (one debounced snapshot save) and patches only the tab label -- no window
+    /// refresh. Unchanged titles and surfaces that closed meanwhile are dropped.
+    private func commitTerminalTitle(workspace: WorkspaceID, surfaceID: SurfaceID, title: String) {
+        guard SurfaceRegistry.shared.surface(surfaceID) != nil else {
+            terminalTitleCoalescer.cancel(surfaceID)
+            return
+        }
+        if let layout = context?.state.workspaces[workspace]?.layout,
+           findSurface(surfaceID, in: layout)?.title == title {
+            return
+        }
+        do {
+            try context?.apply(.renameSurface(workspace, surfaceID, title))
+        } catch {
+            NSLog(
+                "RemoteCode terminal title persistence failed surface=%@ error=%@",
+                surfaceID.value.uuidString,
+                String(describing: error)
+            )
+            return
+        }
+        windowController?.updateSurfaceTabTitle(surfaceID, title: title)
+        EventBus.shared.publish(kind: .surfaceRenamed, payload: .object([
+            "workspace_id": .string(workspace.value.uuidString),
+            "id": .string(surfaceID.value.uuidString),
+            "title": .string(title)
+        ]))
     }
 
     private func restoredBrowserURL(from descriptor: SurfaceDescriptor) -> URL? {
