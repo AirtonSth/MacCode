@@ -1244,7 +1244,30 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// PF-10: hidden Agent App tabs keep reducing the stream but must not
     /// publish at 30 Hz, tick, or reload savings/rail until they are visible.
     private var surfaceVisibility: AgentVisibilityState = .visible
-    private var latestHiddenTimeline: AssistantTimelineState?
+    private var latestHiddenTimeline: AssistantTimelineState? {
+        didSet {
+            hiddenTimelineRevision &+= 1
+            // A live tree always supersedes an archived one.
+            if latestHiddenTimeline != nil { hiddenTimelineArchive = nil }
+        }
+    }
+    /// S-F4c: cold-state session for this tab. Its generation moves on every
+    /// hide and reveal, so a reclaim armed for an earlier hide is rejected.
+    private var visibilitySession = AgentVisibilitySession()
+    /// S-F4c: `latestHiddenTimeline` compacted by `reclaimHiddenState`. At most
+    /// one of the two is set; every reader of the hidden tree thaws it first.
+    private var hiddenTimelineArchive: Data?
+    private var hiddenTimelineRevision: UInt64 = 0
+    private var hiddenReclaimTask: Task<Void, Never>?
+    var hiddenReclaimDelayForTesting: Duration = .seconds(30)
+    var hiddenTimelineIsArchivedForTesting: Bool { hiddenTimelineArchive != nil }
+    var visibilitySessionForTesting: AgentVisibilitySession { visibilitySession }
+    #if DEBUG
+    func setHiddenTimelineArchiveForTesting(_ archive: Data) {
+        latestHiddenTimeline = nil
+        hiddenTimelineArchive = archive
+    }
+    #endif
     private var hiddenTimelineThreadId: AgentThreadID?
     private var hiddenTimelineOpenGeneration: UInt64 = 0
     private var lastHiddenTimelinePublishAt: Date?
@@ -1259,6 +1282,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let previous = surfaceVisibility
         surfaceVisibility = visibility
         if visibility == .hidden {
+            // A repeated hide would stash the already-emptied published
+            // timeline over the real hidden one (or its archive).
+            guard previous != .hidden else { return }
             timelineUpdateTickTask?.cancel()
             timelineUpdateTickTask = nil
             hiddenTimelineThreadId = selectedThreadId
@@ -1267,21 +1293,105 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             timeline = AssistantTimelineState()
             lastHiddenTimelinePublishAt = nil
             hiddenTimelinePublishCountForTesting = 0
+            visibilitySession = AgentVisibilityColdState.didBecomeHidden(
+                session: visibilitySession,
+                checkpoint: AgentPresentationCheckpoint(
+                    selectedThreadId: selectedThreadId?.value.uuidString
+                )
+            )
+            scheduleHiddenReclaim()
             return
         }
         guard previous == .hidden else { return }
+        hiddenReclaimTask?.cancel()
+        hiddenReclaimTask = nil
+        visibilitySession = AgentVisibilityColdState.beginReveal(session: visibilitySession)
         let sameOpen = hiddenTimelineThreadId == selectedThreadId
             && hiddenTimelineOpenGeneration == selectThreadOpenGeneration
+        if sameOpen { thawHiddenTimelineArchive() }
         if sameOpen, let latestHiddenTimeline {
             timeline = latestHiddenTimeline
         }
         hiddenTimelineThreadId = nil
         latestHiddenTimeline = nil
+        hiddenTimelineArchive = nil
         lastHiddenTimelinePublishAt = nil
+        if let revealed = AgentVisibilityColdState.completeReveal(
+            session: visibilitySession,
+            expectedGeneration: visibilitySession.generation,
+            appliedThroughSequence: 0
+        ) {
+            visibilitySession = revealed
+        }
         guard sameOpen else { return }
         objectWillChange.send()
         scheduleReloadThreads()
         reloadTokenSaverThreadSavings()
+    }
+
+    private func scheduleHiddenReclaim() {
+        hiddenReclaimTask?.cancel()
+        let generation = visibilitySession.generation
+        let delay = hiddenReclaimDelayForTesting
+        hiddenReclaimTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            await self?.reclaimHiddenState(generation: generation)
+        }
+    }
+
+    func reclaimHiddenStateForTesting() async {
+        await reclaimHiddenState(generation: visibilitySession.generation)
+    }
+
+    /// S-F4c: a tab that stayed hidden drops the painted caches of threads
+    /// with no live run (a later switch takes the normal full open), and
+    /// compacts the selected thread's hidden tree into an exact archive.
+    /// Encoding runs off-main; the result commits only if this hide is still
+    /// current and nothing wrote the hidden tree meanwhile.
+    func reclaimHiddenState(generation: UInt64) async {
+        guard !isDisposed,
+              surfaceVisibility == .hidden,
+              visibilitySession.generation == generation else { return }
+        let live = Set(runThreads.values)
+        for id in Array(paintedTimelineByThread.keys) where !live.contains(id) {
+            paintedTimelineByThread.removeValue(forKey: id)
+            paintedTimelineOrder.removeAll { $0 == id }
+        }
+        let selectedIsLive = selectedThreadId.map { live.contains($0) } ?? false
+        guard let snapshot = latestHiddenTimeline,
+              !selectedIsLive,
+              currentRunId == nil,
+              scheduledLivePollTask == nil else { return }
+        let revision = hiddenTimelineRevision
+        let archive = try? await Task.detached(priority: .utility) {
+            try AgentColdTimelineArchive.archive(snapshot)
+        }.value
+        guard let archive,
+              !isDisposed,
+              surfaceVisibility == .hidden,
+              visibilitySession.generation == generation,
+              hiddenTimelineRevision == revision else { return }
+        latestHiddenTimeline = nil
+        hiddenTimelineArchive = archive
+    }
+
+    /// Puts an archived hidden tree back before anything reads or extends it.
+    /// A decode failure rebuilds from the durable stream ring (turn start
+    /// times are re-stamped, so it is close but not exact) rather than
+    /// revealing an empty conversation.
+    private func thawHiddenTimelineArchive() {
+        guard let archive = hiddenTimelineArchive else { return }
+        hiddenTimelineArchive = nil
+        do {
+            latestHiddenTimeline = try AgentColdTimelineArchive.restore(archive)
+        } catch {
+            NSLog("[AgentOpen] cold timeline restore failed, replaying durable events: %@", "\(error)")
+            guard let threadId = hiddenTimelineThreadId else { return }
+            latestHiddenTimeline = Self.timelineByReplaying(
+                coordinator.latestStreamEvents(threadId: threadId)
+            )
+        }
     }
 
     private func publishInterestedThreadId(_ id: AgentThreadID?) {
@@ -1314,6 +1424,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard !isDisposed else { return }
         if let selectedThreadId { persistComposerDraft(for: selectedThreadId) }
         isDisposed = true
+        hiddenReclaimTask?.cancel()
+        hiddenReclaimTask = nil
+        hiddenTimelineArchive = nil
         paintedTimelineByThread.removeAll()
         paintedTimelineOrder.removeAll()
         AgentWorkspaceRailReloadCoordinator.shared.unregister(self)
@@ -6535,6 +6648,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private func applyScheduledLiveEvents(_ events: [AssistantEvent], resetTimeline: Bool) {
         scheduledLiveApplyCountForTesting += events.count
         if surfaceVisibility == .hidden {
+            if !resetTimeline { thawHiddenTimelineArchive() }
             var hidden = resetTimeline
                 ? AssistantTimelineState()
                 : (latestHiddenTimeline ?? AssistantTimelineState())
@@ -9842,6 +9956,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 allowedActiveRuns.insert(run)
             }
         }
+        thawHiddenTimelineArchive()
         let input = StreamQuantumReduceInput(
             selectedThreadId: selected,
             timeline: latestHiddenTimeline ?? timeline,
