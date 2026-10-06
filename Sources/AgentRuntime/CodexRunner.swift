@@ -295,8 +295,10 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
     }
 
     /// Bot catalog MCPs (`bot-self-config` / `bot-browser` / `bot-computer` /
-    /// `bot-web`). Always admitted on RemoteCode-spawned Codex, matching Grok's
-    /// per-session ACP list. Must not be written to the user-global config.toml.
+    /// `bot-web`), matching Grok's per-session ACP list. bot-self-config is
+    /// admitted on every RemoteCode-spawned Codex; the bot-only servers only on
+    /// bot runs (`BotRunMCPAdmission`). Must not be written to the user-global
+    /// config.toml.
     public static func botCatalogMCPOverrides(
         command: String? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment
@@ -326,14 +328,17 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
                 mcpEnvironment(for: BotWebMCPAdmit.serverName, from: environment)
             ),
         ]
-        return servers.flatMap {
-            stdioMCPServerOverrides(
-                serverName: $0.name,
-                cliArgument: $0.argument,
-                command: resolved,
-                environment: $0.environment
-            )
-        }
+        let isBotRun = BotRunMCPAdmission.isBotRun(environment: environment)
+        return servers
+            .filter { isBotRun || !BotRunMCPAdmission.botOnlyServerNames.contains($0.name) }
+            .flatMap {
+                stdioMCPServerOverrides(
+                    serverName: $0.name,
+                    cliArgument: $0.argument,
+                    command: resolved,
+                    environment: $0.environment
+                )
+            }
     }
 
     /// The Distill librarian MCP (`RemoteCodeDistillService mcp`, the

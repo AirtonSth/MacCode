@@ -674,16 +674,23 @@ public final class GrokACPClient: @unchecked Sendable {
             command: resolved,
             environment: environment
         )
-        let withBrowser = BotBrowserMCPAdmit.admitGrokACP(
-            existing: withSelfConfig,
-            command: resolved,
-            environment: environment
-        )
-        let withWeb = BotWebMCPAdmit.admitGrokACP(
-            existing: withBrowser,
-            command: resolved,
-            environment: environment
-        )
+        // bot-computer/-browser/-web only work for a bot caller; a non-bot
+        // Agent App session must not be offered tools that always fail.
+        let isBotRun = BotRunMCPAdmission.isBotRun(environment: environment)
+        let withBrowser = isBotRun
+            ? BotBrowserMCPAdmit.admitGrokACP(
+                existing: withSelfConfig,
+                command: resolved,
+                environment: environment
+            )
+            : withSelfConfig
+        let withWeb = isBotRun
+            ? BotWebMCPAdmit.admitGrokACP(
+                existing: withBrowser,
+                command: resolved,
+                environment: environment
+            )
+            : withBrowser
         // The librarian MCP is Token Saver surface: admitted only while the
         // run carries the Token Saver hint, matching Claude (--mcp-config /
         // SDK mcp_servers) and Codex (-c mcp_servers.<name>.* per process).
@@ -694,11 +701,13 @@ public final class GrokACPClient: @unchecked Sendable {
                 environment: environment
             )
             : withWeb
-        let withComputer = BotComputerMCPAdmit.admitGrokACP(
-            existing: withDistill,
-            command: resolved,
-            environment: environment
-        )
+        let withComputer = isBotRun
+            ? BotComputerMCPAdmit.admitGrokACP(
+                existing: withDistill,
+                command: resolved,
+                environment: environment
+            )
+            : withDistill
         guard environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" else {
             return withComputer
         }

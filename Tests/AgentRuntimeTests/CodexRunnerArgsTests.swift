@@ -155,9 +155,13 @@ final class CodexRunnerArgsTests: XCTestCase {
                        "Codex CLI rejects minimal; the picker must expose only efforts that run")
     }
 
+    /// WHY: a bot run's Codex must reach its own computer/browser/web tools
+    /// through per-process `-c` (never the config.toml ChatGPT.app shares),
+    /// whatever the desktop kind. The gate is the run's bot id, not the desktop.
     func test_botCatalogMCPIsPerProcessAndNotGatedOnDesktop() {
         let command = "/tmp/RemoteCodeDistillService"
-        let overrides = CodexRunner.botCatalogMCPOverrides(command: command)
+        let botEnvironment = [BotSelfConfigCatalog.callerEnvironmentKey: "bot-proof"]
+        let overrides = CodexRunner.botCatalogMCPOverrides(command: command, environment: botEnvironment)
         let names = [
             BotSelfConfigMCPAdmit.serverName,
             BotBrowserMCPAdmit.serverName,
@@ -172,16 +176,41 @@ final class CodexRunnerArgsTests: XCTestCase {
         }
         XCTAssertEqual(overrides.first, "-c")
 
-        let args = CodexRunner.buildArgs(req())
+        let args = CodexRunner.buildArgs(AgentRunRequest(
+            threadId: AgentThreadID(), provider: .codex, model: "", cwd: "/tmp",
+            prompt: "do it", environment: botEnvironment
+        ))
         for name in names {
             XCTAssertTrue(args.contains { $0.contains("mcp_servers.\(name).command=") }, name)
         }
 
-        let appServer = CodexRunner.appServerArguments(command: command)
+        let appServer = CodexRunner.appServerArguments(command: command, environment: botEnvironment)
         XCTAssertEqual(appServer.first, "app-server")
         XCTAssertTrue(appServer.contains("-c"))
         for name in names {
             XCTAssertTrue(appServer.contains { $0.contains("mcp_servers.\(name).command=") }, name)
+        }
+    }
+
+    /// WHY: bot-computer/-browser/-web answer every call with callerMissing
+    /// without RC_REMOTE_CODE_BOT_ID, so a non-bot Agent App Codex run must not
+    /// be offered them. bot-self-config stays: Agent App runs use it for
+    /// bot_ask_peer delegation and the rc_* host catalog.
+    func test_botOnlyMCPsAreNotAdmittedOnNonBotCodexRuns() {
+        let command = "/tmp/RemoteCodeDistillService"
+        let surfaces = [
+            CodexRunner.botCatalogMCPOverrides(command: command, environment: [:]),
+            CodexRunner.buildArgs(req()),
+            CodexRunner.appServerArguments(command: command, environment: [:]),
+        ]
+        for argv in surfaces {
+            XCTAssertTrue(argv.contains { $0.contains("mcp_servers.\(BotSelfConfigMCPAdmit.serverName).command=") })
+            for name in [BotBrowserMCPAdmit.serverName, BotComputerMCPAdmit.serverName, BotWebMCPAdmit.serverName] {
+                XCTAssertFalse(
+                    argv.contains { $0.contains("mcp_servers.\(name).") },
+                    "non-bot Codex run must not see bot-only \(name)"
+                )
+            }
         }
     }
 

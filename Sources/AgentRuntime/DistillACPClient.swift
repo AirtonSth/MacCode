@@ -635,7 +635,7 @@ public final class DistillACPClient: @unchecked Sendable {
                 executablePath: path,
                 arguments: launchArguments,
                 currentDirectory: cwd,
-                environment: environment,
+                environment: Self.launchEnvironment(environment),
                 runAsUser: runAsUser,
                 askpassPath: askpassPath
             )
@@ -690,6 +690,21 @@ public final class DistillACPClient: @unchecked Sendable {
 
     deinit { stop() }
 
+    /// A bot's computer is its guest (bot-computer/-browser MCPs), not this
+    /// Mac, so a bot run must not import the user's Mac-only MCPs (cua,
+    /// cua-driver, computer-use-mcp from `~/.claude.json`, plus Cursor's).
+    /// Non-bot runs keep the user's MCPs untouched.
+    ///
+    /// Known gap: MCPs declared in `~/.distill/config.toml` (mac-use,
+    /// playwright, ...) still load on this Mac-side launch path; no env toggle
+    /// or GROK_CONFIG overlay disables them. They go away with the guest-only
+    /// DISTILL_HOME planned for in-VM execution, not a per-bot home here
+    /// (that would copy the user's provider credentials).
+    static func launchEnvironment(_ environment: [String: String]) -> [String: String] {
+        guard BotRunMCPAdmission.isBotRun(environment: environment) else { return environment }
+        return environment.merging(BotRunMCPAdmission.distillUserMCPImportOffEnvironment) { _, off in off }
+    }
+
     public static func initializeParams(clientVersion: String) -> JSONObject {
         [
             "protocolVersion": 1,
@@ -719,16 +734,23 @@ public final class DistillACPClient: @unchecked Sendable {
             command: resolved,
             environment: environment
         )
-        let withBrowser = BotBrowserMCPAdmit.admitGrokACP(
-            existing: withSelfConfig,
-            command: resolved,
-            environment: environment
-        )
-        let withWeb = BotWebMCPAdmit.admitGrokACP(
-            existing: withBrowser,
-            command: resolved,
-            environment: environment
-        )
+        // bot-computer/-browser/-web only work for a bot caller; a non-bot
+        // Agent App session must not be offered tools that always fail.
+        let isBotRun = BotRunMCPAdmission.isBotRun(environment: environment)
+        let withBrowser = isBotRun
+            ? BotBrowserMCPAdmit.admitGrokACP(
+                existing: withSelfConfig,
+                command: resolved,
+                environment: environment
+            )
+            : withSelfConfig
+        let withWeb = isBotRun
+            ? BotWebMCPAdmit.admitGrokACP(
+                existing: withBrowser,
+                command: resolved,
+                environment: environment
+            )
+            : withBrowser
         let withDistill = DistillMCPAdmit.isEnabled(environment: environment)
             ? DistillMCPAdmit.admitGrokACP(
                 existing: withWeb,
@@ -736,11 +758,13 @@ public final class DistillACPClient: @unchecked Sendable {
                 environment: environment
             )
             : withWeb
-        let withComputer = BotComputerMCPAdmit.admitGrokACP(
-            existing: withDistill,
-            command: resolved,
-            environment: environment
-        )
+        let withComputer = isBotRun
+            ? BotComputerMCPAdmit.admitGrokACP(
+                existing: withDistill,
+                command: resolved,
+                environment: environment
+            )
+            : withDistill
         guard environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" else {
             return withComputer
         }

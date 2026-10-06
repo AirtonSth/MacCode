@@ -444,7 +444,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     }
 
     /// Raw nested Codex invocations do not pass through `CodexRunner` or the
-    /// app-server adapter. Admit the same four bot MCPs on the process argv so
+    /// app-server adapter. Admit the same bot MCPs (all four on bot runs,
+    /// bot-self-config only otherwise) on the process argv so
     /// `codex exec resume` and other strict/raw turns retain the host catalog
     /// without consulting the shared `~/.codex/config.toml`, plus the Token
     /// Saver librarian (with the run's recovery scope) under its own gate.
@@ -488,14 +489,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         guard let subcommandIndex else {
             return arguments
         }
-        let names = [
-            BotSelfConfigMCPAdmit.serverName,
-            BotBrowserMCPAdmit.serverName,
-            BotComputerMCPAdmit.serverName,
-            BotWebMCPAdmit.serverName,
-        ]
-        let callerIsScoped = environment[BotSelfConfigCatalog.callerEnvironmentKey]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let callerIsScoped = BotRunMCPAdmission.isBotRun(environment: environment)
+        let names = [BotSelfConfigMCPAdmit.serverName]
+            + (callerIsScoped ? BotRunMCPAdmission.botOnlyServerNames : [])
         let hasManagedCommand = { (name: String) in
             arguments.contains { $0.contains("mcp_servers.\(name).command=") }
         }

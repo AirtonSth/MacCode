@@ -1,6 +1,7 @@
 import XCTest
 @testable import AgentRuntime
 import CoreModel
+import Persistence
 
 final class DistillACPClientSessionParamsTests: XCTestCase {
     func test_sessionNewUsesDistillMetaModelAndReasoningEffortWireFields() {
@@ -191,5 +192,57 @@ final class DistillACPClientSessionParamsTests: XCTestCase {
         let result = DistillModelsConfig.read(home: home)
         XCTAssertNil(result.worker)
         XCTAssertNil(result.workerEffort)
+    }
+
+    private func sessionMCPServerNames(_ environment: [String: String]) -> [String] {
+        DistillACPClient.sessionMCPServers(
+            existing: [],
+            command: "/tmp/RemoteCodeDistillService",
+            environment: environment
+        ).compactMap { ($0 as? [String: Any])?["name"] as? String }
+    }
+
+    /// WHY: bot-computer/-browser/-web answer every call with callerMissing
+    /// without RC_REMOTE_CODE_BOT_ID, so a non-bot Agent App Distill thread was
+    /// being offered tools that can only fail. bot-self-config stays on every
+    /// session: Agent App runs use it for bot_ask_peer and the rc_* host catalog.
+    func test_sessionMCPServersAdmitBotOnlyServersOnlyForBotRuns() {
+        let botOnly = [BotBrowserMCPAdmit.serverName, BotComputerMCPAdmit.serverName, BotWebMCPAdmit.serverName]
+
+        let nonBot = sessionMCPServerNames([:])
+        XCTAssertTrue(nonBot.contains(BotSelfConfigMCPAdmit.serverName))
+        for name in botOnly {
+            XCTAssertFalse(nonBot.contains(name), "non-bot Distill session must not see \(name)")
+        }
+        let blankBotID = sessionMCPServerNames([BotSelfConfigCatalog.callerEnvironmentKey: "  "])
+        XCTAssertFalse(blankBotID.contains(BotComputerMCPAdmit.serverName), "a blank bot id is not a bot run")
+
+        let bot = sessionMCPServerNames([BotSelfConfigCatalog.callerEnvironmentKey: "bot-proof"])
+        for name in [BotSelfConfigMCPAdmit.serverName] + botOnly {
+            XCTAssertTrue(bot.contains(name), "bot Distill session must admit \(name)")
+        }
+    }
+
+    /// WHY: a bot agent called cua-driver__get_browser_state, a Mac tool, from a
+    /// bot run. Distill imports ~/.claude.json and Cursor MCPs unless these two
+    /// toggles are 0 (verified with distill 2.0.30 `inspect`). Only bot runs are
+    /// isolated; a normal Agent App thread keeps the user's MCPs.
+    func test_launchEnvironmentDisablesUserMCPImportOnlyForBotRuns() {
+        let keys = ["GROK_CLAUDE_MCPS_ENABLED", "GROK_CURSOR_MCPS_ENABLED"]
+
+        let bot = DistillACPClient.launchEnvironment([
+            BotSelfConfigCatalog.callerEnvironmentKey: "bot-proof",
+            "GROK_CLAUDE_MCPS_ENABLED": "1",
+            "PATH": "/usr/bin",
+        ])
+        for key in keys {
+            XCTAssertEqual(bot[key], "0", "bot run must not import the user's \(key) MCPs")
+        }
+        XCTAssertEqual(bot["PATH"], "/usr/bin")
+
+        let nonBot = DistillACPClient.launchEnvironment(["PATH": "/usr/bin"])
+        XCTAssertEqual(nonBot, ["PATH": "/usr/bin"], "non-bot runs keep the user's MCPs untouched")
+        let userChoice = DistillACPClient.launchEnvironment(["GROK_CURSOR_MCPS_ENABLED": "1"])
+        XCTAssertEqual(userChoice["GROK_CURSOR_MCPS_ENABLED"], "1")
     }
 }
