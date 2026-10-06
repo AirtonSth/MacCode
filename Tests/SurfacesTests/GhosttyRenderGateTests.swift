@@ -183,6 +183,53 @@ final class GhosttyRenderGateTests: XCTestCase {
             "occlusionState visible is authoritative; the Space check applies only to the key override")
     }
 
+    // `isRenderable` runs on every output drain, and `isOnActiveSpace` is a main-thread
+    // WindowServer round trip. A covered or background window streaming output for
+    // hours must not pay for it per chunk, so the Space is asked only for a key window
+    // with a live drawable whose occlusionState says not-visible.
+
+    func test_spaceIsNotQueriedForAnOcclusionVisibleWindow() {
+        var keyProbes = 0, spaceProbes = 0
+        let inputs = GhosttyTerminalView.keyOverrideInputs(
+            windowOnScreen: true,
+            keyLiveDrawable: { keyProbes += 1; return true },
+            onActiveSpace: { spaceProbes += 1; return true })
+        XCTAssertEqual(keyProbes, 0, "an on-screen window never needs the key override")
+        XCTAssertEqual(spaceProbes, 0, "an on-screen window must not pay for the Space query")
+        XCTAssertFalse(inputs.windowIsKey)
+        XCTAssertFalse(inputs.windowOnActiveSpace)
+    }
+
+    func test_spaceIsNotQueriedForANonKeyWindow() {
+        var spaceProbes = 0
+        let inputs = GhosttyTerminalView.keyOverrideInputs(
+            windowOnScreen: false,
+            keyLiveDrawable: { false },
+            onActiveSpace: { spaceProbes += 1; return true })
+        XCTAssertEqual(spaceProbes, 0,
+            "a covered non-key window (the hot path while output streams) must not query the Space")
+        XCTAssertFalse(
+            onScreenSelected(windowOnScreen: false, windowIsKey: inputs.windowIsKey,
+                             windowOnActiveSpace: inputs.windowOnActiveSpace),
+            "a covered non-key window stays gated off")
+    }
+
+    func test_spaceDecidesTheOverrideForAnOccludedKeyWindow() {
+        for spaceShown in [true, false] {
+            var spaceProbes = 0
+            let inputs = GhosttyTerminalView.keyOverrideInputs(
+                windowOnScreen: false,
+                keyLiveDrawable: { true },
+                onActiveSpace: { spaceProbes += 1; return spaceShown })
+            XCTAssertEqual(spaceProbes, 1, "the latch case must actually consult the Space")
+            XCTAssertEqual(
+                onScreenSelected(windowOnScreen: false, windowIsKey: inputs.windowIsKey,
+                                 windowOnActiveSpace: inputs.windowOnActiveSpace),
+                spaceShown,
+                "an occluded key window renders only on the active Space (audit #1 heal vs S-F2 trap)")
+        }
+    }
+
     func test_keyWindowDoesNotRescueAnUnselectedOrHiddenTab() {
         XCTAssertFalse(
             GhosttyTerminalView.canRender(

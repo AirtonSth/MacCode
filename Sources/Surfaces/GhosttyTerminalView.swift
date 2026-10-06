@@ -1832,6 +1832,7 @@ final class GhosttyTerminalView: NSView {
 
     private var isRenderable: Bool {
         let onScreen = window?.occlusionState.contains(.visible) ?? false
+        let keyOverride = keyOverrideInputs(windowOnScreen: onScreen)
         return Self.canRender(
             visibleInUI: visibleInUI,
             isHidden: isHiddenOrHasHiddenAncestor,
@@ -1840,17 +1841,39 @@ final class GhosttyTerminalView: NSView {
             windowVisible: window?.isVisible ?? false,
             windowMiniaturized: window?.isMiniaturized ?? false,
             windowOnScreen: onScreen,
-            // Only consult the key-window override (audit #1) when occlusionState says
-            // not-visible — and require a LIVE drawable (awake display), so the
-            // false-negative heal can never render into an asleep display (the AGX
-            // trap the gate exists to prevent). When onScreen is already true the
-            // override is irrelevant, so skip the CGDisplayIsAsleep call entirely.
-            windowIsKey: onScreen ? false : Self.windowHasLiveKeyDrawable(window),
-            // S-F2: a key window can stay key while its Space is not shown, so the
-            // key override also needs the window on the active Space. Only queried
-            // when the override matters (it is a WindowServer round trip).
-            windowOnActiveSpace: onScreen ? false : (window?.isOnActiveSpace ?? false)
+            windowIsKey: keyOverride.windowIsKey,
+            windowOnActiveSpace: keyOverride.windowOnActiveSpace
         )
+    }
+
+    /// Inputs for `canRender`'s key-window override, probed lazily (see
+    /// `keyOverrideInputs`) because `isRenderable` runs on every output drain.
+    private func keyOverrideInputs(windowOnScreen: Bool) -> (windowIsKey: Bool, windowOnActiveSpace: Bool) {
+        let window = self.window
+        return Self.keyOverrideInputs(
+            windowOnScreen: windowOnScreen,
+            // Require a LIVE drawable (awake display), so the false-negative heal
+            // can never render into an asleep display (the AGX trap the gate exists
+            // to prevent).
+            keyLiveDrawable: { Self.windowHasLiveKeyDrawable(window) },
+            // S-F2: a key window can stay key while its Space is not shown.
+            onActiveSpace: { window?.isOnActiveSpace ?? false }
+        )
+    }
+
+    /// The key-window override (audit #1) only matters when occlusionState says
+    /// not-visible, and the Space check only matters for a key window with a live
+    /// drawable. Each probe runs only when the previous one allows the override, so
+    /// an occlusion-visible window, or a non-key one (every output drain of a
+    /// covered or background window), never pays for `isOnActiveSpace`, which is a
+    /// WindowServer round trip on the main thread.
+    nonisolated static func keyOverrideInputs(
+        windowOnScreen: Bool,
+        keyLiveDrawable: () -> Bool,
+        onActiveSpace: () -> Bool
+    ) -> (windowIsKey: Bool, windowOnActiveSpace: Bool) {
+        guard !windowOnScreen, keyLiveDrawable() else { return (false, false) }
+        return (true, onActiveSpace())
     }
 
     /// A key, visible, non-minimized window normally has a live Metal drawable — EXCEPT
@@ -1859,6 +1882,10 @@ final class GhosttyTerminalView: NSView {
     /// occlusionState-false-negative heal (audit #1) is allowed to trust.
     private static func windowHasLiveKeyDrawable(_ window: NSWindow?) -> Bool {
         guard let window, window.isKeyWindow, window.isVisible, !window.isMiniaturized else { return false }
+        // Defensive: the override is for a window the user is looking at in the
+        // active app. Whether `isKeyWindow` can still read true for an inactive
+        // app's window on every deactivation path is not verified, so this cheap
+        // local check keeps the override from depending on it.
         guard NSApp.isActive else { return false }
         guard let displayID = window.screen?.displayID, displayID != 0 else { return false }
         return CGDisplayIsAsleep(displayID) == 0
@@ -1996,9 +2023,11 @@ final class GhosttyTerminalView: NSView {
 
     override func keyDown(with event: NSEvent) {
         guard let surface = surfaceForInput() else { return }
-        // Self-heal a stale render gate (audit #1): a keystroke proves the window is
-        // focused and on screen, so re-derive occlusion before the input is handled —
+        // Re-derive a stale render gate (audit #1) before the input is handled —
         // otherwise a latched-off occlusion swallows the echo and typing looks dead.
+        // This re-checks the same gate; it does not force rendering. A key window
+        // can receive keystrokes while its Space is not shown, so a stuck
+        // occlusionState heals here only if `isOnActiveSpace` reads true (S-F2).
         syncOcclusion()
         // Ghostty can ignore surface_key while focus is latched off after park/
         // reattach (firstResponder repair races layout). A keystroke is proof the
@@ -2539,11 +2568,12 @@ final class GhosttyTerminalView: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         guard let surface = surfaceForInput() else { return }
-        // Self-heal a stale render gate (audit #1): a scroll proves the window is on
-        // screen, so re-derive occlusion before the refresh below — otherwise a
-        // latched-off occlusion makes ghostty_surface_refresh a no-op and the
-        // viewport never moves (scroll looks dead). (Display-link reassert for #2
-        // stays on the focus/refresh paths — not this high-frequency momentum path.)
+        // Re-derive a stale render gate (audit #1) before the refresh below —
+        // otherwise a latched-off occlusion makes ghostty_surface_refresh a no-op and
+        // the viewport never moves (scroll looks dead). Like keyDown, this re-checks
+        // the same gate, so the key override still needs the active Space (S-F2).
+        // (Display-link reassert for #2 stays on the focus/refresh paths — not this
+        // high-frequency momentum path.)
         syncOcclusion()
         var x = event.scrollingDeltaX
         var y = event.scrollingDeltaY
