@@ -1,0 +1,177 @@
+import XCTest
+import Darwin
+@testable import AppLifecycleSupport
+
+/// A RemoteCode run that died inside GhosttyKit's crash reporter left no `.ips`
+/// and no lifecycle line saying how it ended. These tests pin the evidence the
+/// next launch must keep: Ghostty's dump files (which Ghostty's next init
+/// deletes) and launchd's exit reason for the dead pid.
+final class GhosttyCrashHarvesterTests: XCTestCase {
+    private func makeTempDir(_ name: String) throws -> URL {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("RC2Crash-\(name)-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        return dir
+    }
+
+    func testCopiesDumpsAndEnvelopesFromRunFoldersWithoutTouchingTheSources() throws {
+        let sentry = try makeTempDir("sentry")
+        let crashState = try makeTempDir("state")
+        let destination = try makeTempDir("dest").appendingPathComponent("ghostty-crash", isDirectory: true)
+        let run = sentry.appendingPathComponent("d8f5dd31.run", isDirectory: true)
+        try FileManager.default.createDirectory(at: run, withIntermediateDirectories: true)
+        try Data("minidump".utf8).write(to: run.appendingPathComponent("4a1b.dmp"))
+        try Data("envelope".utf8).write(to: run.appendingPathComponent("4a1b.envelope"))
+        try Data("{}".utf8).write(to: run.appendingPathComponent("session.json"))
+        try Data().write(to: sentry.appendingPathComponent("d8f5dd31.run.lock"))
+        try Data("report".utf8).write(to: crashState.appendingPathComponent("77c2.ghosttycrash"))
+
+        let copied = GhosttyCrashHarvester.harvest(from: [sentry, crashState], into: destination)
+
+        XCTAssertEqual(
+            Set(copied.map(\.lastPathComponent)),
+            ["d8f5dd31.run--4a1b.dmp", "d8f5dd31.run--4a1b.envelope", "77c2.ghosttycrash"],
+            "only crash files are evidence; session and lock files are not"
+        )
+        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("d8f5dd31.run--4a1b.dmp")), Data("minidump".utf8))
+        // The folders are shared with Ghostty.app: harvesting must never remove its files.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: run.appendingPathComponent("4a1b.dmp").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: crashState.appendingPathComponent("77c2.ghosttycrash").path))
+
+        XCTAssertEqual(
+            GhosttyCrashHarvester.harvest(from: [sentry, crashState], into: destination), [],
+            "a relaunch must not copy the same dump again"
+        )
+    }
+
+    func testMissingSourcesHarvestNothing() throws {
+        let destination = try makeTempDir("dest").appendingPathComponent("ghostty-crash", isDirectory: true)
+        let missing = URL(fileURLWithPath: "/nonexistent-\(UUID().uuidString)", isDirectory: true)
+        XCTAssertEqual(GhosttyCrashHarvester.harvest(from: [missing], into: destination), [])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path), "no dumps must not create an empty folder")
+    }
+
+    func testKeepsOnlyTheNewestCopies() throws {
+        let source = try makeTempDir("src")
+        let destination = try makeTempDir("dest")
+        let limit = GhosttyCrashHarvester.maxRetainedFiles
+        for index in 0..<(limit + 3) {
+            let file = source.appendingPathComponent("dump-\(index).dmp")
+            try Data([UInt8(index)]).write(to: file)
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: 1_000_000 + Double(index))],
+                ofItemAtPath: file.path
+            )
+        }
+
+        GhosttyCrashHarvester.harvest(from: [source], into: destination)
+
+        let kept = try FileManager.default.contentsOfDirectory(atPath: destination.path)
+        XCTAssertEqual(kept.count, limit, "the diagnostics folder must stay bounded")
+        XCTAssertFalse(kept.contains("dump-0.dmp"), "the oldest dump is the one dropped")
+        XCTAssertTrue(kept.contains("dump-\(limit + 2).dmp"), "the newest dump must be kept")
+    }
+
+    func testDefaultSourcesFollowGhosttyCacheAndStateFolders() {
+        let sources = GhosttyCrashHarvester.defaultSourceDirectories(environment: ["XDG_STATE_HOME": "/tmp/xdg-state"])
+        XCTAssertTrue(sources.contains { $0.path.hasSuffix("Library/Caches/com.mitchellh.ghostty/sentry") })
+        XCTAssertTrue(sources.contains { $0.path == "/tmp/xdg-state/ghostty/crash" })
+    }
+}
+
+final class PreviousRunExitStatusTests: XCTestCase {
+    private let launchdOutput = """
+    Timestamp               Ty Process[PID:TID]
+    2026-10-05 19:37:03.385 Df launchd[1:1bf2efa] [gui/501/application.io.remotecode.desktop.1234 [60220]:] exited due to exit(1), ran for 35005804ms
+    """
+
+    func testParsesLaunchdExitReasonForTheDeadPidOnly() {
+        XCTAssertEqual(
+            PreviousRunExitStatus.launchdExitReason(inLogOutput: launchdOutput, pid: 60220),
+            "exited due to exit(1), ran for 35005804ms"
+        )
+        XCTAssertNil(
+            PreviousRunExitStatus.launchdExitReason(inLogOutput: launchdOutput, pid: 6022),
+            "a pid that is a prefix of another must not match its line"
+        )
+    }
+
+    func testRecordsLaunchdReasonFromALogQueryAroundTheLastHeartbeat() {
+        let lastAlive = Date(timeIntervalSince1970: 1_791_000_000)
+        var queried: [String] = []
+        let line = PreviousRunExitStatus.lifecycleLine(pid: 60220, lastAlive: lastAlive, now: lastAlive.addingTimeInterval(86_400)) { arguments, _ in
+            queried = arguments
+            return self.launchdOutput
+        }
+
+        XCTAssertEqual(line, "previous_run_exit pid=60220 launchd=\"exited due to exit(1), ran for 35005804ms\"")
+        XCTAssertTrue(queried.contains { $0.contains("subsystem ENDSWITH \"[60220]\"") }, "query must target the dead pid")
+        let start = queried[queried.firstIndex(of: "--start")! + 1]
+        let end = queried[queried.firstIndex(of: "--end")! + 1]
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        XCTAssertEqual(formatter.string(from: lastAlive.addingTimeInterval(-5)), start)
+        XCTAssertEqual(
+            formatter.string(from: lastAlive.addingTimeInterval(3 * 60 * 60)), end,
+            "a hang stops heartbeats, so the window must reach hours past the last one"
+        )
+    }
+
+    func testUnknownWhenTheQueryFailsOrFindsNothing() {
+        let lastAlive = Date(timeIntervalSince1970: 1_791_000_000)
+        XCTAssertEqual(
+            PreviousRunExitStatus.lifecycleLine(pid: 42, lastAlive: lastAlive) { _, _ in nil },
+            "previous_run_exit pid=42 launchd=unknown",
+            "a timed-out query must still leave a line, not silence"
+        )
+        XCTAssertEqual(
+            PreviousRunExitStatus.lifecycleLine(pid: 42, lastAlive: lastAlive) { _, _ in "Timestamp\n" },
+            "previous_run_exit pid=42 launchd=unknown"
+        )
+        var ran = false
+        XCTAssertEqual(
+            PreviousRunExitStatus.lifecycleLine(pid: 42, lastAlive: nil) { _, _ in ran = true; return nil },
+            "previous_run_exit pid=42 launchd=unknown"
+        )
+        XCTAssertFalse(ran, "without a last sign of life there is no window to search")
+    }
+
+    func testHeartbeatMovesTheMarkersLastAliveSoTheNextLaunchSearchesTheRightWindow() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("RC2Lifecycle-" + UUID().uuidString, isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let recorder = AppLifecycleRecorder(directory: dir)
+        recorder.beginRun()
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let marker = dir.appendingPathComponent("running.\(pid).marker")
+        let launchTime = Date(timeIntervalSinceNow: -3_600)
+        try FileManager.default.setAttributes([.modificationDate: launchTime], ofItemAtPath: marker.path)
+
+        recorder.recordHeartbeat(reason: "periodic")
+
+        let touched = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: marker.path)[.modificationDate] as? Date)
+        XCTAssertGreaterThan(touched.timeIntervalSince(launchTime), 3_000, "a heartbeat must refresh the last sign of life")
+    }
+
+    func testStaleMarkerRecordCarriesPidAndLastAlive() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("RC2Lifecycle-" + UUID().uuidString, isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // pid 99999 with a start time that cannot match any live process.
+        let marker = dir.appendingPathComponent("running.99999.marker")
+        try Data("pid=99999 startedAt=2026-10-05T12:00:00Z procStart=1.000000".utf8).write(to: marker)
+        let lastAlive = Date(timeIntervalSince1970: 1_791_000_000)
+        try FileManager.default.setAttributes([.modificationDate: lastAlive], ofItemAtPath: marker.path)
+
+        let records = AppLifecycleRecorder(directory: dir).consumeStaleRunMarkerRecords()
+
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records.first?.pid, 99999)
+        XCTAssertEqual(records.first?.lastAlive, lastAlive)
+        XCTAssertEqual(records.first?.contents, "pid=99999 startedAt=2026-10-05T12:00:00Z procStart=1.000000")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "a consumed marker must not be reported twice")
+    }
+}

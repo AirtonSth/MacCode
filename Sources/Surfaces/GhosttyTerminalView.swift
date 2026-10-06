@@ -476,6 +476,12 @@ private final class RemoteCodeGhosttyRuntime {
         configureGhosttyEnvironment()
         unsetenv("NO_COLOR")
 
+        // ghostty_init starts Ghostty's embedded Breakpad, which takes over the
+        // crash handlers and turns native crashes into a silent _exit. Give them
+        // back to macOS ReportCrash once Ghostty is up, on every return path.
+        let crashHandlerGuard = GhosttyCrashHandlerGuard.begin()
+        defer { crashHandlerGuard.end() }
+
         let result = ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv)
         guard result == GHOSTTY_SUCCESS else {
             NSLog("RemoteCode Ghostty init failed: %d", result)

@@ -173,6 +173,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             for: channel,
             override: appSupportOverride
         )
+        // First, before anything can start GhosttyKit: its init deletes the
+        // previous run's crash files.
+        let harvestedGhosttyCrashFiles = GhosttyCrashHarvester.harvest(
+            from: GhosttyCrashHarvester.defaultSourceDirectories(),
+            into: appSupportDirectory.appendingPathComponent("diagnostics/ghostty-crash", isDirectory: true)
+        )
         ProviderProcessOwnership.shared.configure(
             fileURL: appSupportDirectory
                 .appendingPathComponent("diagnostics", isDirectory: true)
@@ -232,7 +238,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             }
         }
 
-        installLifecycleRecorder()
+        installLifecycleRecorder(harvestedGhosttyCrashFiles: harvestedGhosttyCrashFiles)
         // PERF (cold launch): the orphan provider sweep is a process scan and
         // the event-log decode + PTY restore are heavy. StartupPlan defers them
         // past the first frame; see runDeferredStartup().
@@ -808,21 +814,36 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         )
     }
 
-    private func installLifecycleRecorder() {
+    private func installLifecycleRecorder(harvestedGhosttyCrashFiles: [URL]) {
         let directory = AppPaths.appSupportDirectory(for: channel, override: appSupportOverride)
             .appendingPathComponent("diagnostics", isDirectory: true)
         let recorder = AppLifecycleRecorder(directory: directory)
-        for stale in recorder.consumeStaleRunMarkers() {
+        let staleMarkers = recorder.consumeStaleRunMarkerRecords()
+        for stale in staleMarkers.map(\.contents) {
             // The previous run never reached applicationWillTerminate: it was
             // killed (SIGTERM/SIGKILL) or died abruptly with no crash report.
             // This is the on-disk evidence for the "app silently vanished" report.
             appLifecycleLog.fault("app.previous_run_unclean \(stale, privacy: .public)")
             recorder.record("previous_run_ended_uncleanly \(stale)")
         }
+        for file in harvestedGhosttyCrashFiles {
+            appLifecycleLog.fault("app.ghostty_crash_harvested file=\(file.lastPathComponent, privacy: .public)")
+            recorder.record("ghostty_crash_harvested file=\(file.lastPathComponent)")
+        }
         recorder.beginRun()
         recorder.installSignalHandlers()
         recorder.installExitHandler()
         lifecycleRecorder = recorder
+        // How each unclean run ended comes from launchd's log, which takes a
+        // second or more to query, so it is recorded off the launch path.
+        let uncleanRuns = staleMarkers.compactMap { marker in marker.pid.map { ($0, marker.lastAlive) } }
+        if !uncleanRuns.isEmpty {
+            DispatchQueue.global(qos: .utility).async {
+                for (pid, lastAlive) in uncleanRuns {
+                    recorder.record(PreviousRunExitStatus.lifecycleLine(pid: pid, lastAlive: lastAlive))
+                }
+            }
+        }
         startHangWatchdog(recorder: recorder, diagnosticsDirectory: directory)
     }
 
