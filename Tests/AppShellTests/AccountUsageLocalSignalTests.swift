@@ -68,7 +68,7 @@ final class AccountUsageLocalSignalTests: XCTestCase {
     /// asserted a fresh account query that was still in flight.
     func test_detailsProbe_ignoresLocalUsageNotificationWhileProbeIsInFlight() async throws {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("RC2TokenSaverDetailsProbe-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("RC2AccountUsageDetailsProbe-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: appSupport) }
         let refresher = GatedAccountUsageRefresher()
         let context = try AppContext(
@@ -204,7 +204,7 @@ final class AccountUsageLocalSignalTests: XCTestCase {
 
     private func makeViewModel() throws -> (AppContext, SidebarViewModel, URL) {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("RC2TokenSaverLocalSignal-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("RC2AccountUsageLocalSignal-\(UUID().uuidString)", isDirectory: true)
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
         let router = AppCommandRouter(context: context)
         context.router = router

@@ -391,7 +391,7 @@ public final class ProviderUsageStore: @unchecked Sendable {
             return .empty(period: period)
         }
         // Older usage.json files predate Grok; ensure every managed agent provider
-        // has a row so Token Saver rings never look like the provider is missing.
+        // has a row so the usage rings never look like the provider is missing.
         // Also fold expired weekly windows to 0 so inactive providers do not stay
         // locked on a pre-reset percentage (Claude 45% after the week rolls).
         return Self.expiringStaleWeeklyUsage(
@@ -469,8 +469,8 @@ public final class ProviderUsageStore: @unchecked Sendable {
         }
     }
 
-    /// Clears live rate-limit percents for a provider while keeping Token Saver
-    /// savings counters. Used when a refresh no longer sees the provider (signed
+    /// Clears live rate-limit percents for a provider while keeping its token
+    /// counters. Used when a refresh no longer sees the provider (signed
     /// out / inactive) so the ring drops to 0% instead of locking on last known %.
     @discardableResult
     public func clearAccountUsagePercentages(

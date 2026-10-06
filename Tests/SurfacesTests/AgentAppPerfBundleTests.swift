@@ -1658,7 +1658,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
             messageId: messageId, originalText: "original", rewrittenText: "rewritten"
         )))
         vm.commitStreamQuantum(reducedQuantum(timeline: small, force: true))
-        XCTAssertFalse(vm.timeline.tokenSaverTranslationsByMessageId.isEmpty,
+        XCTAssertFalse(vm.timeline.sr1TranslationsByMessageId.isEmpty,
                        "a translation under the ceiling must survive the walk")
         XCTAssertEqual(vm.streamAggregateBudgetOpsForTesting, 0,
                        "a forced walk must reset the coalescing counter")
@@ -1691,7 +1691,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
                              "fixture must actually exceed the lowered ceiling")
 
         vm.commitStreamQuantum(reducedQuantum(timeline: oversized, force: true))
-        XCTAssertTrue(vm.timeline.tokenSaverTranslationsByMessageId.isEmpty,
+        XCTAssertTrue(vm.timeline.sr1TranslationsByMessageId.isEmpty,
                       "the budget walk must evict translations over the ceiling")
     }
 

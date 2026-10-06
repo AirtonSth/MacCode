@@ -196,7 +196,7 @@ final class AccountUsageAppContextTests: XCTestCase {
                 && codex?.currentSessionUsedPercent == 13
         }
         XCTAssertTrue(didPersist,
-                      "startup/details/periodic refresh must persist real provider weekly percentages for the Token Saver rings")
+                      "startup/details/periodic refresh must persist real provider weekly percentages for the usage rings")
         XCTAssertEqual(context.accountUsageRefreshCount, 1)
         let requests = await refresher.requests
         XCTAssertEqual(requests.count, 1)
@@ -734,7 +734,7 @@ final class AccountUsageAppContextTests: XCTestCase {
     }
 
     func test_appContextRefreshesGrokAccountUsageFromBillingLogAfterRun() async throws {
-        // WHY: Grok ACP never emits live `.accountUsage`, so the Token Saver
+        // WHY: Grok ACP never emits live `.accountUsage`, so the usage
         // purple ring stayed stale between periodic probes. After
         // a Grok run finishes we re-read the local billing log; this pins that
         // the lightweight path persists creditUsagePercent without Claude/Codex.

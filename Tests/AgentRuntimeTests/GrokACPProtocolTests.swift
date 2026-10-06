@@ -1153,7 +1153,7 @@ final class GrokACPProtocolTests: XCTestCase {
 
     /// Live Grok 1.0 session/prompt `_meta.usage` includes `costUsdTicks`
     /// (1 USD = 10^10 ticks). finishTurn must map them into reportedCostMicros
-    /// so Agent App spend / Token Saver rings match the CLI parser path.
+    /// so Agent App spend / usage rings match the CLI parser path.
     func test_finishTurn_mapsCostUsdTicksToReportedCostMicros() {
         let mapper = GrokACPEventMapper(sessionId: "grok-cost-ticks")
         var events: [AssistantEvent] = []

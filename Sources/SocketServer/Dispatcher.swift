@@ -142,7 +142,8 @@ public protocol CommandRouting: AnyObject {
     func sshFilesRemoteListAsync(surface: SurfaceID, path: String?) async throws -> JSONValue
     // agent
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
-    /// Sticky glanceable Token Saver payload for deterministic iOS pull.
+    /// Sticky account usage digest for deterministic iOS pull (deprecated
+    /// `token_saver.digest.get` name kept until iOS bumps its treaty pin).
     func tokenSaverDigest() -> JSONValue?
     func setAgentWorkerModel(thread: AgentThreadID, model: String?) throws -> AgentThread
     func listDistillAccounts() -> JSONValue
@@ -367,7 +368,7 @@ public extension CommandRouting {
         try sshFilesRemoteList(surface: surface, path: path)
     }
 
-    /// Test/fake hosts may omit Token Saver entirely.
+    /// Test/fake hosts may omit the account usage digest entirely.
     func tokenSaverDigest() -> JSONValue? { nil }
     func setAgentWorkerModel(thread: AgentThreadID, model: String?) throws -> AgentThread { throw JSONRPCError.notSupported("Worker model selection") }
     func listDistillAccounts() -> JSONValue { .object(["accounts": .array([]), "busy_provider": .null, "last_error": .null]) }

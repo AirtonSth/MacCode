@@ -70,8 +70,8 @@ final class GrokParserTests: XCTestCase {
         XCTAssertTrue(parser.parseLine("   ").isEmpty)
     }
 
-    /// Token Saver Grok ring stays "No data" unless end.usage becomes a tokenUsage event.
-    func test_endEventEmitsTokenUsageForTokenSaverRing() {
+    /// The Grok usage ring stays "No data" unless end.usage becomes a tokenUsage event.
+    func test_endEventEmitsTokenUsageForUsageRing() {
         let line = #"""
         {"type":"end","stopReason":"EndTurn","sessionId":"s1","requestId":"r1","usage":{"input_tokens":25103,"cache_read_input_tokens":6016,"output_tokens":18,"reasoning_tokens":13,"total_tokens":31137,"cost_in_usd_ticks":123450000},"modelUsage":{"grok-4.5":{"inputTokens":25103,"outputTokens":18,"cacheReadInputTokens":6016,"modelCalls":1}}}
         """#
@@ -80,7 +80,7 @@ final class GrokParserTests: XCTestCase {
             if case .tokenUsage(let u) = ev { return u }
             return nil
         }.first
-        XCTAssertNotNil(usage, "Grok end.usage must feed Token Saver so the purple ring is not stuck on No data")
+        XCTAssertNotNil(usage, "Grok end.usage must feed account usage so the purple ring is not stuck on No data")
         XCTAssertEqual(usage?.totalTokens, 31137)
         XCTAssertEqual(usage?.resolvedSemantics, .cumulative)
         XCTAssertEqual(usage?.outputTokens, 18)
@@ -92,7 +92,7 @@ final class GrokParserTests: XCTestCase {
     }
 
     /// WHY: grok-build 1.0 streaming-json emits a per-response `usage` line
-    /// before `end`. Ignoring it leaves Token Saver empty when `end` omits spend.
+    /// before `end`. Ignoring it leaves usage empty when `end` omits spend.
     func test_usageEventEmitsTokenUsageWithoutEndingTurn() {
         let line = #"""
         {"type":"usage","messageId":"resp_1","stopReason":"end_turn","usage":{"input_tokens":812,"output_tokens":45,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"reasoning_tokens":0}}

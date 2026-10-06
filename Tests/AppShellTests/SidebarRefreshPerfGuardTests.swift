@@ -163,7 +163,7 @@ final class SidebarRefreshPerfGuardTests: XCTestCase {
         )
     }
 
-    /// WHY: a true account change still has to paint (Token Saver footer,
+    /// WHY: a true account change still has to paint (account usage,
     /// subscribe CTA). The `.rc2PrivateAccountChanged` observer is the only
     /// intended reread path after init.
     func test_privateAccountNotification_stillReloadsUser() async throws {

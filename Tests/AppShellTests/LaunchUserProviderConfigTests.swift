@@ -4,7 +4,7 @@ import Persistence
 @testable import AppShell
 
 /// The launch reconcile (`AppContext.init` → `reconcileComputerUseMCP`, plus the
-/// Token Saver lifecycle's legacy librarian purge) runs against the user's real
+/// legacy purge of what the removed Token Saver installed) runs against the user's real
 /// provider configs. Those files belong to Claude Code / ChatGPT.app, so the
 /// launch path may remove RemoteCode residue but must never rewrite a config it
 /// has nothing to remove from.

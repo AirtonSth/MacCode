@@ -85,7 +85,7 @@ final class ClaudeParserCLITests: XCTestCase {
         XCTAssertEqual(usage?.resolvedSemantics, .cumulative,
                        "final modelUsage is an authoritative run snapshot, not another request charge")
         XCTAssertEqual(usage?.contextWindow, 200_000,
-                       "Claude SDK bridge result.modelUsage must feed Token Saver and context pressure; otherwise /distill responses complete but Saved stays 0")
+                       "Claude SDK bridge result.modelUsage must feed usage and context pressure; otherwise the usage totals stay 0")
         // G3: the three cache buckets are recorded SEPARATELY (not folded), so net
         // dollars are computable. uncached(510+6) + creation(0+22947) + read(0+22517) = 45980.
         XCTAssertEqual(usage?.uncachedInputTokens, 516)
@@ -431,7 +431,7 @@ final class ClaudeParserCLITests: XCTestCase {
                 return usage.provider == .claude && usage.weeklyUsedPercent == 57 && usage.weeklyWindowDurationMinutes == 10_080
             }
             return false
-        }, "Claude rate_limit_info must feed Token Saver weekly account usage instead of leaving the rings at fake 100%")
+        }, "Claude rate_limit_info must feed weekly account usage instead of leaving the rings at fake 100%")
         XCTAssertFalse(evs.contains {
             if case .error(let message, _) = $0 {
                 return message.contains("requests")
@@ -441,7 +441,7 @@ final class ClaudeParserCLITests: XCTestCase {
     }
 
     /// Live Claude Code 2.1.258 emits `unifiedWindows` instead of `primary.usedPercent`.
-    /// Parser must still feed `.accountUsage` so Token Saver rings move during the turn.
+    /// Parser must still feed `.accountUsage` so the usage rings move during the turn.
     func test_rateLimitEvent_unifiedWindowsFeedsAccountUsage() {
         let line = #"{"type":"rate_limit_event","uuid":"rl-1","session_id":"s-rl","rate_limit_info":{"rateLimitType":"five_hour","resetsAt":1788368400,"status":"allowed","unifiedWindows":{"five_hour":{"resetsAt":1788368400,"utilization":0.58},"seven_day":{"resetsAt":1788703200,"utilization":0.30},"seven_day_overage_included":{"resetsAt":1788703200,"utilization":0.39}}}}"#
         let evs = collect([line])
@@ -461,7 +461,7 @@ final class ClaudeParserCLITests: XCTestCase {
                     && usage.currentSessionUsedPercent == 58
             }
             return false
-        }, "Claude Code 2.1.258 unifiedWindows must update Token Saver rings during the turn")
+        }, "Claude Code 2.1.258 unifiedWindows must update the usage rings during the turn")
     }
 
     /// Headless docs: system/api_retry precedes a retriable API failure. Without a

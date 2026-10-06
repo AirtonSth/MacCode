@@ -3,7 +3,7 @@ import CoreModel
 import Persistence
 @testable import AppShell
 
-/// WHY: subagent telemetry env (every run/recovery, including Token Saver off)
+/// WHY: subagent telemetry env (every run/recovery)
 /// used to full-get 26 columns + routing JSON just for model and instance.
 @MainActor
 final class SubagentTelemetryIdentityProbeTests: XCTestCase {

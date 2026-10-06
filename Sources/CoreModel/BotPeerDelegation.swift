@@ -66,8 +66,8 @@ public enum BotPeerDelegation: Sendable {
         """
     }
 
-    /// Carry identity separately from the user's prompt so provider transport,
-    /// including Token Saver, cannot rewrite the user's words or drop the
+    /// Carry identity separately from the user's prompt so provider transport
+    /// cannot rewrite the user's words or drop the
     /// identity context. This is metadata only; the provider owns all semantics.
     public static func environment(
         addingTurnContextTo base: [String: String],

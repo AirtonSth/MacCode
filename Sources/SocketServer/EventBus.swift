@@ -9,7 +9,7 @@ public final class EventBus: @unchecked Sendable {
     public static let shared = EventBus()
 
     /// Posted on the main queue after a new live subscriber is installed so
-    /// AppShell can re-emit sticky glanceable state (Token Saver digest) to
+    /// AppShell can re-emit sticky glanceable state (the account usage digest) to
     /// late remote clients whose replay cursor missed the last publish.
     public static let subscriberAddedNotification = Notification.Name(
         "io.remotecode.eventbus.subscriberAdded"

@@ -4235,7 +4235,7 @@ final class AgentAppViewModelTests: XCTestCase {
     }
 
     /// WHY: between the user's bubble appearing and a run id existing, the surface
-    /// does real work — transcript load, Graphify root resolution (git subprocesses),
+    /// does real work — transcript load, git subprocesses,
     /// prompt compression, provider spawn. That window rendered NOTHING, so a slow
     /// dependency looked like the app had hung. "Loading…" must fill exactly that gap
     /// and must hand over to "Working for Xs" the moment the run is tracked, never
@@ -4268,7 +4268,7 @@ final class AgentAppViewModelTests: XCTestCase {
         }
 
         XCTAssertEqual(preparingMidWindow, true,
-                       "the prepare window must render Loading… — leaving it blank is what read as a hang while Graphify shelled out to git")
+                       "the prepare window must render Loading… — leaving it blank is what read as a hang while preparation shelled out to git")
         XCTAssertEqual(runActiveMidWindow, false,
                        "precondition: no run is tracked yet mid-prepare, so Working cannot be what covers this window")
         XCTAssertEqual(preparingForSiblingThread, false,

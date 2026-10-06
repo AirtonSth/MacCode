@@ -417,7 +417,7 @@ public final class AgentThreadRepository {
         public let model: String
     }
 
-    /// Cheap identity/scope probe for Token Saver same-user, persistent scope,
+    /// Cheap identity/scope probe for same-user, persistent scope,
     /// and env stamps. Avoids the full `get` (26 columns + routing JSON) when
     /// only workspace/project/model/instance/run-as-user are needed.
     public struct IdentityChrome: Equatable, Sendable {
@@ -1389,7 +1389,7 @@ public final class AgentThreadRepository {
         return st.columnText(0) ?? ""
     }
 
-    /// Cheap identity/scope probe for Token Saver env and same-user. Returns
+    /// Cheap identity/scope probe for provider env and same-user. Returns
     /// nil when the durable row is gone.
     public func identity(of id: AgentThreadID) throws -> IdentityChrome? {
         identityProbeCountForTesting += 1
@@ -4784,7 +4784,7 @@ public final class AgentRunRepository: @unchecked Sendable {
         return AgentRunStatus(rawValue: st.columnText(0) ?? "") ?? .pending
     }
 
-    /// Cheap provider probe for Token Saver usage ticks. Avoids the full
+    /// Cheap provider probe for usage ticks. Avoids the full
     /// 10-column `get` (including `error_message`) when only `provider` seeds
     /// the in-memory usage accumulator. Returns nil when the durable row is gone.
     public func provider(of id: AgentRunID) throws -> AgentProvider? {
@@ -4795,9 +4795,9 @@ public final class AgentRunRepository: @unchecked Sendable {
         return AgentProvider(rawValue: st.columnText(0) ?? "") ?? .codex
     }
 
-    /// Cheap model probe for Token Saver attempt begin. Avoids the full
-    /// 10-column `get` (including `error_message`) when only `model` stamps
-    /// the measurement ledger. Returns nil when the durable row is gone.
+    /// Cheap model probe. Avoids the full 10-column `get` (including
+    /// `error_message`) when only `model` is needed. Returns nil when the
+    /// durable row is gone.
     public func model(of id: AgentRunID) throws -> String? {
         modelProbeCountForTesting += 1
         let st = try db.prepare("SELECT model FROM agent_runs WHERE id = ? LIMIT 1;")

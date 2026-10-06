@@ -90,7 +90,7 @@ public final class DistillParser {
 
         case "usage":
             // streaming-json emits a per-response `usage` line
-            // before `end`. Token Saver rings must not wait for `end` only.
+            // before `end`. Usage must not wait for `end` only.
             if let usage = Self.tokenUsage(from: obj) {
                 out.append(.tokenUsage(usage))
             }

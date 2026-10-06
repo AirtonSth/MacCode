@@ -24,7 +24,6 @@ Those gates are **not invented**. Artifacts below are the in-repo mandatory proo
 | Visibility cold-state | `Sources/Surfaces/AgentVisibilityColdState.swift` | present |
 | Pressure coordinator | `Sources/AppLifecycleSupport/PressureGovernorCoordinator.swift` + `AppDiagnostics.heartbeat` ingest/execute | wired into live heartbeat + unit/production-wiring tests |
 | Batcher admission bounds | `Sources/SocketServer/WebSocketEventBatcher.swift` | present + unit tests |
-| Graphify/TS hardening pins | `Sources/AgentRuntime/GraphifyRuntimeHardening.swift` | present (default pin incomplete until physical canary; install refuses floating upgrade when unpinned) |
 | Capacity UX model | `Sources/AppLifecycleSupport/CapacityUXStatus.swift` | present |
 | S6/S8/S11 NO_CHANGE notes | `docs/capacity/NO_CHANGE-*.md` | present |
 

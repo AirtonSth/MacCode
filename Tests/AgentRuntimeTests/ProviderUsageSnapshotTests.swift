@@ -2,14 +2,14 @@ import XCTest
 @testable import AgentRuntime
 import CoreModel
 
-/// Token Saver empty snapshot must reserve a slot for every managed agent provider.
+/// The empty usage snapshot must reserve a slot for every managed agent provider.
 final class ProviderUsageSnapshotTests: XCTestCase {
     func test_emptySnapshotIncludesGrokProviderSlot() {
-        // WHY: Grok has a purple usage ring in the Token Saver card. Without a
+        // WHY: Grok has a purple account usage ring. Without a
         // reserved provider row, the UI only appears after the first Grok run.
         let providers = Set(ProviderUsageSnapshot.empty().providers.map(\.provider))
         XCTAssertTrue(providers.contains(.grok),
-                      "empty usage snapshot must include .grok for the purple Token Saver ring")
+                      "empty usage snapshot must include .grok for the purple usage ring")
         XCTAssertTrue(providers.contains(.claude))
         XCTAssertTrue(providers.contains(.codex))
     }
@@ -29,7 +29,7 @@ final class ProviderUsageSnapshotTests: XCTestCase {
         XCTAssertEqual(byProvider[.codex]?.weeklyUsedPercent, 30)
     }
 
-    /// WHY: inactive Claude left the Token Saver card locked at 45% because the
+    /// WHY: inactive Claude left the usage ring locked at 45% because the
     /// last successful probe was never expired or cleared.
     func test_effectiveWeeklyUsedPercent_expiresWhenResetIsPast() {
         let now = Date(timeIntervalSince1970: 2_000_000)
@@ -134,7 +134,7 @@ final class ProviderUsageSnapshotTests: XCTestCase {
         XCTAssertEqual(claude?.weeklyUsedPercent, 0,
                        "inactive Claude must drop to 0% used, not keep the frozen 45%")
         XCTAssertEqual(claude?.actualProviderTokens, 1_000,
-                       "clearing rate-limit % must not wipe measured Token Saver savings counters")
+                       "clearing rate-limit % must not wipe the measured token counters")
     }
 
     func test_expiringStaleWeeklyUsage_zerosPastWindows() {
@@ -438,7 +438,7 @@ final class ProviderUsageSnapshotTests: XCTestCase {
         )
     }
 
-    /// WHY: `AppDelegate.tokenSaverAccountUsageRefreshInterval` is 60 s, so the
+    /// WHY: `AppDelegate.accountUsageRefreshInterval` is 60 s, so the
     /// probe re-records the same percentages ~1.440×/day while the app is open,
     /// and each repeat used to run the whole read-modify-write (cross-process
     /// flock + encode + atomic replace of the file) on the MainActor for a row

@@ -16,9 +16,7 @@
     "byteRatePerSecond" : 2000000,
     "terminalCount" : 8,
     "clientCount" : 4,
-    "faultKinds" : ["malformed_frame", "reorder", "pipe_pressure", "stop_race", "resume"],
-    "tokenSaverMode" : "on_and_off",
-    "graphifyMode" : "on_and_off"
+    "faultKinds" : ["malformed_frame", "reorder", "pipe_pressure", "stop_race", "resume"]
   },
   "estimator" : {
     "minWarmedSamples" : 3,

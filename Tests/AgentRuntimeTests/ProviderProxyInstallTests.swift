@@ -373,7 +373,7 @@ final class ProviderProxyInstallTests: XCTestCase {
     }
 
     func test_uninstallCommandWrappers_doesNotRemoveProviderProxies() throws {
-        // WHY: Token Saver off must drop compression wrappers, not the provider controller.
+        // WHY: removing legacy compression wrappers must not remove the provider controller.
         let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
         let binary = try fakeServiceBinary(in: home)
         let realBins = try fakeProviderBins(in: home, names: ["claude"])
@@ -393,7 +393,7 @@ final class ProviderProxyInstallTests: XCTestCase {
                 atPath: home.appendingPathComponent(".remote-code/bin/claude").path
             ),
             binary.path,
-            "provider proxy must survive Token Saver wrapper uninstall"
+            "provider proxy must survive legacy wrapper uninstall"
         )
     }
 
@@ -676,7 +676,7 @@ final class ProviderProxyInstallTests: XCTestCase {
         }
     }
 
-    func test_subagentTelemetryScopeKeepsHierarchyWhenTokenSaverIsOff() throws {
+    func test_subagentTelemetryScopeKeepsHierarchyFromAlwaysOnKeys() throws {
         // WHY: Subagents is lifecycle UI, not a paid optimization. A raw custom
         // worker must attach to its real controller using only always-on keys.
         let thread = UUID()
@@ -827,7 +827,7 @@ final class ProviderProxyInstallTests: XCTestCase {
     func test_managedProviderAndAgentAppAliasesRepairRecognizedRelocatedBuildTargets() throws {
         // WHY: isolated builds and app upgrades relocate the native service. A
         // still-executable old RemoteCode target previously blocked all Agent App
-        // delegation while ordinary Token Saver turns appeared healthy.
+        // delegation while ordinary turns appeared healthy.
         let home = tempHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let installer = AgentSkillInstaller(homeDirectory: home)

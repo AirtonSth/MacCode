@@ -4,9 +4,9 @@ import CoreModel
 @testable import AgentRuntime
 
 final class DistillProcessResolutionTests: ProviderProcessTestCase {
-    func test_distillResolverRejectsShimsButKeepsLegitimateTokenSaverPath() throws {
-        // WHY: provider launches must use the Distill agent, while Token Saver
-        // must retain access to its separately managed `distill` executable.
+    func test_distillResolverRejectsShimsButKeepsGenericManagedResolution() throws {
+        // WHY: provider launches must use the Distill agent, while generic
+        // executable resolution must stay unchanged for a managed `distill`.
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("distill-resolution-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -67,12 +67,12 @@ final class DistillProcessResolutionTests: ProviderProcessTestCase {
         XCTAssertEqual(
             ProcessLocator.resolve("distill", environmentPath: nil, homeDirectory: home.path),
             compressor.path,
-            "Generic bare-name resolution used by Token Saver must retain the managed executable."
+            "Generic bare-name resolution must retain the managed executable."
         )
         XCTAssertEqual(
             ProcessLocator.resolve(compressor.path, environmentPath: nil, homeDirectory: home.path),
             compressor.path,
-            "Generic explicit-path resolution used by Token Saver must retain the managed executable."
+            "Generic explicit-path resolution must retain the managed executable."
         )
 
         let foreignHome = root.appendingPathComponent("foreign-home", isDirectory: true)
@@ -116,7 +116,7 @@ final class DistillProcessResolutionTests: ProviderProcessTestCase {
 
     func test_distillACPClientLaunchesResolvedAgentAndReceivesInitialize() async throws {
         // WHY: resolver-only assertions cannot prove the ACP launch boundary
-        // uses the selected agent executable rather than Token Saver's shim.
+        // uses the selected agent executable rather than a managed `distill` shim.
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("distill-acp-launch-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }

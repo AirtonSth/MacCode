@@ -156,7 +156,7 @@ final class ProviderAccountUsageRefresherTests: XCTestCase {
 
     /// WHY: Claude Code headless `/usage` switched to one-line copy
     /// ("Current week (all models): 54% used"). Legacy weekly|subscription
-    /// patterns missed it, so Token Saver left Claude at Used 0% while Codex/Grok
+    /// patterns missed it, so the usage rings left Claude at Used 0% while Codex/Grok
     /// rings updated and Claude Estimated save kept climbing.
     func test_claudeUsageTextParsesModernHeadlessCurrentWeekAndSession() {
         let output = """
@@ -188,7 +188,7 @@ final class ProviderAccountUsageRefresherTests: XCTestCase {
     }
 
     func test_grokBillingLogLineParsesCreditUsagePercent() {
-        // WHY: Token Saver Grok ring was stuck on "No data" because account
+        // WHY: the Grok usage ring was stuck on "No data" because account
         // refresh never read Grok's local billing snapshot (creditUsagePercent).
         let line = #"""
         {"ts":"2026-07-13T23:32:27.798Z","src":"shell","lvl":"info","msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":29.0,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-07-08T20:46:41.975270+00:00","end":"2026-07-15T20:46:41.975270+00:00"},"billingPeriodStart":"2026-07-08T20:46:41.975270+00:00","billingPeriodEnd":"2026-07-15T20:46:41.975270+00:00"},"subscriptionTier":"SuperGrok Heavy"}}
@@ -220,7 +220,7 @@ final class ProviderAccountUsageRefresherTests: XCTestCase {
 
     /// WHY: production `~/.grok/logs/unified.jsonl` put 800KB+ of non-billing
     /// traffic between credit snapshots. The old 512KB tail window returned nil,
-    /// partial refresh cleared Grok, and Token Saver showed Used 0% despite real
+    /// partial refresh cleared Grok, and the rings showed Used 0% despite real
     /// SuperGrok usage (and non-zero Saved tokens for Grok).
     func test_grokFromBillingLogFile_findsPercentBeyondFormer512KBWindow() throws {
         let dir = FileManager.default.temporaryDirectory
@@ -509,7 +509,7 @@ final class ProviderAccountUsageRefresherTests: XCTestCase {
 
     /// Claude Code 2.1.258 stream-json `rate_limit_event` nests utilization under
     /// `unifiedWindows`. Without this mapping, live Claude turns never refresh
-    /// Token Saver rings even though the CLI is streaming accurate percentages.
+    /// account usage rings even though the CLI is streaming accurate percentages.
     func test_claudeFrom_readsUnifiedWindowsUtilization() {
         let usage = AssistantAccountUsageParser.claude(from: [
             "type": "rate_limit_event",

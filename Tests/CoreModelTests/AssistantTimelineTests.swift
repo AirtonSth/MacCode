@@ -1006,7 +1006,7 @@ final class AssistantTimelineTests: XCTestCase {
         s.apply(.turnStarted(turnId: "turn-old"))
         s.apply(.itemStarted(item: AssistantItem(id: "old-item", turnId: "turn-old", type: .tool, startedAtMs: 0)))
         s.apply(.wireTranslation(AssistantWireTranslation(itemId: "old-item", originalText: "orig", rewrittenText: "rw")))
-        XCTAssertNotNil(s.tokenSaverTranslationsByItemId["old-item"])
+        XCTAssertNotNil(s.sr1TranslationsByItemId["old-item"])
 
         // Push the oldest turn out of the live window.
         let extra = AssistantTimelineState.liveTurnLimit + 1
@@ -1018,9 +1018,9 @@ final class AssistantTimelineTests: XCTestCase {
         XCTAssertEqual(s.turns.count, AssistantTimelineState.liveTurnLimit,
                        "turns stay bounded by liveTurnLimit")
         XCTAssertFalse(s.turns.contains { $0.turnId == "turn-old" }, "oldest turn was evicted")
-        XCTAssertNil(s.tokenSaverTranslationsByItemId["old-item"],
+        XCTAssertNil(s.sr1TranslationsByItemId["old-item"],
                      "translation keyed on an evicted turn's item must be pruned, not leaked")
-        XCTAssertNotNil(s.tokenSaverTranslationsByItemId["new-item"],
+        XCTAssertNotNil(s.sr1TranslationsByItemId["new-item"],
                         "translation for a retained turn's item must survive trimming")
     }
 
@@ -1048,7 +1048,7 @@ final class AssistantTimelineTests: XCTestCase {
                        "oldest non-anchor item is trimmed when the per-turn cap is exceeded")
         XCTAssertTrue(s.turns[0].items.contains { $0.id == "item-\(extra - 1)" },
                       "the newest item (the active streaming target) is always retained")
-        XCTAssertNil(s.tokenSaverTranslationsByItemId["victim"],
+        XCTAssertNil(s.sr1TranslationsByItemId["victim"],
                      "a trimmed item's translation must be pruned with it")
     }
 

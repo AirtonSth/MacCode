@@ -82,7 +82,7 @@ final class ScopeRefreshingAdapter: AgentProviderAdapter, @unchecked Sendable {
     }
 
     /// Seeds a resident idle session the coordinator can observe via `hasSession`
-    /// without a durable provider thread id (the pre-continuity Token Saver case).
+    /// without a durable provider thread id (the pre-continuity case).
     func seedIdleSession(
         threadId: AgentThreadID,
         providerThreadId: String? = nil,

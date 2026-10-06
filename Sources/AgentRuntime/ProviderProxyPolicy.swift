@@ -375,7 +375,7 @@ public struct ProviderProxyFinalizationTracker: Sendable {
 /// - Resolve the real provider executable outside the managed bin / self.
 /// - Never parse prompts, transcripts, tool output, or secrets into node ids.
 /// - Fail open: missing real binary or missing telemetry scope is a non-proxy path.
-/// - Do not invent Token Saver admission; the parent environment is authoritative.
+/// - The parent environment is authoritative for identity and capabilities.
 public enum ProviderProxyPolicy {
     public static var providerCommands: Set<String> { ProviderProxyCatalog.providerSet }
 
@@ -1977,7 +1977,7 @@ public enum ProviderProxyPolicy {
                 .first.map(String.init) ?? argument
             guard !continuationFlags.contains(flagName) else {
                 // Final JSON on resumed/continued sessions is cumulative and
-                // cannot be attributed as a fresh Token Saver run.
+                // cannot be attributed as a fresh run.
                 return nil
             }
             if provider == AgentProvider.claude.rawValue,
@@ -2364,8 +2364,8 @@ public enum ProviderProxyPolicy {
         return String(raw.prefix(128))
     }
 
-    // PERF: makeNodeId sanitizes provider basenames on nested Token Saver
-    // PATH-wrapper spawns; union CharacterSet(charactersIn:) per call is waste.
+    // PERF: makeNodeId sanitizes provider basenames on nested provider
+    // spawns; union CharacterSet(charactersIn:) per call is waste.
     private static let nodeIdTokenScalars = CharacterSet.alphanumerics
         .union(CharacterSet(charactersIn: "-_."))
 

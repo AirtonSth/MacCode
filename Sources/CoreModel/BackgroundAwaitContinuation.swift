@@ -39,8 +39,8 @@ public enum BackgroundAwaitContinuation {
     /// render layer (`strippingAwaitingMarker`) so it never shows in the transcript.
     public static let awaitingMarker = "[[RC_AWAITING]]"
 
-    /// System-prompt rule injected for the Claude provider on every run (independent
-    /// of Token Saver) so the agent self-declares an unavoidable background-await
+    /// System-prompt rule injected for the Claude provider on every run so the
+    /// agent self-declares an unavoidable background-await
     /// with `awaitingMarker`. Behaviour-narrow on purpose: it governs only how the
     /// agent *signals* a wait it cannot avoid. It does not tell the agent to
     /// busy-poll, and it explicitly excludes "task is done" and "waiting on the

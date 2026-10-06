@@ -22,7 +22,6 @@ RemoteCode is built around a simple rule: the Mac stays the source of truth. Age
 
 - Start and continue agent threads from a native macOS surface.
 - Use Codex and Claude Code as first-class providers.
-- Enable Token Saver for subscribed accounts to run local Distill compression before selected provider calls.
 - Switch provider, model, reasoning effort, service tier, permissions, and execution mode before a run starts.
 - Use dynamic provider model discovery where available, with safe fallback model aliases.
 - Add custom model IDs, persist them, and manage them later from Settings.
@@ -35,14 +34,6 @@ RemoteCode is built around a simple rule: the Mac stays the source of truth. Age
 - Answer provider approval and user-input cards directly in the app.
 - Rehydrate thread history and runtime state after app restart.
 - Track running/failed/completed state in tabs and workspace chrome.
-
-### Token Saver
-
-- Runs the native `RemoteCodeDistillService` sidecar on localhost only after the account, setting, and approved MLX model checks pass.
-- Installs managed `/distill` instructions and a local `distill` CLI for Codex and Claude while Token Saver is enabled.
-- Compresses long prompts, command output, and SR1-style agent answers with fail-open behavior so provider turns continue if the sidecar is unavailable.
-- Stores large originals behind reversible `[[rc:<handle>]]` markers so exact bytes can be recovered with `distill retrieve <handle>`.
-- Tracks measured saved tokens by provider, mode, and cache state; `distill stats` reads the local savings ledger.
 
 ### Terminal
 
@@ -149,11 +140,10 @@ RemoteCode is split into focused modules:
 - `AppShell`: macOS app shell, workspaces, tabs, panes, settings, command routing, and app lifecycle.
 - `Surfaces`: native macOS surfaces for Agent App, Terminal, Browser, Files, Git/Diff, previews, and related UI.
 - `AgentRuntime`: provider adapters and runtime logic for Codex, Claude Code, streaming, approvals, user input, session recovery, and model discovery.
-- `DistillCore`: Token Saver request routing, deterministic compression, local Distill HTTP service types, managed CLI logic, metrics, and reversible-handle protocol.
 - `SocketServer`: local HTTP/RPC/WebSocket API, pairing, event streaming, and remote-control dispatch.
 - `CoreModel`: shared workspace, surface, agent, provider, and event models.
 - `Persistence`: SQLite-backed storage for settings, workspaces, threads, messages, queues, checkpoints, prompts, and trusted devices.
-- `RemoteCodeDistillService`: packaged localhost sidecar for approved MLX model inference, savings recording, retrieve, metrics, and stats.
+- `RemoteCodeDistillService`: packaged helper executable for the provider proxy, Agent App middleware, subagent telemetry, the Chrome host, and the bot and computer-use MCP servers.
 - `DesignSystemKit`: shared tokens and native UI components.
 - `ios-app`: SwiftUI remote-control client for iPhone.
 - `watchos-app`: watch-side companion surfaces.

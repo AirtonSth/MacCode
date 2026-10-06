@@ -139,8 +139,7 @@ public enum RemoteCodeOrchestrateInstallError: Error, Sendable, Equatable {
 }
 
 /// Always-on parent identity for the provider-neutral `subagent begin` bridge.
-/// This is lifecycle scope only: resolving it must not depend on Token Saver
-/// admission or enable any paid lane.
+/// This is lifecycle scope only: resolving it must not enable any paid lane.
 public struct RemoteCodeSubagentTelemetryScope: Sendable, Equatable {
     public let threadId: AgentThreadID
     public let parentRunId: AgentRunID?
@@ -540,9 +539,6 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         }
         guard let effectiveOverride else { return arguments }
         let encoded = effectiveOverride.assignment.encoded
-        if encoded.contains("TOKEN_SAVER_SAFETY_ABI_V1") {
-            return arguments
-        }
         let delimiter: String
         if encoded.hasPrefix("\"\"\"") && encoded.hasSuffix("\"\"\"") {
             delimiter = "\"\"\""
@@ -1099,8 +1095,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     ///
     /// Ownership-safe and idempotent: never clobbers a user-owned regular file in the
     /// managed bin directory. Only creates a symlink when a real provider executable
-    /// exists outside the managed bin (so we never shadow a missing CLI). Independent
-    /// of Token Saver — available for every thread-scoped provider environment.
+    /// exists outside the managed bin (so we never shadow a missing CLI). Available
+    /// for every thread-scoped provider environment.
     ///
     /// - Parameter searchDirectoriesOverride: test seam; production always discovers
     ///   system PATH minus the managed bin.
@@ -1416,7 +1412,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     }
 
     /// Admit the host-queued computer-use MCP into Claude and Codex configs.
-    /// Idempotent; leftover / user-authored servers stay. Not Token Saver gated.
+    /// Idempotent; leftover / user-authored servers stay.
     public func installComputerUseMCP(serviceBinaryURL: URL? = nil) throws {
         guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
             throw AgentSkillCLIError.serviceBinaryUnavailable
@@ -2600,9 +2596,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return .removed
     }
 
-    // PERF: upsert/remove distill instructions recompiled the begin/end block
-    // pattern via range(of:options:.regularExpression) on every Token Saver
-    // skill install/uninstall. Compile once; match semantics unchanged.
+    // PERF: removing legacy distill instructions recompiled the begin/end block
+    // pattern via range(of:options:.regularExpression) on every call.
+    // Compile once; match semantics unchanged.
     private static let distillInstructionsBlockRegex: NSRegularExpression = {
         let begin = NSRegularExpression.escapedPattern(for: distillInstructionsBeginMarker)
         let end = NSRegularExpression.escapedPattern(for: distillInstructionsEndMarker)

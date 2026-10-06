@@ -2,7 +2,7 @@ import XCTest
 @testable import Persistence
 import CoreModel
 
-/// QA-mac:50 -- the app + the Token Saver sidecar open the SAME sqlite file as two
+/// QA-mac:50 -- the app + a helper process open the SAME sqlite file as two
 /// independent connections (documented at SQLite.swift:45-49 and
 /// ReversibleContentStore.swift:10-13), but nothing exercised that two-connection
 /// contract. These tests open two SQLiteDB connections on one WAL file -- the same
@@ -123,7 +123,7 @@ final class CrossConnectionWALTests: XCTestCase {
         }
 
         try NotificationRepository(db: sidecarConnection).insert(
-            AppNotification(id: "sidecar-auth-write", title: "Token Saver", category: "wal")
+            AppNotification(id: "sidecar-auth-write", title: "Helper", category: "wal")
         )
 
         let verifiedDevice = try trustRepository.verify(
@@ -152,7 +152,7 @@ final class CrossConnectionWALTests: XCTestCase {
         }
 
         try NotificationRepository(db: sidecarConnection).insert(
-            AppNotification(id: "sidecar-write", title: "Token Saver", category: "wal")
+            AppNotification(id: "sidecar-write", title: "Helper", category: "wal")
         )
 
         let pairing = try DeviceTrustRepository(db: appConnection)
@@ -179,7 +179,7 @@ final class CrossConnectionWALTests: XCTestCase {
         }
 
         try NotificationRepository(db: sidecarConnection).insert(
-            AppNotification(id: "sidecar-write-after-error", title: "Token Saver", category: "wal")
+            AppNotification(id: "sidecar-write-after-error", title: "Helper", category: "wal")
         )
 
         let pairing = try DeviceTrustRepository(db: appConnection)

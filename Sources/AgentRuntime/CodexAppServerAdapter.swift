@@ -4045,7 +4045,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let last = container["last"] as? [String: Any]
         let total = container["total"] as? [String: Any]
         // Prefer per-turn `last` for reported input/output/totalTokens (existing
-        // Token Saver / cost accounting contract). Keep that source unchanged.
+        // cost accounting contract). Keep that source unchanged.
         let source = last ?? total ?? container
         let input = int(source["inputTokens"]) ?? int(source["input_tokens"]) ?? 0
         let output = int(source["outputTokens"]) ?? int(source["output_tokens"]) ?? 0

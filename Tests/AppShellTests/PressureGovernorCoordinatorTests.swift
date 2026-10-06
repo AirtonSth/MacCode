@@ -73,7 +73,7 @@ final class PressureGovernorCoordinatorTests: XCTestCase {
             envelope: .unmeasured,
             hostPressure: .warning,
             providerTreePressure: .normal,
-            degradationActions: ["pause Graphify ensure"],
+            degradationActions: ["pause background refresh"],
             unavailableSections: ["hangWatchdog"],
             canExportDiagnostics: true
         )

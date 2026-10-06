@@ -298,7 +298,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
 
     func test_samGrokWorkerPromotion_preservesExactAgentAppContractForEveryEffort() throws {
         // WHY: the promoted execution must keep the worker report ABI while the
-        // real Agent App thread owns persistence, Token Saver and usage.
+        // real Agent App thread owns persistence and usage.
         // Live sam-grok-worker emits --model grok-4.6; grok-4.5 remains valid.
         let models = ["grok-4.5", "grok-4.6", "grok-4.6-preview"]
         for model in models {
@@ -434,7 +434,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
 
     func test_nestedCLIAgentAppDelegation_promotesClaudeCodexGrokAgentTurns() throws {
         // WHY: product requires nested shell `claude`/`codex`/`grok` to enter
-        // Agent App (full Token Saver) when the turn ABI is agent-shaped.
+        // Agent App when the turn ABI is agent-shaped.
         let prompt = "/tmp/rc-nested-prompt.txt"
         let claude = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "claude",
@@ -2000,7 +2000,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
     }
 
     func test_usageCommitBuffer_offCommitsActualUsageWithoutConsumingEligibility() {
-        // WHY: Token Saver OFF still records provider usage with eligibleRuns=0.
+        // WHY: provider usage is still recorded, with eligibleRuns=0.
         // If it is enabled later in the same process, exactly the first admitted
         // commit may carry eligibleRuns=1.
         var buffer = ProviderProxyUsageCommitBuffer()
