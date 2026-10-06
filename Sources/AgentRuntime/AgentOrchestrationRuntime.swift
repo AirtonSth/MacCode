@@ -1155,22 +1155,37 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
             throw lockError(operation: "fchmod")
         }
 
-        var fileLock = Darwin.flock()
-        fileLock.l_start = 0
-        fileLock.l_len = 0
-        fileLock.l_pid = 0
-        fileLock.l_type = Int16(F_WRLCK)
-        fileLock.l_whence = Int16(SEEK_SET)
-        while Darwin.fcntl(descriptor, F_SETLKW, &fileLock) == -1 {
-            if errno != EINTR {
-                throw lockError(operation: "lock")
+        // The file lock is taken before the SQLite transaction (see
+        // withReceiptMutation/withReceiptRead) and is shared with the Distill
+        // sidecars. Wait at most 2 s: a stuck or suspended peer must not hang
+        // the app. Database storage fails open, because BEGIN IMMEDIATE already
+        // serializes writers across processes; the JSONL file has no other
+        // guard, so it fails instead.
+        switch BoundedFileLock.acquireExclusive(
+            descriptor: descriptor,
+            style: .posixRecord,
+            label: "orchestration-receipts",
+            onTimeout: isDatabaseStorage ? .failOpen : .fail
+        ) {
+        case .acquired:
+            defer { BoundedFileLock.unlock(descriptor: descriptor, style: .posixRecord) }
+            return try body()
+        case .timedOut:
+            guard isDatabaseStorage else {
+                throw AgentOrchestrationAdmissionError.receiptPersistenceFailed(
+                    "lock orchestration lock: timed out"
+                )
             }
+            return try body()
+        case .failed(let code):
+            errno = code
+            throw lockError(operation: "lock")
         }
-        defer {
-            fileLock.l_type = Int16(F_UNLCK)
-            _ = Darwin.fcntl(descriptor, F_SETLK, &fileLock)
-        }
-        return try body()
+    }
+
+    private var isDatabaseStorage: Bool {
+        if case .database = storage { return true }
+        return false
     }
 
     private func lockError(operation: String) -> AgentOrchestrationAdmissionError {

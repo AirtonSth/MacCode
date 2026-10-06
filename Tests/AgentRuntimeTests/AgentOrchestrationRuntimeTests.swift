@@ -444,6 +444,52 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
                        "Host receipt must match the admitted route, not allCases default.")
     }
 
+    func testReceiptLockHeldByStuckPeerFailsOpenAfterAboutTwoSeconds() throws {
+        // WHY (S-F7): the orchestration lock is shared with the Distill
+        // sidecars and wrapped the SQLite transaction with an unbounded
+        // F_SETLKW, so a stuck sidecar could hang admission forever. Database
+        // storage fails open after 2 s because BEGIN IMMEDIATE still serializes
+        // writers, so the receipt must persist exactly once anyway.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let databaseURL = URL(fileURLWithPath: db.path).standardizedFileURL
+        let lockPath = databaseURL.deletingLastPathComponent()
+            .appendingPathComponent(".\(databaseURL.lastPathComponent).orchestration.lock").path
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            now: { Date(timeIntervalSince1970: 42) }
+        )
+        let holder = try CrossProcessFileLockHolder(path: lockPath)
+        defer { holder.release() }
+
+        let readStart = Date()
+        XCTAssertTrue(try repository.receipts().isEmpty)
+        let readTime = Date().timeIntervalSince(readStart)
+        XCTAssertGreaterThanOrEqual(readTime, 1.9)
+        XCTAssertLessThan(readTime, 3.0, "one call must not wait for the 30 s holder")
+
+        let runId = AgentRunID()
+        let admitStart = Date()
+        let admission = try runtime.admit(
+            runId: runId,
+            threadId: AgentThreadID(),
+            configuration: configuration(runtime: runtime),
+            providerSnapshots: snapshots(),
+            interactionMode: .default,
+            permissionMode: .supervised,
+            attachments: []
+        )
+        let admitTime = Date().timeIntervalSince(admitStart)
+        print("orchestration admit under held lock: \(admitTime)s")
+        XCTAssertLessThan(admitTime, 6,
+                          "admission must finish well before the holder lets go")
+        holder.release()
+        XCTAssertEqual(try repository.receipts().map(\.id), [admission.receipt.id])
+    }
+
     func testAdmissionSelectsLiveEligibleProviderAndPersistsAuditableReceipt() throws {
         let (db, root) = try database()
         defer { try? FileManager.default.removeItem(atPath: root) }

@@ -9835,19 +9835,24 @@ private final class TerminalHistoryFailureLedger: @unchecked Sendable {
             kind: "lock"
         )
         defer { Darwin.close(descriptor) }
-        var fileLock = Darwin.flock()
-        fileLock.l_start = 0
-        fileLock.l_len = 0
-        fileLock.l_pid = 0
-        fileLock.l_type = Int16(F_WRLCK)
-        fileLock.l_whence = Int16(SEEK_SET)
-        guard Darwin.fcntl(descriptor, F_SETLKW, &fileLock) != -1 else {
+        // Bounded wait: a stuck peer process must not hang terminal history.
+        // The anchors have no other cross-process guard, so a timeout throws.
+        switch BoundedFileLock.acquireExclusive(
+            descriptor: descriptor,
+            style: .posixRecord,
+            label: "terminal-history-failure-ledger",
+            onTimeout: .fail
+        ) {
+        case .acquired:
+            break
+        case .timedOut:
+            errno = ETIMEDOUT
+            throw posixError("lock ledger")
+        case .failed(let code):
+            errno = code
             throw posixError("lock ledger")
         }
-        defer {
-            fileLock.l_type = Int16(F_UNLCK)
-            _ = Darwin.fcntl(descriptor, F_SETLK, &fileLock)
-        }
+        defer { BoundedFileLock.unlock(descriptor: descriptor, style: .posixRecord) }
         guard Darwin.fchmod(descriptor, S_IRUSR | S_IWUSR) == 0 else {
             throw posixError("chmod ledger lock")
         }

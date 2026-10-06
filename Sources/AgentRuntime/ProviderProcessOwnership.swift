@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import Persistence
 
 public enum ProviderProcessOwnershipError: Error, LocalizedError, Equatable {
     case storeNotConfigured
@@ -71,11 +72,29 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
             throw ProviderProcessOwnershipError.processListFailed("ownership lock open failed")
         }
         defer { close(lockFD) }
-        if flock(lockFD, LOCK_EX) != 0 {
-            throw ProviderProcessOwnershipError.processListFailed("ownership lock acquire failed")
-        }
+        try Self.acquireOwnershipLock(lockFD)
         defer { _ = flock(lockFD, LOCK_UN) }
         return try body()
+    }
+
+    /// Bounded wait (2 s) so a stuck or suspended peer cannot hang a spawn or
+    /// sweep. A timeout throws instead of failing open: an unlocked
+    /// read-modify-write could drop another process's ownership row, and a
+    /// provider without a durable row must not run (see AgentProviderRunner).
+    private static func acquireOwnershipLock(_ lockFD: Int32) throws {
+        switch BoundedFileLock.acquireExclusive(
+            descriptor: lockFD,
+            style: .flock,
+            label: "provider-process-ownership",
+            onTimeout: .fail
+        ) {
+        case .acquired:
+            return
+        case .timedOut:
+            throw ProviderProcessOwnershipError.processListFailed("ownership lock acquire timed out")
+        case .failed:
+            throw ProviderProcessOwnershipError.processListFailed("ownership lock acquire failed")
+        }
     }
 
 
@@ -188,9 +207,11 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
             guard lockFD >= 0 else {
                 throw ProviderProcessOwnershipError.processListFailed("ownership lock open failed")
             }
-            if flock(lockFD, LOCK_EX) != 0 {
+            do {
+                try Self.acquireOwnershipLock(lockFD)
+            } catch {
                 close(lockFD)
-                throw ProviderProcessOwnershipError.processListFailed("ownership lock acquire failed")
+                throw error
             }
         }
         defer {
