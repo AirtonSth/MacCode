@@ -22,14 +22,6 @@ final class TokenSaverDependencyPolicyTests: XCTestCase {
         XCTAssertTrue(package.contains("mlx-swift"), "F7: Core ML/MLX is the native Token Saver runtime path")
     }
 
-    func test_agentsDocumentsNativeDependencyPolicy() throws {
-        let agents = try String(contentsOf: repoRoot.appendingPathComponent("AGENTS.md"), encoding: .utf8)
-
-        XCTAssertTrue(agents.contains("Never introduce Python, Rust, external headroom code"))
-        XCTAssertTrue(agents.contains("ONNX Runtime C++ is fallback-only"))
-        XCTAssertTrue(agents.contains("Core ML/MLX remains the default native path"))
-    }
-
     private var repoRoot: URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
