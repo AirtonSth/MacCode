@@ -16,11 +16,17 @@ final class ProviderSessionReaperLivenessTests: XCTestCase {
         let provider: AgentProvider = .distill
         private let lock = NSLock()
         private var sessions: [AgentThreadID: AgentRunStatus] = [:]
+        private var toolsRunning: Set<AgentThreadID> = []
         private var _stopped: [AgentThreadID] = []
 
         var stopped: [AgentThreadID] { lock.withLock { _stopped } }
         func resident(_ threadId: AgentThreadID, status: AgentRunStatus) {
             lock.withLock { sessions[threadId] = status }
+        }
+        func setToolsMayStillRun(_ threadId: AgentThreadID, _ running: Bool) {
+            lock.withLock {
+                if running { toolsRunning.insert(threadId) } else { toolsRunning.remove(threadId) }
+            }
         }
 
         func listModels() async -> [AgentModelDescriptor] { [] }
@@ -39,10 +45,19 @@ final class ProviderSessionReaperLivenessTests: XCTestCase {
                 _stopped.append(threadId)
             }
         }
-        func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {}
+        /// Like Distill and Grok: a recovered session is resident and reports `.completed`.
+        func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {
+            resident(request.threadId, status: .completed)
+        }
         func listSessions() -> [AgentProviderSessionSummary] {
             lock.withLock {
-                sessions.map { AgentProviderSessionSummary(threadId: $0.key, provider: .distill, status: $0.value, providerThreadId: "p-\($0.key.value.uuidString)") }
+                sessions.map {
+                    AgentProviderSessionSummary(
+                        threadId: $0.key, provider: .distill, status: $0.value,
+                        providerThreadId: "p-\($0.key.value.uuidString)",
+                        toolsMayStillRun: toolsRunning.contains($0.key)
+                    )
+                }
             }
         }
         func hasSession(threadId: AgentThreadID) -> Bool { lock.withLock { sessions[threadId] != nil } }
@@ -54,6 +69,7 @@ final class ProviderSessionReaperLivenessTests: XCTestCase {
 
     private struct Fixture {
         let threadRepo: AgentThreadRepository
+        let runRepo: AgentRunRepository
         let sessionRepo: ProviderSessionRuntimeRepository
         let adapter: ResidentAdapter
         let coordinator: AgentRunCoordinator
@@ -71,11 +87,16 @@ final class ProviderSessionReaperLivenessTests: XCTestCase {
         }
 
         /// One reaper tick exactly as AppContext runs it.
-        func tick(cutoff: Date, active: Set<AgentThreadID> = []) throws -> ProviderSessionReaperResult {
+        func tick(
+            cutoff: Date,
+            active: Set<AgentThreadID> = [],
+            cap: Int = ProviderSessionReaper.providerRootCap
+        ) throws -> ProviderSessionReaperResult {
             let live = coordinator.liveProviderSessions()
             let result = try ProviderSessionReaper(
                 sessionRepo: sessionRepo,
-                liveSessions: { live }
+                liveSessions: { live },
+                providerRootCap: cap
             ) { active }.reapIdleSessions(olderThan: cutoff)
             coordinator.releaseReapedProviderSessions(result)
             return result
@@ -88,14 +109,15 @@ final class ProviderSessionReaperLivenessTests: XCTestCase {
         let threadRepo = AgentThreadRepository(db: db)
         let sessionRepo = ProviderSessionRuntimeRepository(db: db)
         let adapter = ResidentAdapter()
+        let runRepo = AgentRunRepository(db: db)
         let coordinator = AgentRunCoordinator(
-            runRepo: AgentRunRepository(db: db),
+            runRepo: runRepo,
             messageRepo: AgentMessageRepository(db: db),
             threadRepo: threadRepo,
             providerSessionRepo: sessionRepo,
             providerAdapters: [.distill: adapter]
         )
-        return Fixture(threadRepo: threadRepo, sessionRepo: sessionRepo, adapter: adapter, coordinator: coordinator)
+        return Fixture(threadRepo: threadRepo, runRepo: runRepo, sessionRepo: sessionRepo, adapter: adapter, coordinator: coordinator)
     }
 
     func test_failedCancelledAndInterruptedSessionsAreReleasedAfterIdle_activeAndInFlightKept() throws {
@@ -186,5 +208,112 @@ final class ProviderSessionReaperLivenessTests: XCTestCase {
         XCTAssertEqual(result.cappedThreadIds, [idle],
                        "only idle sessions can be released; the count stays above the cap while the user runs more agents")
         XCTAssertEqual(Set(f.coordinator.liveProviderSessions().map(\.threadId)), active)
+    }
+
+    func test_sessionWhoseToolsMayStillRun_isKeptUntilItsPromptReturns() throws {
+        // WHY (S-F3 review): the inactivity watchdog ends a turn as interrupted
+        // while a tool call is still open (a long silent build). That tool may
+        // still be running in the session's process tree, so neither the idle
+        // pass nor the cap may kill it; once the prompt returns it is releasable.
+        let f = try makeFixture("reaper-open-tools")
+        let old = Date(timeIntervalSince1970: 1_000)
+        let cutoff = Date(timeIntervalSince1970: 2_000)
+        let building = try f.thread(row: .interrupted, updatedAt: old, resident: .interrupted)
+        f.adapter.setToolsMayStillRun(building, true)
+        let recentBuilding = try f.thread(row: .interrupted, updatedAt: cutoff.addingTimeInterval(10), resident: .interrupted)
+        f.adapter.setToolsMayStillRun(recentBuilding, true)
+
+        let first = try f.tick(cutoff: cutoff, cap: 0)
+        XCTAssertTrue(first.stoppedThreadIds.isEmpty && first.cappedThreadIds.isEmpty)
+        XCTAssertTrue(f.adapter.hasSession(threadId: building),
+                      "an idle session whose tool may still run must not be killed by the idle pass")
+        XCTAssertTrue(f.adapter.hasSession(threadId: recentBuilding),
+                      "nor by the cap, even at a cap of zero")
+
+        f.adapter.setToolsMayStillRun(building, false)
+        let second = try f.tick(cutoff: cutoff, cap: ProviderSessionReaper.providerRootCap)
+        XCTAssertEqual(second.stoppedThreadIds, [building], "once its prompt returned, the idle session is released")
+        XCTAssertFalse(f.adapter.hasSession(threadId: building))
+        XCTAssertEqual(try f.sessionRepo.get(threadId: building)?.status, .interrupted)
+    }
+
+    func test_releaseWaitsOutAFinishInFlightAndAReservedStart() throws {
+        // WHY (S-F3 review): the cap targets sessions that finished seconds ago.
+        // Releasing one whose finish (or a queued follow-up start) is still in
+        // flight kills a turn that just began or forces a respawn nobody needed.
+        let f = try makeFixture("reaper-barrier")
+        let cutoff = Date(timeIntervalSince1970: 1_000)
+        let finishing = try f.thread(row: .completed, updatedAt: cutoff.addingTimeInterval(10), resident: .completed)
+        let reserved = try f.thread(row: .completed, updatedAt: cutoff.addingTimeInterval(20), resident: .completed)
+        let finishingRun = AgentRunID()
+        let reservedRun = AgentRunID()
+        f.coordinator.setFinishingRunForTesting(threadId: finishing, runId: finishingRun, finishing: true)
+        f.coordinator.reserveProviderStart(threadId: reserved, runId: reservedRun)
+
+        let first = try f.tick(cutoff: cutoff, cap: 0)
+        XCTAssertEqual(Set(first.cappedThreadIds), [finishing, reserved], "both are over a cap of zero")
+        XCTAssertTrue(f.adapter.hasSession(threadId: finishing),
+                      "a session whose run is still finishing must not be released")
+        XCTAssertTrue(f.adapter.hasSession(threadId: reserved),
+                      "a session a surface reserved a start on must not be released")
+        XCTAssertTrue(f.adapter.stopped.isEmpty)
+
+        f.coordinator.setFinishingRunForTesting(threadId: finishing, runId: finishingRun, finishing: false)
+        f.coordinator.releaseProviderStartReservation(threadId: reserved, runId: reservedRun)
+        _ = try f.tick(cutoff: cutoff, cap: 0)
+        XCTAssertEqual(Set(f.adapter.stopped), [finishing, reserved],
+                       "once the finish and the start reservation are gone, the next tick releases them")
+    }
+
+    func test_tickReadsSessionAgesInOneQuery() throws {
+        // WHY (S-F3 review): the reaper ticks every 30 s on the main actor over the
+        // single serialized SQLite connection; one row read per live session made
+        // the tick cost grow with every resident agent.
+        let f = try makeFixture("reaper-batched-read")
+        let cutoff = Date(timeIntervalSince1970: 1_000)
+        for index in 0..<5 {
+            _ = try f.thread(row: .completed, updatedAt: cutoff.addingTimeInterval(Double(10 + index)), resident: .completed)
+        }
+        let getsBefore = f.sessionRepo.durableGetCountForTesting
+        let batchesBefore = f.sessionRepo.updatedAtBatchCountForTesting
+
+        _ = try f.tick(cutoff: cutoff)
+
+        XCTAssertEqual(f.sessionRepo.durableGetCountForTesting, getsBefore, "no per-session row read")
+        XCTAssertEqual(f.sessionRepo.updatedAtBatchCountForTesting, batchesBefore + 1)
+    }
+
+    func test_recoveredSessionCountsAsUse_notReleasedOnTheNextTick() async throws {
+        // WHY (S-F3 review): opening an interrupted thread recovers its session,
+        // which spawns a provider process that reports `.completed`. With an old
+        // row, the next tick released that fresh process and the next open spawned
+        // it again: spawn-then-kill churn, and a cold respawn on Continue.
+        let f = try makeFixture("reaper-recovery-use")
+        var thread = AgentThread(title: "t", provider: .distill, model: "m")
+        thread.status = .interrupted
+        thread.worktreePath = NSTemporaryDirectory()
+        try f.threadRepo.upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .distill, model: "m", status: .interrupted)
+        try f.runRepo.upsert(run)
+        let old = Date(timeIntervalSince1970: 1_000)
+        try f.sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id, provider: .distill, status: .interrupted,
+            resumeCursor: "cursor-\(thread.id.value.uuidString)", cwd: NSTemporaryDirectory(),
+            lastRunId: run.id, updatedAt: old
+        ))
+
+        let recoveryStartedAt = Date()
+        _ = try await f.coordinator.readThread(threadId: thread.id)
+        XCTAssertTrue(f.adapter.hasSession(threadId: thread.id), "opening the thread recovered its session")
+        let stamped = try XCTUnwrap(f.sessionRepo.get(threadId: thread.id)?.updatedAt)
+        XCTAssertGreaterThanOrEqual(stamped.timeIntervalSince1970, recoveryStartedAt.timeIntervalSince1970 - 1,
+                                    "a recovery that reuses its last run must still count as use")
+
+        let result = try f.tick(cutoff: recoveryStartedAt.addingTimeInterval(-60))
+        XCTAssertFalse(result.stoppedThreadIds.contains(thread.id))
+        XCTAssertTrue(f.adapter.hasSession(threadId: thread.id),
+                      "the process recovery just spawned must not be released on the next tick")
+        XCTAssertEqual(try f.sessionRepo.get(threadId: thread.id)?.status, .interrupted,
+                       "recovery keeps the Continue target")
     }
 }

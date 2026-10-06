@@ -8169,6 +8169,7 @@ public final class ProviderSessionRuntimeRepository {
     public private(set) var stampResumeCursorCountForTesting = 0
     public private(set) var updateDiagnosticsCountForTesting = 0
     public private(set) var markStoppedCountForTesting = 0
+    public private(set) var updatedAtBatchCountForTesting = 0
     public private(set) var stampLastRunIdCountForTesting = 0
     public private(set) var resumeCursorProbeCountForTesting = 0
     public private(set) var lastErrorMessageProbeCountForTesting = 0
@@ -8345,6 +8346,40 @@ public final class ProviderSessionRuntimeRepository {
             ))
         }
         return sessions
+    }
+
+    /// `updated_at` of each thread's session row in one query, for the idle
+    /// reaper's 30 s tick. Threads with no row are absent.
+    public func updatedAt(threadIds: [AgentThreadID]) throws -> [AgentThreadID: Date] {
+        updatedAtBatchCountForTesting += 1
+        let unique = Array(Set(threadIds))
+        var out: [AgentThreadID: Date] = [:]
+        for start in stride(from: 0, to: unique.count, by: 200) {
+            let batch = unique[start..<min(start + 200, unique.count)]
+            let marks = Array(repeating: "?", count: batch.count).joined(separator: ",")
+            let st = try db.prepare(
+                "SELECT thread_id, updated_at FROM provider_session_runtime WHERE thread_id IN (\(marks));"
+            )
+            for (index, id) in batch.enumerated() {
+                try st.bind(Int32(index + 1), id.value.uuidString)
+            }
+            while try st.step() {
+                guard let uuid = UUID(uuidString: st.columnText(0) ?? "") else { continue }
+                out[AgentThreadID(uuid)] = parseDate(st.columnText(1))
+            }
+        }
+        return out
+    }
+
+    /// `updated_at` only: a recovered session counts as used, so the idle
+    /// reaper does not release the process it just spawned. Missing rows are a no-op.
+    public func stampUsed(threadId: AgentThreadID, at date: Date = Date()) throws {
+        let statement = try db.prepare(
+            "UPDATE provider_session_runtime SET updated_at = ? WHERE thread_id = ?;"
+        )
+        try statement.bind(1, iso.string(from: date))
+        try statement.bind(2, threadId.value.uuidString)
+        _ = try statement.step()
     }
 
     /// Cheap resume-cursor probe for the provider `.error` recoverable bit.

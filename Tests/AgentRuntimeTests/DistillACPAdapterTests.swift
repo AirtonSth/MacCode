@@ -952,25 +952,18 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                        [DistillACPAdapter.incompatibleHistoryNotice + DistillACPAdapter.handoffMissingNoticeSuffix])
     }
 
-    func test_failedTurnReleasesItsSession_completedTurnKeepsItWarm() async throws {
-        // WHY (S-F3): the next send after a failed turn loads the session in a new
-        // process, so the failed one was never reused; it and its MCP sidecars
-        // idled until the app quit. A completed turn's process is reused by the
-        // follow-up, so it must stay.
-        let root = try makeTempRoot("distill-acp-failed-release")
+    func test_failedTurnKeepsItsSessionWarm_retryRunsInTheSameProcess() async throws {
+        // WHY (S-F3 review): a TERM right after the turn skips Distill's session
+        // shutdown, which flushes the records `session/load` replays. Killing a
+        // failed turn's process made Retry reload a session that could miss the
+        // failed prompt and the tool calls it already ran. The failed session
+        // stays resident (listed as failed) so Retry runs warm; the idle reaper
+        // releases it once it has been idle past idleReleaseAge.
+        let root = try makeTempRoot("distill-acp-failed-warm")
         defer { try? FileManager.default.removeItem(at: root) }
         let (harness, requestsURL) = try writeFailureHarness(root: root)
         let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
         defer { adapter.stopAll() }
-
-        let healthy = AgentThreadID()
-        let ok = DistillACPAdapterEventBox()
-        _ = try await adapter.startSession(
-            distillRequest(thread: healthy, model: "muse-spark-1.3-contributor", prompt: "First request", root: root)
-        ) { ok.append($0) }
-        let okFinished = try await ok.waitForFinish()
-        XCTAssertEqual(okFinished.status, .completed)
-        XCTAssertTrue(adapter.hasSession(threadId: healthy))
 
         let thread = AgentThreadID()
         let failed = DistillACPAdapterEventBox()
@@ -979,10 +972,10 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         ) { failed.append($0) }
         let failedFinished = try await failed.waitForFinish()
         XCTAssertEqual(failedFinished.status, .failed)
-        XCTAssertFalse(adapter.hasSession(threadId: thread),
-                       "a failed turn must release its provider process, not leave it resident")
-        XCTAssertFalse(adapter.listSessions().contains { $0.threadId == thread })
-        XCTAssertTrue(adapter.hasSession(threadId: healthy), "only the failed thread's session is released")
+        XCTAssertTrue(adapter.hasSession(threadId: thread),
+                      "a failed turn must not kill its process: Retry needs the warm session and its unflushed context")
+        XCTAssertEqual(adapter.listSessions().first { $0.threadId == thread }?.status, .failed,
+                       "the reaper finds the failed session by its adapter status and releases it after idle")
 
         let retry = DistillACPAdapterEventBox()
         _ = try await adapter.sendTurn(
@@ -990,12 +983,12 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                            providerThreadId: failedFinished.providerThreadId)
         ) { retry.append($0) }
         let retried = try await retry.waitForFinish()
-        XCTAssertEqual(retried.status, .completed, "Retry after the release must still work")
-        XCTAssertEqual(retried.providerThreadId, failedFinished.providerThreadId,
-                       "Retry resumes the same Distill session in a new process")
-        XCTAssertTrue(try recordedRequests(requestsURL).contains {
-            $0["method"] as? String == "session/load" && $0["sessionId"] as? String == failedFinished.providerThreadId
-        }, "the new process must load the failed session, not start an empty one")
+        XCTAssertEqual(retried.status, .completed)
+        XCTAssertEqual(retried.providerThreadId, failedFinished.providerThreadId)
+        let requests = try recordedRequests(requestsURL)
+        XCTAssertFalse(requests.contains { $0["method"] as? String == "session/load" },
+                       "Retry must reuse the live process, not reload the session in a new one")
+        XCTAssertEqual(requests.filter { $0["method"] as? String == "session/prompt" }.count, 2)
     }
 
     func test_modelFamilyIsDerivedFromDistillClaudePrefix() {

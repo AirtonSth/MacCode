@@ -182,6 +182,10 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         /// (`stopReason: "error"`) for `generation`. Fallback for peers that
         /// answer the failed `session/prompt` with a bare "Internal error".
         var promptFailureDetail: (generation: UInt64, text: String)?
+        /// The inactivity watchdog ended this prompt generation while a tool call
+        /// was still open: the tool (a long silent build, say) may still be
+        /// running in this process tree until that prompt's response arrives.
+        var abandonedOpenToolsGeneration: UInt64?
         /// The provider rejected this session's own history; never prompt it again.
         var historyIncompatible = false
         /// A replacement session publishes its id (the resume cursor) only once
@@ -910,7 +914,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 threadId: $0.threadId,
                 provider: .distill,
                 status: $0.status,
-                providerThreadId: $0.providerThreadId
+                providerThreadId: $0.providerThreadId,
+                toolsMayStillRun: $0.abandonedOpenToolsGeneration != nil
             )
         }
     }
@@ -1461,8 +1466,10 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                                 acceptance.settle(.success(()))
                             }
                         )
+                        self.clearAbandonedOpenTools(session: session, generation: promptGeneration)
                         self.handlePromptResponse(response, session: session, generation: promptGeneration)
                     } catch {
+                        self.clearAbandonedOpenTools(session: session, generation: promptGeneration)
                         acceptance.settle(.failure(error))
                         self.finishTransportFailure(session: session, error: error, forced: false)
                     }
@@ -1782,11 +1789,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         // bot's credentials. The next turn loads the session in a new one.
         let endsGuestRun = session.guestPlan != nil
         let stopRequested = status == .cancelled && session.cancelRequested
-        // A failed turn's process is not reused for the next send, which loads
-        // the session in a new one (as after a restart). Left resident, it and
-        // its MCP sidecars idled until the app quit.
-        let releasesFailedSession = status == .failed
-        let shouldStopOwnedTree = stopRequested || endsGuestRun || releasesFailedSession
+        let shouldStopOwnedTree = stopRequested || endsGuestRun
         if shouldStopOwnedTree {
             if sessions[session.threadId] === session {
                 sessions.removeValue(forKey: session.threadId)
@@ -1832,7 +1835,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         }
         if shouldStopOwnedTree {
             distillAcpLog.info(
-                "distill.cancel.ack.tree_stop thread=\(session.threadId.value.uuidString, privacy: .public) guest=\(endsGuestRun, privacy: .public) failed=\(releasesFailedSession, privacy: .public)"
+                "distill.cancel.ack.tree_stop thread=\(session.threadId.value.uuidString, privacy: .public) guest=\(endsGuestRun, privacy: .public)"
             )
             if !gracefulGuestEnd { session.client.stop() }
         }
@@ -1897,6 +1900,9 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         // host does not paint a green completed goal mid long silent shell/CI.
         // Speakable text alone is only enough when no tool_call is still open.
         let hasOpenTools = session.mapper.hasOpenToolCalls
+        if hasOpenTools {
+            synchronized { session.abandonedOpenToolsGeneration = generation }
+        }
         let hasFinal = session.mapper.hasSpeakableFinalContent
         let status: AgentRunStatus
         let stopReason: String
@@ -2065,6 +2071,15 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             payloadJSON: String(data: data, encoding: .utf8) ?? "{}",
             receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
         ))
+    }
+
+    /// The abandoned prompt returned (or failed): its tools are no longer running.
+    private func clearAbandonedOpenTools(session: Session, generation: UInt64) {
+        synchronized {
+            if session.abandonedOpenToolsGeneration == generation {
+                session.abandonedOpenToolsGeneration = nil
+            }
+        }
     }
 
     private func synchronized<T>(_ body: () throws -> T) rethrows -> T {

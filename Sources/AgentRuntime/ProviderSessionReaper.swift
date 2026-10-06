@@ -77,20 +77,23 @@ public final class ProviderSessionReaper {
         // `completed` row, so the scan above never saw its process. Every
         // resident adapter session decides instead, whatever its row status:
         // idle past the cutoff, or the least recently used beyond the cap.
+        // A session whose turn the host ended with a tool call still open is
+        // kept: that tool may still be running (a long silent build). It counts
+        // toward the cap and becomes releasable once its prompt returns.
         let live = liveSessions()
         var released = Set(stopped)
         var statusPreserved = Set<AgentThreadID>()
         var capped: [AgentThreadID] = []
         var underCap: [(threadId: AgentThreadID, updatedAt: Date)] = []
         let releasable = Set(live.filter {
-            !active.contains($0.threadId) && Self.isTerminal($0.status)
-        }.map(\.threadId))
+            !active.contains($0.threadId) && Self.isTerminal($0.status) && !$0.toolsMayStillRun
+        }.map(\.threadId)).subtracting(released)
+        let lastUsed = releasable.isEmpty ? [:] : try sessionRepo.updatedAt(threadIds: Array(releasable))
         for threadId in releasable.sorted(by: { $0.value.uuidString < $1.value.uuidString }) {
-            guard !released.contains(threadId) else { continue }
             // An undated session cannot be ranked as idle; it is kept.
-            guard let session = try sessionRepo.get(threadId: threadId) else { continue }
-            guard session.updatedAt < cutoff else {
-                underCap.append((threadId, session.updatedAt))
+            guard let updatedAt = lastUsed[threadId] else { continue }
+            guard updatedAt < cutoff else {
+                underCap.append((threadId, updatedAt))
                 continue
             }
             if try staleOpenCallbacks(threadId: threadId) {
