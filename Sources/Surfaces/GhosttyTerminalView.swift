@@ -976,6 +976,7 @@ final class GhosttyTerminalView: NSView {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
         // Pull the raw C pointer out of the slot now (while self is still valid).
         // removeForClose() zeroes surfaceSlot.surface, so the pointer can only
         // come out of here once -- no double-free is possible.
@@ -1098,7 +1099,13 @@ final class GhosttyTerminalView: NSView {
         let center = NotificationCenter.default
         center.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
         center.removeObserver(self, name: NSWindow.didChangeScreenNotification, object: nil)
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        workspaceCenter.removeObserver(self, name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         guard let window else { return }
+        // S-F2: the key-window override depends on the active Space, and a Space
+        // switch does not always post an occlusion change, so re-derive the gate.
+        workspaceCenter.addObserver(self, selector: #selector(windowOcclusionDidChange),
+                                    name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         center.addObserver(self, selector: #selector(windowOcclusionDidChange),
                            name: NSWindow.didChangeOcclusionStateNotification, object: window)
         center.addObserver(self, selector: #selector(windowDidChangeScreen),
@@ -1838,7 +1845,11 @@ final class GhosttyTerminalView: NSView {
             // false-negative heal can never render into an asleep display (the AGX
             // trap the gate exists to prevent). When onScreen is already true the
             // override is irrelevant, so skip the CGDisplayIsAsleep call entirely.
-            windowIsKey: onScreen ? false : Self.windowHasLiveKeyDrawable(window)
+            windowIsKey: onScreen ? false : Self.windowHasLiveKeyDrawable(window),
+            // S-F2: a key window can stay key while its Space is not shown, so the
+            // key override also needs the window on the active Space. Only queried
+            // when the override matters (it is a WindowServer round trip).
+            windowOnActiveSpace: onScreen ? false : (window?.isOnActiveSpace ?? false)
         )
     }
 
@@ -1848,6 +1859,7 @@ final class GhosttyTerminalView: NSView {
     /// occlusionState-false-negative heal (audit #1) is allowed to trust.
     private static func windowHasLiveKeyDrawable(_ window: NSWindow?) -> Bool {
         guard let window, window.isKeyWindow, window.isVisible, !window.isMiniaturized else { return false }
+        guard NSApp.isActive else { return false }
         guard let displayID = window.screen?.displayID, displayID != 0 else { return false }
         return CGDisplayIsAsleep(displayID) == 0
     }
@@ -1868,7 +1880,8 @@ final class GhosttyTerminalView: NSView {
         windowVisible: Bool,
         windowMiniaturized: Bool,
         windowOnScreen: Bool,
-        windowIsKey: Bool
+        windowIsKey: Bool,
+        windowOnActiveSpace: Bool
     ) -> Bool {
         guard visibleInUI, !isHidden, hasNonEmptyBounds, windowPresent else { return false }
         // GPU-safety invariant is unchanged: a minimized or ordered-out (invisible)
@@ -1882,8 +1895,10 @@ final class GhosttyTerminalView: NSView {
         // window is by definition the focused front window of the active app, so it
         // HAS a live on-screen drawable. OR it in so a stale occlusionState can never
         // freeze a window the user is actively looking at. (cmux never gates render
-        // purely on occlusionState for the same reason.)
-        return windowOnScreen || windowIsKey
+        // purely on occlusionState for the same reason.) The override still requires
+        // the active Space (S-F2): a key window on a Space that is not shown has no
+        // on-screen drawable, and rendering into it is the AGX trap again.
+        return windowOnScreen || (windowIsKey && windowOnActiveSpace)
     }
 
     /// Decide whether a surface that was closed (`surfaceClosed == true`) should be
