@@ -21,9 +21,10 @@ public protocol DistillGuestLaunchResolving: Sendable {
 /// One in-guest Distill run: `docker exec -i --env-file … run-agent <runId> -- <guestCommand>`.
 ///
 /// The guest process outlives its `docker exec` client, so ending a run means
-/// running `kill-agent` in the guest. `finish` does that, then the resolver's
-/// cleanup, then frees the bot's lease, exactly once per run whichever path
-/// (turn end, Stop, transport loss, failed open) gets there first.
+/// running `kill-agent` in the guest. `finish` does that (after letting a
+/// finished turn exit on its own), then the resolver's cleanup, then frees the
+/// bot's lease, exactly once per run whichever path (turn end, Stop, transport
+/// loss, failed open) gets there first.
 public final class DistillGuestLaunchPlan: @unchecked Sendable {
     public let runID: String
     public let dockerExecutable: String
@@ -36,6 +37,7 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
     public let envFileURL: URL
     public let lease: DistillGuestLease?
     private let teardown: @Sendable (AgentRunStatus) async -> Void
+    private let teardownTimeout: TimeInterval
     private let killGuestBody: @Sendable () async -> Void
     private let killGuestDetachedBody: @Sendable () -> Void
     private let lock = NSLock()
@@ -43,12 +45,21 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
 
     /// Bound on one `kill-agent` (TERM, 1 s, KILL inside the guest).
     public static let killTimeout: TimeInterval = 5
+    /// Bound on a finished turn's own exit after stdin closes. Distill's
+    /// shutdown drains workflows (up to 7 s) and flushes the session (2 s);
+    /// a plain turn took about 2.2 s in the guest.
+    public static let gracefulExitTimeout: TimeInterval = 10
+    /// Bound on the resolver's teardown. Past it the lease is freed anyway: a
+    /// hung cleanup must not block every later run of the bot, and the guest's
+    /// lease reaper and the launch sweep still end anything left behind.
+    public static let teardownTimeout: TimeInterval = 30
 
     /// - Parameters:
     ///   - teardown: the resolver's cleanup after the guest process is gone
     ///     (credentials, gateway token, lease heartbeat).
     ///   - killGuest / killGuestDetached: tests only; default to `kill-agent`
     ///     over `docker exec` as the guest user.
+    ///   - teardownTimeout: tests only.
     public init(
         runID: String,
         dockerExecutable: String,
@@ -59,7 +70,8 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
         lease: DistillGuestLease?,
         teardown: @escaping @Sendable (AgentRunStatus) async -> Void,
         killGuest: (@Sendable () async -> Void)? = nil,
-        killGuestDetached: (@Sendable () -> Void)? = nil
+        killGuestDetached: (@Sendable () -> Void)? = nil,
+        teardownTimeout: TimeInterval = DistillGuestLaunchPlan.teardownTimeout
     ) {
         self.runID = runID
         self.dockerExecutable = dockerExecutable
@@ -69,6 +81,7 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
         self.envFileURL = envFileURL
         self.lease = lease
         self.teardown = teardown
+        self.teardownTimeout = teardownTimeout
         let killArguments = Self.killArguments(container: container, runID: runID, detached: false)
         let detachedArguments = Self.killArguments(container: container, runID: runID, detached: true)
         self.killGuestBody = killGuest ?? {
@@ -124,15 +137,32 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
     /// Kill the guest, run the resolver's teardown, delete the env file, then
     /// free the lease, in that order and once. The lease is what makes the next
     /// run of this bot wait, so it is freed only after the guest is gone and
-    /// its credentials are cleaned up. Later calls return the first call's task.
+    /// its credentials are cleaned up (or teardown ran out of time). Later
+    /// calls return the first call's task.
+    ///
+    /// `exitGracefully` runs before the kill. A finished turn passes one that
+    /// closes the client's stdin and waits (bounded) for Distill to exit on
+    /// its own: a TERM skips its session shutdown, which flushes the turn's
+    /// last durable records that the next turn's `session/load` replays.
     @discardableResult
-    public func finish(_ status: AgentRunStatus) -> Task<Void, Never> {
+    public func finish(
+        _ status: AgentRunStatus,
+        exitGracefully: (@Sendable () async -> Void)? = nil
+    ) -> Task<Void, Never> {
         lock.lock()
         defer { lock.unlock() }
         if let finishTask { return finishTask }
         let task = Task.detached { [self] in
+            await exitGracefully?()
             await killGuest()
-            await teardown(status)
+            let finished = await Self.completes(within: teardownTimeout) { [teardown] in
+                await teardown(status)
+            }
+            if !finished {
+                guestLaunchLog.error(
+                    "distill.guest.teardown.timeout run=\(self.runID, privacy: .public) seconds=\(self.teardownTimeout, privacy: .public)"
+                )
+            }
             unlink(envFileURL.path)
             await lease?.release()
             guestLaunchLog.info(
@@ -141,6 +171,32 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
         }
         finishTask = task
         return task
+    }
+
+    /// Runs `body` unstructured and returns whether it finished in time. A
+    /// body that never returns is left behind rather than awaited.
+    static func completes(
+        within timeout: TimeInterval,
+        _ body: @escaping @Sendable () async -> Void
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let resumed = OSAllocatedUnfairLock(initialState: false)
+            let resume: @Sendable (Bool) -> Void = { value in
+                let first = resumed.withLock { done -> Bool in
+                    defer { done = true }
+                    return !done
+                }
+                if first { continuation.resume(returning: value) }
+            }
+            Task.detached {
+                await body()
+                resume(true)
+            }
+            Task.detached {
+                try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+                resume(false)
+            }
+        }
     }
 
     private static func runDocker(
@@ -202,15 +258,36 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
 /// bot waits until the previous run's guest process is dead and its
 /// credentials are cleaned up. Waiters are served in arrival order.
 public actor DistillGuestLeases {
+    private struct Waiter {
+        let id: UInt64
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
     private var held: Set<String> = []
-    private var waiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var waiters: [String: [Waiter]] = [:]
+    private var nextWaiterID: UInt64 = 0
 
     public init() {}
 
-    public func acquire(_ key: String) async -> DistillGuestLease {
+    /// Throws `CancellationError` when the waiting task is cancelled (Stop
+    /// while the run waits for the bot): the waiter leaves the queue and never
+    /// takes the lease. A lease handed over before the cancellation is
+    /// returned and must be released by the caller.
+    public func acquire(_ key: String) async throws -> DistillGuestLease {
+        try Task.checkCancellation()
         if held.contains(key) {
+            nextWaiterID += 1
+            let id = nextWaiterID
             // `release` hands the lease over without freeing it in between.
-            await withCheckedContinuation { waiters[key, default: []].append($0) }
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    waiters[key, default: []].append(Waiter(id: id, continuation: continuation))
+                }
+            } onCancel: {
+                // Runs after the append: this actor is busy until the
+                // continuation above suspends.
+                Task { await self.cancelWaiter(key, id: id) }
+            }
         } else {
             held.insert(key)
         }
@@ -221,6 +298,13 @@ public actor DistillGuestLeases {
         held.contains(key)
     }
 
+    private func cancelWaiter(_ key: String, id: UInt64) {
+        guard var queue = waiters[key], let index = queue.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = queue.remove(at: index)
+        waiters[key] = queue.isEmpty ? nil : queue
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+
     fileprivate func release(_ key: String) {
         guard var queue = waiters[key], !queue.isEmpty else {
             held.remove(key)
@@ -228,7 +312,7 @@ public actor DistillGuestLeases {
         }
         let next = queue.removeFirst()
         waiters[key] = queue.isEmpty ? nil : queue
-        next.resume()
+        next.continuation.resume()
     }
 }
 

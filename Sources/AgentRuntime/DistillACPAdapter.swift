@@ -983,7 +983,22 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         let bufferedNotifications = NotificationBuffer()
         // Never falls back to the Mac: a guest thread that cannot run in its
         // guest fails here.
-        let guestPlan = try await synchronized { guestLaunchResolver }?.prepare(request)
+        let resolver = synchronized { guestLaunchResolver }
+        let guestPlan = try await resolver?.prepare(request)
+        // The resolver's two answers must agree. A guest thread without a plan
+        // would run on the Mac; a plan on an open that sends no prompt would
+        // hold the bot's guest, credentials and lease with no turn to end it.
+        if guestPlan == nil, resolver?.isGuestThread(request.threadId) == true {
+            throw AgentProviderAdapterError.unsupported(
+                "This bot thread runs in its Linux guest, but no guest launch was prepared; it will not run on the Mac."
+            )
+        }
+        if let guestPlan, !shouldStartPrompt {
+            guestPlan.finish(.cancelled)
+            throw AgentProviderAdapterError.unsupported(
+                "A bot guest run was prepared for a session open that sends no prompt."
+            )
+        }
         let client: DistillACPClient
         do {
             if let guestPlan {
@@ -1757,7 +1772,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         // A guest run ends with its turn: no idle guest process keeps the
         // bot's credentials. The next turn loads the session in a new one.
         let endsGuestRun = session.guestPlan != nil
-        let shouldStopOwnedTree = (status == .cancelled && session.cancelRequested) || endsGuestRun
+        let stopRequested = status == .cancelled && session.cancelRequested
+        let shouldStopOwnedTree = stopRequested || endsGuestRun
         if shouldStopOwnedTree {
             if sessions[session.threadId] === session {
                 sessions.removeValue(forKey: session.threadId)
@@ -1780,12 +1796,32 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         // Started before the client stops, so this status (not the docker
         // client's exit) is the run's; teardown runs in the background under
         // the bot's lease, and the callbacks below are not delayed by it.
-        session.guestPlan?.finish(status)
+        // A turn that ended on its own closes stdin and lets Distill exit
+        // first: a TERM right after the turn skips the session shutdown that
+        // flushes what the next turn's `session/load` replays. Stop kills now.
+        let gracefulGuestEnd = endsGuestRun && !stopRequested
+        if gracefulGuestEnd, let guestPlan = session.guestPlan {
+            let client = session.client
+            let runID = guestPlan.runID
+            guestPlan.finish(status, exitGracefully: {
+                let exited = await client.closeInputAndWaitForExit(
+                    timeout: DistillGuestLaunchPlan.gracefulExitTimeout
+                )
+                if !exited {
+                    distillAcpLog.error(
+                        "distill.guest.graceful_exit.timeout run=\(runID, privacy: .public)"
+                    )
+                }
+                client.stop()
+            })
+        } else {
+            session.guestPlan?.finish(status)
+        }
         if shouldStopOwnedTree {
             distillAcpLog.info(
                 "distill.cancel.ack.tree_stop thread=\(session.threadId.value.uuidString, privacy: .public) guest=\(endsGuestRun, privacy: .public)"
             )
-            session.client.stop()
+            if !gracefulGuestEnd { session.client.stop() }
         }
         callback?(.status(status))
         callback?(.finished(status, finalMessage: final, providerThreadId: providerThreadId))

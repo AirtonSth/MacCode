@@ -541,6 +541,9 @@ public final class DistillACPClient: @unchecked Sendable {
     private var pending: [Int: Pending] = [:]
     private var stderrBuffer = Data()
     private var stopped = false
+    /// Set on `writeQueue` once stdin is closed; later writes fail instead of
+    /// reaching a descriptor number the system may have reused.
+    private var inputClosed = false
     private let foreignUserUID: uid_t?
     private let mcpEnvironment: [String: String]
     /// Set when this client drives an in-guest run through `docker exec`.
@@ -1312,6 +1315,25 @@ public final class DistillACPClient: @unchecked Sendable {
         }
     }
 
+    /// Ends the ACP stream with EOF and waits up to `timeout` for the process
+    /// to exit by itself. Distill then runs its normal session shutdown, which
+    /// flushes the session's durable records; `stop()` (TERM) skips it.
+    /// Returns whether the process exited in time.
+    @discardableResult
+    func closeInputAndWaitForExit(timeout: TimeInterval) async -> Bool {
+        writeQueue.sync {
+            guard !inputClosed else { return }
+            inputClosed = true
+            try? stdinPipe.fileHandleForWriting.close()
+        }
+        let deadline = Date().addingTimeInterval(max(0, timeout))
+        while process.isRunning {
+            guard Date() < deadline else { return false }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return true
+    }
+
     public func stopImmediatelyForAppTermination() {
         lock.lock()
         let shouldStop = !stopped
@@ -1639,6 +1661,9 @@ public final class DistillACPClient: @unchecked Sendable {
         line.append(0x0A)
         let toWrite = line
         return try writeQueue.sync {
+            guard !inputClosed else {
+                throw DistillACPError.processExited(reason: .exit, status: -1, stderrTail: "")
+            }
             guard admittedBy?() ?? true else { return false }
             try GuardedStdinWrite.write(
                 toWrite, to: stdinPipe.fileHandleForWriting, process: process,
