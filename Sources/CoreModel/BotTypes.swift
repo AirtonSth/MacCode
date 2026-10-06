@@ -818,6 +818,9 @@ public struct BotConversation: Codable, Sendable, Equatable {
     public var linkedAgentThreadID: AgentThreadID?
     public var createdAt: Date
     public var updatedAt: Date
+    /// Set only on a group participant's hidden member conversation. Desk and
+    /// remote conversation lists exclude these rows. Immutable after insert.
+    public var groupID: BotGroupID?
 
     public init(
         id: BotConversationID = BotConversationID(),
@@ -829,7 +832,8 @@ public struct BotConversation: Codable, Sendable, Equatable {
         attentionState: BotAttentionState = .none,
         linkedAgentThreadID: AgentThreadID? = nil,
         createdAt: Date = Date(),
-        updatedAt: Date = Date()
+        updatedAt: Date = Date(),
+        groupID: BotGroupID? = nil
     ) {
         self.id = id
         self.botID = botID
@@ -841,6 +845,7 @@ public struct BotConversation: Codable, Sendable, Equatable {
         self.linkedAgentThreadID = linkedAgentThreadID
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.groupID = groupID
     }
 }
 

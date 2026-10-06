@@ -6125,7 +6125,7 @@ public final class BotsViewModel: ObservableObject {
         }
         var ids: [AgentThreadID] = []
         let inFlight = includeInFlightSends && deskSendInFlightBotID == botID
-        for conversation in try botStore.listConversations(botID: botID) {
+        for conversation in try botStore.listConversations(botID: botID, includeGroupMembers: true) {
             guard let threadID = conversation.linkedAgentThreadID else { continue }
             if inFlight {
                 ids.append(threadID)

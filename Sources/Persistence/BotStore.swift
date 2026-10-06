@@ -4,11 +4,15 @@ import CoreModel
 public enum BotStoreError: Error, Equatable, CustomStringConvertible {
     case notFound
     case invalidRow(String)
+    case revisionConflict
+    case invalidInput(String)
 
     public var description: String {
         switch self {
         case .notFound: return "Bot was not found."
         case .invalidRow(let message): return "Invalid bot row: \(message)"
+        case .revisionConflict: return "This changed somewhere else. Reload and try again."
+        case .invalidInput(let message): return message
         }
     }
 }
@@ -51,7 +55,7 @@ public final class BotStore: @unchecked Sendable {
     private static let legacyReasoningEffortColumnValue: AgentReasoningEffort = .medium
     private static let legacyCompatibleRouteSetColumnValue = ["default"]
 
-    private let db: SQLiteDB
+    let db: SQLiteDB
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 #if DEBUG
@@ -112,6 +116,14 @@ public final class BotStore: @unchecked Sendable {
     private func forgetLinkedThreads(botID: BotID) {
         linkedThreadCacheState.withLock {
             botIDByLinkedThread = botIDByLinkedThread.filter { $0.value != botID }
+        }
+    }
+
+    func forgetLinkedThreads(_ threadIDs: [AgentThreadID]) {
+        let forgotten = Set(threadIDs)
+        linkedThreadCacheState.withLock {
+            for threadID in forgotten { botIDByLinkedThread[threadID] = nil }
+            linkedThreadByConversation = linkedThreadByConversation.filter { !forgotten.contains($0.value) }
         }
     }
 
@@ -601,6 +613,7 @@ public final class BotStore: @unchecked Sendable {
             try executeBound("DELETE FROM bot_routine_activations WHERE bot_id = ?;", id: id)
             try executeBound("DELETE FROM bot_routine_definitions WHERE bot_id = ?;", id: id)
             try executeBound("DELETE FROM bot_queued_follow_ups WHERE bot_id = ?;", id: id)
+            try removeFromTeamsAndGroupsLocked(botID: id, now: now)
         }
         forgetLinkedThreads(botID: id)
         bumpBotsListRevision()
@@ -608,9 +621,13 @@ public final class BotStore: @unchecked Sendable {
 
     public func listLinkedAgentThreadIDs() throws -> Set<AgentThreadID> {
         try db.performSync { database in
-            let statement = try database.prepare(
-                "SELECT linked_agent_thread_id FROM bot_conversations WHERE linked_agent_thread_id IS NOT NULL;"
-            )
+            // Group room threads are bot-owned too: they must never surface as
+            // ordinary Agent App threads (Pet, Active Threads).
+            let statement = try database.prepare("""
+                SELECT linked_agent_thread_id FROM bot_conversations WHERE linked_agent_thread_id IS NOT NULL
+                UNION
+                SELECT room_thread_id FROM bot_group_conversations;
+                """)
             defer { statement.reset() }
             var ids = Set<AgentThreadID>()
             while try statement.step() {
@@ -774,10 +791,15 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
-    public func listConversations(botID: BotID) throws -> [BotConversation] {
+    /// Desk conversations of one bot. Group member conversations are hidden
+    /// plumbing for group turns and are excluded unless `includeGroupMembers`
+    /// (live-run discovery must still see a bot's group runs).
+    public func listConversations(botID: BotID, includeGroupMembers: Bool = false) throws -> [BotConversation] {
         try db.performSync { database in
             let statement = try database.prepare(
-                Self.conversationSelect + " WHERE bot_id = ? ORDER BY updated_at DESC;"
+                Self.conversationSelect + (includeGroupMembers
+                    ? " WHERE bot_id = ? ORDER BY updated_at DESC;"
+                    : " WHERE bot_id = ? AND group_id IS NULL ORDER BY updated_at DESC;")
             )
             defer { statement.reset() }
             try statement.bind(1, botID.value.uuidString.lowercased())
@@ -834,8 +856,8 @@ public final class BotStore: @unchecked Sendable {
             let statement = try database.prepare("""
                 INSERT INTO bot_conversations(
                     id, bot_id, title, pinned, hidden, unread, attention_state,
-                    linked_agent_thread_id, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    linked_agent_thread_id, created_at, updated_at, group_id
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title=excluded.title, pinned=excluded.pinned, hidden=excluded.hidden,
                     unread=excluded.unread, attention_state=excluded.attention_state,
@@ -853,6 +875,7 @@ public final class BotStore: @unchecked Sendable {
             try statement.bind(8, conversation.linkedAgentThreadID?.value.uuidString.lowercased())
             try statement.bind(9, string(conversation.createdAt))
             try statement.bind(10, string(conversation.updatedAt))
+            try statement.bind(11, conversation.groupID?.value.uuidString.lowercased())
             _ = try statement.step()
         }
         rememberLinkedThread(conversation)
@@ -2047,7 +2070,7 @@ public final class BotStore: @unchecked Sendable {
         )
     }
 
-    private func loadBot(id: BotID, database: SQLiteDB) throws -> BotDefinition? {
+    func loadBot(id: BotID, database: SQLiteDB) throws -> BotDefinition? {
         let statement = try database.prepare(Self.botSelect + " WHERE id = ? LIMIT 1;")
         defer { statement.reset() }
         try statement.bind(1, id.value.uuidString.lowercased())
@@ -2232,7 +2255,7 @@ public final class BotStore: @unchecked Sendable {
         )
     }
 
-    private func decodeConversation(_ statement: SQLiteStatement) throws -> BotConversation {
+    func decodeConversation(_ statement: SQLiteStatement) throws -> BotConversation {
         guard
             let idRaw = statement.columnText(0), let id = UUID(uuidString: idRaw),
             let botRaw = statement.columnText(1), let bot = UUID(uuidString: botRaw),
@@ -2253,7 +2276,8 @@ public final class BotStore: @unchecked Sendable {
             attentionState: state,
             linkedAgentThreadID: thread,
             createdAt: created,
-            updatedAt: updated
+            updatedAt: updated,
+            groupID: statement.columnText(10).flatMap(UUID.init(uuidString:)).map(BotGroupID.init)
         )
         rememberLinkedThread(conversation)
         return conversation
@@ -2375,11 +2399,11 @@ public final class BotStore: @unchecked Sendable {
         return string
     }
 
-    private func string(_ date: Date?) -> String? {
+    func string(_ date: Date?) -> String? {
         date.map { dates.string(from: $0) }
     }
 
-    private func date(_ string: String?) -> Date? {
+    func date(_ string: String?) -> Date? {
         string.flatMap(dates.date(from:))
     }
 
@@ -2397,7 +2421,7 @@ public final class BotStore: @unchecked Sendable {
         FROM bot_revisions
         """
 
-    private static let conversationSelect = """
+    static let conversationSelect = """
         SELECT id, bot_id, title, pinned, hidden,
                CASE
                    WHEN linked_agent_thread_id IS NOT NULL
@@ -2441,7 +2465,7 @@ public final class BotStore: @unchecked Sendable {
                    THEN 'none'
                    ELSE attention_state
                END AS attention_state,
-               linked_agent_thread_id, created_at, updated_at
+               linked_agent_thread_id, created_at, updated_at, group_id
         FROM bot_conversations
         """
 

@@ -1784,4 +1784,59 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         XCTAssertEqual(try rowCount(db, table: "agent_item_host_attestations"), 0,
                        "durable proof must not outlive its owning run")
     }
+
+    func test_v87ToV88AddsTeamsAndGroupsKeepingExistingConversationsUngrouped() throws {
+        // WHY: v88 is additive. Every existing bot conversation must stay a
+        // desk conversation (group_id NULL) and stay listed after upgrade, and
+        // re-running the migration must be a no-op.
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 87 })
+        XCTAssertEqual(try maxVersion(db), 87)
+        let botID = BotID()
+        let conversationID = BotConversationID()
+        try db.execute("""
+            INSERT INTO bots(id, handle, name, title, description, avatar_symbol, created_at, updated_at)
+            VALUES('\(botID.value.uuidString.lowercased())', 'piper', 'Piper', 'Scout', '', 'person',
+                   '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+            INSERT INTO bot_conversations(id, bot_id, title, created_at, updated_at)
+            VALUES('\(conversationID.value.uuidString.lowercased())', '\(botID.value.uuidString.lowercased())',
+                   'Desk', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+            """)
+
+        try Schema.migrateSteps(db, Schema.steps)
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
+        XCTAssertGreaterThanOrEqual(Schema.currentVersion, 88)
+        let listed = try BotStore(db: db).listConversations(botID: botID)
+        XCTAssertEqual(listed.map(\.id), [conversationID])
+        XCTAssertNil(listed.first?.groupID)
+        for table in ["bot_teams", "bot_team_members", "bot_group_conversations",
+                      "bot_group_participants", "bot_group_turns"] {
+            XCTAssertEqual(try rowCount(db, table: table), 0, "\(table) must exist and start empty")
+        }
+        XCTAssertNoThrow(try Schema.migrateSteps(db, Schema.steps))
+        XCTAssertEqual(try rowCount(db, table: "bot_conversations"), 1)
+
+        // The CHECKs back the store's validation.
+        let group = "INSERT INTO bot_group_conversations(id, title, room_thread_id, policy, max_auto_hops, created_at, updated_at) VALUES"
+        XCTAssertThrowsError(try db.execute("\(group) ('g1', 't', 'r1', 'everyone', 4, 'x', 'x');"))
+        XCTAssertThrowsError(try db.execute("\(group) ('g2', 't', 'r2', 'lead', 9, 'x', 'x');"))
+        XCTAssertNoThrow(try db.execute("\(group) ('g3', 't', 'r3', 'mentions_only', 8, 'x', 'x');"))
+        XCTAssertThrowsError(try db.execute("\(group) ('g4', 't', 'r3', 'lead', 0, 'x', 'x');"),
+                             "one room thread belongs to one group")
+        XCTAssertThrowsError(try db.execute("""
+            INSERT INTO bot_group_turns(id, group_id, round_id, bot_id, ordinal, state, room_message_id, created_at, updated_at)
+            VALUES('t1', 'g3', 'r', 'b', 1, 'paused', 'm1', 'x', 'x');
+            """))
+    }
+
+    func test_v88IsIdempotentWhenGroupColumnAlreadyExists() throws {
+        // WHY: a sibling branch may ship the same column under another version;
+        // a plain ADD COLUMN would then abort every launch.
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 87 })
+        try db.execute("ALTER TABLE bot_conversations ADD COLUMN group_id TEXT;")
+        XCTAssertNoThrow(try Schema.migrateSteps(db, Schema.steps))
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
+        XCTAssertEqual(try rowCount(db, table: "bot_group_turns"), 0)
+    }
 }
