@@ -276,6 +276,100 @@ final class TerminalOSCTitleWiringContractTests: XCTestCase {
     XCTAssertFalse(router.terminalTitleCoalescer.hasPendingWorkForTesting)
   }
 
+  func testUserRenameInsideTheWindowWinsOverAPendingOSCTitle() throws {
+    // WHY (H3 review): the trailing commit is deferred work. A tab rename the
+    // user makes (inline or from iOS) while an OSC title is pending is newer
+    // state; the stale OSC title must never overwrite it or reach iOS.
+    let (context, router, _) = try makeHarness()
+    router.terminalTitleCoalescer.interval = 0.3
+    let (workspace, terminal) = try makeTerminal(router, name: "H3 rename")
+    let surfaceID = terminal.descriptor.id
+    terminal.handleOSCTitle("A")
+
+    let events = captureSurfaceRenamedEvents(surfaceID: surfaceID) {
+      terminal.handleOSCTitle("B")
+      XCTAssertTrue(router.terminalTitleCoalescer.hasPendingWorkForTesting)
+      try? router.renameSurface(workspace, surfaceID, "Mine")
+      pumpMainRunLoop(for: 0.6)
+    }
+    XCTAssertEqual(surfaceTitle(in: context, workspaceID: workspace, surfaceID: surfaceID), "Mine")
+    XCTAssertFalse(
+      events.contains { $0.payload.objectValue?["title"]?.stringValue == "B" },
+      "the stale OSC title must not be broadcast after the user's rename")
+    XCTAssertFalse(router.terminalTitleCoalescer.hasPendingWorkForTesting)
+
+    terminal.handleOSCTitle("C")
+    pumpMainRunLoop(for: 0.6)
+    XCTAssertEqual(
+      surfaceTitle(in: context, workspaceID: workspace, surfaceID: surfaceID), "C",
+      "a title the TUI sets after the rename still mirrors, as before H3")
+  }
+
+  func testPendingTitleIsFlushedBeforeTheQuitSnapshot() throws {
+    // WHY (H3 review): a real title still inside the throttle window when the
+    // app quits must survive the relaunch; the quit path flushes it before the
+    // final snapshot save.
+    let (context, router, directory) = try makeHarness()
+    router.terminalTitleCoalescer.interval = 30
+    let (workspace, terminal) = try makeTerminal(router, name: "H3 quit")
+    let surfaceID = terminal.descriptor.id
+    terminal.handleOSCTitle("Old")
+
+    let events = captureSurfaceRenamedEvents(surfaceID: surfaceID) {
+      terminal.handleOSCTitle("Newest")
+      XCTAssertEqual(surfaceTitle(in: context, workspaceID: workspace, surfaceID: surfaceID), "Old")
+      router.flushPendingTerminalTitles()
+    }
+    XCTAssertEqual(events.map { $0.payload.objectValue?["title"]?.stringValue }, ["Newest"])
+    XCTAssertFalse(router.terminalTitleCoalescer.hasPendingWorkForTesting)
+
+    context.saveSnapshot()
+    closeAndUnregisterAllSurfaces()
+    let reloaded = try AppContext(channel: .debug, appSupportOverride: directory)
+    XCTAssertEqual(
+      surfaceTitle(in: reloaded, workspaceID: workspace, surfaceID: surfaceID), "Newest")
+  }
+
+  func testCommittedTitleReachesTheVisibleTabLabelAndSidebarButSpinnerFramesDoNot() throws {
+    // WHY (H3 review): the commit patches the tab label in place instead of a
+    // full window refresh. Without a window controller every other test passes
+    // even if that patch is dropped, so drive a real MainWindowController.
+    let (context, router, _) = try makeHarness()
+    router.terminalTitleCoalescer.interval = 0.2
+    let (workspace, terminal) = try makeTerminal(router, name: "H3 tab label")
+    let surfaceID = terminal.descriptor.id
+    let controller = MainWindowController(context: context, router: router)
+    router.windowController = controller
+    defer { router.windowController = nil; controller.window.orderOut(nil) }
+    pumpMainRunLoop(for: 0.05)
+    let tab = { () -> PaneTabButton? in
+      controller.window.contentView?.layoutSubtreeIfNeeded()
+      return self.allSubviews(of: controller.window.contentView ?? NSView())
+        .compactMap { $0 as? PaneTabButton }
+        .first { $0.accessibilityIdentifier() == "pane.tab.\(surfaceID.value.uuidString)" }
+    }
+    XCTAssertEqual(try XCTUnwrap(tab()).titleForTesting, "Before OSC")
+    let tabBefore = try XCTUnwrap(tab())
+
+    terminal.handleOSCTitle("⠋ Deploy")
+    XCTAssertEqual(tabBefore.titleForTesting, "Deploy", "the committed title patches the visible label")
+    XCTAssertTrue(tab() === tabBefore, "a title-only change must not rebuild the tab strip")
+    let sidebarTitle = controller.sidebarWorkspacesForTesting
+      .first { $0.id == workspace }
+      .flatMap { ws in ws.layout.paneIDs().compactMap { ws.layout.find(paneID: $0) }
+        .flatMap(\.surfaces).first { $0.id == surfaceID }?.title }
+    XCTAssertEqual(sidebarTitle, "Deploy", "the sidebar's workspace snapshot follows the committed title")
+
+    pumpMainRunLoop(for: 0.3)
+    for glyph in ["⠙", "⠹", "⠸", "◐", "✳"] { terminal.handleOSCTitle("\(glyph) Deploy") }
+    pumpMainRunLoop(for: 0.3)
+    XCTAssertEqual(tabBefore.titleForTesting, "Deploy", "spinner frames leave the label as is")
+  }
+
+  private func allSubviews(of view: NSView) -> [NSView] {
+    view.subviews + view.subviews.flatMap { allSubviews(of: $0) }
+  }
+
   private func makeTerminal(
     _ router: AppCommandRouter, name: String
   ) throws -> (WorkspaceID, TerminalSurface) {

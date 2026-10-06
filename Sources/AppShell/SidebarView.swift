@@ -5805,6 +5805,8 @@ public final class SidebarView: NSObject {
         viewModel.reload()
     }
 
+    var workspacesForTesting: [Workspace] { viewModel.workspaces }
+
     /// Canonical workspace-add path for shell-level entry points such as the
     /// header "+" and the empty-state button: DEDUP-P2, File ▸ Open Recent and
     /// the failure sheet all live in the view model, so creating the workspace

@@ -51,6 +51,24 @@ final class TerminalTitleCoalescer {
         lastCommitAt[surfaceID] = nil
     }
 
+    /// Drops a surface's pending title but keeps its throttle window, so a
+    /// newer explicit rename is never overwritten by an older OSC title.
+    func dropPending(_ surfaceID: SurfaceID) {
+        pending[surfaceID] = nil
+    }
+
+    /// Commits every pending title now (quit/update path, before the final
+    /// snapshot save). The scheduled flushes then find no entry and do nothing.
+    func flushAll() {
+        let entries = pending
+        pending.removeAll()
+        let now = Date()
+        for (surfaceID, entry) in entries {
+            lastCommitAt[surfaceID] = now
+            entry.commit(entry.title)
+        }
+    }
+
     var hasPendingWorkForTesting: Bool { !pending.isEmpty }
 
     private func flush(_ surfaceID: SurfaceID, token: UInt64) {

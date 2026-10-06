@@ -670,6 +670,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private func persistRestorableStateBeforeUpdate() {
+        router?.flushPendingTerminalTitles()
         context?.saveSnapshot()
         // Sparkle may relaunch immediately after this hook returns. Make every
         // previously published event durable before handing control back.

@@ -376,6 +376,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     private var currentShellHostingView: NSView?
     /// Test seam: Workspaces <-> Bots must reattach this instance, not remount.
     var botsHostingViewForTesting: NSView? { botsHostingView }
+    var sidebarWorkspacesForTesting: [Workspace] { sidebar.workspacesForTesting }
     private var destinationPersistenceTask: Task<Void, Never>?
     private var workspaceRebuildTask: Task<Void, Never>?
     private var workspaceRebuildGeneration: UInt64 = 0
@@ -944,6 +945,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         for controller in workspaceWindows.values {
             controller.updateSurfaceTabTitle(surfaceID, title: title)
         }
+        // Busy tooltips read titles from the sidebar's workspace snapshot.
+        sidebar.refresh()
     }
 
     public func refreshSurfaceRuntimeState() {

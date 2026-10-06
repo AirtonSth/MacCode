@@ -1573,6 +1573,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func renameSurface(_ wid: WorkspaceID, _ sid: SurfaceID, _ title: String) throws {
+        // H3: an explicit rename is newer than any OSC title still pending.
+        terminalTitleCoalescer.dropPending(sid)
         try context?.apply(.renameSurface(wid, sid, title))
         windowController?.refreshFromState()
     }
@@ -7866,6 +7868,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
         }
         return terminal
+    }
+
+    /// H3: commits terminal titles still inside the throttle window, so the
+    /// final snapshot before quit or update holds the newest title.
+    func flushPendingTerminalTitles() {
+        terminalTitleCoalescer.flushAll()
     }
 
     /// H3: a normalized terminal title change. Persists through one layout apply
