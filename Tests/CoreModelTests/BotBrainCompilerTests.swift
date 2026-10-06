@@ -150,6 +150,31 @@ final class BotBrainCompilerTests: XCTestCase {
         )
         XCTAssertTrue(docker.compiledPayload.contains(BotStandingInstructions.computerObserveTool))
         XCTAssertTrue(docker.compiledPayload.contains(BotDesktopKind.dockerDesktop.displayTitle))
+
+        // WHY (plan A S11): a Docker bot's thread whose agent runs inside its
+        // guest has other tools (own shell, linux-use, Playwright, gateway bot
+        // tools) and another place than a Mac thread of the same bot. The
+        // payload and the Source layers come from one compiler and must agree.
+        let guest = BotBrainCompiler.assemble(
+            bot: bot, revision: revision(.dockerDesktop), userText: "Hi", runsInGuest: true
+        )
+        let guestDesktop = "\(BotDesktopKind.dockerDesktop.displayTitle). \(BotDesktopKind.dockerDesktopGuestRunHonestyLabel)"
+        let guestTools = BotStandingInstructions.admittedToolsText(for: .dockerDesktop, inGuest: true)
+        XCTAssertTrue(guest.compiledPayload.contains("Desktop: \(guestDesktop)"))
+        XCTAssertTrue(guest.compiledPayload.contains(guestTools))
+        XCTAssertFalse(guest.compiledPayload.contains(BotStandingInstructions.generatedGuestComputerLine))
+        XCTAssertFalse(guest.compiledPayload.contains(BotStandingInstructions.generatedBrowserLine))
+        XCTAssertEqual(guest.layers.first { $0.id == "desktop-kind" }?.text, guestDesktop)
+        XCTAssertEqual(guest.layers.first { $0.id == "tools" }?.text, guestTools)
+        XCTAssertTrue(
+            docker.compiledPayload.contains("Desktop: \(BotDesktopKind.dockerDesktop.displayTitle). \(BotDesktopKind.dockerDesktopMacRunHonestyLabel)"),
+            "a Mac run of a Docker bot keeps saying its agent stays on this Mac"
+        )
+        XCTAssertEqual(
+            BotBrainCompiler.assemble(bot: bot, revision: revision(.logicalExecutionSpace), userText: "Hi", runsInGuest: true).compiledPayload,
+            host.compiledPayload,
+            "only a Docker bot has a guest to run in"
+        )
     }
 
     func test_workingSpaceCompilesForCustomSoul_becauseIsolationHonestyIsNotAnEscapeHatch() {

@@ -3,6 +3,7 @@ import AgentRuntime
 import CoreModel
 @testable import AppShell
 @testable import Persistence
+import SocketServer
 @testable import Surfaces
 
 /// WHY (plan A S9): a new Bots Desk conversation of a Docker-desktop bot on
@@ -139,8 +140,8 @@ final class BotDeskGuestThreadTests: XCTestCase {
         )
         let request = try XCTUnwrap(f.distill.requests.first)
         XCTAssertTrue(
-            request.prompt.hasSuffix(BotStandingInstructions.vmThreadRules),
-            "the agent must be told it runs in a Linux VM"
+            request.prompt.hasSuffix(BotStandingInstructions.guestThreadRules),
+            "the agent must be told it runs inside the Linux VM, with the tools a guest run has"
         )
         await finishAll(f)
     }
@@ -154,6 +155,7 @@ final class BotDeskGuestThreadTests: XCTestCase {
         XCTAssertNil(claude.executionTarget)
         XCTAssertNil(try f.ctx.threadRepo.guestPlacement(of: claude.id)?.guestRuntime)
         XCTAssertFalse(try XCTUnwrap(f.claude.requests.first).prompt.contains(BotStandingInstructions.vmThreadRules))
+        XCTAssertFalse(try XCTUnwrap(f.claude.requests.first).prompt.contains(BotStandingInstructions.guestThreadRules))
         await finishAll(f)
 
         let plain = try makeBot(f, docker: false)
@@ -186,6 +188,7 @@ final class BotDeskGuestThreadTests: XCTestCase {
         let request = try XCTUnwrap(f.distill.requests.last)
         XCTAssertEqual(request.providerThreadId, "mac-session-1", "the Mac session keeps resuming")
         XCTAssertFalse(request.prompt.contains(BotStandingInstructions.vmThreadRules))
+        XCTAssertFalse(request.prompt.contains(BotStandingInstructions.guestThreadRules))
         await finishAll(f)
     }
 
@@ -230,7 +233,7 @@ final class BotDeskGuestThreadTests: XCTestCase {
         XCTAssertTrue(started, agent.statusMessage)
         XCTAssertEqual(workspaces, [nil], "a desk thread has no workspace to mount")
         XCTAssertNil(agent.vmUnavailableBotID)
-        XCTAssertTrue(try XCTUnwrap(f.distill.requests.last).prompt.contains(BotStandingInstructions.vmThreadRules))
+        XCTAssertTrue(try XCTUnwrap(f.distill.requests.last).prompt.contains(BotStandingInstructions.guestThreadRules))
         await finishAll(f)
     }
 
@@ -318,6 +321,129 @@ final class BotDeskGuestThreadTests: XCTestCase {
         await finishAll(f)
     }
 
+    func test_deskPaneSaysWhereTheSelectedConversationsAgentRuns() async throws {
+        // WHY (plan A S11): a Docker bot's threads run in two places, new Distill
+        // threads inside its Linux guest and every other thread on the Mac, and
+        // the user's accounts go with them. The desktop pane must say which one
+        // the selected conversation uses, before its first send and after a move
+        // to the Mac, and never show another thread's answer.
+        let f = try makeFixture()
+        let bot = try makeBot(f, docker: true)
+        let inVM = "Running inside Piper's Linux VM · your accounts"
+        f.vm.openDesk(bot)
+        XCTAssertTrue(f.vm.createDeskThread())
+        f.vm.setDeskProvider(.distill)
+        XCTAssertEqual(f.vm.deskRuntimeLabel, inVM, "a new Distill conversation's first send runs in the guest")
+        f.vm.setDeskProvider(.claude)
+        XCTAssertEqual(f.vm.deskRuntimeLabel, BotDesktopKind.macRuntimeLabel, "other providers run on the Mac")
+
+        let thread = try await firstSend(f, bot: bot, provider: .distill)
+        await finishAll(f)
+        let conversationID = try XCTUnwrap(f.vm.selectedConversation?.id)
+        XCTAssertTrue(f.vm.createDeskThread())
+        f.vm.selectDeskThread(conversationID)
+        XCTAssertEqual(f.vm.deskRuntimeLabel, inVM, "the guest thread reads its stored placement")
+        let agent = try XCTUnwrap(f.vm.deskAgentVM)
+
+        // "Rodar esta thread no Mac" / an approved Mac execution request.
+        XCTAssertTrue(try f.ctx.threadRepo.setActor(
+            id: thread.id, actor: thread.actor, lockedAt: thread.actorLockedAt, executionTarget: .mac
+        ))
+        agent.mirrorExecutionTarget(.mac, thread: thread.id)
+        XCTAssertEqual(f.vm.deskRuntimeLabel, BotDesktopKind.macRuntimeLabel, "a thread moved to the Mac says so at once")
+
+        let plain = try makeBot(f, docker: false)
+        f.vm.openDesk(plain)
+        XCTAssertTrue(f.vm.createDeskThread())
+        XCTAssertNil(f.vm.deskRuntimeLabel, "only a Docker bot has two places to run")
+    }
+
+    func test_aGuestRunIsToldOnlyTheToolsItHasAndAMacRunKeepsItsOwn() async throws {
+        // WHY (plan A S11): a guest run has its own shell, linux-use, Playwright
+        // and the bot tools the host gateway serves. bot_computer_* and
+        // bot_browser_* are Mac-side relays it is never served; a prompt naming
+        // them sends the agent to tools that do not exist. A Mac thread of the
+        // same bot still has those relays and must keep its prompt.
+        let f = try makeFixture()
+        let bot = try makeBot(f, docker: true)
+        _ = try await firstSend(f, bot: bot, provider: .distill)
+        let guest = try XCTUnwrap(f.distill.requests.first).prompt
+        XCTAssertTrue(guest.contains(BotStandingInstructions.generatedInGuestComputerLine))
+        XCTAssertTrue(guest.contains(BotDesktopKind.dockerDesktopGuestRunHonestyLabel))
+        XCTAssertFalse(guest.contains(BotDesktopKind.dockerDesktopMacRunHonestyLabel), "its agent is not on the Mac")
+        let relays = [
+            BotStandingInstructions.computerObserveTool, BotStandingInstructions.computerActTool,
+            BotStandingInstructions.computerExecTool, BotStandingInstructions.computerRebuildTool,
+            BotStandingInstructions.openBrowserTool, BotStandingInstructions.getBrowserTool,
+            BotStandingInstructions.waitLoginTool, BotStandingInstructions.snapshotBrowserTool,
+            BotStandingInstructions.actBrowserTool,
+        ]
+        for relay in relays {
+            XCTAssertFalse(guest.contains(relay), "a guest run is never served \(relay)")
+        }
+        await finishAll(f)
+
+        _ = try await firstSend(f, bot: bot, provider: .claude, text: "mac words")
+        let mac = try XCTUnwrap(f.claude.requests.first).prompt
+        XCTAssertTrue(mac.contains(BotDesktopKind.dockerDesktopMacRunHonestyLabel))
+        XCTAssertTrue(mac.contains(BotStandingInstructions.computerObserveTool))
+        XCTAssertTrue(mac.contains(BotStandingInstructions.openBrowserTool))
+        XCTAssertFalse(mac.contains(BotStandingInstructions.generatedInGuestComputerLine))
+        await finishAll(f)
+    }
+
+    func test_everyBotToolAGuestRunIsToldAboutIsServedToTheGuest() throws {
+        // WHY (plan A S11): the guest prompt may name only tools that exist for
+        // a guest run. Bot tools reach it through the host gateway's allowlist,
+        // desktop tools through the vendored linux-use (native-only).
+        let text = BotStandingInstructions.admittedToolsText(for: .dockerDesktop, inGuest: true)
+            + "\n" + BotStandingInstructions.guestThreadRules
+        let regex = try NSRegularExpression(pattern: "bot_[a-z_]+\\*?|request_mac_execution")
+        let named = Set(regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap {
+            Range($0.range, in: text).map { String(text[$0]) }
+        }.filter { !$0.hasSuffix("*") })
+        XCTAssertTrue(named.contains(BotStandingInstructions.postScreenshotTool), "positive control: \(named)")
+        let served = Set(BotGuestMCPGateway.defaultRoutes.flatMap(\.allowedTools))
+        XCTAssertEqual(named.subtracting(served), [], "named but not served to a guest run")
+
+        let server = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent("Sources/AppShell/Resources/GuestAgentKit/linux-use/server.py"),
+            encoding: .utf8
+        )
+        let baseTools = try XCTUnwrap(server.split(separator: "\n").first { $0.hasPrefix("BASE_TOOLS = [\"") })
+        for tool in ["list_windows", "screenshot", "left_click", "type", "key", "scroll"] {
+            XCTAssertTrue(baseTools.contains("\"\(tool)\""), "linux-use has no \(tool)")
+            XCTAssertTrue(text.contains(tool))
+        }
+        XCTAssertFalse(text.contains("jev_decide"), "removed from the guest's linux-use")
+    }
+
+    func test_guestStartupStagesShowInTheDeskTranscriptUntilTheAgentIsUp() async throws {
+        // WHY (AGENTS.md loading rules, plan A S11): a guest run prepares the VM,
+        // the agent and the sign-in for seconds before its first token. The send
+        // is acknowledged at once in the transcript's running strip with the
+        // real stage, which gives way to the normal strip once the agent is up.
+        let f = try makeFixture()
+        let bot = try makeBot(f, docker: true)
+        let thread = try await firstSend(f, bot: bot, provider: .distill)
+        let runID = try XCTUnwrap(f.distill.requests.first).runId
+        let agent = try XCTUnwrap(f.vm.deskAgentVM, "the desk transcript of the running conversation")
+        XCTAssertEqual(agent.selectedThreadId, thread.id)
+        XCTAssertEqual(agent.provider, .distill, "the strip shows Distill status only for a Distill thread")
+
+        XCTAssertTrue(f.distill.emit(runID: runID, DistillGuestStage.launching.runtimeEvent))
+        let shown = await waitUntil { agent.distillLive?.headline == DistillGuestStage.launching.text }
+        XCTAssertTrue(shown, "headline: \(String(describing: agent.distillLive?.headline))")
+        XCTAssertTrue(agent.selectedThreadRunIsStartingOrRunning, "the running strip that shows it is on screen")
+
+        XCTAssertTrue(f.distill.emit(runID: runID, DistillGuestStage.ready.runtimeEvent))
+        let cleared = await waitUntil { agent.distillLive != nil && agent.distillLive?.headline == nil }
+        XCTAssertTrue(cleared, "headline: \(String(describing: agent.distillLive?.headline))")
+        await finishAll(f)
+    }
+
     /// `docker` stand-in for the desk gate: `inspect` reports the bot container's
     /// state; every other call fails as when the daemon cannot start it.
     private final class ScriptedDocker: @unchecked Sendable {
@@ -344,7 +470,15 @@ final class BotDeskGuestThreadTests: XCTestCase {
         let rules = BotStandingInstructions.vmThreadRules
         XCTAssertEqual(
             BotsViewModel.supervisedRunPrompt(userText: "hi", compiledPayload: "BRAIN", provider: .distill, executionTarget: .vm),
-            "BRAIN\n\n" + rules
+            "BRAIN\n\n" + rules,
+            "a legacy .vm thread (agent on the Mac) keeps the rules of its Mac-side tools"
+        )
+        XCTAssertEqual(
+            BotsViewModel.supervisedRunPrompt(
+                userText: "hi", compiledPayload: "BRAIN", provider: .distill, executionTarget: .vm, runsInGuest: true
+            ),
+            "BRAIN\n\n" + BotStandingInstructions.guestThreadRules,
+            "a guest run is told the tools it has inside the VM, not the Mac-side relays"
         )
         XCTAssertEqual(
             BotsViewModel.supervisedRunPrompt(userText: "/goal x", compiledPayload: "BRAIN", provider: .distill, executionTarget: .vm),

@@ -12074,6 +12074,9 @@ final class BotsWindowTests: XCTestCase {
         let pane = String(source[paneStart...].prefix(2200))
         XCTAssertTrue(pane.contains("BotComputerGuestCanvas"))
         XCTAssertTrue(pane.contains("bots.desk.desktop.guestScreen"))
+        // Plan A: the pane says where the selected thread's agent runs (guest or Mac).
+        XCTAssertTrue(pane.contains("vm.deskRuntimeLabel"))
+        XCTAssertTrue(pane.contains("bots.desk.desktop.runtime"))
         XCTAssertTrue(pane.contains("bots.desk.desktop.start"))
         XCTAssertTrue(source.contains("openGuestDesktopInNewWindow"))
         let canvas = try String(
@@ -17880,6 +17883,14 @@ final class ControlledBotHandoffRunner: AgentProviderRunner, @unchecked Sendable
             finalMessage: status == .completed ? reply : nil,
             providerThreadId: providerThreadID
         ))
+        return true
+    }
+
+    /// Streams one provider event into a still-running run.
+    @discardableResult
+    func emit(runID: AgentRunID, _ event: AssistantEvent) -> Bool {
+        guard let pending = lock.withLock({ pendingByRunID[runID] }) else { return false }
+        pending.onEvent(.event(event))
         return true
     }
 

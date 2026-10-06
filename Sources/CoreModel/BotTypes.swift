@@ -78,8 +78,25 @@ public enum BotDesktopKind: String, Codable, Sendable, CaseIterable {
     public static let botOwnedBrowserHonestyLabel =
         "This Mac · this teammate's own Playwright browser. Not the owner's browser. Same macOS account."
 
+    /// Where a Docker bot's agent runs depends on the thread (plan A): new
+    /// Distill threads run inside the guest, every other thread on the Mac.
     public static let dockerDesktopHonestyLabel =
+        "Linux screen in Docker on 127.0.0.1. New Distill threads run the bot's agent inside this Linux VM with your accounts; other threads run the agent on this Mac. Not a security boundary."
+
+    /// Compiled into a thread whose agent runs inside the bot's guest.
+    public static let dockerDesktopGuestRunHonestyLabel =
+        "Linux screen in Docker on 127.0.0.1. This thread's agent, shell, and files run inside this Linux VM with the user's accounts. Not a security boundary."
+
+    /// Compiled into a Docker bot's thread whose agent runs on the Mac.
+    public static let dockerDesktopMacRunHonestyLabel =
         "Linux screen in Docker on 127.0.0.1. Browser work runs Playwright inside the guest. Agent, files, and workspace stay on this Mac. Not a security boundary."
+
+    /// Desk desktop pane: where the selected thread's agent runs.
+    public static func guestRuntimeLabel(botName: String) -> String {
+        "Running inside \(botName)'s Linux VM · your accounts"
+    }
+
+    public static let macRuntimeLabel = "Running on this Mac"
 
     /// Decode-only leftover. Display and publish resolve to Logical execution space.
     public static let dedicatedLocalVMHonestyLabel =
@@ -310,6 +327,21 @@ public enum BotStandingInstructions {
     Ação manual: Peça ação manual só para login, captcha, 2FA, pagamento ou confirmação humana. Nunca peça senha, código ou dados de cartão no chat. Depois de retomar, sempre tire screenshot antes de agir.
     """
 
+    /// Appended instead of `vmThreadRules` to threads whose agent runs inside
+    /// the bot's guest (plan A). Names only the tools such a run has: its own
+    /// shell, linux-use and Playwright inside the guest, and the bot tools the
+    /// host gateway serves. Legacy `.vm` threads (agent on the Mac) keep
+    /// `vmThreadRules`.
+    public static let guestThreadRules: String = """
+    Este ambiente é a VM Linux deste bot: seu shell, seus arquivos e suas ferramentas rodam aqui, com as contas do usuário. Ferramentas só-macOS (swift, xcodebuild, xcrun) não existem. Use request_mac_execution(reason) para pedir execução no Mac.
+
+    Ferramentas: seu próprio shell (comandos e pacotes rodam nesta VM); desktop Linux pelas ferramentas linux-use (list_windows, screenshot, left_click, type, key, scroll); sites pelas ferramentas Playwright (browser_navigate, browser_snapshot, browser_click, browser_type) no Chromium visível, onde ficam os logins que o usuário fez; as ferramentas bot_* para memória, skills, rotinas, segredos, web, perguntas ao usuário e outros bots. bot_computer_*, bot_browser_* e o computer-use do Mac não existem aqui.
+
+    Screenshots: enviar bot_post_screenshot em: fim de tarefa visual; erro visível; pedido de login/ação humana; antes de ação irreversível; mudança grande de tela em tarefa longa.
+
+    Ação manual: Peça ação manual com bot_request_user_action só para login, captcha, 2FA, pagamento ou confirmação humana. Nunca peça senha, código ou dados de cartão no chat. Depois de retomar, sempre tire screenshot antes de agir.
+    """
+
     /// Unique last line so Studio can refresh the starter without overwriting a custom soul.
     public static let generatedSignature =
         "Do not invent tools, files, accounts, or access you do not have."
@@ -382,18 +414,31 @@ public enum BotStandingInstructions {
     /// Compiler layer. Starter soul must not own these names.
     public static let admittedToolsText = admittedToolsText(for: .logicalExecutionSpace)
 
-    public static func admittedToolsText(for kind: BotDesktopKind) -> String {
+    /// Tools layer of a run whose agent runs inside the bot's guest. The host
+    /// relays (`bot_computer_*`, `bot_browser_*`) are not served to it: the
+    /// guest has its own shell, linux-use and Playwright instead.
+    public static let generatedInGuestComputerLine =
+        "You run inside this bot's Linux VM (Docker on 127.0.0.1). Your own shell runs here: run commands and install packages directly. To see or use the Linux desktop, use the linux-use tools: list_windows, then screenshot, then left_click, type, key, or scroll on that exact window. For websites, use the Playwright tools (browser_navigate, browser_snapshot, browser_click, browser_type); they drive the visible Chromium, which keeps the logins the user made in the viewer. To show the user the screen, call \(postScreenshotTool). For a login, captcha, 2FA, payment, or human confirmation, call \(requestUserActionTool). For macOS-only work, call \(requestMacExecutionTool). bot_computer_*, bot_browser_*, host computer-use, and host docker do not exist here."
+
+    /// `inGuest`: the run's agent runs inside the bot's guest (only a Docker
+    /// desktop has one); its tools differ from a Mac run of the same bot.
+    public static func admittedToolsText(for kind: BotDesktopKind, inGuest: Bool = false) -> String {
         let admission = BotDesktopAdmission.forPublished(kind)
+        let runsInGuest = inGuest && admission.allowsGuestComputer
         var lines = [
             generatedCapabilityLine,
             generatedMutateLine,
             generatedSecretsLine,
         ]
-        if admission.allowsGuestComputer {
-            lines.append(generatedGuestComputerLine)
-        }
-        if admission.allowsBotOwnedBrowser {
-            lines.append(generatedBrowserLine)
+        if runsInGuest {
+            lines.append(generatedInGuestComputerLine)
+        } else {
+            if admission.allowsGuestComputer {
+                lines.append(generatedGuestComputerLine)
+            }
+            if admission.allowsBotOwnedBrowser {
+                lines.append(generatedBrowserLine)
+            }
         }
         lines.append(contentsOf: [
             generatedWebLine,

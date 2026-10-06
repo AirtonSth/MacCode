@@ -1,5 +1,6 @@
 import AppKit
 import AgentRuntime
+import Combine
 import CoreModel
 import DesignSystemKit
 import Persistence
@@ -3498,6 +3499,25 @@ public final class BotsViewModel: ObservableObject {
 
     public var desktopHonestyLabel: String {
         displayedDesktopKind.honestyLabel
+    }
+
+    /// Desk desktop pane of a Docker bot: where the selected conversation's
+    /// agent runs. A linked thread reads its stored placement; a conversation
+    /// with no thread yet says where its first send will put it (the same
+    /// rule as `lockNewDeskThreadToGuestIfDistill`). nil while the placement
+    /// of the selected thread is not known, never another thread's answer.
+    public var deskRuntimeLabel: String? {
+        guard screen == .desk, displayedDesktopKind == .dockerDesktop,
+              let bot = selectedBot,
+              let conversation = selectedConversation, conversation.botID == bot.id else { return nil }
+        let inGuest: Bool
+        if let threadID = conversation.linkedAgentThreadID {
+            guard let runtime = deskThreadRuntime, runtime.threadID == threadID else { return nil }
+            inGuest = runtime.runsInGuest
+        } else {
+            inGuest = deskRouting.provider == .distill && deskRouting.runAsUser.uid == getuid()
+        }
+        return inGuest ? BotDesktopKind.guestRuntimeLabel(botName: bot.name) : BotDesktopKind.macRuntimeLabel
     }
 
     public var desktopStatusPill: String {
@@ -9975,6 +9995,13 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private var deskAgentKey: DeskAgentKey?
+    private struct DeskThreadRuntime: Equatable {
+        let threadID: AgentThreadID
+        let runsInGuest: Bool
+    }
+    /// The embedded desk thread's placement, for `deskRuntimeLabel`.
+    @Published private var deskThreadRuntime: DeskThreadRuntime?
+    private var deskThreadRuntimeObservation: AnyCancellable?
     private var isSyncingDeskAgent = false
     private var pendingDeskReceipts: [AgentRunID: ContextAssemblyReceipt] = [:]
 
@@ -10108,6 +10135,7 @@ public final class BotsViewModel: ObservableObject {
         AppCommandRouter.wireTokenSaverThreadFooter(on: vm, context: context)
         deskAgentKey = key
         deskAgentVM = vm
+        observeDeskThreadRuntime(threadID, in: vm)
     }
 
     /// Desk send gate: nil when Docker reports the bot's container running.
@@ -10282,7 +10310,31 @@ public final class BotsViewModel: ObservableObject {
         lastStartedConversationByBot[botID]
     }
 
+    /// Re-reads the placement whenever the thread's target or provider
+    /// changes on the embedded Agent App (a Mac handoff, an approved Mac
+    /// execution request, a model switch); the first value comes at once.
+    private func observeDeskThreadRuntime(_ threadID: AgentThreadID, in vm: AgentAppViewModel) {
+        struct Route: Equatable {
+            let target: ExecutionTarget?
+            let provider: AgentProvider?
+        }
+        deskThreadRuntimeObservation = vm.$threads
+            .map { $0.first(where: { $0.id == threadID }).map { Route(target: $0.executionTarget, provider: $0.provider) } }
+            .removeDuplicates()
+            .sink { [weak self] _ in self?.refreshDeskThreadRuntime(threadID) }
+    }
+
+    private func refreshDeskThreadRuntime(_ threadID: AgentThreadID) {
+        let provider = ((try? context.threadRepo.get(id: threadID)) ?? nil)?.provider
+        let next = DeskThreadRuntime(
+            threadID: threadID,
+            runsInGuest: provider.map { runsInGuest(threadID: threadID, provider: $0) } ?? false
+        )
+        if next != deskThreadRuntime { deskThreadRuntime = next }
+    }
+
     private func tearDownDeskAgentVM() {
+        deskThreadRuntimeObservation = nil
         deskAgentKey = nil
         guard let vm = deskAgentVM else { return }
         deskAgentVM = nil
@@ -10320,6 +10372,7 @@ public final class BotsViewModel: ObservableObject {
         let thread = try context.threadRepo.get(id: threadID)
         let routing = thread.map { BotDeskRouting(thread: $0) } ?? deskRouting
         let model = routing.resolvedModel(defaultModel: Self.defaultModel(for:))
+        let inGuest = runsInGuest(threadID: threadID, provider: routing.provider)
         let conversation = conversations.first(where: { $0.id == conversationID })
             ?? ((try? botStore.conversation(id: conversationID)) ?? nil)
         let brain = destBrainInputs(for: bot)
@@ -10343,7 +10396,8 @@ public final class BotsViewModel: ObservableObject {
                     bots: bots,
                     excluding: bot.id
                 )
-            )
+            ),
+            runsInGuest: inGuest
         )
         lastSupervisedRunUserTextForTesting = text
         pendingDeskReceipts[runID] = receipt
@@ -10359,27 +10413,39 @@ public final class BotsViewModel: ObservableObject {
             userText: text,
             compiledPayload: receipt.compiledPayload,
             provider: routing.provider,
-            executionTarget: thread?.executionTarget
+            executionTarget: thread?.executionTarget,
+            runsInGuest: inGuest
         )
+    }
+
+    /// The run's agent runs inside the bot's Linux guest: the thread is on the
+    /// VM with the guest marker, and its provider is Distill (the only one the
+    /// guest runs; any other fails closed before it starts).
+    private func runsInGuest(threadID: AgentThreadID, provider: AgentProvider) -> Bool {
+        provider == .distill && ((try? context.threadRepo.guestPlacement(of: threadID)) ?? nil)?.runsInGuest == true
     }
 
     /// Distill resolves `/name args` only when the prompt starts with the slash;
     /// the brain wrap would bury it, so slash commands go through raw. Shared by
     /// the embedded desk and the paired-device (iOS) supervised run. A thread
     /// locked to the bot's VM gets the VM rules after the brain (never after a
-    /// raw slash command, whose arguments they would become).
+    /// raw slash command, whose arguments they would become). A thread whose
+    /// agent runs inside the guest gets the guest rules, which name the tools
+    /// that run has; a legacy `.vm` thread (agent on the Mac) keeps the VM rules.
     nonisolated static func supervisedRunPrompt(
         userText: String,
         compiledPayload: String,
         provider: AgentProvider,
-        executionTarget: ExecutionTarget? = nil
+        executionTarget: ExecutionTarget? = nil,
+        runsInGuest: Bool = false
     ) -> String {
         if provider == .distill,
            userText.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/") {
             return userText
         }
         guard executionTarget == .vm else { return compiledPayload }
-        return compiledPayload + "\n\n" + BotStandingInstructions.vmThreadRules
+        let rules = runsInGuest ? BotStandingInstructions.guestThreadRules : BotStandingInstructions.vmThreadRules
+        return compiledPayload + "\n\n" + rules
     }
 
     private func deskAgentRunStarted(
@@ -10716,6 +10782,7 @@ public final class BotsViewModel: ObservableObject {
                 threadId: prepared.thread.id,
                 runId: prepared.runID
             )
+            let inGuest = runsInGuest(threadID: prepared.thread.id, provider: routing.provider)
             let receipt = BotBrainCompiler.assemble(
                 bot: bot,
                 revision: revision,
@@ -10736,7 +10803,8 @@ public final class BotsViewModel: ObservableObject {
                         bots: bots,
                         excluding: bot.id
                     )
-                )
+                ),
+                runsInGuest: inGuest
             )
             // Dest already listed Source on open. Stamp that catalog so
             // sendAgentMessage preflight does not rediscover models.
@@ -10767,7 +10835,8 @@ public final class BotsViewModel: ObservableObject {
                     userText: userText,
                     compiledPayload: receipt.compiledPayload,
                     provider: routing.provider,
-                    executionTarget: prepared.thread.executionTarget
+                    executionTarget: prepared.thread.executionTarget,
+                    runsInGuest: inGuest
                 ),
                 provider: routing.provider,
                 model: model,
@@ -13117,6 +13186,13 @@ public struct BotsRootView: View {
                 Spacer(minLength: 0)
                 DSPill(vm.desktopStatusPill, tone: .neutral)
             }
+            if let runtime = vm.deskRuntimeLabel {
+                Text(runtime)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("bots.desk.desktop.runtime")
+            }
             if vm.displayedDesktopKind == .dockerDesktop {
                 BotComputerGuestCanvas(
                     url: vm.guestScreenURL(for: bot.id),
@@ -13142,7 +13218,7 @@ public struct BotsRootView: View {
         .padding(DS.Space.lg)
         .dsBar(edge: .bottom)
         .accessibilityIdentifier("bots.desk.desktop")
-        .accessibilityLabel("Desktop for \(bot.name). \(vm.desktopHonestyLabel)")
+        .accessibilityLabel("Desktop for \(bot.name). \(vm.deskRuntimeLabel.map { "\($0). " } ?? "")\(vm.desktopHonestyLabel)")
     }
 
     private func deskInspector(_ bot: BotDefinition) -> some View {
