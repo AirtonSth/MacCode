@@ -8498,7 +8498,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 transformFailure = error
             }
         }
-        var req = AgentRunRequest(
+        let req = AgentRunRequest(
             runId: runId,
             threadId: tid,
             provider: runProvider,
@@ -8522,7 +8522,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             environment: providerEnvironment,
             runAsUser: threadRunAsUser
         )
-        req.providerPromptOverridesDisplay = runPrompt != text
         do {
             // Status + unread + updated_at only. A leftover 26-column + routing
             // `get` then `upsert` hitchs every composer send and rewrites routing

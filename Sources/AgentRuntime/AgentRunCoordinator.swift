@@ -1119,9 +1119,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             contextSnapshot: request.contextSnapshot,
             preparedContextSeed: request.preparedContextSeed
         )
-        // Same contract as a bot-brain prompt: the provider prompt differs from
-        // the displayed text, so it is the prompt that goes out.
-        handed.providerPromptOverridesDisplay = request.providerPromptOverridesDisplay || summary != nil
         return handed
     }
 
@@ -1337,24 +1334,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let recoveryContext = request.providerThreadId == nil && macHandoff == nil
             ? try recoverableResumeContext(for: request) : nil
         let resumeCursor = request.providerThreadId ?? recoveryContext?.resumeCursor
-        // The displayed user message is always the human text. The provider
-        // gets the request prompt when it replaces that text (bot brain,
-        // Mac handoff summary), else the displayed text; Auto wraps either in
-        // the orchestration skill invocation. Distill gets the prompt as is.
+        // The displayed user message keeps the human text (with its attachment
+        // summary); the provider gets the request prompt (already wrapped by
+        // Auto admission, or a host-built bot / handoff prompt).
         let preservedUserContent = request.userMessageContent ?? request.prompt
-        let providerInput = request.providerPromptOverridesDisplay ? request.prompt : preservedUserContent
-        let outboundPrompt: String
-        if request.provider == .distill {
-            // Distill receives the human prompt unchanged; keep bot directives in its client.
-            outboundPrompt = request.prompt
-        } else if let route = admittedRequest.autoRoute {
-            outboundPrompt = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(
-                userPrompt: providerInput,
-                admittedRoute: route
-            )
-        } else {
-            outboundPrompt = providerInput
-        }
+        let outboundPrompt = request.prompt
         var effectiveEnvironment = request.environment
         if request.provider != .distill {
             let scopedEnvironment = await runEnvironmentProvider?(
@@ -1414,7 +1398,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             runAsUser: request.runAsUser,
             acceptancePermit: pendingProviderStart.acceptancePermit
         )
-        effectiveRequest.providerPromptOverridesDisplay = request.providerPromptOverridesDisplay
         guard let runner = providers[effectiveRequest.provider] else {
             throw AgentRunError.missingBinary(effectiveRequest.provider.rawValue)
         }

@@ -708,11 +708,6 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     /// Runtime-only queue dispatch gate. Intentionally excluded from Codable and
     /// value equality; it has no meaning outside the current host process.
     public var acceptancePermit: AgentRunAcceptancePermit?
-    /// Runtime-only. True when `prompt` is a host-built envelope (bot brain,
-    /// Mac handoff summary) that the provider receives while
-    /// `userMessageContent` stays the display text. When false the provider
-    /// receives the display text.
-    public var providerPromptOverridesDisplay: Bool = false
     /// Canonical prior conversation captured before provider start. Runtime-only.
     public var contextSnapshot: TokenSaverCanonicalConversationSnapshot?
     /// Prepared RCSEED1 document for a confirmed fresh-fallback destination.

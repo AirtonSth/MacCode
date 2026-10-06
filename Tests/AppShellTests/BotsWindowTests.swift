@@ -16589,7 +16589,6 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(request.prompt.contains(raw))
         XCTAssertTrue(request.prompt.contains("Piper"), "queued send carries the bot brain")
         XCTAssertEqual(request.userMessageContent, raw, "visible user message stays the raw text")
-        XCTAssertTrue(request.providerPromptOverridesDisplay)
         let home = BotHome(appSupportDirectory: context.appSupportDirectory, bot: bot).root
         XCTAssertTrue(request.cwd.hasSuffix(home.lastPathComponent),
                       "bot threads run in the bot home, not the process cwd")

@@ -5399,7 +5399,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             if let botCwd = transformed.cwd { runCwd = GrokACPClient.resolvedSessionCwd(botCwd) }
             botPromptApplied = true
         }
-        var req = AgentRunRequest(
+        let req = AgentRunRequest(
             runId: requestedRunID,
             threadId: thread,
             provider: prov,
@@ -5424,7 +5424,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             runAsUser: t.runAsUser,
             acceptancePermit: acceptancePermit
         )
-        req.providerPromptOverridesDisplay = botPromptApplied
         let runId: AgentRunID
         do {
             runId = try await ctx.coordinator.startRun(req, routingSnapshot: coordinatorSnapshot)
