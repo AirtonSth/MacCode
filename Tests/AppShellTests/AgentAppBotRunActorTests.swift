@@ -149,6 +149,69 @@ final class AgentAppBotRunActorTests: XCTestCase {
         XCTAssertEqual(try f.ctx.queuedMessageRepo.list(threadId: f.thread.id).count, 1)
     }
 
+    /// Locks `thread` to the bot through the busy-VM path (lock, then queue)
+    /// so no provider starts; returns the stored guest marker.
+    private func lockOnBusyVM(_ f: Fixture, thread: AgentThread) async throws -> String? {
+        f.vm.botExecutionTargetProvider = { _ in .vm }
+        let snapshots = f.vm.providerSnapshots + [
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .distill,
+                models: [AgentModelDescriptor(id: "claude/claude-sonnet-4-5", label: "Sonnet", provider: .distill)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "distill"
+            )
+        ]
+        f.router.rememberProviderSnapshotsForSend(snapshots)
+        f.vm.providerSnapshots = snapshots
+        f.vm.selectThread(thread.id)
+        let holder = BotVMRunRegistry.Entry(
+            threadID: AgentThreadID(), runID: AgentRunID(), title: "Tarefa A", workspace: f.workspaceCwd
+        )
+        XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: f.bot.id, entry: holder))
+        defer { _ = BotVMRunRegistry.shared.releaseAndNextWaiting(runID: holder.runID) }
+        f.vm.setRunActor(.bot(f.bot.id))
+        f.vm.prompt = "task"
+        await f.vm.send()
+        XCTAssertTrue(f.runner.requests.isEmpty)
+        let stored = try XCTUnwrap(try f.ctx.threadRepo.get(id: thread.id))
+        XCTAssertEqual(stored.actor, .bot(f.bot.id), f.vm.statusMessage)
+        XCTAssertEqual(stored.executionTarget, .vm)
+        return try XCTUnwrap(try f.ctx.threadRepo.guestPlacement(of: thread.id)).guestRuntime
+    }
+
+    func test_aNewDistillWorkspaceThreadOfADockerBotIsMarkedToRunInTheGuest() async throws {
+        // WHY (plan A B3, owner decision 5): the guest marker is what routes a
+        // run into the bot's Linux VM. Without it a new Distill thread of a
+        // Docker-desktop bot would run on the Mac for good.
+        let f = try makeFixture()
+        let thread = try f.router.createAgentThread(
+            workspace: f.vm.workspaceID, title: "Distill thread", provider: .distill,
+            model: "claude/claude-sonnet-4-5", permissionMode: .supervised, reasoningEffort: .medium
+        )
+        let marker = try await lockOnBusyVM(f, thread: thread)
+        XCTAssertEqual(marker, BotGuestRuntime.distillV1)
+    }
+
+    func test_aCodexThreadOrADistillThreadWithAMacSessionIsNotMarked() async throws {
+        // WHY: only Distill runs in the guest (B4: a marked Codex thread fails
+        // closed), and a thread whose Distill session lives on the Mac keeps
+        // running there (D5); the guest could not load that session.
+        let f = try makeFixture()
+        let codexMarker = try await lockOnBusyVM(f, thread: f.thread)
+        XCTAssertNil(codexMarker)
+
+        var withMacSession = try f.router.createAgentThread(
+            workspace: f.vm.workspaceID, title: "Old distill", provider: .distill,
+            model: "claude/claude-sonnet-4-5", permissionMode: .supervised, reasoningEffort: .medium
+        )
+        withMacSession.providerThreadId = "mac-session-1"
+        try f.ctx.threadRepo.upsert(withMacSession)
+        f.vm.reloadThreads()
+        let sessionMarker = try await lockOnBusyVM(f, thread: withMacSession)
+        XCTAssertNil(sessionMarker)
+    }
+
     func test_noActorRequestMatchesPreChangeValuesFieldByField() async throws {
         let f = try makeFixture()
         f.vm.prompt = "plain question"

@@ -6158,6 +6158,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         try linker(botID, tid)
         let lockedAt = Date()
         let target = botExecutionTargetProvider(botID)
+        // Plan A: a new Distill conversation of a Docker-desktop bot runs
+        // inside the bot's Linux guest. One that already has a Mac Distill
+        // session keeps running on the Mac (D5). Written before the lock: on
+        // its own (no `.vm` target yet) the marker routes nothing.
+        let thread = try threadRepo.get(id: tid)
+        let hasMacDistillSession = thread?.provider == .distill && thread?.providerThreadId?.isEmpty == false
+        let runsInGuest = target == .vm && provider == .distill && !hasMacDistillSession
+        try threadRepo.setGuestRuntime(id: tid, runsInGuest ? BotGuestRuntime.distillV1 : nil)
         guard try threadRepo.setActor(
             id: tid, actor: .bot(botID), lockedAt: lockedAt, executionTarget: target
         ) else {

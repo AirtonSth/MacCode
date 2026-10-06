@@ -41,6 +41,11 @@ protocol BotGuestVMPreparing: Sendable {
 /// conversation's run ("bot ocupado"); the coordinator's run-finished callback
 /// frees it. The per-bot lease then makes the run wait until the previous
 /// run's guest process is dead and its sign-in copies are gone.
+///
+/// Stop while a run is still preparing (an image build can take minutes)
+/// invalidates the run's acceptance permit; preparation then stops at its
+/// next step and undoes what it did, so nothing is provisioned, copied or
+/// spawned for a run the user already stopped.
 final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendable {
     struct Dependencies: @unchecked Sendable {
         var threadRepo: AgentThreadRepository
@@ -90,6 +95,20 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
     ) async throws -> DistillGuestLaunchPlan? {
         guard let placement = try deps.threadRepo.guestPlacement(of: request.threadId),
               placement.runsInGuest else { return nil }
+        let work = Task { try await self.prepareGuestRun(request, placement: placement, progress: progress) }
+        request.acceptancePermit?.onInvalidate { work.cancel() }
+        return try await withTaskCancellationHandler {
+            try await work.value
+        } onCancel: {
+            work.cancel()
+        }
+    }
+
+    private func prepareGuestRun(
+        _ request: AgentRunRequest,
+        placement: AgentThreadGuestPlacement,
+        progress: @escaping @Sendable (DistillGuestStage) -> Void
+    ) async throws -> DistillGuestLaunchPlan {
         guard placement.guestRuntime == BotGuestRuntime.distillV1 else {
             throw DistillGuestLaunchError.unavailable(
                 "this conversation was set up by a newer RemoteCode; update RemoteCode to run it."
@@ -109,7 +128,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             throw DistillGuestLaunchError.unavailable("the conversation no longer exists.")
         }
         let botID = try dockerBot(of: thread)
-        await deps.barrier.wait()
+        try await deps.barrier.wait()
 
         let claim = BotVMRunRegistry.Entry(
             threadID: request.threadId, runID: request.runId, title: thread.title, workspace: request.cwd
@@ -126,6 +145,8 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         let runID = request.runId.value.uuidString.lowercased()
         var undo: [() -> Void] = []
         do {
+            // A lease handed over just before a Stop is this run's to free.
+            try Task.checkCancellation()
             progress(.startingVM)
             let workspace = try await workspaceRoot(of: thread)
             let registered = Set(await deps.workspaces().values)
@@ -136,6 +157,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                     workspace: workspace, registeredWorkspaces: registered
                 )
             }
+            try Task.checkCancellation()
             let guestCwd = try Self.guestCwd(
                 requestCwd: request.cwd, workspace: workspace, mounted: vm.mountedWorkspaces
             )
@@ -143,6 +165,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             progress(.preparingAgent)
             let binaryPath = try await deps.binaryGuestPath(deps.hostBinary(request), vm.dockerArch)
             let dockerExecutable = try deps.dockerExecutable()
+            try Task.checkCancellation()
 
             progress(.signingIn)
             let hostEnvironment = deps.processEnvironment.merging(request.environment) { _, run in run }
@@ -152,6 +175,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             )) ?? ""
             let provider = DistillGuestCredentials.accountProvider(model: request.model, hostConfig: hostConfig)
             try await deps.refresh(hostHome, provider)
+            try Task.checkCancellation()
             let guestHome = BotComputerGuestSpec.guestHomeURL(appSupport: deps.appSupport, botID: botID)
             let guestDistillHome = DistillGuestCredentials.distillHome(guestHome: guestHome)
             let mirror = mirror(hostHome: hostHome)
@@ -172,9 +196,11 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                     "the model \(request.model) cannot run in the bot's Linux VM: \(reason)"
                 )
             }
-            try Self.writePrivateFile(
-                Data(rendered.toml.utf8), to: guestDistillHome.appendingPathComponent("config.toml")
-            )
+            // Relative to a no-follow descriptor: the guest can swap its
+            // `.distill` for a symlink to any Mac folder at any moment.
+            let distillDirectory = try PrivateDirectory(guestDistillHome, create: true)
+            defer { distillDirectory.close() }
+            try distillDirectory.writeAtomically(Data(rendered.toml.utf8), to: "config.toml")
             let environment = DistillGuestEnvironment.build(
                 providerEnvironment: request.environment,
                 runID: runID,
@@ -193,6 +219,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             )
             undo.append { heartbeat.stop() }
             let guestCommand = try DistillGuestLaunchPlan.guestCommand(binaryPath: binaryPath, for: request)
+            try Task.checkCancellation()
 
             progress(.launching)
             guestResolverLog.info(
@@ -215,9 +242,15 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         } catch {
             undo.reversed().forEach { $0() }
             await lease.release()
-            guestResolverLog.error(
-                "bot.guest.prepare_failed run=\(runID, privacy: .public) bot=\(leaseKey, privacy: .public)"
-            )
+            if error is CancellationError {
+                guestResolverLog.info(
+                    "bot.guest.prepare_stopped run=\(runID, privacy: .public) bot=\(leaseKey, privacy: .public)"
+                )
+            } else {
+                guestResolverLog.error(
+                    "bot.guest.prepare_failed run=\(runID, privacy: .public) bot=\(leaseKey, privacy: .public)"
+                )
+            }
             throw Self.launchError(error)
         }
     }
@@ -329,35 +362,21 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             }
         }
     }
-
-    /// Temp + rename at 0600, so the guest never reads a half-written file.
-    static func writePrivateFile(_ data: Data, to url: URL) throws {
-        let temporary = url.deletingLastPathComponent()
-            .appendingPathComponent(".rc-\(url.lastPathComponent).\(UUID().uuidString)")
-        let descriptor = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-        do {
-            try handle.write(contentsOf: data)
-            try handle.close()
-            guard rename(temporary.path, url.path) == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
-        } catch {
-            unlink(temporary.path)
-            throw error
-        }
-    }
 }
 
 /// Renews `<guest home>/.rc-runs/<runId>.lease` while the Mac owns a guest
 /// run. The guest's reaper (run-agent) ends a run whose lease has not changed
 /// for 45 s, which is what stops it after the app crashes or is killed. Each
 /// renewal re-creates the file (temp + rename): the agent can delete it.
+/// The agent owns `.rc-runs` too and can swap it for a symlink to a Mac
+/// folder, so every write and delete goes through a no-follow descriptor
+/// reopened each time; a swapped `.rc-runs` makes renewals fail (and the
+/// reaper end the run), never write into the Mac folder.
 final class BotGuestLeaseHeartbeat: @unchecked Sendable {
     static let interval: TimeInterval = 10
 
     let fileURL: URL
+    private let directoryURL: URL
     private let queue = DispatchQueue(label: "io.remotecode.bot-guest.lease", qos: .utility)
     private var timer: DispatchSourceTimer?
     private var stopped = false
@@ -365,9 +384,8 @@ final class BotGuestLeaseHeartbeat: @unchecked Sendable {
 
     /// Writes the lease once before returning; throws when it cannot.
     init(guestHome: URL, runID: String, interval: TimeInterval = BotGuestLeaseHeartbeat.interval) throws {
-        let directory = guestHome.appendingPathComponent(".rc-runs", isDirectory: true)
-        fileURL = directory.appendingPathComponent("\(runID).lease")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        directoryURL = guestHome.appendingPathComponent(".rc-runs", isDirectory: true)
+        fileURL = directoryURL.appendingPathComponent("\(runID).lease")
         try queue.sync { try renew() }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + interval, repeating: interval)
@@ -392,20 +410,17 @@ final class BotGuestLeaseHeartbeat: @unchecked Sendable {
             stopped = true
             timer?.cancel()
             timer = nil
-            unlink(fileURL.path)
+            guard let directory = try? PrivateDirectory(directoryURL, create: false) else { return }
+            directory.remove(fileURL.lastPathComponent)
+            directory.close()
         }
     }
 
     private func renew() throws {
         renewals += 1
-        let temporary = fileURL.deletingLastPathComponent()
-            .appendingPathComponent(".\(fileURL.lastPathComponent).\(UUID().uuidString)")
-        try Data("\(renewals)\n".utf8).write(to: temporary)
-        guard rename(temporary.path, fileURL.path) == 0 else {
-            let code = errno
-            unlink(temporary.path)
-            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
-        }
+        let directory = try PrivateDirectory(directoryURL, create: true)
+        defer { directory.close() }
+        try directory.writeAtomically(Data("\(renewals)\n".utf8), to: fileURL.lastPathComponent)
     }
 }
 
@@ -546,13 +561,17 @@ enum BotGuestLaunchSweep {
         for name in (try? fileManager.contentsOfDirectory(atPath: runs.path)) ?? [] where name.hasSuffix(".env") {
             unlink(runs.appendingPathComponent(name).path)
         }
-        // A lease nobody renews makes the guest reaper end its leftover agent.
+        // A lease nobody renews makes the guest reaper end its leftover agent
+        // (up to ~50 s later: S10 ends them before the barrier opens). The
+        // guest owns `.rc-runs`: a symlinked one is skipped, never followed.
         for bot in (try? fileManager.contentsOfDirectory(atPath: guestHomes.path)) ?? [] {
             let leases = guestHomes.appendingPathComponent(bot, isDirectory: true)
                 .appendingPathComponent("home/.rc-runs", isDirectory: true)
-            for name in (try? fileManager.contentsOfDirectory(atPath: leases.path)) ?? [] where name.hasSuffix(".lease") {
-                unlink(leases.appendingPathComponent(name).path)
+            guard let directory = try? PrivateDirectory(leases, create: false) else { continue }
+            for name in directory.entries() where name.hasSuffix(".lease") {
+                directory.remove(name)
             }
+            directory.close()
         }
     }
 }

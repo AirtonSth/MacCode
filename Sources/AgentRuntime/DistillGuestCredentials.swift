@@ -397,12 +397,17 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
     }
 }
 
-/// A directory opened with `O_NOFOLLOW`; all access is relative to it.
-struct PrivateDirectory {
+/// A directory opened with `O_NOFOLLOW`; all access is relative to it. For
+/// any directory the guest owns (it lives on the guest-home bind): the guest
+/// can swap it for a symlink to a Mac directory at any moment, and a write or
+/// delete by path would then land in that Mac directory.
+public struct PrivateDirectory {
     let path: String
     let descriptor: Int32
 
-    init(_ url: URL, create: Bool) throws {
+    /// `create`: make it (0700) when missing. Throws `unsafeDirectory` when
+    /// the last component is a symlink or not a directory.
+    public init(_ url: URL, create: Bool) throws {
         path = url.path
         var fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         if fd < 0, errno == ENOENT, create {
@@ -424,7 +429,7 @@ struct PrivateDirectory {
         descriptor = fd
     }
 
-    func close() { Darwin.close(descriptor) }
+    public func close() { Darwin.close(descriptor) }
 
     /// Far above any credential file; a bigger one is treated as differing.
     static let readLimit = 1 << 20
@@ -444,7 +449,7 @@ struct PrivateDirectory {
 
     /// Temp file at 0600 + fsync + rename, so a reader sees the old file or
     /// the whole new one, never a partial one.
-    func writeAtomically(_ data: Data, to name: String) throws {
+    public func writeAtomically(_ data: Data, to name: String) throws {
         let temp = "\(DistillGuestCredentials.temporaryPrefix)\(UUID().uuidString).tmp"
         let fd = openat(descriptor, temp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw DistillGuestCredentialError.writeFailed(path: "\(path)/\(name)", errno: errno) }
@@ -478,11 +483,11 @@ struct PrivateDirectory {
     }
 
     @discardableResult
-    func remove(_ name: String) -> Bool {
+    public func remove(_ name: String) -> Bool {
         unlinkat(descriptor, name, 0) == 0
     }
 
-    func entries() -> [String] {
+    public func entries() -> [String] {
         let fd = dup(descriptor)
         guard fd >= 0 else { return [] }
         guard let stream = fdopendir(fd) else {

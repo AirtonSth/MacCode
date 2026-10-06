@@ -80,25 +80,47 @@ public enum DistillGuestStage: String, Sendable, Equatable, CaseIterable {
 }
 
 /// Opens once. Guest runs wait on it until launch cleanup (stale credential
-/// copies, env files, leftover agents) is done, so the cleanup can never
-/// delete what a new run just wrote.
+/// copies, env files and leases) is done, so the cleanup can never delete
+/// what a new run just wrote.
+///
+/// The cleanup does not yet end a leftover in-guest agent of a crashed or
+/// killed session (S10 adds `kill-agent --all` before opening). Until then
+/// such an agent ends only when its reaper sees no lease change for 45 s,
+/// so it can live up to about 50 s after the barrier opens, and a new run of
+/// the same bot admitted in that window shares its guest home with it.
 public actor DistillGuestLaunchBarrier {
     private var isOpen = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [UInt64: CheckedContinuation<Void, Error>] = [:]
+    private var nextWaiterID: UInt64 = 0
 
     public init() {}
 
-    public func wait() async {
+    /// Throws `CancellationError` when the waiting task is cancelled (Stop
+    /// while the run waits for launch cleanup).
+    public func wait() async throws {
+        try Task.checkCancellation()
         guard !isOpen else { return }
-        await withCheckedContinuation { waiters.append($0) }
+        nextWaiterID += 1
+        let id = nextWaiterID
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { waiters[id] = $0 }
+        } onCancel: {
+            // Runs after the insert: this actor is busy until the
+            // continuation above suspends.
+            Task { await self.cancelWaiter(id) }
+        }
     }
 
     public func open() {
         guard !isOpen else { return }
         isOpen = true
-        let ready = waiters
-        waiters = []
+        let ready = waiters.values
+        waiters = [:]
         ready.forEach { $0.resume() }
+    }
+
+    private func cancelWaiter(_ id: UInt64) {
+        waiters.removeValue(forKey: id)?.resume(throwing: CancellationError())
     }
 }
 

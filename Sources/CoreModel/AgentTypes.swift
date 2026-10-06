@@ -601,21 +601,44 @@ public final class AgentRunAcceptancePermit: @unchecked Sendable {
 
     private let lock = NSLock()
     private var state: State = .pending
+    private var invalidationHandlers: [@Sendable () -> Void] = []
 
     public init() {}
 
     @discardableResult
     public func invalidate() -> AgentRunAcceptanceAttempt? {
-        lock.withLock {
+        let (attempt, handlers) = lock.withLock { () -> (AgentRunAcceptanceAttempt?, [@Sendable () -> Void]) in
             if case .pending = state {
                 state = .invalidated
-                return nil
+                defer { invalidationHandlers = [] }
+                return (nil, invalidationHandlers)
             }
             if case .claimed(let attempt) = state {
-                return attempt
+                return (attempt, [])
             }
-            return nil
+            return (nil, [])
         }
+        handlers.forEach { $0() }
+        return attempt
+    }
+
+    /// Runs `handler` once if the permit is invalidated before anything claims
+    /// it (Stop while the start is still preparing), at once when it already
+    /// is. Never runs once a prompt write claimed or was accepted: work that
+    /// must stop with the start (a long launch preparation) cancels itself here.
+    public func onInvalidate(_ handler: @escaping @Sendable () -> Void) {
+        let runNow = lock.withLock { () -> Bool in
+            switch state {
+            case .pending:
+                invalidationHandlers.append(handler)
+                return false
+            case .invalidated:
+                return true
+            case .claimed, .accepted, .unknown:
+                return false
+            }
+        }
+        if runNow { handler() }
     }
 
     public var outcome: AgentRunAcceptanceOutcome {
@@ -641,6 +664,7 @@ public final class AgentRunAcceptancePermit: @unchecked Sendable {
             }
             let attempt = AgentRunAcceptanceAttempt()
             state = .claimed(attempt)
+            invalidationHandlers = []
             return attempt
         }
         defer { attempt.complete() }

@@ -1,4 +1,5 @@
 import XCTest
+import os
 import AgentRuntime
 import CoreModel
 import Persistence
@@ -140,7 +141,8 @@ final class BotGuestRunResolverTests: XCTestCase {
     }
 
     private func request(
-        _ thread: AgentThread, cwd: String? = nil, runAsUser: AgentRunAsUser? = nil
+        _ thread: AgentThread, cwd: String? = nil, runAsUser: AgentRunAsUser? = nil,
+        permit: AgentRunAcceptancePermit? = nil
     ) -> AgentRunRequest {
         AgentRunRequest(
             threadId: thread.id, provider: .distill, model: "claude/claude-sonnet-4-5",
@@ -150,7 +152,8 @@ final class BotGuestRunResolverTests: XCTestCase {
                 BotSecretEnvironment.botIDEnvironmentKey: "bot",
                 "PATH": "/Users/someone/bin:/usr/bin",
             ],
-            runAsUser: runAsUser
+            runAsUser: runAsUser,
+            acceptancePermit: permit
         )
     }
 
@@ -382,6 +385,154 @@ final class BotGuestRunResolverTests: XCTestCase {
         await f.barrier.open()
         let plan = try unwrapPlan(try await run.value)
         await plan.finish(.completed).value
+    }
+
+    // MARK: - Stop while preparing
+
+    func test_stopWhileTheVMIsStarting_copiesNoSignIn_writesNothing_andFreesTheBot() async throws {
+        // WHY (AGENTS.md loading rules): a stopped send must not go on to
+        // renew sign-ins, copy them into the guest, mint a gateway token and
+        // spawn an agent minutes later (an image build), nor keep the bot's
+        // lease so the next send waits on a run nobody wants.
+        let f = try await makeFixture()
+        let thread = try makeThread(f)
+        let permit = AgentRunAcceptancePermit()
+        let req = request(thread, permit: permit)
+        let gate = DispatchSemaphore(value: 0)
+        f.vm.gate = gate
+        let run = Task { try await f.resolver.prepare(req) { _ in } }
+        try await waitUntil { f.vm.calls.count == 1 }
+        permit.invalidate() // what the coordinator's Stop does to a pending start
+        gate.signal()
+        do {
+            let plan = try await run.value
+            XCTFail("a stopped run must not get a launch plan")
+            await plan?.finish(.cancelled).value
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        XCTAssertTrue(f.refreshes.values.isEmpty, "no sign-in renewal for a stopped run")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: f.guestDistillHome.appendingPathComponent("config.toml").path))
+        try await assertNothingLeft(f, req)
+
+        // Positive control: the same thread runs normally afterwards.
+        _ = f.registry.releaseAndNextWaiting(runID: req.runId)
+        f.vm.gate = nil
+        let plan = try unwrapPlan(try await f.resolver.prepare(request(thread)) { _ in })
+        await plan.finish(.completed).value
+    }
+
+    func test_stopWhileWaitingForLaunchCleanup_endsTheWaitWithoutClaimingTheBot() async throws {
+        let f = try await makeFixture(openBarrier: false)
+        let thread = try makeThread(f)
+        let permit = AgentRunAcceptancePermit()
+        let run = Task { try await f.resolver.prepare(self.request(thread, permit: permit)) { _ in } }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        permit.invalidate()
+        let ended = OSAllocatedUnfairLock(initialState: false)
+        Task { _ = try? await run.value; ended.withLock { $0 = true } }
+        try await waitUntil(timeout: 2) { ended.withLock { $0 } } // fails: Stop did not end the wait
+        if !ended.withLock({ $0 }) { await f.barrier.open() }
+        do {
+            let plan = try await run.value
+            XCTFail("a stopped run must not get a launch plan")
+            await plan?.finish(.cancelled).value
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        XCTAssertEqual(f.vm.calls.count, 0)
+        XCTAssertNil(f.registry.active(botID: f.bot.id), "a run stopped before the barrier never claims the bot")
+    }
+
+    // MARK: - Guest-owned directories
+
+    func test_aGuestSwappingItsDistillFolderForASymlink_neverGetsTheConfigWrittenIntoAMacFolder() async throws {
+        // WHY: the guest owns `~/.distill`. A leftover guest process can flip
+        // it between a folder and a symlink to a Mac folder (the user's own
+        // ~/.distill, ~/.codex, ...); a config write that follows it would
+        // replace the Mac's config.toml.
+        let f = try await makeFixture()
+        let thread = try makeThread(f)
+        let victim = root.appendingPathComponent("mac-victim", isDirectory: true)
+        try FileManager.default.createDirectory(at: victim, withIntermediateDirectories: true)
+        let distill = f.guestDistillHome.path
+        let link = f.guestHome.appendingPathComponent("link").path
+        try FileManager.default.createDirectory(atPath: distill, withIntermediateDirectories: true)
+        XCTAssertEqual(symlink(victim.path, link), 0)
+        // The attacker's primitive: atomically exchange the folder and the
+        // symlink (Linux renameat2 RENAME_EXCHANGE; RENAME_SWAP here).
+        let stop = OSAllocatedUnfairLock(initialState: false)
+        let flipper = Thread {
+            while !stop.withLock({ $0 }) {
+                guard renamex_np(link, distill, UInt32(RENAME_SWAP)) == 0 else { continue }
+                usleep(50)
+                renamex_np(link, distill, UInt32(RENAME_SWAP))
+                usleep(50)
+            }
+        }
+        flipper.start()
+        var plans = 0
+        for _ in 0..<60 {
+            let req = request(thread)
+            if let plan = try? await f.resolver.prepare(req, progress: { _ in }) {
+                plans += 1
+                await plan.finish(.completed).value
+            }
+            _ = f.registry.releaseAndNextWaiting(runID: req.runId)
+        }
+        stop.withLock { $0 = true }
+        while !flipper.isFinished { try await Task.sleep(nanoseconds: 1_000_000) }
+        XCTAssertGreaterThan(plans, 0, "positive control: runs still prepare while the folder is real")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: victim.path), [],
+                       "nothing the guest run writes may land in a Mac folder (\(plans) runs prepared)")
+    }
+
+    func test_aGuestSwappingItsLeaseFolderForASymlink_neverMakesTheMacWriteOrDeleteThere() async throws {
+        // WHY: the agent owns `~/.rc-runs` during its run. Renewals, Stop and
+        // the launch sweep must not create or delete `*.lease` files in a Mac
+        // folder it points that name at.
+        let f = try await makeFixture()
+        let thread = try makeThread(f)
+        let req = request(thread)
+        let plan = try unwrapPlan(try await f.resolver.prepare(req) { _ in })
+        let victim = root.appendingPathComponent("mac-victim", isDirectory: true)
+        try FileManager.default.createDirectory(at: victim, withIntermediateDirectories: true)
+        let runLease = "\(req.runId.value.uuidString.lowercased()).lease"
+        try "mine\n".write(to: victim.appendingPathComponent(runLease), atomically: true, encoding: .utf8)
+        try "mine\n".write(to: victim.appendingPathComponent("other.lease"), atomically: true, encoding: .utf8)
+        let leases = f.guestHome.appendingPathComponent(".rc-runs", isDirectory: true)
+        try FileManager.default.removeItem(at: leases)
+        try FileManager.default.createSymbolicLink(at: leases, withDestinationURL: victim)
+
+        try await Task.sleep(nanoseconds: 300_000_000) // several 50 ms renewals
+        await plan.finish(.completed).value
+        BotGuestLaunchSweep.removeLeftovers(appSupport: f.appSupport)
+
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: victim.path).sorted(),
+                       ["other.lease", runLease].sorted())
+        for name in ["other.lease", runLease] {
+            XCTAssertEqual(try String(contentsOf: victim.appendingPathComponent(name), encoding: .utf8), "mine\n",
+                           "\(name) was rewritten through the guest's symlink")
+        }
+    }
+
+    func test_aSymlinkedLeaseFolderFailsTheRunClosed() async throws {
+        // Positive control for the run itself: with no lease the guest
+        // reaper would end the agent, so the start fails instead.
+        let f = try await makeFixture()
+        let thread = try makeThread(f)
+        let victim = root.appendingPathComponent("mac-victim", isDirectory: true)
+        try FileManager.default.createDirectory(at: victim, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: f.guestHome.appendingPathComponent(".rc-runs"), withDestinationURL: victim
+        )
+        let req = request(thread)
+        await assertUnavailable(containing: "") {
+            _ = try await f.resolver.prepare(req) { _ in }
+        }
+        try await assertNothingLeft(f, req)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: victim.path), [])
     }
 
     // MARK: - Coordinator placement
