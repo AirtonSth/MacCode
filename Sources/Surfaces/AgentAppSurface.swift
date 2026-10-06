@@ -5374,8 +5374,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 availableModelsAreFallback = current.models.map(\.id) == availableModels.map(\.id)
             }
             availableModels = current.models
+            // A thread stored under the raw provider id ("distill", written by
+            // AppCommandRouter.normalizedProviderInstanceId when no configured
+            // instance matches) is the provider's default instance, not another
+            // source. Mapping it to the snapshot id ("distill-acp") must keep
+            // the thread's pinned model; a real instance switch still resets.
+            let isDefaultInstanceAlias = selectedThreadId != nil
+                && current.provider == previousProvider
+                && previousInstanceId == previousProvider.rawValue
             let sourceChanged = current.provider != previousProvider
-                || current.id != previousInstanceId
+                || (current.id != previousInstanceId && !isDefaultInstanceAlias)
             if sourceChanged {
                 // SC-ux-1: auto-rebind must reset model like setProvider — do not
                 // keep a Codex id (e.g. gpt-5.6-sol) after switching to Claude.

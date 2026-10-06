@@ -3472,7 +3472,11 @@ public final class BotsViewModel: ObservableObject {
     @Published public private(set) var botSecrets: [BotSecretMetadata] = []
     @Published public private(set) var isBotSecretsLoading = false
     @Published public private(set) var botSecretsLoadFailed = false
-    @Published public private(set) var providers: [AgentProviderSnapshot] = []
+    @Published public private(set) var providers: [AgentProviderSnapshot] = [] {
+        didSet { resolveUnlinkedDeskModelIfNeeded() }
+    }
+    /// Same last-used store the Agent App reads for new threads. Tests inject an isolated one.
+    var lastModelStore: AgentLastModelStore = .shared
     @Published public private(set) var isControlPlaneActive = true
     @Published public private(set) var isMemoryActive = true
     @Published public private(set) var isAutonomyActive = false
@@ -8295,6 +8299,9 @@ public final class BotsViewModel: ObservableObject {
                 deskRouting = fallback
             }
         }
+        if let conversation, conversation.linkedAgentThreadID == nil {
+            resolveUnlinkedDeskModel()
+        }
         normalizeDeskReasoning()
         let routingChanged = priorRouting != deskRouting
         isApplyingDeskRouting = false
@@ -8302,6 +8309,51 @@ public final class BotsViewModel: ObservableObject {
         if routingChanged, let conversationID = conversation?.id {
             captureDeskRouting(for: conversationID)
         }
+    }
+
+    /// An unlinked conversation's Main chip must show what its first send runs.
+    /// A copied route keeps a model the provider accepts (sticky model); an
+    /// empty or unlisted Distill model resolves like a new Agent App thread
+    /// (`AgentDefaultModelSelection`: last-used, then first listed model).
+    nonisolated static func resolvedUnlinkedDeskModel(
+        _ routing: BotDeskRouting,
+        snapshot: AgentProviderSnapshot?,
+        lastUsed: String?
+    ) -> String {
+        guard routing.provider == .distill else { return routing.model }
+        let models = snapshot?.models.filter { $0.provider == routing.provider } ?? []
+        let current = routing.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !current.isEmpty,
+           models.isEmpty
+            || models.contains(where: { $0.id == current })
+            || models.contains(where: \.supportsCustomModel) {
+            return routing.model
+        }
+        return AgentDefaultModelSelection.resolve(
+            provider: routing.provider,
+            lastUsed: lastUsed,
+            availableModelIds: models.map(\.id)
+        )
+    }
+
+    private func resolveUnlinkedDeskModel() {
+        let resolved = Self.resolvedUnlinkedDeskModel(
+            deskRouting,
+            snapshot: selectedDeskSnapshot,
+            lastUsed: lastModelStore.model(for: deskRouting.provider)
+        )
+        guard resolved != deskRouting.model else { return }
+        deskRouting.model = resolved
+    }
+
+    /// Provider snapshots can land after the conversation opened; re-check
+    /// the unlinked route so an empty Main model never reaches the first send.
+    private func resolveUnlinkedDeskModelIfNeeded() {
+        guard let conversation = selectedConversation,
+              conversation.linkedAgentThreadID == nil else { return }
+        let before = deskRouting.model
+        resolveUnlinkedDeskModel()
+        if deskRouting.model != before { normalizeDeskReasoning() }
     }
 
     private func persistDeskRouting() {
@@ -9927,7 +9979,8 @@ public final class BotsViewModel: ObservableObject {
     private var pendingDeskReceipts: [AgentRunID: ContextAssemblyReceipt] = [:]
 
     /// Keeps at most one pinned Agent App VM on the selected conversation's
-    /// linked thread; creates the thread eagerly when the conversation has none.
+    /// linked thread. An unlinked conversation gets no VM: its thread is created
+    /// lazily by the first send (`ensureLinkedThread`).
     func syncDeskAgentVM() {
         guard !isSyncingDeskAgent else { return }
         isSyncingDeskAgent = true
@@ -12882,6 +12935,8 @@ public struct BotsRootView: View {
 
     /// Unlinked conversation: no thread exists yet. The first send creates it
     /// through the legacy send path, then the embedded Agent App takes over.
+    /// The Main/Worker pills are the Agent App's shared component bound to this
+    /// conversation's `deskRouting`, so the first run uses the model shown.
     private func deskUnlinkedComposer(_ bot: BotDefinition) -> some View {
         VStack(spacing: 0) {
             Spacer(minLength: 0)
@@ -12898,6 +12953,9 @@ public struct BotsRootView: View {
                 onRemoveAttachment: { vm.removeAttachment($0) },
                 composerIdentifier: "bots.desk.composer",
                 sendIdentifier: "bots.desk.send",
+                leadingControls: vm.deskRouting.provider == .distill
+                    ? AnyView(deskUnlinkedModelPills)
+                    : nil,
                 suggestions: vm.composerSuggestions,
                 onApplySuggestion: { vm.applyComposerSuggestion($0) },
                 onCursorMoved: { vm.composerCursorOffset = $0 },
@@ -12905,6 +12963,46 @@ public struct BotsRootView: View {
                 onFileDrop: { vm.insertDroppedFilePaths($0) }
             )
         }
+    }
+
+    private var deskUnlinkedModelPills: some View {
+        let models = vm.deskModels.filter { !$0.id.isEmpty }
+        let mainModel = vm.deskRouting.model
+        let mainUnavailable = !mainModel.isEmpty && !models.isEmpty
+            && !models.contains(where: { $0.id == mainModel || $0.supportsCustomModel })
+        let menuWidth = AgentModelMenuWidth.estimatedWidth(
+            titles: models.map(\.label) + vm.deskSupportedReasoning.map(\.displayName),
+            min: AgentModelMenuWidth.distillMin,
+            max: AgentModelMenuWidth.distillMax
+        )
+        let emptyListTitle = vm.providers.isEmpty ? "Loading models..." : "No models available"
+        return AgentDistillModelPills(
+            mainModel: mainModel, mainModels: models,
+            reasoningModel: vm.deskRouting.reasoningModel, reasoningModels: models,
+            mainEffortSelection: vm.deskDistillMainEffortSelection,
+            mainEfforts: vm.deskSupportedReasoning,
+            supportsMainEffortAuto: vm.deskSupportsDistillMainEffortAuto,
+            reasoningEffortSelection: vm.deskDistillReasoningEffortSelection,
+            reasoningEfforts: vm.deskDistillReasoningEfforts,
+            supportsReasoningModelEffort: vm.deskSupportsDistillReasoningModelEffort,
+            homePath: vm.selectedDeskSnapshot?.homePath,
+            mainUnavailable: mainUnavailable,
+            isRunning: vm.deskRunIsLive,
+            isDisabled: vm.deskRunIsLive,
+            emptyListTitle: emptyListTitle,
+            workerEmptyListTitle: vm.providers.isEmpty
+                ? "Loading models..." : "No models yet. Connect an account on the start screen.",
+            menuWidth: menuWidth,
+            mainIdentifier: "bots.desk.model.menu", mainPopoverIdentifier: "bots.desk.model.popover",
+            workerIdentifier: "bots.desk.reasoningModel.menu",
+            workerPopoverIdentifier: "bots.desk.reasoningModel.popover",
+            onSelectMainModel: vm.setDeskModel, onSelectCustomMainModel: vm.setDeskModel,
+            onSelectMainEffort: vm.setDeskDistillMainEffortSelection,
+            onSelectWorkerModel: vm.setDeskReasoningModel,
+            onSelectWorkerEffort: vm.setDeskDistillReasoningEffortSelection,
+            statusHeader: { EmptyView() },
+            mainFooter: { EmptyView() }
+        )
     }
 
     private func deskDesktopPane(_ bot: BotDefinition) -> some View {

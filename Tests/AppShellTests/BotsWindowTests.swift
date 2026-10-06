@@ -17048,6 +17048,111 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try context.threadRepo.list().count, threadsBefore + 1)
     }
 
+    private func unlinkedDeskDistillSnapshot(id: String = "distill-acp") -> AgentProviderSnapshot {
+        AgentProviderSnapshotFactory.snapshot(
+            provider: .distill,
+            models: [
+                AgentModelDescriptor(id: "main-a", label: "Main A", provider: .distill),
+                AgentModelDescriptor(id: "main-b", label: "Main B", provider: .distill),
+            ],
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            id: id,
+            capabilitiesOverride: AgentProviderCapabilities(supportsDistillMainEffortAuto: true)
+        )
+    }
+
+    private func isolatedLastModelStore(distill: String?) -> AgentLastModelStore {
+        let suiteName = "rc2-bots-last-model-" + UUID().uuidString
+        let suite = UserDefaults(suiteName: suiteName)!
+        addTeardownBlock { suite.removePersistentDomain(forName: suiteName) }
+        let store = AgentLastModelStore(defaults: suite)
+        if let distill { store.remember(model: distill, for: .distill) }
+        return store
+    }
+
+    func test_unlinkedDeskMainModelPickIsTheModelTheFirstSendRuns() async throws {
+        // WHY: an empty bot conversation has no embedded Agent App, so its
+        // composer mounts the shared Main pill bound to deskRouting. Run 1 once
+        // used a hidden route the user never saw; the model picked on the empty
+        // conversation must be exactly the model the first send runs.
+        AgentProvider.selectableForTesting = nil
+        defer { AgentProvider.selectableForTesting = AgentProvider.allCases }
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .distill)
+        context.coordinator.replaceProvider(.distill, runner: runner)
+        let snapshot = unlinkedDeskDistillSnapshot()
+        router.rememberProviderSnapshotsForSend([snapshot])
+        router.preflightListedProviderSnapshotsForTesting = false
+        let vm = BotsViewModel(context: context, router: router)
+        vm.lastModelStore = isolatedLastModelStore(distill: nil)
+        vm.replaceProvidersForTests([snapshot])
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        XCTAssertNil(vm.selectedConversation?.linkedAgentThreadID)
+        XCTAssertEqual(vm.deskRouting.model, "main-a",
+                       "no last-used model: the pill opens on the first listed model, never an empty Main")
+
+        // The pill's onSelectMainModel is vm.setDeskModel (source-pinned in AgentComposerChromeTests).
+        vm.setDeskModel("main-b")
+        XCTAssertTrue(vm.send("first words"))
+
+        let started = await waitUntil(timeout: 5) { !runner.requests.isEmpty }
+        XCTAssertTrue(started, "the first send must reach the Distill runner")
+        let request = try XCTUnwrap(runner.requests.first)
+        XCTAssertEqual(request.model, "main-b", "run 1 must use the model the empty-thread pill showed")
+        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID)
+        XCTAssertEqual(try context.threadRepo.get(id: threadID)?.model, "main-b",
+                       "the lazily created thread must store the picked model, not a copied route")
+        runner.finish(runID: request.runId, status: .completed, reply: "ok")
+    }
+
+    func test_newDeskConversationNeverRunsOnAnInvisibleEmptyOrStaleModel() throws {
+        // WHY: a new conversation copies the previous route (sticky model). A
+        // valid copied model must stay; an empty or unlisted one must resolve
+        // like a new Agent App thread (last-used first) so shown == run.
+        AgentProvider.selectableForTesting = nil
+        defer { AgentProvider.selectableForTesting = AgentProvider.allCases }
+        let snapshot = unlinkedDeskDistillSnapshot()
+        let emptyRoute = BotDeskRouting(provider: .distill, providerInstanceID: "distill-acp", model: "")
+        XCTAssertEqual(
+            BotsViewModel.resolvedUnlinkedDeskModel(emptyRoute, snapshot: snapshot, lastUsed: "main-b"),
+            "main-b", "an empty route takes the user's last-used Distill model")
+        XCTAssertEqual(
+            BotsViewModel.resolvedUnlinkedDeskModel(emptyRoute, snapshot: snapshot, lastUsed: nil),
+            "main-a", "no last-used: first listed model, as AgentDefaultModelSelection does")
+        var staleRoute = emptyRoute
+        staleRoute.model = "retired-model"
+        XCTAssertEqual(
+            BotsViewModel.resolvedUnlinkedDeskModel(staleRoute, snapshot: snapshot, lastUsed: nil),
+            "main-a", "a model the provider no longer lists (and no custom ids) must not run invisibly")
+        var stickyRoute = emptyRoute
+        stickyRoute.model = "main-b"
+        XCTAssertEqual(
+            BotsViewModel.resolvedUnlinkedDeskModel(stickyRoute, snapshot: snapshot, lastUsed: "main-a"),
+            "main-b", "a valid copied model is the sticky-model feature and must win over last-used")
+
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.lastModelStore = isolatedLastModelStore(distill: nil)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        XCTAssertEqual(vm.deskRouting.model, "",
+                       "before snapshots load there is nothing honest to show yet")
+        vm.replaceProvidersForTests([snapshot])
+        XCTAssertEqual(vm.deskRouting.model, "main-a",
+                       "late snapshots must fill the empty Main model of the open unlinked conversation")
+
+        vm.setDeskModel("main-b")
+        XCTAssertTrue(vm.createDeskThread())
+        XCTAssertEqual(vm.deskRouting.model, "main-b",
+                       "the next new conversation keeps the previous valid model, now visible on its pill")
+    }
+
     private func makeWorkspaceLinkedDesk() throws -> (
         context: AppContext, router: AppCommandRouter, vm: BotsViewModel, bot: BotDefinition,
         thread: AgentThread, workspaceDir: String, runner: ControlledBotHandoffRunner

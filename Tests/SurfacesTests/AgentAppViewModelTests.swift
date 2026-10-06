@@ -994,6 +994,85 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertNotEqual(vm.model, "gpt-5.6-sol")
     }
 
+    /// WHY: the router stores bot/iOS-created threads under the raw provider id
+    /// ("distill") when no configured instance matches. Mapping that alias to the
+    /// snapshot id ("distill-acp") is the same source; treating it as a source
+    /// switch silently replaced the thread's model with the last-used one after
+    /// turn 1, and the next turn sent a foreign model into the same session.
+    func test_defaultInstanceAliasRemap_keepsThreadPinnedModel() async throws {
+        let (vm, repo) = try makeVM()
+        let suiteName = "rc2-alias-model-" + UUID().uuidString
+        let suite = UserDefaults(suiteName: suiteName)!
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        let store = AgentLastModelStore(defaults: suite)
+        store.remember(model: "claude/claude-opus-5-5", for: .distill)
+        vm.lastModelStore = store
+        let thread = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "bot thread",
+            provider: .distill,
+            providerInstanceId: "distill",
+            model: "muse-spark-1.3-contributor"
+        )
+        try repo.upsert(thread)
+        vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        XCTAssertEqual(vm.providerInstanceId, "distill")
+        XCTAssertEqual(vm.model, "muse-spark-1.3-contributor")
+
+        // The custom model is deliberately absent from the discovered list.
+        let distillACP = AgentProviderSnapshotFactory.snapshot(
+            provider: .distill,
+            models: [AgentModelDescriptor(id: "claude/claude-opus-5-5", label: "Claude Opus 5.5", provider: .distill)],
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            id: "distill-acp"
+        )
+        vm.providerSnapshotLoader = { [distillACP] }
+        await vm.loadProviderSnapshots()
+
+        XCTAssertEqual(vm.providerInstanceId, "distill-acp", "the alias still maps to the real snapshot id")
+        XCTAssertEqual(vm.model, "muse-spark-1.3-contributor",
+                       "an alias remap is not a source change and must not swap in the last-used model")
+    }
+
+    /// WHY: the alias exemption is narrow. A thread pinned to a configured
+    /// instance that disappeared moves to a different instance, which is a real
+    /// source change and still resets to the preferred model.
+    func test_realInstanceChange_stillAppliesPreferredModel() async throws {
+        let (vm, repo) = try makeVM()
+        let suiteName = "rc2-instance-model-" + UUID().uuidString
+        let suite = UserDefaults(suiteName: suiteName)!
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        let store = AgentLastModelStore(defaults: suite)
+        store.remember(model: "claude/claude-opus-5-5", for: .distill)
+        vm.lastModelStore = store
+        let thread = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "work account thread",
+            provider: .distill,
+            providerInstanceId: "distill-work",
+            model: "work-only-model"
+        )
+        try repo.upsert(thread)
+        vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+
+        let distillACP = AgentProviderSnapshotFactory.snapshot(
+            provider: .distill,
+            models: [AgentModelDescriptor(id: "claude/claude-opus-5-5", label: "Claude Opus 5.5", provider: .distill)],
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            id: "distill-acp"
+        )
+        vm.providerSnapshotLoader = { [distillACP] }
+        await vm.loadProviderSnapshots()
+
+        XCTAssertEqual(vm.providerInstanceId, "distill-acp")
+        XCTAssertEqual(vm.model, "claude/claude-opus-5-5",
+                       "a different configured instance is a source change and keeps the reset")
+    }
+
     /// WHY: explicit Source pick of an unrunnable provider must stay sticky so
     /// recovery UI is not thrashed by snapshot refresh.
     func test_userPinnedUnrunnableSource_notReboundOnSnapshotRefresh() async throws {
