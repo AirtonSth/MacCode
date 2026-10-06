@@ -40,6 +40,8 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     var lifecycle: [String] = []
     /// Runs while `docker build` is in progress.
     var onBuild: (() -> Void)?
+    /// Answers an exec instead of `png` when it returns non-nil.
+    var execOutput: (([String]) -> Data?)?
 
     func info() throws -> String {
         if infoFails { throw BotComputerGuestError.dockerUnavailable }
@@ -101,6 +103,7 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
             throw BotComputerGuestError.observeFailed
         }
         if let execError { throw execError }
+        if let output = execOutput?(command) { return output }
         return png
     }
     func rename(from: String, to: String) throws {
@@ -1149,6 +1152,48 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertEqual(replaced, .typeRegular)
         XCTAssertFalse(try String(contentsOf: ignore, encoding: .utf8).contains("HOST-PRIVATE-KEY"))
         XCTAssertEqual(try String(contentsOf: hostSecret, encoding: .utf8), "HOST-PRIVATE-KEY\n")
+    }
+
+    func test_guestRunVMProbesTheAgentToolsOncePerImageAndNamesWhatIsMissing() throws {
+        // WHY (plan A S8): an in-guest run needs the agent's tools in the
+        // image (a stale or customised image may lack them); it must fail
+        // naming them, not start a broken agent. The probe costs a docker
+        // exec per turn, so a container keeps its result until it is recreated.
+        let support = makeSupport("rc-guest-run-vm")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.infoText = "Server Version: 29.4.0\n Architecture: aarch64\n"
+        var probes = 0
+        var probeAnswer = "git wmctrl "
+        fake.execOutput = { command in
+            guard command.first == "sh", command.last == BotGuestDockerVM.toolsProbeScript else { return nil }
+            probes += 1
+            return Data(probeAnswer.utf8)
+        }
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake,
+            recipeContext: AppShellResourceBundle.computerGuestRecipeURL(),
+            observeAttempts: 1, observeDelay: 0
+        )
+        let vm = BotGuestDockerVM(appSupport: support, docker: fake, service: service)
+        let botID = BotID()
+        XCTAssertThrowsError(try vm.prepare(
+            botID: botID, threadID: AgentThreadID(), workspace: nil, registeredWorkspaces: []
+        )) { error in
+            XCTAssertEqual(String(describing: error),
+                           "VM indisponível: the bot's Linux image lacks git, wmctrl. "
+                           + "Add them to the bot's Dockerfile, or restore the default one, and rebuild.")
+        }
+        XCTAssertEqual(fake.lastExec?.user, BotComputerGuestSpec.agentUser, "probed as the user the agent runs as")
+
+        probeAnswer = ""
+        let ready = try vm.prepare(botID: botID, threadID: AgentThreadID(), workspace: nil, registeredWorkspaces: [])
+        XCTAssertEqual(ready, BotGuestVM(
+            container: BotComputerGuestSpec.containerName(botID: botID), dockerArch: "aarch64", mountedWorkspaces: []
+        ))
+        _ = try vm.prepare(botID: botID, threadID: AgentThreadID(), workspace: nil, registeredWorkspaces: [])
+        XCTAssertEqual(probes, 2, "a passed probe is reused while the container keeps its image")
+        service.teardown(botID: botID)
     }
 
     func test_provisionStartsStoppedContainerInsteadOfRecreating() throws {

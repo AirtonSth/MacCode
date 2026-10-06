@@ -42,10 +42,12 @@ public enum Schema {
     /// agent_threads(workspace_id, updated_at DESC, id DESC) for the rail list,
     /// v84 adds agent_threads.reasoning_model, and v85 adds scheduled-task
     /// model fields, including repair for databases that already recorded v84,
-    /// and v86 adds agent_threads.actor_json / actor_locked_at / execution_target.
+    /// and v86 adds agent_threads.actor_json / actor_locked_at / execution_target,
+    /// and v87 adds agent_threads.guest_runtime (bot agent runs inside its guest).
     private static let scheduledTaskModelColumnsSchemaVersion = 85
     private static let threadActorSchemaVersion = 86
-    public static let currentVersion: Int = threadActorSchemaVersion
+    private static let threadGuestRuntimeSchemaVersion = 87
+    public static let currentVersion: Int = threadGuestRuntimeSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1792,6 +1794,9 @@ public enum Schema {
         ALTER TABLE agent_threads ADD COLUMN actor_json TEXT;
         ALTER TABLE agent_threads ADD COLUMN actor_locked_at TEXT;
         ALTER TABLE agent_threads ADD COLUMN execution_target TEXT;
+        """),
+        SchemaStep(threadGuestRuntimeSchemaVersion, """
+        ALTER TABLE agent_threads ADD COLUMN guest_runtime TEXT;
         """),
     ]
 

@@ -1,4 +1,5 @@
 import XCTest
+import AgentRuntime
 @testable import Surfaces
 
 final class DistillLiveStatusTests: XCTestCase {
@@ -28,6 +29,33 @@ final class DistillLiveStatusTests: XCTestCase {
         XCTAssertEqual(s.subagents[0].typeLabel, "General")
         XCTAssertEqual(s.modelEffortText, "meta/muse-spark-1.3-contributor low")
         XCTAssertNil(s.mainCompactingSince)
+    }
+
+    func test_guestStage_showsRealStartupProgressWithItsElapsedTime_thenGivesTheStripBack() throws {
+        // WHY (AGENTS.md loading rules): a guest send must be acknowledged at
+        // once with what is really happening, and the strip must return to
+        // the turn's own status once the guest agent is up.
+        var s = DistillLiveStatus()
+        let start = Date()
+        func stage(_ value: DistillGuestStage, at: Date) throws {
+            guard case .providerRuntime(let runtime) = value.runtimeEvent else { return XCTFail("not a runtime event") }
+            XCTAssertTrue(DistillLiveStatus.isCarrierMethod(runtime.method))
+            s.apply(method: runtime.method, payloadJSON: runtime.payloadJSON, receivedAt: at)
+        }
+        try stage(.starting, at: start)
+        XCTAssertEqual(s.headline, "Starting Linux agent…")
+        XCTAssertEqual(s.headlineSince, start)
+        XCTAssertFalse(s.isEmpty, "the strip renders the stage")
+        let later = start.addingTimeInterval(3)
+        try stage(.startingVM, at: later)
+        XCTAssertEqual(s.headline, "Starting the bot's Linux VM…")
+        XCTAssertEqual(s.headlineSince, later, "each stage counts its own time")
+        send(&s, "main", ["sessionUpdate": "auto_compact_started"])
+        XCTAssertEqual(s.headline, "Compacting…", "compaction outranks the startup stage")
+        send(&s, "main", ["sessionUpdate": "auto_compact_completed"])
+        try stage(.ready, at: later.addingTimeInterval(1))
+        XCTAssertNil(s.headline)
+        XCTAssertNil(s.headlineSince)
     }
 
     func test_mainCompaction_togglesHeadlineOnStartAndComplete() {

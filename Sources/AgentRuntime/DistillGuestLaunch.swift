@@ -14,8 +14,92 @@ public protocol DistillGuestLaunchResolving: Sendable {
     func isGuestThread(_ threadId: AgentThreadID) -> Bool
     /// A launch plan for a guest thread, nil for a Mac thread. Throws when the
     /// thread belongs in a guest that cannot run it now; the run fails rather
-    /// than run on the Mac.
-    func prepare(_ request: AgentRunRequest) async throws -> DistillGuestLaunchPlan?
+    /// than run on the Mac. `progress` reports each stage as it starts.
+    func prepare(
+        _ request: AgentRunRequest,
+        progress: @escaping @Sendable (DistillGuestStage) -> Void
+    ) async throws -> DistillGuestLaunchPlan?
+}
+
+/// Why a guest thread cannot run now. It never runs on the Mac instead.
+public enum DistillGuestLaunchError: LocalizedError, CustomStringConvertible, Equatable {
+    case unavailable(String)
+    /// Another conversation holds the bot (`BotVMRunRegistry.busyMessage`).
+    case busy(String)
+
+    public var description: String {
+        switch self {
+        case .unavailable(let reason): return "VM indisponível: \(reason)"
+        case .busy(let message): return message
+        }
+    }
+
+    public var errorDescription: String? { description }
+}
+
+/// What a guest run is doing before its agent answers, shown live in the
+/// running strip so the send is acknowledged at once (each stage is real
+/// work, never a timer).
+public enum DistillGuestStage: String, Sendable, Equatable, CaseIterable {
+    case starting
+    /// The bot's previous run is still being torn down.
+    case waitingForBot
+    case startingVM
+    case preparingAgent
+    case signingIn
+    case launching
+    /// The guest agent answered `initialize`; the strip returns to normal.
+    case ready
+
+    public var text: String? {
+        switch self {
+        case .starting: return "Starting Linux agent…"
+        case .waitingForBot: return "Waiting for the bot's previous run to end…"
+        case .startingVM: return "Starting the bot's Linux VM…"
+        case .preparingAgent: return "Preparing the Linux agent…"
+        case .signingIn: return "Checking your sign-in…"
+        case .launching: return "Launching the agent in the Linux VM…"
+        case .ready: return nil
+        }
+    }
+
+    /// `ProviderRuntimeEvent.method` carrying a stage.
+    public static let runtimeMethod = "remotecode/guest_stage"
+
+    public var runtimeEvent: AssistantEvent {
+        let payload = (try? JSONSerialization.data(withJSONObject: ["stage": rawValue], options: [.sortedKeys]))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        return .providerRuntime(ProviderRuntimeEvent(
+            provider: .distill,
+            source: "remotecode.guest",
+            method: Self.runtimeMethod,
+            payloadJSON: payload,
+            receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+        ))
+    }
+}
+
+/// Opens once. Guest runs wait on it until launch cleanup (stale credential
+/// copies, env files, leftover agents) is done, so the cleanup can never
+/// delete what a new run just wrote.
+public actor DistillGuestLaunchBarrier {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    public init() {}
+
+    public func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    public func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        let ready = waiters
+        waiters = []
+        ready.forEach { $0.resume() }
+    }
 }
 
 /// One in-guest Distill run: `docker exec -i --env-file … run-agent <runId> -- <guestCommand>`.

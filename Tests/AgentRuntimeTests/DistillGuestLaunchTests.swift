@@ -177,6 +177,70 @@ final class DistillGuestLaunchTests: ProviderProcessTestCase {
         try await waitUntil { teardowns.values == [.completed, .completed] }
     }
 
+    func test_guestSendIsAcknowledgedBeforeTheGuestIsReadyAndTheStripClearsOnceTheAgentIsUp() async throws {
+        // WHY (AGENTS.md loading rules): preparing a guest (VM, agent binary,
+        // sign-in) takes seconds; the send must show real progress at once,
+        // and the strip must return to the turn's own status once the guest
+        // agent is up, not linger over its answer.
+        let docker = try writeFakeDocker()
+        let resolver = FakeGuestResolver()
+        let adapter = DistillACPAdapter(binaryNameOverride: "/missing/mac-distill")
+        adapter.setGuestLaunchResolver(resolver)
+        defer { adapter.stopAll() }
+        let threadID = AgentThreadID()
+        resolver.guestThreads = [threadID]
+        resolver.stages = [.startingVM, .launching]
+        let prepareGate = Gate()
+        resolver.makePlan = { request in
+            await prepareGate.wait()
+            let runID = request.runId.value.uuidString
+            return DistillGuestLaunchPlan(
+                runID: runID,
+                dockerExecutable: docker.path,
+                container: "remotecode-bot-test",
+                guestCwd: "/home/remotecode",
+                guestCommand: try DistillGuestLaunchPlan.guestCommand(binaryPath: "/guest/distill", for: request),
+                envFileURL: try DistillGuestEnvironment.writeEnvFile(
+                    ["RC_GUEST_RUN_ID": runID], runID: runID,
+                    directory: self.root.appendingPathComponent("guest-runs")
+                ),
+                lease: nil,
+                teardown: { _ in },
+                killGuest: {},
+                killGuestDetached: {}
+            )
+        }
+        let events = GuestEventBox()
+        let start = Task {
+            try await adapter.startSession(AgentRunRequest(
+                threadId: threadID, provider: .distill, model: "grok-4.6", cwd: "/tmp", prompt: "hi"
+            )) { events.append($0) }
+        }
+        try await waitUntil { events.guestStages == ["starting", "startingVM", "launching"] }
+        XCTAssertEqual(records(kind: "spawn").count, 0, "acknowledged while the guest was still being prepared")
+        prepareGate.open()
+        _ = try await start.value
+        _ = try await events.waitForFinish()
+        XCTAssertEqual(events.guestStages, ["starting", "startingVM", "launching", "ready"])
+        let ready = try XCTUnwrap(events.lastGuestStageIndex)
+        let firstItem = try XCTUnwrap(events.firstItemIndex)
+        XCTAssertLessThan(ready, firstItem, "the strip clears before the agent's answer streams")
+    }
+
+    func test_macThreadsGetNoGuestStages() async throws {
+        // WHY: the stage strip is for guest runs only; a Mac Distill run that
+        // fails to start must not claim it was starting a Linux agent.
+        let resolver = FakeGuestResolver()
+        resolver.makePlan = { _ in nil }
+        let adapter = DistillACPAdapter(binaryNameOverride: "/missing/mac-distill")
+        adapter.setGuestLaunchResolver(resolver)
+        let events = GuestEventBox()
+        _ = try? await adapter.startSession(AgentRunRequest(
+            threadId: AgentThreadID(), provider: .distill, model: "grok-4.6", cwd: "/tmp", prompt: "hi"
+        )) { events.append($0) }
+        XCTAssertEqual(events.guestStages, [])
+    }
+
     func test_recoverSpawnsNothing_readThreadIsEmpty_andForkIsUnsupportedForGuestThreads() async throws {
         // WHY (M3): opening an interrupted guest thread recovers its session;
         // that must neither throw nor start a guest process holding credentials.
@@ -667,6 +731,8 @@ private final class FakeGuestResolver: DistillGuestLaunchResolving, @unchecked S
     private let lock = NSLock()
     var guestThreads: Set<AgentThreadID> = []
     var makePlan: (@Sendable (AgentRunRequest) async throws -> DistillGuestLaunchPlan?)?
+    /// Reported through `progress` before `makePlan` runs.
+    var stages: [DistillGuestStage] = []
     private var prepares = 0
 
     var prepareCount: Int { lock.withLock { prepares } }
@@ -675,11 +741,15 @@ private final class FakeGuestResolver: DistillGuestLaunchResolving, @unchecked S
         lock.withLock { guestThreads.contains(threadId) }
     }
 
-    func prepare(_ request: AgentRunRequest) async throws -> DistillGuestLaunchPlan? {
-        let make = lock.withLock { () -> (@Sendable (AgentRunRequest) async throws -> DistillGuestLaunchPlan?)? in
+    func prepare(
+        _ request: AgentRunRequest,
+        progress: @escaping @Sendable (DistillGuestStage) -> Void
+    ) async throws -> DistillGuestLaunchPlan? {
+        let (make, stages) = lock.withLock { () -> ((@Sendable (AgentRunRequest) async throws -> DistillGuestLaunchPlan?)?, [DistillGuestStage]) in
             prepares += 1
-            return makePlan
+            return (makePlan, self.stages)
         }
+        stages.forEach(progress)
         return try await make?(request)
     }
 }
@@ -723,6 +793,38 @@ private final class GuestEventBox: @unchecked Sendable {
     private var values: [AgentRunEvent] = []
 
     func append(_ event: AgentRunEvent) { lock.withLock { values.append(event) } }
+
+    /// Guest stages in arrival order.
+    var guestStages: [String] {
+        lock.withLock {
+            values.compactMap { event -> String? in
+                guard case .event(.providerRuntime(let runtime)) = event,
+                      runtime.method == DistillGuestStage.runtimeMethod,
+                      let data = runtime.payloadJSON.data(using: .utf8),
+                      let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+                return payload["stage"] as? String
+            }
+        }
+    }
+
+    /// Index of the first assistant item, to order it against the stages.
+    var firstItemIndex: Int? {
+        lock.withLock {
+            values.firstIndex { event in
+                if case .event(.itemStarted) = event { return true }
+                return false
+            }
+        }
+    }
+
+    var lastGuestStageIndex: Int? {
+        lock.withLock {
+            values.lastIndex { event in
+                if case .event(.providerRuntime(let runtime)) = event { return runtime.method == DistillGuestStage.runtimeMethod }
+                return false
+            }
+        }
+    }
 
     func waitForFinish(timeout: TimeInterval = 10) async throws -> (status: AgentRunStatus, finalMessage: String?, providerThreadId: String?) {
         let deadline = Date().addingTimeInterval(timeout)

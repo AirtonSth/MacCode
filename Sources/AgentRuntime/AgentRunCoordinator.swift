@@ -1886,6 +1886,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
     }
 
+    /// Only Distill runs inside a bot's Linux guest. A guest thread whose
+    /// provider changed (picker, Auto routing) fails before anything is
+    /// persisted or spawned: on the Mac it would run outside the guest it
+    /// belongs to, with the guest's session cursor.
+    static func checkGuestPlacement(provider: AgentProvider, placement: AgentThreadGuestPlacement?) throws {
+        guard placement?.runsInGuest == true, provider != .distill else { return }
+        throw DistillGuestLaunchError.unavailable(
+            "this bot conversation runs inside the bot's Linux VM, which only runs Distill. "
+                + "Switch the conversation back to Distill; it will not run on the Mac."
+        )
+    }
+
     @discardableResult
     public func startRun(
         _ request: AgentRunRequest,
@@ -2310,6 +2322,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         guard let runner = providers[effectiveRequest.provider] else {
             throw AgentRunError.missingBinary(effectiveRequest.provider.rawValue)
         }
+        try Self.checkGuestPlacement(
+            provider: effectiveRequest.provider,
+            placement: try threadRepo.guestPlacement(of: effectiveRequest.threadId)
+        )
         try await providerAdmissionCheck(effectiveRequest.provider, effectiveRequest.threadId)
         let adapterKey = providerAdapterKey(runner)
         let binaryIdentity = providerBinaryIdentity(effectiveRequest.provider, adapter: runner)

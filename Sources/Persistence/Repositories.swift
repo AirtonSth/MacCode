@@ -2291,6 +2291,31 @@ public final class AgentThreadRepository {
         return try changes.step() && changes.columnInt64(0) == 1
     }
 
+    /// Guest runtime marker only (`BotGuestRuntime`); nil clears it. Neither
+    /// `upsert` nor `setActor` writes this column. Missing rows return false.
+    @discardableResult
+    public func setGuestRuntime(id: AgentThreadID, _ runtime: String?) throws -> Bool {
+        let st = try db.prepare("UPDATE agent_threads SET guest_runtime = ? WHERE id = ?;")
+        try st.bind(1, runtime)
+        try st.bind(2, id.value.uuidString)
+        _ = try st.step()
+        let changes = try db.prepare("SELECT changes();")
+        return try changes.step() && changes.columnInt64(0) == 1
+    }
+
+    /// Execution target and guest runtime marker; nil when the row is gone.
+    public func guestPlacement(of id: AgentThreadID) throws -> AgentThreadGuestPlacement? {
+        let st = try db.prepare(
+            "SELECT execution_target, guest_runtime FROM agent_threads WHERE id = ? LIMIT 1;"
+        )
+        try st.bind(1, id.value.uuidString)
+        guard try st.step() else { return nil }
+        return AgentThreadGuestPlacement(
+            executionTarget: st.columnText(0).flatMap(ExecutionTarget.init(rawValue:)),
+            guestRuntime: st.columnText(1)
+        )
+    }
+
     /// Permission-mode chrome only. Avoids the full get+upsert (26 columns +
     /// routing JSON rewrite) when an unselected session-grant must persist
     /// `permission_mode`. Missing rows return false.

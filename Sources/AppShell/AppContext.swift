@@ -386,6 +386,8 @@ public final class AppContext {
             if succeeded { await self.router?.refreshDistillProviderCatalog() }
         }
     }()
+    /// Opens once launch cleanup of bot guests is done; guest runs wait on it.
+    public let botGuestLaunchBarrier = DistillGuestLaunchBarrier()
     /// One per app so every bot shares the guest distill cache and its downloads.
     public lazy var distillGuestBinaries = DistillGuestBinaryProvisioner(
         guestToolsRoot: BotComputerGuestSpec.guestToolsURL(appSupport: appSupportDirectory)
@@ -1133,6 +1135,7 @@ public final class AppContext {
         )
         let claude: AgentProviderAdapter = AppContext.makeClaudeAdapter(engine: claudeEngine, binary: configuredClaudeBinary)
         let grok = GrokACPAdapter(binaryNameOverride: try? settingsRepo.get("cli.grok.path"))
+        let distill = DistillACPAdapter(binaryNameOverride: try? settingsRepo.get("cli.distill.path"))
         let contextReference = WeakReference()
         self.orchestrationRuntime = AgentOrchestrationRuntime(
             repository: AgentOrchestrationRepository(db: db),
@@ -1146,7 +1149,7 @@ public final class AppContext {
             providerSnapshotSupplier: {
                 await contextReference.value?.router?.listAgentProviderSnapshots() ?? []
             },
-            providerAdapters: [.codex: codex, .claude: claude, .grok: grok, .distill: DistillACPAdapter(binaryNameOverride: try? settingsRepo.get("cli.distill.path"))]
+            providerAdapters: [.codex: codex, .claude: claude, .grok: grok, .distill: distill]
         )
         self.coordinator.onRecoveredForkPrunedThreadIDs = { [weak contextReference] ids in
             await MainActor.run {
@@ -1160,6 +1163,7 @@ public final class AppContext {
         self.tokenSaverCodexAdapter.contextSeedPreparer = self.coordinator.tokenSaverContextSeedPreparer
         self.tokenSaverCodexAdapter.contextSeedReceipts = self.runRepo.contextSelectionReceipts()
         contextReference.value = self
+        distill.setGuestLaunchResolver(makeBotGuestRunResolver(hostsGuestRuns: performLaunchRunReconciliation))
         let liveActivitySyncCoordinator = self.liveActivitySyncCoordinator
         coordinator.onActiveRunProjectionChanged = { [weak contextReference] projection, cause in
             let syncCause: LiveActivitySyncCause

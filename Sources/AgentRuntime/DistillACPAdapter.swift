@@ -984,7 +984,14 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         // Never falls back to the Mac: a guest thread that cannot run in its
         // guest fails here.
         let resolver = synchronized { guestLaunchResolver }
-        let guestPlan = try await resolver?.prepare(request)
+        // Acknowledge a guest send before any guest work: preparing the VM,
+        // the agent binary and the sign-in can take seconds.
+        if resolver?.isGuestThread(request.threadId) == true {
+            onEvent(.event(DistillGuestStage.starting.runtimeEvent))
+        }
+        let guestPlan = try await resolver?.prepare(request, progress: { stage in
+            onEvent(.event(stage.runtimeEvent))
+        })
         // The resolver's two answers must agree. A guest thread without a plan
         // would run on the Mac; a plan on an open that sends no prompt would
         // hold the bot's guest, credentials and lease with no turn to end it.
@@ -1073,6 +1080,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     reasoningModelSelectionSupported: capabilities.sessionWorkerModel
                 )
             }
+            // The guest agent is up with its MCP servers: the strip goes back to the turn's own status.
+            if guestPlan != nil { onEvent(.event(DistillGuestStage.ready.runtimeEvent)) }
             let mapper = DistillACPEventMapper(sessionId: opened.sessionId)
             // Seed mode so plan session updates can tell live progress from Plan review.
             let availableModeIDs = Set(opened.availableModes.map(\.id))

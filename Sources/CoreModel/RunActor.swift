@@ -56,6 +56,33 @@ public enum ExecutionTarget: String, Codable, Sendable, Equatable, Hashable {
     case vm
 }
 
+/// Durable marker of a bot thread whose agent runs inside the bot's Linux
+/// guest. A `.vm` thread without it is a legacy thread: its agent session lives
+/// on the Mac and it keeps running there.
+public enum BotGuestRuntime {
+    /// Distill inside the guest. The only runtime this build can launch.
+    public static let distillV1 = "guest-v1"
+}
+
+/// A thread's VM placement as stored: target and guest runtime marker.
+public struct AgentThreadGuestPlacement: Equatable, Sendable {
+    public var executionTarget: ExecutionTarget?
+    public var guestRuntime: String?
+
+    public init(executionTarget: ExecutionTarget?, guestRuntime: String?) {
+        self.executionTarget = executionTarget
+        self.guestRuntime = guestRuntime
+    }
+
+    /// The agent runs inside the bot's guest, never on the Mac. Any marker
+    /// counts, including one a newer build wrote: such a thread must fail,
+    /// not fall back to the Mac. Moving a thread to the Mac (`.mac`) is the
+    /// user's explicit choice and wins over the marker.
+    public var runsInGuest: Bool {
+        executionTarget == .vm && guestRuntime?.isEmpty == false
+    }
+}
+
 public enum BotExecutionDefault {
     /// Only a Docker desktop gives the bot a VM; every other kind runs on the Mac.
     public static func target(for revision: BotRevision?) -> ExecutionTarget {

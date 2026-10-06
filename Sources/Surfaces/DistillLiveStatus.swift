@@ -1,5 +1,6 @@
 import Foundation
 import CoreModel
+import AgentRuntime
 
 /// Live Distill ACP status (compaction, model, subagents) folded from
 /// `providerRuntime` events so the running strip can mirror the Distill TUI.
@@ -97,6 +98,9 @@ public struct DistillLiveStatus: Equatable, Sendable {
     public var subagents: [Subagent] = []
     public var goal: Goal?
     public var scheduledTasks: [ScheduledTask] = []
+    /// Guest run startup ("Starting Linux agent…") until its agent is up.
+    public var guestStage: DistillGuestStage?
+    public var guestStageSince: Date?
 
     public init(runId: AgentRunID? = nil) {
         self.runId = runId
@@ -110,6 +114,7 @@ public struct DistillLiveStatus: Equatable, Sendable {
     public var headline: String? {
         if let sub = compactingSubagent { return "Subagent (\(sub.description)): Compacting…" }
         if mainCompactingSince != nil { return "Compacting…" }
+        if let text = guestStage?.text { return text }
         return nil
     }
 
@@ -122,6 +127,7 @@ public struct DistillLiveStatus: Equatable, Sendable {
     /// Start of the compaction the headline describes.
     public var headlineSince: Date? {
         compactingSubagent?.compactingSince ?? mainCompactingSince
+            ?? (guestStage?.text != nil ? guestStageSince : nil)
     }
 
     /// "<model> <effort>" of whoever the headline describes (else the main agent).
@@ -157,7 +163,8 @@ public struct DistillLiveStatus: Equatable, Sendable {
     ]
 
     public static func isCarrierMethod(_ method: String) -> Bool {
-        method == "x.ai/session_notification" || method == "x.ai/session/update"
+        method == DistillGuestStage.runtimeMethod
+            || method == "x.ai/session_notification" || method == "x.ai/session/update"
             || method == "_x.ai/session_notification" || method == "_x.ai/session/update"
             || kinds.contains(where: { method.hasPrefix($0) })
     }
@@ -167,6 +174,12 @@ public struct DistillLiveStatus: Equatable, Sendable {
         guard Self.isCarrierMethod(method),
               let data = payloadJSON.data(using: .utf8),
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return
+        }
+        if method == DistillGuestStage.runtimeMethod {
+            guard let stage = (payload["stage"] as? String).flatMap(DistillGuestStage.init(rawValue:)) else { return }
+            if stage != guestStage { guestStageSince = receivedAt }
+            guestStage = stage == .ready ? nil : stage
             return
         }
         let update: [String: Any]
