@@ -379,6 +379,9 @@ public protocol CommandRouting: AnyObject {
     /// `agent.attachment.get`: one message attachment's bytes (or a JPEG
     /// thumbnail), read off the main actor with `AgentAttachmentGetWire.load`.
     func getAgentAttachment(_ request: AgentAttachmentGetWire.Request) async throws -> JSONValue
+    /// `agent.account.usage.get`: stored provider account usage
+    /// (`AgentAccountUsageWire.load`), read off the main actor, no provider probe.
+    func getAgentAccountUsage() async throws -> JSONValue
 }
 
 public extension CommandRouting {
@@ -399,6 +402,9 @@ public extension CommandRouting {
     func replayedRunErrorFields(message: String, recoverable: Bool) -> [String: JSONValue] { [:] }
     func getAgentAttachment(_ request: AgentAttachmentGetWire.Request) async throws -> JSONValue {
         throw JSONRPCError.notSupported("agent.attachment.get")
+    }
+    func getAgentAccountUsage() async throws -> JSONValue {
+        throw JSONRPCError.notSupported("agent.account.usage.get")
     }
 
     func sshTransferUploadAsync(surface: SurfaceID, localPath: String, remotePath: String) async throws -> JSONValue {
@@ -2504,7 +2510,9 @@ public final class JSONRPCDispatcher {
                     // Same flag as DirectHTTPServer.capabilitiesProjection.
                     "run_recovery_action_v1": .bool(true),
                     // Same flag as DirectHTTPServer.capabilitiesProjection.
-                    "attachment_get_v1": .bool(true)
+                    "attachment_get_v1": .bool(true),
+                    // Same flag as DirectHTTPServer.capabilitiesProjection.
+                    "account_usage_get_v1": .bool(true)
                 ]
                 if let attachmentUpload =
                     agentAttachmentUploadCapability {
@@ -3851,6 +3859,8 @@ public final class JSONRPCDispatcher {
             case "agent.attachment.get":
                 let request = try AgentAttachmentGetWire.request(from: params)
                 return .init(id: id, result: try await router.getAgentAttachment(request))
+            case "agent.account.usage.get":
+                return .init(id: id, result: try await router.getAgentAccountUsage())
             case "agent.manual_action.list":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let actions = try router.listManualActions(thread: tid)
@@ -4911,7 +4921,7 @@ public final class JSONRPCDispatcher {
         "surface.health", "surface.read_text", "surface.read_history",
         "agent.thread.list", "agent.message.queue.list", "agent.plan.notes.get",
         "agent.message.list", "agent.message.get", "agent.pending_callbacks.list", "agent.manual_action.list",
-        "agent.attachment.get",
+        "agent.attachment.get", "agent.account.usage.get",
         // Legacy agent.checkpoint.list remains batch-admitted. Explicit
         // response_version 1 is rejected by preflightTransport before execution.
         "agent.thread.read", "agent.checkpoint.list", "agent.checkpoint.diff",

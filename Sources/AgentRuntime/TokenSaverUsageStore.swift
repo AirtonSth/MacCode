@@ -379,6 +379,9 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
         self.now = now
     }
 
+    /// The usage file itself (its modification date bounds how old the stored values are).
+    public var storeURL: URL { url }
+
     public func load(period: TokenSaverPeriod = .sevenDays) -> TokenSaverUsageSnapshot {
         // `saveUnlocked` atomically replaces usage.json, so a lock-free reader
         // observes either the complete old file or the complete new file. Reads

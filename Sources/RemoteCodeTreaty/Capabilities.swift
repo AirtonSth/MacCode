@@ -57,6 +57,10 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
         /// AgentAttachmentGetContracts.swift). False for older hosts: show the
         /// filename chip only.
         public let attachmentGetV1: Bool
+        /// `agent.account.usage.get` (stored per-provider account usage; see
+        /// AgentAccountUsageContracts.swift). False for older hosts: rings stay
+        /// empty until the first live `agent.account.usage` event.
+        public let accountUsageGetV1: Bool
 
         public init(
             providers: [String],
@@ -65,7 +69,8 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             manualActionsV1: Bool = false,
             threadActorV1: Bool = false,
             runRecoveryActionV1: Bool = false,
-            attachmentGetV1: Bool = false
+            attachmentGetV1: Bool = false,
+            accountUsageGetV1: Bool = false
         ) {
             self.providers = providers
             self.supportsStreamEvents = supportsStreamEvents
@@ -74,6 +79,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             self.threadActorV1 = threadActorV1
             self.runRecoveryActionV1 = runRecoveryActionV1
             self.attachmentGetV1 = attachmentGetV1
+            self.accountUsageGetV1 = accountUsageGetV1
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -84,6 +90,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             case threadActorV1 = "thread_actor_v1"
             case runRecoveryActionV1 = "run_recovery_action_v1"
             case attachmentGetV1 = "attachment_get_v1"
+            case accountUsageGetV1 = "account_usage_get_v1"
         }
 
         public init(from decoder: Decoder) throws {
@@ -95,6 +102,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             threadActorV1 = try container.decodeIfPresent(Bool.self, forKey: .threadActorV1) ?? false
             runRecoveryActionV1 = try container.decodeIfPresent(Bool.self, forKey: .runRecoveryActionV1) ?? false
             attachmentGetV1 = try container.decodeIfPresent(Bool.self, forKey: .attachmentGetV1) ?? false
+            accountUsageGetV1 = try container.decodeIfPresent(Bool.self, forKey: .accountUsageGetV1) ?? false
         }
     }
 

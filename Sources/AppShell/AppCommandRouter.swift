@@ -7959,6 +7959,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }.value
     }
 
+    /// Reads the stored usage file off the main actor; never probes a provider.
+    public func getAgentAccountUsage() async throws -> JSONValue {
+        guard let directory = context?.appSupportDirectory else {
+            throw JSONRPCError.notSupported("agent.account.usage.get")
+        }
+        return await Task.detached(priority: .userInitiated) {
+            AgentAccountUsageWire.load(appSupportDirectory: directory)
+        }.value
+    }
+
     public func importAgentAttachment(workspace: WorkspaceID, relativePath: String) throws -> AgentAttachmentUploadResult {
         let raw = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty, !raw.hasPrefix("/"), !raw.split(separator: "/").contains("..") else {

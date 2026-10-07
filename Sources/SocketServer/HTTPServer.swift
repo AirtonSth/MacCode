@@ -1332,6 +1332,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // agent.attachment.get (read-only bytes or JPEG thumbnail of one
             // message attachment) and agent.message.appended for bot screenshots.
             "attachment_get_v1": true,
+            // agent.account.usage.get (stored per-provider account usage, no probe).
+            "account_usage_get_v1": true,
         ]
         if let attachmentUpload {
             agent["attachment_upload"] = attachmentUpload.foundationObject
