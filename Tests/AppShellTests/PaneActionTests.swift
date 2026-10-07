@@ -1591,6 +1591,47 @@ final class PaneActionTests: XCTestCase {
                        "the newly selected surface content must be the visible one")
     }
 
+    func test_detachedWorkspaceWindowRefreshKeepsHiddenTabMounted() throws {
+        // WHY (PF-11): any full shell refresh (sidebar, rename, run state)
+        // also refreshes detached workspace windows. Tearing their panes down
+        // unmounted the previously selected tab, and the hidden terminal was
+        // then parked in an offscreen window instead of staying mounted.
+        let (ctx, router) = try makeContext()
+        let detached = try router.createWorkspace(name: "detached-refresh", cwd: NSTemporaryDirectory())
+        guard case .pane(let initialPane) = detached.layout,
+              let firstSurfaceID = initialPane.surfaces.first?.id else {
+            return XCTFail("expected a single-pane workspace with a default surface")
+        }
+        let second = try router.createSurface(
+            workspace: detached.id,
+            type: .terminal,
+            paneID: initialPane.id,
+            title: "terminal-refresh"
+        )
+        try router.focusSurface(workspace: detached.id, surface: second.id)
+        _ = try router.createWorkspace(name: "main-refresh", cwd: NSTemporaryDirectory())
+        let controller = MainWindowController(context: ctx, router: router)
+        router.windowController = controller
+        controller.openWorkspaceInNewWindow(detached.id)
+        defer { controller.workspaceWindow(for: detached.id)?.orderOut(nil) }
+        let detachedWindow = try XCTUnwrap(controller.workspaceWindow(for: detached.id))
+        detachedWindow.contentView?.layoutSubtreeIfNeeded()
+
+        try router.focusSurface(workspace: detached.id, surface: firstSurfaceID)
+        controller.refreshFromState()
+        controller.flushPendingRefresh()
+        drainMainQueue()
+
+        let content = try XCTUnwrap(detachedWindow.contentView)
+        let secondSurfaceView = try XCTUnwrap(SurfaceRegistry.shared.surface(second.id)?.view)
+        let firstSurfaceView = try XCTUnwrap(SurfaceRegistry.shared.surface(firstSurfaceID)?.view)
+        XCTAssertTrue(secondSurfaceView.isDescendant(of: content),
+                      "a full refresh must keep the previously selected tab mounted in the detached window")
+        XCTAssertTrue(secondSurfaceView.isHidden)
+        XCTAssertTrue(firstSurfaceView.isDescendant(of: content))
+        XCTAssertFalse(firstSurfaceView.isHidden)
+    }
+
     func test_backButtonFromWorkspaceWindowReturnsToMainSidebarWithoutClosingAppWindow() throws {
         let (ctx, router) = try makeContext()
         let detached = try router.createWorkspace(name: "detached-back", cwd: NSTemporaryDirectory())

@@ -1577,7 +1577,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
                !detachedWorkspaceIDs.contains(wid),
                let ws = ctx.state.workspaces[wid],
                let rootView = workspaceContent.subviews.first {
-                applyRatiosInPlace(view: rootView, node: ws.layout)
+                Self.applyRatiosInPlace(view: rootView, node: ws.layout)
             }
             reconcilePaneControllersInPlace()
             shellLog.debug("rebuildWorkspaceContainer reconciled in place (structure unchanged)")
@@ -1648,11 +1648,11 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
             return "empty"
         }
         var parts: [String] = ["ws:\(wid.value.uuidString)", "collapsed:\(sidebarCollapsed)"]
-        appendLayoutSignature(ws.layout, into: &parts)
+        Self.appendLayoutSignature(ws.layout, into: &parts)
         return parts.joined(separator: "|")
     }
 
-    private func appendLayoutSignature(_ node: LayoutNode, into parts: inout [String]) {
+    fileprivate static func appendLayoutSignature(_ node: LayoutNode, into parts: inout [String]) {
         switch node {
         case .pane(let p):
             // P1: STRUCTURAL fingerprint only -- pane id + ordered surface
@@ -1705,7 +1705,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     // at `view` and apply new ratios from `node` in place. Called only when
     // ratiosOnlyChanged confirmed a ratio-only update — no views are added,
     // removed, or re-parented.
-    private func applyRatiosInPlace(view: NSView, node: LayoutNode) {
+    fileprivate static func applyRatiosInPlace(view: NSView, node: LayoutNode) {
         if case .split(let s) = node, let split = view as? RatioSplitView {
             split.ratios = s.ratios.map { CGFloat($0) }
             split.relayoutNow()
@@ -2181,6 +2181,7 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate, PaneK
     private let workspaceContent = NSView()
     private let titleLabel = NSTextField(labelWithString: "")
     private var paneControllers: [PaneTabsView] = []
+    private var lastLayoutSignature: String?
     private var closingFromOwner = false
     private let onBack: () -> Void
     private let onClose: () -> Void
@@ -2237,6 +2238,24 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate, PaneK
         window.title = ws.name
         window.configureRemoteCodeWindowAccessibility(title: ws.name, identifier: "window.workspace")
         titleLabel.stringValue = ws.name
+        // PF-11 parity with the main window (PERF-MAC_SHELL_WINDOW-002): an
+        // unchanged pane/surface structure patches the live strips in place.
+        // A teardown here unmounted hidden tabs, so a refresh after a tab
+        // click parked the previous terminal outside this window.
+        var signatureParts: [String] = []
+        MainWindowController.appendLayoutSignature(ws.layout, into: &signatureParts)
+        let signature = signatureParts.joined(separator: "|")
+        if signature == lastLayoutSignature, !paneControllers.isEmpty {
+            if let rootView = workspaceContent.subviews.first {
+                MainWindowController.applyRatiosInPlace(view: rootView, node: ws.layout)
+            }
+            for controller in paneControllers {
+                guard let freshPane = ws.layout.find(paneID: controller.pane.id) else { continue }
+                controller.reconcile(to: freshPane)
+            }
+            return
+        }
+        lastLayoutSignature = signature
         for subview in workspaceContent.subviews { subview.removeFromSuperview() }
         paneControllers.removeAll()
         var primaryControlsAvailable = true
