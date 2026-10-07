@@ -27,12 +27,21 @@ on FIN, RST, or a host-side `shutdown` (revoke, server stop). It wakes on new by
 - **Peer gone** (`recv` peek returns 0 or a hard error), or the registry no longer
   owns the fd: the release (unbind owner, close fd, cancel the work task) runs once,
   from the cancel handler, after libdispatch has dropped the descriptor.
-- **Bytes waiting** (a pipelined request): it stops watching. The source is
-  level-triggered and would otherwise spin. It never reads the bytes, so the
-  keep-alive reader still gets them. The 5 ms poll also reported "connected" for the
-  rest of the RPC in this case.
-- `stop()` returns only after the cancel handler ran, so the response thread
-  owns the fd again with no source still attached.
+- **Bytes waiting** (a pipelined request): the read source is level-triggered
+  and would spin, so it hands over to a 5 ms timer on the same queue, which is the old
+  poll's cadence and checks. It still never reads the bytes, so the keep-alive reader
+  gets them. A peer FIN with bytes buffered reads as "connected", as it did with the
+  old poll. A host-side `shutdown` (revoke, stop) flushes the buffer, so the peek
+  returns 0, and a registry release flips ownership. Either one still cancels the RPC.
+  Only this rare case pays timer wakeups (URLSession does not pipeline). The A/B
+  workload above never pipelines, so its receipts are unaffected.
+- `stop()` returns only after every source's cancel handler ran, and reports whether
+  the release ran. If it did, the handoff task never touches that fd number again.
+  The accept loop may already have handed the number to another peer, and
+  `isActive(fd)` cannot tell the two connections apart. Before this fix, A's RPC
+  response could reach peer B and start a second reader on B's socket. That race
+  was pre-existing (the 5 ms poll had the same close-then-guard shape), and
+  `test_httpRPC_releasedFDReusedByNewPeer_neverReceivesOldResponse` pins it.
 
 `DirectHTTPServer.isRPCPeerConnected` lost its only caller and was removed.
 

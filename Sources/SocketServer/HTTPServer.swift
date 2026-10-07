@@ -3678,7 +3678,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     work.cancel()
                 }
                 let respData = await work.value
-                await watchdog.stop()
+                // The watchdog already released this fd. The accept loop may
+                // have handed the same number to another peer, which
+                // isActive(fd) cannot tell apart, so never touch it again.
+                if await watchdog.stop() {
+                    self.requestPhaseMetrics.recordCancelled()
+                    return
+                }
                 guard registry.isActive(fd) else {
                     self.requestPhaseMetrics.recordCancelled()
                     ownerRegistry.unbind(fd)
