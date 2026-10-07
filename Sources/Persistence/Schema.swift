@@ -45,12 +45,14 @@ public enum Schema {
     /// and v86 adds agent_threads.actor_json / actor_locked_at / execution_target,
     /// and v87 adds agent_threads.guest_runtime (bot agent runs inside its guest),
     /// and v88 adds Bot teams and group conversations plus
-    /// bot_conversations.group_id (column added only when missing).
+    /// bot_conversations.group_id (column added only when missing),
+    /// and v89 adds bot_conversation_routing (per-conversation Bot desk route).
     private static let scheduledTaskModelColumnsSchemaVersion = 85
     private static let threadActorSchemaVersion = 86
     private static let threadGuestRuntimeSchemaVersion = 87
     static let botTeamsGroupsSchemaVersion = 88
-    public static let currentVersion: Int = botTeamsGroupsSchemaVersion
+    static let botConversationRoutingSchemaVersion = 89
+    public static let currentVersion: Int = botConversationRoutingSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1802,7 +1804,21 @@ public enum Schema {
         ALTER TABLE agent_threads ADD COLUMN guest_runtime TEXT;
         """),
         SchemaStep(botTeamsGroupsSchemaVersion, botTeamsGroupsMigrationSQL),
+        SchemaStep(botConversationRoutingSchemaVersion, botConversationRoutingMigrationSQL),
     ]
+
+    /// Additive and idempotent. One row per desk conversation holds the
+    /// encoded Bot desk route (Main/Worker model, efforts, permission, run-as
+    /// user) that the Mac desk and paired `bot.send` both use. Rows go away
+    /// with their conversation.
+    static let botConversationRoutingMigrationSQL: String = """
+        CREATE TABLE IF NOT EXISTS bot_conversation_routing (
+            conversation_id TEXT PRIMARY KEY NOT NULL
+                REFERENCES bot_conversations(id) ON DELETE CASCADE,
+            routing_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
 
     /// Additive and idempotent: every object uses IF NOT EXISTS, and the
     /// bot_conversations.group_id column is added by `addMissingBotConversationGroupColumn`
@@ -1939,6 +1955,9 @@ public enum Schema {
     public static func migrate(_ db: SQLiteDB) throws {
         try migrateSteps(db, steps)
         try healBotTeamsGroupsSchema(db)
+        // Same sibling-branch hazard as teams/groups: a branch that recorded
+        // v89+ first would skip the step. The DDL is idempotent.
+        try db.execute(botConversationRoutingMigrationSQL)
     }
 
     /// `migrateSteps` skips by version, not by step. If a sibling branch

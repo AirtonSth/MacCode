@@ -18,6 +18,13 @@ public enum BotSend: RemoteCodeRPCContract {
         public let reasoningEffort: String?
         public let serviceTier: String?
         public let runAsUser: RemoteCodeJSONValue?
+        /// Distill Worker model; "" turns the Worker off. Must match the
+        /// `bot.routing.set` receipt when either side carries it.
+        public let workerModel: String?
+        /// Worker effort level or "auto".
+        public let workerEffort: String?
+        /// Distill Main effort level or "auto".
+        public let distillMainEffort: String?
 
         public init(
             botID: String,
@@ -33,7 +40,10 @@ public enum BotSend: RemoteCodeRPCContract {
             permissionMode: String? = nil,
             reasoningEffort: String? = nil,
             serviceTier: String? = nil,
-            runAsUser: RemoteCodeJSONValue? = nil
+            runAsUser: RemoteCodeJSONValue? = nil,
+            workerModel: String? = nil,
+            workerEffort: String? = nil,
+            distillMainEffort: String? = nil
         ) {
             self.botID = botID
             self.conversationID = conversationID
@@ -49,6 +59,9 @@ public enum BotSend: RemoteCodeRPCContract {
             self.reasoningEffort = reasoningEffort
             self.serviceTier = serviceTier
             self.runAsUser = runAsUser
+            self.workerModel = workerModel
+            self.workerEffort = workerEffort
+            self.distillMainEffort = distillMainEffort
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -66,6 +79,9 @@ public enum BotSend: RemoteCodeRPCContract {
             case reasoningEffort = "reasoning_effort"
             case serviceTier = "service_tier"
             case runAsUser = "run_as_user"
+            case workerModel = "worker_model"
+            case workerEffort = "worker_effort"
+            case distillMainEffort = "distill_main_effort"
         }
     }
 

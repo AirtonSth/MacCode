@@ -38,6 +38,31 @@ final class RemoteCodeTreatyTests: XCTestCase {
         XCTAssertNil(object["client_request_id"])
     }
 
+    func testBotSendParamsCarryTheDistillWorkerRoute() throws {
+        // WHY: a paired send must be able to name the exact Worker/efforts the
+        // routing receipt admitted; older clients omit them unchanged.
+        let params = BotSend.Params(
+            botID: "bot-1",
+            text: "hello",
+            submitKey: "return",
+            workerModel: "worker-a",
+            workerEffort: "high",
+            distillMainEffort: "auto"
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(params)) as? [String: Any]
+        )
+        XCTAssertEqual(object["worker_model"] as? String, "worker-a")
+        XCTAssertEqual(object["worker_effort"] as? String, "high")
+        XCTAssertEqual(object["distill_main_effort"] as? String, "auto")
+        XCTAssertEqual(try JSONDecoder().decode(BotSend.Params.self, from: encoder.encode(params)), params)
+
+        let legacy = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: encoder.encode(BotSend.Params(botID: "bot-1", text: "hi", submitKey: "return"))
+        ) as? [String: Any])
+        XCTAssertNil(legacy["worker_model"], "absent Worker fields stay off the wire")
+    }
+
     func testBotSendResultDecodesCurrentStartedReceipt() throws {
         let data = Data(#"""
         {

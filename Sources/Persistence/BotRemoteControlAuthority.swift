@@ -75,7 +75,15 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     public var onRebuildGuest: ((BotID, String, [String: Any]) -> Void)?
     public var onGuestInput: ((BotID, [String: Any], String, [String: Any]) throws -> Void)?
     public var onDockerClear: ((BotID) throws -> Void)?
-    public var onSend: ((BotID, String, BotConversationID?, [AgentAttachment], [String: Any]) throws -> [String: Any])?
+    /// Routing is nil when the send carries no routing receipt: the host then
+    /// runs the conversation's own desk route (or the resolved Distill default)
+    /// and reports it back as `effective_routing`.
+    public var onSend: ((BotID, String, BotConversationID?, [AgentAttachment], [String: Any]?) throws -> [String: Any])?
+    /// `bot.routing.set` with `conversation_id`: the host adopts the route as
+    /// that conversation's desk route and returns the resolved route.
+    public var onConversationRoutingSet: ((BotID, BotConversationID, [String: Any]) throws -> [String: Any])?
+    /// The route the next send to a desk conversation runs, for `bot.conversation.list`.
+    public var onConversationRouting: ((BotConversation) -> [String: Any]?)?
     public var onForceQueuedFollowUp: ((BotID, String) throws -> [String: Any])?
     public var onDelegatedAttentionSnapshot: (() throws -> [[String: Any]])?
     public var onOpenFile: ((BotID, String, Bool, String) throws -> Void)?
@@ -602,6 +610,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 row["run_id"] = identity.runID
             } else if let threadID = conversation.linkedAgentThreadID {
                 row["linked_agent_thread_id"] = threadID.value.uuidString.lowercased()
+            }
+            if let routing = onConversationRouting?(conversation) {
+                row["desk_routing"] = routing
             }
             return row
         }
@@ -1137,7 +1148,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             if let conversationID = requestedConversationID ?? selectedConversation[botID] {
                 payload["conversation_id"] = conversationID
             }
-            payload["routing"] = routing
+            if let routing { payload["routing"] = routing }
             payload["client_request_id"] = requestID
             let payloadJSON = jsonString(payload) ?? "{}"
             let stored = try store.enqueueQueuedFollowUp(
@@ -1150,7 +1161,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 )
             )
             consumeAttachments(attachmentIDs)
-            if let routingReceiptID = routing["routing_receipt_id"] as? String {
+            if let routingReceiptID = routing?["routing_receipt_id"] as? String {
                 consumedRoutingReceipts.insert(routingReceiptID)
             }
             let conversationID = requestedConversationID ?? selectedConversation[botID]
@@ -1165,8 +1176,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                     "enqueued": true,
                     "queue": encodeQueue(try store.listQueuedFollowUps(botID: bot.id)),
                     "id": stored.id,
-                    "routing_receipt_id": routing["routing_receipt_id"] ?? NSNull(),
-                    "effective_routing": routing,
+                    "routing_receipt_id": routing?["routing_receipt_id"] ?? NSNull(),
+                    "effective_routing": routing ?? NSNull(),
                 ]
             )
         }
@@ -1197,6 +1208,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             ]
         }
         consumeAttachments(attachmentIDs)
+        let effectiveRouting: Any = routing
+            ?? authoritativeSend["effective_routing"]
+            ?? NSNull()
         let runID = authoritativeSend["run_id"] as? String
             ?? UUID().uuidString.lowercased()
         let conversationID = authoritativeSend["conversation_id"] as? String
@@ -1216,8 +1230,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                     "enqueued": true,
                     "id": authoritativeSend["id"] ?? NSNull(),
                     "queue": encodeQueue(try store.listQueuedFollowUps(botID: bot.id)),
-                    "routing_receipt_id": routing["routing_receipt_id"] ?? NSNull(),
-                    "effective_routing": routing,
+                    "routing_receipt_id": routing?["routing_receipt_id"] ?? NSNull(),
+                    "effective_routing": effectiveRouting,
                 ]
             )
         }
@@ -1231,7 +1245,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "started_at": now.timeIntervalSince1970,
             "run_id": runID,
             "conversation_id": conversationID ?? NSNull(),
-            "routing": routing,
+            "routing": effectiveRouting,
         ]
         if let threadID = authoritativeSend["thread_id"] as? String, !threadID.isEmpty {
             liveRun["thread_id"] = threadID
@@ -1251,7 +1265,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "detail": text,
             "source": "bot",
         ], hostID: string(params, "host_id"))
-        if let routingReceiptID = routing["routing_receipt_id"] as? String {
+        if let routingReceiptID = routing?["routing_receipt_id"] as? String {
             consumedRoutingReceipts.insert(routingReceiptID)
         }
         return runtimeReceipt(
@@ -1264,8 +1278,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 "enqueued": false,
                 "run": liveRuns[botID] as Any,
                 "workspace": NSNull(),
-                "routing_receipt_id": routing["routing_receipt_id"] ?? NSNull(),
-                "effective_routing": routing,
+                "routing_receipt_id": routing?["routing_receipt_id"] ?? NSNull(),
+                "effective_routing": effectiveRouting,
             ]
         )
     }
@@ -2684,12 +2698,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func routingSet(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
-        let provider = string(params, "provider") ?? "grok"
+        let provider = string(params, "provider") ?? AgentProvider.defaultProvider.rawValue
         let providerInstanceID = string(params, "provider_instance_id") ?? provider
         let routingReceiptID = UUID().uuidString.lowercased()
         let runAsUser = params["run_as_user"] ?? Self.runAsUserObject(AgentRunAsUser.current())
         var pref: [String: Any] = [
-            "provider": string(params, "provider") ?? "grok",
+            "provider": provider,
             "provider_instance_id": providerInstanceID,
             "model": string(params, "model") ?? "",
             "routing_mode": string(params, "routing_mode") ?? "auto",
@@ -2701,7 +2715,25 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "host_id": string(params, "host_id") ?? "",
             "bot_id": id(bot),
         ]
-        pref["effective"] = pref
+        for key in Self.workerRoutingKeys where params[key] != nil {
+            guard let value = string(params, key) else { throw Error.invalidParams }
+            if key != "worker_model", value != "auto", AgentReasoningEffort(rawValue: value) == nil {
+                throw Error.invalidParams
+            }
+            pref[key] = value
+        }
+        if let rawConversationID = string(params, "conversation_id") {
+            guard let uuid = UUID(uuidString: rawConversationID),
+                  let conversation = try store.conversation(id: BotConversationID(uuid)) else {
+                throw Error.conversationGone
+            }
+            guard conversation.botID == bot.id, conversation.groupID == nil else { throw Error.crossTarget }
+            pref["conversation_id"] = conversation.id.value.uuidString.lowercased()
+            if let onConversationRoutingSet {
+                pref["effective"] = try onConversationRoutingSet(bot.id, conversation.id, pref)
+            }
+        }
+        if pref["effective"] == nil { pref["effective"] = pref }
         routingPref[id(bot)] = pref
         return receipt(
             requestID: requestID,
@@ -2711,6 +2743,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             receiptID: routingReceiptID
         )
     }
+
+    /// Optional Distill Worker/effort route fields, shared by `bot.routing.set`
+    /// and the receipt check in `bot.send`.
+    private static let workerRoutingKeys = ["worker_model", "worker_effort", "distill_main_effort"]
 
     private func attentionAck(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
@@ -2970,50 +3006,15 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return exactReceipt
     }
 
+    /// Nil without a routing receipt: the host runs the conversation's own
+    /// desk route. A receipt pins the exact route `bot.routing.set` admitted.
     private func effectiveRouting(
         botID: String,
         params: [String: Any]
-    ) throws -> [String: Any] {
-        let requestedReceipt = string(params, "routing_receipt_id")
-        // 1.1: fallback must come from the Bot's published revision when
-        // available, not a hardcoded grok constant — otherwise a claude/opus
-        // Bot runs as grok-4.6 when the mirror omits routing.
-        let publishedRoutingFallback: [String: Any]? = {
-            guard let uuid = UUID(uuidString: botID),
-                  let bot = try? store.get(id: BotID(uuid)),
-                  let revID = bot.currentRevisionID,
-                  let rev = try? store.getRevision(id: revID) else { return nil }
-            // Current BotRevision no longer carries provider/model; keep the
-            // permission/desktop as contextual fallback and defer provider to
-            // the desk's frozen routing when possible. The hard grok default
-            // remains only when no revision context exists at all.
-            return [
-                "provider": "grok",
-                "provider_instance_id": "grok",
-                "model": "",
-                "routing_mode": "auto",
-                "permission_mode": rev.permissionMode.rawValue,
-                "reasoning_effort": "medium",
-                "service_tier": "auto",
-                "run_as_user": Self.runAsUserObject(AgentRunAsUser.current()),
-                "host_id": string(params, "host_id") ?? "",
-                "bot_id": botID,
-            ]
-        }()
-        var routing = routingPref[botID] ?? publishedRoutingFallback ?? [
-            "provider": "grok",
-            "provider_instance_id": "grok",
-            "model": "",
-            "routing_mode": "auto",
-            "permission_mode": "supervised",
-            "reasoning_effort": "medium",
-            "service_tier": "auto",
-            "run_as_user": Self.runAsUserObject(AgentRunAsUser.current()),
-            "host_id": string(params, "host_id") ?? "",
-            "bot_id": botID,
-        ]
-        guard let requestedReceipt else { return routing }
-        guard !requestedReceipt.isEmpty,
+    ) throws -> [String: Any]? {
+        guard let requestedReceipt = string(params, "routing_receipt_id") else { return nil }
+        guard var routing = routingPref[botID],
+              !requestedReceipt.isEmpty,
               !consumedRoutingReceipts.contains(requestedReceipt),
               routing["routing_receipt_id"] as? String == requestedReceipt,
               routing["host_id"] as? String == string(params, "host_id"),
@@ -3028,6 +3029,13 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                   requested == routing[key] as? String else {
                 throw Error.crossTarget
             }
+        }
+        for key in Self.workerRoutingKeys where routing[key] != nil || params[key] != nil {
+            guard params[key] as? String == routing[key] as? String else { throw Error.crossTarget }
+        }
+        if let scoped = routing["conversation_id"] as? String,
+           string(params, "conversation_id") != scoped {
+            throw Error.crossTarget
         }
         if let requestedRunAs = params["run_as_user"],
            !Self.jsonObjectsEqual(requestedRunAs, routing["run_as_user"]) {

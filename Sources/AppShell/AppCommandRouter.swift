@@ -3508,7 +3508,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     message: "Bot runtime is unavailable."
                 )
             }
-            let routing = try Self.pairedBotDeskRouting(routingValues)
+            let routing = try routingValues.map(Self.pairedBotDeskRouting)
             let attachments = try self.resolveInboundAgentAttachments(attachmentReferences)
             let result = try vm.enqueueHostMessage(
                 botID: id,
@@ -3518,6 +3518,23 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 routing: routing
             )
             return Self.foundationObject(result.objectValue ?? [:])
+        }
+        created.onConversationRoutingSet = { [weak self] id, conversationID, routingValues in
+            guard let vm = self?.botsViewModel else {
+                throw BotRemoteControlAuthority.Error(
+                    code: -32091,
+                    message: "Bot runtime is unavailable."
+                )
+            }
+            let routing = try Self.pairedBotDeskRouting(routingValues)
+            let adopted = try vm.adoptRemoteDeskRouting(routing, botID: id, conversationID: conversationID)
+            return Self.foundationObject(adopted.remoteWireObject)
+        }
+        created.onConversationRouting = { [weak self] conversation in
+            guard let routing = self?.botsViewModel?.effectiveDeskRouting(for: conversation) else {
+                return nil
+            }
+            return Self.foundationObject(routing.remoteWireObject)
         }
         created.onForceQueuedFollowUp = { [weak self] id, itemID in
             guard let vm = self?.botsViewModel else {
@@ -3819,7 +3836,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         else {
             throw BotRemoteControlAuthority.Error.invalidParams
         }
-        return BotDeskRouting(
+        var routing = BotDeskRouting(
             provider: provider,
             providerInstanceID: providerInstanceID,
             model: values["model"] as? String ?? "",
@@ -3830,6 +3847,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 .flatMap(AgentServiceTier.init(rawValue:)) ?? .auto,
             runAsUser: runAsUser
         )
+        // Only a Distill route carries a Worker; a legacy route was already
+        // reset to Distill defaults by the initializer.
+        if routing.provider == provider {
+            do {
+                try routing.applyRemoteWorkerFields(values)
+            } catch {
+                throw BotRemoteControlAuthority.Error.invalidParams
+            }
+        }
+        return routing
     }
 
     private static func foundationObject(_ params: [String: JSONValue]) -> [String: Any] {
