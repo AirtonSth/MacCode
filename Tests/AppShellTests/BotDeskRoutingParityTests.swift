@@ -373,8 +373,8 @@ final class BotDeskRoutingParityTests: XCTestCase {
         XCTAssertTrue(try f.context.botStore.setDeskRoutingJSON(emptyJSON, conversationID: target.id))
 
         let restarted = BotsViewModel(context: f.context, router: f.router)
-        restarted.replaceProvidersForTests(f.vm.providers)
         restarted.lastModelStore = f.vm.lastModelStore
+        restarted.replaceProvidersForTests(f.vm.providers)
         restarted.openDesk(bot)
         restarted.selectDeskThread(other.id)
         let before = EventBus.shared.snapshot().lastSeq
